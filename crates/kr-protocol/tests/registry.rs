@@ -391,11 +391,12 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     }
 
     // Managed voice spends an account's balance, so the host signs an account in on its own, at
-    // this machine: a write that starts the sign-in and a read of where it stands, both served on
-    // the local socket alone and asking for host management. A paired device neither starts nor
-    // reads them.
-    let account: [(&str, EffectClass); 2] = [
+    // this machine: a write that starts the sign-in, a write that ends it and a read of where it
+    // stands, all served on the local socket alone and asking for host management. A paired device
+    // neither starts, ends nor reads them.
+    let account: [(&str, EffectClass); 3] = [
         ("account.sign_in", EffectClass::Write),
+        ("account.sign_out", EffectClass::Write),
         ("account.status", EffectClass::Read),
     ];
     for (name, effect) in account {

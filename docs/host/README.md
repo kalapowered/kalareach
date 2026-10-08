@@ -279,6 +279,16 @@ is refused while a voice call is open on the host, and one that is waiting when 
 without spending its code. A host that held an account token file from an earlier version removes it
 once, when the daemon starts, because that file held no refresh credential; the person signs in.
 
+`kr account sign-out` (`account.sign_out`, served on the local socket alone, asking for host
+management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret
+store and asks the service to end it. It works at the scope sign-in works at, so a host can sign out
+of the account service it can sign in at and of no other, and it is refused while a voice call is
+open, for the reason a sign-in is. A service that cannot be told leaves the grant gone from this
+host and the revocation queued; the daemon sends it again when it next starts, and the command says
+so. A host with no account answers that there was none. Between the check for an open call and the
+removal there is a short window in which a call can start; that call's close then finds no account
+to present, and the service ends the call at its own deadline.
+
 ### How the daemon is started
 
 A headless or SSH-first host has its per-user daemon started on demand, and only once it has been

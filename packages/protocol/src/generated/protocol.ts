@@ -19,6 +19,12 @@ export type AccountAttempt =
   | 'not_kept'
   | 'unreachable'
   | 'superseded'
+  | 'listener_failed'
+  | 'call_open'
+/**
+ * Why a host signs in nowhere.
+ */
+export type SignInUnavailable = 'no_broker' | 'broker_is_another_service' | 'not_usable'
 /**
  * Where the host stands with an account.
  */
@@ -52,8 +58,7 @@ export type AccountState =
        */
       email: string | null
       /**
-       * The service the sign-in belongs to. A call is brokered at the service the host's
-       * configuration names, and a token from another service is never presented to it.
+       * The account service the sign-in was made at, which is also the voice broker.
        */
       origin: string
       /**
@@ -1996,6 +2001,8 @@ export interface KalaReachProtocol {
   account_report?: AccountReport
   account_sign_in_params?: AccountSignInParams
   account_sign_in_started?: AccountSignInStarted
+  account_sign_out_params?: AccountSignOutParams
+  account_signed_out?: AccountSignedOut
   account_state?: AccountState
   account_status_params?: AccountStatusParams
   action_cancel_params?: ActionCancelParams
@@ -2631,13 +2638,14 @@ export interface KalaReachProtocol {
  */
 export interface AccountReport {
   /**
-   * How the last attempt ended, until the next one begins. It is null before any attempt since
-   * the daemon started.
+   * How the most recent attempt that has ended ended. It stays while a newer attempt waits, and
+   * is null before any attempt has ended since the daemon started or the host was signed out.
    */
   last_attempt: AccountAttempt | null
   /**
-   * The managed service this host's configuration names as its voice broker, which is where a
-   * sign-in is made and where its token is presented. Null when the host names none.
+   * The account service this host signs in at, which is also where its token is presented: the
+   * voice broker its configuration names, when that is the account service. Null when it is
+   * not, and `unavailable` says why.
    */
   service: string | null
   /**
@@ -2673,8 +2681,7 @@ export interface AccountReport {
          */
         email: string | null
         /**
-         * The service the sign-in belongs to. A call is brokered at the service the host's
-         * configuration names, and a token from another service is never presented to it.
+         * The account service the sign-in was made at, which is also the voice broker.
          */
         origin: string
         /**
@@ -2686,6 +2693,10 @@ export interface AccountReport {
     | {
         state: 'ended'
       }
+  /**
+   * Why this host signs in nowhere, when `service` is null.
+   */
+  unavailable: SignInUnavailable | null
 }
 /**
  * Parameters of `account.sign_in`. The environment is the one the connection reaches.
@@ -2704,6 +2715,25 @@ export interface AccountSignInStarted {
    * When the daemon stops waiting for the browser, in UTC milliseconds.
    */
   expires_at_ms: string
+}
+/**
+ * Parameters of `account.sign_out`. The environment is the one the connection reaches.
+ */
+export interface AccountSignOutParams {}
+/**
+ * What `account.sign_out` answers: whether there was an account to sign out, and whether the
+ * service has been told to end it.
+ */
+export interface AccountSignedOut {
+  /**
+   * Whether the service has acknowledged ending the grant. When it has not, the grant is gone
+   * from this host and the daemon sends the revocation again when it next starts.
+   */
+  service_told: boolean
+  /**
+   * Whether an account was signed in. A host with none answers `false` and changes nothing.
+   */
+  was_signed_in: boolean
 }
 /**
  * Parameters of `account.status`. The environment is the one the connection reaches.
@@ -10864,11 +10894,11 @@ export interface NetworkSelection {
   /**
    * The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
-   * and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker, and
-   * plugin repositories. Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
-   * submission do not use it. It is this machine's own choice: no invitation or host bundle
-   * carries it. It names no user and no password, because a proxy that needs credentials is
-   * not supported.
+   * and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and
+   * account service, and plugin repositories. Nothing goes around it, so an address it
+   * cannot reach fails. Name lookups and mail submission do not use it. It is this machine's
+   * own choice: no invitation or host bundle carries it. It names no user and no password,
+   * because a proxy that needs credentials is not supported.
    */
   proxy_url?: string | null
   /**
@@ -16100,6 +16130,7 @@ export interface MethodEntry {
     | 'privacy.set'
     | 'privacy.status'
     | 'account.sign_in'
+    | 'account.sign_out'
     | 'account.status'
     | 'host.update.handover'
     | 'description.setup'
@@ -24662,6 +24693,7 @@ export interface ServiceRequestPayload {
     | 'privacy.set'
     | 'privacy.status'
     | 'account.sign_in'
+    | 'account.sign_out'
     | 'account.status'
     | 'host.update.handover'
     | 'description.setup'

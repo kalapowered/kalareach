@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 164,
+  "method_count": 165,
   "methods": [
     {
       "capability": "none",
@@ -312,7 +312,36 @@
       "resource_selectors": [
         "environment"
       ],
-      "summary": "Start this host's own sign-in to the managed account service: listen on the loopback address the desktop client is registered with, answer the address a person opens in a browser, and keep the grant that comes back in this host's secret store. Nothing in the answer is a token.",
+      "summary": "Start this host's own sign-in to the managed account service: listen on the loopback address the desktop client is registered with, and keep the grant that comes back from the person's browser in this host's secret store. The address the person opens is read with account.status. Nothing in the answer is a token.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "account.sign_out",
+      "name": "account.sign_out",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "End this host's own sign-in to the managed account service: remove the grant from this host's secret store and ask the service to end it. Refused while a voice call is open, because a call closes under the account it started under. The answer says whether an account was signed in and whether the service acknowledged ending it; nothing in it is a token.",
       "version": 1
     },
     {

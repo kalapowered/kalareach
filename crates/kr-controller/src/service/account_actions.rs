@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use kr_protocol::envelope::ParamsValue;
-use kr_protocol::host_account::{AccountSignInParams, AccountStatusParams};
+use kr_protocol::host_account::{AccountSignInParams, AccountSignOutParams, AccountStatusParams};
 use kr_protocol::service::GatewayOrigin;
 
 use crate::error::{ControllerError, Result};
@@ -99,6 +99,21 @@ impl Controller {
         let _: AccountSignInParams = parse(&mutation.params)?;
         let started = self.account.sign_in().await?;
         ParamsValue::from_typed(&started)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Answers `account.sign_out`: removes the grant and asks the service to end it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host cannot sign out, as [`crate::account::HostAccount::sign_out`] does.
+    pub(super) async fn account_sign_out(
+        &self,
+        mutation: &kr_protocol::envelope::MutationRequest,
+    ) -> Result<ParamsValue> {
+        let _: AccountSignOutParams = parse(&mutation.params)?;
+        let done = self.account.sign_out().await?;
+        ParamsValue::from_typed(&done)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
