@@ -151,8 +151,8 @@ finds the bearer the gateway last issued. A write the store refuses is repeated 
 of questions, because the bearer it would have kept is the only one the gateway takes. A credential
 past its expiry is loaded too, because renewal needs only the authorisation, the gateway and this
 host's key. A stored item this build cannot read, or that is another authorisation's, is reported
-and not used. The start removes it if the store lets it, and goes on if the store does not: a
-daemon that stopped for an item it never loads would deliver to nobody.
+and not used. The start removes it if the store lets it, and goes on if the store does not. Nothing
+loads the item, and a daemon that stopped for it would deliver to nobody.
 
 The gateway keeps one bearer for an authorisation. A renewal replaces it, and so does an issue by
 the device's installation, and the host learns of the first from the gateway's answer and of the
@@ -181,11 +181,15 @@ Unpairing a device ends its destination. The daemon writes down that it owes the
 revocation of the authorisation behind it, removes the destination, and forgets the credential held
 for it, in memory and in the secret store. It asks at once and then every few minutes, further apart
 each time. The debt ends when the host has let go of what it kept of the authorisation and one of
-three things is true. The gateway has revoked the authorisation. Or the gateway has refused the
-opening of the revocation with `FORBIDDEN`, which it gives for an authorisation it holds none of for
-this host's key. Or thirty days and a few asks have passed. While the secret store still holds the
-item the debt stays owed whatever the gateway says, because it is the only record that the item is
-not to be kept.
+these is true:
+
+- the gateway has revoked the authorisation;
+- the gateway has refused the opening of the revocation with `FORBIDDEN`, which it gives for an
+  authorisation it holds none of for this host's key;
+- thirty days and a few asks have passed.
+
+While the secret store still holds the item the debt stays owed, whatever the gateway says. The debt
+is the only record that the item is not to be kept.
 
 Any other answer, a bare status, a refusal that is not the gateway's own or a success whose record
 is not this authorisation's, revoked, leaves the revocation owed. The debt survives a restart, and a
