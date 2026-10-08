@@ -44,6 +44,9 @@ mod stored_formats;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
+#[cfg(target_os = "linux")]
+#[path = "support/user_manager.rs"]
+mod user_manager;
 
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -788,6 +791,16 @@ fn writable(root: &Path) {
     }
 }
 
+/// Whether a daemon answers for the environment of `tree`.
+async fn answers_for(tree: &teardown::Tree) -> bool {
+    let Ok(endpoint) = tree.environment().controller_endpoint() else {
+        return false;
+    };
+    LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .is_ok()
+}
+
 /// Hands over and stops whatever daemon serves `tree`'s environment, through its own door, and says
 /// whether none is left serving it.
 async fn stop_daemon_of(tree: &teardown::Tree) -> bool {
@@ -932,14 +945,7 @@ impl Second {
 
     /// Whether a daemon answers for this environment.
     async fn answers(&self) -> bool {
-        let endpoint = self
-            .tree
-            .environment()
-            .controller_endpoint()
-            .expect("an endpoint");
-        LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-            .await
-            .is_ok()
+        answers_for(&self.tree).await
     }
 
     /// What this environment's daemon states about its build.
@@ -7612,6 +7618,162 @@ async fn a_daemon_is_started_again_as_its_own_document_chose() {
         host.daemon_document(),
         (document.display().to_string(), "loaded".to_owned()),
         "and it reads the document where the daemon before it did"
+    );
+}
+
+/// A release whose control daemon keeps its keys in the environment's own files and not in the
+/// person's credential store, as every harness here has it, unless it is started with a choice of
+/// its own. It is the daemon itself, because it hands over with `exec`: the process a service
+/// manager starts from this release is the daemon.
+#[cfg(target_os = "linux")]
+fn with_keys_in_files(release: Assembled) -> Assembled {
+    release
+        .with_program(
+            "kr-controller-real",
+            &Assembled::program_bytes("kr-controller"),
+        )
+        .with_program(
+            "kr-controller",
+            b"#!/bin/sh\ncase \"$1\" in --version) echo kr-controller; exit 0;; esac\n\
+              real=\"$(dirname \"$0\")/kr-controller-real\"\n\
+              case \" $* \" in *\" --secret-store \"*) exec \"$real\" \"$@\";; esac\n\
+              exec \"$real\" --secret-store file \"$@\"\n",
+        )
+}
+
+/// The process the user service manager of a test runs `unit` as, or 0 when it runs none.
+#[cfg(target_os = "linux")]
+fn main_process_of(manager: &user_manager::UserManager, unit: &str) -> u32 {
+    let shown = user_manager::bounded(
+        manager.systemctl(&["show", "--property=MainPID", "--value", unit]),
+        user_manager::STREAMS_DEADLINE,
+    )
+    .expect("the manager answers");
+    String::from_utf8_lossy(&shown.stdout)
+        .trim()
+        .parse()
+        .expect("a process number")
+}
+
+/// Waits until a daemon answers for the environment of `tree`.
+#[cfg(target_os = "linux")]
+async fn waited_for_a_daemon_of(tree: &teardown::Tree) {
+    let started = Instant::now();
+    while !answers_for(tree).await {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "no daemon answered for the environment"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-26.10: a daemon the user's service manager started is started again by it, from the release
+/// that is current when it starts, in an update and in a rollback: the daemon that answers afterwards is
+/// the process the manager runs the unit as, and not one `kr` started beside it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_the_service_manager_started_is_started_again_by_it() {
+    let host = Host::bare();
+    let home = host.scratch("home");
+    let manager = match user_manager::UserManager::start(&home, host.tree.holder()) {
+        Ok(manager) => manager,
+        Err(why) => {
+            user_manager::not_tested_here(&why);
+            return;
+        }
+    };
+    let one = with_keys_in_files(Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1));
+    let two = with_keys_in_files(Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2));
+    host.install(&one);
+    let manager_of_kr = [
+        ("HOME", home.as_os_str()),
+        ("XDG_RUNTIME_DIR", manager.runtime.as_os_str()),
+    ];
+
+    // The service start is chosen, and the manager starts the daemon of the release installed.
+    let (output, said) = host.kr_json_with(
+        &manager_of_kr,
+        &["host", "startup", "--set", "service", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "kr host startup: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let unit = format!(
+        "{}.service",
+        said["startup"]["definition"]["label"]
+            .as_str()
+            .expect("the unit's label")
+    );
+    let started = user_manager::bounded(
+        manager.systemctl(&["start", &unit]),
+        user_manager::STREAMS_DEADLINE,
+    )
+    .expect("the manager answers");
+    assert!(
+        started.status.success(),
+        "systemctl start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    waited_for_a_daemon_of(&host.tree).await;
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    let served_by = |host: &Host| {
+        kr_controller::singleton::SingletonLock::holder(&host.tree.environment().singleton_lock())
+            .expect("reads the lock")
+            .expect("a daemon holds the environment")
+    };
+    assert_eq!(served_by(&host), main_process_of(&manager, &unit));
+
+    // An update: the manager's daemon is handed over, and the manager starts the new release's.
+    let before = served_by(&host);
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json_with(
+        &manager_of_kr,
+        &[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+    assert_ne!(served_by(&host), before, "a daemon of the new release");
+    assert_eq!(
+        served_by(&host),
+        main_process_of(&manager, &unit),
+        "the manager started it"
+    );
+
+    // A rollback: the same, back to the older release.
+    let (output, said) = host.kr_json_with(&manager_of_kr, &["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    assert_eq!(
+        served_by(&host),
+        main_process_of(&manager, &unit),
+        "the manager started it"
     );
 }
 

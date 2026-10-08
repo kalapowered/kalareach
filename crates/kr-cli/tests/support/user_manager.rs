@@ -3,6 +3,10 @@
 //! Included by the suites that have a daemon started through the user's service manager. Each of
 //! them has the `teardown` module of the controller's tests at its root, which this uses.
 
+// Each suite compiles this module on its own and uses the part of it that it needs, so a helper
+// the other suite uses is dead code from this one's point of view.
+#![allow(dead_code)]
+
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
