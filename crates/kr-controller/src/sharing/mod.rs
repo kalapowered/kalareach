@@ -5,7 +5,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
-//! | [`roles`] | Compiling a role selection into explicit actions and history, the delegation rule, and what an actor may reach through a plugin, an attachment action or a workflow |
+//! | [`roles`] | Compiling a role selection into explicit actions and history, and the delegation rule |
 //! | [`invitation`] | Single-use expiring invitations and the preview their issuer accepted |
 //! | [`transfer`] | Handing control of a session to another device |
 //!
@@ -42,7 +42,6 @@ use crate::grants::{GrantDirectory, GrantRecord, GrantRevocation};
 
 pub use confirmation::{ConfirmedAction, OwnerConfirmations};
 pub use invitation::InvitationRecord;
-pub use roles::{Intermediary, effective_rights};
 pub use transfer::{ConfirmedTransfer, ControlTransfer, TransferHost, TransferPlan};
 
 /// What the issuer supplies when it shares a session.

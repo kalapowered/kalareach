@@ -2121,6 +2121,8 @@ struct Served {
     runtime: Arc<kr_worker::runtime::SessionRuntime>,
     endpoint: kr_ipc::paths::Endpoint,
     accepted: kr_transport::window::AcceptedDeadline,
+    /// The connector's package, whose actions an invocation names.
+    plugin_id: kr_protocol::ids::PluginId,
     /// Where the connector's package was laid out, removed when the test ends.
     package: std::path::PathBuf,
     /// The channel server's end of the channel's connection.
@@ -2293,6 +2295,7 @@ impl Served {
                 kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             ),
         };
+        let plugin_id = connector.plugin_id();
         let (retire, retired) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(kr_worker::broker::channels::serve(
             kr_worker::broker::channels::ChannelLaunch {
@@ -2327,6 +2330,7 @@ impl Served {
             runtime,
             endpoint,
             accepted,
+            plugin_id,
             package,
             relays,
             _verdicts: verdicts,
@@ -2443,6 +2447,60 @@ impl Served {
             .await
             .expect("the owner answers the approval");
         assert!(answered.state.is_terminal(), "{answered:?}");
+    }
+
+    /// Shares the session with `recipient` as the local owner, as `role`, and has the recipient
+    /// redeem the invitation: the share it then holds.
+    async fn shared_as(
+        &self,
+        role: kr_protocol::sharing::SessionRole,
+        recipient: DeviceId,
+        action: u8,
+    ) -> kr_protocol::grant::Grant {
+        let selection = RoleSelection::plain(role);
+        let mutation = MutationRequest {
+            action_id: ActionId::new(Uuid::from_bytes([action; 16])),
+            params: ParamsValue::from_typed(&GrantCreateParams {
+                session_id: self.session_id,
+                recipient_device_id: recipient,
+                parent_grant_id: Nullable::null(),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Nullable::null(),
+                owner_confirmation: Nullable::null(),
+            })
+            .expect("encodes"),
+            ..share(
+                self.environment_id,
+                self.session_id,
+                action,
+                RoleSelection::plain(role),
+            )
+        };
+        let carried = fake::admission(&self.controller, self.accepted).await;
+        let issued: GrantCreateResult = self
+            .controller
+            .authority_change(
+                &ActorId::new("local:test").expect("a principal"),
+                crate::service::authority_changes::AuthorityCaller::Owner,
+                &mutation,
+                Method::GrantCreate,
+                carried,
+            )
+            .await
+            .expect("the share is written")
+            .to_typed()
+            .expect("a share result");
+        self.controller
+            .sharing()
+            .redeem(
+                issued.preview.invitation_id,
+                recipient,
+                kr_ipc::now_ms().get(),
+                || Ok(()),
+                None,
+            )
+            .expect("the invitation is redeemed")
     }
 
     /// Shares the session as the local owner, reaching back to `bound_ms` and naming these.
@@ -2681,5 +2739,122 @@ async fn kr_req_10_51_a_device_reads_the_decisions_its_grant_names_while_they_ar
             .expect("a record");
     }
     drop(window);
+    served.close();
+}
+
+/// One `plugin.action.invoke` of the connector's `prompt.send` on the served instance.
+fn prompting(
+    served: &Served,
+    connection: &super::RemoteConnection,
+    byte: u8,
+    grant: kr_protocol::ids::GrantId,
+) -> MutationRequest {
+    let window = connection
+        .windows
+        .issue(connection.connection_id, served.controller.boot_epoch)
+        .expect("a window");
+    MutationRequest {
+        request_id: RequestId::new(u64::from(byte)),
+        method: Method::PluginActionInvoke.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(Uuid::from_bytes([byte; 16])),
+        grant_id: Nullable::some(grant),
+        target: ActionTarget {
+            environment_id: served.environment_id,
+            session_id: Nullable::some(served.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(channel_instance()),
+            agent_binding_revision: Nullable::some(kr_protocol::ids::AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: window.action_window_id,
+        requested_ttl_ms: DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+            target: kr_protocol::agent::AgentMutationTarget {
+                subject: kr_protocol::agent::AgentSubject {
+                    session_id: served.session_id,
+                    application_instance_id: channel_instance(),
+                },
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            },
+            plugin_id: served.plugin_id.clone(),
+            action: kr_protocol::broker::ActionName::new("prompt.send").expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id: Nullable::null(),
+            parameters: kr_protocol::scalars::Bytes::from(b"{}".to_vec()),
+        })
+        .expect("encodes"),
+    }
+}
+
+/// KR-REQ-19.01: a view-only recipient obtains no input through a plugin action. The package
+/// registers an action whose declared class is a prompt to the agent, and the recipient holds a
+/// share that carries `session.view` and nothing else. The call is refused for the right the
+/// action's class needs, whatever the action's own declaration says it reaches. The control is a
+/// recipient whose share carries that right: the same call is not refused for it, and meets
+/// whatever a component action meets on this host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_19_01_a_view_only_share_invokes_no_plugin_action_that_prompts_for_it() {
+    use kr_protocol::sharing::SessionRole;
+
+    let served = Served::start().await;
+    let declared =
+        serde_json::from_value::<kr_plugin_sdk::effect::ActionDeclaration>(serde_json::json!({
+            "id": "prompt.send",
+            "label": "prompt.send",
+            "effect": "upstream.prompt",
+            "implementation": { "type": "component" },
+            "parameters": { "parameters": [] },
+            "description": "prompt.send, as the package declares it",
+            "confirmation_required": false,
+        }))
+        .expect("a declaration the manifest format reads");
+    let refused = served
+        .service
+        .broker()
+        .register_actions(
+            BrokerBindingId::new(Uuid::from_bytes([0xe2; 16])),
+            &[declared],
+        )
+        .expect("the action is registered");
+    assert!(refused.is_empty(), "{refused:?}");
+
+    let mut codes = Vec::new();
+    for (role, byte) in [
+        (SessionRole::Viewer, 0x81_u8),
+        (SessionRole::Controller, 0x82),
+    ] {
+        let device = DeviceId::new(Uuid::from_bytes([byte; 16]));
+        let (mut pairing, _) = crate::service::net::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            served.controller.policy().authority_revision(),
+        );
+        pairing.recipient_device_id = device;
+        pairing.session_selector = kr_protocol::grant::SessionSelector::None;
+        let record = holding_grant(&served.controller, byte, pairing);
+        let held = served.shared_as(role, device, byte).await;
+        let connection = super::RemoteConnection::for_test(&served.controller, record);
+        let answer = connection
+            .mutate(&prompting(&served, &connection, byte, held.grant_id))
+            .await;
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) = answer
+        else {
+            panic!("a component action is carried by nothing on this host: {answer:?}");
+        };
+        codes.push(error.code);
+    }
+    assert_eq!(
+        codes[0],
+        ErrorCode::PermissionDenied,
+        "the viewer is refused for the right"
+    );
+    assert_ne!(
+        codes[1],
+        ErrorCode::PermissionDenied,
+        "the controller holds the right, so the refusal is not for it"
+    );
     served.close();
 }

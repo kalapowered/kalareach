@@ -4986,8 +4986,8 @@ struct Watching {
     grant_id: kr_protocol::ids::GrantId,
 }
 
-/// Pairs a device under a grant that reaches no session, shares the live screen of `session_id`
-/// with it as the local owner, and has the device redeem the invitation and follow the screen.
+/// Has a device hold a share of the live screen and follow it from a connection that sends nothing
+/// more.
 async fn watching_a_shared_screen(
     daemon: &RunningDaemon,
     host: &Host,
@@ -4996,84 +4996,39 @@ async fn watching_a_shared_screen(
     session_id: SessionId,
     lifetime_ms: Option<u64>,
 ) -> Watching {
-    let viewer = Device::create(&loopback()).await;
-    let viewer_record = pair_with(
+    let redeemed = a_redeemed_share(
         daemon,
-        &viewer,
+        host,
         owner,
-        proposing(&[ActionRight::SessionView], SessionSelector::None),
+        local,
+        session_id,
+        kr_protocol::sharing::SessionRole::Viewer,
+        lifetime_ms,
     )
     .await;
-    let selection = kr_protocol::sharing::RoleSelection {
-        include_live_screen: true,
-        ..kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer)
-    };
-    let issued: kr_protocol::sharing::GrantCreateResult = local
-        .mutate(
-            Method::GrantCreate,
-            ActionId::new(kr_ipc::new_uuid()),
-            on_session(host.environment_id, session_id),
-            &kr_protocol::sharing::GrantCreateParams {
-                session_id,
-                recipient_device_id: viewer_record.device_id,
-                parent_grant_id: Nullable::null(),
-                accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(
-                    &selection.actions(),
-                ),
-                selection,
-                lifetime_ms: Nullable(lifetime_ms.map(DurationMs::new)),
-                owner_confirmation: Nullable::null(),
-            },
-        )
-        .await
-        .expect("the call reaches the daemon")
-        .expect("the share is written")
-        .to_typed()
-        .expect("decodes");
-    let session = connect(daemon, &viewer, &viewer_record).await;
-    let _: kr_protocol::sharing::GrantRedeemResult = session
-        .mutate(
-            Method::GrantRedeem,
-            ActionTarget {
-                environment_id: host.environment_id,
-                session_id: Nullable::null(),
-                session_epoch: Nullable::null(),
-                application_instance_id: Nullable::null(),
-                agent_binding_revision: Nullable::null(),
-            },
-            None,
-            &ParamsValue::empty(),
-            &kr_protocol::sharing::GrantRedeemParams {
-                invitation_id: issued.preview.invitation_id,
-            },
-            DurationMs::new(120_000),
-        )
-        .await
-        .expect("the invitation is redeemed")
-        .to_typed()
-        .expect("decodes");
     let watching = attach_one(
-        &session,
+        &redeemed.session,
         host.environment_id,
         session_id,
         &[AttachmentCapability::ObserveTerminal],
     )
     .await;
-    let events = session.events();
-    let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
+    let events = redeemed.session.events();
+    let mut restoration = Restoration::start(output_stream(), &redeemed.session.cursors().await);
     let params = restoration
         .subscribe_params(session_id, watching, &[EventStream::Output])
         .expect("the stream is waiting to subscribe");
-    session
+    redeemed
+        .session
         .subscribe_events(&params)
         .await
         .expect("the share includes the live screen, so the device subscribes");
     restoration.subscribed().expect("the order is kept");
     Watching {
-        _device: viewer,
-        session,
+        _device: redeemed._device,
+        session: redeemed.session,
         events,
-        grant_id: issued.grant.grant_id,
+        grant_id: redeemed.grant_id,
     }
 }
 
@@ -5287,4 +5242,154 @@ async fn kr_req_25_10_a_recipient_whose_share_runs_out_is_let_go_of_with_it() {
     watching.session.close();
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
+}
+
+/// KR-REQ-19.01: a recipient holding a view-only share attaches a terminal with no input, and the
+/// lease it asks for is refused; a recipient holding a controller share attaches with input and is
+/// given the lease. The attachment is the intermediary: it is granted what the share carries and
+/// nothing it asks for beyond that.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_19_01_a_view_only_recipient_attaches_with_no_input() {
+    use kr_protocol::sharing::SessionRole;
+
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    let mut granted = Vec::new();
+    for role in [SessionRole::Viewer, SessionRole::Controller] {
+        let recipient =
+            a_redeemed_share(&daemon, &host, &owner, &mut local, session_id, role, None).await;
+        let attached: SessionAttachResult = recipient
+            .session
+            .mutate(
+                Method::SessionAttach,
+                on_session(host.environment_id, session_id),
+                None,
+                &ParamsValue::empty(),
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Semantic,
+                    claim_geometry: false,
+                    dimensions: Nullable::null(),
+                    terminal_profile_id: Nullable::null(),
+                    requested: [
+                        AttachmentCapability::ObserveTerminal,
+                        AttachmentCapability::Input,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect("the attach is settled")
+            .to_typed()
+            .expect("an attachment");
+        let lease = recipient
+            .session
+            .mutate(
+                Method::InputAcquire,
+                on_session(host.environment_id, session_id),
+                None,
+                &ParamsValue::empty(),
+                &InputAcquireParams {
+                    session_id,
+                    attachment_id: attached.attachment.attachment_id,
+                    expected_epoch: Nullable::null(),
+                },
+                DurationMs::new(120_000),
+            )
+            .await;
+        granted.push((attached.attachment.granted, lease.is_ok()));
+        recipient.session.close();
+    }
+    let (viewer_granted, viewer_leased) = &granted[0];
+    assert!(viewer_granted.contains(&AttachmentCapability::ObserveTerminal));
+    assert!(!viewer_granted.contains(&AttachmentCapability::Input));
+    assert!(!viewer_leased, "a viewer is given no input lease");
+    let (controller_granted, controller_leased) = &granted[1];
+    assert!(controller_granted.contains(&AttachmentCapability::Input));
+    assert!(controller_leased, "a controller is");
+
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// A device paired under a grant that reaches no session, shared the live screen of `session_id`
+/// by the local owner as `role` for `lifetime_ms`, which redeemed the invitation.
+struct Redeemed {
+    session: Session,
+    grant_id: kr_protocol::ids::GrantId,
+    _device: Device,
+}
+
+async fn a_redeemed_share(
+    daemon: &RunningDaemon,
+    host: &Host,
+    owner: &DeviceKeys,
+    local: &mut LocalClient,
+    session_id: SessionId,
+    role: kr_protocol::sharing::SessionRole,
+    lifetime_ms: Option<u64>,
+) -> Redeemed {
+    let viewer = Device::create(&loopback()).await;
+    let viewer_record = pair_with(
+        daemon,
+        &viewer,
+        owner,
+        proposing(&[ActionRight::SessionView], SessionSelector::None),
+    )
+    .await;
+    let selection = kr_protocol::sharing::RoleSelection {
+        include_live_screen: true,
+        ..kr_protocol::sharing::RoleSelection::plain(role)
+    };
+    let issued: kr_protocol::sharing::GrantCreateResult = local
+        .mutate(
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_session(host.environment_id, session_id),
+            &kr_protocol::sharing::GrantCreateParams {
+                session_id,
+                recipient_device_id: viewer_record.device_id,
+                parent_grant_id: Nullable::null(),
+                accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(
+                    &selection.actions(),
+                ),
+                selection,
+                lifetime_ms: Nullable(lifetime_ms.map(DurationMs::new)),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is written")
+        .to_typed()
+        .expect("decodes");
+    let session = connect(daemon, &viewer, &viewer_record).await;
+    let _: kr_protocol::sharing::GrantRedeemResult = session
+        .mutate(
+            Method::GrantRedeem,
+            ActionTarget::environment(host.environment_id),
+            None,
+            &ParamsValue::empty(),
+            &kr_protocol::sharing::GrantRedeemParams {
+                invitation_id: issued.preview.invitation_id,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the invitation is redeemed")
+        .to_typed()
+        .expect("decodes");
+    Redeemed {
+        session,
+        grant_id: issued.grant.grant_id,
+        _device: viewer,
+    }
 }
