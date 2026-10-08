@@ -2624,15 +2624,23 @@ fn create_new_private_directory(directory: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Makes a new owner-only directory with a short fresh name, `prefix` then eight hexadecimal
-/// digits, inside `root`; a name already there is drawn again.
+/// The hexadecimal digits in the name of a session's root and of a backend's directory.
+///
+/// A backend's socket is below both, and a socket path has 103 bytes on macOS, where the runtime
+/// directory by default is already 67: the two names, their separators and the socket's own name
+/// have to fit in the 36 that are left. Four digits keep them at 31. The name only has to differ
+/// from the ones in the same directory, and a name that is taken is drawn again.
+const NAME_DIGITS: usize = 4;
+
+/// Makes a new owner-only directory with a short fresh name, `prefix` then [`NAME_DIGITS`]
+/// hexadecimal digits, inside `root`; a name already there is drawn again.
 fn new_private_directory(root: &Path, prefix: &str) -> Result<PathBuf> {
     for _ in 0..8 {
         let name: String = kr_ipc::new_uuid()
             .to_string()
             .chars()
             .filter(char::is_ascii_hexdigit)
-            .take(8)
+            .take(NAME_DIGITS)
             .collect();
         let directory = root.join(format!("{prefix}{name}"));
         if create_new_private_directory(&directory)? {

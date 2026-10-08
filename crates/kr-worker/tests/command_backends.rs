@@ -41,6 +41,37 @@ fn private_directory(prefix: &str) -> PathBuf {
     directory
 }
 
+/// How long the runtime directory of one environment is on a Mac by default: the user's temporary
+/// directory, which macOS names with 49 bytes including the separator that ends it, then
+/// `kalareach`, a separator and the environment's eight-character prefix.
+const A_MACS_DEFAULT_RUNTIME_DIRECTORY_BYTES: usize = 49 + "kalareach/".len() + 8;
+
+/// A directory a case made, removed when the case ends.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A private directory as long as a Mac's default runtime directory, or longer where this machine's
+/// temporary directory already is.
+fn as_long_as_a_macs_default_runtime_directory() -> Removed {
+    let unique: String = kr_ipc::new_uuid()
+        .to_string()
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    let temporary = std::env::temp_dir();
+    let short = A_MACS_DEFAULT_RUNTIME_DIRECTORY_BYTES
+        .saturating_sub(temporary.join(&unique).as_os_str().len());
+    let directory = temporary.join(format!("{unique}{}", "k".repeat(short)));
+    kr_ipc::paths::create_private_directory(&directory).expect("a private directory");
+    Removed(directory)
+}
+
 /// The program a case's launcher and application are copies of: one every machine of the platform
 /// has, which is never run here.
 fn stand_in_program() -> PathBuf {
@@ -341,6 +372,39 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
     assert_eq!(
         PathBuf::from(record["credential"].as_str().expect("a credential path")),
         directory.join("credential")
+    );
+}
+
+/// KR-REQ-12.07: a backend is established where a Mac's default runtime directory puts it: the
+/// socket path its directories and endpoint add below that directory fits the 103 bytes a socket
+/// path may have on macOS, so the endpoint binds and the answer is not a bypass.
+#[tokio::test]
+async fn kr_req_12_07_a_backend_is_established_under_a_macs_default_runtime_directory() {
+    let runtime = as_long_as_a_macs_default_runtime_directory();
+    let setup = Setup::with(|config| CommandBackendsConfig {
+        runtime_dir: runtime.0.clone(),
+        ..config
+    });
+    let answer = setup
+        .backends
+        .establish(&request(
+            &setup,
+            &invocation(&["claude", "--resume"]),
+            &Setup::integration(),
+            1,
+        ))
+        .expect("a backend is established");
+    let directory = PathBuf::from(&answer.environment[0].value)
+        .parent()
+        .expect("the backend's directory")
+        .to_path_buf();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("launch")).expect("a launch record"))
+            .expect("the record is JSON");
+    let endpoint = record["endpoint"].as_str().expect("an endpoint");
+    assert!(
+        endpoint_exists(endpoint),
+        "the endpoint is bound: {endpoint}"
     );
 }
 
