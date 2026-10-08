@@ -604,22 +604,20 @@ impl RemoteConnection {
     /// request is refused as revoked, and its standing is read on both clocks. The device's pairing
     /// grant has to stand under this host's policy as well: a share is something a device holds
     /// while it is paired, and a member whose organisation lease lapsed does not keep working
-    /// through a grant that names none. A share's end is not the pairing grant's end, so it is
-    /// refused here and written nowhere on the device's record, and it is held as a bound of its
-    /// own, which the write boundary keeps a response or a relayed batch to.
+    /// through a grant that names none. The lease and the offline validity that pairing grant
+    /// stands under bound the request as they bound one decided under it. A share's end is not the
+    /// pairing grant's end, so it is refused here and written nowhere on the device's record, and
+    /// it is held as a bound of its own, which the write boundary keeps a response or a relayed
+    /// batch to.
     fn decide_share(
         &self,
         acting: &kr_protocol::grant::Grant,
         request: crate::grants::AccessRequest,
     ) -> std::result::Result<super::super::DeviceDecision, ProtocolError> {
         let pairing = self.pairing_record(&self.device.grant);
-        self.controller
-            .decide_for_workflow(
-                &pairing,
-                ActorIngress::PairedDevice,
-                request.now_ms,
-                request.continuous_now,
-            )
+        let standing = self
+            .controller
+            .decide_pairing_standing(&pairing, request.now_ms, request.continuous_now)
             .map_err(|refusal| match refusal {
                 // A floor this host could not write down says nothing about the grant.
                 kr_automation::AutomationError::AuthorityUnavailable(detail) => {
@@ -632,11 +630,10 @@ impl RemoteConnection {
             .controller
             .decide_for_device(&record.grant, &record, request)
             .map_err(|refusal| refusal.to_protocol_error())?;
-        let bound = self.share_bound(&record)?;
-        Ok(super::super::DeviceDecision {
-            share: Some(bound),
-            ..decided
-        })
+        let mut beside = vec![self.share_bound(&record)?];
+        beside.extend(standing.lease);
+        beside.extend(standing.offline);
+        Ok(super::super::DeviceDecision { beside, ..decided })
     }
 
     /// The grant this device's requests are decided against ([`decided_with_voice`]).
