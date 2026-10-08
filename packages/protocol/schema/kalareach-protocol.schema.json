@@ -3053,6 +3053,67 @@
       ],
       "type": "object"
     },
+    "AttentionApprovalRecord": {
+      "additionalProperties": false,
+      "description": "One transition of a pending resource the session's broker holds, as the attention store reads\nit.\n\nOnly an approval the broker has interpreted under a granted decoder raises attention, and only\nby the transition that interpreted it; every other transition travels so that the numbering of\nthe source has no hole, and the store moves its cursor past it. A record carries no text: what\nan approval asks is the application's to show, and the store keeps and serves none of it.",
+      "properties": {
+        "approval": {
+          "description": "Whether the resource is an approval, which it is once the broker has interpreted it under\na granted decoder, and from this transition on or from an earlier one.",
+          "type": "boolean"
+        },
+        "interpreted": {
+          "description": "Whether this transition is the one that interpreted the resource, which is what makes a\npending approval an actionable one. A claim given back, an answer on its way and every\nlater transition of the same approval are not.",
+          "type": "boolean"
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this transition was recorded."
+        },
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The resource."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "Its place in the session's approval transitions."
+        },
+        "state": {
+          "$ref": "#/$defs/PendingState",
+          "description": "The state the resource moved to."
+        }
+      },
+      "required": [
+        "sequence",
+        "resource_id",
+        "state",
+        "approval",
+        "interpreted",
+        "recorded_at_ms"
+      ],
+      "type": "object"
+    },
+    "AttentionApprovalSlice": {
+      "additionalProperties": false,
+      "description": "One source's part of a page: where the source stands, and its records after the cursor.",
+      "properties": {
+        "head": {
+          "$ref": "#/$defs/U64",
+          "description": "The source's last record when it was read, or nought for none."
+        },
+        "records": {
+          "description": "Its records after the cursor, oldest first, up to the head and the page's bounds.",
+          "items": {
+            "$ref": "#/$defs/AttentionApprovalRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "head",
+        "records"
+      ],
+      "type": "object"
+    },
     "AttentionAutomationSubject": {
       "description": "What an automation item is about: a workflow revision, or a causal chain.\n\nTold apart by which variant is present, as [`ReviewSubject`] is, so the canonical form's\nidentifiers decode as themselves.",
       "oneOf": [
@@ -3822,6 +3883,11 @@
           "type": "string"
         },
         {
+          "const": "approvals",
+          "description": "The transitions of the session's pending approvals, which its broker records.",
+          "type": "string"
+        },
+        {
           "const": "host_events",
           "description": "Terminal side effects with no attachment to go to.",
           "type": "string"
@@ -3840,8 +3906,12 @@
     },
     "AttentionSourcePage": {
       "additionalProperties": false,
-      "description": "A page of one session's attention source records.\n\nIt is read in order: the moment first, then each source's head and its records after the\ncursor, then the session's privacy state, which decides which records carry text. A source\nwhose last record in the page is its head, or which returned none with the cursor at or past\nits head, is complete; a page complete for both sources holds every record the session\ncommitted before `built_at_boot_ms`.",
+      "description": "A page of one session's attention source records.\n\nIt is read in order: the moment first, then each source's head and its records after the\ncursor, then the session's privacy state, which decides which records carry text. A source\nwhose last record in the page is its head, or which returned none with the cursor at or past\nits head, is complete; a page complete for every source holds every record the session\ncommitted before `built_at_boot_ms`.",
       "properties": {
+        "approvals": {
+          "$ref": "#/$defs/AttentionApprovalSlice",
+          "description": "The transitions of the session's pending approvals."
+        },
         "built_at_boot_ms": {
           "$ref": "#/$defs/U64",
           "description": "When the worker began reading, on the machine's continuous clock since boot, which the\ncontrol daemon reads too."
@@ -3885,6 +3955,7 @@
         "request_id",
         "built_at_boot_ms",
         "questions",
+        "approvals",
         "host_events",
         "privacy_generation",
         "output_floor"
@@ -3895,6 +3966,10 @@
       "additionalProperties": false,
       "description": "A request for one session's attention source records past where the store has read.\n\nThe worker answers with an [`AttentionSourcePage`]. While neither source has a record past its\ncursor and the session's privacy state has not moved, it may hold the request for up to\n`wait_ms`, answering as soon as a question transition, a host event or a privacy transition\nis committed.",
       "properties": {
+        "approvals_after": {
+          "$ref": "#/$defs/U64",
+          "description": "The last approval transition the store has read, or nought for none."
+        },
         "fingerprint_key": {
           "$ref": "#/$defs/SecretBytes32",
           "description": "The key this session's notification fingerprints are made under.\n\nThe attention store derives it for this session from its own secret, so a fingerprint is\nthe same for the same text whenever and wherever it is made: live, after either process\nrestarts, and from the session's journal once the session has closed. The session keeps no\nkey of its own for it."
@@ -3934,6 +4009,7 @@
       "required": [
         "request_id",
         "questions_after",
+        "approvals_after",
         "host_events_after",
         "max_records",
         "wait_ms",
@@ -38360,6 +38436,12 @@
     },
     "attention_acknowledge_result": {
       "$ref": "#/$defs/AttentionAcknowledgeResult"
+    },
+    "attention_approval_record": {
+      "$ref": "#/$defs/AttentionApprovalRecord"
+    },
+    "attention_approval_slice": {
+      "$ref": "#/$defs/AttentionApprovalSlice"
     },
     "attention_automation_subject": {
       "$ref": "#/$defs/AttentionAutomationSubject"

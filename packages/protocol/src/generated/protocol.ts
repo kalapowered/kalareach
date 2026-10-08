@@ -1996,6 +1996,8 @@ export interface KalaReachProtocol {
   attachment_viewport_result?: AttachmentViewportResult
   attention_acknowledge_params?: AttentionAcknowledgeParams
   attention_acknowledge_result?: AttentionAcknowledgeResult
+  attention_approval_record?: AttentionApprovalRecord
+  attention_approval_slice?: AttentionApprovalSlice
   attention_automation_subject?: AttentionAutomationSubject
   attention_barrier?: AttentionBarrier
   attention_barrier_acknowledged?: AttentionBarrierAcknowledged
@@ -5267,6 +5269,57 @@ export interface AttentionAcknowledgeResult {
   stale: AttentionKey[]
 }
 /**
+ * One transition of a pending resource the session's broker holds, as the attention store reads
+ * it.
+ *
+ * Only an approval the broker has interpreted under a granted decoder raises attention, and only
+ * by the transition that interpreted it; every other transition travels so that the numbering of
+ * the source has no hole, and the store moves its cursor past it. A record carries no text: what
+ * an approval asks is the application's to show, and the store keeps and serves none of it.
+ */
+export interface AttentionApprovalRecord {
+  /**
+   * Whether the resource is an approval, which it is once the broker has interpreted it under
+   * a granted decoder, and from this transition on or from an earlier one.
+   */
+  approval: boolean
+  /**
+   * Whether this transition is the one that interpreted the resource, which is what makes a
+   * pending approval an actionable one. A claim given back, an answer on its way and every
+   * later transition of the same approval are not.
+   */
+  interpreted: boolean
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+  /**
+   * One pending resource the broker arbitrates and resolves exactly once.
+   */
+  resource_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * The state the resource moved to.
+   */
+  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+}
+/**
+ * One source's part of a page: where the source stands, and its records after the cursor.
+ */
+export interface AttentionApprovalSlice {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  head: string
+  /**
+   * Its records after the cursor, oldest first, up to the head and the page's bounds.
+   */
+  records: AttentionApprovalRecord[]
+}
+/**
  * A worker's statement of its privacy fence to the control daemon, on its attention connection.
  *
  * It is the worker's whole state, not a change to it: whether a privacy transition is in progress
@@ -5329,7 +5382,7 @@ export interface AttentionGap {
   /**
    * Which source the range belongs to.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
   /**
    * The first sequence that is present again, or null when nothing after the range can be read.
    *
@@ -5479,7 +5532,7 @@ export interface AttentionItem {
    * It is what a gap is weighed against: a range that retention took from this source is a
    * range that could have resolved this item, and a range taken from another source is not.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
   /**
    * One line naming the subject, when this caller may be served it.
    *
@@ -5696,7 +5749,7 @@ export interface AttentionRecordRef {
   /**
    * Its source: the question ledger or the host events.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
 }
 /**
  * One record's text, as the session serves it now.
@@ -5709,7 +5762,7 @@ export interface AttentionRecordText {
   /**
    * Its source.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
   /**
    * Its text, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], or null when the session does not serve
    * it now or no longer holds the record.
@@ -5722,10 +5775,11 @@ export interface AttentionRecordText {
  * It is read in order: the moment first, then each source's head and its records after the
  * cursor, then the session's privacy state, which decides which records carry text. A source
  * whose last record in the page is its head, or which returned none with the cursor at or past
- * its head, is complete; a page complete for both sources holds every record the session
+ * its head, is complete; a page complete for every source holds every record the session
  * committed before `built_at_boot_ms`.
  */
 export interface AttentionSourcePage {
+  approvals: AttentionApprovalSlice1
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -5747,6 +5801,19 @@ export interface AttentionSourcePage {
    * The request this answers.
    */
   request_id: string
+}
+/**
+ * The transitions of the session's pending approvals.
+ */
+export interface AttentionApprovalSlice1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  head: string
+  /**
+   * Its records after the cursor, oldest first, up to the head and the page's bounds.
+   */
+  records: AttentionApprovalRecord[]
 }
 /**
  * The host events.
@@ -5783,6 +5850,10 @@ export interface AttentionQuestionSlice1 {
  * is committed.
  */
 export interface AttentionSourcesRequest {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  approvals_after: string
   /**
    * The key this session's notification fingerprints are made under.
    *

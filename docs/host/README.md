@@ -3993,19 +3993,27 @@ reading of the host time contract from the daemon.
 
 ### Where its events come from
 
-Two sources in each session's journal reach it: the question ledger, whose events carry the moment
-a request became pending, and the journal's host events, which are the terminal side effects that
-had no attachment to go to. For each live session the daemon opens a connection of its own to the
+Three sources in each session's journal reach it: the question ledger, whose events carry the moment
+a request became pending; the transitions the session's broker records for the requests an
+application makes of a person, which is how an approval an application raises through its channel
+comes to be pending; and the journal's host events, which are the terminal side effects that had no
+attachment to go to. An approval is raised by the transition that interpreted it, the one that
+gave it a meaning a person can answer, and ended by the state it reaches when it is answered,
+withdrawn, expired or left uncertain; a request nothing has interpreted, a claim taken and given
+back and every other transition move the cursor and raise nothing. None of the three carries text
+but the question ledger and the host events: what an approval asks is the application's to show.
+For each live session the daemon opens a connection of its own to the
 session's worker, verified and bound to the daemon's generation like every other, and declared for
 attention: it carries the daemon's requests for these records and nothing else, and a newer one
 replaces the one before it. The daemon keeps one request for records past the store's cursors
-waiting on it. The worker answers that request as soon as it commits a question transition, a host
-event or a privacy transition, and after at most thirty seconds otherwise, so a question asked in a
-session is in the inbox within moments rather than at some later pass.
+waiting on it. The worker answers that request as soon as it commits a question transition, a
+broker transition, a host event or a privacy transition, and after at most thirty seconds
+otherwise, so a question asked in a session is in the inbox within moments rather than at some
+later pass.
 
 A page is read in a fixed order: the moment, then each source's newest record and the records after
 the cursor up to it, then the session's privacy record. A page that reaches the newest record of
-both sources certifies everything the session committed before the moment it was read, and a timer
+every source certifies everything the session committed before the moment it was read, and a timer
 of that session is decided only up to its latest certified moment. That is what keeps an answer the
 store has not read yet from turning into a reminder. A page that stops short is followed by the
 next one at once. A link that stalls or fails certifies nothing more, and that session's timers

@@ -527,6 +527,9 @@ fn outcome_from(text: &str) -> Result<ClientRequestOutcome> {
 pub struct Ledger {
     connection: Connection,
     faults: Faults,
+    /// Woken after each transition event this ledger commits, for whoever follows the session's
+    /// approvals ([`Ledger::attach_changes`]).
+    changes: std::sync::OnceLock<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Where a failure of one ledger's store is reported, and how a busy store is read.
@@ -607,9 +610,29 @@ impl Ledger {
             None => Connection::open_in_memory(),
         }
         .map_err(|error| faults.of(error))?;
-        let ledger = Self { connection, faults };
+        let ledger = Self {
+            connection,
+            faults,
+            changes: std::sync::OnceLock::new(),
+        };
         ledger.prepare()?;
         Ok(ledger)
+    }
+
+    /// Wakes `changes` after every transition event this ledger commits from now on, once and for
+    /// good: a second attachment is ignored.
+    ///
+    /// The wake is after the commit, so whoever it wakes finds the event; one that subscribed to
+    /// the signal before it read has the commit in what it read or in what wakes it.
+    pub fn attach_changes(&self, changes: std::sync::Arc<tokio::sync::Notify>) {
+        let _ = self.changes.set(changes);
+    }
+
+    /// Wakes whoever follows this ledger's transitions.
+    fn announce(&self) {
+        if let Some(changes) = self.changes.get() {
+            changes.notify_waiters();
+        }
     }
 
     /// Turns one failure of this ledger's store into what it is, reported where it happened.
@@ -1115,7 +1138,9 @@ impl Ledger {
             )?;
         }
         write_event(&self.faults, &transaction, event)?;
-        transaction.commit().map_err(|error| self.fault(error))
+        transaction.commit().map_err(|error| self.fault(error))?;
+        self.announce();
+        Ok(())
     }
 
     /// Admits one decoded interpretation of a request this ledger already holds: consumes its
@@ -1205,6 +1230,7 @@ impl Ledger {
         }
         write_event(&self.faults, &transaction, event)?;
         transaction.commit().map_err(|error| faults.of(error))?;
+        self.announce();
         Ok(true)
     }
 
@@ -1297,7 +1323,9 @@ impl Ledger {
             )));
         }
         write_event(&self.faults, &transaction, event)?;
-        transaction.commit().map_err(|error| self.fault(error))
+        transaction.commit().map_err(|error| self.fault(error))?;
+        self.announce();
+        Ok(())
     }
 
     /// Returns the highest event sequence this ledger holds.
@@ -1512,7 +1540,9 @@ impl Ledger {
             )));
         }
         write_event(&self.faults, &transaction, event)?;
-        transaction.commit().map_err(|error| self.fault(error))
+        transaction.commit().map_err(|error| self.fault(error))?;
+        self.announce();
+        Ok(())
     }
 
     /// Commits an evidence gap and everything that happened inside it, in one transaction.

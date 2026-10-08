@@ -56,6 +56,8 @@ pub mod binder;
 pub mod bridge;
 pub mod capability;
 pub mod catalogue;
+#[cfg(feature = "testing")]
+pub mod channel_fixture;
 pub mod channels;
 pub mod commands;
 pub mod component;
@@ -984,6 +986,21 @@ impl Broker {
             #[cfg(feature = "testing")]
             channel_write_pause: Mutex::new(None),
         })
+    }
+
+    /// Wakes `changes` after every transition event this broker commits from now on, on both of
+    /// its connections to the ledger, so that whoever follows the session's approvals reads the
+    /// new transition without waiting for a timer.
+    pub fn attach_attention_changes(&self, changes: Arc<tokio::sync::Notify>) {
+        self.state().ledger.attach_changes(Arc::clone(&changes));
+        if let Some(recorder) = self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            recorder.attach_changes(changes);
+        }
     }
 
     /// Hands the broker the session's description facts, once: what it decides from then on is
