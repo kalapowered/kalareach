@@ -3463,6 +3463,7 @@ impl WorkerService {
         }
         let outcome = match method {
             Method::SessionRead => self.session_read(&request.params, caller),
+            Method::SessionScreenPreview => self.session_screen_preview(&request.params),
             Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
@@ -5377,6 +5378,26 @@ impl WorkerService {
                     .flatten()
                     .map(U64::new),
             ),
+        })
+    }
+
+    /// Serves `session.screen.preview`: the visible lines a viewer holding a history scope would
+    /// first see, which an issuer is shown before a share that includes them exists.
+    ///
+    /// The lines come from the buffer that is showing and nothing else, and they pass through the
+    /// same filter every other surface does, built from the scope the caller names: a scope that
+    /// does not include the live screen is given none. The cut is the preview's own, and the caller
+    /// that must show the whole screen refuses one that was cut.
+    fn session_screen_preview(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::SessionScreenPreviewParams = parse(params)?;
+        let session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        let filter = crate::history_filter::HistoryFilter::new(
+            crate::history_filter::ViewerScope::from_history(&params.history, true),
+        );
+        let lines = session.engine().visible_text();
+        encode(&kr_protocol::sharing::SessionScreenPreviewResult {
+            screen: Nullable(filter.preview_live_screen(lines.iter().map(String::as_str))),
         })
     }
 
