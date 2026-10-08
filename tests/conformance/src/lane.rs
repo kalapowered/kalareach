@@ -350,6 +350,8 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
         "actual",
         "external",
         "inline",
+        "nonisolated",
+        "package",
     ];
     const NOT_CLASSES: &[&str] = &["func", "var", "let", "init", "subscript", "deinit"];
     let swift = file.ends_with(".swift");
@@ -357,7 +359,8 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
     let mut package = String::new();
     let mut found = Vec::new();
     let mut depth = 0_i64;
-    for line in masked.lines() {
+    let originals: Vec<&str> = source.lines().collect();
+    for (number, line) in masked.lines().enumerate() {
         let at_top = depth == 0;
         for c in line.chars() {
             match c {
@@ -366,7 +369,10 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
                 _ => {}
             }
             if depth < 0 {
-                return Err("a brace closes what was never opened".to_owned());
+                return Err(format!(
+                    "a brace on line {} closes what was never opened",
+                    number + 1
+                ));
             }
         }
         let line = line.trim();
@@ -391,13 +397,35 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
                 continue;
             }
             if word == "class" {
-                declared = words.next().map(|name| {
-                    name.chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect::<String>()
-                });
+                declared = Some(
+                    words
+                        .next()
+                        .map(|name| {
+                            name.chars()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default(),
+                );
             }
             break;
+        }
+        // A class name in backticks is blanked with the other quoted identifiers, so what follows
+        // `class` is not its name: the file cannot be read for its classes.
+        let quoted = originals.get(number).is_some_and(|original| {
+            original
+                .match_indices("class")
+                .any(|(at, word)| original[at + word.len()..].trim_start().starts_with('`'))
+        });
+        if declared
+            .as_ref()
+            .is_some_and(|name| !NOT_CLASSES.contains(&name.as_str()))
+            && (quoted || declared.as_ref().is_some_and(String::is_empty))
+        {
+            return Err(format!(
+                "line {} declares a class whose name cannot be read",
+                number + 1
+            ));
         }
         if let Some(name) =
             declared.filter(|name| !name.is_empty() && !NOT_CLASSES.contains(&name.as_str()))
@@ -415,7 +443,7 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
     Ok(found)
 }
 
-/// The source with every comment, string and character literal blanked out, each newline kept: what
+/// The source with every comment, string, character literal and quoted identifier blanked out, each newline kept: what
 /// is left is code, so a brace or a keyword in it is one. Block comments nest (Java's do not, and no
 /// lane holds a Java file). A triple-quoted string spans lines; a Kotlin one has no escapes, and a
 /// Swift one does. A Swift raw string (`#"..."#`) ends at its own number of `#`, and an expression
@@ -458,7 +486,8 @@ impl Masker {
         }
     }
 
-    /// One piece of code: a character it keeps, or a comment, string or literal it blanks.
+    /// One piece of code: a character it keeps, or a comment, string, literal or quoted identifier
+    /// it blanks.
     fn code(&mut self) {
         if !self.blanked() {
             self.out.push(self.chars[self.at]);
@@ -466,7 +495,8 @@ impl Masker {
         }
     }
 
-    /// Blanks a comment, string or literal that starts here, and says whether there was one.
+    /// Blanks a comment, string, literal or quoted identifier that starts here, and says whether
+    /// there was one.
     fn blanked(&mut self) -> bool {
         let c = self.chars[self.at];
         if self.swift && c == '#' && self.raw_string() {
@@ -542,7 +572,8 @@ impl Masker {
     }
 
     /// The body of a string, after its opening quotes, up to and including the closing ones. A
-    /// raw string (`hashes` above 0) takes escapes and interpolations only after that many hashes.
+    /// Swift raw string (`hashes` above 0) takes escapes and interpolations only after that many
+    /// hashes.
     fn string(&mut self, triple: bool, hashes: usize) {
         let close: String = format!(
             "{}{}",
@@ -695,6 +726,34 @@ mod tests {
         assert_eq!(
             declared_classes("A.kt", kotlin).expect("balanced"),
             ["A", "B", "C"]
+        );
+    }
+
+    #[test]
+    fn a_class_whose_name_cannot_be_read_stops_the_reading() {
+        // A quoted name, followed by a word that would pass for one, and a name on the next line.
+        assert!(declared_classes("A.kt", "class `A` constructor() {}\n").is_err());
+        assert!(declared_classes("A.kt", "class `Login test` {\n}\n").is_err());
+        assert!(declared_classes("A.kt", "class\nA {\n}\n").is_err());
+        // The words around a class that are not a name stay as they were.
+        assert_eq!(
+            declared_classes("A.swift", "nonisolated final class B: XCTestCase {}\n")
+                .expect("balanced"),
+            ["B"]
+        );
+        assert_eq!(
+            declared_classes("A.swift", "final class C {\n    class func make() {}\n}\n")
+                .expect("balanced"),
+            ["C"]
+        );
+    }
+
+    #[test]
+    fn an_interpolation_in_a_kotlin_raw_string_is_an_expression_even_after_a_backslash() {
+        let source = "class A {\n    val s = \"\"\"\\${\"\"\"{\"\"\"}\"\"\"\n}\nclass B {}\n";
+        assert_eq!(
+            declared_classes("A.kt", source).expect("balanced"),
+            ["A", "B"]
         );
     }
 

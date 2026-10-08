@@ -306,8 +306,10 @@ The report reads the classes a file declares from the lines outside every brace,
 string that begin with modifiers, attributes and `class` (a Kotlin or Java class by its
 package-qualified name). A class nested in another belongs to the file of the class around it
 (a JVM reports it as `Outer$Inner`). The report stops before it runs anything when a file that
-names a row declares no class. A case the lane reports that no file of the lane declares, or that
-two declare, is a problem of the result. A file whose braces do not balance once comments and
+names a row declares no class, or declares one whose name it cannot read (a name in backticks). A
+case the lane reports that no file of the lane declares, or that two declare, is a problem of the
+result, and it fails every file of its lane: a result that cannot be given to one file cannot be
+given to any row, whichever way the reading of the sources went wrong. A file whose braces do not balance once comments and
 strings are blanked cannot be read for its classes, and the report stops before it runs anything.
 
 The two scripts run the tests unchanged and leave what the tool wrote at the path `--results` names:

@@ -716,46 +716,58 @@ pub fn assemble(
     }
 }
 
-/// What is wrong with the cases a lane's tool reported: each belongs to exactly one file of the
-/// lane, the file that declares its class. A case that no file declares, or that two declare,
-/// cannot be keyed to a row, so the result is not complete.
-fn unowned_lane_cases(options: &Options, map: &Map, executed: &[Executed]) -> Vec<String> {
-    let mut problems = Vec::new();
-    for (index, step) in executed.iter().enumerate() {
-        let (Some(cases), plan::Reading::Lane(tests)) = (&step.lane, &step.step.reading) else {
-            continue;
-        };
-        let files: Vec<&Vec<String>> = map
-            .lane_classes
-            .iter()
-            .filter(|(file, _)| {
-                options
-                    .lanes
-                    .iter()
-                    .any(|lane| lane.reads == Some(*tests) && plan::matches(lane.files, file))
-            })
-            .map(|(_, classes)| classes)
-            .collect();
-        let classes: BTreeSet<&str> = cases.iter().map(|case| case.class.as_str()).collect();
-        for class in classes {
+/// The classes a lane's tool reported that cannot be given to exactly one file of the lane, each
+/// with why: no file declares it, or more than one does.
+///
+/// The files' classes come from reading their sources, which can go wrong in ways no reading can
+/// rule out. What keeps a misreading from showing as a pass is that a case whose class cannot be
+/// given to one file fails every file of its lane (see `Resolver::lane`): the result then cannot be
+/// attributed to the rows, whichever way the reading went wrong.
+fn unattributed_classes(map: &Map, options: &Options, step: &Executed) -> Vec<String> {
+    let (Some(cases), plan::Reading::Lane(tests)) = (&step.lane, &step.step.reading) else {
+        return Vec::new();
+    };
+    let files: Vec<&Vec<String>> = map
+        .lane_classes
+        .iter()
+        .filter(|(file, _)| {
+            options
+                .lanes
+                .iter()
+                .any(|lane| lane.reads == Some(*tests) && plan::matches(lane.files, file))
+        })
+        .map(|(_, classes)| classes)
+        .collect();
+    let classes: BTreeSet<&str> = cases.iter().map(|case| case.class.as_str()).collect();
+    classes
+        .into_iter()
+        .filter_map(|class| {
             match files
                 .iter()
                 .filter(|declared| lane::declares(declared, class))
                 .count()
             {
-                1 => {}
-                0 => problems.push(format!(
-                    "step {}: the lane reported {class}, which no file of the lane declares",
-                    index + 1
-                )),
-                _ => problems.push(format!(
-                    "step {}: the lane reported {class}, which more than one file of the lane declares",
-                    index + 1
+                1 => None,
+                0 => Some(format!("{class}, which no file of the lane declares")),
+                _ => Some(format!(
+                    "{class}, which more than one file of the lane declares"
                 )),
             }
-        }
-    }
-    problems
+        })
+        .collect()
+}
+
+/// What is wrong with the cases the lanes' tools reported, as problems of the result.
+fn unowned_lane_cases(options: &Options, map: &Map, executed: &[Executed]) -> Vec<String> {
+    executed
+        .iter()
+        .enumerate()
+        .flat_map(|(index, step)| {
+            unattributed_classes(map, options, step)
+                .into_iter()
+                .map(move |why| format!("step {}: the lane reported {why}", index + 1))
+        })
+        .collect()
 }
 
 /// Resolves keyed places to outcomes against what ran.
@@ -896,6 +908,13 @@ impl<'a> Resolver<'a> {
                 step.error.clone().unwrap_or_default()
             ));
         };
+        let unattributed = unattributed_classes(self.map, self.options, step);
+        if !unattributed.is_empty() {
+            return failed(format!(
+                "the lane reported {}; a result that cannot be given to one file cannot be given to any row",
+                unattributed.join("; ")
+            ));
+        }
         let declared = self
             .map
             .lane_classes

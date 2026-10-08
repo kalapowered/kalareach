@@ -278,7 +278,7 @@ fn a_lane_whose_results_cannot_be_read_fails_all_its_files() {
 }
 
 #[test]
-fn a_failed_case_in_a_file_no_row_names_is_listed_and_a_case_no_file_declares_is_a_problem() {
+fn a_failed_case_in_a_file_no_row_names_is_listed_and_touches_no_row() {
     let map = map_of(&fixtures().join("lanes"));
     let mut cases = xcode("ios.json");
     cases
@@ -286,13 +286,6 @@ fn a_failed_case_in_a_file_no_row_names_is_listed_and_a_case_no_file_declares_is
         .find(|case| case.class == "LaunchPlanTests")
         .expect("a case of the unkeyed file")
         .outcome = LibtestOutcome::Failed;
-    cases.push(Case {
-        class: "ElsewhereTests".to_owned(),
-        name: "testElsewhere()".to_owned(),
-        selector: "KalaReachNativeTests/ElsewhereTests/testElsewhere".to_owned(),
-        outcome: LibtestOutcome::Passed,
-        note: None,
-    });
     let document = assemble(
         Platform::MacOs,
         &map,
@@ -301,10 +294,56 @@ fn a_failed_case_in_a_file_no_row_names_is_listed_and_a_case_no_file_declares_is
     assert!(!document.passed());
     assert_eq!(document.failures_outside_identifiers.len(), 1);
     assert!(document.failures_outside_identifiers[0].contains("LaunchPlanTests"));
-    assert_eq!(document.problems.len(), 1, "{:?}", document.problems);
-    assert!(document.problems[0].contains("ElsewhereTests"));
-    // The rows the file with the failure does not name are untouched.
+    assert!(document.problems.is_empty(), "{:?}", document.problems);
     assert_eq!(counts(&document, "KR-REQ-15.34").0, Verdict::Passed);
+}
+
+#[test]
+fn a_case_no_file_can_be_given_to_fails_every_row_of_its_lane() {
+    // Whichever way the reading of the sources went wrong, a result that cannot be given to one
+    // file cannot be given to any row: here a class no file declares, and a class the reading
+    // missed in a file that names the rows.
+    let map = map_of(&fixtures().join("lanes"));
+    let elsewhere = Case {
+        class: "ElsewhereTests".to_owned(),
+        name: "testElsewhere()".to_owned(),
+        selector: "KalaReachNativeTests/ElsewhereTests/testElsewhere".to_owned(),
+        outcome: LibtestOutcome::Passed,
+        note: None,
+    };
+    let mut cases = xcode("ios.json");
+    cases.push(elsewhere);
+    let mut missed = map_of(&fixtures().join("lanes"));
+    let swift = "apps/companion/native/ios/Tests/VoiceCaptureStateTests.swift";
+    missed
+        .lane_classes
+        .get_mut(swift)
+        .expect("the file's classes")
+        .retain(|class| class != "VoiceRecorderReaderTests");
+    for (map, cases, why) in [
+        (&map, cases, "ElsewhereTests"),
+        (&missed, xcode("ios.json"), "VoiceRecorderReaderTests"),
+    ] {
+        let document = assemble(
+            Platform::MacOs,
+            map,
+            &[executed(step(Platform::MacOs), 0, Ok(cases))],
+        );
+        assert!(!document.passed());
+        assert_eq!(document.problems.len(), 1, "{:?}", document.problems);
+        assert!(document.problems[0].contains(why));
+        for row in ["KR-REQ-15.34", "KR-REQ-15.35", "KR-REQ-15.36", "KR-ACC-014"] {
+            assert_eq!(document.identifiers[row].verdict, Verdict::Failed, "{row}");
+        }
+        assert!(
+            document.identifiers["KR-REQ-15.34"].tests[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(why)),
+            "{:?}",
+            document.identifiers["KR-REQ-15.34"].tests
+        );
+    }
 }
 
 #[test]
@@ -613,6 +652,34 @@ fn a_phone_test_file_whose_braces_do_not_balance_is_one_problem_that_names_it() 
         "{:?}",
         map.problems
     );
+}
+
+#[test]
+fn a_phone_test_file_that_names_a_row_and_declares_no_class_is_a_problem() {
+    let root = tempfile::tempdir().expect("a directory");
+    let kotlin = "apps/companion/native/android/src/test/kotlin/to/kala/reach/companion/mobile/VoiceCaptureGateTest.kt";
+    let target = root.path().join(kotlin);
+    std::fs::create_dir_all(target.parent().expect("a directory")).expect("directories");
+    let text = std::fs::read_to_string(fixtures().join("lanes").join(kotlin)).expect("the fixture");
+    let text = text.replace(
+        "class VoiceCaptureGateTest {",
+        "object VoiceCaptureGateTest {",
+    );
+    std::fs::write(&target, text).expect("a file");
+    let map = map_of(root.path());
+    assert!(
+        map.keys
+            .values()
+            .flat_map(|places| places.keys())
+            .any(|place| matches!(place, Place::Lane { file, .. } if file == kotlin))
+    );
+    let own: Vec<&String> = map
+        .problems
+        .iter()
+        .filter(|problem| problem.starts_with(kotlin))
+        .collect();
+    assert_eq!(own.len(), 1, "{:?}", map.problems);
+    assert!(own[0].contains("declares no class"), "{:?}", map.problems);
 }
 
 #[test]
