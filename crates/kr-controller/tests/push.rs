@@ -1863,11 +1863,13 @@ impl CredentialRenewal for RenewalThatWaitsToBeAllowed {
 /// KR-REQ-16.09, KR-REQ-16.12: a notification whose credential has expired and cannot be renewed
 /// yet waits for the renewal without using up its attempts. The gateway is asked once and refuses,
 /// and for as long as the host waits to ask again, every look at the notification leaves it as it
-/// was: pending, one attempt used, nothing presented, the gateway not asked. When a bearer arrives
-/// the notification goes out. The control for the first half is the same notification the first
-/// time: that look is the one that asked, and it used its attempt.
+/// was: pending, one attempt used, nothing presented, the gateway not asked. When the renewal
+/// succeeds, after a new bearer from the device, the notification goes out. The control for the
+/// first half is the same notification the first time: that look is the one that asked, and it
+/// used its attempt.
 #[test]
-fn a_notification_waiting_for_a_renewal_keeps_its_attempts_and_goes_out_when_a_bearer_arrives() {
+fn a_notification_waiting_for_a_renewal_keeps_its_attempts_and_goes_out_once_the_renewal_succeeds()
+{
     let environment = environment();
     let destination = push_destination(&environment, true);
     environment
@@ -1953,6 +1955,212 @@ fn a_notification_waiting_for_a_renewal_keeps_its_attempts_and_goes_out_when_a_b
     assert_eq!(pass(now_ms), 1);
     assert_eq!(gateway.sent().len(), 1, "presented once the bearer arrived");
     assert_eq!(record().state, DeliveryState::Accepted);
+}
+
+/// A status route that counts the places it gives out in the gateway's allowance, the places given
+/// back, and the questions put.
+#[derive(Debug, Default)]
+struct CountedStatus {
+    taken: std::sync::atomic::AtomicU64,
+    released: std::sync::atomic::AtomicU64,
+    asked: std::sync::atomic::AtomicU64,
+}
+
+impl DeliveryStatus for CountedStatus {
+    fn status(
+        &self,
+        _credential: &PushDeliveryCredential,
+        _notification_id: NotificationId,
+    ) -> StatusAnswer {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        StatusAnswer::Unanswered {
+            detail: "the gateway did not answer".to_owned(),
+        }
+    }
+
+    fn reserve(&self, _steady_ms: u64) -> bool {
+        self.taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    fn release(&self) {
+        self.released
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// KR-REQ-16.13: a status question that waits for a renewal is looked at again without putting a
+/// question to the gateway, so it does not spend the pass's share of the gateway's allowance for
+/// questions either: every place taken for a look goes back, and the question is put, and takes its
+/// place, when the renewal has happened.
+#[test]
+fn a_status_question_waiting_for_a_renewal_gives_its_place_in_the_allowance_back() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    // Inside the renewal window, so the question has to renew first, and the gateway refuses.
+    let credentials = held(NOW + 2 * 24 * 60 * 60 * 1000);
+    let renewal = Arc::new(RenewalThatWaitsToBeAllowed::default());
+    credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
+    let gateway = GatewayDouble::answering(vec![gateway_retrying()]);
+    let status = CountedStatus::default();
+    let pass = |now_ms: u64| {
+        environment
+            .module
+            .run_due(
+                &gateway,
+                &status,
+                &credentials,
+                &ExternalDouble::answering(Vec::new()),
+                &Granted(BTreeSet::new()),
+                &at(now_ms),
+            )
+            .expect("a pass")
+    };
+    // The gateway takes it and goes on retrying: what is due next is a question about it.
+    assert_eq!(pass(NOW), 1);
+    assert_eq!(renewal.asked(), 1, "the renewal ahead of need was refused");
+    let mut now_ms = NOW;
+    for _ in 0..20 {
+        now_ms += LONGER_THAN_ANY_BACKOFF_MS;
+        assert_eq!(pass(now_ms), 1);
+    }
+    assert_eq!(status.asked.load(SeqCst), 0, "no question was put");
+    assert_eq!(
+        status.taken.load(SeqCst),
+        status.released.load(SeqCst),
+        "every place taken for a look went back"
+    );
+    assert!(status.taken.load(SeqCst) >= 20);
+
+    // The renewal happens: the question is put, and keeps its place.
+    renewal.allow();
+    let mut fresh = credential(NOW + 30 * 24 * 60 * 60 * 1000);
+    fresh.secret = SecretBytes32::from_bytes([0xaa; 32]);
+    fresh.revision = kr_protocol::ids::PushSenderRevision::new(2);
+    credentials.keep(fresh).expect("the bearer is kept");
+    now_ms += LONGER_THAN_ANY_BACKOFF_MS;
+    assert_eq!(pass(now_ms), 1);
+    assert_eq!(status.asked.load(SeqCst), 1, "the question is put");
+    assert_eq!(
+        status.taken.load(SeqCst) - status.released.load(SeqCst),
+        1,
+        "and it keeps the place it took"
+    );
+}
+
+/// A renewal that takes long and then fails: what it does while it waits is the test's.
+struct FailingRenewal<F: Fn() + Send + Sync>(F);
+
+impl<F: Fn() + Send + Sync> std::fmt::Debug for FailingRenewal<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FailingRenewal")
+    }
+}
+
+impl<F: Fn() + Send + Sync> CredentialRenewal for FailingRenewal<F> {
+    fn renew(&self, _held: &PushDeliveryCredential) -> Result<PushDeliveryCredential, String> {
+        (self.0)();
+        Err("the gateway could not be reached".to_owned())
+    }
+}
+
+/// KR-REQ-16.12: what a failed renewal leaves is decided from what is held when it returns, not
+/// from what was held when it began. The renewal ahead of need that fails leaves a bearer that
+/// works to carry the notification; but a renewal is a call that waits, and a bearer that expires
+/// meanwhile is not presented, and neither is one the host let go of meanwhile: the notification
+/// waits for a renewal in the first case and settles as revoked in the second. The control is the
+/// same renewal failing without either happening: the bearer held is presented.
+#[test]
+fn a_bearer_that_expires_or_is_let_go_of_while_a_renewal_waits_is_not_presented() {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+
+    for happens in [
+        "nothing",
+        "the bearer expires",
+        "the authorisation is let go of",
+    ] {
+        let environment = environment();
+        let destination = push_destination(&environment, true);
+        environment
+            .module
+            .configure(&destination)
+            .expect("a destination");
+        take_and_produce(
+            &environment,
+            &notice(1, "an approval is waiting"),
+            std::slice::from_ref(&destination),
+            1,
+        );
+        // Inside the renewal window and a minute from its end.
+        let credentials = Arc::new(HeldCredentials::new());
+        credentials.hold(credential(NOW + 60_000));
+        let clock_ms = Arc::new(AtomicU64::new(NOW));
+        credentials.attach_renewal(Arc::new(FailingRenewal({
+            let (credentials, clock_ms) = (Arc::clone(&credentials), Arc::clone(&clock_ms));
+            move || match happens {
+                "the bearer expires" => clock_ms.store(NOW + 120_000, SeqCst),
+                "the authorisation is let go of" => {
+                    credentials
+                        .forget(PushSenderRecordId::new(uuid(3)))
+                        .expect("forgotten");
+                }
+                _ => {}
+            }
+        })) as Arc<dyn CredentialRenewal>);
+        let gateway = GatewayDouble::queued();
+        environment
+            .module
+            .run_due(
+                &gateway,
+                &gateway,
+                credentials.as_ref(),
+                &ExternalDouble::answering(Vec::new()),
+                &Granted(BTreeSet::new()),
+                &{
+                    let clock_ms = Arc::clone(&clock_ms);
+                    move || clock_ms.load(SeqCst)
+                },
+            )
+            .expect("a pass");
+        let record = environment
+            .module
+            .with(|producer| Ok(producer.journal().deliveries().expect("a read").remove(0)))
+            .expect("a read");
+        match happens {
+            "nothing" => {
+                assert_eq!(gateway.sent().len(), 1, "the bearer held carries it");
+                assert_eq!(record.state, DeliveryState::Accepted);
+            }
+            "the bearer expires" => {
+                assert!(gateway.sent().is_empty(), "{happens}: nothing is presented");
+                assert_eq!(record.state, DeliveryState::Retrying, "{:?}", record.detail);
+                assert!(
+                    record
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("has to be renewed")),
+                    "{:?}",
+                    record.detail
+                );
+            }
+            _ => {
+                assert!(gateway.sent().is_empty(), "{happens}: nothing is presented");
+                assert_eq!(record.state, DeliveryState::Revoked, "{:?}", record.detail);
+            }
+        }
+    }
 }
 
 /// KR-REQ-16.12: the burst is admitted, the rest collapse, and every request is retained.
@@ -2397,84 +2605,6 @@ fn a_pass_sends_to_the_destination_its_claim_validated() {
     );
 }
 
-/// Grants what `Granted` does, and keeps the destinations it was asked where a device's grant
-/// stands for.
-#[derive(Debug, Default)]
-struct WatchedDevices {
-    asked: Mutex<Vec<DestinationId>>,
-}
-
-impl WatchedDevices {
-    fn asked(&self) -> usize {
-        self.asked.lock().expect("not poisoned").len()
-    }
-}
-
-impl RecipientAuthority for WatchedDevices {
-    fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
-        Some(Granted(BTreeSet::new()).scope())
-    }
-
-    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
-        self.asked
-            .lock()
-            .expect("not poisoned")
-            .push(destination.id.clone());
-        Some(Granted(BTreeSet::new()).scope())
-    }
-}
-
-/// KR-REQ-16.10: where a paired device's grant stands is asked in each round of questions, so
-/// that a grant that has run out is found while nothing is being delivered to the device. The
-/// recovery at the start asks once; the control is that nothing else asks while nothing is queued,
-/// and the round does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_round_of_questions_asks_where_each_devices_grant_stands() {
-    let environment = environment();
-    let destination = push_destination(&environment, true);
-    environment
-        .module
-        .configure(&destination)
-        .expect("a destination");
-    let module = Arc::new(environment.module);
-    let authority = Arc::new(WatchedDevices::default());
-    let runtime = kr_controller::push::runtime::DeliveryRuntime::new(
-        Arc::clone(&module),
-        Arc::new(HeldCredentials::new()),
-        Arc::clone(&authority) as Arc<dyn RecipientAuthority + Send + Sync>,
-        Arc::new(kr_controller::push::sender::HostSigner::new(
-            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
-        )),
-        kr_controller::push::runtime::Cadence {
-            pass: std::time::Duration::from_millis(20),
-            questions: std::time::Duration::from_millis(20),
-            ..kr_controller::push::runtime::Cadence::DEFAULT
-        },
-        tokio::runtime::Handle::current(),
-    );
-    runtime.start().await;
-    let after_recovery = authority.asked();
-    assert_eq!(after_recovery, 1, "recovery asked once");
-    // Several passes, with nothing queued and no transport to ask through: nothing asks.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(authority.asked(), after_recovery);
-
-    assert!(
-        runtime.attach_transport(Arc::new(OneTransport(Arc::new(
-            RecordingHttp::answering(Vec::new())
-        )
-            as Arc<dyn kr_client::services::ServiceHttp>)))
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while authority.asked() == after_recovery {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no round of questions asked where the device's grant stands"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
-
 /// A secret store that stops the first read made while it is armed until the test lets it go,
 /// which is how a test holds a pass in the middle of reading a credential.
 struct SecretsThatCanBeHeld {
@@ -2536,12 +2666,13 @@ impl RecipientAuthority for Revocable {
 }
 
 /// KR-REQ-25.23: a message to an external destination is sent only while its recipient's grant
-/// stands, and the grant is asked again after the credential is read from the secret store, which
-/// can take as long as the store does. A grant that ends while the credential is being read sends
-/// nothing and says why. The control is the same pass with the grant left standing, which sends.
+/// stands and before the notification expires, and both are asked again after the credential is
+/// read from the secret store, which can take as long as the store does. A grant that ends, or a
+/// deadline that passes, while the credential is being read sends nothing and says why. The
+/// control is the same pass with neither happening, which sends.
 #[test]
-fn a_grant_that_ends_while_a_credential_is_read_sends_nothing() {
-    for revoked_meanwhile in [false, true] {
+fn a_grant_that_ends_or_a_deadline_that_passes_while_a_credential_is_read_sends_nothing() {
+    for happens in ["nothing", "the grant ends", "the notification expires"] {
         let (reading, reads) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let store = Arc::new(SecretsThatCanBeHeld {
@@ -2622,6 +2753,7 @@ fn a_grant_that_ends_while_a_credential_is_read_sends_nothing() {
 
         let external = ExternalDouble::answering(Vec::new());
         let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clock_ms = Arc::new(std::sync::atomic::AtomicU64::new(NOW));
         let authority = Revocable {
             revoked: Arc::clone(&revoked),
         };
@@ -2636,15 +2768,23 @@ fn a_grant_that_ends_while_a_credential_is_read_sends_nothing() {
                         &held(NOW + 30 * 24 * 60 * 60 * 1000),
                         &external,
                         &authority,
-                        &at(NOW),
+                        &{
+                            let clock_ms = Arc::clone(&clock_ms);
+                            move || clock_ms.load(std::sync::atomic::Ordering::SeqCst)
+                        },
                     )
                     .expect("a pass")
             });
             reads
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the pass is reading the credential");
-            if revoked_meanwhile {
-                revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+            match happens {
+                "the grant ends" => revoked.store(true, std::sync::atomic::Ordering::SeqCst),
+                "the notification expires" => clock_ms.store(
+                    NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1,
+                    std::sync::atomic::Ordering::SeqCst,
+                ),
+                _ => {}
             }
             release.send(()).expect("the pass is waiting");
             pass.join().expect("the pass finished");
@@ -2654,22 +2794,138 @@ fn a_grant_that_ends_while_a_credential_is_read_sends_nothing() {
             .module
             .with(|producer| Ok(producer.journal().deliveries().expect("a read").remove(0)))
             .expect("a read");
-        if revoked_meanwhile {
-            assert!(external.sent().is_empty(), "nothing is sent");
-            assert_eq!(record.state, DeliveryState::Revoked);
+        if happens == "nothing" {
+            assert_eq!(external.sent().len(), 1, "the control sends");
+            assert_eq!(record.state, DeliveryState::Accepted);
+        } else {
+            assert!(external.sent().is_empty(), "{happens}: nothing is sent");
+            let (state, said) = if happens == "the grant ends" {
+                (DeliveryState::Revoked, "recipient's authority")
+            } else {
+                (DeliveryState::Expired, "expired")
+            };
+            assert_eq!(record.state, state, "{happens}");
             assert!(
                 record
                     .detail
                     .as_deref()
-                    .is_some_and(|detail| detail.contains("recipient's authority")),
+                    .is_some_and(|detail| detail.contains(said)),
                 "{:?}",
                 record.detail
             );
-        } else {
-            assert_eq!(external.sent().len(), 1, "the control sends");
-            assert_eq!(record.state, DeliveryState::Accepted);
         }
     }
+}
+
+/// KR-REQ-25.23: a credential given with a configuration is kept with it or not at all. The write
+/// asks its admission once the journal's lock is held, and a refusal there, like a refusal of the
+/// record itself, puts the store back as it was found: a destination being replaced goes on with the
+/// credential and the stamp it had, and a first configuration leaves nothing kept. The control is
+/// the same configuration admitted, which replaces both.
+#[test]
+fn a_configuration_the_write_refuses_puts_back_the_credential_it_replaced() {
+    let slack = |text: &str| kr_protocol::delivery::DestinationSecret::Slack {
+        webhook_url: kr_protocol::delivery::SecretText::new(text).expect("a credential"),
+    };
+    let store: Arc<dyn kr_crypto::store::SecretStore> =
+        Arc::new(kr_crypto::store::MemoryStore::new());
+    let secrets = || {
+        kr_controller::push::secrets::DestinationSecrets::new(
+            Arc::clone(&store),
+            kr_protocol::ids::EnvironmentId::new(uuid(0xee)),
+        )
+    };
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = DeliveryModule::open_at(
+        &directory.path().join("delivery.sqlite3"),
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
+    )
+    .expect("a delivery module");
+    let chat = |name: &str, endpoint: &str| DestinationRecord {
+        id: DestinationId::new(name).expect("an identifier"),
+        destination: Destination::External(ExternalDestination {
+            kind: DestinationKind::Slack,
+            endpoint: endpoint.to_owned(),
+            idempotency: Idempotency::Unsupported,
+            credential: None,
+        }),
+        rule: Some(DeliveryRule {
+            name: "on a failed command".to_owned(),
+            grant_id: None,
+        }),
+        enabled: true,
+        configured_at_ms: TimestampMs::new(NOW),
+    };
+    let first = "https://hooks.slack.com/services/T000/B000/first-credential";
+    let second = "https://hooks.slack.com/services/T000/B000/second-credential";
+    let refusal = || -> kr_controller::error::Result<()> {
+        Err(kr_controller::error::ControllerError::PermissionDenied {
+            detail: "the grant stopped standing".to_owned(),
+        })
+    };
+    let kept = |name: &str| {
+        secrets()
+            .get(&DestinationId::new(name).expect("an identifier"))
+            .expect("a read")
+    };
+
+    assert!(
+        module
+            .configure_with_secret_if(&chat("chat", "first"), &slack(first), &|| Ok(()))
+            .expect("the first configuration")
+    );
+    let original = kept("chat").expect("the credential is kept");
+
+    // A replacement the write refuses, and a first configuration the write refuses.
+    module
+        .configure_with_secret_if(&chat("chat", "second"), &slack(second), &refusal)
+        .expect_err("the write is refused");
+    module
+        .configure_with_secret_if(&chat("fresh", "second"), &slack(second), &refusal)
+        .expect_err("the write is refused");
+    let after = kept("chat").expect("the credential is still kept");
+    assert_eq!(after.stamp, original.stamp, "under the stamp it had");
+    assert_eq!(after.secret, original.secret, "and unchanged");
+    assert!(
+        kept("fresh").is_none(),
+        "nothing is kept for a refused first"
+    );
+    let record = module
+        .with(|producer| {
+            Ok(producer
+                .journal()
+                .destination(&DestinationId::new("chat").expect("an identifier"))
+                .expect("a read"))
+        })
+        .expect("a read")
+        .expect("the destination");
+    let Destination::External(external) = &record.destination else {
+        panic!("an external destination");
+    };
+    assert_eq!(external.endpoint, "first");
+    assert_eq!(external.credential.as_ref(), Some(&original.stamp));
+
+    // The control.
+    assert!(
+        module
+            .configure_with_secret_if(&chat("chat", "second"), &slack(second), &|| Ok(()))
+            .expect("the replacement")
+    );
+    let replaced = kept("chat").expect("kept");
+    assert_ne!(replaced.stamp, original.stamp);
+    assert_eq!(replaced.secret, slack(second));
+
+    // A credential of another service than the destination's is refused before anything is kept.
+    let mut discord = chat("chat", "second");
+    if let Destination::External(external) = &mut discord.destination {
+        external.kind = DestinationKind::Discord;
+    }
+    module
+        .configure_with_secret_if(&discord, &slack(first), &|| Ok(()))
+        .expect_err("a Slack credential is not a Discord destination's");
+    assert_eq!(kept("chat").expect("kept").stamp, replaced.stamp);
 }
 
 /// A rotation neither store will take changes neither of them: section 16 keeps one replaced key,

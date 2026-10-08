@@ -5286,6 +5286,111 @@ mod tests {
         assert_eq!(journal.due(3_000, 10).expect("a read").len(), 1);
     }
 
+    /// An attempt given back is the attempt not made: the notification goes back to the state it
+    /// was in before the claim, with the count it had, no row for the number that was claimed, and
+    /// its next turn where the transition puts it. The next claim is the same attempt again. A
+    /// transition that settles the record, as an expiry does, keeps the attempt it was claimed as.
+    #[test]
+    fn an_attempt_given_back_is_not_counted_and_the_next_claim_is_the_same_attempt() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let id = NotificationId::new(uuid(9));
+        let give_back = |journal: &mut DeliveryJournal,
+                         attempt: u64,
+                         state: DeliveryState,
+                         due: Option<u64>,
+                         next: crate::push::NextAction| {
+            journal
+                .record_unattempted(&Transition {
+                    notification_id: id,
+                    attempt,
+                    state,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_000)),
+                    next_attempt_at_ms: due.map(TimestampMs::new),
+                    next,
+                    detail: Some("the credential has to be renewed first".to_owned()),
+                    suppression: None,
+                    left_this_host: false,
+                    reported_by_destination: false,
+                })
+                .expect("a transition")
+        };
+
+        let claimed = claim(&mut journal, 9, 2_000);
+        assert_eq!(claimed.attempt, 1);
+        assert!(give_back(
+            &mut journal,
+            claimed.attempt,
+            DeliveryState::Retrying,
+            Some(5_000),
+            crate::push::NextAction::RenewThenSend,
+        ));
+        let record = journal.delivery(id).expect("a read").expect("the record");
+        assert_eq!(record.state, DeliveryState::Retrying);
+        assert_eq!(record.attempts, 0, "the attempt was given back");
+        assert!(journal.attempts(id).expect("attempts").is_empty());
+        assert!(journal.due(4_999, 10).expect("a read").is_empty());
+        let due = journal.due(5_000, 10).expect("a read");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].attempts, 0);
+        assert_eq!(due[0].next, crate::push::NextAction::RenewThenSend);
+        assert!(
+            !due[0].content.is_empty(),
+            "the request is kept for the send"
+        );
+
+        // The next claim is the first attempt again, and spending it counts.
+        let again = claim(&mut journal, 9, 5_000);
+        assert_eq!(again.attempt, 1);
+        assert!(
+            journal
+                .record_attempt(&Transition {
+                    notification_id: id,
+                    attempt: again.attempt,
+                    state: DeliveryState::Retrying,
+                    started_at_ms: TimestampMs::new(5_000),
+                    settled_at_ms: Some(TimestampMs::new(5_010)),
+                    next_attempt_at_ms: Some(TimestampMs::new(9_000)),
+                    next: crate::push::NextAction::Send,
+                    detail: Some("the provider was busy".to_owned()),
+                    suppression: None,
+                    left_this_host: false,
+                    reported_by_destination: false,
+                })
+                .expect("a transition")
+        );
+        assert_eq!(
+            journal
+                .delivery(id)
+                .expect("a read")
+                .expect("the record")
+                .attempts,
+            1
+        );
+
+        // And a look that finds the notification past its time settles it, keeping the attempt it
+        // was claimed as.
+        let last = claim(&mut journal, 9, 9_000);
+        assert_eq!(last.attempt, 2);
+        assert!(give_back(
+            &mut journal,
+            last.attempt,
+            DeliveryState::Expired,
+            None,
+            crate::push::NextAction::None,
+        ));
+        let record = journal.delivery(id).expect("a read").expect("the record");
+        assert_eq!(record.state, DeliveryState::Expired);
+        assert_eq!(record.attempts, 2);
+        assert!(journal.due(u64::MAX, 10).expect("a read").is_empty());
+    }
+
     /// An attempt given back is a notification put back to work, which privacy mode's boundary
     /// forbids as it does for an answer: the notification is cancelled, keeps the attempt it was
     /// claimed as, and leaves no outbox row.

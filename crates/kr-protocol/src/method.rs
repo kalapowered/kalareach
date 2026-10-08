@@ -415,7 +415,7 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Remove a notification destination, and the credential kept for it. What was queued \
           for it and not sent is taken back, and the answer says how much, and how many attempts \
-          were on the wire and can still arrive. Removing a paired device's destination ends its \
+          were under way and can still arrive. Removing a paired device's destination ends its \
           delivery and owes the gateway a revocation of the device's authorisation, as unpairing \
           does, without unpairing the device.";
 
@@ -423,9 +423,9 @@ methods! {
     effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
-    doc: "List the notification destinations in service: a paired device's and the ones the \
-          owner configured, with where each sends and the grant it is told under. It never \
-          carries a credential.";
+    doc: "List the notification destinations that have a rule: a paired device's and the ones \
+          the owner configured, each with where it sends, the grant it is told under and whether \
+          it is in force. A removed destination is not listed. It never carries a credential.";
 
     DeliveryDestinationSecretSet = "delivery.destination.secret.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],

@@ -9579,6 +9579,17 @@
         "rule_name": {
           "description": "What the owner calls the rule that sends to this destination. A label: it selects nothing.",
           "type": "string"
+        },
+        "secret": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DestinationSecret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The credential the destination sends with, for every service but a webhook, or null to\nleave the one already kept under the identifier. When it is given, it is kept and the\ndestination is configured together: a configuration the host refuses leaves the credential\nkept before it as it was. It has to be the credential of the destination's service."
         }
       },
       "required": [
@@ -9587,7 +9598,8 @@
         "endpoint",
         "idempotency_header",
         "rule_name",
-        "grant_id"
+        "grant_id",
+        "secret"
       ],
       "type": "object"
     },
@@ -9662,7 +9674,7 @@
     },
     "DeliveryDestinationListResult": {
       "additionalProperties": false,
-      "description": "The result of `delivery.destination.list`: the destinations that have a rule, by identifier.\nOne that was removed is not listed.",
+      "description": "The result of `delivery.destination.list`: the destinations that have a rule, by identifier,\nin force or not. One that was removed is not listed.",
       "properties": {
         "destinations": {
           "description": "The destinations, ordered by identifier.",
@@ -9701,7 +9713,7 @@
         },
         "fenced": {
           "$ref": "#/$defs/U64",
-          "description": "How many attempts were on the wire when the destination was removed. Each finishes and\nreports its answer, and the destination may still receive that message."
+          "description": "How many attempts were under way when the destination was removed. Each finishes and\nreports its answer, and the destination may still receive the message of one that had\nreached it."
         },
         "found": {
           "description": "Whether a destination was configured under it.",
@@ -9775,7 +9787,7 @@
     },
     "DeliveryDestinationSummary": {
       "additionalProperties": false,
-      "description": "One destination this host delivers to, as `delivery.destination.list` says it. It never carries\na credential, and says only whether one is kept.",
+      "description": "One destination this host delivers to, as `delivery.destination.list` says it. It never carries\na credential.",
       "properties": {
         "configured_at_ms": {
           "$ref": "#/$defs/TimestampMs",
@@ -9819,7 +9831,7 @@
           "description": "The header a webhook deduplicates by. Null when it deduplicates by nothing, and for every\nkind but a webhook."
         },
         "in_force": {
-          "description": "Whether the destination is in service. A destination the gateway rejected the token of is\nnot, and stays listed until it is removed or its device registers again.",
+          "description": "Whether the destination is in force. A destination the gateway rejected the token of is\nnot, and stays listed until it is removed or its device registers again.",
           "type": "boolean"
         },
         "kind": {
@@ -19059,12 +19071,12 @@
         },
         {
           "const": "delivery.destination.remove",
-          "description": "Remove a notification destination, and the credential kept for it. What was queued for it and not sent is taken back, and the answer says how much, and how many attempts were on the wire and can still arrive. Removing a paired device's destination ends its delivery and owes the gateway a revocation of the device's authorisation, as unpairing does, without unpairing the device.",
+          "description": "Remove a notification destination, and the credential kept for it. What was queued for it and not sent is taken back, and the answer says how much, and how many attempts were under way and can still arrive. Removing a paired device's destination ends its delivery and owes the gateway a revocation of the device's authorisation, as unpairing does, without unpairing the device.",
           "type": "string"
         },
         {
           "const": "delivery.destination.list",
-          "description": "List the notification destinations in service: a paired device's and the ones the owner configured, with where each sends and the grant it is told under. It never carries a credential.",
+          "description": "List the notification destinations that have a rule: a paired device's and the ones the owner configured, each with where it sends, the grant it is told under and whether it is in force. A removed destination is not listed. It never carries a credential.",
           "type": "string"
         },
         {

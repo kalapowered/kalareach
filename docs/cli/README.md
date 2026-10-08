@@ -1679,8 +1679,10 @@ device's identifier is refused.
 Every kind but a webhook sends with a credential, and `--credential-file` names the file that holds
 it: a Slack or Discord webhook address, a Telegram bot token, or for email a JSON document with
 `server`, `port`, `security` (`implicit_tls` or `starttls`), `username`, `password` and
-`from_address`. The command reads the file once and hands it to the daemon, which keeps it in its
-secret store. It is never an argument, because the process list and the shell's history would keep
+`from_address`. The command reads the file once and hands it to the daemon in the same request as
+the configuration, and the daemon keeps it in its secret store together with the destination: a
+configuration the daemon refuses leaves the credential kept before it as it was. It is never an
+argument, because the process list and the shell's history would keep
 it, and the command never prints it: not in its text, in `--json`, in `list`, or in an error. A file
 that holds no credential of its kind is refused with its name and what it should hold, and nothing is
 configured. Every message to an external destination says that whoever can read the destination can
@@ -1688,14 +1690,15 @@ read the message, and `configure` says it back to you.
 
 `remove` takes the destination away with the credential kept for it, and takes back what was queued
 for it and not sent. It says how many notifications that was, how many had been sent once so that
-what became of them cannot be settled, and how many attempts were on the wire, which finish and may
+what became of them cannot be settled, and how many attempts were under way, which finish and may
 still arrive. A paired device's destination is named by the device's identifier in `list`, and
 removing it ends delivery to the device without unpairing it. Removing an identifier nothing is
 configured under says so and exits with 0.
 
-`list` shows each destination in service: its identifier, its kind, where it sends, the grant it is
-told under, and whether it is in force. A destination whose push token the gateway rejected is out of
-service until its device registers again or you remove it. `--json` prints
+`list` shows each destination this host sends to: its identifier, its kind, where it sends, the
+grant it is told under, and whether it is in force. A destination whose push token the gateway
+rejected is out of force until its device registers again or you remove it, and one you removed is
+not listed. A webhook's address is shown without any query or fragment it carries. `--json` prints
 `{ "ok": true, "destinations": [ { "destination_id", "kind", "endpoint", "idempotency_header",
 "rule_name", "grant_id", "in_force", "configured_at_ms" } ] }`, with `endpoint` and
 `idempotency_header` null where the destination has none. `configure --json` prints
