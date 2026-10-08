@@ -624,7 +624,7 @@ impl OutputHub {
     /// Delivers output to every subscriber that is keeping up.
     ///
     /// `behind_the_screen` names the ranges of `bytes` that only describe the screen. A subscriber
-    /// whose caller is shown the live screen alone, which `scope_of` says, is sent the rest of the
+    /// whose caller is the recipient of a share, which `scope_of` says, is sent the rest of the
     /// span as the pieces between those ranges, each at the position of the raw stream it starts
     /// at; every other subscriber is sent the whole span.
     ///
@@ -638,7 +638,7 @@ impl OutputHub {
         oldest_retained_cursor: u64,
         scope_of: impl Fn(AttachmentId) -> crate::render::Scope,
     ) -> Vec<AttachmentId> {
-        // Cut only when a subscriber shown the live screen alone needs it.
+        // Cut only when a share's recipient needs it.
         let mut screen_only: Option<Vec<(u64, Arc<Vec<u8>>)>> = None;
         let mut resynchronised = Vec::new();
         let mut gone = Vec::new();

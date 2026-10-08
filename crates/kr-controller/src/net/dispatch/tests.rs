@@ -306,7 +306,7 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
                 grant_rights: with_voice.clone(),
                 accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(u64::MAX),
                 history: None,
-                previewed_screen: false,
+                screen_basis: None,
             })))
             .await;
         assert!(
@@ -1574,7 +1574,7 @@ async fn close_for_a_device_of(
                 actor: &envelope,
                 grant_rights: &rights,
                 history: Some(&connection.device.grant.history),
-                previewed_screen: false,
+                screen_basis: None,
             },
             accepted,
             &connection.expiry_observer(),

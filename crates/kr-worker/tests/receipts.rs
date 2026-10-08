@@ -1095,7 +1095,7 @@ async fn a_forwarded_close_sent_again_is_marked_retained_only_on_a_link_that_dec
             grant_rights: kr_protocol::scalars::CanonicalSet::new(),
             accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
             history: None,
-            previewed_screen: false,
+            screen_basis: None,
         }))
     };
 
@@ -1301,7 +1301,7 @@ async fn the_host_authorises_against_current_state_and_a_relayed_envelope_grants
         },
         accepted_deadline_boot_ms: U64::new(u64::MAX),
         history: None,
-        previewed_screen: false,
+        screen_basis: None,
     }));
     client
         .writer()
@@ -3032,7 +3032,7 @@ async fn a_forwarded_retry_is_answered_after_its_deadline_and_never_first_admitt
             grant_rights: kr_protocol::scalars::CanonicalSet::new(),
             accepted_deadline_boot_ms: U64::new(deadline),
             history: None,
-            previewed_screen: false,
+            screen_basis: None,
         }))
     };
 

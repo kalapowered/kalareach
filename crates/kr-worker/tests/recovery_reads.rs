@@ -549,7 +549,7 @@ async fn forwarded_mutation<T: serde::Serialize>(
         grant_rights: [ActionRight::SessionView].into_iter().collect(),
         accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
         history: None,
-        previewed_screen: false,
+        screen_basis: None,
     }));
     within("the worker's answer", async {
         daemon

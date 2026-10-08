@@ -96,8 +96,8 @@ pub struct DirectSpan {
     /// The bytes, as the application wrote them.
     pub bytes: Vec<u8>,
     /// The ranges of `bytes`, in order, that only describe the screen: a title, the target of a
-    /// link, a working directory, a shell's marks. A caller shown the live screen alone is sent
-    /// the rest of the span, and the gaps it leaves are positions of the raw stream like any other.
+    /// link, a working directory, a shell's marks. The recipient of a share is sent the rest of the
+    /// span, and the gaps it leaves are positions of the raw stream like any other.
     pub behind_the_screen: Vec<std::ops::Range<usize>>,
 }
 

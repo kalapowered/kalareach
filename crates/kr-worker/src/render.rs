@@ -483,8 +483,8 @@ impl Writer {
                 // by its whole depth on every repaint, and could evict a title the person's
                 // terminal had saved for itself.
                 self.carried.title_stack += stack.len();
-                // A caller shown the live screen alone is told no title: the preview its issuer
-                // saw is the text.
+                // The recipient of a share is told no title: the preview its issuer saw is the
+                // text.
                 if self.scope.names_titles_and_links() {
                     self.osc(b"1", title.icon.as_bytes());
                     self.osc(b"2", title.window.as_bytes());
@@ -863,8 +863,8 @@ impl Writer {
     /// Opens `link`, with the parameters that make it the link it is, unless it is the one already
     /// open. Two links to one target stay two on the terminal that is drawn into.
     ///
-    /// Every link a restoration opens is opened here, and a caller shown the live screen alone is
-    /// given the text of a link and never its target.
+    /// Every link a restoration opens is opened here, and the recipient of a share is given the
+    /// text of a link and never its target.
     fn open_link(&mut self, link: &Link) {
         if !self.scope.names_titles_and_links() || self.link.as_ref() == Some(link) {
             return;
