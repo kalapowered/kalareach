@@ -170,6 +170,9 @@ struct Host {
     worker_packages: Option<PathBuf>,
     /// Everything the daemon asked its supervisor to start, when a test keeps the list.
     launched: Option<Arc<std::sync::Mutex<Vec<Launch>>>>,
+    /// Whether the daemon starts its workers through the supervisor the shipping daemon chooses on
+    /// this platform, rather than as detached processes of its own.
+    platform_service: bool,
 }
 
 impl Host {
@@ -208,6 +211,7 @@ impl Host {
             shell_packages: None,
             worker_packages: None,
             launched: None,
+            platform_service: false,
         }
     }
 
@@ -223,6 +227,9 @@ impl Host {
         if let Some(task) = &self.task {
             return Box::new(task.supervisor(&self.paths()));
         }
+        if self.platform_service {
+            return kr_controller::supervision::detect();
+        }
         Box::new(DetachedSupervisor::new())
     }
 
@@ -233,6 +240,12 @@ impl Host {
     /// package names cannot be executed, so the worker starts, claims its reservation, fails to
     /// start the root shell and says so. Everything here is this test's own: nothing depends on
     /// what the machine happens to have installed.
+    /// Starts the daemon's workers through the supervisor the shipping daemon chooses here.
+    fn through_the_platform(mut self) -> Self {
+        self.platform_service = true;
+        self
+    }
+
     /// Keeps a list of everything the daemon asks its supervisor to start.
     fn recording_launches(mut self) -> Self {
         self.launched = Some(Arc::default());
@@ -1991,6 +2004,179 @@ async fn removing_the_environments_task_leaves_its_running_worker_running() {
     );
     let closed = close(&mut client, &host, session_id).await;
     assert_eq!(closed.session_id, session_id, "and closes as usual");
+    drop(client);
+    daemon.stop().await;
+}
+
+// MEASUREMENT (scratch, not part of the change)
+
+/// What a session's root shell starts, as the startup file an interactive POSIX shell reads.
+const TREE: &str = r#"
+n() { p=$2; [ -r /proc/$p/winpid ] && p=$(cat /proc/$p/winpid); printf '%s\n' "$p" > "$1.pid"; }
+sleep 600 &
+n plain $!
+( trap '' HUP TERM; exec sleep 601 ) &
+n stubborn $!
+( ( trap '' HUP TERM; exec sleep 602 ) & n orphan $! )
+case $(uname) in
+  MINGW*|MSYS*) ;;
+  *) ( trap '' HUP TERM; exec perl -e 'use POSIX qw(setsid); setsid(); open(F, ">escaped.pid"); print F $$; close F; exec "sleep", "603"' ) & ;;
+esac
+"#;
+
+fn hard_kill(identity: &kr_protocol::identity::ProcessStartIdentity) {
+    assert_eq!(
+        kr_ipc::identity::process_state(identity),
+        kr_ipc::identity::ProcessState::Running,
+        "the process is running before it is killed"
+    );
+    #[cfg(unix)]
+    {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(identity.pid.get()).expect("a pid"))
+            .expect("a process number");
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("kills it");
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill.exe")
+            .args(["/PID", &identity.pid.get().to_string(), "/F"])
+            .status()
+            .expect("taskkill runs");
+        assert!(status.success(), "taskkill ended the process");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement"]
+async fn measure_a_crashed_workers_tree() {
+    let host = Host::create().through_the_platform();
+    let script = host.temp.root().join("tree.sh");
+    std::fs::write(&script, TREE).expect("writes the tree");
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let mut params = create_params(host.environment_id, host.temp.root());
+    params
+        .environment_snapshot
+        .push(kr_protocol::session::EnvironmentVariable {
+            name: "ENV".to_owned(),
+            value: script.display().to_string(),
+        });
+    let created: SessionCreateResult = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("reaches the daemon")
+        .unwrap_or_else(|error| panic!("the create failed: {error}"))
+        .to_typed()
+        .expect("decodes");
+    let session_id = created.session.session_id;
+    let root = created
+        .session
+        .root_process
+        .as_ref()
+        .cloned()
+        .expect("a root shell");
+    let mut nodes: Vec<(&str, kr_protocol::identity::ProcessStartIdentity)> = Vec::new();
+    let names = ["plain", "stubborn", "orphan", "escaped"];
+    let wanted = if cfg!(windows) { 3 } else { 4 };
+    let started = std::time::Instant::now();
+    while nodes.len() < wanted {
+        nodes.clear();
+        for name in names {
+            if let Ok(text) = std::fs::read_to_string(host.temp.root().join(format!("{name}.pid")))
+            {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    if let Ok(identity) = kr_ipc::identity::process_start_identity(pid) {
+                        nodes.push((name, identity));
+                    }
+                }
+            }
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the tree never appeared: {nodes:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let worker = registry
+        .workers()
+        .expect("reads the worker records")
+        .into_iter()
+        .find(|worker| worker.session_id == session_id)
+        .expect("a worker record")
+        .process_identity;
+    drop(registry);
+    eprintln!(
+        "MEASURE supervisor: {}",
+        kr_controller::supervision::detect().describe()
+    );
+    eprintln!("MEASURE worker {worker:?}\nMEASURE root {root:?}\nMEASURE nodes {nodes:?}");
+    hard_kill(&worker);
+    let killed = std::time::Instant::now();
+    let mut closed_at = None;
+    let mut last = String::new();
+    loop {
+        let listed: SessionListResult = client
+            .request(
+                Method::SessionList,
+                &SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: true,
+                },
+            )
+            .await
+            .expect("reaches the daemon")
+            .expect("lists")
+            .to_typed()
+            .expect("decodes");
+        let closed = listed.sessions.iter().any(|summary| {
+            summary.session_id == session_id && summary.state == SessionState::Closed
+        });
+        if closed && closed_at.is_none() {
+            closed_at = Some(killed.elapsed());
+        }
+        let mut line = format!(
+            "closed={closed} root={:?}",
+            kr_ipc::identity::process_state(&root)
+        );
+        let mut alive = 0;
+        for (name, identity) in &nodes {
+            let state = kr_ipc::identity::process_state(identity);
+            if state == kr_ipc::identity::ProcessState::Running {
+                alive += 1;
+            }
+            line.push_str(&format!(
+                " {name}={}",
+                if state == kr_ipc::identity::ProcessState::Running {
+                    "RUN"
+                } else {
+                    "gone"
+                }
+            ));
+        }
+        if line != last {
+            eprintln!("MEASURE t={:.1?} {line}", killed.elapsed());
+            last = line;
+        }
+        if (alive == 0 && closed) || killed.elapsed() > std::time::Duration::from_secs(150) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    eprintln!("MEASURE closed after {closed_at:?}");
+    // End what is left, by identity.
+    for (name, identity) in &nodes {
+        if kr_ipc::identity::process_state(identity) == kr_ipc::identity::ProcessState::Running {
+            eprintln!("MEASURE ending {name} by hand");
+            hard_kill(identity);
+        }
+    }
     drop(client);
     daemon.stop().await;
 }
