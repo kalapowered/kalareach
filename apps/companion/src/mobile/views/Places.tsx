@@ -12,6 +12,7 @@ import type { EnvironmentListResult, SessionListResult } from '@kalareach/protoc
 import { useApp } from '../../app/state'
 import { failureMessage, watch, type Watch } from '../../host/port'
 import { Banner } from '../../components/ui'
+import { PairingFlow } from '../../pairing/PairingFlow'
 import { accountName } from '../../views/account-name'
 import {
   activityLine,
@@ -39,10 +40,13 @@ interface Row {
 /** The sessions on every host this device can see. */
 export function MobileSessions({
   surface,
-  onOpen
+  onOpen,
+  onOpenVoice
 }: {
   readonly surface: Surface
   readonly onOpen: (sessionId: string) => void
+  /** Opens the voice screen. Absent while no host is reached, when there is no one to talk to. */
+  readonly onOpenVoice?: () => void
 }): ReactNode {
   const { port } = useApp()
   const [rows, setRows] = useState<readonly Row[] | null>(null)
@@ -93,6 +97,18 @@ export function MobileSessions({
 
   return (
     <>
+      {onOpenVoice === undefined ? null : (
+        <button
+          type="button"
+          className="m-row"
+          data-testid="voice-entry"
+          style={{ minBlockSize: target }}
+          onClick={onOpenVoice}
+        >
+          <span className="m-row-title">Talk to your host</span>
+          <span className="m-row-detail">Voice, for the sessions you choose</span>
+        </button>
+      )}
       {error ? (
         <Banner tone="warning" title="The sessions could not be read" detail={error} />
       ) : null}
@@ -151,8 +167,21 @@ export function MobileSessions({
   )
 }
 
-/** The hosts this device is paired with. */
-export function MobileHosts({ surface }: { readonly surface: Surface }): ReactNode {
+/**
+ * The hosts this device is paired with, and the way to pair another.
+ *
+ * A phone has no host of its own: it pairs with one, and its commands go to the one it uses. The
+ * list under the pairing entry is what that host reports of its environments, read again whenever
+ * the connection comes or goes.
+ */
+export function MobileHosts({
+  surface,
+  connected
+}: {
+  readonly surface: Surface
+  /** Whether a host is being reached now, or null before anything has said. */
+  readonly connected?: boolean | null
+}): ReactNode {
   const { port } = useApp()
   const [rows, setRows] = useState<readonly Row[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -185,10 +214,15 @@ export function MobileHosts({ surface }: { readonly surface: Surface }): ReactNo
         })
     })
     return reads.stop
-  }, [port])
+  }, [port, connected])
 
   return (
     <>
+      <PairingFlow
+        chooseHost={async (reference) => {
+          await port.hostsUse(reference)
+        }}
+      />
       {error ? <Banner tone="warning" title="The hosts could not be read" detail={error} /> : null}
       {rows ? (
         <ul className="m-list">
