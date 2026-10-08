@@ -1583,6 +1583,10 @@ impl ManagedVoiceService for NullService {
     fn close<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, voice::VoiceClosure> {
         unconfigured(ManagedService::ManagedInference.as_str())
     }
+
+    fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {
+        unconfigured(ManagedService::ManagedInference.as_str())
+    }
 }
 
 #[cfg(test)]

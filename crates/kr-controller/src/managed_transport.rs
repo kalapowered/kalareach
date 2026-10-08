@@ -101,6 +101,19 @@ impl ServiceHttp for ManagedTransport {
             }
         })
     }
+
+    fn get_json<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            match self.transport() {
+                Some(transport) => ServiceHttp::get_json(&transport, url, headers).await,
+                None => Err(unavailable()),
+            }
+        })
+    }
 }
 
 impl AccountHttp for ManagedTransport {

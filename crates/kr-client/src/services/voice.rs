@@ -61,6 +61,12 @@ pub const VOICE_SCOPE: &str = "voice";
 /// Where brokered session creation answers.
 pub const VOICE_SESSIONS_PATH: &str = "/api/voice/sessions";
 
+/// Where a client reads the call its account already has.
+///
+/// A read, and the one voice route that answers for the account rather than for a call: it names
+/// the account's open call, or says there is none.
+pub const VOICE_CURRENT_PATH: &str = "/api/voice/sessions/current";
+
 /// Where the service answers what a call started now would be, before one exists.
 ///
 /// The one voice route that creates nothing: no provider session, no reservation and no call
@@ -73,6 +79,12 @@ pub const VOICE_HEARTBEAT_SECONDS: u32 = 20;
 
 /// Seconds without a control socket after which the service closes the call.
 pub const VOICE_CLIENT_ABSENT_SECONDS: u32 = 120;
+
+/// How long a host waits for the service to say whether it still holds a call open.
+///
+/// A host asks while a person is waiting to sign in or out, so it asks for much less than a start
+/// may take. A service that has not answered by then is one that could not be asked.
+const CALL_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Seconds before the reservation ends at which the service closes the call.
 pub const VOICE_CLOSE_LEAD_SECONDS: u32 = 15;
@@ -953,6 +965,21 @@ pub trait ManagedVoiceService: Send + Sync + fmt::Debug {
     /// Returns a transport or protocol error.
     fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure>;
 
+    /// Whether the service still holds this call open.
+    ///
+    /// A service ends a call without its device: at the call's deadline, and when nothing has been
+    /// on its control socket for a while. A host whose device went silent cannot be told so, and
+    /// asks. `false` is an answer: the service holds no such call open for the account, or holds it
+    /// closing. It creates nothing and ends nothing, and an answer is only as current as the read.
+    ///
+    /// A provider that has no way to know answers `true`: the call then ends at its own deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport or protocol error, or the service's refusal. A caller then does not know
+    /// and holds the call open.
+    fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool>;
+
     /// What this provider is, for a caller holding calls from more than one.
     ///
     /// A call identifier means something only to the provider that issued it, and two providers
@@ -1159,15 +1186,29 @@ impl ManagedVoiceBroker {
         &self.origin
     }
 
-    /// Sends one authorised request and returns what came back.
-    async fn exchange(&self, path: &str, body: Vec<u8>) -> Result<ServiceHttpAnswer> {
+    /// The value of the `authorization` header a request carries.
+    async fn authorisation(&self) -> Result<String> {
         let token = self.tokens.token(VOICE_SCOPE).await?;
         // The one place the token is read. It goes into a header value and nowhere else: not into
         // the URL, not into the body, and not into any error this function returns.
-        let authorisation = format!("Bearer {}", token.expose());
+        Ok(format!("Bearer {}", token.expose()))
+    }
+
+    /// Sends one authorised request and returns what came back.
+    async fn exchange(&self, path: &str, body: Vec<u8>) -> Result<ServiceHttpAnswer> {
+        let authorisation = self.authorisation().await?;
         let url = format!("{}{path}", self.origin);
         self.http
             .post_json(&url, &body, &[("authorization", authorisation.as_str())])
+            .await
+    }
+
+    /// Reads one authorised address and returns what came back.
+    async fn read(&self, path: &str) -> Result<ServiceHttpAnswer> {
+        let authorisation = self.authorisation().await?;
+        let url = format!("{}{path}", self.origin);
+        self.http
+            .get_json(&url, &[("authorization", authorisation.as_str())])
             .await
     }
 
@@ -1227,6 +1268,72 @@ impl ManagedVoiceService for ManagedVoiceBroker {
             })
         })
     }
+
+    fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool> {
+        Box::pin(async move {
+            let answer = tokio::time::timeout(CALL_READ_WITHIN, self.read(VOICE_CURRENT_PATH))
+                .await
+                .map_err(|_| {
+                    ClientError::refusal(
+                        ErrorCode::UpstreamUnavailable,
+                        Shown::said("the managed service did not say whether it holds the call"),
+                    )
+                })??;
+            // An account with no call open is an answer to this question, not a failure of it.
+            if names_no_call(&answer) {
+                return Ok(false);
+            }
+            let current: CurrentCall =
+                serde_json::from_value(data_of(&answer)?).map_err(|error| {
+                    unreadable(
+                        200,
+                        crate::shown!(
+                            "this client cannot read the call its account has: {}",
+                            Shown::json(&error)
+                        ),
+                    )
+                })?;
+            // The account's open call is another call, or this one on its way out: this one is
+            // over. A state this client does not know is read as open, because the call then ends
+            // at its own deadline and no sooner than the service says.
+            Ok(current.call_id == call_id && current.state != "closing")
+        })
+    }
+}
+
+/// The call an account has open, as the service describes it.
+///
+/// Only what the question needs is read: which call it is and what it is doing.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentCall {
+    call_id: String,
+    state: String,
+}
+
+/// Whether the service answered that the account has no call open.
+///
+/// Read from the answer's own words: a 404 that carries the service's `NOT_FOUND` for this route,
+/// and not one from something in front of it.
+fn names_no_call(answer: &ServiceHttpAnswer) -> bool {
+    #[derive(Deserialize)]
+    struct Envelope {
+        ok: bool,
+        error: Option<Named>,
+    }
+
+    #[derive(Deserialize)]
+    struct Named {
+        code: String,
+    }
+
+    answer.status == 404
+        && super::json::read::<Envelope>(&answer.body).is_ok_and(|envelope| {
+            !envelope.ok
+                && envelope
+                    .error
+                    .is_some_and(|error| error.code == "NOT_FOUND")
+        })
 }
 
 /// A start the service answered with a success this client cannot read: the call may be running,
@@ -2057,6 +2164,29 @@ mod tests {
                 .expect("the script has an answer for every request");
             Box::pin(async move { Ok(answer) })
         }
+
+        fn get_json<'a>(
+            &'a self,
+            url: &'a str,
+            headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.sent.lock().expect("what was sent").push(Sent {
+                url: url.to_owned(),
+                body: serde_json::Value::Null,
+                authorisation: headers
+                    .iter()
+                    .find(|(name, _)| *name == "authorization")
+                    .map(|(_, value)| (*value).to_owned()),
+            });
+            let answer = self.answers.lock().expect("the script").pop_front();
+            Box::pin(async move {
+                match answer {
+                    Some(answer) => Ok(answer),
+                    // A service that never answers.
+                    None => std::future::pending().await,
+                }
+            })
+        }
     }
 
     #[derive(Debug)]
@@ -2101,6 +2231,113 @@ mod tests {
                 "contextBytes": 500
             }
         })
+    }
+
+    /// The account's call, as `GET /api/voice/sessions/current` describes it.
+    fn current_call(call_id: &str, state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "data": {
+                "callId": call_id,
+                "state": state,
+                "closesAt": "2099-01-01T00:10:00Z",
+                "controlPath": "/api/voice/sessions/call-1/control",
+                "heartbeatSeconds": 20,
+                "usageSeconds": 30,
+                "usageProvisional": true,
+                "delegations": [],
+                "disclosure": ["The managed service can read the conversation."]
+            }
+        })
+    }
+
+    /// KR-REQ-17.23: a host asks the service whether it still holds a call open, with the account
+    /// token and no body. Only the service's own word that the account has no such call, or has it
+    /// closing, reads as over; anything the host cannot read, or an answer from something in front
+    /// of the service, leaves the call open for the host to hold until its deadline.
+    #[tokio::test]
+    async fn a_call_reads_as_over_only_when_the_service_says_it_holds_none() {
+        let not_found = serde_json::json!({
+            "ok": false,
+            "error": { "code": "NOT_FOUND", "message": "This account has no managed call." }
+        });
+        let internal = serde_json::json!({
+            "ok": false,
+            "error": { "code": "INTERNAL", "message": "Try again." }
+        });
+        let cases: [(&str, (u16, serde_json::Value), Option<bool>); 8] = [
+            (
+                "the account's call, live",
+                (200, current_call("call-1", "live")),
+                Some(true),
+            ),
+            (
+                "the account's call, opening",
+                (200, current_call("call-1", "opening")),
+                Some(true),
+            ),
+            (
+                "the account's call, closing",
+                (200, current_call("call-1", "closing")),
+                Some(false),
+            ),
+            (
+                "another call of the account",
+                (200, current_call("call-2", "live")),
+                Some(false),
+            ),
+            (
+                "a state this client does not know",
+                (200, current_call("call-1", "paused")),
+                Some(true),
+            ),
+            ("no call", (404, not_found.clone()), Some(false)),
+            ("a service that fails", (503, internal), None),
+            // A gateway's 404 is not the service saying the account has no call.
+            (
+                "a 404 that is not the service's",
+                (404, serde_json::json!("<html>not found</html>")),
+                None,
+            ),
+        ];
+        for (what, answer, over) in cases {
+            let service = Scripted::answering([answer]);
+            let read = broker(&service).call_is_open("call-1").await;
+            match over {
+                Some(open) => assert_eq!(
+                    read.unwrap_or_else(|e| panic!("{what}: {e}")),
+                    open,
+                    "{what}"
+                ),
+                None => assert!(read.is_err(), "{what} is not an answer: {read:?}"),
+            }
+            let sent = service.sent();
+            assert_eq!(sent.len(), 1, "{what}");
+            assert_eq!(
+                sent[0].url, "https://reach.example/api/voice/sessions/current",
+                "{what}"
+            );
+            assert_eq!(
+                sent[0].body,
+                serde_json::Value::Null,
+                "{what}: a read has no body"
+            );
+            assert_eq!(
+                sent[0].authorisation.as_deref(),
+                Some("Bearer a-voice-token"),
+                "{what}"
+            );
+        }
+    }
+
+    /// KR-REQ-17.23: a service that does not answer is one that could not be asked, and the host
+    /// does not wait for it as long as it waits for a call to be created.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_does_not_say_whether_it_holds_a_call_is_given_up_on() {
+        let service = Scripted::answering([]);
+        let read = broker(&service).call_is_open("call-1").await;
+        let error = read.expect_err("no answer came");
+        assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
     }
 
     fn start_request(version: Option<&str>) -> VoiceSessionRequest {
