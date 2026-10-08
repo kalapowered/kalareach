@@ -613,14 +613,48 @@ async fn a_held_page_answers_when_a_host_event_is_committed() {
     assert_eq!(page.host_events.records.len(), 1);
 }
 
+/// Waits until the worker has read the broker's records through `record` and held the request on
+/// them, so that it has looked at what was committed and found it no reason to answer. The wait
+/// fails the moment the worker answers instead, and when it neither holds nor answers.
+async fn until_held_through(host: &Host, link: &mut Link, record: u64) {
+    let service = Arc::clone(&host.service);
+    let held = async move {
+        while service.held_attention_approvals_head() < record {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        () = held => {}
+        answer = next_answer(link) => {
+            panic!("the worker answered with broker record {record} past the cursor: {answer:?}")
+        }
+        () = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("the worker never held the request after reading broker record {record}")
+        }
+    }
+}
+
+/// Waits until the worker holds the request once more than it has, so that the test commits what
+/// should wake it after the request found nothing and began to wait.
+async fn until_held_again(host: &Host, held_before: u64) {
+    let service = Arc::clone(&host.service);
+    tokio::time::timeout(Duration::from_secs(30), async move {
+        while service.held_attention_requests() == held_before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the worker holds the request");
+}
+
 /// KR-REQ-25.01: a relayed approval committed to the broker's ledger while a request is held
 /// answers it at once, with the transitions the broker recorded, and a transition that is no
 /// approval's does not. The test waits until the worker counts the request as held, so the commits
 /// come after the request found nothing and began to wait. A request nothing interprets is relayed
-/// first, and once the broker has recorded it the held request is still held after a wait: it goes
-/// with the next page. The approval relayed then answers it, within five seconds of a request held
-/// for twenty, with the unbound request's record before it: a commit that did not wake it fails
-/// here, and so does an answer to every transition.
+/// first, and the test waits until the worker has read its record and held the request on it: it
+/// goes with the next page. The approval relayed then answers the request, with the unbound
+/// request's record before it, within five seconds of a request held for twenty: a commit that did
+/// not wake it fails here, and so does an answer to every transition.
 #[tokio::test]
 async fn a_held_page_answers_when_an_approval_is_committed() {
     use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
@@ -641,32 +675,12 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
         .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
         .await
         .expect("writes the request");
-    let service = Arc::clone(&host.service);
-    tokio::time::timeout(Duration::from_secs(30), async move {
-        while service.held_attention_requests() == held_before {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the worker holds the request");
+    until_held_again(&host, held_before).await;
 
     // A request no binding gives a meaning is recorded, and wakes nothing that is waiting for an
     // approval.
     unbound.relay("fghij").await;
-    let recorded = Arc::clone(&host.service);
-    tokio::time::timeout(Duration::from_secs(30), async move {
-        while recorded.broker().pending_resources().is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the broker records the request");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), next_answer(&mut link))
-            .await
-            .is_err(),
-        "a transition that is no approval's is left for the next page"
-    );
+    until_held_through(&host, &mut link, 1).await;
 
     bound.relay("abcde").await;
     let Answer::Page(woken) = within(&mut link, Duration::from_secs(5)).await else {
@@ -685,6 +699,72 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
         "and the record of the request nothing interpreted comes before it"
     );
     assert!(!woken.approvals.records[0].approval);
+    unbound.close().await;
+    bound.close().await;
+}
+
+/// KR-REQ-25.01: an approval's transition behind a full page of the broker's other records is
+/// read at once and not when the request's bound runs out. The request takes one record a page, and
+/// the test waits until the worker has read the record of a request nothing interprets and held the
+/// request on it. The approval relayed then is behind that record, so the page the worker reads
+/// holds the unbound request's record and no approval's, and ends before the broker's newest
+/// record: that answers the request, which a worker that answered only for a page that carries an
+/// approval's transition would not do until the bound.
+#[tokio::test]
+async fn a_held_page_answers_when_an_approval_waits_behind_a_full_page() {
+    use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
+    use kr_worker::broker::connectors::fixture;
+
+    let host = host().await;
+    let broker = host.service.broker();
+    register(broker, 2);
+    register(broker, 3);
+    let package = Package::laid_out();
+    package.bind(broker, 2);
+    let launch = |number: u8| package.launch(broker, number, Some(fixture::QUALIFIED_VERSION));
+    let mut unbound = Channel::open(launch(3), 3, launched(3));
+    let mut bound = Channel::open(launch(2), 2, launched(2));
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let held_before = host.service.held_attention_requests();
+    link.writer()
+        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+            max_records: U64::new(1),
+            ..sources(0, 0, 20_000)
+        }))
+        .await
+        .expect("writes the request");
+    until_held_again(&host, held_before).await;
+
+    unbound.relay("fghij").await;
+    until_held_through(&host, &mut link, 1).await;
+
+    bound.relay("abcde").await;
+    // A page that holds one record and ends before the broker's newest answers the request. The
+    // request held again on a page past the first record is the page that did not.
+    let service = Arc::clone(&host.service);
+    let held_again = async move {
+        while service.held_attention_approvals_head() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let answer = tokio::select! {
+        answer = next_answer(&mut link) => answer,
+        () = held_again => {
+            panic!("the request was held again with an approval's transition behind a full page")
+        }
+        () = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("the worker neither answered nor held the request")
+        }
+    };
+    let Answer::Page(page) = answer else {
+        panic!("expected the held page");
+    };
+    assert_eq!(page.approvals.records.len(), 1, "the page takes one record");
+    assert_eq!(page.approvals.records[0].sequence, U64::new(1));
+    assert!(
+        page.approvals.head.get() > 1,
+        "and the broker has recorded more than it carries"
+    );
     unbound.close().await;
     bound.close().await;
 }
