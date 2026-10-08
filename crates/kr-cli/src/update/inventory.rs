@@ -269,16 +269,135 @@ pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Re
     let database = environment.paths.registry_database();
     // What a daemon that ended by a signal left in its log is taken into the file first, as its own
     // clean stop would have: the environment's lock is held, so nothing writes meanwhile.
-    Registry::take_in_its_log(&database).map_err(|error| {
-        CliError::Other(shown!(
-            "environment {}'s registry could not be read: {}",
-            environment.environment_id,
-            Shown::protocol(&error.to_protocol_error())
-        ))
-    })?;
+    Registry::take_in_its_log(&database).map_err(|error| unreadable(environment, &error))?;
+    classify_in(environment, target, &database).await
+}
+
+/// Classes every record of an environment's registry for a rollback to `target`, as [`classify`]
+/// does, from a private copy of the registry that is brought to the schema this release reads, and
+/// returns what holds the rollback.
+///
+/// The registry itself is read and not changed, not even to take in a log: a rollback goes to a
+/// release older than the one now current, which reads a registry no newer than its own schema,
+/// so bringing the registry forward to this release's would put it out of that release's reach. The
+/// copy is what the registry would be if a daemon of this release had started in the environment, and
+/// holds the same records, so a worker the registry names that no daemon of this release has met is
+/// classed all the same. The copy goes when this returns.
+///
+/// # Errors
+///
+/// Returns the failure to copy the registry, to bring the copy forward or to read it.
+pub async fn classify_apart(
+    environment: &Environment,
+    target: &ReleaseManifest,
+) -> Result<Vec<Holding>> {
+    if !has_registry(environment)? {
+        return Ok(Vec::new());
+    }
+    let original = environment.paths.registry_database();
+    let Some(copy) = ApartRegistry::of(environment, &original)? else {
+        // Not a regular file: the reader refuses it in its own words, before it opens anything.
+        return classify_in(environment, target, &original).await;
+    };
+    let database = copy.database();
+    Registry::bring_forward(&database, environment.environment_id)
+        .map_err(|error| unreadable(environment, &error))?;
+    classify_in(environment, target, &database).await
+}
+
+/// What a failure to read an environment's registry says.
+fn unreadable(environment: &Environment, error: &kr_controller::ControllerError) -> CliError {
+    CliError::Other(shown!(
+        "environment {}'s registry could not be read: {}",
+        environment.environment_id,
+        Shown::protocol(&error.to_protocol_error())
+    ))
+}
+
+/// A private copy of an environment's registry, with the log or journal beside it, which goes when
+/// the copy does.
+struct ApartRegistry {
+    directory: std::path::PathBuf,
+}
+
+impl Drop for ApartRegistry {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+impl ApartRegistry {
+    /// Copies the registry at `original`; `None` where it is not a regular file.
+    fn of(environment: &Environment, original: &std::path::Path) -> Result<Option<Self>> {
+        let failed = |what: &'static str, error: &std::io::Error| {
+            CliError::Other(shown!(
+                "environment {}'s registry could not be copied to be read: {} {}",
+                environment.environment_id,
+                what,
+                Shown::io(error)
+            ))
+        };
+        match std::fs::symlink_metadata(original) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(error) => return Err(failed("it could not be looked at:", &error)),
+        }
+        let directory = std::env::temp_dir().join(format!("kr-registry-{}", kr_ipc::new_uuid()));
+        let copy = Self { directory };
+        kr_ipc::paths::create_private_tree(&copy.directory, &copy.directory).map_err(|error| {
+            CliError::Other(shown!(
+                "environment {}'s registry could not be copied to be read: no directory could be \
+                 made for the copy: {}",
+                environment.environment_id,
+                Shown::ipc(&error)
+            ))
+        })?;
+        std::fs::copy(original, copy.database())
+            .map_err(|error| failed("the file could not be copied:", &error))?;
+        for suffix in ["-wal", "-journal"] {
+            let mut beside = original.as_os_str().to_owned();
+            beside.push(suffix);
+            let beside = std::path::PathBuf::from(beside);
+            match std::fs::symlink_metadata(&beside) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(metadata) if metadata.is_file() => {
+                    let mut named = copy.database().as_os_str().to_owned();
+                    named.push(suffix);
+                    std::fs::copy(&beside, &named).map_err(|error| {
+                        failed("what is beside it could not be copied:", &error)
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(CliError::Other(shown!(
+                        "environment {}'s registry has beside it something that is not a regular file, {}",
+                        environment.environment_id,
+                        Shown::root(&beside)
+                    )));
+                }
+                Err(error) => {
+                    return Err(failed("what is beside it could not be looked at:", &error));
+                }
+            }
+        }
+        Ok(Some(copy))
+    }
+
+    /// Where the copy of the registry is.
+    fn database(&self) -> std::path::PathBuf {
+        self.directory.join("registry.sqlite")
+    }
+}
+
+/// Classes the records of the registry at `database`, which is the environment's or a copy of it,
+/// and has been brought to the schema this release reads, if it was to be.
+async fn classify_in(
+    environment: &Environment,
+    target: &ReleaseManifest,
+    database: &std::path::Path,
+) -> Result<Vec<Holding>> {
     let (spawned, running, workers) = {
         let registry =
-            Registry::open_to_read(&database, environment.environment_id).map_err(|error| {
+            Registry::open_to_read(database, environment.environment_id).map_err(|error| {
                 CliError::Other(shown!(
                     "environment {}'s registry could not be read: {}",
                     environment.environment_id,

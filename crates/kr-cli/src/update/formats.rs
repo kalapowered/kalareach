@@ -142,12 +142,15 @@ pub fn unlookable(target: &ReleaseManifest) -> Vec<Refusal> {
 /// `environments` are the environments whose daemons have stopped and whose locks are held.
 /// `published` are the directories the daemons said they read their configuration documents in,
 /// by environment: each is looked at beside the places this command's own environment gives.
+/// `carries` is whether the switch brings a registry that is behind forward before the target meets
+/// it, which an update does and a rollback does not.
 #[must_use]
 pub fn check(
     target: &ReleaseManifest,
     install: &kr_ipc::install::Store,
     environments: &[&Environment],
     published: &[(EnvironmentId, PathBuf)],
+    carries: bool,
 ) -> Vec<Refusal> {
     let mut refusals = unlookable(target);
     for listed in &target.stores {
@@ -167,7 +170,7 @@ pub fn check(
             match files(&directory, listed) {
                 Ok(found) => {
                     for file in found {
-                        if let Some(why) = look(listed, &file) {
+                        if let Some(why) = look(listed, &file, carries) {
                             refuse(file, why);
                         }
                     }
@@ -294,15 +297,16 @@ fn files(directory: &Path, listed: &ReleaseStore) -> Result<Vec<PathBuf>, Shown>
 }
 
 /// Reads the version one file records and says why the target does not read it, when it does not.
-fn look(listed: &ReleaseStore, file: &Path) -> Option<Why> {
+fn look(listed: &ReleaseStore, file: &Path, carries: bool) -> Option<Why> {
     let found = match read(listed, file) {
         Ok(None) => return None,
         Ok(Some(found)) => found,
         Err(reason) => return Some(Why::Unreadable(reason)),
     };
     // The one store an update itself migrates: it brings a registry that is behind forward to the
-    // version it reads, so that is the version the target meets.
-    let brought_to = (listed.store == "registry"
+    // version it reads, so that is the version the target meets. A rollback brings nothing forward.
+    let brought_to = (carries
+        && listed.store == "registry"
         && (kr_controller::registry::OLDEST_SCHEMA_VERSION
             ..kr_controller::registry::SCHEMA_VERSION)
             .contains(&i64::from(found)))

@@ -1528,7 +1528,7 @@ async fn hand_over(
             .as_ref()
             .map(Transaction::published_directories)
             .unwrap_or_default();
-        let refusals = formats::check(target, store, &every, &published);
+        let refusals = formats::check(target, store, &every, &published, !report.rolled_back);
         if !refusals.is_empty() {
             drop(held);
             drop(install);
@@ -1540,20 +1540,30 @@ async fn hand_over(
             // Every daemon has stopped and every environment's lock and the install lock are held:
             // an environment whose daemon did not run since an earlier schema step is brought to the
             // schema this release reads, which is the schema its registry is classed by.
-            match inventory::carry_forward(environment) {
-                Ok(Some(done)) => report.carried.push(CarriedRegistry {
-                    environment: environment.environment_id,
-                    from: done.from,
-                    to: done.to,
-                }),
-                Ok(None) => {}
-                Err(error) => {
-                    drop(held);
-                    drop(install);
-                    return Err(undo(store, record, error).await);
+            // A rollback carries nothing: the release it goes to reads a registry no newer than its
+            // own schema, which this release's would be beyond. Its registries are classed from a
+            // private copy brought forward instead, so nothing is left unlooked at.
+            if !report.rolled_back {
+                match inventory::carry_forward(environment) {
+                    Ok(Some(done)) => report.carried.push(CarriedRegistry {
+                        environment: environment.environment_id,
+                        from: done.from,
+                        to: done.to,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => {
+                        drop(held);
+                        drop(install);
+                        return Err(undo(store, record, error).await);
+                    }
                 }
             }
-            match inventory::classify(environment, target).await {
+            let classed = if report.rolled_back {
+                inventory::classify_apart(environment, target).await
+            } else {
+                inventory::classify(environment, target).await
+            };
+            match classed {
                 Ok(found) => {
                     if let Some(first) = found.first() {
                         holding = Some(first.said(target));

@@ -5035,6 +5035,91 @@ async fn a_rollback_goes_back_to_the_release_before_and_moves_no_live_session() 
     }
 }
 
+/// KR-REQ-26.10: a rollback brings no registry forward. An environment whose daemon has not run since
+/// a schema before this release's has a registry the older release can read as it is, and a rollback
+/// that migrated it to this release's schema would put it beyond that release. It is left as the file
+/// it was, with nothing made beside it, and the rollback says it carried nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_leaves_a_registry_behind_this_release_s_schema_as_it_is() {
+    let (host, one, two, archive) = host_to_update().await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let idle = Idle::new(&host.store).shaped_as(6);
+    let before = idle.records();
+    assert_eq!(idle.version(), 6);
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(said["carried"], serde_json::json!([]), "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    assert_eq!(idle.version(), 6, "the registry was not brought forward");
+    assert_eq!(idle.records(), before, "and what it records is as it was");
+    assert!(
+        idle.sidecars().is_empty(),
+        "and nothing is left beside it: {:?}",
+        idle.sidecars()
+    );
+    let _ = two;
+}
+
+/// KR-REQ-26.10: a rollback classes the records of a registry that is behind this release's schema
+/// all the same, from a copy it brings forward: a worker the registry names that does not answer and
+/// has not ended holds the rollback, as it holds an update, and the registry is left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_classes_a_registry_behind_this_release_s_schema_without_changing_it() {
+    let (host, one, two, archive) = host_to_update().await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let idle = Idle::new(&host.store)
+        .with_a_worker_that_holds_the_update()
+        .shaped_as(6);
+    let before = idle.records();
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not answer its challenge and has not ended"),
+        "{said}"
+    );
+    assert_eq!(idle.version(), 6, "the registry was not brought forward");
+    assert_eq!(idle.records(), before, "and what it records is as it was");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon the rollback stopped serves again"
+    );
+    let _ = one;
+}
+
 /// KR-REQ-26.10: a rollback is refused, naming the store, when a store as it stands is at a version
 /// the older release does not read, and nothing is switched: the registry a daemon of this build
 /// wrote is at this build's schema version, and a release that reads the one before cannot take it.
@@ -6191,7 +6276,7 @@ async fn a_daemon_is_started_again_as_its_own_document_chose() {
     std::fs::write(&document, br#"{"version": 1}"#).expect("a document");
     std::fs::write(
         host.tree.environment().state_dir().join("config.json"),
-        br#"{"version": 1, "startup": {"controller": "service"}}"#,
+        br#"{"version": 1, "revision": 1, "startup": {"controller": "service"}}"#,
     )
     .expect("a document that chooses the service start");
     let archive = host.scratch("archives").join("two.tar.gz");
