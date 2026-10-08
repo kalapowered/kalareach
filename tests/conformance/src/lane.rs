@@ -346,6 +346,10 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
         "value",
         "static",
         "strictfp",
+        "expect",
+        "actual",
+        "external",
+        "inline",
     ];
     const NOT_CLASSES: &[&str] = &["func", "var", "let", "init", "subscript", "deinit"];
     let swift = file.ends_with(".swift");
@@ -494,6 +498,16 @@ impl Masker {
         } else if c == '"' {
             self.blank(1);
             self.string(false, 0);
+        } else if c == '`' {
+            // A quoted identifier (a Kotlin test name with spaces, a Swift keyword used as a
+            // name) ends at the next backtick or the end of the line.
+            self.blank(1);
+            while self.at < self.chars.len() && !matches!(self.chars[self.at], '`' | '\n') {
+                self.blank(1);
+            }
+            if self.chars.get(self.at) == Some(&'`') {
+                self.blank(1);
+            }
         } else if c == '\''
             && (self.chars.get(self.at + 2) == Some(&'\'')
                 || (self.chars.get(self.at + 1) == Some(&'\\')
@@ -673,6 +687,15 @@ mod tests {
         // In a raw string `\#(` interpolates and `\(` does not.
         let raw = "final class A {\n    let t = #\"\\#(f(\"a\\\"#{\"))\"#\n    let r = #\"\\(x\"#\n}\nfinal class B {}\n";
         assert_eq!(classes(raw), ["A", "B"]);
+    }
+
+    #[test]
+    fn a_quoted_identifier_is_blanked_whatever_braces_it_holds() {
+        let kotlin = "class A {\n    @Test fun `opens a {`() {}\n}\nclass B {\n    @Test fun `closes a }`() {}\n}\nexpect class C\n";
+        assert_eq!(
+            declared_classes("A.kt", kotlin).expect("balanced"),
+            ["A", "B", "C"]
+        );
     }
 
     #[test]
