@@ -174,6 +174,7 @@ describe('the lists of a phone, when the host changes', () => {
 })
 
 describe('the hosts list of a phone, when the second host refuses', () => {
+  // KR-REQ-13.08: a host that refuses to list its own environments leaves nothing of the first.
   it('shows no host of the first connection when the second refuses to list its own', async () => {
     const { controls } = start()
     await openTab('Hosts')
