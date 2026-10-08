@@ -36,8 +36,10 @@ pub struct Probed {
     pub mode: Option<String>,
     /// Why no mode was read, where none was.
     pub unread: Option<String>,
-    /// Whether the probe was still running when its deadline passed: the application did not
-    /// answer, as against one that answered with something no mode can be read from.
+    /// Whether the probe's output had not ended when its deadline passed: the application did not
+    /// finish, as against one that finished with something no mode can be read from. It holds
+    /// also for an application that printed a mode and then went on running, whose output the host
+    /// does not use.
     pub late: bool,
 }
 

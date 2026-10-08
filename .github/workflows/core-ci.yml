@@ -681,7 +681,8 @@ jobs:
       # What a launch reads of its application's mode. The declared diagnostic is run in the launch's own
       # directory with no input and no shell, a nonzero exit is not a failure, and one that prints too
       # much, never finishes or cannot start records no mode and is ended with everything it started. A
-      # mode the package refuses in a service session is a named launch failure where the worker is in one.
+      # mode the package refuses in a service session, or one its probe does not finish reading, is a named
+      # launch failure where the worker is in one.
       - name: Test what a launch reads of its application's mode
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test launch_probe

@@ -604,6 +604,13 @@ pub struct NativeGateway {
     /// flight comes from [`crate::broker::probe::DEADLINE`] and not from this field, so a gateway
     /// whose probe was given longer is not one a closure waits that long for.
     probe_deadline: std::time::Duration,
+    /// Whether this worker runs in a Windows service session, read once when the gateway is bound.
+    ///
+    /// It is [`in_service_session`] for every gateway this product binds. It is a field rather than
+    /// a call at the one place that reads it so that a test can put one gateway in each kind of
+    /// session on any platform, and decide what a launch does there, instead of deciding it only
+    /// on the machines that happen to be in one.
+    in_service_session: bool,
     /// The last process a launch of this gateway started, for this host's own tests.
     ///
     /// A launch that fails after its process started returns no process, and this is how a test
@@ -914,6 +921,17 @@ impl NativeGateway {
         self
     }
 
+    /// Sets whether this gateway launches as a worker in a Windows service session does.
+    ///
+    /// It exists so that this host's own tests can launch in each kind of session on every platform,
+    /// whichever one the machine they run on is in. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn with_service_session(mut self, in_service_session: bool) -> Self {
+        self.in_service_session = in_service_session;
+        self
+    }
+
     /// Binds the endpoint this launch publishes.
     ///
     /// # Errors
@@ -945,6 +963,7 @@ impl NativeGateway {
         Ok(Self {
             teardown: TEARDOWN_DEADLINE,
             probe_deadline: crate::broker::probe::DEADLINE,
+            in_service_session: in_service_session(),
             broker,
             endpoint,
             observatory,
@@ -1058,8 +1077,9 @@ impl NativeGateway {
     /// assembled from the installation's current grants answers
     /// ([`crate::broker::connectors::InstalledConnector::launch_probe`]). A launch that has one
     /// runs it before anything starts, records the mode it read in the launch's profile, and is
-    /// refused by name where the package says the application cannot run with that mode in a
-    /// Windows service session and this worker is in one.
+    /// refused by name where this worker is in a Windows service session and either the package
+    /// says the application cannot run with that mode there, or the probe did not finish in time
+    /// for a package that says so of any mode, since the mode is then unknown.
     #[must_use]
     pub fn with_launch_probe(mut self, probe: kr_plugin_sdk::launch_probe::LaunchProbe) -> Self {
         self.launch_probe = Some(probe);
@@ -1102,7 +1122,8 @@ impl NativeGateway {
     /// credential as a file, [`BrokerError::Launch`] when the intent is stale,
     /// [`BrokerError::PreconditionFailed`] on Windows when there is no session job to hold the
     /// launch, the session is closing, a vendor's own sandbox cannot run under the jobs the launch
-    /// would start in, or the application's package refuses the mode it is configured for, and
+    /// would start in, the application's package refuses the mode it is configured for, or its
+    /// probe did not finish in time where the package refuses a mode in this session, and
     /// [`BrokerError::LedgerUnavailable`] when the directory is not private, or the process cannot
     /// be started or its files written.
     pub fn launch(
@@ -1165,7 +1186,8 @@ impl NativeGateway {
         refuse_what_a_vendor_sandbox_cannot_run_under(&session, intent.profile.ownership)?;
         // What the application's own package reads of the mode it will run in, before anything
         // starts: the profile records it, and a mode the package says cannot run in this session
-        // is a named failure now rather than a launch that hangs.
+        // (or a mode its probe did not finish reading, which may be one) is a named failure now
+        // rather than a launch that hangs.
         let probed = self.read_vendor_mode(intent)?;
         let intent = &probed;
         crate::broker::process::check_private_directory(&self.runtime_directory)?;
@@ -1307,7 +1329,7 @@ impl NativeGateway {
         );
         if let Some(mode) = probed.mode.as_deref()
             && probe.refuses_in_service_session(mode)
-            && in_service_session()
+            && self.in_service_session
         {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
@@ -1317,16 +1339,22 @@ impl NativeGateway {
                 ),
             });
         }
-        // A probe that gave no answer leaves the mode unknown, and where the package refuses some
-        // mode in a service session the unknown one may be that mode. What the host cannot read
-        // it does not guess at, so there the launch does not go ahead on a guess.
-        if probed.late && !probe.refused_in_service_session.is_empty() && in_service_session() {
+        // A probe that did not finish leaves the mode unknown, and where the package refuses some
+        // mode in a service session the unknown one may be that mode. This differs from a probe
+        // that finished and printed nothing a mode can be read from: that is an application that
+        // answered, and what the host cannot read it does not guess at, so such a launch goes
+        // ahead and records no mode. A probe that did not finish may only be slow, and a launch
+        // that goes ahead on that would let a refused mode through unseen.
+        if probed.late && !probe.refused_in_service_session.is_empty() && self.in_service_session {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
-                    "the application did not report the mode it runs in within {} ms, and its \
-                     package says some modes cannot run in a Windows service session, and this \
-                     worker runs in one, so the mode is unknown and nothing was started",
-                    self.probe_deadline.as_millis()
+                    "the mode the application runs in is unknown, and its package says some modes \
+                     cannot run in a Windows service session, and this worker runs in one, so \
+                     nothing was started: {}",
+                    probed
+                        .unread
+                        .as_deref()
+                        .unwrap_or("its probe did not finish")
                 ),
             });
         }
