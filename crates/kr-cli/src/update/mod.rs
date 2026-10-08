@@ -1052,7 +1052,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         // The release that is current is not an update to go on past a failed one with: the daemons
         // it left unstarted are still owed.
         if let (Some(why), Some(failed)) = (left, record.update.as_ref()) {
-            return Err(left_part_way(&why, &failed.source));
+            return Err(left_part_way(&why, &failed.source, true));
         }
         return Ok(Updated {
             target: source.clone(),
@@ -1738,18 +1738,28 @@ async fn hand_over(
     let written = record.write(store);
     drop(held);
     drop(install);
+    let went_from = record.update.as_ref().map(|update| update.source.clone());
     let restarted = match record.update.as_ref() {
         Some(update) => start_recorded(store, update, true).await,
         None => Ok(Vec::new()),
     }
     .map_err(|failed| {
+        // An update that does not start can be gone back from; a rollback goes back to a release
+        // that is older than the one it left, and a daemon that does not start there is started by
+        // an update, which is where a host goes from here.
+        let goes_back = match (&went_from, report.rolled_back) {
+            (Some(source), false) => shown!(
+                ", and kr host rollback goes back to {}",
+                crate::shown::release(source)
+            ),
+            _ => Shown::said(""),
+        };
         CliError::Other(shown!(
             "this host's current release is {} now, and a control daemon the update stopped did \
-             not start from it: {}; {} starts it before anything else, and kr host rollback goes \
-             back to the release before",
+             not start from it: {}; the next kr host update starts it before anything else{}",
             crate::shown::release(&target.release),
             failed.said(),
-            "kr host update"
+            goes_back
         ))
     })?;
     written?;
@@ -2206,22 +2216,30 @@ async fn recover(store: &Store, record: &mut Record, how: Recovery) -> Result<Re
             Ok(Recovered::Settled)
         }
         Err(failed) if switched => Ok(Recovered::Failed(failed.said())),
-        Err(failed) => Err(left_part_way(&failed.said(), &update.source)),
+        Err(failed) => Err(left_part_way(&failed.said(), &update.source, false)),
     }
 }
 
 /// What a run says when an update an earlier run left is not settled: the daemon that does not start,
-/// what starts it, and what goes back.
+/// what starts it, and, for an update that switched, what goes back.
 #[cfg(unix)]
-fn left_part_way(why: &Shown, source: &ReleaseName) -> CliError {
-    CliError::Other(shown!(
-        "an update an earlier run left part way is not settled yet: a control daemon it stopped \
-         did not start again, and the next {} starts it before anything else, or kr host rollback \
-         goes back to {}: {}",
-        RUN_AGAIN,
-        crate::shown::release(source),
-        why.clone()
-    ))
+fn left_part_way(why: &Shown, source: &ReleaseName, switched: bool) -> CliError {
+    if switched {
+        CliError::Other(shown!(
+            "an update an earlier run left part way is not settled yet: a control daemon it \
+             stopped did not start again, and the next kr host update starts it before anything \
+             else, while kr host rollback goes back to {}: {}",
+            crate::shown::release(source),
+            why.clone()
+        ))
+    } else {
+        CliError::Other(shown!(
+            "an update an earlier run left part way is not settled yet: a control daemon it \
+             stopped did not start again, and the next {} starts it before anything else: {}",
+            RUN_AGAIN,
+            why.clone()
+        ))
+    }
 }
 
 /// Asks whether each daemon `update` recorded, and each of a failed update it went on past, answers
