@@ -343,19 +343,29 @@ impl Controller {
             };
             match kr_ipc::identity::process_state(&worker.process_identity) {
                 kr_ipc::identity::ProcessState::Ended => {
-                    // A worker that handed over its own closure before it went has nothing more to
-                    // stop; one that did not is a crash, and what its session still owned is
-                    // stopped before its identity is released.
-                    if matches!(
+                    // A worker that handed over its own closure before it went has stopped what it
+                    // owned, and its account is the record. One that did not is a crash, and what
+                    // its session still owned is stopped before its identity is released.
+                    let finished = if self.recovered_closure(session_id).is_some() {
+                        self.record_final(
+                            session_id,
+                            reason,
+                            &worker.process_identity,
+                            &crate::archive::Fenced::nothing(session_id),
+                            true,
+                        )
+                        .await
+                        .map(Some)
+                    } else {
                         self.crash_flight(
                             session_id,
                             worker.display_number,
                             &worker.process_identity,
                             reason,
                         )
-                        .await,
-                        Ok(Some(_))
-                    ) {
+                        .await
+                    };
+                    if matches!(finished, Ok(Some(_))) {
                         // The closure this watcher was waiting on has finished, so what it was
                         // counted as is over. Whoever asked for it is not waiting for this.
                         self.review_power_soon();
