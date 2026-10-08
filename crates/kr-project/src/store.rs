@@ -755,12 +755,13 @@ impl Store {
             // location means. Version 8 is where a staging path that is still there records why,
             // when a removal of it stopped part way; an earlier row says nothing. Version 9 is where
             // a repository records whether its path is its working tree's top level, which an
-            // adoption through a directory below the top level is not. Version 10 is where an
-            // independent clone's workspace records its own Git directory; a clone an earlier
-            // build recorded has none, and the first open that writes records the directory it
-            // finds. Each is a version of its own because a store already at the version before
-            // has neither column, and a store at the version this build reads is not migrated at
-            // all.
+            // adoption through a directory below the top level is not. Each of these is a version
+            // of its own because a store already at the version before has neither column, and a
+            // store at the version this build reads is not migrated at all. Version 10 gives the
+            // columns that record an independent clone's workspace's own Git directory a version of
+            // their own too: they arrived while the store stood at 8, so its step adds them to a
+            // store that lacks them and changes no value, and the first open that writes a clone's
+            // record fills them.
             //
             // This arm serves a store written under any earlier version. Remove it, with
             // `rebuild_retained_items`, `protect_recorded_reasons`, `protect_recorded_answers` and
@@ -5155,22 +5156,28 @@ mod tests {
     }
 
     #[test]
-    fn a_store_at_version_nine_gains_the_git_directory_of_its_clones() {
-        // Version 9 had no record of an independent clone's own Git directory. The store is made
-        // by this build and then given the earlier shape, so that what the step adds is exactly
-        // what this build reads: a workspace recorded then reads as a clone with no directory
-        // recorded yet, which is what it is.
+    fn a_store_a_release_wrote_gains_the_git_directory_of_its_clones() {
+        // A release wrote its store at version 8, without the record of an independent clone's own
+        // Git directory and without the flag of a project's top level. The store is made by this
+        // build and then given that shape, so that what the step adds is exactly what this build
+        // reads: a workspace recorded then reads as a clone with no directory recorded yet, which
+        // is what it is.
         let directory = tempfile::tempdir().expect("a directory");
-        let journal = directory.path().join("nine.sqlite");
+        let journal = directory.path().join("release.sqlite");
         drop(Store::open(&journal, environment()).expect("this build makes a store"));
-        let nine = Connection::open(&journal).expect("the store opens");
+        let release = Connection::open(&journal).expect("the store opens");
         for column in ["git_dir_device", "git_dir_file_id", "git_dir_fs"] {
-            nine.execute_batch(&format!("ALTER TABLE workspaces DROP COLUMN {column};"))
-                .expect("the version-9 shape lacks the column");
+            release
+                .execute_batch(&format!("ALTER TABLE workspaces DROP COLUMN {column};"))
+                .expect("the release's shape lacks the column");
         }
-        nine.execute("UPDATE schema_version SET version = 9", [])
-            .expect("the store is at version 9");
-        drop(nine);
+        release
+            .execute_batch("ALTER TABLE projects DROP COLUMN path_is_top_level;")
+            .expect("the release's shape lacks the flag");
+        release
+            .execute("UPDATE schema_version SET version = 8", [])
+            .expect("the store is at version 8");
+        drop(release);
         let store = Store::open(&journal, environment()).expect("this build opens it");
         for column in ["git_dir_device", "git_dir_file_id", "git_dir_fs"] {
             let present: i64 = store
@@ -5187,7 +5194,7 @@ mod tests {
             .connection
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .expect("the version reads");
-        assert_eq!(version, 10, "a store at version 9 is brought to version 10");
+        assert_eq!(version, 10, "a store at version 8 is brought to version 10");
         assert_eq!(version, SCHEMA_VERSION);
     }
 
