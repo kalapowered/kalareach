@@ -227,19 +227,24 @@ impl Gateway {
         let mut secret = [0_u8; 32];
         kr_crypto::random_bytes(&mut secret).expect("a secret");
         let issued = self.stamp();
+        let mut state = self.state();
+        // An identifier the gateway already holds is issued again as the Worker does: the next
+        // revision, a new bearer that retires the last, and the hour after a renewal opened.
+        let earlier = state
+            .authorisations
+            .get(&sender_record_id)
+            .map(|held| held.revision);
         let authorisation = Authorisation {
             installation_id,
             host_signing_key,
             state: PushSenderState::Active,
-            revision: 1,
+            revision: earlier.map_or(1, |revision| revision + 1),
             secret,
             expires_at_ms: issued + self.lifetime(),
-            renewed_at_ms: 0,
+            renewed_at_ms: if earlier.is_some() { issued } else { 0 },
         };
         let credential = Self::credential_of(sender_record_id, &authorisation, issued);
-        self.state()
-            .authorisations
-            .insert(sender_record_id, authorisation);
+        state.authorisations.insert(sender_record_id, authorisation);
         credential
     }
 
@@ -3540,6 +3545,19 @@ async fn removing_a_paired_devices_destination_ends_its_delivery_and_leaves_it_p
         "the device is still paired"
     );
 
+    until("the debt being paid", || owed(&environment).is_empty()).await;
+
+    // Nothing reaches the device now, and the authorisation that was revoked is not registered
+    // again.
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until_the_questions_are_settled(&environment, 1).await;
+    assert!(environment.gateway.delivered().is_empty());
+    let refused = phone
+        .register(&environment, &credential)
+        .await
+        .expect_err("a revoked authorisation is not registered again");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+
     let again = environment.gateway.issue(
         PushSenderRecordId::new(uuid(0x6e)),
         phone.installation(),
@@ -3550,4 +3568,104 @@ async fn removing_a_paired_devices_destination_ends_its_delivery_and_leaves_it_p
         .await
         .expect("another authorisation registers");
     assert!(environment.destination(phone.device_id()).is_some());
+    // The destination the removal ended stays in the journal as history, and registering again
+    // does not owe the gateway the revocation it already took.
+    assert!(owed(&environment).is_empty());
+}
+
+/// KR-REQ-16.12: a bearer past its expiry is not presented because a renewal failed. The renewal
+/// ahead of need that fails leaves a bearer that still works to carry the notification; one that
+/// no longer works is renewed first, and the notification waits for the renewal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_renewal_that_fails_leaves_a_bearer_past_its_expiry_unpresented() {
+    use kr_delivery::journal::DeliveryState;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x6f));
+    // A credential that expires a moment after it is registered.
+    environment.gateway.issue_for(3_000);
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let expires_at = credential.expires_at_ms.get();
+    until("the credential expiring", || now() >= expires_at).await;
+
+    environment
+        .gateway
+        .answer_route_with(RENEW_ROUTE, Some((503, "unavailable")));
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the notification waiting for a renewal", || {
+        environment
+            .deliveries_to(&phone.device_id().to_string())
+            .first()
+            .is_some_and(|record| {
+                record.state == DeliveryState::Retrying
+                    && record
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("has to be renewed"))
+            })
+    })
+    .await;
+    assert!(
+        environment.gateway.delivered().is_empty(),
+        "the expired bearer was not presented"
+    );
+    assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+/// KR-REQ-24.12: removing a destination takes back what waits for it, unsent, and says how much.
+/// The destination had asked for later, so nothing of the message had left; and what is queued for
+/// a destination that is removed is not sent when it asks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn removing_a_destination_takes_back_what_waits_for_it_and_says_so() {
+    use kr_delivery::journal::DeliveryState;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    environment
+        .gateway
+        .answer_route_with("/in/slow", Some((429, "later")));
+    environment
+        .configure(&webhook(
+            "slow",
+            "https://hooks.example.test/in/slow",
+            Some("Idempotency-Key"),
+            phone.record.grant.grant_id,
+        ))
+        .await
+        .expect("a webhook");
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the destination asking for later", || {
+        environment
+            .deliveries_to("slow")
+            .first()
+            .is_some_and(|record| record.state == DeliveryState::Retrying)
+    })
+    .await;
+
+    let removed = environment.remove("slow").await.expect("removed");
+    assert!(removed.found);
+    assert_eq!(removed.revoked.get(), 1, "the message that waited");
+    assert_eq!(removed.unresolved.get() + removed.fenced.get(), 0);
+    assert_eq!(
+        environment
+            .deliveries_to("slow")
+            .first()
+            .map(|record| record.state),
+        Some(DeliveryState::Revoked)
+    );
+    environment.gateway.answer_route_with("/in/slow", None);
+    let posts = environment.gateway.posted().len();
+    environment
+        ._worker
+        .ask("deploy-2", "Deploy the release again?");
+    until_the_questions_are_settled(&environment, 2).await;
+    assert_eq!(environment.gateway.posted().len(), posts);
 }
