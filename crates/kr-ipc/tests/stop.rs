@@ -166,3 +166,66 @@ fn there_is_no_request_to_end_that_is_not_the_end() {
     );
     assert_eq!(process_state(&identity), ProcessState::Running);
 }
+
+/// A process that runs a new program between the reading and the signal has the identifier and
+/// start that were recorded and a new version, and the kernel answers the old version with no such
+/// process. That is not the process having ended: it is stopped under the version it has now.
+///
+/// The process waits on a pipe until the stop has read it, then runs a new program, and the test
+/// waits for the new program before the signal is sent.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_process_that_runs_a_new_program_while_it_is_being_stopped_is_still_stopped() {
+    let directory = std::env::temp_dir().join(format!("kr-stop-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("a directory for the pipe");
+    let pipe = directory.join("go");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("makes the pipe")
+            .success()
+    );
+    let mut child = Reaped(
+        Command::new("/bin/sh")
+            .args(["-c", "read line < \"$0\"; exec sleep 600"])
+            .arg(&pipe)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("starts the process"),
+    );
+    let identity = identity_of(&child.0);
+    let pid = child.0.id().to_string();
+
+    let release = pipe.clone();
+    let stopped = kr_ipc::identity::after_instance_read(
+        move || {
+            std::fs::write(&release, b"go\n").expect("lets the process go on");
+            let started = Instant::now();
+            loop {
+                let program = Command::new("/bin/ps")
+                    .args(["-o", "comm=", "-p", &pid])
+                    .output()
+                    .expect("asks for the program");
+                if String::from_utf8_lossy(&program.stdout).contains("sleep") {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "the process runs its new program"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        },
+        || stop_process(&identity, Stop::Terminate),
+    );
+
+    assert!(
+        matches!(stopped, Stopped::Signalled),
+        "the same process under its new version is signalled: {stopped:?}"
+    );
+    assert!(ended(&mut child.0), "and it ends");
+    let _ = std::fs::remove_dir_all(&directory);
+}
