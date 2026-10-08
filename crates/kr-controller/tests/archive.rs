@@ -1005,36 +1005,53 @@ async fn a_process_the_platform_will_not_stop_is_named_and_the_coverage_stays_in
 /// A claim of completeness is read off the report it sits in: a process the report names as still
 /// running is never inside a complete claim, whatever else ended or was confirmed.
 ///
-/// Two processes the platform will not let this host stop, one of which has ended by the time the
-/// cleanup is done, must leave the other named and the coverage incomplete. It needs a boundary
-/// the cleanup can confirm without a service manager, so it runs where one exists: Windows (the
-/// worker's job) and Linux (a control group the record names, gone under a parent that is there,
-/// which the kernel reads as empty).
+/// Two processes the platform will not let this host stop: the second ends on its own right after
+/// its refusal, so the cleanup sees it refused and then ended, after it has seen the first
+/// refused and still running. The first must stay named and the coverage incomplete. It needs a
+/// boundary the cleanup can confirm without a service manager, so it runs where one exists:
+/// Windows (the worker's job) and Linux (a control group the record names, gone under a parent
+/// that is there, which the kernel reads as empty).
 #[cfg(any(windows, target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_survivor_is_never_inside_a_complete_claim_whatever_else_ended() {
     let (_temp, archive) = host();
     let session_id = session();
     let lingering = leftover();
-    let mut leaving = leftover();
+    let leaving = leftover();
     let unit = format!("kr-worker-{}", kr_ipc::new_uuid());
     {
-        let mut record = owned_record(vec![lingering.identity.clone(), leaving.identity.clone()]);
-        record.cgroup = Some(format!("/{unit}.service"));
+        let record = owned_record(vec![lingering.identity.clone(), leaving.identity.clone()]);
+        // On Windows the job is the boundary and no group is named.
+        #[cfg(target_os = "linux")]
+        let record = kr_worker::ownership::OwnedRecord {
+            cgroup: Some(format!("/{unit}.service")),
+            ..record
+        };
         let mut journal = journal_for(&archive, session_id);
         journal
             .record_owned(session_id, &record)
             .expect("records what the session owned");
     }
     kr_controller::testing::refuse_stopping(lingering.identity.clone());
-    kr_controller::testing::refuse_stopping(leaving.identity.clone());
+    let leaving_identity = leaving.identity.clone();
+    kr_controller::testing::refuse_stopping_then(leaving_identity.clone(), move || {
+        // Ending it and collecting it is the process ending on its own.
+        let mut leaving = leaving;
+        leaving.child.kill().expect("ends the second");
+        leaving.child.wait().expect("collects it");
+    });
     let ownership = take(&archive, session_id);
-    leaving.child.kill().expect("ends the second");
-    leaving.child.wait().expect("collects it");
 
     let fenced = archive.fence_owned(&ownership, Some(&unit)).await;
 
     assert!(lingering.running(), "the first still runs");
+    assert!(
+        fenced
+            .ended
+            .iter()
+            .any(|ended| ended.identity == leaving_identity),
+        "the second was refused and then ended: {fenced:?}"
+    );
     assert!(
         fenced
             .surviving
@@ -1043,7 +1060,7 @@ async fn a_survivor_is_never_inside_a_complete_claim_whatever_else_ended() {
                 && resource
                     .detail
                     .starts_with(&format!("process {} ", lingering.identity.pid.get()))),
-        "and is named: {fenced:?}"
+        "and the first is named: {fenced:?}"
     );
     assert_eq!(
         fenced.coverage,
