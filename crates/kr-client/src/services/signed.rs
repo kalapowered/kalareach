@@ -55,6 +55,10 @@
 //! client waits that delay and sends the request once more, signed afresh, and the second answer
 //! is the answer, whatever it is. Never a third send, and never a request that is not safe.
 //!
+//! A caller that schedules its own questions to a service, and holds every one of them to the delays
+//! that service names, builds the exchange with [`SignedService::leaving_delays_to_the_caller`]:
+//! the first answer, delay included, is then the answer, and the caller decides when to ask again.
+//!
 //! # What is never rendered
 //!
 //! A request body carries a credential and an answer carries whatever answered, so the types here
@@ -199,6 +203,9 @@ pub struct SignedService {
     origin: GatewayOrigin,
     http: Arc<dyn ServiceHttp>,
     signer: Arc<dyn ServiceSigner>,
+    /// Whether a request that is safe to repeat goes once more, by itself, after a short delay the
+    /// service stated.
+    repeats_after_a_delay: bool,
 }
 
 impl fmt::Debug for SignedService {
@@ -225,7 +232,16 @@ impl SignedService {
             origin,
             http,
             signer,
+            repeats_after_a_delay: true,
         }
+    }
+
+    /// The same exchange, answering a delay the service stated with that answer and not with a
+    /// second send of its own, for a caller that holds every question it asks to those delays.
+    #[must_use]
+    pub const fn leaving_delays_to_the_caller(mut self) -> Self {
+        self.repeats_after_a_delay = false;
+        self
     }
 
     /// The gateway these calls are addressed to.
@@ -442,7 +458,8 @@ impl SignedService {
         let authorisation = authorisation.as_deref();
         let first = self.post(&url, &request, carriage, authorisation).await?;
 
-        let Some(delay) = send_again_after(repeat, &first) else {
+        let Some(delay) = send_again_after(repeat, &first).filter(|_| self.repeats_after_a_delay)
+        else {
             return Ok((first, repeat));
         };
         tokio::time::sleep(delay).await;

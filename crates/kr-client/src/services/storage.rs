@@ -1014,6 +1014,14 @@ impl ManagedStorageService {
         self
     }
 
+    /// The same client, answering a delay the service stated with that answer and not with a second
+    /// send of its own, for a caller that holds every question it asks to those delays.
+    #[must_use]
+    pub fn leaving_delays_to_the_caller(mut self) -> Self {
+        self.call = self.call.leaving_delays_to_the_caller();
+        self
+    }
+
     /// The gateway this client addresses.
     #[must_use]
     pub const fn origin(&self) -> &GatewayOrigin {
