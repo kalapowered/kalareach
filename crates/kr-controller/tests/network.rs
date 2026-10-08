@@ -5325,6 +5325,8 @@ async fn kr_req_19_01_a_view_only_recipient_attaches_with_no_input() {
 struct Redeemed {
     session: Session,
     grant_id: kr_protocol::ids::GrantId,
+    /// The screen its issuer was shown before the share existed.
+    shown: kr_protocol::sharing::LiveScreenPreview,
     _device: Device,
 }
 
@@ -5390,6 +5392,364 @@ async fn a_redeemed_share(
     Redeemed {
         session,
         grant_id: issued.grant.grant_id,
+        shown: issued
+            .preview
+            .live_screen
+            .0
+            .expect("the owner is shown the screen being shared"),
         _device: viewer,
     }
+}
+
+/// The owner's own terminal on the worker's endpoint: drawn the whole screen, holding the input
+/// lease, and reading every byte the session's output carries.
+struct OwnerTerminal {
+    client: LocalClient,
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    next_sequence: u64,
+    seen: String,
+}
+
+impl OwnerTerminal {
+    async fn start(created: &SessionCreateResult, host: &Host) -> Self {
+        let session_id = created.session.session_id;
+        let mut client = LocalClient::connect(
+            &kr_ipc::paths::Endpoint::from_path(
+                created
+                    .endpoint
+                    .as_ref()
+                    .cloned()
+                    .expect("a live session names its worker"),
+            )
+            .expect("a worker endpoint"),
+            LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("the local terminal reaches the worker");
+        let target = on_session(host.environment_id, session_id);
+        let attached: SessionAttachResult = client
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: false,
+                    dimensions: Nullable::some(created.session.dimensions),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested: [
+                        AttachmentCapability::ObserveTerminal,
+                        AttachmentCapability::Input,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the local terminal attaches")
+            .to_typed()
+            .expect("decodes");
+        let attachment_id = attached.attachment.attachment_id;
+        let lease: InputAcquireResult = client
+            .mutate(
+                Method::InputAcquire,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &InputAcquireParams {
+                    session_id,
+                    attachment_id,
+                    expected_epoch: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the local terminal takes the keys")
+            .to_typed()
+            .expect("decodes");
+        let _: EventsSubscribeResult = client
+            .request(
+                Method::EventsSubscribe,
+                &kr_protocol::recovery::EventsSubscribeParams {
+                    session_id,
+                    attachment_id,
+                    streams: [EventStream::Output].into_iter().collect(),
+                    from_cursor: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the local terminal subscribes")
+            .to_typed()
+            .expect("decodes");
+        Self {
+            client,
+            session_id,
+            attachment_id,
+            epoch: lease.lease.epoch,
+            next_sequence: 0,
+            seen: String::new(),
+        }
+    }
+
+    /// Types `text` and reads the output until `wanted` has come back.
+    async fn type_and_read(&mut self, text: &str, wanted: &str) {
+        let _: InputWriteResult = self
+            .client
+            .request(
+                Method::InputWrite,
+                &InputWriteParams {
+                    session_id: self.session_id,
+                    attachment_id: self.attachment_id,
+                    epoch: self.epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(self.next_sequence),
+                    bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker takes the line")
+            .to_typed()
+            .expect("decodes");
+        self.next_sequence += 1;
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while !self.seen.contains(wanted) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, self.client.recv()).await {
+                Ok(Ok(kr_protocol::envelope::ControlFrame::Notification(notification)))
+                    if notification.event_type.as_str() == "session.output" =>
+                {
+                    if let Ok(event) = notification.payload.to_typed::<OutputEvent>() {
+                        self.seen
+                            .push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    panic!("the terminal's connection ended ({error}): {:?}", self.seen)
+                }
+                Err(_) => panic!("the terminal never read {wanted:?}: {:?}", self.seen),
+            }
+        }
+    }
+}
+
+/// What a share's recipient was sent until `wanted` arrived: the bytes of the session's output and
+/// every other event's fields as one text, and the kinds of event it was sent.
+async fn received_until(
+    events: &mut tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
+    wanted: &str,
+) -> (String, std::collections::BTreeSet<String>) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut seen = String::new();
+    let mut kinds = std::collections::BTreeSet::new();
+    while tokio::time::Instant::now() < deadline && !seen.contains(wanted) {
+        let Ok(Ok(notification)) =
+            tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
+            continue;
+        };
+        kinds.insert(notification.event_type.as_str().to_owned());
+        if notification.event_type.as_str() == "session.output" {
+            let event: OutputEvent = notification.payload.to_typed().expect("an output event");
+            seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+        } else {
+            seen.push_str(&format!("{:?}", notification.payload));
+        }
+    }
+    assert!(
+        seen.contains(wanted),
+        "the recipient never received {wanted:?}: {seen:?}"
+    );
+    (seen, kinds)
+}
+
+/// The title and the link target a screen's text does not show.
+const HIDDEN_TITLE: &str = "title-hidden-5e2";
+const HIDDEN_LINK: &str = "https://example.invalid/link-hidden-5e2";
+const LATER_TITLE: &str = "title-later-8b4";
+const LATER_LINK: &str = "https://example.invalid/link-later-8b4";
+
+/// A command that sets the window title, prints a linked word and then `word`.
+///
+/// The title, the target and the word are cut across the command's own text, so the line the
+/// terminal echoes holds none of them whole: they are in the output only as what the command
+/// writes, and a wait for the word is a wait for the command to have run.
+fn sets_a_title_and_a_link(title: &str, link: &str, word: &str) -> String {
+    let (title_head, title_tail) = title.split_at(2);
+    let (link_head, link_tail) = link.split_at(10);
+    let (word_head, word_tail) = word.split_at(6);
+    format!(
+        "printf '\\033]2;{title_head}%s\\033\\\\\\033]8;;{link_head}%s\\033\\\\a link\\033]8;;\\033\\\\ {word_head}%s\\n' {title_tail} {link_tail} {word_tail}\n"
+    )
+}
+
+/// KR-REQ-25.10 and KR-REQ-10.50: what a recipient is sent of the live screen is what its issuer was
+/// shown. The issuer's preview is the screen's text; a window title and the target of a link are
+/// behind that text, so a recipient is sent neither, in the screen it joins, in the updates that
+/// follow, or in the bytes that follow, whichever way it is served. The owner's own terminal,
+/// drawn the whole screen, is sent both.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer_was_not_shown() {
+    use kr_protocol::sharing::SessionRole;
+
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    // Before anything is shared the screen has a title and a link on it.
+    let mut terminal = OwnerTerminal::start(&created, &host).await;
+    terminal
+        .type_and_read(
+            &sets_a_title_and_a_link(HIDDEN_TITLE, HIDDEN_LINK, "shown-before"),
+            "shown-before",
+        )
+        .await;
+    for told in [HIDDEN_TITLE, HIDDEN_LINK] {
+        assert!(
+            terminal.seen.contains(told),
+            "the owner's terminal is sent {told}: {:?}",
+            terminal.seen
+        );
+    }
+
+    // Two recipients of the one screen, served in the two forms a recipient can be: the session's
+    // bytes, and a rendering of its grid.
+    let raw = a_redeemed_share(
+        &daemon,
+        &host,
+        &owner,
+        &mut local,
+        session_id,
+        SessionRole::Viewer,
+        None,
+    )
+    .await;
+    let drawn = a_redeemed_share(
+        &daemon,
+        &host,
+        &owner,
+        &mut local,
+        session_id,
+        SessionRole::Viewer,
+        None,
+    )
+    .await;
+    for recipient in [&raw, &drawn] {
+        let previewed = recipient.shown.lines.join("\n");
+        assert!(previewed.contains("a link shown-before"), "{previewed:?}");
+        for hidden in [HIDDEN_TITLE, HIDDEN_LINK] {
+            assert!(
+                !previewed.contains(hidden),
+                "the preview shows {hidden}: {previewed:?}"
+            );
+        }
+    }
+    let mut raw_events = raw.session.events();
+    let watching = attach_one(
+        &raw.session,
+        host.environment_id,
+        session_id,
+        &[AttachmentCapability::ObserveTerminal],
+    )
+    .await;
+    let mut restoration = Restoration::start(output_stream(), &raw.session.cursors().await);
+    let params = restoration
+        .subscribe_params(session_id, watching, &[EventStream::Output])
+        .expect("the stream is waiting to subscribe");
+    raw.session
+        .subscribe_events(&params)
+        .await
+        .expect("the share includes the live screen");
+    restoration.subscribed().expect("the order is kept");
+
+    let mut drawn_events = drawn.session.events();
+    let attached: SessionAttachResult = drawn
+        .session
+        .mutate(
+            Method::SessionAttach,
+            on_session(host.environment_id, session_id),
+            None,
+            &ParamsValue::empty(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(created.session.dimensions),
+                terminal_profile_id: Nullable::null(),
+                requested: [AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the attach is settled")
+        .to_typed()
+        .expect("an attachment");
+    let mut restoration = Restoration::start(output_stream(), &drawn.session.cursors().await);
+    let params = restoration
+        .subscribe_params(
+            session_id,
+            attached.attachment.attachment_id,
+            &[EventStream::Output],
+        )
+        .expect("the stream is waiting to subscribe");
+    drawn
+        .session
+        .subscribe_events(&params)
+        .await
+        .expect("the share includes the live screen");
+    restoration.subscribed().expect("the order is kept");
+
+    // The screen each was joined on, and then what the application sets next.
+    terminal
+        .type_and_read(
+            &sets_a_title_and_a_link(LATER_TITLE, LATER_LINK, "shown-after"),
+            "shown-after",
+        )
+        .await;
+    for told in [LATER_TITLE, LATER_LINK] {
+        assert!(
+            terminal.seen.contains(told),
+            "the owner's terminal is sent {told}"
+        );
+    }
+    let (by_bytes, byte_kinds) = received_until(&mut raw_events, "shown-after").await;
+    let (by_rendering, rendering_kinds) = received_until(&mut drawn_events, "shown-after").await;
+    assert!(
+        byte_kinds.contains("session.output"),
+        "one recipient is served the session's bytes: {byte_kinds:?}"
+    );
+    assert!(
+        rendering_kinds.contains("session.projection.snapshot")
+            && rendering_kinds.contains("session.projection.delta"),
+        "the other is served a rendering of its grid, installed and then updated: {rendering_kinds:?}"
+    );
+    for (how, received) in [("bytes", &by_bytes), ("a rendering", &by_rendering)] {
+        for hidden in [HIDDEN_TITLE, HIDDEN_LINK, LATER_TITLE, LATER_LINK] {
+            assert!(
+                !received.contains(hidden),
+                "a recipient served {how} is sent {hidden}: {received:?}"
+            );
+        }
+        assert!(
+            received.contains("a link"),
+            "and is sent the text: {received:?}"
+        );
+    }
+
+    raw.session.close();
+    drawn.session.close();
+    drop(terminal);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
 }

@@ -2384,7 +2384,10 @@ What the grant decides, for every request:
   and "the live screen" means the screen that is showing: a device's attachment is drawn the active
   buffer alone, and the rows of the buffer that is not showing are counted among what its
   restoration did not carry. The exception section 10 names is the visible screen, and never the
-  inactive buffer, the scrollback or the backing transcript.
+  inactive buffer, the scrollback or the backing transcript. It is the screen's text and how that
+  is drawn: no title, no title stack and no link target is sent to a device, in its restoration, in
+  a rendering of the grid, in an update or in the stream that follows, because none of them is in
+  the preview the issuer of a share was shown.
 
 What a subscription carries is a read that goes on after it was answered, so the same decision is
 taken again, as a subscription to the attached session, before each batch the host writes to it,
@@ -4714,7 +4717,9 @@ share is abandoned, and the worker's dispatch lease is not renewed until it ackn
 authority revision again. A share that only waited for the link, or could not open one, leaves the
 link, and the lease, as they were. The request is refused when the notices the issuer states it
 accepted are not the ones the grant carries. A shared live screen can hold text printed long before
-the invitation, so the preview carries the text rather than a description of it. A new recipient
+the invitation, so the preview carries the text rather than a description of it. What the recipient
+is sent is that text and how it is drawn, and nothing behind it: the window title and the target of
+a link are not in the preview, so they are not sent. A new recipient
 receives no historical attachment keys.
 
 **Invitations are single use and they expire.** The default is `session.view` for one hour, from the

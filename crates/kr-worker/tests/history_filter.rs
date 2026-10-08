@@ -8,7 +8,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-10.49 | `one_filter_covers_every_surface_a_grant_reaches`, `a_summary_made_now_from_pre_cutoff_content_is_withheld_or_recomputed`, `derived_data_names_the_interval_and_resources_it_was_built_from` |
-//! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope` |
+//! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope`, `kr_req_10_50_a_live_screen_restoration_carries_no_title_and_no_link_target`, `kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now_or_later` |
 //! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_named_question_is_excepted_only_while_it_is_open`, `a_named_approval_is_excepted_only_while_it_is_current`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
 
 use kr_protocol::gateway::PendingState;
@@ -347,6 +347,177 @@ fn the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing() {
             "{surface} served a live-only invitation"
         );
     }
+}
+
+/// What a screen's text hides: the titles of its window, the title it kept on the stack and the
+/// target of each link. The issuer's preview is the text, so none of this is in it.
+const ICON_TITLE: &str = "icon-title-behind-the-screen";
+const KEPT_TITLE: &str = "kept-title-behind-the-screen";
+const WINDOW_TITLE: &str = "window-title-behind-the-screen";
+const LINK_TARGET: &str = "https://example.invalid/link-target-behind-the-screen";
+const OPEN_LINK_TARGET: &str = "https://example.invalid/open-link-behind-the-screen";
+const LATER_TITLE: &str = "later-title-behind-the-screen";
+const LATER_LINK_TARGET: &str = "https://example.invalid/later-link-behind-the-screen";
+const LATER_OPEN_LINK_TARGET: &str = "https://example.invalid/later-open-link-behind-the-screen";
+
+/// A terminal that set its titles, kept one on the title stack, printed a link and left another
+/// open with the cursor saved inside it, all before an invitation exists.
+fn engine_whose_text_hides_titles_and_links() -> TerminalEngine {
+    let mut engine = TerminalEngine::new(
+        dimensions(80, 24),
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+    .expect("a canonical grid");
+    let stream = format!(
+        "\x1b]1;{ICON_TITLE}\x1b\\\x1b]2;{KEPT_TITLE}\x1b\\\x1b[22;2t\x1b]2;{WINDOW_TITLE}\x1b\\\
+         \x1b]8;;{LINK_TARGET}\x1b\\a linked word\x1b]8;;\x1b\\ and plain text\r\n\
+         \x1b]8;;{OPEN_LINK_TARGET}\x1b\\\x1b7still open"
+    );
+    engine.feed(0, stream.as_bytes(), LaneGate::default());
+    engine
+}
+
+/// Everything a set of projection events carries, as one text a test can search.
+fn carried_by(events: &[kr_worker::snapshot::Outgoing]) -> String {
+    format!(
+        "{:?}",
+        events
+            .iter()
+            .map(|outgoing| &outgoing.event)
+            .collect::<Vec<_>>()
+    )
+}
+
+#[test]
+fn kr_req_10_50_a_live_screen_restoration_carries_no_title_and_no_link_target() {
+    let mut engine = engine_whose_text_hides_titles_and_links();
+    let mut restored = |scope| {
+        let (_, restoration, _) = engine.restoration(
+            dimensions(80, 24),
+            LaneGate::default(),
+            kr_worker::render::Keyboard::Install,
+            scope,
+        );
+        String::from_utf8_lossy(&restoration.bytes).into_owned()
+    };
+    let whole = restored(Scope::WholeScreen);
+    for told in [ICON_TITLE, WINDOW_TITLE, LINK_TARGET, OPEN_LINK_TARGET] {
+        assert!(
+            whole.contains(told),
+            "the unrestricted owner is told {told}: {whole:?}"
+        );
+    }
+
+    let live = restored(Scope::LiveScreen);
+    for hidden in [
+        ICON_TITLE,
+        KEPT_TITLE,
+        WINDOW_TITLE,
+        LINK_TARGET,
+        OPEN_LINK_TARGET,
+    ] {
+        assert!(
+            !live.contains(hidden),
+            "a caller shown the live screen is not told {hidden}: {live:?}"
+        );
+    }
+    assert!(
+        live.contains("a linked word") && live.contains("and plain text"),
+        "the text the preview shows is drawn: {live:?}"
+    );
+}
+
+#[test]
+fn kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now_or_later() {
+    let mut engine = engine_whose_text_hides_titles_and_links();
+    let window = Window::live(dimensions(80, 24));
+    let mut installed = |scope| {
+        engine
+            .projection_install(
+                window,
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                kr_worker::output::DEFAULT_SEND_QUEUE_BYTES,
+                scope,
+            )
+            .expect("a snapshot")
+            .0
+    };
+    let whole = carried_by(&installed(Scope::WholeScreen).events);
+    for told in [
+        ICON_TITLE,
+        KEPT_TITLE,
+        WINDOW_TITLE,
+        LINK_TARGET,
+        OPEN_LINK_TARGET,
+    ] {
+        assert!(
+            whole.contains(told),
+            "the unrestricted owner is told {told}: {whole:?}"
+        );
+    }
+
+    let live = installed(Scope::LiveScreen);
+    let screen = carried_by(&live.events);
+    for hidden in [
+        ICON_TITLE,
+        KEPT_TITLE,
+        WINDOW_TITLE,
+        LINK_TARGET,
+        OPEN_LINK_TARGET,
+    ] {
+        assert!(
+            !screen.contains(hidden),
+            "a caller shown the live screen is not told {hidden}: {screen:?}"
+        );
+    }
+    assert!(
+        screen.contains("a linked word") && screen.contains("and plain text"),
+        "the text the preview shows is installed: {screen:?}"
+    );
+
+    // What the application sets afterwards is held to the same rule: a title or a link the issuer
+    // could not have been shown is not sent in an update either.
+    let held = kr_worker::snapshot::Held {
+        base: live.base,
+        viewport: engine.anchored_viewport(window),
+        screen_top_row: engine.live_top_row(),
+    };
+    // A new title, kept on the stack, a linked word and a link left open.
+    let later = format!(
+        "\r\n\x1b]2;{LATER_TITLE}\x1b\\\x1b[22;2t\
+         \x1b]8;;{LATER_LINK_TARGET}\x1b\\a later word\x1b]8;;\x1b\\\
+         \x1b]8;;{LATER_OPEN_LINK_TARGET}\x1b\\"
+    );
+    let at = engine.output_cursor();
+    engine.feed(at, later.as_bytes(), LaneGate::default());
+    let advanced = |scope| {
+        let kr_worker::snapshot::Owed::Update(update) = engine
+            .projection_advance(held, window, scope)
+            .expect("an answer")
+        else {
+            panic!("the change is a bounded update");
+        };
+        carried_by(&update.events)
+    };
+    let owner = advanced(Scope::WholeScreen);
+    for told in [LATER_TITLE, LATER_LINK_TARGET, LATER_OPEN_LINK_TARGET] {
+        assert!(
+            owner.contains(told),
+            "the unrestricted owner is told {told}: {owner:?}"
+        );
+    }
+    let update = advanced(Scope::LiveScreen);
+    for hidden in [LATER_TITLE, LATER_LINK_TARGET, LATER_OPEN_LINK_TARGET] {
+        assert!(
+            !update.contains(hidden),
+            "a caller shown the live screen is not told {hidden}: {update:?}"
+        );
+    }
+    assert!(
+        update.contains("a later word"),
+        "the text is sent: {update:?}"
+    );
 }
 
 #[test]

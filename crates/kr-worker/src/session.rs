@@ -126,7 +126,7 @@ pub struct CloseAcceptance {
 /// One thing a batch of output has for the attachments, in the order the application produced it.
 enum Piece {
     /// A span of the raw stream a terminal may take unchanged, and the cursor it starts at.
-    Span(u64, Vec<u8>),
+    Span(crate::projection::DirectSpan),
     /// A side effect for the attachment holding the input lease.
     Effect(OwedEffect),
 }
@@ -136,7 +136,7 @@ impl Piece {
     /// cursor.
     fn order(&self) -> (u64, bool) {
         match self {
-            Self::Span(cursor, _) => (*cursor, false),
+            Self::Span(span) => (span.cursor, false),
             Self::Effect(owed) => (owed.effect.at, true),
         }
     }
@@ -3646,12 +3646,7 @@ impl Session {
         // the lease holder are two views of the same output, and the holder receives both, so they
         // are published in the order the application produced them.
         let mut pieces: Vec<Piece> = Vec::with_capacity(filtered.direct.len() + effects.len());
-        pieces.extend(
-            filtered
-                .direct
-                .into_iter()
-                .map(|(cursor, bytes)| Piece::Span(cursor, bytes)),
-        );
+        pieces.extend(filtered.direct.into_iter().map(Piece::Span));
         pieces.extend(effects.into_iter().map(Piece::Effect));
         pieces.sort_by_key(Piece::order);
         for piece in pieces {
@@ -3659,11 +3654,16 @@ impl Session {
                 Piece::Effect(owed) => {
                     self.deliver_effect(&owed, oldest, &mut resynchronised, &mut unrecorded);
                 }
-                Piece::Span(cursor, bytes) => {
+                Piece::Span(span) => {
+                    // What each subscriber is sent of the span is decided by how much of the
+                    // screen its caller's authority reaches, read where that is recorded.
+                    let scopes = &self.content_scopes;
                     resynchronised.extend(self.hub.publish_direct(
-                        cursor,
-                        &Arc::new(bytes),
+                        span.cursor,
+                        &Arc::new(span.bytes),
+                        &span.behind_the_screen,
                         oldest,
+                        |attachment_id| scopes.get(&attachment_id).copied().unwrap_or_default(),
                     ));
                 }
             }
