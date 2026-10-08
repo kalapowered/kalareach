@@ -136,7 +136,7 @@ impl Controller {
         // Every write this makes happens while the registry guard is held, and the guard goes
         // before the fence, which takes it again. The block is what drops it: nothing this holds
         // may be alive across the await below.
-        let (revocation, lapsed, owes, own) = {
+        let (revocation, lapsed, owes, own, recorded) = {
             let registry = match carried {
                 Some(carried) => {
                     let registry = self.registry.lock().await;
@@ -214,19 +214,23 @@ impl Controller {
             // never be retired. A record that could not be marked answers with its error, and what
             // it published is left to the debt pass.
             let own = own.and(self.publish_debts(&Self::host_wide(record_debt)));
-            recorded?;
-            if lapsed.is_none() {
+            if recorded.is_ok() && lapsed.is_none() {
                 self.unbind_device(device_id);
             }
             let owes = revocation.debt.is_some() || record_debt.is_some();
-            (revocation, lapsed, owes, own)
+            (revocation, lapsed, owes, own, recorded)
         };
         // The device is unpaired, so the host stops delivering to it, forgets what it delivers
         // under and owes the gateway a revocation (section 16). A revocation the admission lapsed
-        // before it began changed nothing and ends nothing.
+        // before it began changed nothing and ends nothing. A device record that could not be
+        // marked revoked ends the destination all the same: the grants are withdrawn, the
+        // destination sends under the device's own pairing grant, which the unmarked record still
+        // holds, and nothing else would stop it. The error is answered after the destination is
+        // ended.
         if lapsed.is_none() {
             self.retire_push_destination(device_id);
         }
+        recorded?;
         match lapsed {
             // Nothing was withdrawn and nothing is owed, so there is nothing to finish.
             Some(error) if !owes => Err(error),
