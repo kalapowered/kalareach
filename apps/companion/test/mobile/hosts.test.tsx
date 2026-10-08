@@ -102,9 +102,9 @@ describe('the Hosts screen of a phone', () => {
 
 describe('forgetting a host on a phone', () => {
   // KR-REQ-13.08: a host this phone cannot reach any more, one that revoked it among them, stays
-  // listed until the person forgets it. Forgetting asks first, because this phone must pair with
-  // the host again to reach it; the safe answer has the focus, and keeping the host puts it back
-  // where it was.
+  // listed until the person forgets it. Forgetting asks first, because this phone cannot reach the
+  // host again from here; the safe answer has the focus, and keeping the host puts it back where it
+  // was.
   it('asks before it forgets a host, and forgets it once the person says so', async () => {
     const { controls } = start()
     await openTab('Hosts')
@@ -114,6 +114,11 @@ describe('forgetting a host on a phone', () => {
     await userEvent.click(await screen.findByTestId('forget-host'))
     const question = await screen.findByTestId('forget-host-ask')
     expect(question).toHaveTextContent('Forget studio?')
+    // What is true now: the host keeps any access it still gives this phone, and the phone does
+    // not promise a way back that the host would refuse.
+    expect(question).toHaveTextContent('keeps any access it still gives this phone')
+    expect(question).not.toHaveTextContent('pair with it again')
+    expect(question).not.toHaveTextContent('confirming requests')
     expect(screen.getByTestId('keep-host')).toHaveFocus()
     expect(controls.forgottenHosts).toEqual([])
 
@@ -171,8 +176,24 @@ describe('forgetting a host on a phone', () => {
     expect((await screen.findByTestId('forget-host-failure')).textContent).toContain(
       'could not change its records'
     )
-    expect(screen.getByTestId('forget-host-confirm')).toBeEnabled()
+    // The button the person pressed keeps the focus through the refusal, and can be pressed again.
+    const confirm = screen.getByTestId('forget-host-confirm')
+    expect(confirm).toHaveFocus()
+    expect(confirm).toHaveAttribute('aria-disabled', 'false')
     expect(within(screen.getByTestId('paired-hosts')).getByText('studio')).toBeInTheDocument()
+  })
+
+  // KR-REQ-13.08: a host this phone owns says what else stops: its confirmations.
+  it('says that the phone stops confirming requests when the host is one it owns', async () => {
+    const { controls } = start()
+    await openTab('Hosts')
+    act(() => {
+      controls.setPairing({ hosts: [{ ...STUDIO, owner: true }] })
+    })
+    await userEvent.click(await screen.findByTestId('forget-host'))
+    expect(await screen.findByTestId('forget-host-ask')).toHaveTextContent(
+      'This phone also stops confirming requests from it.'
+    )
   })
 })
 

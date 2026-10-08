@@ -14,6 +14,8 @@
 //! | KR-REQ-13.08 | `a_choice_of_host_that_cannot_be_kept_is_not_made` |
 //! | KR-REQ-13.08 | `a_phone_its_host_revoked_can_forget_that_host` |
 //! | KR-REQ-13.08 | `forgetting_the_host_in_use_ends_the_connection_to_it` |
+//! | KR-REQ-13.08 | `a_forget_whose_write_reports_a_failure_once_the_record_is_gone_still_ends_the_connection` |
+//! | KR-REQ-13.08 | `a_choice_made_from_a_listing_that_has_since_forgotten_the_host_is_refused` |
 //! | KR-REQ-13.08 | `forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_other` |
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
 
@@ -708,6 +710,98 @@ async fn forgetting_the_host_in_use_ends_the_connection_to_it() {
         .expect_err("no command goes to a host that was forgotten");
     assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
     assert!(companion.device().host_in_use().is_none());
+    host.stop().await;
+}
+
+/// KR-REQ-13.08: a write of the records that reports a failure after the record is gone, as one
+/// does whose last step (making the rename durable) fails, is a host forgotten all the same: the
+/// connection to it ends and no host is in use, instead of a host that is no longer listed going on
+/// being reached with nothing left to forget it by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_whose_write_reports_a_failure_once_the_record_is_gone_still_ends_the_connection()
+{
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    let reference = the_host(companion);
+
+    // The rename that removes the record is done and the flush that follows it fails: the write
+    // reports a failure for a record that is gone.
+    let refused = kr_flush::testing::refuse_flushes_of(phone.data.path().join("pairing"));
+    let forgotten = companion
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("a host that is gone from the records is forgotten");
+    drop(refused);
+    assert_eq!(forgotten["connected"], false, "{forgotten}");
+
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    assert_eq!(view["hosts"], json!([]), "{view}");
+    assert!(companion.device().host_in_use().is_none());
+    let refused = companion
+        .call("session_list", every_session())
+        .expect_err("no command goes to a host that was forgotten");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    host.stop().await;
+}
+
+/// KR-REQ-13.08: a choice of host made from a listing that has since forgotten the host is refused
+/// and connects to nothing. The host is found before the choice is made, and a host forgotten in
+/// between is not one to be reached by a task started from what was found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_made_from_a_listing_that_has_since_forgotten_the_host_is_refused() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    let reference = the_host(companion);
+    // What a choice holds once it has found the host and has not yet taken its turn.
+    let found = companion
+        .device()
+        .host_by_reference(&reference)
+        .expect("the host is listed");
+
+    companion
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host is forgotten");
+    let refused = companion_tauri::hosts::use_host(companion.app.handle(), found)
+        .await
+        .expect_err("the host is no longer paired");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::InvalidArgument,
+        "{refused:?}"
+    );
+
+    assert!(companion.device().host_in_use().is_none());
+    let state = companion
+        .call("connection_state", json!({}))
+        .expect("the connection's state");
+    assert_eq!(state["connected"], false, "{state}");
+    assert_eq!(
+        companion
+            .call("pairing_view", json!({}))
+            .expect("the pairing screen")["hosts"],
+        json!([])
+    );
+    // Nothing is taken up when the application starts again either.
+    let restarted = Companion::start(
+        phone.data.path(),
+        support::parts(Arc::clone(&phone.secrets), Arc::clone(&phone.room)),
+        Arc::new(NoOwner),
+        StubPaste::holding("", false),
+    );
+    companion_tauri::hosts::resume(restarted.app.handle());
+    assert_eq!(
+        restarted
+            .call("connection_state", json!({}))
+            .expect("the connection's state")["connected"],
+        false
+    );
     host.stop().await;
 }
 
