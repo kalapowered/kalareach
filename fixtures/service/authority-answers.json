@@ -1,0 +1,2982 @@
+{
+  "decoded": [
+    {
+      "outcome": "feed of the host, host device known false, 0 records [], more false, after 0; summary: revision None, last acknowledgement None, outstanding 0, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the host reads a feed nobody has written to, for its summary"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 0 records [], more false, after 0; summary: revision None, last acknowledgement None, outstanding 0, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the host reads its records"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 0 records [], more false, after 0; summary: revision None, last acknowledgement None, outstanding 0, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "a remote owner reads the host's feed"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 1 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement None, refused None], more false, after 1; summary: revision None, last acknowledgement None, outstanding 1, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the owner publishes a revocation request"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 1 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement None, refused None], more false, after 1; summary: revision None, last acknowledgement None, outstanding 1, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the owner publishes it again"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "the owner publishes another request under the same identity"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 1 records [2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision None, last acknowledgement None, outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "a stranger publishes a request of its own"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "the owner carries a request another key signed"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "the owner publishes a request altered after it was signed"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement None, refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision None, last acknowledgement None, outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the host reads what was published"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 1 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement None, refused None], more false, after 1; summary: revision None, last acknowledgement None, outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the owner reads only what it published"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 1 records [2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision None, last acknowledgement None, outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the stranger reads only what it published"
+    },
+    {
+      "outcome": "feed of the host, host device known false, 1 records [2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision None, last acknowledgement None, outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the host reads from a cursor"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement None, refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision Some(1), last acknowledgement None, outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the host issues its first revision"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement None, refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision Some(1), last acknowledgement None, outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known false",
+      "step": "the host sends it again"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "the host sends another record under the same number"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "the host sends a revision that does not follow the one the feed holds"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host sends a revision that is not above the one it follows"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Pending { pending_workers: U64(1) })), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision Some(1), last acknowledgement Some((1, Pending { pending_workers: U64(1) })), outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known true",
+      "step": "the host reports progress on the request"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Pending { pending_workers: U64(1) })), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision Some(1), last acknowledgement Some((1, Pending { pending_workers: U64(1) })), outstanding 2, removed false, removal keys [], poll every 30 seconds, acknowledged at known true",
+      "step": "the host reads the record, which is still outstanding"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host reports an older acknowledgement"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Complete)), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused None], more false, after 2; summary: revision Some(1), last acknowledgement Some((1, Complete)), outstanding 1, removed false, removal keys [], poll every 30 seconds, acknowledged at known true",
+      "step": "the host acknowledges the request as complete"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host reports progress after completion"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host acknowledges under a revision it never issued"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host acknowledges a request the revision did not apply"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host acknowledges a request nobody published"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Complete)), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused Some(NoOwnerAuthority)], more false, after 2; summary: revision Some(1), last acknowledgement Some((1, Complete)), outstanding 0, removed false, removal keys [], poll every 30 seconds, acknowledged at known true",
+      "step": "the host refuses the stranger's request"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Complete)), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused Some(NoOwnerAuthority)], more false, after 2; summary: revision Some(1), last acknowledgement Some((1, Complete)), outstanding 0, removed false, removal keys [], poll every 30 seconds, acknowledged at known true",
+      "step": "the host refuses it again"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host refuses a request nobody published"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Complete)), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused Some(NoOwnerAuthority)], more false, after 2; summary: revision Some(2), last acknowledgement Some((1, Complete)), outstanding 0, removed false, removal keys [], poll every 30 seconds, acknowledged at known true",
+      "step": "the host issues a revision that applies the request it refused"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the host acknowledges the request it refused"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Complete)), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused Some(NoOwnerAuthority)], more false, after 2; summary: revision Some(2), last acknowledgement Some((1, Complete)), outstanding 0, removed false, removal keys [\"the owner\"], poll every 30 seconds, acknowledged at known true",
+      "step": "the host names the owner's key as one that may remove it"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Complete)), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused Some(NoOwnerAuthority)], more false, after 2; summary: revision Some(2), last acknowledgement Some((1, Complete)), outstanding 0, removed false, removal keys [], poll every 30 seconds, acknowledged at known true",
+      "step": "the host names no key"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 2 records [1 a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1 by the owner: acknowledgement Some((1, Complete)), refused None; 2 a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2 by a stranger: acknowledgement None, refused Some(NoOwnerAuthority)], more false, after 2; summary: revision Some(2), last acknowledgement Some((1, Complete)), outstanding 0, removed false, removal keys [\"the owner\"], poll every 30 seconds, acknowledged at known true",
+      "step": "the host names the owner's key again"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "a stranger removes the host"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 0 records [], more false, after 0; summary: revision Some(2), last acknowledgement Some((1, Complete)), outstanding 0, removed true, removal keys [\"the owner\"], poll every 30 seconds, acknowledged at known true",
+      "step": "the owner the host named removes it"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 0 records [], more false, after 0; summary: revision Some(2), last acknowledgement Some((1, Complete)), outstanding 0, removed true, removal keys [\"the owner\"], poll every 30 seconds, acknowledged at known true",
+      "step": "the host reads its feed after its removal"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "the owner publishes to a host that was removed"
+    },
+    {
+      "outcome": "feed of the host, host device known true, 0 records [], more false, after 0; summary: revision Some(2), last acknowledgement Some((1, Complete)), outstanding 0, removed true, removal keys [\"the owner\"], poll every 30 seconds, acknowledged at known true",
+      "step": "the host reads the summary of its removal"
+    }
+  ],
+  "exchanges": [
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "0",
+          "records": [],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": null
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reads a feed nobody has written to, for its summary"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "0",
+          "records": [],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": null
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reads its records"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "0",
+          "records": [],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": null
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "a remote owner reads the host's feed"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "1",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "1",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the owner publishes a revocation request"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "1",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "1",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the owner publishes it again"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "That request identifier has already carried a different request."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "the owner publishes another request under the same identity"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "grants": {
+                    "grant_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "a stranger publishes a request of its own"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "That record names a key other than the one that carried the request."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "the owner carries a request another key signed"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "That record was not signed by the key that carried it."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "the owner publishes a request altered after it was signed"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reads what was published"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "1",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the owner reads only what it published"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "grants": {
+                    "grant_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the stranger reads only what it published"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": null,
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": null,
+            "last_acknowledgement": null,
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": null
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "null",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "grants": {
+                    "grant_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "null",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "null"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reads from a cursor"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": "1",
+            "last_acknowledgement": null,
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.432Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "string",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host issues its first revision"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": null,
+            "authority_revision": "1",
+            "last_acknowledgement": null,
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.432Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": "null",
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "null",
+            "authority_revision": "string",
+            "last_acknowledgement": "null",
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host sends it again"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "That revision has already been issued with different content."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "the host sends another record under the same number"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "A revision follows the revision this feed holds."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "the host sends a revision that does not follow the one the feed holds"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "A revision follows the revision it names."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "the host sends a revision that is not above the one it follows"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "1000",
+                "authority_revision": "1",
+                "completion": {
+                  "pending": {
+                    "pending_workers": "1"
+                  }
+                },
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.445Z",
+            "authority_revision": "1",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "1000",
+              "authority_revision": "1",
+              "completion": {
+                "pending": {
+                  "pending_workers": "1"
+                }
+              },
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.432Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": {
+                  "pending": {
+                    "pending_workers": "string"
+                  }
+                },
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": {
+                "pending": {
+                  "pending_workers": "string"
+                }
+              },
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reports progress on the request"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "1000",
+                "authority_revision": "1",
+                "completion": {
+                  "pending": {
+                    "pending_workers": "1"
+                  }
+                },
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.445Z",
+            "authority_revision": "1",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "1000",
+              "authority_revision": "1",
+              "completion": {
+                "pending": {
+                  "pending_workers": "1"
+                }
+              },
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "2",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.432Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": {
+                  "pending": {
+                    "pending_workers": "string"
+                  }
+                },
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": {
+                "pending": {
+                  "pending_workers": "string"
+                }
+              },
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reads the record, which is still outstanding"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "That acknowledgement is older than the one this record holds."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "the host reports an older acknowledgement"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "2000",
+                "authority_revision": "1",
+                "completion": "complete",
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "1",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "1",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.432Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": "string",
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host acknowledges the request as complete"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "That request has already been acknowledged as complete."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "the host reports progress after completion"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "An acknowledgement names a revision this host has issued."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "the host acknowledges under a revision it never issued"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "An acknowledgement names the revision that applied that request."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "the host acknowledges a request the revision did not apply"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "No such record."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "the host acknowledges a request nobody published"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "2000",
+                "authority_revision": "1",
+                "completion": "complete",
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": "no_owner_authority",
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "1",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.432Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": "string",
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host refuses the stranger's request"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "2000",
+                "authority_revision": "1",
+                "completion": "complete",
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": "no_owner_authority",
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "1",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.432Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": "string",
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host refuses it again"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "No such record."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "the host refuses a request nobody published"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "2000",
+                "authority_revision": "1",
+                "completion": "complete",
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": "no_owner_authority",
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "2",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.470Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": "string",
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host issues a revision that applies the request it refused"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "That request has been refused rather than applied."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "the host acknowledges the request it refused"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "2000",
+                "authority_revision": "1",
+                "completion": "complete",
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": "no_owner_authority",
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "2",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [
+              "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0"
+            ],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.470Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": "string",
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": "string"
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host names the owner's key as one that may remove it"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "2000",
+                "authority_revision": "1",
+                "completion": "complete",
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": "no_owner_authority",
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "2",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.470Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": "string",
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": null
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host names no key"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "2",
+          "records": [
+            {
+              "acknowledgement": {
+                "acknowledged_at_ms": "2000",
+                "authority_revision": "1",
+                "completion": "complete",
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+              },
+              "published_at_ms": "1791486996405",
+              "published_by": "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+              "rejected": null,
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+                "issuer_key_id": "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+                "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "signature": "JWlUxg7za06m7oYQavIWFLfFtGF_yctBQZkLtxm9JBPJuRVS_c4aqwZBefulOmlird_nkykLoNTmlgGRGS0DCw",
+                "target": {
+                  "devices": {
+                    "device_ids": [
+                      "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "1"
+            },
+            {
+              "acknowledgement": null,
+              "published_at_ms": "1791486996414",
+              "published_by": "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do",
+              "rejected": "no_owner_authority",
+              "request": {
+                "host_device_id": "01010101-0101-0101-0101-010101010101",
+                "issued_at_ms": "1700000000000",
+                "issuer_device_id": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+                "issuer_key_id": "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+                "request_id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+                "signature": "1WrkI8S5-a-F7-NWy_CS7dKvyeODgEA2HskoONdKCAwFRQkk5OjrawtEloQKXlL1iBOPA1lrzXt7vVl38TdiBQ",
+                "target": {
+                  "grants": {
+                    "grant_ids": [
+                      "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+                    ]
+                  }
+                }
+              },
+              "sequence": "2"
+            }
+          ],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "2",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [
+              "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0"
+            ],
+            "removed": false,
+            "revised_at": "2026-10-08T19:16:36.470Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": {
+              "acknowledgement": {
+                "acknowledged_at_ms": "string",
+                "authority_revision": "string",
+                "completion": "string",
+                "host_device_id": "string",
+                "request_id": "string"
+              },
+              "published_at_ms": "string",
+              "published_by": "string",
+              "rejected": "null",
+              "request": {
+                "host_device_id": "string",
+                "issued_at_ms": "string",
+                "issuer_device_id": "string",
+                "issuer_key_id": "string",
+                "request_id": "string",
+                "signature": "string",
+                "target": {
+                  "devices": {
+                    "device_ids": {
+                      "array": "string"
+                    }
+                  }
+                }
+              },
+              "sequence": "string"
+            }
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": "string"
+            },
+            "removed": false,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host names the owner's key again"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "The host issues its own revisions, acknowledgements and refusals, and only the host or a key it named removes it."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "a stranger removes the host"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "0",
+          "records": [],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "2",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [
+              "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0"
+            ],
+            "removed": true,
+            "revised_at": "2026-10-08T19:16:36.470Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": null
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": "string"
+            },
+            "removed": true,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the owner the host named removes it"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "0",
+          "records": [],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "2",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [
+              "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0"
+            ],
+            "removed": true,
+            "revised_at": "2026-10-08T19:16:36.470Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": null
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": "string"
+            },
+            "removed": true,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reads its feed after its removal"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "That host has been removed from the feed."
+        },
+        "ok": false
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "the owner publishes to a host that was removed"
+    },
+    {
+      "body": {
+        "data": {
+          "host_device_id": "01010101-0101-0101-0101-010101010101",
+          "host_key_id": "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+          "more": false,
+          "next_after_sequence": "0",
+          "records": [],
+          "summary": {
+            "acknowledged_at": "2026-10-08T19:16:36.453Z",
+            "authority_revision": "2",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "2000",
+              "authority_revision": "1",
+              "completion": "complete",
+              "host_device_id": "01010101-0101-0101-0101-010101010101",
+              "request_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+            },
+            "outstanding": "0",
+            "poll_interval_seconds": 30,
+            "removal_keys": [
+              "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0"
+            ],
+            "removed": true,
+            "revised_at": "2026-10-08T19:16:36.470Z"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/authority/sync",
+      "shape": {
+        "data": {
+          "host_device_id": "string",
+          "host_key_id": "string",
+          "more": "boolean",
+          "next_after_sequence": "string",
+          "records": {
+            "array": null
+          },
+          "summary": {
+            "acknowledged_at": "string",
+            "authority_revision": "string",
+            "last_acknowledgement": {
+              "acknowledged_at_ms": "string",
+              "authority_revision": "string",
+              "completion": "string",
+              "host_device_id": "string",
+              "request_id": "string"
+            },
+            "outstanding": "string",
+            "poll_interval_seconds": "number",
+            "removal_keys": {
+              "array": "string"
+            },
+            "removed": true,
+            "revised_at": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the host reads the summary of its removal"
+    }
+  ],
+  "names": [
+    "NnweE9VUzHEslKwrTBJUOAxJKDolkGO4BfpkXJREtuE",
+    "e4VXG-YBQ6r6yDJi_KcgnSMEOwS_FSlDAsz8bseLp_0",
+    "Pm9iBm2WQ6slvmy00a0mcgp69XiRBYe0BuSXmlEP17U",
+    "XxnzUI0Bw7PblFWvFlvLWzp1bupp6PpTmLn0n5nOhM0",
+    "qhS5dpKLGuR6dANrFMKbYC61pcwB1187Bf8hNXI69Do"
+  ],
+  "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
+  "web_commit": "9347c57e1ada1b593571000f9d67b2e93c1d2836"
+}
