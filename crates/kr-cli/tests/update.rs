@@ -5197,7 +5197,10 @@ async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
     assert!(
         message.contains(&format!("transfers of environment {named}"))
             && message.contains("schema version 1")
-            && message.contains("versions 2 to 2"),
+            && message.contains(&format!(
+                "versions 2 to {}",
+                kr_transfer::store::SCHEMA_VERSION
+            )),
         "the journal that is too old is named: {said}"
     );
     assert!(
