@@ -101,7 +101,8 @@ pub enum Upstream {
 /// component registered for one binding, and a scripted upstream behind the production transport.
 pub struct Acting {
     pub hosted: Hosted,
-    pub runtime: Arc<PluginClient>,
+    /// The connection this test registered the component over, where it registered it by hand.
+    pub runtime: Option<Arc<PluginClient>>,
     pub written: Written,
     /// How the scripted upstream answers.
     pub upstream: Arc<Mutex<Upstream>>,
@@ -111,18 +112,42 @@ pub struct Acting {
     pub _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// How the component comes to be registered with the plugin runtime and handed to the worker.
+enum Registration {
+    /// The test registers it over a connection of its own, and sets that connection on the broker.
+    /// `told` says whether the worker has been told where the component stands, as its link tells
+    /// it once the runtime has the component.
+    ByHand { told: bool },
+    /// The worker's own link asks the daemon for the runtime, registers the component and hands
+    /// the connection to the broker, as it does for a package a person installed.
+    ByLink,
+}
+
 impl Acting {
     pub async fn start() -> Option<Self> {
-        Self::start_with(true).await
+        Self::assemble(Registration::ByHand { told: true }).await
     }
 
     /// Starts the world; `registered` says whether the worker has been told where the component
     /// stands, as its link tells it once the runtime has the component.
     pub async fn start_with(registered: bool) -> Option<Self> {
+        Self::assemble(Registration::ByHand { told: registered }).await
+    }
+
+    /// Starts the world with the worker's own link running: nothing is registered by the test, and
+    /// the plugin runtime is not asked for until the link asks the daemon for it.
+    pub async fn start_linked() -> Option<Self> {
+        Self::assemble(Registration::ByLink).await
+    }
+
+    async fn assemble(registration: Registration) -> Option<Self> {
         let wasm = component("preparing")?;
         let hosted = hosted().await;
         let source = install(&hosted.environment(), &wasm);
-        let runtime = Arc::new(hosted.runtime().await);
+        let runtime = match registration {
+            Registration::ByHand { .. } => Some(Arc::new(hosted.runtime().await)),
+            Registration::ByLink => None,
+        };
         let service = &hosted._service;
         let broker = service.broker();
         let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
@@ -226,31 +251,6 @@ impl Acting {
             async move { owner.serve(upstream_reads, true).await }
         });
 
-        // The component is registered with the runtime the way the worker's link registers it,
-        // and the worker is told where it stands.
-        runtime
-            .register(
-                BindingId::new(binding().get()),
-                &PluginIdentity::new(
-                    PluginId::new("kalareach/preparing").expect("an identifier"),
-                    PackageVersion::parse("1.0.0").expect("a version"),
-                    source.digest,
-                    RepositoryGeneration::new(1),
-                ),
-                &BindingFacts {
-                    plugin_id: "kalareach/preparing".to_owned(),
-                    binding_revision: 1,
-                    activity: BindingActivity::Idle,
-                    thread_id: None,
-                    turn_id: None,
-                    updated_at_ms: 0,
-                    held_rights: Vec::new(),
-                },
-                "/bin/sh",
-                &source,
-            )
-            .await
-            .expect("the component registers in the runtime");
         // The package contributes attachments by an upload to its upstream, and the worker asks the
         // daemon for the drafts they are offered from.
         broker
@@ -267,9 +267,81 @@ impl Acting {
                     .as_path()
                     .to_path_buf(),
             ));
-        broker.component_calls().set(Some(Arc::clone(&runtime)));
-        if registered {
-            broker.set_component_state(binding(), ComponentState::Registered, None);
+        let mut tasks = vec![peer, driving, reading];
+        match (&registration, runtime.as_ref()) {
+            (Registration::ByHand { told }, Some(runtime)) => {
+                // The component is registered with the runtime the way the worker's link registers
+                // it, and the worker is told where it stands.
+                runtime
+                    .register(
+                        BindingId::new(binding().get()),
+                        &PluginIdentity::new(
+                            PluginId::new("kalareach/preparing").expect("an identifier"),
+                            PackageVersion::parse("1.0.0").expect("a version"),
+                            source.digest,
+                            RepositoryGeneration::new(1),
+                        ),
+                        &BindingFacts {
+                            plugin_id: "kalareach/preparing".to_owned(),
+                            binding_revision: 1,
+                            activity: BindingActivity::Idle,
+                            thread_id: None,
+                            turn_id: None,
+                            updated_at_ms: 0,
+                            held_rights: Vec::new(),
+                        },
+                        "/bin/sh",
+                        &source,
+                    )
+                    .await
+                    .expect("the component registers in the runtime");
+                broker.component_calls().set(Some(Arc::clone(runtime)));
+                if *told {
+                    broker.set_component_state(binding(), ComponentState::Registered, None);
+                }
+            }
+            _ => {
+                // The binding ships the component, and the link does the rest.
+                broker
+                    .ship_component(
+                        binding(),
+                        kr_protocol::admission::LiveRelease {
+                            plugin_id: package(),
+                            publisher_id: PublisherId::new("kalareach").expect("a publisher"),
+                            version: "1.0.0".to_owned(),
+                            package_digest: Digest256::from_bytes([5; 32]),
+                            origin: kr_protocol::admission::ReleaseOrigin {
+                                repository_id: "official".to_owned(),
+                                enrolment_key: "test".to_owned(),
+                            },
+                        },
+                        kr_worker::broker::ledger::BoundExecutable {
+                            path: "/bin/sh".to_owned(),
+                            digest: Digest256::from_bytes([3; 32]),
+                            version: None,
+                        },
+                        kr_worker::broker::component::BoundComponent {
+                            path: source.path.clone(),
+                            digest: Digest256::from_bytes(*source.digest.as_bytes()),
+                            bytes: source.bytes,
+                            refusal: None,
+                        },
+                    )
+                    .expect("the binding ships the component");
+                tasks.push(tokio::spawn(kr_worker::plugin_runtime::link(
+                    kr_worker::plugin_runtime::RuntimeRequest {
+                        session_id: hosted.session_id,
+                        rendezvous: hosted
+                            .environment()
+                            .rendezvous_endpoint()
+                            .expect("an endpoint")
+                            .as_path()
+                            .to_path_buf(),
+                        environment: hosted.environment(),
+                    },
+                    Arc::downgrade(broker),
+                )));
+            }
         }
         Some(Self {
             hosted,
@@ -277,7 +349,7 @@ impl Acting {
             written,
             upstream,
             _owner: owner,
-            _tasks: vec![peer, driving, reading],
+            _tasks: tasks,
         })
     }
 
@@ -611,6 +683,25 @@ pub fn contribution() -> kr_plugin_sdk::effect::AttachmentContribution {
     }
 }
 
+/// What changes while an action's component prepares it, between the action's admission and the
+/// moment it comes back to be dispatched.
+pub enum Change {
+    /// The binding's grant is withdrawn.
+    Grant,
+    /// The package registers the action again as another class its component prepares.
+    Declaration,
+    /// The package registers the action again as one the host carries out itself, which needs
+    /// nothing from the plan it was prepared for.
+    Presentation,
+    /// The binding moves to another revision, as a thread selection does.
+    Binding,
+    /// The daemon announces an authority revision, which revokes what was admitted under the one
+    /// before.
+    Authority,
+    /// The connection the action was accepted on ends.
+    Connection,
+}
+
 /// The principal the local owner's connection to the worker acts as, and so the owner of the
 /// drafts and uploads a test makes for it through the daemon's transfer service.
 pub fn local_actor() -> kr_protocol::ids::ActorId {
@@ -686,6 +777,14 @@ impl Acting {
 
     /// A draft for the session and the instance the actions act on, as the local owner made it.
     pub fn new_draft(&self) -> kr_protocol::transfer::DraftRecord {
+        self.new_draft_for(instance())
+    }
+
+    /// A draft for the session and for `application_instance_id`, as the local owner made it.
+    pub fn new_draft_for(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> kr_protocol::transfer::DraftRecord {
         self.transfers()
             .draft_create(
                 &local_actor(),
@@ -693,7 +792,7 @@ impl Acting {
                     environment_id: self.hosted.environment_id,
                     device_id: Nullable::null(),
                     session_id: Nullable::some(self.hosted.session_id),
-                    application_instance_id: Nullable::some(instance()),
+                    application_instance_id: Nullable::some(application_instance_id),
                     text: "have a look at this".to_owned(),
                 },
                 None,
@@ -708,6 +807,20 @@ impl Acting {
         draft: &kr_protocol::transfer::DraftRecord,
         handle: &kr_protocol::transfer::AttachmentHandle,
     ) -> kr_protocol::transfer::DraftRecord {
+        self.bind_by(
+            draft,
+            handle,
+            kr_protocol::transfer::InsertionMethod::TypedSubmission,
+        )
+    }
+
+    /// Binds a published file to a draft, to be inserted by `method`.
+    pub fn bind_by(
+        &self,
+        draft: &kr_protocol::transfer::DraftRecord,
+        handle: &kr_protocol::transfer::AttachmentHandle,
+        method: kr_protocol::transfer::InsertionMethod,
+    ) -> kr_protocol::transfer::DraftRecord {
         self.transfers()
             .draft_add_attachment(
                 &local_actor(),
@@ -720,7 +833,7 @@ impl Acting {
                         accepted_media_types: vec!["image/png".to_owned()],
                         max_byte_len: kr_protocol::scalars::U64::new(1024 * 1024),
                         max_count: kr_protocol::scalars::U64::new(4),
-                        insertion_method: kr_protocol::transfer::InsertionMethod::TypedSubmission,
+                        insertion_method: method,
                         external_destination: Nullable::null(),
                         model_media_capability: false,
                     },
@@ -755,6 +868,49 @@ impl Acting {
         params.draft_id = Nullable::some(draft_id);
         mutation.params = ParamsValue::from_typed(&params).expect("encodes");
         mutation
+    }
+}
+
+impl Acting {
+    /// Makes `change` to what `action` was accepted under, while its component is held. A change
+    /// of the connection takes `asking`, which is the connection the action was accepted on.
+    pub async fn change(&self, change: Change, action: &str, asking: &mut Option<LocalClient>) {
+        let broker = self.hosted._service.broker();
+        match change {
+            Change::Grant => broker
+                .withdraw_grant(binding(), BrokerGrant::UpstreamAction)
+                .expect("the grant is withdrawn"),
+            Change::Declaration => {
+                broker
+                    .register_actions(binding(), &[declared(action, "upstream.prompt")])
+                    .expect("the package re-registers the action as another class");
+            }
+            Change::Presentation => {
+                broker
+                    .register_actions(binding(), &[presented(action)])
+                    .expect("the package re-registers the action as a presentation");
+            }
+            Change::Binding => {
+                broker
+                    .advance_binding(instance(), None, TimestampMs::new(2))
+                    .expect("the binding moves");
+            }
+            Change::Authority => {
+                let mut daemon = self
+                    .hosted
+                    .daemon_connection(kr_protocol::local::ControllerConnectionRole::Authority)
+                    .await;
+                daemon
+                    .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+                        environment_id: self.hosted.environment_id,
+                        revision: kr_protocol::ids::AuthorityRevision::new(2),
+                        evidence_from: 0,
+                    })
+                    .await
+                    .expect("the worker installs the revision");
+            }
+            Change::Connection => drop(asking.take()),
+        }
     }
 }
 
