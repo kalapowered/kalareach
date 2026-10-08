@@ -569,6 +569,14 @@ impl Controller {
             net::pairing::HostPairingClock::new(&setup.boot_identity),
             net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
         ));
+        // The host's own sign-in to the managed account service lives in the same store, in a
+        // scope of its own.
+        let account = Arc::new(Self::build_host_account(
+            &started,
+            Arc::clone(&secret_store),
+            setup.environment_id,
+            setup.paths.runtime_root(),
+        ));
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
         let delivery = Arc::new(crate::push::DeliveryModule::open(
@@ -661,6 +669,7 @@ impl Controller {
                 }),
             )),
             started,
+            account,
             rights_ceiling,
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
             debt_pass: Arc::new(tokio::sync::Notify::new()),
@@ -990,7 +999,7 @@ impl Controller {
     }
 
     /// The proxy `started` selects, read as the network endpoint reads it.
-    fn proxy_of(
+    pub(super) fn proxy_of(
         started: &crate::config::Started,
     ) -> Result<Option<kr_transport::config::ProxyUrl>> {
         started

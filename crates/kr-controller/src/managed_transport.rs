@@ -1,16 +1,17 @@
-//! How the host reaches the managed voice service.
+//! How the host reaches the managed service: the voice broker and the account service.
 //!
 //! The transport is built when a request first needs it and kept once it is built, as delivery's
 //! is. A host whose platform cannot set up certificate verification still starts, serves
-//! everything that needs no managed service, and says why whenever a voice request needs the
-//! service. A failed build is not kept, so a host whose platform is repaired reaches the service
-//! at its next request without a restart.
+//! everything that needs no managed service, and says why whenever a request needs the service. A
+//! failed build is not kept, so a host whose platform is repaired reaches the service at its next
+//! request without a restart.
 
 use std::sync::Mutex;
 
 use kr_client::error::ClientError;
 use kr_client::services::{
-    HttpDeadlines, HttpService, ResponseLimits, ServiceFuture, ServiceHttp, ServiceHttpAnswer,
+    AccountHttp, HttpDeadlines, HttpService, ResponseLimits, ServiceFuture, ServiceHttp,
+    ServiceHttpAnswer,
 };
 use kr_client::shown::Shown;
 use kr_protocol::error::ErrorCode;
@@ -28,22 +29,28 @@ pub const VOICE_DEADLINES: HttpDeadlines = HttpDeadlines {
     total: std::time::Duration::from_secs(50),
 };
 
-/// The managed voice service's transport: one gateway, through the proxy the host's configuration
-/// selects or directly, and never through one the environment names.
+/// A managed service's transport: one gateway, through the proxy the host's configuration selects
+/// or directly, and never through one the environment names.
 #[derive(Debug)]
-pub struct VoiceTransport {
+pub struct ManagedTransport {
     origin: GatewayOrigin,
     proxy: Option<ProxyUrl>,
+    deadlines: HttpDeadlines,
     built: Mutex<Option<HttpService>>,
 }
 
-impl VoiceTransport {
-    /// A transport to `origin` that is built on its first use.
+impl ManagedTransport {
+    /// A transport to `origin` with `deadlines` that is built on its first use.
     #[must_use]
-    pub const fn new(origin: GatewayOrigin, proxy: Option<ProxyUrl>) -> Self {
+    pub const fn new(
+        origin: GatewayOrigin,
+        proxy: Option<ProxyUrl>,
+        deadlines: HttpDeadlines,
+    ) -> Self {
         Self {
             origin,
             proxy,
+            deadlines,
             built: Mutex::new(None),
         }
     }
@@ -58,7 +65,7 @@ impl VoiceTransport {
         if built.is_none() {
             *built = HttpService::through(
                 self.origin.clone(),
-                VOICE_DEADLINES,
+                self.deadlines,
                 ResponseLimits::default(),
                 self.proxy.as_ref(),
             )
@@ -68,7 +75,19 @@ impl VoiceTransport {
     }
 }
 
-impl ServiceHttp for VoiceTransport {
+/// The refusal a request gets when the platform cannot set up certificate verification. Nothing was
+/// sent.
+fn unavailable() -> ClientError {
+    ClientError::refusal(
+        ErrorCode::UpstreamUnavailable,
+        Shown::said(
+            "this host could not set up the platform's certificate verification, so it reaches no \
+             managed service",
+        ),
+    )
+}
+
+impl ServiceHttp for ManagedTransport {
     fn post_json<'a>(
         &'a self,
         url: &'a str,
@@ -78,13 +97,35 @@ impl ServiceHttp for VoiceTransport {
         Box::pin(async move {
             match self.transport() {
                 Some(transport) => transport.post_json(url, body, headers).await,
-                None => Err(ClientError::refusal(
-                    ErrorCode::UpstreamUnavailable,
-                    Shown::said(
-                        "this host could not set up the platform's certificate verification, so \
-                         it reaches no managed voice service",
-                    ),
-                )),
+                None => Err(unavailable()),
+            }
+        })
+    }
+}
+
+impl AccountHttp for ManagedTransport {
+    fn post_form<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            match self.transport() {
+                Some(transport) => transport.post_form(url, body).await,
+                None => Err(unavailable()),
+            }
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            match self.transport() {
+                Some(transport) => AccountHttp::get(&transport, url, headers).await,
+                None => Err(unavailable()),
             }
         })
     }
@@ -95,13 +136,13 @@ mod tests {
     use super::*;
 
     /// The service takes up to 30 seconds to answer a start (its creation window), so the
-    /// transport this host builds waits longer than that for the answer's head and for the whole
-    /// exchange.
+    /// transport this host builds for it waits longer than that for the answer's head and for the
+    /// whole exchange.
     #[test]
-    fn the_transport_waits_longer_for_a_start_than_the_service_takes() {
+    fn the_voice_transport_waits_longer_for_a_start_than_the_service_takes() {
         const SERVICE_CREATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
         let origin = GatewayOrigin::new("https://voice.example.test").expect("an origin");
-        let transport = VoiceTransport::new(origin, None)
+        let transport = ManagedTransport::new(origin, None, VOICE_DEADLINES)
             .transport()
             .expect("a transport on a platform with certificate verification");
         let deadlines = transport.deadlines();

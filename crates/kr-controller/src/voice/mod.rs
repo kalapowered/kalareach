@@ -23,7 +23,6 @@ mod authority;
 mod context;
 mod host;
 mod submit;
-mod transport;
 
 use std::sync::Arc;
 
@@ -42,7 +41,6 @@ pub use context::{
 };
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use submit::{HostDispatch, ProposalSubmitter, method_for};
-pub use transport::{VOICE_DEADLINES, VoiceTransport};
 
 use crate::error::{ControllerError, Result};
 
@@ -129,7 +127,8 @@ impl VoiceModule {
         &self.broker_origin
     }
 
-    /// Builds the managed broker client for the origin the configuration document names.
+    /// Builds the managed broker client for the origin the configuration document names,
+    /// presenting the account token `tokens` holds for it.
     ///
     /// # Errors
     ///
@@ -138,15 +137,9 @@ impl VoiceModule {
     pub fn managed_provider(
         origin: &str,
         http: Arc<dyn ServiceHttp>,
-        runtime_root: &std::path::Path,
+        tokens: Arc<dyn kr_client::services::AccountTokenSource>,
     ) -> std::result::Result<Arc<dyn ManagedVoiceService>, kr_client::ClientError> {
-        // Bound to the origin this host is configured to reach, so a token issued for another
-        // service is refused before a request carries it.
-        let tokens = Arc::new(
-            kr_voice::broker::AccountTokenFile::under(runtime_root).for_origin(origin.to_owned()),
-        );
-        let broker = ManagedVoiceBroker::new(origin, http, tokens)?;
-        Ok(Arc::new(broker))
+        Ok(Arc::new(ManagedVoiceBroker::new(origin, http, tokens)?))
     }
 
     /// Replaces the provider this service brokers through.
@@ -496,6 +489,19 @@ mod tests {
         }
     }
 
+    /// A token source that is never asked: building a broker client presents no token.
+    #[derive(Debug)]
+    struct NoToken;
+
+    impl kr_client::services::AccountTokenSource for NoToken {
+        fn token<'a>(
+            &'a self,
+            _scope: &'a str,
+        ) -> kr_client::services::ServiceFuture<'a, kr_client::services::AccountToken> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     /// KR-REQ-26.14: a broker origin the configuration document accepts is one the managed broker
     /// accepts, so a device is never handed an origin its own client would refuse.
     ///
@@ -503,7 +509,6 @@ mod tests {
     /// other fails this.
     #[test]
     fn every_broker_origin_the_document_accepts_is_one_the_broker_accepts() {
-        let root = tempfile::tempdir().expect("a directory for the token file");
         let corpus = [
             "https://voice.example.com",
             "https://voice.example.com:8443",
@@ -528,7 +533,8 @@ mod tests {
             }
             accepted += 1;
             assert!(
-                VoiceModule::managed_provider(origin, Arc::new(NoExchange), root.path()).is_ok(),
+                VoiceModule::managed_provider(origin, Arc::new(NoExchange), Arc::new(NoToken))
+                    .is_ok(),
                 "{origin} validated and the managed broker refused it"
             );
             assert!(

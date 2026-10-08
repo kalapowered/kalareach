@@ -48,6 +48,7 @@ pub mod net;
 #[path = "catalogue/rounds.rs"]
 mod admission_rounds;
 
+mod account_actions;
 mod admission;
 mod attention_reach;
 mod authority_changes;
@@ -547,6 +548,8 @@ pub struct Controller {
     /// The environment's voice service: the coordinator and the seams it reads and proposes
     /// through. Built after the daemon exists, because two of its seams hold a weak reference back.
     voice: std::sync::OnceLock<Arc<crate::voice::VoiceModule>>,
+    /// This host's own sign-in to the managed account service, which managed voice presents.
+    account: Arc<crate::account::HostAccount>,
     /// The environment's privacy record: privacy mode's generation, what each session still owes,
     /// and the root that drives the backup service, delivery and the descriptions through it.
     pub(crate) privacy: Arc<crate::privacy::EnvironmentPrivacy>,
