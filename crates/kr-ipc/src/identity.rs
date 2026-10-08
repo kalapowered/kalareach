@@ -173,6 +173,14 @@ pub fn after_each_read<T>(then: impl FnMut(u32, &str) + 'static, work: impl FnOn
     platform::after_each_read(then, work)
 }
 
+/// Runs `work`, and `then` once, right after a stop on this thread has read the instance of the
+/// process it is about to signal, for the host crates' own tests: what a test uses to have the
+/// process run a new program in the window between the reading and the signal.
+#[cfg(all(feature = "testing", target_os = "macos"))]
+pub fn after_instance_read<T>(then: impl FnOnce() + 'static, work: impl FnOnce() -> T) -> T {
+    platform::after_instance_read(then, work)
+}
+
 /// Returns the process identifiers currently in one process group.
 ///
 /// A terminal session's processes normally stay in the group the shell leads, which is what makes
@@ -1364,6 +1372,25 @@ mod platform {
         })
     }
 
+    /// What a test runs once, right after [`stop`] has read the instance it will signal.
+    #[cfg(feature = "testing")]
+    type AfterInstanceRead = Box<dyn FnOnce()>;
+
+    #[cfg(feature = "testing")]
+    thread_local! {
+        static AFTER_INSTANCE_READ: std::cell::RefCell<Option<AfterInstanceRead>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs `work`, and `then` once after the next instance a stop on this thread has read.
+    #[cfg(feature = "testing")]
+    pub fn after_instance_read<T>(then: impl FnOnce() + 'static, work: impl FnOnce() -> T) -> T {
+        AFTER_INSTANCE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(then)));
+        let done = work();
+        AFTER_INSTANCE_READ.with(|slot| *slot.borrow_mut() = None);
+        done
+    }
+
     /// Signals the process holding `identity` through the kernel's version of it.
     ///
     /// One reading gives the start value and the process's version together, and the signal is
@@ -1385,10 +1412,17 @@ mod platform {
         if instance.start_value != identity.start_value.get() {
             return super::Stopped::Gone;
         }
+        #[cfg(feature = "testing")]
+        if let Some(then) = AFTER_INSTANCE_READ.with(|slot| slot.borrow_mut().take()) {
+            then();
+        }
         let signals: &[i32] = match stop {
             super::Stop::Terminate => &[libc::SIGTERM, libc::SIGHUP, libc::SIGCONT],
             super::Stop::Kill => &[libc::SIGKILL],
         };
+        // How many times a process that keeps running new programs is followed before it is said
+        // to be out of reach.
+        const MOVED_ON: u32 = 4;
         let mut instance = instance;
         for (index, signal) in signals.iter().enumerate() {
             // A process that runs a new program between the reading and the signal has the same
@@ -1402,10 +1436,14 @@ mod platform {
                     Signalled::NoSuchProcess => {
                         attempts += 1;
                         match read_instance(instance.pid()) {
-                            Ok(Some(now))
-                                if now.start_value == identity.start_value.get()
-                                    && attempts < 4 =>
-                            {
+                            Ok(Some(now)) if now.start_value == identity.start_value.get() => {
+                                if attempts == MOVED_ON {
+                                    return super::Stopped::Unsafe(
+                                        "the process kept running new programs while it was \
+                                         being signalled"
+                                            .to_owned(),
+                                    );
+                                }
                                 instance = now;
                             }
                             Ok(Some(_) | None) if index == 0 => return super::Stopped::Gone,
