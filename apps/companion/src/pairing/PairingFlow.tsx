@@ -694,7 +694,9 @@ function PairedHosts({
                 data-testid="forget-host-ask"
               >
                 <p className="small">
-                  Forget {host.name}? This phone stops listing it and must pair with it again.
+                  Forget {host.name}? This phone stops listing it and stops reaching it. The host
+                  keeps any access it still gives this phone until you remove the phone there.
+                  {host.owner ? ' This phone also stops confirming requests from it.' : ''}
                 </p>
                 <div className="row wrap">
                   <Button
@@ -710,8 +712,12 @@ function PairedHosts({
                   <Button
                     tone="danger"
                     data-testid="forget-host-confirm"
-                    disabled={forgetting !== null}
+                    aria-disabled={forgetting !== null}
                     onClick={() => {
+                      // Not disabled while it works: a button that is disabled loses the focus
+                      // the person's keyboard or screen reader is on, and keeps it nowhere after a
+                      // refusal.
+                      if (forgetting !== null) return
                       setForgetting(host.reference)
                       setForgetFailure(null)
                       forgetHost(host)
