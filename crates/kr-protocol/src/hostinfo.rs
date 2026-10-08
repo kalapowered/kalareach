@@ -1345,13 +1345,15 @@ impl ComposedBundle {
 ///     "pkarr_resolver_url": "https://discovery.example.com/pkarr",
 ///     "dns_origin": "discovery.example.com"
 ///   },
-///   "voice": { "broker_origin": "https://voice.example.com" }
+///   "voice": { "broker_origin": "https://voice.example.com" },
+///   "storage": { "origin": "https://reach.example.com" }
 /// }
 /// ```
 ///
-/// The `network` and `voice` sections are the only place a network selection or the voice
-/// broker's origin is chosen, and the daemon reads them when it starts ([`NetworkSelection`],
-/// [`VoiceSelection`]). No environment variable reaches either.
+/// The `network`, `voice` and `storage` sections are the only place a network selection, the voice
+/// broker's origin or the managed storage service's origin is chosen, and the daemon reads them
+/// when it starts ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`]). No environment
+/// variable reaches any of them.
 ///
 /// Its numbers are ordinary JSON numbers rather than the decimal strings the wire types use. This
 /// is a file a person may open and edit, not a message a JavaScript consumer parses, and the
@@ -1390,6 +1392,7 @@ impl ComposedBundle {
 /// [`FILE_NAME`]: configuration::FILE_NAME
 /// [`NetworkSelection`]: configuration::NetworkSelection
 /// [`VoiceSelection`]: configuration::VoiceSelection
+/// [`StorageSelection`]: configuration::StorageSelection
 /// [`resolve`]: configuration::resolve
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
@@ -1898,6 +1901,11 @@ pub mod configuration {
         /// Read when the daemon starts, so a change applies at the next start. No environment
         /// variable reaches it.
         pub voice: VoiceSelection,
+        /// The managed storage service this host uploads its backups to.
+        ///
+        /// Read when the daemon starts, so a change applies at the next start. No environment
+        /// variable reaches it.
+        pub storage: StorageSelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -1947,6 +1955,7 @@ pub mod configuration {
                 secrets: Vec::new(),
                 network: NetworkSelection::default(),
                 voice: VoiceSelection::default(),
+                storage: StorageSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2431,6 +2440,28 @@ pub mod configuration {
         #[must_use]
         pub fn broker_origin(&self) -> Option<&str> {
             self.broker_origin.as_ref().map(String::as_str)
+        }
+    }
+
+    /// The managed storage service this host uploads its backups to.
+    ///
+    /// A provider origin, so it is this document's to choose and no inherited variable's. The
+    /// daemon reads it when it starts its backup uploader, so a change applies at the next start.
+    /// Absent means this host uploads nothing, which is a complete host: its local state is the
+    /// authority, and a person's own backups stay theirs.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct StorageSelection {
+        /// The service's origin: an `https` origin, or an `http` origin on a loopback address,
+        /// spelled as a gateway origin is, with no path and no trailing slash.
+        pub origin: Nullable<String>,
+    }
+
+    impl StorageSelection {
+        /// The service's origin, when one is chosen.
+        #[must_use]
+        pub fn origin(&self) -> Option<&str> {
+            self.origin.as_ref().map(String::as_str)
         }
     }
 
@@ -3098,6 +3129,20 @@ pub mod configuration {
                     .stated(
                         ") is not an https or http origin with a lower-case host or a canonical \
                          address, no port its scheme implies, no path and no trailing slash",
+                    ),
+            );
+        }
+        if let Some(origin) = document.storage.origin()
+            && crate::service::GatewayOrigin::new(origin).is_err()
+        {
+            problems.push(
+                Sentence::new()
+                    .stated("storage.origin (")
+                    .withheld(super::export::ContentClass::Location, origin)
+                    .stated(
+                        ") is not an https origin, or an http origin on a loopback address, in \
+                         the canonical spelling a gateway origin has, with no path and no \
+                         trailing slash",
                     ),
             );
         }
@@ -4008,6 +4053,12 @@ pub mod configuration {
         about: "the managed voice broker this host names to its paired devices",
     };
 
+    /// The managed storage service this host uploads its backups to.
+    pub const STORAGE_ORIGIN: Selection = Selection {
+        key: "storage.origin",
+        about: "the managed storage service this host uploads its backups to",
+    };
+
     /// How this environment's control daemon is started when a command finds none running.
     pub const STARTUP_CONTROLLER: Selection = Selection {
         key: "startup.controller",
@@ -4016,7 +4067,7 @@ pub mod configuration {
     };
 
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 13] = [
+    pub const SELECTIONS: [Selection; 14] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -4029,6 +4080,7 @@ pub mod configuration {
         NETWORK_MAINLINE_DHT,
         NETWORK_PROXY_URL,
         VOICE_BROKER_ORIGIN,
+        STORAGE_ORIGIN,
         STARTUP_CONTROLLER,
     ];
 
@@ -4424,6 +4476,11 @@ pub mod configuration {
                 location(document.voice.broker_origin()),
             ),
             row(
+                STORAGE_ORIGIN,
+                document.storage.origin.is_present(),
+                location(document.storage.origin()),
+            ),
+            row(
                 STARTUP_CONTROLLER,
                 document.startup.controller.is_present(),
                 Declared::term(
@@ -4547,9 +4604,9 @@ pub mod configuration {
     /// reads the hosts file under `SystemRoot`. They move where those requests go and can mislead
     /// the captive-portal check; they choose no relay, no service and no trust.
     ///
-    /// Every network selection, the proxy included, and the voice broker's origin are this host's
-    /// configuration document's ([`NetworkSelection`], [`VoiceSelection`]), and nothing reads them
-    /// from the environment. The managed-service, rendezvous, delivery, plugin repository and mail
+    /// Every network selection, the proxy included, the voice broker's origin and the managed
+    /// storage service's origin are this host's configuration document's ([`NetworkSelection`],
+    /// [`VoiceSelection`], [`StorageSelection`]), and nothing reads them from the environment. The managed-service, rendezvous, delivery, plugin repository and mail
     /// clients verify a server against the platform's own store, the network endpoint verifies its
     /// relays and discovery servers against the public anchors and the document's relay trust
     /// anchors, and neither reads the variables other programs take to name a store
@@ -8077,6 +8134,7 @@ mod tests {
             proxy_url: Nullable::some("http://proxy.example.com:3128".to_owned()),
         };
         document.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
+        document.storage.origin = Nullable::some("https://reach.example.com".to_owned());
         configuration::validate(&document).expect("a complete selection");
         let written = configuration::contents(&document);
         let loaded = configuration::load(Some(written.as_bytes()));
@@ -8269,6 +8327,38 @@ mod tests {
                     .any(|problem| problem.as_str().contains("voice.broker_origin")),
                 "{origin}: {problems:?}"
             );
+        }
+
+        // The storage origin is a gateway origin, which the managed-service transport then
+        // accepts as it stands: https, or http on a loopback address only.
+        for origin in [
+            "reach.example.com",
+            "http://reach.example.com",
+            "https://reach.example.com/",
+            "https://Reach.example.com",
+            "https://reach.example.com:443",
+            "ftp://reach.example.com",
+            "",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.storage.origin = Nullable::some(origin.to_owned());
+            let problems = configuration::validate(&document).expect_err("an origin it refuses");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.as_str().contains("storage.origin")),
+                "{origin}: {problems:?}"
+            );
+        }
+        for origin in [
+            "https://reach.example.com",
+            "https://reach.example.com:8443",
+            "http://127.0.0.1:8787",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.storage.origin = Nullable::some(origin.to_owned());
+            configuration::validate(&document)
+                .unwrap_or_else(|problems| panic!("{origin}: {problems:?}"));
         }
 
         // A document whose network section does not validate is not this host's to rewrite, so an

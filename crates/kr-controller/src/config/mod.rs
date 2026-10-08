@@ -321,7 +321,7 @@ impl InForce {
 
 /// The selections this daemon read when it started, which are what it acts on until it next starts.
 ///
-/// The network endpoint and the voice service are built once, at startup, from the document on disk
+/// The network endpoint, the voice service and the backup uploader are built once, at startup, from the document on disk
 /// then. A later edit applies at the next start, and `kr doctor` compares the two so an owner who
 /// changed one can see that it is not in force yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -330,16 +330,19 @@ pub struct Started {
     pub network: configuration::NetworkSelection,
     /// The voice broker this daemon names to its paired devices.
     pub voice: configuration::VoiceSelection,
+    /// The managed storage service this daemon uploads its backups to.
+    pub storage: configuration::StorageSelection,
 }
 
 impl Started {
-    /// Reads both selections from one document, or the defaults of selecting nothing when this
+    /// Reads the selections from one document, or the defaults of selecting nothing when this
     /// host cannot use the document it found.
     #[must_use]
     pub fn of(document: Option<&configuration::ConfigurationDocument>) -> Self {
         document.map_or_else(Self::default, |document| Self {
             network: document.network.clone(),
             voice: document.voice.clone(),
+            storage: document.storage.clone(),
         })
     }
 }
@@ -1171,8 +1174,8 @@ pub fn network_check(
     let moved = Started::of(document) != *started;
     if moved {
         detail = detail.stated(
-            "; the configuration document now selects a different network or voice broker from the \
-             one this host started with, which applies at the next start",
+            "; the configuration document now selects a different network, voice broker or storage \
+             service from the one this host started with, which applies at the next start",
         );
     }
     DoctorCheck::new(

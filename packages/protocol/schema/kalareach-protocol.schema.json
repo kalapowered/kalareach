@@ -7834,6 +7834,13 @@
           },
           "description": "How this environment's control daemon is started when a command finds none running.\n\nRead by `kr new` when it finds no daemon to ask, so a change applies at the next start.\nNo environment variable reaches it."
         },
+        "storage": {
+          "$ref": "#/$defs/StorageSelection",
+          "default": {
+            "origin": null
+          },
+          "description": "The managed storage service this host uploads its backups to.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches it."
+        },
         "version": {
           "default": 1,
           "description": "The schema version this document is written against.",
@@ -33181,6 +33188,25 @@
           ],
           "default": null,
           "description": "How the control daemon is started. Absent starts none."
+        }
+      },
+      "type": "object"
+    },
+    "StorageSelection": {
+      "additionalProperties": false,
+      "description": "The managed storage service this host uploads its backups to.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts its backup uploader, so a change applies at the next start.\nAbsent means this host uploads nothing, which is a complete host: its local state is the\nauthority, and a person's own backups stay theirs.",
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The service's origin: an `https` origin, or an `http` origin on a loopback address,\nspelled as a gateway origin is, with no path and no trailing slash."
         }
       },
       "type": "object"
