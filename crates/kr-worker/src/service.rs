@@ -8690,17 +8690,18 @@ fn reported_outcome(
             match settled {
                 Some(mutation) => ReportedOutcome::AcceptedByAgent {
                     provenance: mutation.provenance,
-                    evidence: format!(
-                        "upstream request {}, turn {}",
-                        mutation
-                            .upstream_request_id
-                            .as_ref()
-                            .map_or_else(|| "unnamed".to_owned(), ToString::to_string),
-                        mutation
-                            .turn_id
-                            .as_ref()
-                            .map_or_else(|| "none".to_owned(), ToString::to_string)
-                    ),
+                    // What the upstream named in its answer, and no more than it named.
+                    evidence: match (
+                        mutation.upstream_request_id.as_ref(),
+                        mutation.turn_id.as_ref(),
+                    ) {
+                        (Some(request), Some(turn)) => {
+                            format!("upstream request {request}, turn {turn}")
+                        }
+                        (Some(request), None) => format!("upstream request {request}"),
+                        (None, Some(turn)) => format!("upstream turn {turn}"),
+                        (None, None) => "the upstream acknowledged the request".to_owned(),
+                    },
                 },
                 None => ReportedOutcome::Unknown {
                     detail: "the upstream's answer could not be read".to_owned(),

@@ -27,6 +27,7 @@
 //! | `cancel.present` | a redraw of its own document |
 //! | `attach.photo` | the attachment it was given, offered as that attachment |
 //! | `attach.other` | an attachment it was not given |
+//! | `attach.as.cancel` | the cancellation of the turn, for an action declared as an attachment |
 //! | `cancel.fault` | a declared fault |
 //! | `cancel.loop` | nothing: it never returns |
 
@@ -202,6 +203,12 @@ impl Guest for Component {
                     arguments,
                 ))
             }
+            "attach.as.cancel" => Ok(plan(
+                action,
+                EffectClass::UpstreamAttachment,
+                PreparedOperation::UpstreamCancel,
+                arguments,
+            )),
             "cancel.fault" => Err(Fault::Refused(format!("{action} is not something to do"))),
             "cancel.loop" => loop {
                 core::hint::spin_loop();

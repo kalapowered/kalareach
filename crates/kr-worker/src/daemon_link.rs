@@ -167,12 +167,21 @@ pub enum Asked {
 }
 
 impl Asked {
-    /// Whether asking again can help: the daemon was not reached, or it said the condition passes.
+    /// Whether asking again can help: the daemon was not reached, it said the condition passes, or
+    /// it could not say what became of the question.
     #[must_use]
     pub fn can_be_asked_again(&self) -> bool {
+        self.is_unanswered()
+            || matches!(self, Self::Refused(error) if error.retry == RetryCategory::Transient)
+    }
+
+    /// Whether the daemon may have acted on the question without saying so: it was not reached or
+    /// did not answer, or it answered that it could not report what became of the question.
+    #[must_use]
+    pub fn is_unanswered(&self) -> bool {
         match self {
             Self::Unreached(_) => true,
-            Self::Refused(error) => error.retry == RetryCategory::Transient,
+            Self::Refused(error) => error.retry == RetryCategory::OutcomeUnknown,
         }
     }
 
@@ -304,8 +313,8 @@ impl Drafts {
                 Ok((ClaimHold::new(slot, actor.clone(), begin), *claim))
             }
             Ok(_) => Err(wrong_answer()),
-            Err(asked @ Asked::Refused(_)) => Err(asked.into_error()),
-            Err(asked @ Asked::Unreached(_)) => {
+            Err(asked) if !asked.is_unanswered() => Err(asked.into_error()),
+            Err(asked) => {
                 self.ensure_reporter();
                 let not_before = begin.deadline_boot_ms.get();
                 ClaimHold::new(slot, actor.clone(), begin).report_after(
@@ -534,9 +543,14 @@ async fn deliver(
         };
         // A report for a claim the daemon may still commit waits for the claim's deadline, after
         // which it cannot.
+        // The clock is read again after each sleep, because a sleep can end before the counter it
+        // is measured against has passed the time.
         if let Some(not_before) = head.not_before_boot_ms {
-            let now = kr_ipc::clock::boot_elapsed_ms();
-            if now < not_before {
+            loop {
+                let now = kr_ipc::clock::boot_elapsed_ms();
+                if now > not_before {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(not_before - now + 1)).await;
             }
         }
