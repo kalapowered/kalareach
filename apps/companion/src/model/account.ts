@@ -181,7 +181,7 @@ export function describeOutcome(outcome: AccountOutcome): string {
     case 'timed_out':
       return 'The browser did not come back within 15 minutes, so signing in stopped.'
     case 'not_kept':
-      return 'KalaReach could not keep the sign-in safely on this device, so it kept nothing.'
+      return 'KalaReach could not keep the sign-in safely on this device.'
     case 'service_refused':
       return `${ACCOUNT_HOST} refused the sign-in.`
     case 'browser_failed':
