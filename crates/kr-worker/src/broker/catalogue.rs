@@ -63,12 +63,12 @@ impl ReadPackage {
 }
 
 /// What this host does with a package's component, whatever a binding stands at: it registers the
-/// component with the plugin runtime for a binding, and calls none of its other exports.
+/// component with the plugin runtime for a binding, and asks it to prepare an action a person
+/// invokes, and calls none of its other exports.
 ///
 /// The words are always true of the package, whether or not a binding holds it now; where each
 /// binding's component stands is in that binding's own report.
-pub const COMPONENT_NOT_CALLED: &str =
-    "this host calls none of its component's exports beyond registering it for a binding";
+pub const COMPONENT_CALLS: &str = "this host calls none of its component's exports beyond registering it for a binding and preparing an action a person invokes";
 
 /// Whether a snapshot was applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -394,7 +394,7 @@ impl Admissions {
                 Ok(read) => {
                     let mut unused = Vec::new();
                     if read.manifest().has_component() {
-                        unused.push(COMPONENT_NOT_CALLED.to_owned());
+                        unused.push(COMPONENT_CALLS.to_owned());
                     }
                     if let Some(refused) = action_refusals
                         .get(digest)

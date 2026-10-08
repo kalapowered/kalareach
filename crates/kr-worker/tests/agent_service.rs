@@ -2137,10 +2137,10 @@ async fn plugin_refusal(
 }
 
 /// Section 5: an action the package's component prepares is admitted as any other, and refused
-/// before its dispatch marker because this host calls no export of a component to prepare an
-/// effect, with that reason.
+/// before its dispatch marker while its component is not registered with the plugin runtime, with
+/// that reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_action_the_component_prepares_is_refused_because_no_component_is_called_to_prepare() {
+async fn an_action_whose_component_is_not_registered_is_refused_before_its_marker() {
     let host = host().await;
     let upstream = Arc::new(CountingUpstream::default());
     register(
@@ -2154,7 +2154,7 @@ async fn an_action_the_component_prepares_is_refused_because_no_component_is_cal
     assert!(
         error
             .message
-            .contains("this host calls no export of a component to prepare an effect"),
+            .contains("is not registered with the plugin runtime"),
         "{}",
         error.message
     );

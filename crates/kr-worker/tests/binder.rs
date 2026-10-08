@@ -1899,7 +1899,7 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
     let details = reported(&worker, source.package_digest);
     assert_eq!(details.len(), 1, "{details:?}");
     assert!(
-        details[0].contains("calls none of its component's exports beyond registering it"),
+        details[0].contains("beyond registering it for a binding and preparing an action"),
         "{}",
         details[0]
     );

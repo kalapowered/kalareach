@@ -40,6 +40,31 @@ use kr_worker::broker::{
 
 const CREDENTIAL: [u8; 32] = [9; 32];
 
+/// What `plugin.action.invoke` does once the draft has been read and the component has prepared
+/// its effect: the admission, the validation of the effect against it, and the transmission.
+async fn invoke_prepared(
+    broker: &Broker,
+    params: &PluginActionInvokeParams,
+    draft: Option<kr_worker::broker::DraftSnapshot>,
+    effect: &kr_protocol::broker::PreparedEffect,
+    now: TimestampMs,
+) -> Result<kr_protocol::agent::PluginActionInvokeResult, BrokerError> {
+    let admitted = broker.admit_plugin_action(&caller(), binding(), params, draft, now)?;
+    broker.validate_effect(&admitted, effect)?;
+    record_plugin_action(broker, &admitted)?.settled().await
+}
+
+/// Carries one admitted plugin action to its transport, as the worker's service does once the
+/// session boundary is over.
+fn record_plugin_action(
+    broker: &Broker,
+    admitted: &kr_worker::broker::MutationAdmission,
+) -> Result<kr_worker::broker::ActionInFlight, BrokerError> {
+    let taken = broker.take_plugin_action(admitted)?;
+    let (dispatch, request) = taken.transmission();
+    Ok(taken.submitted(dispatch.submit(&request)?))
+}
+
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([1; 16]))
 }
@@ -245,30 +270,6 @@ impl UpstreamDispatch for RecordingUpstream {
 /// its own is testing nothing: this is what the host itself computes.
 fn arguments_digest() -> Digest256 {
     Digest256::from_bytes(kr_cbor::sha256(b"{}"))
-}
-
-/// A draft store that holds exactly the drafts it was told about.
-#[derive(Debug)]
-struct KnownDrafts {
-    known: std::collections::BTreeSet<kr_protocol::ids::DraftId>,
-}
-
-impl kr_worker::broker::DraftResolver for KnownDrafts {
-    fn resolve(
-        &self,
-        draft_id: &kr_protocol::ids::DraftId,
-    ) -> Result<kr_worker::broker::DraftSnapshot, BrokerError> {
-        if self.known.contains(draft_id) {
-            Ok(kr_worker::broker::DraftSnapshot {
-                draft_id: *draft_id,
-                revision: kr_protocol::scalars::U64::new(1),
-            })
-        } else {
-            Err(BrokerError::PreconditionFailed {
-                detail: format!("no draft {draft_id}"),
-            })
-        }
-    }
 }
 
 /// A transport that will not admit the operation it is offered.
@@ -1142,7 +1143,11 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
             argument_hash: arguments_digest(),
         }
     };
-    let invoke = |action: &str, draft: Nullable<kr_protocol::ids::DraftId>| {
+    // The draft is read from the control daemon before the invocation is admitted, so what the
+    // broker is given is the snapshot of it, or none.
+    let invoke_with = |action: &str,
+                       draft: Nullable<kr_protocol::ids::DraftId>,
+                       snapshot: Option<kr_worker::broker::DraftSnapshot>| {
         let params = PluginActionInvokeParams {
             target: target(1),
             plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -1153,11 +1158,14 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
         };
         let effect = prepared(action, draft);
         let broker = &broker;
-        async move {
-            broker
-                .plugin_action_invoke(&caller(), binding(), &params, &effect, TimestampMs::new(4))
-                .await
-        }
+        async move { invoke_prepared(broker, &params, snapshot, &effect, TimestampMs::new(4)).await }
+    };
+    let invoke = |action: &str, draft: Nullable<kr_protocol::ids::DraftId>| {
+        let snapshot = draft.0.map(|draft_id| kr_worker::broker::DraftSnapshot {
+            draft_id,
+            revision: kr_protocol::scalars::U64::new(1),
+        });
+        invoke_with(action, draft, snapshot)
     };
 
     let applied = invoke("prompt.submit", Nullable::null())
@@ -1177,28 +1185,16 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
         .expect_err("a precondition the action declares is checked");
     assert_eq!(missing_draft.code(), ErrorCode::DraftConflict);
 
-    // Naming one is not enough either: a draft this host cannot resolve is a precondition nobody
-    // has established, and the action waits for it rather than being sent hopefully.
+    // Naming one is not enough either: a draft nobody read is a precondition nobody has
+    // established, and the action waits for it rather than being sent hopefully.
     let draft = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
-    let unresolvable = invoke("draft.attach", Nullable::some(draft))
+    let unread = invoke_with("draft.attach", Nullable::some(draft), None)
         .await
-        .expect_err("nothing here resolves a draft");
-    assert_eq!(unresolvable.code(), ErrorCode::DraftConflict);
-    broker.bind_drafts(std::sync::Arc::new(KnownDrafts {
-        known: [draft].into_iter().collect(),
-    }));
-    assert!(
-        invoke(
-            "draft.attach",
-            Nullable::some(kr_protocol::ids::DraftId::new(Uuid::from_bytes([5; 16]))),
-        )
-        .await
-        .is_err(),
-        "and a draft the store does not hold is refused"
-    );
+        .expect_err("a draft that was not read is not one to act on");
+    assert_eq!(unread.code(), ErrorCode::DraftConflict);
     invoke("draft.attach", Nullable::some(draft))
         .await
-        .expect("and it runs once the draft is one this host can resolve");
+        .expect("and it runs once the draft was read");
     // And what goes to the upstream names the revision the draft stood at when it was admitted,
     // not only the identifier: the identifier alone would denote whatever the draft holds by the
     // time the frame lands.
@@ -1258,29 +1254,28 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
         TimestampMs::new(5),
     );
     assert!(
-        broker
-            .plugin_action_invoke(
-                &caller(),
-                binding(),
-                &PluginActionInvokeParams {
-                    target: target(1),
-                    plugin_id: PluginId::new("kalareach.codex").expect("valid"),
-                    action: ActionName::new("prompt.submit").expect("valid"),
-                    draft_id: Nullable::null(),
-                    resource_id: Nullable::null(),
-                    parameters: Bytes::from(b"{}".to_vec()),
-                },
-                &kr_protocol::broker::PreparedEffect {
-                    action: ActionName::new("prompt.submit").expect("valid"),
-                    class: EffectClass::Write,
-                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-                    draft_id: Nullable::null(),
-                    argument_hash: Digest256::from_bytes([8; 32]),
-                },
-                TimestampMs::new(6),
-            )
-            .await
-            .is_err()
+        invoke_prepared(
+            &broker,
+            &PluginActionInvokeParams {
+                target: target(1),
+                plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+                action: ActionName::new("prompt.submit").expect("valid"),
+                draft_id: Nullable::null(),
+                resource_id: Nullable::null(),
+                parameters: Bytes::from(b"{}".to_vec()),
+            },
+            None,
+            &kr_protocol::broker::PreparedEffect {
+                action: ActionName::new("prompt.submit").expect("valid"),
+                class: EffectClass::Write,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                draft_id: Nullable::null(),
+                argument_hash: Digest256::from_bytes([8; 32]),
+            },
+            TimestampMs::new(6),
+        )
+        .await
+        .is_err()
     );
     broker
         .agent_capabilities(&AgentCapabilitiesParams {
@@ -1594,14 +1589,14 @@ fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_on
         parameters: Bytes::from(b"{}".to_vec()),
     };
     broker
-        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(2))
+        .admit_plugin_action(&caller(), binding(), &invoke, None, TimestampMs::new(2))
         .expect("the action is admitted while its own component works");
 
     // The component that would run the action faults. The other one is untouched, and under the
     // old rule that was enough to let this action through.
     broker.disable_rich(binding(), "the component trapped");
     let refusal = broker
-        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(3))
+        .admit_plugin_action(&caller(), binding(), &invoke, None, TimestampMs::new(3))
         .expect_err("the component answerable for this action is disabled");
     assert_eq!(refusal.code(), ErrorCode::UnsupportedCapability);
     assert!(
@@ -1628,9 +1623,6 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let draft = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
-    broker.bind_drafts(std::sync::Arc::new(KnownDrafts {
-        known: [draft].into_iter().collect(),
-    }));
     broker
         .register_actions(
             binding(),
@@ -1649,6 +1641,10 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
                 resource_id: Nullable::null(),
                 parameters: Bytes::from(b"{}".to_vec()),
             },
+            Some(kr_worker::broker::DraftSnapshot {
+                draft_id: draft,
+                revision: kr_protocol::scalars::U64::new(1),
+            }),
             TimestampMs::new(2),
         )
         .expect("the invocation is admitted");
@@ -1841,7 +1837,7 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
 
     // The generic dispatch route, which any consumer of the broker can reach.
     let admitted = broker
-        .admit_plugin_action(&caller(), binding(), &invoke(), TimestampMs::new(2))
+        .admit_plugin_action(&caller(), binding(), &invoke(), None, TimestampMs::new(2))
         .expect("the invocation is admitted");
     assert!(
         broker
@@ -1852,12 +1848,10 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
 
     // And the plugin route.
     let admitted = broker
-        .admit_plugin_action(&caller(), binding(), &invoke(), TimestampMs::new(4))
+        .admit_plugin_action(&caller(), binding(), &invoke(), None, TimestampMs::new(4))
         .expect("the invocation is admitted");
     assert!(
-        broker
-            .record_plugin_action(&admitted, TimestampMs::new(5))
-            .is_err(),
+        record_plugin_action(&broker, &admitted).is_err(),
         "nor is it one to record"
     );
     assert!(upstream.submitted().is_empty(), "and nothing was written");
@@ -1865,7 +1859,7 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
     // A plan whose arguments are not the ones that will execute is not this invocation's plan,
     // whatever hash it carries.
     let admitted = broker
-        .admit_plugin_action(&caller(), binding(), &invoke(), TimestampMs::new(6))
+        .admit_plugin_action(&caller(), binding(), &invoke(), None, TimestampMs::new(6))
         .expect("the invocation is admitted");
     assert!(
         broker
@@ -1882,11 +1876,7 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
             .is_err(),
         "a hash a component wrote is not evidence about the arguments"
     );
-    assert!(
-        broker
-            .record_plugin_action(&admitted, TimestampMs::new(7))
-            .is_err()
-    );
+    assert!(record_plugin_action(&broker, &admitted).is_err());
     assert!(upstream.submitted().is_empty());
 }
 
@@ -1909,7 +1899,7 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
         parameters: Bytes::from(b"{}".to_vec()),
     };
     let admitted = broker
-        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(2))
+        .admit_plugin_action(&caller(), binding(), &invoke, None, TimestampMs::new(2))
         .expect("the invocation is admitted");
 
     // The package re-registers the same action as a read. The invocation already admitted is not
@@ -1919,7 +1909,7 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
         .expect("the package registers its actions");
     assert!(
         broker
-            .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(3))
+            .admit_plugin_action(&caller(), binding(), &invoke, None, TimestampMs::new(3))
             .is_err(),
         "the declaration in force now is a read, and this is the write path"
     );
@@ -2159,7 +2149,7 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
     // An admission whose approval route is asked for it keeps its permit: the mistake is refused
     // before anything is consumed, and the right route still works.
     let admitted = broker
-        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(2))
+        .admit_plugin_action(&caller(), binding(), &invoke, None, TimestampMs::new(2))
         .expect("the invocation is admitted");
     assert!(
         broker
@@ -2171,15 +2161,13 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
     broker
         .validate_effect(&admitted, &plan)
         .expect("the plan is the invocation's own");
-    broker
-        .record_plugin_action(&admitted, TimestampMs::new(4))
-        .expect("and the right route carries it");
+    record_plugin_action(&broker, &admitted).expect("and the right route carries it");
     assert_eq!(upstream.submitted().len(), 1);
 
     // The thread selection moves while the component is preparing its plan. The token was spent
     // to invite that work, so what refuses the plan is the authority as it stands now.
     let admitted = broker
-        .admit_plugin_action(&caller(), binding(), &invoke, TimestampMs::new(5))
+        .admit_plugin_action(&caller(), binding(), &invoke, None, TimestampMs::new(5))
         .expect("the invocation is admitted");
     broker
         .advance_binding(instance(), None, TimestampMs::new(6))
@@ -2189,9 +2177,7 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
         .expect_err("the invocation's revision is not the one in force");
     assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::StaleSession);
     assert!(
-        broker
-            .record_plugin_action(&admitted, TimestampMs::new(7))
-            .is_err(),
+        record_plugin_action(&broker, &admitted).is_err(),
         "and nothing carries a plan this host did not validate"
     );
     assert_eq!(upstream.submitted().len(), 1, "nothing more was written");
@@ -2291,6 +2277,7 @@ fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
                 resource_id: Nullable::null(),
                 parameters: Bytes::from(b"{}".to_vec()),
             },
+            None,
             TimestampMs::new(2),
         )
         .expect("the invocation is admitted");
@@ -2325,46 +2312,10 @@ fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
         .expect_err("rich work is fenced");
     assert_eq!(refusal.code(), ErrorCode::UpstreamUnavailable);
     assert!(
-        broker
-            .record_plugin_action(&admitted, TimestampMs::new(5))
-            .is_err(),
+        record_plugin_action(&broker, &admitted).is_err(),
         "and nothing carries a plan this host did not validate"
     );
     assert!(upstream.submitted().is_empty());
-}
-
-/// A draft store whose draft moves between one read and the next.
-#[derive(Debug)]
-struct MovingDrafts {
-    draft_id: kr_protocol::ids::DraftId,
-    revision: std::sync::atomic::AtomicU64,
-}
-
-impl MovingDrafts {
-    fn moved(&self) {
-        self.revision
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl kr_worker::broker::DraftResolver for MovingDrafts {
-    fn resolve(
-        &self,
-        draft_id: &kr_protocol::ids::DraftId,
-    ) -> Result<kr_worker::broker::DraftSnapshot, BrokerError> {
-        if draft_id == &self.draft_id {
-            Ok(kr_worker::broker::DraftSnapshot {
-                draft_id: *draft_id,
-                revision: kr_protocol::scalars::U64::new(
-                    self.revision.load(std::sync::atomic::Ordering::SeqCst),
-                ),
-            })
-        } else {
-            Err(BrokerError::PreconditionFailed {
-                detail: format!("no draft {draft_id}"),
-            })
-        }
-    }
 }
 
 /// Forwards one request and interprets it, the way a live gateway does.
@@ -2512,64 +2463,6 @@ async fn kr_req_11_27_a_second_caller_inside_the_first_ones_transmission_settles
     );
 }
 
-/// KR-REQ-23.30: a draft that moves while a component prepares its plan leaves nothing to carry.
-///
-/// The invocation binds to the revision the draft stood at when it was admitted. A plan prepared
-/// against that revision is not a plan against what the draft holds now, and the difference is
-/// `DRAFT_CONFLICT` rather than an operation on a draft nobody admitted.
-#[test]
-fn kr_req_23_30_a_draft_that_moved_while_the_plan_was_prepared_transmits_nothing() {
-    let upstream = std::sync::Arc::new(RecordingUpstream::default());
-    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
-    let draft_id = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
-    let drafts = std::sync::Arc::new(MovingDrafts {
-        draft_id,
-        revision: std::sync::atomic::AtomicU64::new(1),
-    });
-    broker.bind_drafts(std::sync::Arc::clone(&drafts) as _);
-    broker
-        .register_actions(
-            binding(),
-            &[declared("draft.attach", "upstream.attachment")],
-        )
-        .expect("the action is registered");
-    let params = PluginActionInvokeParams {
-        target: target(1),
-        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
-        action: ActionName::new("draft.attach").expect("valid"),
-        draft_id: Nullable::some(draft_id),
-        resource_id: Nullable::null(),
-        parameters: Bytes::from(b"{}".to_vec()),
-    };
-    let effect = kr_protocol::broker::PreparedEffect {
-        action: ActionName::new("draft.attach").expect("valid"),
-        class: EffectClass::Write,
-        operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
-        draft_id: Nullable::some(draft_id),
-        argument_hash: arguments_digest(),
-    };
-
-    let admitted = broker
-        .admit_plugin_action(&caller(), binding(), &params, TimestampMs::new(4))
-        .expect("the invocation is admitted against the draft as it stands");
-    // The person edits the draft while the component is preparing its plan.
-    drafts.moved();
-    let refusal = broker
-        .validate_effect(&admitted, &effect)
-        .expect_err("the plan was prepared against a draft that has moved");
-    assert_eq!(refusal.code(), ErrorCode::DraftConflict);
-    assert!(
-        broker
-            .record_plugin_action(&admitted, TimestampMs::new(5))
-            .is_err(),
-        "and an invocation with no validated plan has nothing to transmit"
-    );
-    assert!(
-        upstream.submitted().is_empty(),
-        "no frame went for a draft nobody admitted"
-    );
-}
-
 /// KR-REQ-11.28: arguments that name a member twice are refused before anything is marked.
 ///
 /// The parse keeps the last member and another reader of the same bytes may keep the first, so
@@ -2594,6 +2487,7 @@ fn kr_req_11_28_arguments_that_name_a_member_twice_are_refused_before_the_marker
                 resource_id: Nullable::null(),
                 parameters: Bytes::from(parameters.to_vec()),
             },
+            None,
             TimestampMs::new(4),
         )
     };
@@ -2692,45 +2586,6 @@ async fn kr_req_11_27_the_native_and_rich_answers_race_and_one_of_them_writes() 
     }
 }
 
-/// A draft store that stops inside the resolution a plan validation performs, until it is let go.
-///
-/// Validation resolves the draft outside every lock, which is the window a registration or a grant
-/// change can land in. This is what opens that window on purpose.
-#[derive(Debug)]
-struct PausingDrafts {
-    draft_id: kr_protocol::ids::DraftId,
-    calls: std::sync::atomic::AtomicU64,
-    inside: std::sync::mpsc::SyncSender<()>,
-    go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-}
-
-impl kr_worker::broker::DraftResolver for PausingDrafts {
-    fn resolve(
-        &self,
-        draft_id: &kr_protocol::ids::DraftId,
-    ) -> Result<kr_worker::broker::DraftSnapshot, BrokerError> {
-        if draft_id != &self.draft_id {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("no draft {draft_id}"),
-            });
-        }
-        // The first call is the admission's. The second is the one inside plan validation, and
-        // that is the one this stops.
-        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            self.inside.send(()).expect("the test is watching");
-            self.go
-                .lock()
-                .expect("the gate is not poisoned")
-                .recv()
-                .expect("the test lets it go");
-        }
-        Ok(kr_worker::broker::DraftSnapshot {
-            draft_id: *draft_id,
-            revision: kr_protocol::scalars::U64::new(1),
-        })
-    }
-}
-
 /// One action as the package's manifest declares it: an `observe` read is the package's own
 /// presentation, and every other class is prepared by its component.
 fn declared(id: &str, effect: &str) -> ActionDeclaration {
@@ -2749,92 +2604,4 @@ fn declared(id: &str, effect: &str) -> ActionDeclaration {
         "confirmation_required": false,
     }))
     .expect("a declaration the manifest format reads")
-}
-
-/// KR-REQ-23.30 and KR-REQ-11.28: authority that moves while a plan is being validated refuses it.
-///
-/// Validation reads the draft outside every lock, because the draft store is not the broker's. The
-/// window that opens is real, and what closes it is that the declaration and the invocation's own
-/// authority are read again inside the final transaction. Here the change lands *inside* that
-/// window rather than before validation starts.
-#[test]
-fn kr_req_23_30_authority_that_moves_inside_plan_validation_refuses_the_plan() {
-    for change in ["the declaration", "the grant"] {
-        let (entered, inside) = std::sync::mpsc::sync_channel(1);
-        let (release, go) = std::sync::mpsc::sync_channel(1);
-        let upstream = std::sync::Arc::new(RecordingUpstream::default());
-        let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
-        let draft_id = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
-        broker.bind_drafts(std::sync::Arc::new(PausingDrafts {
-            draft_id,
-            calls: std::sync::atomic::AtomicU64::new(0),
-            inside: entered,
-            go: std::sync::Mutex::new(go),
-        }));
-        broker
-            .register_actions(
-                binding(),
-                &[declared("draft.attach", "upstream.attachment")],
-            )
-            .expect("the action is registered");
-        let admitted = broker
-            .admit_plugin_action(
-                &caller(),
-                binding(),
-                &PluginActionInvokeParams {
-                    target: target(1),
-                    plugin_id: PluginId::new("kalareach.codex").expect("valid"),
-                    action: ActionName::new("draft.attach").expect("valid"),
-                    draft_id: Nullable::some(draft_id),
-                    resource_id: Nullable::null(),
-                    parameters: Bytes::from(b"{}".to_vec()),
-                },
-                TimestampMs::new(4),
-            )
-            .expect("the invocation is admitted");
-        let effect = kr_protocol::broker::PreparedEffect {
-            action: ActionName::new("draft.attach").expect("valid"),
-            class: EffectClass::Write,
-            operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
-            draft_id: Nullable::some(draft_id),
-            argument_hash: arguments_digest(),
-        };
-
-        let refusal = std::thread::scope(|scope| {
-            let validating = scope.spawn(|| broker.validate_effect(&admitted, &effect));
-            // Validation is inside the draft store now, holding no broker lock. The authority it
-            // was admitted under moves here, which is the whole of the window.
-            inside.recv().expect("validation reached the draft store");
-            if change == "the declaration" {
-                broker
-                    .register_actions(binding(), &[declared("draft.attach", "upstream.prompt")])
-                    .expect("the package re-registers the action as another class");
-            } else {
-                broker
-                    .withdraw_grant(binding(), BrokerGrant::UpstreamAction)
-                    .expect("the grant is withdrawn");
-            }
-            release.send(()).expect("validation is let go");
-            validating.join().expect("the thread finished")
-        })
-        .expect_err("{change} moved while the component was preparing its plan");
-
-        assert!(
-            matches!(
-                refusal.code(),
-                ErrorCode::DraftConflict | ErrorCode::PermissionDenied
-            ),
-            "{change}: {refusal:?}"
-        );
-        assert!(
-            broker
-                .record_plugin_action(&admitted, TimestampMs::new(6))
-                .is_err(),
-            "{change}: an invocation with no validated plan has nothing to transmit"
-        );
-        assert!(
-            upstream.submitted().is_empty(),
-            "{change}: nothing went for an invocation whose authority had moved"
-        );
-    }
 }

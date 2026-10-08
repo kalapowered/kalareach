@@ -70,6 +70,7 @@ pub mod image;
 pub mod ledger;
 pub mod listener;
 pub mod methods;
+pub mod prepare;
 pub mod probe;
 pub mod process;
 pub mod profiles;
@@ -136,8 +137,8 @@ pub use crate::broker::listener::{
 };
 pub use crate::broker::methods::{
     ActionInFlight, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission, MutationInFlight,
-    PendingTransmission, RegisteredAction, Responsible, SnapshotPart, TakenMutation, UpstreamBody,
-    UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command, subject,
+    PendingTransmission, RegisteredAction, Responsible, SnapshotPart, TakenAction, TakenMutation,
+    UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
     BackendStop, BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
@@ -593,30 +594,15 @@ pub struct ClientRequest {
 
 /// One draft as it stood when an invocation was admitted against it.
 ///
-/// The admission binds to this rather than to a resolver call, so what the effect plan is checked
-/// against is the draft the invocation was admitted for and not whatever the store answers a
-/// moment later.
+/// The control daemon owns the draft, so the worker reads it before the admission and the
+/// admission binds to what was read. What the effect plan is checked against is the draft the
+/// invocation was admitted for and not whatever the store answers a moment later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftSnapshot {
     /// The draft.
     pub draft_id: kr_protocol::ids::DraftId,
     /// Its revision when the snapshot was taken.
     pub revision: kr_protocol::scalars::U64,
-}
-
-/// What resolves a draft the broker is asked to act on.
-///
-/// The draft store is not the broker's, so this is a seam. What the broker needs of it is one
-/// answer: is this draft one an operation may act on now, and at which revision? A draft that has
-/// gone, or that moved since the invocation named it, is `DRAFT_CONFLICT` rather than an operation
-/// sent hopefully.
-pub trait DraftResolver: Send + Sync + core::fmt::Debug {
-    /// Answers whether one draft can be acted on now, and returns it as it stands.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::PreconditionFailed`] when the draft has gone or has moved.
-    fn resolve(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<DraftSnapshot>;
 }
 
 /// What stopping an instance actually does.
@@ -737,8 +723,6 @@ struct BrokerState {
     capabilities: CapabilityOwner,
     volatile: VolatileState,
     next_connection: u64,
-    /// What resolves a draft this host is asked to act on, where anything does.
-    drafts: Option<std::sync::Arc<dyn DraftResolver>>,
     /// What carries an answer out on each live connection.
     ///
     /// An answer resolves a resource one connection created, and it goes back on that connection.
@@ -845,6 +829,9 @@ pub struct Broker {
     /// Where the session's description facts take what this broker decides: the thread an
     /// application selected, the events it reported, and the prompts it admitted.
     description_facts: std::sync::OnceLock<crate::description_facts::DescriptionFacts>,
+    /// How a component is asked to prepare an action: the plugin runtime's client, once the link
+    /// has one, and the bound on how many preparations are under way.
+    component_calls: Arc<prepare::ComponentCalls>,
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
     #[cfg(feature = "testing")]
     recovery_pause: Mutex<Option<RecoveryPause>>,
@@ -958,7 +945,6 @@ impl Broker {
                 capabilities: CapabilityOwner::new(),
                 volatile,
                 next_connection,
-                drafts: None,
                 connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
                 connection_packages,
@@ -979,6 +965,7 @@ impl Broker {
             notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
             description_facts: std::sync::OnceLock::new(),
+            component_calls: Arc::new(prepare::ComponentCalls::new()),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -2308,36 +2295,6 @@ impl Broker {
     }
 
     // -- action tokens ------------------------------------------------------------------------
-
-    /// Binds what resolves a draft this host acts on.
-    ///
-    /// A plugin action that acts on a draft, such as one that contributes an attachment to the
-    /// upstream draft, names it, and the broker refuses one it cannot resolve rather than sending
-    /// an operation against a draft that may have moved. The draft store itself is not the
-    /// broker's; this is the seam it is reached through. A host that serves such an action binds
-    /// it, and a worker that binds none refuses every action that names a draft. A prompt that
-    /// names a draft is not one of these: the control daemon records it before it reaches the
-    /// worker, and the broker passes its draft on without resolving it.
-    pub fn bind_drafts(&self, drafts: std::sync::Arc<dyn DraftResolver>) {
-        self.state().drafts = Some(drafts);
-    }
-
-    /// Checks that one draft is one this host can act on.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::PreconditionFailed`] when nothing resolves drafts here, and whatever
-    /// the resolver refuses for a draft that has gone or moved.
-    pub fn resolve_draft(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<DraftSnapshot> {
-        let drafts = self.state().drafts.clone();
-        let drafts = drafts.ok_or_else(|| BrokerError::PreconditionFailed {
-            detail: format!(
-                "this host cannot resolve draft {draft_id}, so an operation that acts on it is \
-                 refused rather than sent against a draft nobody checked"
-            ),
-        })?;
-        drafts.resolve(draft_id)
-    }
 
     /// Issues an action token for one invocation.
     ///
