@@ -43,11 +43,238 @@
         }
       ]
     },
+    "AccountAttempt": {
+      "description": "How the last sign-in attempt ended.",
+      "oneOf": [
+        {
+          "const": "signed_in",
+          "description": "The account is signed in.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The person refused in the browser.",
+          "type": "string"
+        },
+        {
+          "const": "service_refused",
+          "description": "The service would not sign this host in.",
+          "type": "string"
+        },
+        {
+          "const": "not_for_this_attempt",
+          "description": "The answer that came back was not for this attempt, or the service named another account\nthan the one that signed in.",
+          "type": "string"
+        },
+        {
+          "const": "port_busy",
+          "description": "Another program held the loopback address.",
+          "type": "string"
+        },
+        {
+          "const": "timed_out",
+          "description": "Nothing came back in time.",
+          "type": "string"
+        },
+        {
+          "const": "not_kept",
+          "description": "The service signed the account in and the host could not keep the grant.",
+          "type": "string"
+        },
+        {
+          "const": "unreachable",
+          "description": "The service could not be reached to exchange the answer.",
+          "type": "string"
+        },
+        {
+          "const": "superseded",
+          "description": "A newer attempt ended this one.",
+          "type": "string"
+        }
+      ]
+    },
     "AccountId": {
       "description": "A managed account identifier minted by the service. It names the payer; it is not authority.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "AccountReport": {
+      "additionalProperties": false,
+      "description": "Where this host's sign-in stands: the answer to `account.status`.",
+      "properties": {
+        "last_attempt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountAttempt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the last attempt ended, until the next one begins. It is null before any attempt since\nthe daemon started."
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The managed service this host's configuration names as its voice broker, which is where a\nsign-in is made and where its token is presented. Null when the host names none."
+        },
+        "state": {
+          "$ref": "#/$defs/AccountState",
+          "description": "The account this host is signed in as, or what stands in its way."
+        }
+      },
+      "required": [
+        "service",
+        "state",
+        "last_attempt"
+      ],
+      "type": "object"
+    },
+    "AccountSignInParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `account.sign_in`. The environment is the one the connection reaches.",
+      "type": "object"
+    },
+    "AccountSignInStarted": {
+      "additionalProperties": false,
+      "description": "What `account.sign_in` answers once the daemon is listening for the browser's answer.\n\nThe address the person opens is not in it: the answer to a mutation is kept as the receipt of\nthe action, and the address carries the attempt's state and nonce. `account.status` says it.\nAsking again with the same action answers the same attempt; asking with a new action ends the\nattempt that is waiting and starts another.",
+      "properties": {
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the daemon stops waiting for the browser, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "AccountState": {
+      "description": "Where the host stands with an account.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "No account is signed in on this host.",
+          "properties": {
+            "state": {
+              "const": "signed_out",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An attempt is waiting for the browser's answer.",
+          "properties": {
+            "authorise_url": {
+              "description": "The address the person opens in a browser. It carries this attempt's state and nonce,\nso it is shown to the person who asked and to nobody else, and it is used once.",
+              "type": "string"
+            },
+            "expires_at_ms": {
+              "$ref": "#/$defs/TimestampMs",
+              "description": "When the daemon stops waiting, in UTC milliseconds."
+            },
+            "redirect_address": {
+              "description": "The address on this host the browser must reach to finish, such as `127.0.0.1:8765`. A\nperson who opens the browser on another machine forwards this port to the host.",
+              "type": "string"
+            },
+            "state": {
+              "const": "waiting_for_browser",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "authorise_url",
+            "redirect_address",
+            "expires_at_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The browser's answer came back and the daemon is exchanging it with the service.",
+          "properties": {
+            "state": {
+              "const": "finishing",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An account is signed in.",
+          "properties": {
+            "email": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The account's address, when the service said it."
+            },
+            "origin": {
+              "description": "The service the sign-in belongs to. A call is brokered at the service the host's\nconfiguration names, and a token from another service is never presented to it.",
+              "type": "string"
+            },
+            "scopes": {
+              "description": "The scopes the grant carries, as the service issued them.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "signed_in",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "origin",
+            "email",
+            "scopes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The service ended the sign-in, for a refresh token it no longer accepts. Signing in again\nreplaces it.",
+          "properties": {
+            "state": {
+              "const": "ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AccountStatusParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `account.status`. The environment is the one the connection reaches.",
+      "type": "object"
     },
     "ActionCancelParams": {
       "additionalProperties": false,
@@ -18737,6 +18964,16 @@
         {
           "const": "privacy.status",
           "description": "Where privacy mode stands: its generation, whether its last change has taken effect, what each session still owes, what is kept and what had already left this host.",
+          "type": "string"
+        },
+        {
+          "const": "account.sign_in",
+          "description": "Start this host's own sign-in to the managed account service: listen on the loopback address the desktop client is registered with, answer the address a person opens in a browser, and keep the grant that comes back in this host's secret store. Nothing in the answer is a token.",
+          "type": "string"
+        },
+        {
+          "const": "account.status",
+          "description": "Where this host's sign-in to the managed account service stands: signed out, waiting for the browser, signed in at which service, or ended, and how the last attempt ended.",
           "type": "string"
         },
         {
@@ -37845,6 +38082,24 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.",
   "properties": {
+    "account_attempt": {
+      "$ref": "#/$defs/AccountAttempt"
+    },
+    "account_report": {
+      "$ref": "#/$defs/AccountReport"
+    },
+    "account_sign_in_params": {
+      "$ref": "#/$defs/AccountSignInParams"
+    },
+    "account_sign_in_started": {
+      "$ref": "#/$defs/AccountSignInStarted"
+    },
+    "account_state": {
+      "$ref": "#/$defs/AccountState"
+    },
+    "account_status_params": {
+      "$ref": "#/$defs/AccountStatusParams"
+    },
     "action_cancel_params": {
       "$ref": "#/$defs/ActionCancelParams"
     },
