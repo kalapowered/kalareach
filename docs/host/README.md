@@ -4594,12 +4594,20 @@ alike. A request that names none is decided under the pairing grant when its sel
 session, and otherwise under the one live share that does. When several shares admit the session
 and nothing names one, the request is refused and says to name the grant, which a mutation does and
 a read cannot: a client that acts under a share names it in its first mutation, `session.attach`
-for a subscription. A request that names no session is decided under the pairing grant.
+for a subscription. A request that names no session is decided under the pairing grant, and so is
+every voice request, because a voice grant is selected by the voice coordinator and a share never
+carries one. `session.list` shows what the pairing grant admits; the session of a redeemed share is
+named by the `grant.redeem` answer, and a client reaches it by that identity.
 
 The pairing grant stays the condition for connecting at all. It has to be unexpired, and it has to
 stand under this host's policy, whichever grant a request acts under, so a share is reachable only
-while the device's pairing grant lasts. A connection serves one session, and the grant it opened its
-link to that session under is the grant it acts under for that session until it ends. The worker
+while the device's pairing grant lasts, and the membership lease and bounded offline validity the
+pairing grant stands under bound a request decided under a share as they bound one decided under
+the pairing grant. A connection serves one session, and the grant it opened its link to that
+session's worker under is the grant it acts under for that session until it ends. The first request
+that is forwarded to the worker opens the link: a read, a mutation the worker performs, or
+`session.attach`. A mutation the daemon performs itself, such as a rename or a close, is decided
+under the grant it names and fixes nothing. The worker
 keeps state that belongs to a grant, the history scope a subscription carries and the lease an
 attachment holds, and deciding a later request under another grant would leave that state outliving
 the grant it was made under. The worker is told which grant a request was decided under, and holds
@@ -4676,9 +4684,11 @@ moment it was asked, while it is open, and what a named approval asks and when i
 while it can still be decided, pending or claimed. For the live screen it asks the worker for the
 visible lines of the buffer that is showing (`session.screen.preview`, a read only the owner at
 this machine makes), cut to the scope the share would carry: the buffer that is not showing and
-what has scrolled off are not in it. A screen too large for a preview is not shared, because the
-issuer would be shown less than the recipient will read, and a session whose worker is of a build
-that cannot show it is not shared either. What an approval asks is its decoder's summary,
+what has scrolled off are not in it. While an application holds the alternate buffer, that buffer is
+the screen being shared and previewed, and the primary buffer behind it is neither. A screen too
+large for a preview, or one with a row the terminal grid had to cut to keep it inside its byte
+bound, is not shared, because the issuer would be shown less than the recipient will read, and a
+session whose worker is of a build that cannot show it is not shared either. What an approval asks is its decoder's summary,
 or where the decoder gave none, as the Claude Code channel's table gives none, the request as its
 upstream wrote it, when that is text of at most 4,096 bytes; an approval with neither cannot be
 named, because a preview cut short would show its issuer less than the recipient will read. An

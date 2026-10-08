@@ -1163,17 +1163,16 @@ async fn read_screen(
         .map_err(PreviewFailure::Link)?;
     let result: kr_protocol::sharing::SessionScreenPreviewResult = match answered {
         Ok(value) => answered_as(&value)?,
+        // A worker of an earlier build answers a read it does not know as one it does not serve.
         Err(error)
-            if matches!(
-                error.code,
-                ErrorCode::PermissionDenied
-                    | ErrorCode::InvalidArgument
-                    | ErrorCode::UnsupportedCapability
-            ) =>
+            if error.code == ErrorCode::UnsupportedCapability
+                || (error.code == ErrorCode::InvalidArgument
+                    && error.message.ends_with("is not a read this worker serves")) =>
         {
             return Err(PreviewFailure::Refused(ControllerError::Refused {
                 code: ErrorCode::UnsupportedCapability,
-                detail: "this session's worker is of a build that cannot show its screen to the                          issuer of a share, so the screen is not shared"
+                detail: "this session's worker is of a build that cannot show its screen to the \
+                         issuer of a share, so the screen is not shared"
                     .to_owned(),
             }));
         }
