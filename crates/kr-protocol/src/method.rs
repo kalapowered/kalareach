@@ -426,8 +426,10 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "List the notification destinations that have a rule: a paired device's and the ones \
           the owner configured, each with where it sends, the grant it is told under and whether \
-          it is in force. A removed destination is not listed. It never carries a credential, and a webhook's \
-          address is given without its query and fragment.";
+          it is in force. A removed destination is not listed. It carries no credential kept in \
+          the secret store, and does not say whether one is kept. A webhook's address is given \
+          without its query and fragment, but its path is given as it was configured, and a \
+          path can carry a token its owner put there.";
 
     DeliveryDestinationSecretSet = "delivery.destination.secret.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
