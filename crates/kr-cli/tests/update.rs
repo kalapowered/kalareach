@@ -1857,6 +1857,9 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     let record = host.record();
     assert!(record["update"].is_null(), "{record}");
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
+    // The record the update left was written by an earlier build, as format 1; it is written again
+    // in the format this build writes.
+    assert_eq!(record["format"], 2, "{record}");
 }
 
 /// KR-REQ-26.10: a transaction an earlier build began holds no root, and settles on the roots of its

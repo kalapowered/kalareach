@@ -105,7 +105,16 @@ pub fn said(error: &InstallError) -> Shown {
 }
 
 /// The store record's format this build writes, and the newest it reads.
-pub const RECORD_FORMAT: u32 = 1;
+///
+/// Format 2 records the update channel root this host trusts, and the root an update under way
+/// settles on. A record of format 1 holds neither; it reads as it is and is written as format 2
+/// the next time it is written.
+pub const RECORD_FORMAT: u32 = 2;
+
+/// The oldest store record format this build reads. Raise it, and remove the step in
+/// [`Record::read`] that brings an earlier record forward, once no supported upgrade starts from
+/// one.
+pub const OLDEST_RECORD_FORMAT: u32 = 1;
 
 /// The longest store record this build reads: it holds the channel roots of the host and of an
 /// update under way, of which a release may carry one up to 1 MiB each, written out in the
@@ -238,7 +247,12 @@ impl Record {
                 RECORD_FORMAT
             )));
         }
-        Ok(record)
+        // The step from an earlier format: what a record of format 1 holds is all that format 2
+        // holds before it records a root, so it reads as format 2 and the next write says so.
+        Ok(Self {
+            format: RECORD_FORMAT,
+            ..record
+        })
     }
 
     /// Writes the record in place of the store's, whole or not at all, and flushed.

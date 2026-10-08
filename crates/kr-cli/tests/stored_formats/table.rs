@@ -63,7 +63,7 @@ pub fn table() -> Vec<Store> {
                 "install.json",
                 member("format", 0),
                 kr_cli::update::RECORD_FORMAT,
-                kr_cli::update::RECORD_FORMAT,
+                kr_cli::update::OLDEST_RECORD_FORMAT,
             ),
             owned: Vec::new(),
             kept: vec![Kept::Source(
