@@ -10,8 +10,9 @@
 //! # Reading a session
 //!
 //! For every live session a link holds one request for the records past the store's cursors; the
-//! worker answers it as soon as it commits a question transition, a host event or a privacy
-//! transition, and after a bounded wait otherwise. A page that reached the head of both sources
+//! worker answers it as soon as it commits a question transition, a host event, the transition of
+//! a pending approval or a privacy transition, and after a bounded wait otherwise. A page that
+//! reached the head of every source
 //! certifies everything the session committed before the moment it was read, and a timer of that
 //! session is decided only up to that moment: an answer on a page the store has not read never
 //! becomes a reminder. A link that stops certifies nothing, and its session's timers wait.
@@ -297,7 +298,7 @@ struct Origins {
     /// The worker each of those sessions is reached at.
     workers: BTreeMap<SessionId, Watched>,
     /// Each live session's latest certificate: the moment of its latest page that reached the
-    /// head of both sources.
+    /// head of every source.
     certified: BTreeMap<SessionId, u64>,
     /// The environment's latest certificate: the moment of its latest read that reached the end of
     /// the workflow journal's attention records.
@@ -1482,6 +1483,11 @@ impl AttentionModule {
     ) -> (Vec<(usize, Option<String>)>, Ticket) {
         let mut by_session: BTreeMap<SessionId, Vec<(usize, EventCursor)>> = BTreeMap::new();
         for (index, record) in records {
+            // What an approval asks is the application's to show: a broker transition has no text
+            // to read, so no worker is asked for it.
+            if record.source == AttentionSource::Approvals {
+                continue;
+            }
             if let Some(session_id) = record.origin.session() {
                 by_session
                     .entry(session_id)
@@ -2875,7 +2881,7 @@ impl AttentionModule {
 
 /// What became of a page the store was offered.
 enum Taken {
-    /// It reached the head of both sources.
+    /// It reached the head of every source.
     Complete,
     /// It stopped short of a head, and the next page follows at once.
     Partial,
@@ -4481,6 +4487,114 @@ pub(crate) mod tests {
             module.cursors(session_id).expect("the cursors").approvals,
             7
         );
+    }
+
+    /// KR-REQ-25.01: a page of the broker's transitions that stops short of the source's head is
+    /// followed at once, and a number the source never carried between two records it did carry
+    /// makes the approvals raised before it uncertain without ending them: a hole in the numbering is
+    /// a range the store cannot read, and an unresolved approval is not inferred resolved by it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_short_page_of_approvals_is_followed_at_once_and_a_hole_leaves_them_uncertain() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+        let approval = PendingResourceId::new(kr_ipc::new_uuid());
+        let approvals = |module: &Arc<AttentionModule>| {
+            module
+                .store()
+                .expect("the store")
+                .inbox(&owner(), &Viewer::Owner, true)
+                .expect("the inbox")
+                .into_iter()
+                .filter(|item| item.rule == kr_protocol::attention::AttentionRule::PendingApproval)
+                .collect::<Vec<_>>()
+        };
+
+        // The source holds five records and this page carries three: not complete, and the
+        // approval raised on it is certain.
+        let mut short = approval_page(vec![
+            transition(1, approval, PendingState::Pending, false, false),
+            transition(2, approval, PendingState::Pending, true, true),
+            transition(3, approval, PendingState::Claimed, true, false),
+        ]);
+        short.approvals.head = U64::new(5);
+        let taken = module
+            .take_page(session_id, &link, Cursors::default(), &short)
+            .await
+            .expect("the store answers");
+        assert!(
+            matches!(taken, Taken::Partial),
+            "the daemon reads on at once"
+        );
+        let raised = approvals(&module);
+        assert_eq!(raised.len(), 1);
+        assert!(!raised[0].uncertain);
+
+        // The next page continues from the cursor and ends at the head, with number four never
+        // carried: the approval stays in the inbox and says the host cannot tell.
+        let taken = module
+            .take_page(
+                session_id,
+                &link,
+                Cursors {
+                    approvals: 3,
+                    ..Cursors::default()
+                },
+                &approval_page(vec![transition(
+                    5,
+                    PendingResourceId::new(kr_ipc::new_uuid()),
+                    PendingState::Pending,
+                    false,
+                    false,
+                )]),
+            )
+            .await
+            .expect("the store answers");
+        assert!(matches!(taken, Taken::Complete));
+        let after = approvals(&module);
+        assert_eq!(after.len(), 1, "a hole ends nothing");
+        assert!(after[0].uncertain, "and says the host cannot tell");
+    }
+
+    /// KR-REQ-25.01: a session that closes over a worker this host could not account for leaves its
+    /// pending approvals in the inbox as uncertain, the same as its questions: the broker's records
+    /// are one of the sources that closure marks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_approval_of_a_session_closed_unaccounted_for_is_left_uncertain() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+        let approval = PendingResourceId::new(kr_ipc::new_uuid());
+        module
+            .take_page(
+                session_id,
+                &link,
+                Cursors::default(),
+                &approval_page(vec![transition(
+                    1,
+                    approval,
+                    PendingState::Pending,
+                    true,
+                    true,
+                )]),
+            )
+            .await
+            .expect("the store answers");
+        module
+            .session_closed(&Stub { unaccounted: true }, session_id)
+            .await;
+        let items = module
+            .store()
+            .expect("the store")
+            .inbox(&owner(), &Viewer::Owner, true)
+            .expect("the inbox");
+        let approval = items
+            .iter()
+            .find(|item| item.rule == kr_protocol::attention::AttentionRule::PendingApproval)
+            .expect("the approval stays");
+        assert!(approval.uncertain);
     }
 
     /// A page that arrives after its session's closure is not taken: the closure holds the store

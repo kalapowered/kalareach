@@ -202,7 +202,8 @@ pub enum EventKind {
     /// say "I read this and it was nothing", the cursor would stay behind and the next record the
     /// engine does have a rule for would look like a gap. This is that way.
     Observed,
-    /// An upstream agent asked for an approval decision.
+    /// An approval is waiting for a decision: an upstream agent asked for one, or the session's
+    /// broker has interpreted a request into one a person can answer.
     ApprovalRequested {
         /// The request.
         request_id: ApprovalRequestId,
@@ -217,8 +218,8 @@ pub enum EventKind {
         request_id: ApprovalRequestId,
         /// The session it belonged to.
         ///
-        /// An upstream request identifier is the connector's own and is not unique across
-        /// sessions, so the request is named by both.
+        /// A request identifier is the connector's own or the broker's identifier of the pending
+        /// resource, and is not unique across sessions, so the request is named by both.
         session_id: SessionId,
     },
     /// A question became pending.

@@ -163,8 +163,10 @@ impl Subject {
         &self.0
     }
 
-    /// A pending approval: the session it waits in, then the upstream request identifier, which is
-    /// the connector's own and not unique across sessions.
+    /// A pending approval: the session it waits in, then the request identifier, which is the
+    /// connector's own where the upstream states one, or the broker's identifier of the pending
+    /// resource where the session's broker records the approval; neither is unique across
+    /// sessions.
     #[must_use]
     pub fn approval(session_id: SessionId, request_id: &impl core::fmt::Display) -> Self {
         Builder::of(Form::Approval)
