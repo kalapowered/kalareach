@@ -609,6 +609,8 @@ fn kr_req_10_51_an_earlier_session_invitation_reads_unchanged_or_cannot_be_redee
             invitation,
             DeviceId::new(Uuid::from_bytes(DEVICE)),
             kr_ipc::now_ms().get(),
+            || Ok(()),
+            None,
         )
         .expect_err("it cannot be redeemed");
     assert!(

@@ -323,7 +323,7 @@ impl RemoteConnection {
                     request
                 };
                 let answer = self.controller.read_method(&actor_id, request).await;
-                let narrowed = self.narrow(answer);
+                let narrowed = self.narrow(answer, &decided.acting);
                 if entry.method == Method::ChangesetRead {
                     super::narrowing::without_host_text(narrowed)
                 } else {
@@ -372,7 +372,7 @@ impl RemoteConnection {
                     .await
             }
             DeviceRead::Attention => {
-                let caller = crate::attention::Caller::device(&self.device.grant);
+                let caller = crate::attention::Caller::device(&decided.acting.grant);
                 let reach = self.controller.attention_reach();
                 self.controller
                     .attention()
@@ -416,7 +416,7 @@ impl RemoteConnection {
                         })?;
                     let summary = self.controller.session_summary(params.session_id).await?;
                     let reach = crate::describe::HistoryReach::of_grant(
-                        self.device.grant.history.lower_bound_ms.0,
+                        decided.acting.grant.history.lower_bound_ms.0,
                         Some(summary.created_at_ms),
                     );
                     self.controller.session_describe(summary, reach).await
@@ -492,10 +492,11 @@ impl RemoteConnection {
         let actor_id = self.device.principal();
         // The rights this request was decided with: the grant as this host's policy and its
         // configured ceiling leave it. They are what the worker is told the host checked.
-        let decided = match self.ask(
+        let decided = match self.ask_naming(
             mutation.target.session_id.as_ref().copied(),
             entry,
             claims_geometry(mutation),
+            mutation.grant_id.as_ref().copied(),
         ) {
             Ok(decided) => decided,
             Err(error) => return failure(mutation.request_id, error),
@@ -584,7 +585,7 @@ impl RemoteConnection {
             }
             // The daemon's own retained answer is a read of what an earlier submission produced,
             // and is written under the decision that read is ([`Self::read_of_retained`]).
-            match self.read_of_retained(entry.method, mutation, &retained) {
+            match self.read_of_retained(entry.method, mutation, &retained, &decided.acting) {
                 Ok(Some(read)) => *asked = Some(read),
                 Ok(None) => {}
                 Err(error) => return failure(mutation.request_id, error),
@@ -684,7 +685,11 @@ impl RemoteConnection {
                 // the same read of somebody's result as a retained answer anywhere else, and it
                 // says so: `deduplicated` is what distinguishes it from a session made now.
                 if deduplicated(&answer) {
-                    match self.may_read_receipts(answered_session(&answer), Method::SessionCreate) {
+                    match self.may_read_receipts(
+                        answered_session(&answer),
+                        Method::SessionCreate,
+                        &decided.acting,
+                    ) {
                         Ok(read) => *asked = Some(read),
                         Err(error) => return failure(request_id, error),
                     }
@@ -717,9 +722,9 @@ impl RemoteConnection {
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
-                let envelope = self.envelope(validated);
+                let envelope = self.envelope(decided.acting.grant.grant_id, validated);
                 let grant_rights = rights;
-                let history = self.device.grant.history.clone();
+                let history = decided.acting.grant.history.clone();
                 let request_id = mutation.request_id;
                 // The answer comes back before the link that carried the close is released,
                 // because releasing it is what tells the worker the acceptance was delivered.
@@ -764,8 +769,11 @@ impl RemoteConnection {
                                 );
                             }
                             Retained::Record | Retained::Worker { .. } => {
-                                match self.may_read_receipts(Some(session_id), Method::SessionClose)
-                                {
+                                match self.may_read_receipts(
+                                    Some(session_id),
+                                    Method::SessionClose,
+                                    &decided.acting,
+                                ) {
                                     Ok(read) => *asked = Some(read),
                                     Err(error) => return failure(request_id, error),
                                 }
@@ -951,7 +959,7 @@ impl RemoteConnection {
                 let mutation = mutation.clone();
                 let request_id = mutation.request_id;
                 let method = entry.method;
-                let caller = crate::attention::Caller::device(&self.device.grant);
+                let caller = crate::attention::Caller::device(&decided.acting.grant);
                 let carried = crate::authority::AdmittedMutation {
                     connection_id: self.connection_id(),
                     admitted_revision: validated,
@@ -1086,6 +1094,37 @@ impl RemoteConnection {
                     let kept = controller.settle_claim(&hold, &outcome);
                     drop(hold);
                     kept.and(outcome)
+                });
+                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
+            }
+            // A redemption is this daemon's own effect, once per actor's action, for the device
+            // that sends it and no other: the invitation names the device that may redeem it. The
+            // route names this host as the owner of the receipt, and the redemption is claimed,
+            // committed with its answer and answered on a task that outlives this connection, so
+            // a retry is answered from that record.
+            Method::GrantRedeem => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let device_id = self.device.device_id;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let effect = tokio::spawn(async move {
+                    controller
+                        .authority_change(
+                            &actor_id,
+                            crate::service::authority_changes::AuthorityCaller::Device(device_id),
+                            &mutation,
+                            Method::GrantRedeem,
+                            carried,
+                        )
+                        .await
                 });
                 settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
@@ -1271,8 +1310,15 @@ impl RemoteConnection {
             }
             // Everything else belongs to the worker that owns the session.
             _ => {
-                self.proxied_mutation(mutation, accepted, validated, rights, asked)
-                    .await
+                self.proxied_mutation(
+                    mutation,
+                    accepted,
+                    validated,
+                    rights,
+                    &decided.acting,
+                    asked,
+                )
+                .await
             }
         }
     }

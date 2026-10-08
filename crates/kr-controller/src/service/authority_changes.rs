@@ -22,6 +22,15 @@ use crate::error::{ControllerError, Result};
 
 use super::{Controller, encode, net, parse, respond};
 
+/// Who an authority change is made for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthorityCaller {
+    /// The owner at this machine, over local IPC. It acts as this host.
+    Owner,
+    /// A paired device, acting as itself.
+    Device(kr_protocol::ids::DeviceId),
+}
+
 impl Controller {
     /// Answers an authority change this host already holds a claim on, before freshness is asked
     /// for.
@@ -447,9 +456,10 @@ impl Controller {
     /// twice and fence the host twice for one withdrawal. Only the attempt that writes the claim
     /// performs the change; any other is answered from the record
     /// ([`Self::recorded_authority_change`]).
-    pub(super) async fn authority_change(
+    pub(crate) async fn authority_change(
         &self,
         actor_id: &ActorId,
+        caller: AuthorityCaller,
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
@@ -476,6 +486,7 @@ impl Controller {
         };
         let outcome = match method {
             Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
+            Method::GrantRedeem => self.grant_redeem(mutation, caller, carried, &hold).await,
             Method::GrantRevoke => self.grant_revoke(mutation, carried, &hold).await,
             Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
             Method::DevicePreviewKeyUpdate => {
@@ -684,6 +695,45 @@ impl Controller {
                         .to_owned(),
                 })
             })
+    }
+
+    /// Redeems a session invitation for the device that calls, and activates the grant it carries.
+    ///
+    /// The answer is written beside the action's claim in the commit that activates the grant, so
+    /// a redemption that committed is answered to every repeat of its action, whatever happens to
+    /// this attempt afterwards. The admission is checked under the registry lock and again inside
+    /// that commit.
+    async fn grant_redeem(
+        &self,
+        mutation: &MutationRequest,
+        caller: AuthorityCaller,
+        carried: crate::authority::AdmittedMutation,
+        hold: &crate::grants::ClaimHold,
+    ) -> Result<ParamsValue> {
+        let AuthorityCaller::Device(device_id) = caller else {
+            return Err(ControllerError::PermissionDenied {
+                detail: "an invitation is redeemed by the device it names".to_owned(),
+            });
+        };
+        let params: kr_protocol::sharing::GrantRedeemParams = parse(&mutation.params)?;
+        // Written down before the decision that stands on it, so an invitation that ran out is
+        // refused as expired rather than as a reading this host has not recorded.
+        let now_ms = self.settled_now_ms();
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        let redeemed = self.sharing.redeem(
+            params.invitation_id,
+            device_id,
+            now_ms,
+            || self.check_admission(&registry, &carried),
+            Some(hold),
+        );
+        drop(registry);
+        self.settle_floor();
+        encode(&kr_protocol::sharing::GrantRedeemResult {
+            invitation_id: params.invitation_id,
+            grant: redeemed?,
+        })
     }
 
     /// Revokes a grant, its descendants, and everything they were being used for.

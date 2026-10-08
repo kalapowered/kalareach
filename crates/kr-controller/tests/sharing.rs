@@ -303,7 +303,13 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
         .share(&share(SessionRole::Owner, 1), || Ok(()))
         .expect("an owner");
     service
-        .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .redeem(
+            owner.preview.invitation_id,
+            device_id(0xf1),
+            NOW + 1,
+            || Ok(()),
+            None,
+        )
         .expect("the owner redeems it");
 
     let plan = TransferPlan {
@@ -821,6 +827,56 @@ fn an_issuer_that_accepted_different_consequences_does_not_get_the_grant() {
 // KR-REQ-25.10: single use, expiring, previewed, and no historical attachment keys
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-25.10: a redemption that committed is answered to a repeat of its action even when the
+/// attempt that made it never recorded the answer. The answer is written beside the action's claim
+/// in the commit that activates the grant, so an attempt that ends between that commit and its own
+/// record leaves an action that reads as answered, not as one nobody can say anything about.
+#[test]
+fn kr_req_25_10_a_committed_redemption_is_answered_to_a_repeat_of_its_action() {
+    use kr_controller::grants::{ActionClaim, ActionRecord};
+    use kr_protocol::ids::{ActionId, ActorId};
+    use kr_protocol::scalars::Digest256;
+
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    let issued = service
+        .share(&share(SessionRole::Viewer, 1), || Ok(()))
+        .expect("issued");
+    let actor = ActorId::new("device:f1").expect("an actor");
+    let action = ActionId::new(Uuid::from_bytes([0x5a; 16]));
+    let digest = Digest256::from_bytes([0x33; 32]);
+    let ActionClaim::Claimed { hold } = service
+        .grants()
+        .claim_action(&actor, action, &digest, NOW)
+        .expect("claimed")
+    else {
+        panic!("a first claim is held by its attempt");
+    };
+    let granted = service
+        .redeem(
+            issued.preview.invitation_id,
+            device_id(0xf1),
+            NOW + 1,
+            || Ok(()),
+            Some(&hold),
+        )
+        .expect("the invitation is redeemed");
+    // The attempt ends here: it never records its answer.
+    drop(hold);
+
+    let record = service
+        .grants()
+        .recorded_action(&actor, action, &digest)
+        .expect("readable")
+        .expect("the action is on record");
+    let ActionRecord::Answered { result } = record else {
+        panic!("the committed redemption is answered: {record:?}");
+    };
+    let answered: kr_protocol::sharing::GrantRedeemResult =
+        kr_cbor::from_canonical_slice(&result, &kr_cbor::Limits::DEFAULT).expect("decodes");
+    assert_eq!(answered.grant, granted);
+    assert_eq!(answered.invitation_id, issued.preview.invitation_id);
+}
+
 #[test]
 fn an_invitation_is_single_use_and_expires() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
@@ -840,17 +896,31 @@ fn an_invitation_is_single_use_and_expires() {
         "a grant is a proposal until it is redeemed"
     );
 
-    // A device the invitation was not issued to cannot redeem it.
+    // A device the invitation was not issued to cannot redeem it, and is told what it is told of an
+    // invitation that does not exist.
     let error = service
-        .redeem(first, device_id(0xf9), NOW + 1_000)
+        .redeem(first, device_id(0xf9), NOW + 1_000, || Ok(()), None)
         .expect_err("the invitation names one device");
+    let unknown = service
+        .redeem(
+            invitation_id(0x7f),
+            device_id(0xf9),
+            NOW + 1_000,
+            || Ok(()),
+            None,
+        )
+        .expect_err("nobody issued this invitation");
     assert!(
-        error.to_string().contains("another device"),
+        matches!(
+            &error,
+            kr_controller::error::ControllerError::PermissionDenied { .. }
+        ),
         "unexpected refusal: {error}"
     );
+    assert_eq!(error.to_string(), unknown.to_string());
 
     let activated = service
-        .redeem(first, device_id(0xf1), NOW + 1_000)
+        .redeem(first, device_id(0xf1), NOW + 1_000, || Ok(()), None)
         .expect("the named device redeems it");
     assert_eq!(activated.grant_id, issued.grant.grant_id);
     assert!(
@@ -865,7 +935,7 @@ fn an_invitation_is_single_use_and_expires() {
 
     // Not even the device that redeemed it can do so twice.
     let error = service
-        .redeem(first, device_id(0xf1), NOW + 1_200)
+        .redeem(first, device_id(0xf1), NOW + 1_200, || Ok(()), None)
         .expect_err("single use means once");
     assert!(
         error.to_string().contains("already been redeemed"),
@@ -886,7 +956,13 @@ fn an_invitation_is_single_use_and_expires() {
         .expect("issued");
     let expires_at = second.preview.expires_at_ms.get();
     let error = service
-        .redeem(second.preview.invitation_id, device_id(0xf4), expires_at)
+        .redeem(
+            second.preview.invitation_id,
+            device_id(0xf4),
+            expires_at,
+            || Ok(()),
+            None,
+        )
         .expect_err("an expired invitation is refused");
     assert!(
         error.to_string().contains("expired"),
@@ -906,9 +982,15 @@ fn an_invitation_is_single_use_and_expires() {
             || Ok(()),
         )
         .expect("issued");
-    service
-        .cancel(third.preview.invitation_id, NOW + 5)
+    // Withdrawing an invitation is revoking the proposal it carries: the invitation says what
+    // became of it, and nothing is left to fence because nothing was ever active.
+    let withdrawn = service
+        .revoke(third.grant.grant_id, NOW + 5, || Ok(()), None)
         .expect("withdrawn");
+    assert_eq!(
+        withdrawn.debt, None,
+        "a proposal nobody redeemed fences nothing"
+    );
     assert!(
         service
             .grants()
@@ -919,8 +1001,23 @@ fn an_invitation_is_single_use_and_expires() {
             .is_some(),
         "a withdrawn invitation leaves no proposal behind"
     );
+    assert_eq!(
+        service
+            .invitation(third.preview.invitation_id)
+            .expect("readable")
+            .expect("present")
+            .state,
+        kr_protocol::sharing::InvitationState::Cancelled,
+        "the invitation says it was withdrawn"
+    );
     service
-        .redeem(third.preview.invitation_id, device_id(0xf5), NOW + 6)
+        .redeem(
+            third.preview.invitation_id,
+            device_id(0xf5),
+            NOW + 6,
+            || Ok(()),
+            None,
+        )
         .expect_err("a withdrawn invitation activates nothing");
 }
 
@@ -932,7 +1029,13 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
         .share(&share(SessionRole::Owner, 1), || Ok(()))
         .expect("an owner");
     service
-        .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .redeem(
+            owner.preview.invitation_id,
+            device_id(0xf1),
+            NOW + 1,
+            || Ok(()),
+            None,
+        )
         .expect("the owner redeems it");
 
     let plan = TransferPlan {
@@ -1207,7 +1310,13 @@ fn a_delegation_narrows_what_the_issuer_holds() {
     // Redeemed, because a proposal carries nothing to delegate: authority nobody has taken up is
     // not authority anybody can pass on.
     service
-        .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .redeem(
+            owner.preview.invitation_id,
+            device_id(0xf1),
+            NOW + 1,
+            || Ok(()),
+            None,
+        )
         .expect("the owner redeems it");
 
     // The owner delegates a viewer's grant to a third device: narrower, and accepted.
@@ -1231,7 +1340,13 @@ fn a_delegation_narrows_what_the_issuer_holds() {
     );
 
     service
-        .redeem(narrower.preview.invitation_id, device_id(0xf2), NOW + 2)
+        .redeem(
+            narrower.preview.invitation_id,
+            device_id(0xf2),
+            NOW + 2,
+            || Ok(()),
+            None,
+        )
         .expect("the viewer redeems it");
 
     // The viewer it just created tries to pass its own view on. It holds no `session.share`, so
@@ -1560,7 +1675,13 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
         )
         .expect("an owner");
     service
-        .redeem(owner.preview.invitation_id, device_id(0xaa), NOW + 1)
+        .redeem(
+            owner.preview.invitation_id,
+            device_id(0xaa),
+            NOW + 1,
+            || Ok(()),
+            None,
+        )
         .expect("the owner redeems it");
     let other_issuer = service
         .share(
@@ -1600,7 +1721,13 @@ fn an_invitation_refused_as_expired_stays_expired() {
     let expires_at = issued.preview.expires_at_ms.get();
 
     service
-        .redeem(issued.preview.invitation_id, device_id(0xf1), expires_at)
+        .redeem(
+            issued.preview.invitation_id,
+            device_id(0xf1),
+            expires_at,
+            || Ok(()),
+            None,
+        )
         .expect_err("an expired invitation is refused");
 
     // The refusal wrote the invitation's expiry down, and that write survived the refusal. A later
@@ -1615,7 +1742,13 @@ fn an_invitation_refused_as_expired_stays_expired() {
         "the expiry is committed, not rolled back with the refusal"
     );
     service
-        .redeem(issued.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .redeem(
+            issued.preview.invitation_id,
+            device_id(0xf1),
+            NOW + 1,
+            || Ok(()),
+            None,
+        )
         .expect_err("a clock that went back does not re-open it");
 }
 
@@ -1644,7 +1777,13 @@ async fn transferring_control_through_the_daemon_completes_through_the_barrier()
         .expect("the host shares a session");
     controller
         .sharing()
-        .redeem(owner.preview.invitation_id, device_id(0xf1), now_ms + 1)
+        .redeem(
+            owner.preview.invitation_id,
+            device_id(0xf1),
+            now_ms + 1,
+            || Ok(()),
+            None,
+        )
         .expect("the owner redeems it");
 
     let plan = TransferPlan {
@@ -1810,7 +1949,13 @@ fn shared_and_redeemed(controller: &Controller, byte: u8, device: DeviceId) -> G
         .expect("the host shares a session");
     controller
         .sharing()
-        .redeem(shared.preview.invitation_id, device, now_ms + 1)
+        .redeem(
+            shared.preview.invitation_id,
+            device,
+            now_ms + 1,
+            || Ok(()),
+            None,
+        )
         .expect("the device redeems it")
 }
 
@@ -2122,6 +2267,8 @@ async fn a_redemption_whose_invitation_expired_before_it_was_written_is_refused(
             shared.preview.invitation_id,
             device_id(0xf1),
             shared_at_ms + 1,
+            || Ok(()),
+            None,
         )
         .expect_err("the invitation had run out by the time the redemption was written");
     assert!(refused.to_string().contains("expired"), "{refused}");
@@ -2230,7 +2377,13 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
         .expect("the host shares a session");
     controller
         .sharing()
-        .redeem(issued.preview.invitation_id, device_id(0xf1), now_ms + 1)
+        .redeem(
+            issued.preview.invitation_id,
+            device_id(0xf1),
+            now_ms + 1,
+            || Ok(()),
+            None,
+        )
         .expect("the recipient redeems it");
 
     // A delegation from it, so the revocation has a descendant to take with it.
@@ -2434,7 +2587,13 @@ async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
                 Effect::Delegation => delegate(&controller, &grant, 5).map(|_| ()),
                 Effect::Redemption => controller
                     .sharing()
-                    .redeem(invitation.expect("an invitation"), device_id(0xf1), now + 1)
+                    .redeem(
+                        invitation.expect("an invitation"),
+                        device_id(0xf1),
+                        now + 1,
+                        || Ok(()),
+                        None,
+                    )
                     .map(|_| ()),
                 Effect::Transfer => transfer_to_another(&controller, &grant, grant_id(9)).await,
             }
@@ -2713,7 +2872,7 @@ async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanch
         tokio::task::spawn_blocking(move || {
             controller
                 .sharing()
-                .redeem(invitation_id, device_id(0xf1), now + 1)
+                .redeem(invitation_id, device_id(0xf1), now + 1, || Ok(()), None)
         })
     };
     // Answered while the other writer's transaction is still open. A redemption that went on to its
@@ -2724,8 +2883,8 @@ async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanch
         .expect("the redemption answers while the other writer holds the store")
         .expect("the redemption ends");
     match outcome {
-        Err(kr_controller::error::ControllerError::InvalidArgument(detail)) => {
-            assert_eq!(detail, "this host holds no such invitation");
+        Err(kr_controller::error::ControllerError::PermissionDenied { detail }) => {
+            assert_eq!(detail, "this invitation is not open to this device");
         }
         other => panic!(
             "an invitation this host did not hold when the redemption began is refused as \

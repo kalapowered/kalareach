@@ -1013,6 +1013,7 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
     let late = || {
         controller.authority_change(
             &actor_id,
+            super::authority_changes::AuthorityCaller::Owner,
             &mutation,
             Method::GrantRevoke,
             carried(&controller, connection_id),
@@ -1047,7 +1048,13 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
         let carried = carried(&controller, connection_id);
         async move {
             controller
-                .authority_change(&actor_id, &mutation, Method::GrantRevoke, carried)
+                .authority_change(
+                    &actor_id,
+                    super::authority_changes::AuthorityCaller::Owner,
+                    &mutation,
+                    Method::GrantRevoke,
+                    carried,
+                )
                 .await
         }
     });

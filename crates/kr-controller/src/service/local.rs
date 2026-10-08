@@ -196,6 +196,7 @@ impl Controller {
         if matches!(
             method,
             Method::GrantCreate
+                | Method::GrantRedeem
                 | Method::GrantRevoke
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate

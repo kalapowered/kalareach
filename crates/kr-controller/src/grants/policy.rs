@@ -71,6 +71,11 @@ pub enum BoundIdentity {
     },
     /// No offline bound: the owner chose none.
     Unbounded,
+    /// The end of one share a device was given, by the grant's identity.
+    Share {
+        /// The grant.
+        grant_id: kr_protocol::ids::GrantId,
+    },
 }
 
 /// One time bound on authority as it stands: which bound it is, when it ends on the continuous
