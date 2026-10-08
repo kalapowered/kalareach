@@ -2227,6 +2227,7 @@ impl Session {
                         | kr_protocol::attachment::PresentationReason::AwaitingParserBoundary
                 )
             )
+            && self.content_scope(attachment_id).shows_the_other_buffer()
         {
             // What the last screen could not carry says nothing about the one this window is drawn
             // next, and a screen that was carried when it was drawn can have changed since. A
@@ -2236,7 +2237,9 @@ impl Session {
             // session has told to begin again, whatever window it repeats: the screen it will be
             // drawn is the session's as it is now, and what its table holds is about the last one.
             // A terminal the hub is sending the application's bytes is left out whatever its
-            // stored window says: every byte that changed its screen reached it.
+            // stored window says: every byte that changed its screen reached it. A caller shown
+            // the live screen alone is left out because it was asked when its scope was recorded,
+            // and no screen it is drawn can carry everything.
             self.ask_restoration(attachment_id, dimensions);
             (presentation, presentation_reason) =
                 self.attachments
@@ -3171,6 +3174,12 @@ impl Session {
             };
             let keyboard = self.attachments.keyboard_control(attachment_id);
             let scope = self.content_scope(attachment_id);
+            if !scope.shows_the_other_buffer() {
+                // The other buffer's rows are always left out of what a caller shown the live
+                // screen alone is drawn, so such a terminal never has a screen to be handed the
+                // stream from.
+                continue;
+            }
             let key = (dimensions, keyboard, scope);
             let continues = match answers.iter().find(|(asked, _)| *asked == key) {
                 Some((_, continues)) => *continues,
