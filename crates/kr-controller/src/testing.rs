@@ -17,6 +17,31 @@ use crate::error::{ControllerError, Result};
 /// the environment over, not how soon the holder lets go.
 pub const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 
+/// The processes whose stop a test has had the kernel refuse.
+static REFUSED_STOPS: std::sync::Mutex<Vec<kr_protocol::identity::ProcessStartIdentity>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the stop of one recorded process answer "operation not permitted", as the kernel does for
+/// a process that belongs to another account. Every other stop is the platform's own.
+///
+/// A test cannot make a real process of its own refuse a signal without an account it does not
+/// have, and what the cleanup does with a process it cannot stop is the thing under test: the
+/// survivor stays a real running process, and the refusal is the only part supplied.
+pub fn refuse_stopping(identity: kr_protocol::identity::ProcessStartIdentity) {
+    REFUSED_STOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(identity);
+}
+
+/// Whether a test has had the stop of this process refused.
+pub(crate) fn stop_is_refused(identity: &kr_protocol::identity::ProcessStartIdentity) -> bool {
+    REFUSED_STOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(identity)
+}
+
 /// How long a start waits before it tries again.
 const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 

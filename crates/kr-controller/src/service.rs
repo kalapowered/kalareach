@@ -652,6 +652,13 @@ pub struct Controller {
     /// reconciliation this daemon does on its own both reach that point for the same session, so
     /// the two steps are one transaction.
     finalising: Mutex<()>,
+    /// The sessions whose crashed worker is being cleaned up, each under a lock of its own.
+    ///
+    /// A worker's death is noticed by a read, a list, the closure watcher, the barrier and the
+    /// daemon's start, and any two can notice it at once. Stopping what the session still owned
+    /// and writing its closure happen once: the second to arrive waits and finds the closure.
+    crash_flights:
+        std::sync::Mutex<std::collections::HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
     /// This daemon's side of an update of the host: its gate to new sessions, the creates under
     /// way, and whether it has been told to stop.
     handover: host::Handover,

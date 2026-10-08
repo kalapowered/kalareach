@@ -761,57 +761,245 @@ fn taking_ownership_creates_no_worker_and_no_store() {
 // KR-REQ-07.65, 07.66: the closure receipt and what a crash fences
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(unix)]
-#[test]
-fn a_crash_stops_nothing_on_the_strength_of_an_identifier_the_kernel_may_have_reused() {
-    // KR-REQ-07.66's cleanup half. A worker's descendants join the group it led, and once the
-    // worker has gone the kernel is free to give its number to an unrelated process whose group
-    // would answer to it. This host therefore stops nothing from a dead identifier, and says so:
-    // the boundary is one it has none of, and the coverage is incomplete.
+/// A process this test starts to stand in for what a crashed session left behind: it runs until it
+/// is ended, and ends when asked.
+fn leftover() -> Reaped {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 600"]);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let root = std::env::var_os("SystemRoot").expect("the system directory");
+        let mut command = std::process::Command::new(
+            std::path::Path::new(&root)
+                .join("System32")
+                .join("PING.EXE"),
+        );
+        command.args(["-n", "600", "127.0.0.1"]);
+        command
+    };
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("starts a process");
+    let identity = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
+    Reaped { child, identity }
+}
+
+/// A leftover process, ended when the test is over whatever the test did.
+struct Reaped {
+    child: std::process::Child,
+    identity: kr_protocol::identity::ProcessStartIdentity,
+}
+
+impl Reaped {
+    fn running(&self) -> bool {
+        matches!(
+            kr_ipc::identity::process_state(&self.identity),
+            kr_ipc::identity::ProcessState::Running
+        )
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The record a worker leaves of a session whose root shell and descendants are `processes`.
+fn owned_record(
+    processes: Vec<kr_protocol::identity::ProcessStartIdentity>,
+) -> kr_worker::ownership::OwnedRecord {
+    kr_worker::ownership::OwnedRecord {
+        boot: Some(kr_ipc::identity::boot_identity().expect("this boot")),
+        root: processes.first().cloned().expect("a root"),
+        processes,
+        cgroup: None,
+        boundary: "the terminal's process group".to_owned(),
+        limits: Vec::new(),
+    }
+}
+
+/// Takes ownership of a session whose worker is gone, as the daemon does before it fences.
+fn take(
+    archive: &ArchiveService,
+    session_id: SessionId,
+) -> kr_controller::archive::RecoveryOwnership {
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership")
+}
+
+/// KR-REQ-07.66's cleaning half and KR-REQ-24.25's fencing half. A crashed session's recorded
+/// processes are stopped by their identity and nothing else is: a recorded identifier that now
+/// belongs to another process leaves that process alone, and a process the worker never recorded is
+/// not looked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_stops_the_processes_the_worker_recorded_and_no_other() {
     let (_temp, archive) = host();
     let session_id = session();
-
-    // A process this test started, which stands in for whatever a crashed session left behind.
-    let mut child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("sleep 5")
-        .spawn()
-        .expect("starts a child");
-    let owned = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
-
-    let ended = kr_ipc::identity::ended_process_identity(1);
-    let ownership = archive
-        .take_ownership(session_id, DisplayNumber::new(1), &ended)
-        .expect("ownership");
-    let mut record = closure(session_id, ClosureReason::WorkerCrash);
-    record.terminated = vec![TerminatedProcess {
-        identity: ended.clone(),
-        name: Nullable::some("the session's worker".to_owned()),
-        forced: false,
-    }];
-    record.surviving = vec![SurvivingResource {
-        kind: "browser".to_owned(),
-        detail: "an explicitly brokered window".to_owned(),
-    }];
-
-    let fenced = archive.fence_owned(&ownership, &record);
-    assert_eq!(fenced.session_id, session_id);
-    assert!(fenced.stopped.is_empty(), "nothing is stopped by inference");
-    assert_eq!(fenced.already_gone, 1, "the worker had already ended");
-    assert!(
-        fenced.unaccounted > 0,
-        "a boundary this host has none of is something it cannot account for"
+    let recorded = leftover();
+    // The identifier is right and the start is not: the number belongs to another process now.
+    let stranger = leftover();
+    let reused = kr_protocol::identity::ProcessStartIdentity::new(
+        stranger.identity.pid.get(),
+        stranger.identity.source,
+        stranger.identity.start_value.get().wrapping_add(1_000_000),
     );
-    assert_eq!(fenced.surviving.len(), 1, "what survives is reported");
-    assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete);
+    let unrecorded = leftover();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_owned(
+                session_id,
+                &owned_record(vec![recorded.identity.clone(), reused.clone()]),
+            )
+            .expect("records what the session owned");
+    }
+    let ownership = take(&archive, session_id);
 
-    // And the process this test started is untouched, because nothing went looking for it.
-    assert!(matches!(
-        kr_ipc::identity::process_state(&owned),
-        kr_ipc::identity::ProcessState::Running
-    ));
-    let _ = child.kill();
-    let _ = child.wait();
+    let fenced = archive.fence_owned(&ownership, None).await;
+
+    assert_eq!(fenced.session_id, session_id);
+    assert!(
+        !recorded.running(),
+        "the process the worker recorded was stopped"
+    );
+    assert!(
+        fenced
+            .ended
+            .iter()
+            .any(|ended| ended.identity == recorded.identity && ended.root),
+        "and the closure names it, as the root shell it was recorded as: {fenced:?}"
+    );
+    assert!(
+        fenced
+            .ended
+            .iter()
+            .any(|ended| ended.identity == reused && !ended.forced),
+        "the recorded process whose number was reused had ended, and was not forced"
+    );
+    assert!(
+        stranger.running(),
+        "the process that holds a recorded number now was not touched"
+    );
+    assert!(
+        unrecorded.running(),
+        "and a process the worker never recorded was not looked for"
+    );
+    assert_eq!(
+        fenced.coverage,
+        OwnershipCoverage::Incomplete,
+        "nothing here proves a boundary, so the coverage is incomplete"
+    );
+}
+
+/// A record this pass may not act on stops nothing, and the closure says why. The processes are
+/// real and carry their true identities, so the only reason they are left alone is the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_from_another_boot_or_none_at_all_stops_nothing_and_says_why() {
+    for what in ["another boot", "a record that names no boot", "no record"] {
+        let (_temp, archive) = host();
+        let session_id = session();
+        let leftover = leftover();
+        {
+            let mut journal = journal_for(&archive, session_id);
+            let mut record = owned_record(vec![leftover.identity.clone()]);
+            match what {
+                "another boot" => {
+                    record.boot = Some(kr_protocol::identity::BootIdentity {
+                        source: kr_protocol::identity::BootIdentitySource::BootTime,
+                        value: kr_protocol::scalars::Bytes::new(b"not this boot".to_vec()),
+                    });
+                }
+                "a record that names no boot" => record.boot = None,
+                _ => {}
+            }
+            if what != "no record" {
+                journal
+                    .record_owned(session_id, &record)
+                    .expect("records what the session owned");
+            }
+        }
+        let ownership = take(&archive, session_id);
+        let fenced = archive.fence_owned(&ownership, None).await;
+        assert!(leftover.running(), "{what}: nothing was stopped");
+        assert!(fenced.ended.is_empty(), "{what}: nothing is reported ended");
+        assert!(
+            fenced
+                .surviving
+                .iter()
+                .any(|resource| resource.kind == "unestablished"),
+            "{what}: the closure says why: {fenced:?}"
+        );
+        assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete, "{what}");
+    }
+}
+
+/// A process the platform will not let this host stop is named in the closure, by identifier and
+/// start and where it ran, with incomplete coverage: it is not claimed gone.
+///
+/// The kernel's refusal is the only part supplied, because a test cannot make a process of its own
+/// refuse a signal without an account it does not have; the process is real and keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_the_platform_will_not_stop_is_named_and_the_coverage_stays_incomplete() {
+    let (_temp, archive) = host();
+    let session_id = session();
+    let obstinate = leftover();
+    let obedient = leftover();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_owned(
+                session_id,
+                &owned_record(vec![obedient.identity.clone(), obstinate.identity.clone()]),
+            )
+            .expect("records what the session owned");
+    }
+    kr_controller::testing::refuse_stopping(obstinate.identity.clone());
+    let ownership = take(&archive, session_id);
+
+    let fenced = archive.fence_owned(&ownership, None).await;
+
+    assert!(!obedient.running(), "the process that can be stopped was");
+    assert!(
+        obstinate.running(),
+        "the one the platform refused still runs"
+    );
+    let named = fenced
+        .surviving
+        .iter()
+        .find(|resource| resource.kind == "process")
+        .expect("the survivor is in the closure");
+    assert!(
+        named
+            .detail
+            .contains(&format!("process {} ", obstinate.identity.pid.get()))
+            && named
+                .detail
+                .contains(&format!("started {}", obstinate.identity.start_value.get())),
+        "it is named by identifier and start: {named:?}"
+    );
+    assert!(
+        named.detail.contains("terminal's process group"),
+        "and by where it ran: {named:?}"
+    );
+    assert!(
+        !fenced
+            .ended
+            .iter()
+            .any(|ended| ended.identity == obstinate.identity),
+        "it is not claimed gone"
+    );
+    assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete);
 }
 
 #[test]
