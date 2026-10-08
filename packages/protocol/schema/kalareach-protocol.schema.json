@@ -78,7 +78,7 @@
         },
         {
           "const": "not_kept",
-          "description": "The service signed the account in and the host could not keep the grant.",
+          "description": "The host's secret store failed, before the code was spent or after the service signed the\naccount in, so the host kept no grant.",
           "type": "string"
         },
         {
@@ -133,7 +133,7 @@
               "type": "null"
             }
           ],
-          "description": "The account service this host signs in at, which is also where its token is presented: the\nvoice broker its configuration names, when that is the account service. Null when it is\nnot, and `unavailable` says why."
+          "description": "The account service this host keeps its account for, which is also where its token is\npresented when its voice broker is that service. Null when the host could not set up how to\nreach it, and `unavailable` says why."
         },
         "state": {
           "$ref": "#/$defs/AccountState",
@@ -148,7 +148,7 @@
               "type": "null"
             }
           ],
-          "description": "Why this host signs in nowhere, when `service` is null."
+          "description": "Why this host does not sign in or present its account: its configuration names no voice\nbroker, names another service than the account service, or the host could not set up how to\nreach the account service. A grant the host already keeps still shows in `state`, and\n`account.sign_out` ends it, whatever the broker is."
         }
       },
       "required": [
@@ -188,7 +188,7 @@
       "description": "What `account.sign_out` answers: whether there was an account to sign out, and whether the\nservice has been told to end it.",
       "properties": {
         "service_told": {
-          "description": "Whether the service has acknowledged ending the grant. When it has not, the grant is gone\nfrom this host and the daemon sends the revocation again when it next starts.",
+          "description": "Whether the service has acknowledged every revocation this host holds: the one just sent\nand any that were waiting. When it has not, the grant is gone from this host all the same,\nand the daemon sends what is left again when it next starts.",
           "type": "boolean"
         },
         "was_signed_in": {
@@ -278,7 +278,7 @@
               "description": "The account's address, when the service said it."
             },
             "origin": {
-              "description": "The account service the sign-in was made at, which is also the voice broker.",
+              "description": "The account service the sign-in was made at.",
               "type": "string"
             },
             "scopes": {
@@ -33106,7 +33106,7 @@
       "type": "string"
     },
     "SignInUnavailable": {
-      "description": "Why a host signs in nowhere.",
+      "description": "Why a host does not sign in or present its account.",
       "oneOf": [
         {
           "const": "no_broker",

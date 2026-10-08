@@ -258,9 +258,11 @@ The browser signs in at the managed account service, and the code it brings back
 there and nowhere else, so the exchange, every refresh and every revocation go to that one service.
 The host presents a token to the voice broker its configuration names only when that broker is the
 account service (`voice.broker_origin` is `https://reach.kala.to`). A host whose broker is another
-service has nothing to sign in to: `kr account sign-in` says so and no token is presented. What the
-store holds is kept under the service's name, so a grant, and a revocation that waits to be sent, are
-reached only through the service that issued them.
+service, or none, signs in nowhere and presents nothing: `kr account sign-in` says so. It still
+reaches the account service for what it holds, so a grant it was signed in with while its broker was
+the managed one is shown by `kr account show`, revoked when a revocation waits, and ended by
+`kr account sign-out`. What the store holds is kept under the service's name, so a grant, and a
+revocation that waits to be sent, are reached only through the service that issued them.
 
 The grant is of the same kind as the one the companion keeps on a desktop: an access token that
 lasts ten minutes, and a refresh token that rotates on every use, so a second holder would end the
@@ -273,20 +275,29 @@ it no longer accepts) shows `ended` until then.
 
 The sign-in is single use and local: one attempt waits at a time, a newer one ends the older one,
 and nothing is waiting after fifteen minutes. A program that already holds the loopback address
-stops the attempt with `port_busy`. A call closes under the account it started under, so a sign-in
-is refused while a voice call is open on the host, and one that is waiting when a call opens ends
-without spending its code. A host that held an account token file from an earlier version removes it
-once, when the daemon starts, because that file held no refresh credential; the person signs in.
+stops the attempt with `port_busy`. A host that held an account token file from an earlier version
+removes it once, when the daemon starts, because that file held no refresh credential; the person
+signs in.
+
+A call closes under the account it started under, so the account never changes under one. A call is
+open from the moment its start asks the broker, through the time it is live, until its close has
+been told to the broker, and the daemon counts all three. A sign-in or a sign-out is refused while a
+call is open, and a sign-in that is waiting when a call opens ends without spending its code. A
+change then raises a gate that refuses every token request while it is made: a start that begins
+after the check is refused its token, and one that began before it was counted by the check, so no
+call holds a token of the old account across the change. The exchange of a sign-in is a request that
+waits on the service, and a call can open while it does: the new grant is then revoked and the
+attempt ends as `call_open`; nothing the call holds changes. The gate is raised for the commit of a
+sign-in, the read of the account's identity that follows it, and the removal of a sign-out with the
+revocation that follows it.
 
 `kr account sign-out` (`account.sign_out`, served on the local socket alone, asking for host
 management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret
-store and asks the service to end it. It works at the scope sign-in works at, so a host can sign out
-of the account service it can sign in at and of no other, and it is refused while a voice call is
-open, for the reason a sign-in is. A service that cannot be told leaves the grant gone from this
-host and the revocation queued; the daemon sends it again when it next starts, and the command says
-so. A host with no account answers that there was none. Between the check for an open call and the
-removal there is a short window in which a call can start; that call's close then finds no account
-to present, and the service ends the call at its own deadline.
+store and asks the service to end it. It is refused while a call is open, for the reason a sign-in
+is. A service that cannot be told leaves the grant gone from this host and the revocation queued;
+the daemon sends it again when it next starts, and the command says so. A host with no account
+answers that there was none. Recovery at start and before the first token is tried again by the next
+request when the store fails it, and no token goes out until it has succeeded.
 
 ### How the daemon is started
 
