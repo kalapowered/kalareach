@@ -209,6 +209,10 @@ shows its issuer the rights it proposes and no preview of any named resource. So
 challenge to confirm issuing such an invitation, and both issues and `issue_grant` refuse the
 proposal as well, with that reason, before anything is written.
 
+A session shared with an already paired device reaches it as an invitation, and the device redeems
+it with `grant.redeem` over its own connection. Redeeming activates the grant the invitation
+carries, once, for the device the invitation names, and for nobody else.
+
 A remote owner publishes a signed revocation **request**, which carries no host revision: only the
 target host issues ordered authority revisions, and a device that could name one would be assigning
 itself a place in the host's order. A host rejects a revision record that does not follow the one it
@@ -361,7 +365,8 @@ it takes when it decides a request, the revocation cascade along the parent link
 dispatch barrier a revocation completes through, the organisation lease that stops a grant
 while the transport stays connected, and the bounded offline-validity policy an owner may choose.
 Those are rules the control daemon implements and decides with `grants::decide`; a paired device's
-session request is decided at the network boundary, against the grant its pairing recorded.
+session request is decided at the network boundary, under the one grant it acts under: its pairing
+grant, or a share it was given.
 
 Two rules cross the boundary, and this document states both.
 
