@@ -923,6 +923,7 @@ configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json 
   …
   voice.broker_origin = none from default, applies at the next start
   storage.origin = none from default, applies at the next start
+  authority.origin = none from default, applies at the next start
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations

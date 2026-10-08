@@ -1346,14 +1346,16 @@ impl ComposedBundle {
 ///     "dns_origin": "discovery.example.com"
 ///   },
 ///   "voice": { "broker_origin": "https://voice.example.com" },
-///   "storage": { "origin": "https://reach.example.com" }
+///   "storage": { "origin": "https://reach.example.com" },
+///   "authority": { "origin": "https://reach.example.com" }
 /// }
 /// ```
 ///
-/// The `network`, `voice` and `storage` sections are the only place a network selection, the voice
-/// broker's origin or the managed storage service's origin is chosen, and the daemon reads them
-/// when it starts ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`]). No environment
-/// variable reaches any of them.
+/// The `network`, `voice`, `storage` and `authority` sections are the only place a network
+/// selection, the voice broker's origin, the managed storage service's origin or the authority
+/// feed's origin is chosen, and the daemon reads them when it starts ([`NetworkSelection`],
+/// [`VoiceSelection`], [`StorageSelection`], [`AuthoritySelection`]). No environment variable
+/// reaches any of them.
 ///
 /// Its numbers are ordinary JSON numbers rather than the decimal strings the wire types use. This
 /// is a file a person may open and edit, not a message a JavaScript consumer parses, and the
@@ -1393,6 +1395,7 @@ impl ComposedBundle {
 /// [`NetworkSelection`]: configuration::NetworkSelection
 /// [`VoiceSelection`]: configuration::VoiceSelection
 /// [`StorageSelection`]: configuration::StorageSelection
+/// [`AuthoritySelection`]: configuration::AuthoritySelection
 /// [`resolve`]: configuration::resolve
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
@@ -1906,6 +1909,11 @@ pub mod configuration {
         /// Read when the daemon starts, so a change applies at the next start. No environment
         /// variable reaches it.
         pub storage: StorageSelection,
+        /// The authority feed this host reads its remote revocations from.
+        ///
+        /// Read when the daemon starts, so a change applies at the next start. No environment
+        /// variable reaches it.
+        pub authority: AuthoritySelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -1956,6 +1964,7 @@ pub mod configuration {
                 network: NetworkSelection::default(),
                 voice: VoiceSelection::default(),
                 storage: StorageSelection::default(),
+                authority: AuthoritySelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2458,6 +2467,29 @@ pub mod configuration {
     }
 
     impl StorageSelection {
+        /// The service's origin, when one is chosen.
+        #[must_use]
+        pub fn origin(&self) -> Option<&str> {
+            self.origin.as_ref().map(String::as_str)
+        }
+    }
+
+    /// The authority feed this host reads its remote revocations from.
+    ///
+    /// A provider origin, so it is this document's to choose and no inherited variable's. The
+    /// daemon reads it when it starts, so a change applies at the next start. An owner whose host
+    /// lost its feed points it at another service, or at none. Absent means this host has no feed:
+    /// it takes revocations from the owners who reach it directly, and a remote owner's revocation
+    /// cannot reach it.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct AuthoritySelection {
+        /// The service's origin: an `https` origin, or an `http` origin on a loopback address,
+        /// spelled as a gateway origin is, with no path and no trailing slash.
+        pub origin: Nullable<String>,
+    }
+
+    impl AuthoritySelection {
         /// The service's origin, when one is chosen.
         #[must_use]
         pub fn origin(&self) -> Option<&str> {
@@ -3138,6 +3170,20 @@ pub mod configuration {
             problems.push(
                 Sentence::new()
                     .stated("storage.origin (")
+                    .withheld(super::export::ContentClass::Location, origin)
+                    .stated(
+                        ") is not an https origin, or an http origin on a loopback address, in \
+                         the canonical spelling a gateway origin has, with no path and no \
+                         trailing slash",
+                    ),
+            );
+        }
+        if let Some(origin) = document.authority.origin()
+            && crate::service::GatewayOrigin::new(origin).is_err()
+        {
+            problems.push(
+                Sentence::new()
+                    .stated("authority.origin (")
                     .withheld(super::export::ContentClass::Location, origin)
                     .stated(
                         ") is not an https origin, or an http origin on a loopback address, in \
@@ -4059,6 +4105,12 @@ pub mod configuration {
         about: "the managed storage service this host uploads its backups to",
     };
 
+    /// The authority feed this host reads its remote revocations from.
+    pub const AUTHORITY_ORIGIN: Selection = Selection {
+        key: "authority.origin",
+        about: "the authority feed this host reads its remote revocations from",
+    };
+
     /// How this environment's control daemon is started when a command finds none running.
     pub const STARTUP_CONTROLLER: Selection = Selection {
         key: "startup.controller",
@@ -4067,7 +4119,7 @@ pub mod configuration {
     };
 
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 14] = [
+    pub const SELECTIONS: [Selection; 15] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -4081,6 +4133,7 @@ pub mod configuration {
         NETWORK_PROXY_URL,
         VOICE_BROKER_ORIGIN,
         STORAGE_ORIGIN,
+        AUTHORITY_ORIGIN,
         STARTUP_CONTROLLER,
     ];
 
@@ -4479,6 +4532,11 @@ pub mod configuration {
                 STORAGE_ORIGIN,
                 document.storage.origin.is_present(),
                 location(document.storage.origin()),
+            ),
+            row(
+                AUTHORITY_ORIGIN,
+                document.authority.origin.is_present(),
+                location(document.authority.origin()),
             ),
             row(
                 STARTUP_CONTROLLER,
@@ -8135,6 +8193,7 @@ mod tests {
         };
         document.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
         document.storage.origin = Nullable::some("https://reach.example.com".to_owned());
+        document.authority.origin = Nullable::some("https://reach.example.com".to_owned());
         configuration::validate(&document).expect("a complete selection");
         let written = configuration::contents(&document);
         let loaded = configuration::load(Some(written.as_bytes()));
@@ -8360,6 +8419,27 @@ mod tests {
             configuration::validate(&document)
                 .unwrap_or_else(|problems| panic!("{origin}: {problems:?}"));
         }
+
+        // The authority feed's origin is held to the same spelling.
+        for origin in [
+            "reach.example.com",
+            "http://reach.example.com",
+            "https://reach.example.com/",
+            "",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.authority.origin = Nullable::some(origin.to_owned());
+            let problems = configuration::validate(&document).expect_err("an origin it refuses");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.as_str().contains("authority.origin")),
+                "{origin}: {problems:?}"
+            );
+        }
+        let mut document = ConfigurationDocument::empty();
+        document.authority.origin = Nullable::some("http://127.0.0.1:8787".to_owned());
+        configuration::validate(&document).expect("a loopback origin is usable");
 
         // A document whose network section does not validate is not this host's to rewrite, so an
         // edit to any other section of it is refused rather than applied on top.
