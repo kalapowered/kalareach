@@ -1493,20 +1493,26 @@ async fn a_daemon_that_stopped_after_recording_a_closure_ends_its_insertions_whe
         "the file is what it was"
     );
 
-    // A session no draft named when its closure was recorded refuses a draft's binding all the same.
-    let draft = service
-        .draft_create(
+    // A session no draft named when its closure was recorded refuses a draft for it, and the
+    // binding of an upload that belongs to it, all the same.
+    let draft_for_unnamed = |service: &Arc<kr_transfer::TransferService>, session_id| {
+        service.draft_create(
             &actor,
             &DraftCreateParams {
                 environment_id,
                 device_id: Nullable::null(),
-                session_id: Nullable::some(unnamed),
+                session_id,
                 application_instance_id: Nullable::null(),
                 text: "too late".to_owned(),
             },
             None,
         )
-        .expect("creates the draft")
+    };
+    let refusal = draft_for_unnamed(service, Nullable::some(unnamed))
+        .expect_err("a draft for a closed session");
+    assert_eq!(refusal.code(), ErrorCode::SessionClosed, "{refusal:?}");
+    let draft = draft_for_unnamed(service, Nullable::null())
+        .expect("creates a draft that targets no session")
         .draft;
     let late = publish_for(service, &second, unnamed, &pattern(514));
     let refusal = bind(service, &draft, &late).expect_err("a binding for a closed session");
@@ -1551,19 +1557,24 @@ async fn the_sweep_ends_the_insertions_of_a_session_closed_beneath_a_running_dae
         kr_protocol::transfer::InsertionState::Failed,
         "{ended:?}"
     );
-    let other = service
-        .draft_create(
+    let draft_for_unnamed = |session_id| {
+        service.draft_create(
             &test_actor(),
             &DraftCreateParams {
                 environment_id: host.environment_id,
                 device_id: Nullable::null(),
-                session_id: Nullable::some(unnamed),
+                session_id,
                 application_instance_id: Nullable::null(),
                 text: "too late".to_owned(),
             },
             None,
         )
-        .expect("creates the draft")
+    };
+    let refusal =
+        draft_for_unnamed(Nullable::some(unnamed)).expect_err("a draft for a closed session");
+    assert_eq!(refusal.code(), ErrorCode::SessionClosed, "{refusal:?}");
+    let other = draft_for_unnamed(Nullable::null())
+        .expect("creates a draft that targets no session")
         .draft;
     let late = publish_for(service, &host, unnamed, &pattern(514));
     let refusal = bind(service, &other, &late).expect_err("a binding for a closed session");

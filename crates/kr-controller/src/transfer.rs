@@ -105,6 +105,14 @@ pub struct TransferModule {
     /// is what refuses it. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
+    /// The point a worker's claim of an attachment stops at, before it enters the transfer service.
+    /// Compiled only with the `testing` feature.
+    #[cfg(feature = "testing")]
+    before_a_claim: Arc<crate::attention::Pause>,
+    /// The point a worker's claim stops at once the transfer service has decided it, before the
+    /// answer is written. Compiled only with the `testing` feature.
+    #[cfg(feature = "testing")]
+    after_a_claim: Arc<crate::attention::Pause>,
 }
 
 /// The admission one transfer mutation arrived under, as the transfer service asks about it.
@@ -363,6 +371,10 @@ impl TransferModule {
             tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             after_the_outer_check: Arc::new(crate::attention::Pause::default()),
+            #[cfg(feature = "testing")]
+            before_a_claim: Arc::new(crate::attention::Pause::default()),
+            #[cfg(feature = "testing")]
+            after_a_claim: Arc::new(crate::attention::Pause::default()),
         })
     }
 
@@ -377,6 +389,32 @@ impl TransferModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.after_the_outer_check.arm()
+    }
+
+    /// Arms the pause a worker's claim of an attachment stops at once it has been asked of this
+    /// daemon, before it enters the transfer service. Returns the end that says it has arrived, and
+    /// the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_a_claim(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.before_a_claim.arm()
+    }
+
+    /// Arms the pause a worker's claim of an attachment stops at once the transfer service has
+    /// decided it, whether it committed or was refused, before the answer is written. Returns the
+    /// end that says it has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_a_claim(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.after_a_claim.arm()
     }
 
     /// Returns the service itself.
@@ -672,17 +710,28 @@ impl TransferModule {
     ) -> kr_protocol::insertion::DraftAnswer {
         use kr_protocol::insertion::{DraftAnswer, DraftStep};
         let service = Arc::clone(&self.service);
+        #[cfg(feature = "testing")]
+        let before_a_claim = Arc::clone(&self.before_a_claim);
+        #[cfg(feature = "testing")]
+        let after_a_claim = Arc::clone(&self.after_a_claim);
         blocking(move || {
             Ok(match step {
                 DraftStep::Facts { draft_id } => {
                     DraftAnswer::Facts(service.insertion_facts(&actor_id, session_id, draft_id)?)
                 }
-                DraftStep::Begin(begin) => DraftAnswer::Claim(Box::new(service.insertion_begin(
-                    &actor_id,
-                    session_id,
-                    &begin,
-                    &kr_ipc::clock::boot_elapsed_ms,
-                )?)),
+                DraftStep::Begin(begin) => {
+                    #[cfg(feature = "testing")]
+                    before_a_claim.wait();
+                    let decided = service.insertion_begin(
+                        &actor_id,
+                        session_id,
+                        &begin,
+                        &kr_ipc::clock::boot_elapsed_ms,
+                    );
+                    #[cfg(feature = "testing")]
+                    after_a_claim.wait();
+                    DraftAnswer::Claim(Box::new(decided?))
+                }
                 DraftStep::Report(report) => DraftAnswer::Reported(
                     service.record_insertion_outcome(&actor_id, session_id, &report)?,
                 ),

@@ -1146,15 +1146,30 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
     assert_eq!(kept.content_digest, handle.content_digest);
     assert_eq!(kept.byte_len, handle.byte_len);
 
+    // A draft is not made for the ended session, and a binding for the draft it had is refused.
+    let refused_draft = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable::null(),
+                text: "for a session that is gone".to_owned(),
+            },
+            None,
+        )
+        .expect_err("a draft for an ended session is refused");
+    assert_eq!(refused_draft.code(), ErrorCode::SessionClosed);
     let late = harness.publish(&pattern(65), "image/png", "later.png");
-    let another = draft(&harness);
     let refusal = harness
         .service
         .draft_add_attachment(
             &harness.actor,
             &AgentDraftAddAttachmentParams {
-                draft_id: another.draft_id,
-                expected_revision: another.revision,
+                draft_id: read.draft_id,
+                expected_revision: read.revision,
                 transfer_id: late.transfer_id,
                 contribution: contribution(&late, InsertionMethod::TypedSubmission),
             },
