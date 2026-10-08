@@ -4459,6 +4459,65 @@ fn a_worker_judges_an_establishment_against_a_reading_taken_after_it() {
     );
 }
 
+/// KR-REQ-09.19: a reading is stamped with the continuous clock after the wall clock is read, so
+/// an owner who acts between the two costs that reading a refusal and never an acceptance. The
+/// worker reads the wall clock a minute low; the owner corrects it and confirms it; the worker
+/// stamps the reading, which now looks like one taken after the owner spoke, a minute behind the
+/// owner's word. The worker holds it against the confirmation, and the owner's next action frees
+/// it. (Were the stamp taken first, the reading would predate the owner's word and be followed.)
+#[test]
+fn an_owner_acting_inside_a_reading_costs_that_reading_a_refusal() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::WallClock as _;
+
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let wall = Arc::new(WallThatMovesAfterItsNextReading {
+        inner: machine.wall.clone(),
+        after: std::sync::Mutex::new(None),
+    });
+    let mut session = Session::open(SessionConfig {
+        time: kr_worker::action::time::TimeSources {
+            wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+            ..machine.sources_on(&floor)
+        },
+        ..session_config(&environment, session_id)
+    })
+    .expect("opens");
+    machine.runs(AN_HOUR);
+    machine.steps_back(std::time::Duration::from_secs(60));
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+
+    let right = machine.wall.clone();
+    let continuous = machine.continuous.clone();
+    let published = Arc::clone(&floor);
+    *wall
+        .after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        right.advance(std::time::Duration::from_secs(60));
+        continuous.advance(std::time::Duration::from_secs(1));
+        published.establish(right.now_ms().get(), continuous.boot_elapsed_ms());
+    }));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "the reading taken just before the owner acted is stamped just after"
+    );
+
+    machine.runs(std::time::Duration::from_secs(1));
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "and the owner's next action frees the worker"
+    );
+}
+
 /// KR-REQ-09.18, KR-REQ-09.19: an older confirmation does not clear a rollback the worker found
 /// after it. The owner establishes the clock; a second passes and the wall clock steps forward ten
 /// minutes, and a worker that begins afterwards takes that reading for its mark, which is later
