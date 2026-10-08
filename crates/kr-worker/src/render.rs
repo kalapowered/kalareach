@@ -197,6 +197,10 @@ pub enum Keyboard {
 /// buffer that is not showing, the scrollback or the backing transcript. A caller whose authority
 /// is that exception is served [`Scope::LiveScreen`], and the rows of the other buffer are counted
 /// among what the restoration did not carry rather than painted into it.
+///
+/// The same caller is shown the screen as its issuer previewed it: the text and how it is drawn.
+/// The window title, the title stack and the target of every link are behind that text and are
+/// not in the preview, so they are not sent either, whichever way the screen is carried.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
     /// Everything the snapshot describes, including the buffer that is not showing.
@@ -204,6 +208,15 @@ pub enum Scope {
     WholeScreen,
     /// The currently visible screen only.
     LiveScreen,
+}
+
+impl Scope {
+    /// Whether a caller served this scope is told the titles and the link targets behind the
+    /// screen's text.
+    #[must_use]
+    pub const fn names_titles_and_links(self) -> bool {
+        matches!(self, Self::WholeScreen)
+    }
 }
 
 /// Renders a restoration for a terminal showing `viewport` of the canonical grid.
@@ -460,8 +473,12 @@ impl Writer {
                 // by its whole depth on every repaint, and could evict a title the person's
                 // terminal had saved for itself.
                 self.carried.title_stack += stack.len();
-                self.osc(b"1", title.icon.as_bytes());
-                self.osc(b"2", title.window.as_bytes());
+                // A caller shown the live screen alone is told no title: the preview its issuer
+                // saw is the text.
+                if self.scope.names_titles_and_links() {
+                    self.osc(b"1", title.icon.as_bytes());
+                    self.osc(b"2", title.window.as_bytes());
+                }
             }
             RestoreOp::SetRendition { rendition } => self.rendition(*rendition),
             RestoreOp::SetHyperlink { link } => {
@@ -835,8 +852,11 @@ impl Writer {
 
     /// Opens `link`, with the parameters that make it the link it is, unless it is the one already
     /// open. Two links to one target stay two on the terminal that is drawn into.
+    ///
+    /// Every link a restoration opens is opened here, and a caller shown the live screen alone is
+    /// given the text of a link and never its target.
     fn open_link(&mut self, link: &Link) {
-        if self.link.as_ref() == Some(link) {
+        if !self.scope.names_titles_and_links() || self.link.as_ref() == Some(link) {
             return;
         }
         self.osc(b"8", link.payload().as_bytes());

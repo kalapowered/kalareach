@@ -400,6 +400,33 @@ pub enum Presentation {
     Projected,
 }
 
+/// The pieces of a span that lie between the ranges that only describe the screen, each with the
+/// position of the raw stream it starts at.
+fn screen_only_pieces(
+    cursor: u64,
+    bytes: &Arc<Vec<u8>>,
+    behind_the_screen: &[std::ops::Range<usize>],
+) -> Vec<(u64, Arc<Vec<u8>>)> {
+    let mut pieces = Vec::new();
+    let mut from = 0_usize;
+    for named in behind_the_screen {
+        if from < named.start {
+            pieces.push((
+                cursor.saturating_add(from as u64),
+                Arc::new(bytes[from..named.start].to_vec()),
+            ));
+        }
+        from = from.max(named.end);
+    }
+    if from < bytes.len() {
+        pieces.push((
+            cursor.saturating_add(from as u64),
+            Arc::new(bytes[from..].to_vec()),
+        ));
+    }
+    pieces
+}
+
 /// Every attachment currently receiving output.
 #[derive(Debug, Default)]
 pub struct OutputHub {
@@ -596,22 +623,41 @@ impl OutputHub {
 
     /// Delivers output to every subscriber that is keeping up.
     ///
+    /// `behind_the_screen` names the ranges of `bytes` that only describe the screen. A subscriber
+    /// whose caller is shown the live screen alone, which `scope_of` says, is sent the rest of the
+    /// span as the pieces between those ranges, each at the position of the raw stream it starts
+    /// at; every other subscriber is sent the whole span.
+    ///
     /// Returns the subscribers that were told to resynchronise. This call never awaits and never
     /// fails: the read loop that produced these bytes continues whatever any client is doing.
     pub fn publish_direct(
         &mut self,
         cursor: u64,
         bytes: &Arc<Vec<u8>>,
+        behind_the_screen: &[std::ops::Range<usize>],
         oldest_retained_cursor: u64,
+        scope_of: impl Fn(AttachmentId) -> crate::render::Scope,
     ) -> Vec<AttachmentId> {
+        let screen_only = screen_only_pieces(cursor, bytes, behind_the_screen);
         let mut resynchronised = Vec::new();
         let mut gone = Vec::new();
         for (id, subscriber) in &mut self.subscribers {
             if subscriber.resynchronising || subscriber.presentation != Presentation::Direct {
                 continue;
             }
+            let whole = [(cursor, Arc::clone(bytes))];
+            let pieces: &[(u64, Arc<Vec<u8>>)] =
+                if scope_of(*id).names_titles_and_links() || behind_the_screen.is_empty() {
+                    &whole
+                } else {
+                    &screen_only
+                };
+            let size: usize = pieces.iter().map(|(_, piece)| piece.len()).sum();
+            if size == 0 {
+                continue;
+            }
             let queued = subscriber.queued.load(Ordering::Acquire);
-            if queued.saturating_add(bytes.len()) > subscriber.limit {
+            if queued.saturating_add(size) > subscriber.limit {
                 // Nothing is trimmed and nothing is zeroed here. The subscriber still owns what is
                 // already queued and releases it as it reads; stopping new output is what bounds
                 // the queue. Zeroing the counter would make those later releases underflow it.
@@ -625,16 +671,19 @@ impl OutputHub {
                 resynchronised.push(*id);
                 continue;
             }
-            subscriber.queued.fetch_add(bytes.len(), Ordering::AcqRel);
-            if subscriber
-                .sender
-                .send(OutputDelivery::Bytes {
-                    cursor,
-                    bytes: Arc::clone(bytes),
-                })
-                .is_err()
-            {
-                gone.push(*id);
+            subscriber.queued.fetch_add(size, Ordering::AcqRel);
+            for (at, piece) in pieces {
+                if subscriber
+                    .sender
+                    .send(OutputDelivery::Bytes {
+                        cursor: *at,
+                        bytes: Arc::clone(piece),
+                    })
+                    .is_err()
+                {
+                    gone.push(*id);
+                    break;
+                }
             }
         }
         for id in gone {
@@ -883,6 +932,20 @@ mod tests {
         AttachmentId::new(Uuid::from_bytes([byte; 16]))
     }
 
+    /// Every caller is drawn the whole screen.
+    fn whole_screen(_: AttachmentId) -> crate::render::Scope {
+        crate::render::Scope::WholeScreen
+    }
+
+    /// The caller of attachment 2 is shown the live screen alone, and nobody else is narrowed.
+    fn second_is_shown_the_live_screen(attachment_id: AttachmentId) -> crate::render::Scope {
+        if attachment_id == identifier(2) {
+            crate::render::Scope::LiveScreen
+        } else {
+            crate::render::Scope::WholeScreen
+        }
+    }
+
     fn closure(code: u64) -> ClosureRecord {
         ClosureRecord {
             session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([9; 16])),
@@ -910,7 +973,7 @@ mod tests {
         let mut hub = OutputHub::new();
         let mut first = hub.subscribe(identifier(1), 1024, Presentation::Direct);
         let mut second = hub.subscribe(identifier(2), 1024, Presentation::Direct);
-        hub.publish_direct(0, &Arc::new(b"last words".to_vec()), 0);
+        hub.publish_direct(0, &Arc::new(b"last words".to_vec()), &[], 0, whole_screen);
         hub.close(&closure(7), [identifier(1), identifier(2)]);
         assert!(hub.is_empty(), "a closed hub keeps no subscriber");
         let deliveries = hub.closure_deliveries();
@@ -938,8 +1001,8 @@ mod tests {
     async fn a_subscriber_that_fell_behind_is_told_and_one_that_has_gone_owes_nothing() {
         let mut hub = OutputHub::new();
         let mut behind = hub.subscribe(identifier(1), 4, Presentation::Direct);
-        hub.publish_direct(0, &Arc::new(vec![b'a'; 4]), 0);
-        hub.publish_direct(4, &Arc::new(vec![b'b'; 4]), 0);
+        hub.publish_direct(0, &Arc::new(vec![b'a'; 4]), &[], 0, whole_screen);
+        hub.publish_direct(4, &Arc::new(vec![b'b'; 4]), &[], 0, whole_screen);
         assert!(hub.is_resynchronising(identifier(1)));
         let gone = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         drop(gone);
@@ -1042,7 +1105,7 @@ mod tests {
         let mut first = hub.subscribe(identifier(1), 1024, Presentation::Direct);
         let mut second = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         assert!(
-            hub.publish_direct(0, &Arc::new(b"hello".to_vec()), 0)
+            hub.publish_direct(0, &Arc::new(b"hello".to_vec()), &[], 0, whole_screen)
                 .is_empty()
         );
         for stream in [&mut first, &mut second] {
@@ -1056,15 +1119,70 @@ mod tests {
         }
     }
 
+    /// A span with a title and a link's target in it is sent whole to a caller drawn the whole
+    /// screen, and to a caller shown the live screen alone as the pieces between them, each at
+    /// the position of the raw stream it starts at.
+    #[tokio::test]
+    async fn a_live_screen_subscriber_is_sent_the_span_without_what_only_describes_the_screen() {
+        let mut hub = OutputHub::new();
+        let mut owner = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        let mut viewer = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+        // `ab` `<title>` `cd` `<link>` `ef`, from position 100.
+        let span = Arc::new(b"abTITLEcdLINKef".to_vec());
+        hub.publish_direct(
+            100,
+            &span,
+            &[2..7, 9..13],
+            0,
+            second_is_shown_the_live_screen,
+        );
+
+        let received = |stream: &mut OutputStream| -> Vec<(u64, Vec<u8>)> {
+            let mut taken = Vec::new();
+            while let Some(delivery) = stream.try_recv() {
+                let OutputDelivery::Bytes { cursor, bytes } = delivery else {
+                    panic!("an unexpected delivery: {delivery:?}");
+                };
+                taken.push((cursor, bytes.to_vec()));
+            }
+            taken
+        };
+        assert_eq!(
+            received(&mut owner),
+            vec![(100, b"abTITLEcdLINKef".to_vec())]
+        );
+        assert_eq!(
+            received(&mut viewer),
+            vec![
+                (100, b"ab".to_vec()),
+                (107, b"cd".to_vec()),
+                (113, b"ef".to_vec())
+            ]
+        );
+
+        // A span that is nothing but a title is sent to the viewer as nothing at all, and its queue
+        // is charged nothing for it.
+        let only = Arc::new(b"TITLE".to_vec());
+        hub.publish_direct(
+            200,
+            &only,
+            std::slice::from_ref(&(0..5)),
+            0,
+            second_is_shown_the_live_screen,
+        );
+        assert!(received(&mut viewer).is_empty());
+        assert_eq!(received(&mut owner), vec![(200, b"TITLE".to_vec())]);
+    }
+
     #[tokio::test]
     async fn a_slow_subscriber_is_resynchronised_and_the_others_are_not_held_up() {
         let mut hub = OutputHub::new();
         let mut slow = hub.subscribe(identifier(1), 8, Presentation::Direct);
         let mut quick = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         // The quick subscriber drains; the slow one does not.
-        hub.publish_direct(0, &Arc::new(vec![b'a'; 8]), 0);
+        hub.publish_direct(0, &Arc::new(vec![b'a'; 8]), &[], 0, whole_screen);
         let _ = quick.recv().await.expect("a delivery");
-        let resynchronised = hub.publish_direct(8, &Arc::new(vec![b'b'; 8]), 0);
+        let resynchronised = hub.publish_direct(8, &Arc::new(vec![b'b'; 8]), &[], 0, whole_screen);
         assert_eq!(resynchronised, vec![identifier(1)]);
         assert!(hub.is_resynchronising(identifier(1)));
 
@@ -1089,7 +1207,7 @@ mod tests {
         }
         // Publishing never waits, so once it has returned everything it queued is queued: the
         // absence is read then, not after a quiet moment.
-        hub.publish_direct(16, &Arc::new(vec![b'c'; 8]), 0);
+        hub.publish_direct(16, &Arc::new(vec![b'c'; 8]), &[], 0, whole_screen);
         hub.require_resync_all(ResyncReason::AgentStreamGap, 24, 0);
         assert!(
             slow.try_recv().is_none(),
@@ -1363,12 +1481,12 @@ mod tests {
     async fn resubscribing_clears_the_resynchronisation() {
         let mut hub = OutputHub::new();
         let _slow = hub.subscribe(identifier(1), 4, Presentation::Direct);
-        hub.publish_direct(0, &Arc::new(vec![b'a'; 4]), 0);
-        hub.publish_direct(4, &Arc::new(vec![b'b'; 4]), 0);
+        hub.publish_direct(0, &Arc::new(vec![b'a'; 4]), &[], 0, whole_screen);
+        hub.publish_direct(4, &Arc::new(vec![b'b'; 4]), &[], 0, whole_screen);
         assert!(hub.is_resynchronising(identifier(1)));
         let mut fresh = hub.subscribe(identifier(1), 4, Presentation::Direct);
         assert!(!hub.is_resynchronising(identifier(1)));
-        hub.publish_direct(8, &Arc::new(b"ok".to_vec()), 8);
+        hub.publish_direct(8, &Arc::new(b"ok".to_vec()), &[], 8, whole_screen);
         assert!(matches!(
             fresh.recv().await.expect("a delivery"),
             OutputDelivery::Bytes { cursor: 8, .. }
@@ -1381,7 +1499,7 @@ mod tests {
         let departed = hub.subscribe(identifier(1), 1024, Presentation::Direct);
         let mut staying = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         drop(departed);
-        hub.publish_direct(0, &Arc::new(b"x".to_vec()), 0);
+        hub.publish_direct(0, &Arc::new(b"x".to_vec()), &[], 0, whole_screen);
         assert_eq!(hub.len(), 1);
         assert!(matches!(
             staying.recv().await.expect("a delivery"),

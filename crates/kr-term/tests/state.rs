@@ -1062,6 +1062,70 @@ fn a_delta_belongs_to_the_base_it_names() {
     assert_eq!(behind.title, again.title);
 }
 
+/// What only describes the screen is named apart from what draws it, so a caller shown the live
+/// screen alone can be sent the second and none of the first.
+///
+/// A title, a link's target, a working directory and a shell's marks are forwarded to a terminal
+/// as they were written, and each tells whoever reads it something the screen's text does not. The
+/// palette and the text are what draws the screen.
+#[test]
+fn the_forwarded_stream_names_apart_what_only_describes_the_screen() {
+    let mut engine = engine();
+    let stream: &[u8] = b"\x1b]0;a-title\x07text \x1b]8;;https://example.invalid/target\x1b\\link\
+        \x1b]8;;\x1b\\ \x1b]7;file://host/directory\x1b\\\x1b]133;A\x1b\\\x1b]1337;CurrentDir=/directory\x07\
+        \x1b]4;1;rgb:ff/00/00\x07\x1b]10;rgb:00/ff/00\x07\x1b[31mred\r\n";
+    let outcome = engine.feed(stream, 0);
+    // The bytes of the stream that fall in any of `spans`.
+    let within = |spans: &[kr_term::span::ByteSpan]| -> Vec<bool> {
+        (0..stream.len() as u64)
+            .map(|at| {
+                spans
+                    .iter()
+                    .any(|span| span.start() <= at && at < span.end())
+            })
+            .collect()
+    };
+    let forwarded = within(&outcome.forward);
+    let named = within(&outcome.behind_the_screen);
+    let text = |keep: &dyn Fn(usize) -> bool| -> String {
+        let bytes: Vec<u8> = (0..stream.len())
+            .filter(|at| keep(*at))
+            .map(|at| stream[at])
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let named_apart = text(&|at| named[at]);
+    for told in [
+        "a-title",
+        "https://example.invalid/target",
+        "file://host/directory",
+    ] {
+        assert!(
+            named_apart.contains(told),
+            "{told} is named apart: {named_apart:?}"
+        );
+    }
+    assert!(
+        (0..stream.len()).all(|at| !named[at] || forwarded[at]),
+        "what is named apart is a part of what is forwarded"
+    );
+    // What is left once those are taken out is the text and the palette, and nothing that names a
+    // title, a target or a place.
+    let drawn = text(&|at| forwarded[at] && !named[at]);
+    for hidden in ["a-title", "example.invalid", "file://host", "133", "1337"] {
+        assert!(!drawn.contains(hidden), "{hidden} is not drawn: {drawn:?}");
+    }
+    for kept in [
+        "text ",
+        "link",
+        "]4;1;rgb:ff/00/00",
+        "]10;rgb:00/ff/00",
+        "red",
+    ] {
+        assert!(drawn.contains(kept), "{kept} is drawn: {drawn:?}");
+    }
+}
+
 /// A snapshot settles the held cell and hands back what settling produced.
 #[test]
 fn a_snapshot_returns_the_output_its_own_settling_made() {
