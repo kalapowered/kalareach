@@ -517,6 +517,9 @@ struct Turn {
     unabandoned: BTreeSet<String>,
     /// Generations left behind whose reclamation waited in this pass.
     unreclaimed: BTreeSet<(ArchiveId, BackupGeneration)>,
+    /// What held an abandonment back although its attempt ended anyway, so that the pass says an
+    /// abandonment is still owed and whatever runs it asks again.
+    deferred: Option<Hold>,
 }
 
 /// The only way the uploader reaches the backup store.
@@ -941,6 +944,9 @@ impl Uploader {
             if let Some(hold) = held {
                 report.hold = Some(report.hold.map_or(hold, |earlier| earlier.and(hold)));
             }
+        }
+        if let Some(hold) = turn.deferred {
+            report.hold = Some(report.hold.map_or(hold, |earlier| earlier.and(hold)));
         }
         Ok(report)
     }
@@ -1408,9 +1414,16 @@ impl Uploader {
                 continue;
             }
             let stepped = self.abandon_left(&record, turn).await?;
-            if !matches!(stepped, Stepped::Waiting { .. }) {
+            let Stepped::Waiting { hold, .. } = stepped else {
                 return Ok(stepped);
-            }
+            };
+            // The attempt ends all the same, and the upload is abandoned in a later pass, which
+            // the pass has to say is owed: no step of this pass carries it.
+            let hold = hold.unwrap_or(Hold {
+                code: ErrorCode::ServiceCapacity,
+                retry_after: None,
+            });
+            turn.deferred = Some(turn.deferred.map_or(hold, |earlier| earlier.and(hold)));
         }
         let everything_held = self
             .disk

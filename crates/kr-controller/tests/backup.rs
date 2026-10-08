@@ -8594,6 +8594,67 @@ async fn an_abandonment_put_off_by_a_delay_is_kept_and_sent_when_the_delay_has_p
     assert_eq!(host.web.count(|asked| matches!(asked, Asked::Abort(_))), 1);
 }
 
+/// An attempt that ends while its upload could not be abandoned leaves the abandonment owed, and
+/// the pass says so, so that whatever runs it asks again and the upload is not left open at the
+/// service until its lifetime runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_that_ends_an_attempt_without_abandoning_its_upload_says_the_abandonment_is_owed() {
+    let host = Host::open();
+    host.admit(1, &[THREE_PARTS]);
+    host.web.fail(Kind::Abort, 1, Fault::Dropped);
+    // Privacy mode is turned on while the first part is on its way.
+    let service = Arc::clone(&host.service);
+    host.web.when_a_part_arrives(move |number| {
+        if number == 1 {
+            let generation = PrivacyGeneration::new(1);
+            service
+                .raise_fence(generation, TimestampMs::new(11_000))
+                .expect("the fence is raised");
+            service
+                .cancel_undispatched_work(generation, TimestampMs::new(11_000))
+                .expect("undispatched work is taken back");
+        }
+    });
+    let mut uploader = host.uploader(10_000);
+    // The first pass ends where the fence took the part's attempt away. The second ends the
+    // attempt, and the abort it sends is lost.
+    uploader
+        .pass(TimestampMs::new(12_000))
+        .await
+        .expect("a pass");
+    let second = uploader
+        .pass(TimestampMs::new(13_000))
+        .await
+        .expect("a pass");
+    assert!(
+        kinds(&second.steps).contains(&"stopped"),
+        "{:?}",
+        second.steps
+    );
+    assert!(
+        second.hold.is_some(),
+        "the abandonment that is still owed is in the report: {second:?}"
+    );
+    assert_eq!(
+        host.web.count(|asked| matches!(asked, Asked::Abort(_))),
+        0,
+        "the abort that was lost never arrived"
+    );
+
+    // The next pass abandons it.
+    let third = uploader
+        .pass(TimestampMs::new(14_000))
+        .await
+        .expect("a pass");
+    assert!(
+        kinds(&third.steps).contains(&"abandoned"),
+        "{:?}",
+        third.steps
+    );
+    assert_eq!(third.hold, None);
+    assert_eq!(host.web.count(|asked| matches!(asked, Asked::Abort(_))), 1);
+}
+
 /// Ending work in flight under privacy mode does not wait out a delay the service asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_fence_ends_the_work_in_flight_inside_a_delay_the_service_asked_for() {
