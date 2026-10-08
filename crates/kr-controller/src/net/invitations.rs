@@ -1198,11 +1198,27 @@ fn read_action_row(
         .optional()
 }
 
+/// The methods a recorded pairing action can name, each stored by its wire name.
+///
+/// The reader of a row matches only these, so a method added here is one a release that does not
+/// have it refuses a row of. The stored-format lock reads the names from here.
+pub const RECORDED_METHODS: [Method; 6] = [
+    Method::OwnerConfirmationRequest,
+    Method::OwnerConfirmationComplete,
+    Method::HostClockEstablish,
+    Method::PairInvite,
+    Method::PairConfirm,
+    Method::PairCancel,
+];
+
 /// Decodes the row of one actor's pairing action.
 fn decode_action(actor: &ActorId, action_id: ActionId, raw: RawAction) -> Result<PairingAction> {
     let identity = uuid(Some(&raw.subject))?;
-    let subject = match (raw.method.as_str(), raw.challenge) {
-        ("owner.confirmation.request", Some(challenge)) => {
+    let method = RECORDED_METHODS
+        .into_iter()
+        .find(|method| method.as_str() == raw.method);
+    let subject = match (method, raw.challenge) {
+        (Some(Method::OwnerConfirmationRequest), Some(challenge)) => {
             let request: OwnerConfirmationRequest = decode(&challenge)?;
             if request.confirmation_id.get() != identity {
                 return Err(ControllerError::registry(
@@ -1211,18 +1227,19 @@ fn decode_action(actor: &ActorId, action_id: ActionId, raw: RawAction) -> Result
             }
             ActionSubject::Requested(Box::new(request))
         }
-        ("owner.confirmation.complete", None) => {
+        (Some(Method::OwnerConfirmationComplete), None) => {
             ActionSubject::Completed(ConfirmationId::new(identity))
         }
-        ("host.clock.establish", None) => {
+        (Some(Method::HostClockEstablish), None) => {
             ActionSubject::ClockEstablished(ConfirmationId::new(identity))
         }
-        ("pair.invite", None) => ActionSubject::Issued(InvitationId::new(identity)),
-        ("pair.confirm", None) => ActionSubject::Confirmed(InvitationId::new(identity)),
-        ("pair.cancel", None) => ActionSubject::Ended(InvitationId::new(identity)),
-        (other, _) => {
+        (Some(Method::PairInvite), None) => ActionSubject::Issued(InvitationId::new(identity)),
+        (Some(Method::PairConfirm), None) => ActionSubject::Confirmed(InvitationId::new(identity)),
+        (Some(Method::PairCancel), None) => ActionSubject::Ended(InvitationId::new(identity)),
+        _ => {
             return Err(ControllerError::registry(format!(
-                "a recorded pairing action names {other:?}, which this host does not record"
+                "a recorded pairing action names {:?}, which this host does not record",
+                raw.method
             )));
         }
     };

@@ -145,15 +145,20 @@ pub fn table() -> Vec<Store> {
                         "StoredRevocation",
                     ],
                 ),
-                // `ActionSubject` has a variant for each method a recorded pairing action can name,
-                // and the reader of the row matches the stored method against them.
                 Kept::Source(
                     "crates/kr-controller/src/net/invitations.rs",
-                    &["StoredCommitment", "ActionSubject"],
+                    &["StoredCommitment"],
                 ),
                 Kept::Source(
                     "crates/kr-controller/src/net/devices.rs",
                     &["KeyDeclaration"],
+                ),
+                Kept::Words(
+                    "methods a recorded pairing action names",
+                    kr_controller::service::net::invitations::RECORDED_METHODS
+                        .iter()
+                        .map(|method| method.as_str().to_owned())
+                        .collect(),
                 ),
                 Kept::Words(
                     "launch phases",
