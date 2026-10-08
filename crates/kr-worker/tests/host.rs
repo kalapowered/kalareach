@@ -2049,7 +2049,11 @@ fn hard_kill(identity: &kr_protocol::identity::ProcessStartIdentity) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement"]
 async fn measure_a_crashed_workers_tree() {
-    let host = Host::create().through_the_platform();
+    let host = if std::env::var_os("KR_MEASURE_DETACHED").is_some() {
+        Host::create()
+    } else {
+        Host::create().through_the_platform()
+    };
     let script = host.temp.root().join("tree.sh");
     std::fs::write(&script, TREE).expect("writes the tree");
     let daemon = host.start().await;
