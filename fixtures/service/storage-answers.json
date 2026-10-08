@@ -57,15 +57,15 @@
       "step": "read past its end"
     },
     {
-      "outcome": "created, parts PartTable { total_bytes: 1000, part_count: 1 }, reserved 1000, principal Account(..)",
+      "outcome": "created, parts PartTable { total_bytes: 1000, part_count: 1 }, reserved 3000, principal Account(..)",
       "step": "create an upload to give up"
     },
     {
-      "outcome": "Done(UploadAborted { cleaned: true, released_bytes: Some(1000) })",
+      "outcome": "Done(UploadAborted { cleaned: true, released_bytes: Some(3000) })",
       "step": "abandon it"
     },
     {
-      "outcome": "Done(UploadAborted { cleaned: true, released_bytes: Some(1000) })",
+      "outcome": "Done(UploadAborted { cleaned: true, released_bytes: Some(3000) })",
       "step": "abandon it again"
     },
     {
@@ -254,7 +254,7 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
           "retention": {
             "daily_snapshots": 30,
             "provider_recovery_days": 30,
@@ -401,7 +401,7 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
           "retention": {
             "daily_snapshots": 30,
             "provider_recovery_days": 30,
@@ -468,7 +468,7 @@
     {
       "body": {
         "data": {
-          "expires_at": "2026-10-08T13:17:47.149Z",
+          "expires_at": "2026-10-08T14:24:16.555Z",
           "layout": {
             "final_part_bytes": "1000",
             "part_count": 1,
@@ -483,10 +483,10 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
           "reserved_bytes": "1000",
           "state": "created",
-          "upload_id": "Yx76RIl0_bZeZVzDtfSBIBGpEppikj_645MM5GdEoO0"
+          "upload_id": "Ius28nkhuUQwIrCdSueN7frMDVn2qo2-rP9ySPOo1Nc"
         },
         "ok": true
       },
@@ -598,10 +598,10 @@
             "encrypted_object_hash": "TkwpSzMfeiCZo3m-w0ufn8A9xGq0ZdmY9NaD2lNIfm0",
             "object_id": "72727272-7272-7272-7272-727272727272"
           },
-          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
           "size_bucket_bytes": "1024",
           "state": "stored",
-          "stored_at": "2026-10-08T12:17:47.199Z"
+          "stored_at": "2026-10-08T13:24:17.016Z"
         },
         "ok": true
       },
@@ -637,10 +637,10 @@
             "encrypted_object_hash": "TkwpSzMfeiCZo3m-w0ufn8A9xGq0ZdmY9NaD2lNIfm0",
             "object_id": "72727272-7272-7272-7272-727272727272"
           },
-          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
           "size_bucket_bytes": "1024",
           "state": "duplicate",
-          "stored_at": "2026-10-08T12:17:47.199Z"
+          "stored_at": "2026-10-08T13:24:17.016Z"
         },
         "ok": true
       },
@@ -715,7 +715,7 @@
     {
       "body": {
         "data": {
-          "expires_at": "2026-10-08T13:17:47.250Z",
+          "expires_at": "2026-10-08T14:24:17.434Z",
           "layout": {
             "final_part_bytes": "1000",
             "part_count": 1,
@@ -730,10 +730,10 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
-          "reserved_bytes": "1000",
+          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
+          "reserved_bytes": "3000",
           "state": "created",
-          "upload_id": "eg97CjSCE55SRbQtM8bbQzHc_fr7JMy1DqAH5Z2z6ww"
+          "upload_id": "1DVh-HDuuIsHjDRfikQB3_HtvetkEpUB8dlebWRhOqE"
         },
         "ok": true
       },
@@ -768,7 +768,7 @@
     {
       "body": {
         "data": {
-          "released_bytes": "1000",
+          "released_bytes": "3000",
           "state": "cleaned"
         },
         "ok": true
@@ -787,7 +787,7 @@
     {
       "body": {
         "data": {
-          "released_bytes": "1000",
+          "released_bytes": "3000",
           "state": "cleaned"
         },
         "ok": true
@@ -853,8 +853,8 @@
           },
           "state": "enrolled",
           "writer": {
-            "enrolled_at": "2026-10-08T12:17:47.338Z",
-            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "enrolled_at": "2026-10-08T13:24:18.060Z",
+            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
             "writer_revision": "1"
           }
         },
@@ -896,8 +896,8 @@
           },
           "state": "unchanged",
           "writer": {
-            "enrolled_at": "2026-10-08T12:17:47.338Z",
-            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "enrolled_at": "2026-10-08T13:24:18.060Z",
+            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
             "writer_revision": "1"
           }
         },
@@ -943,8 +943,8 @@
           "generation": {
             "backup_generation": "1",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
-            "published_at": "2026-10-08T12:17:47.346Z",
+            "encrypted_manifest_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
+            "published_at": "2026-10-08T13:24:18.109Z",
             "recipients": 1
           },
           "state": "published"
@@ -996,8 +996,8 @@
           "generation": {
             "backup_generation": "1",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
-            "published_at": "2026-10-08T12:17:47.346Z",
+            "encrypted_manifest_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
+            "published_at": "2026-10-08T13:24:18.109Z",
             "recipients": 1
           },
           "state": "duplicate"
@@ -1049,8 +1049,8 @@
           "generation": {
             "backup_generation": "1",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
-            "published_at": "2026-10-08T12:17:47.346Z",
+            "encrypted_manifest_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
+            "published_at": "2026-10-08T13:24:18.109Z",
             "recipients": 1
           },
           "state": "duplicate"
@@ -1122,8 +1122,8 @@
           "generation": {
             "backup_generation": "2",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "yG3hPx8n4k-igzYYEAqE6hp8JJ7nFZxhDDPNNwmNgI4",
-            "published_at": "2026-10-08T12:17:47.460Z",
+            "encrypted_manifest_hash": "j7PkUR52lN8B7uycGud_Nn3nVlysCjw8_ZRD7MpLrxk",
+            "published_at": "2026-10-08T13:24:18.736Z",
             "recipients": 1
           },
           "state": "published"
@@ -1177,8 +1177,8 @@
           "generation": {
             "backup_generation": "4",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
-            "published_at": "2026-10-08T12:17:47.478Z",
+            "encrypted_manifest_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
+            "published_at": "2026-10-08T13:24:18.894Z",
             "recipients": 1
           },
           "state": "published"
@@ -1248,8 +1248,8 @@
             ]
           },
           "current_writer": {
-            "enrolled_at": "2026-10-08T12:17:47.338Z",
-            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "enrolled_at": "2026-10-08T13:24:18.060Z",
+            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
             "writer_revision": "1"
           },
           "publication": {
@@ -1259,33 +1259,33 @@
                 "backup_generation": "4",
                 "encrypted_manifest": {
                   "encrypted_len": "1103",
-                  "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                  "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
                   "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4"
                 },
                 "manifest_key_wraps": [
                   {
-                    "ciphertext": "mvZ7uG116DcgEr1Q66rCOfcV0BL2LztkQC0nToYmOXjFGHWvJhCUQE9CGDr0KhR245mybxWdCsX7rDZDDtSIeAZx4VSeEagufo_NWEmGt5HPtsuUHFhHb0Q9SF0cQ-jiYduZmEnczGXEFwppdyJnJVKADj16yWOK-vuFQjBgYghWtNU9z4mIRsDmLzYGI0LTJ8xKS6TiFq3UcbrpKJDF8M578-cEpah3zQcJLoDfUXYogZ-S7xVX72BeOgilORfDFyE7V7YTTO2V27kaAxr_io-tw6pqwLJtcK2WZIEGCxfQPRKE80BMNmzUlDepSSL-uU2T3W7VUz53HM8YVhQa1FWd6EdeHrUSjUd6HeFPOXFqIBOM_q63aXQALXoP7FKSHa47y-R5jJtB_3poZoSrj2ajm9r608cv_Mc5wrQVKFhP3A",
+                    "ciphertext": "ADzocuybTCfrePL8Je3GLjAYmz5zp5egu3tb6_B5cD1VETJRujpWokqRu7gAZ2695TtQTMMaF_vZrf43kaaIemsAZhlwpd7s5MVW4ktmlRXM6x7_3je5HNvL9kQRwpypcGvu85hIqRDfD7UERDggLluU36yVA7z_o5cMk9IByaFIRf1XHzi54qCGNZPWx4a8gFKSoRNwwCXlpDahND199t0wYLVg1zIPysts7jdAIs1PRwKaUwxkgKIQVHJTdxthDiVosAW-Nk60aJEk21G0PuzkS0zo4hZUtmmG_4KnGLpBXAmrCI0xggtzIaxLm6-DeJ8hplxygX2USwOvSM46wtgbicH4Lim5kf2xDqAxNGpl27osUhClKL-BEOOiVUt9NbHahpMD1GMrLBiGG3bf4-TlK5m0SSqG-auOlUG-7tdVdQ",
                     "context": {
                       "archive_id": "71717171-7171-7171-7171-717171717171",
                       "backup_generation": "4",
-                      "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                      "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
                       "format": "kr-keywrap/1",
                       "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4",
                       "purpose": "manifest_key",
-                      "recipient_key_id": "vD-ajgN06LiLLrDydStZ1gjfwwc41NvPOxtPubcHeJQ",
-                      "sender_key_id": "Ij9HLtCCqTLKH7jrhVZgTSUVSeDf59VqMN2Z5hVEkCE"
+                      "recipient_key_id": "cy6Evwnsa2bD1giDl2qoenDSwtX8sOZc5GRphwvMaZw",
+                      "sender_key_id": "y5De5oE7DODNVcQW7EUhYeZaV4kMG5Uit6Eq8aMDrrg"
                     },
-                    "nonce": "YLkylc9KEpb4a6y8dNIt05lLGOZqvAIg"
+                    "nonce": "P0CeZltRBUxv22QrqiUbt9M5mAd4b2Ss"
                   }
                 ],
                 "version": "1"
               },
               "published_at_ms": "2000",
-              "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts"
+              "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA"
             },
-            "signature": "mIbtPqu08Lf9inGVZI6aKKfOhfJW6uP7voQfsGD6PDg0ZlkPd5wnMK_B9QXuAWz2s1BcOWfqGlIUvqGAk6d-Dg"
+            "signature": "Dd_Iug57Dt6siiwJ_yi4SvLWFZhymeU2fKR5Q0fZeP_sodwEUzQx8RHtnxHHh-xW5bFgnRqguLrPvfdF8LrEDQ"
           },
-          "published_at": "2026-10-08T12:17:47.478Z"
+          "published_at": "2026-10-08T13:24:18.894Z"
         },
         "ok": true
       },
@@ -1361,8 +1361,8 @@
             ]
           },
           "current_writer": {
-            "enrolled_at": "2026-10-08T12:17:47.338Z",
-            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "enrolled_at": "2026-10-08T13:24:18.060Z",
+            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
             "writer_revision": "1"
           },
           "publication": {
@@ -1372,33 +1372,33 @@
                 "backup_generation": "1",
                 "encrypted_manifest": {
                   "encrypted_len": "1103",
-                  "encrypted_object_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+                  "encrypted_object_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
                   "object_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
                 },
                 "manifest_key_wraps": [
                   {
-                    "ciphertext": "sgkhdaEbc5pbIoVGGV7kdnIUUFL24IUCm-gyjGoW-WC3ZzdsCP400cLIQitu7sf8fRLnEHKi18r_olG4ibU6908ATunhsKAPhxtpZQV2fCJ3YROhwjVpNbEf20FD7wXr4Bpelm82I7ww6xohUp8DLYEp0d9cCBGTfGouHohpCv6WvZ83lIcMeX7_FuIngCCxh_cVw1AHYUBD57vrDXhJlCWwLr00vVmIyLDfB9Hq55SqCuHTIq5_aTjcb0BGa5WAS1neqtkMzbBPtwBHoYuBQKnaaaseoVrOE-d82AnIr5Bd_2GTWeVkfLJ5YxCB9K3R-lRYrDB35Dw61rkWH7pFhPOgw82GfwTF_EYRCwXkS3jgD-TkTGIkZRx6f3gesob5l3k_ateII974xaycIoFP1bFQZahdSFeWz-8pAHBLgd4OqQ",
+                    "ciphertext": "Qny07egX4tAVBIkKOZiv6_AerIM0rcQPJxN8U1J9-U-7n27Nf84ikOUCj6juTPtRYReSh9erneL1ORcnnUIVPqnNjh5v3YlnQmRRhuhrHw2zdtKZ4UlRe9c-5rSGQ6jy8ubx1zmZFUoDqQsxeDtVdxnJCF_U3MIhXPTZ1qy3V-Sv8kuxqjJejHdDuEIJ31xyT5xMXXuUd_ECSkImaW42rsvNcvaJajqvmqtO3EMhenOSeWiWWFq4YFAvgnYMQOvGRDplvpxoKyduSVUhs8uwXiZ2_s9vapJ9hdZxKxgm5vk3R1awBpGvay2mnlXp47_NXDg5Y5w72vk1zytvxe_G3usGQVaBhk8npRu3RviMYBZU9vLgY690qG2pbxLcq67mdKuytPjG-3C2OU8YKmzzycElhvNH76TvCE_9MukOC1lJTw",
                     "context": {
                       "archive_id": "71717171-7171-7171-7171-717171717171",
                       "backup_generation": "1",
-                      "encrypted_object_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+                      "encrypted_object_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
                       "format": "kr-keywrap/1",
                       "object_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
                       "purpose": "manifest_key",
-                      "recipient_key_id": "vD-ajgN06LiLLrDydStZ1gjfwwc41NvPOxtPubcHeJQ",
-                      "sender_key_id": "Ij9HLtCCqTLKH7jrhVZgTSUVSeDf59VqMN2Z5hVEkCE"
+                      "recipient_key_id": "cy6Evwnsa2bD1giDl2qoenDSwtX8sOZc5GRphwvMaZw",
+                      "sender_key_id": "y5De5oE7DODNVcQW7EUhYeZaV4kMG5Uit6Eq8aMDrrg"
                     },
-                    "nonce": "7pJKzEezjWGulch0JyOtSDgoBawWzPws"
+                    "nonce": "Hob_PRC8epNTbCqTg6op39V6SBkWSoLA"
                   }
                 ],
                 "version": "1"
               },
               "published_at_ms": "2000",
-              "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts"
+              "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA"
             },
-            "signature": "EtG0A7IgNPwQDCD0xgBD0OQUf6mUDvzQW3Gy3VGZxJUm0p6rOXAbSj0RkVQ0__NtzsV493ejWrp8iqc_qse8CQ"
+            "signature": "UohqaF5zilBvCZEvaLO_nZIw2Fc2BI1sJAILNeqJ98Q7QAUp0Fm1xd7AH585oxHIbWsJiv5ijnL4PzjkN6ztAA"
           },
-          "published_at": "2026-10-08T12:17:47.346Z"
+          "published_at": "2026-10-08T13:24:18.109Z"
         },
         "ok": true
       },
@@ -1512,8 +1512,8 @@
             ]
           },
           "current_writer": {
-            "enrolled_at": "2026-10-08T12:17:47.338Z",
-            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "enrolled_at": "2026-10-08T13:24:18.060Z",
+            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
             "writer_revision": "1"
           },
           "publication": {
@@ -1523,33 +1523,33 @@
                 "backup_generation": "4",
                 "encrypted_manifest": {
                   "encrypted_len": "1103",
-                  "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                  "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
                   "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4"
                 },
                 "manifest_key_wraps": [
                   {
-                    "ciphertext": "mvZ7uG116DcgEr1Q66rCOfcV0BL2LztkQC0nToYmOXjFGHWvJhCUQE9CGDr0KhR245mybxWdCsX7rDZDDtSIeAZx4VSeEagufo_NWEmGt5HPtsuUHFhHb0Q9SF0cQ-jiYduZmEnczGXEFwppdyJnJVKADj16yWOK-vuFQjBgYghWtNU9z4mIRsDmLzYGI0LTJ8xKS6TiFq3UcbrpKJDF8M578-cEpah3zQcJLoDfUXYogZ-S7xVX72BeOgilORfDFyE7V7YTTO2V27kaAxr_io-tw6pqwLJtcK2WZIEGCxfQPRKE80BMNmzUlDepSSL-uU2T3W7VUz53HM8YVhQa1FWd6EdeHrUSjUd6HeFPOXFqIBOM_q63aXQALXoP7FKSHa47y-R5jJtB_3poZoSrj2ajm9r608cv_Mc5wrQVKFhP3A",
+                    "ciphertext": "ADzocuybTCfrePL8Je3GLjAYmz5zp5egu3tb6_B5cD1VETJRujpWokqRu7gAZ2695TtQTMMaF_vZrf43kaaIemsAZhlwpd7s5MVW4ktmlRXM6x7_3je5HNvL9kQRwpypcGvu85hIqRDfD7UERDggLluU36yVA7z_o5cMk9IByaFIRf1XHzi54qCGNZPWx4a8gFKSoRNwwCXlpDahND199t0wYLVg1zIPysts7jdAIs1PRwKaUwxkgKIQVHJTdxthDiVosAW-Nk60aJEk21G0PuzkS0zo4hZUtmmG_4KnGLpBXAmrCI0xggtzIaxLm6-DeJ8hplxygX2USwOvSM46wtgbicH4Lim5kf2xDqAxNGpl27osUhClKL-BEOOiVUt9NbHahpMD1GMrLBiGG3bf4-TlK5m0SSqG-auOlUG-7tdVdQ",
                     "context": {
                       "archive_id": "71717171-7171-7171-7171-717171717171",
                       "backup_generation": "4",
-                      "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                      "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
                       "format": "kr-keywrap/1",
                       "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4",
                       "purpose": "manifest_key",
-                      "recipient_key_id": "vD-ajgN06LiLLrDydStZ1gjfwwc41NvPOxtPubcHeJQ",
-                      "sender_key_id": "Ij9HLtCCqTLKH7jrhVZgTSUVSeDf59VqMN2Z5hVEkCE"
+                      "recipient_key_id": "cy6Evwnsa2bD1giDl2qoenDSwtX8sOZc5GRphwvMaZw",
+                      "sender_key_id": "y5De5oE7DODNVcQW7EUhYeZaV4kMG5Uit6Eq8aMDrrg"
                     },
-                    "nonce": "YLkylc9KEpb4a6y8dNIt05lLGOZqvAIg"
+                    "nonce": "P0CeZltRBUxv22QrqiUbt9M5mAd4b2Ss"
                   }
                 ],
                 "version": "1"
               },
               "published_at_ms": "2000",
-              "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts"
+              "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA"
             },
-            "signature": "mIbtPqu08Lf9inGVZI6aKKfOhfJW6uP7voQfsGD6PDg0ZlkPd5wnMK_B9QXuAWz2s1BcOWfqGlIUvqGAk6d-Dg"
+            "signature": "Dd_Iug57Dt6siiwJ_yi4SvLWFZhymeU2fKR5Q0fZeP_sodwEUzQx8RHtnxHHh-xW5bFgnRqguLrPvfdF8LrEDQ"
           },
-          "published_at": "2026-10-08T12:17:47.478Z"
+          "published_at": "2026-10-08T13:24:18.894Z"
         },
         "ok": true
       },
@@ -1652,7 +1652,7 @@
       "body": {
         "error": {
           "code": "NOT_FOUND",
-          "message": "This collection holds a different manifest at the generation that checkpoint names."
+          "message": "That generation is older than the checkpoint that was presented."
         },
         "ok": false
       },
@@ -1705,8 +1705,8 @@
           "generation": {
             "backup_generation": "5",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "6okyYNnklYIZixaBGAlTR--R9QrP86sJFQuYmWstWOc",
-            "published_at": "2026-10-08T12:17:47.548Z",
+            "encrypted_manifest_hash": "U0sb1o7nPSdGHtf3TKqtLMTdNnUwGVZo8SV3rnEBbWA",
+            "published_at": "2026-10-08T13:24:19.433Z",
             "recipients": 1
           },
           "state": "published"
@@ -1762,8 +1762,8 @@
           "generation": {
             "backup_generation": "6",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "ytF3Lcj9PQVOHAmIJUUknOL6zIuiSZjpOqqtylnhEos",
-            "published_at": "2026-10-08T12:17:47.561Z",
+            "encrypted_manifest_hash": "eB4N1Paaj3N7lYbElgvMepJ0jDTrPadHNZmRuPxU71s",
+            "published_at": "2026-10-08T13:24:19.676Z",
             "recipients": 1
           },
           "state": "published"
@@ -1820,8 +1820,8 @@
           "generation": {
             "backup_generation": "7",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "6pPfgZD2hLIUL3iYX1EERwsQY7HQwrv-dkthGja8QqQ",
-            "published_at": "2026-10-08T12:17:47.582Z",
+            "encrypted_manifest_hash": "dWg6EvnBZuQz6nUQ0JhzYxLvDk-r4MD42Ks9tgt4aCU",
+            "published_at": "2026-10-08T13:24:19.754Z",
             "recipients": 1
           },
           "state": "published"
@@ -1879,8 +1879,8 @@
           "generation": {
             "backup_generation": "8",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "xiM307NDKosl8erRCvfGEKA_bMmc2_ASeDDCT7sc1ho",
-            "published_at": "2026-10-08T12:17:47.609Z",
+            "encrypted_manifest_hash": "a9NmDOP0F4DoTk0MGa15q6SE0hVZwt9BtCY_TGNRZeA",
+            "published_at": "2026-10-08T13:24:19.835Z",
             "recipients": 1
           },
           "state": "published"
@@ -1939,8 +1939,8 @@
           "generation": {
             "backup_generation": "9",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "1mTqnOwb-J6Plb8WOc3RSPhfyuLulWAgm9b6wUGhd8c",
-            "published_at": "2026-10-08T12:17:47.682Z",
+            "encrypted_manifest_hash": "-omG9yDCNVEDcUnJMHgHhaJSEwSSupv4zYwTPQj40RE",
+            "published_at": "2026-10-08T13:24:19.947Z",
             "recipients": 1
           },
           "state": "published"
@@ -2000,8 +2000,8 @@
           "generation": {
             "backup_generation": "10",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "qkZO_uteMzA8Daqu-6O0FG5YEW54q27cWtpjuWDUCLo",
-            "published_at": "2026-10-08T12:17:47.701Z",
+            "encrypted_manifest_hash": "_mn6_mTkNXfzsX7NxddouqxFQ3I_OFTtuBvKKQKAb28",
+            "published_at": "2026-10-08T13:24:20.123Z",
             "recipients": 1
           },
           "state": "published"
@@ -2062,8 +2062,8 @@
           "generation": {
             "backup_generation": "11",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "skSJreJeMRGCAMm8eRvBEw8NsjEBbytDY364iH7Irxg",
-            "published_at": "2026-10-08T12:17:47.732Z",
+            "encrypted_manifest_hash": "pD83-hyZpujbx1TcbU4EtNaZuodVMf0Ji3AKTQlI6iA",
+            "published_at": "2026-10-08T13:24:20.154Z",
             "recipients": 1
           },
           "state": "published"
@@ -2125,8 +2125,8 @@
           "generation": {
             "backup_generation": "12",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "5S6kbAKg2n6GqfAP6p1gKYPyB13kvb3zNljkmk4UGFU",
-            "published_at": "2026-10-08T12:17:47.749Z",
+            "encrypted_manifest_hash": "F0zquKCqlQBbCxylWN9JujIoHYKTWyCfxR1vA69UEAc",
+            "published_at": "2026-10-08T13:24:20.268Z",
             "recipients": 1
           },
           "state": "published"
@@ -2189,8 +2189,8 @@
           "generation": {
             "backup_generation": "13",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "5BK6bywhVXddLfbUfccIA-yeEmmKax9Jqd1DrfygD6c",
-            "published_at": "2026-10-08T12:17:47.776Z",
+            "encrypted_manifest_hash": "PmmIwaYbv58bVXRplYIJ9QCDXrjNfcoLyodTgd3n-TM",
+            "published_at": "2026-10-08T13:24:20.486Z",
             "recipients": 1
           },
           "state": "published"
@@ -2254,8 +2254,8 @@
           "generation": {
             "backup_generation": "14",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "ZSTHowpxX9rN-FRYcOhu7mMyLCA51Th0H_cYNGl6iAA",
-            "published_at": "2026-10-08T12:17:47.792Z",
+            "encrypted_manifest_hash": "0jl63Jrpmk4QDbaUuXcDyWSXrjsextyoPOb_ToeWRu4",
+            "published_at": "2026-10-08T13:24:20.630Z",
             "recipients": 1
           },
           "state": "published"
@@ -2320,8 +2320,8 @@
           "generation": {
             "backup_generation": "15",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "S-_uBrUKmzKkt5g2DHbaVyMd4k97WiHcY4Ay5IS7cwg",
-            "published_at": "2026-10-08T12:17:47.804Z",
+            "encrypted_manifest_hash": "eYeXTuK_8WYeLBN8j095c2cZj6GHG5Vk3BJsAde8ynE",
+            "published_at": "2026-10-08T13:24:20.871Z",
             "recipients": 1
           },
           "state": "published"
@@ -2387,8 +2387,8 @@
           "generation": {
             "backup_generation": "16",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "jn4abRyKWrhN4uOVpu3ivlPdptqQkS3EKOpxQeefJQk",
-            "published_at": "2026-10-08T12:17:47.818Z",
+            "encrypted_manifest_hash": "af9N-ZLrsQ27buMjB2fXIQBc_w0bXUEx1jYIjbdhokU",
+            "published_at": "2026-10-08T13:24:21.099Z",
             "recipients": 1
           },
           "state": "published"
@@ -2455,8 +2455,8 @@
           "generation": {
             "backup_generation": "17",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "fQDofB10g-Mo7pYLd9lV3M0otKlek2GkMUs0x4N_yXQ",
-            "published_at": "2026-10-08T12:17:47.830Z",
+            "encrypted_manifest_hash": "FtuhrdqmM9BNmm5c2-QsfZuly563tyzU9Er3Ts0fYMM",
+            "published_at": "2026-10-08T13:24:21.209Z",
             "recipients": 1
           },
           "state": "published"
@@ -2525,8 +2525,8 @@
           "generation": {
             "backup_generation": "18",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "Biya-AFv0uU_b1eztr2i6NHdoMbvDVyYwpSrrIQL1Yk",
-            "published_at": "2026-10-08T12:17:47.952Z",
+            "encrypted_manifest_hash": "vrPPXqQxOFrOnCUQUC_nzqjNCRNE4kt3aayUDd3JYgM",
+            "published_at": "2026-10-08T13:24:21.765Z",
             "recipients": 1
           },
           "state": "published"
@@ -2584,8 +2584,8 @@
     {
       "body": {
         "data": {
-          "deleted_at": "2026-10-08T12:17:47.974Z",
-          "purge_after": "2026-10-15T12:17:47.974Z",
+          "deleted_at": "2026-10-08T13:24:22.232Z",
+          "purge_after": "2026-10-15T13:24:22.232Z",
           "retained_bytes": "1000",
           "retention": {
             "daily_snapshots": 30,
@@ -2617,8 +2617,8 @@
     {
       "body": {
         "data": {
-          "deleted_at": "2026-10-08T12:17:47.974Z",
-          "purge_after": "2026-10-15T12:17:47.974Z",
+          "deleted_at": "2026-10-08T13:24:22.232Z",
+          "purge_after": "2026-10-15T13:24:22.232Z",
           "retained_bytes": "1000",
           "retention": {
             "daily_snapshots": 30,
@@ -2668,27 +2668,27 @@
     }
   ],
   "names": [
-    "8pAa8Jv23xRDlPTosx828NRveUJ4Sk2ocnKgi--z5pI",
-    "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
-    "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
-    "0X47Jlp4D78NNjNFUPRuic_NlGQOvxpGzjvUvKtAx5o",
-    "yG3hPx8n4k-igzYYEAqE6hp8JJ7nFZxhDDPNNwmNgI4",
-    "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
-    "3nC5kIrSHmeH-MmeNg7iRnD7amXxAuZk0IMwn2ep4Kc",
-    "6okyYNnklYIZixaBGAlTR--R9QrP86sJFQuYmWstWOc",
-    "ytF3Lcj9PQVOHAmIJUUknOL6zIuiSZjpOqqtylnhEos",
-    "6pPfgZD2hLIUL3iYX1EERwsQY7HQwrv-dkthGja8QqQ",
-    "xiM307NDKosl8erRCvfGEKA_bMmc2_ASeDDCT7sc1ho",
-    "1mTqnOwb-J6Plb8WOc3RSPhfyuLulWAgm9b6wUGhd8c",
-    "qkZO_uteMzA8Daqu-6O0FG5YEW54q27cWtpjuWDUCLo",
-    "skSJreJeMRGCAMm8eRvBEw8NsjEBbytDY364iH7Irxg",
-    "5S6kbAKg2n6GqfAP6p1gKYPyB13kvb3zNljkmk4UGFU",
-    "5BK6bywhVXddLfbUfccIA-yeEmmKax9Jqd1DrfygD6c",
-    "ZSTHowpxX9rN-FRYcOhu7mMyLCA51Th0H_cYNGl6iAA",
-    "S-_uBrUKmzKkt5g2DHbaVyMd4k97WiHcY4Ay5IS7cwg",
-    "jn4abRyKWrhN4uOVpu3ivlPdptqQkS3EKOpxQeefJQk",
-    "fQDofB10g-Mo7pYLd9lV3M0otKlek2GkMUs0x4N_yXQ",
-    "Biya-AFv0uU_b1eztr2i6NHdoMbvDVyYwpSrrIQL1Yk"
+    "kg9KXw3984_Zp9KHGMtBDOMxlWUFlLvGR2nQAyFxeSI",
+    "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
+    "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
+    "CVA4evOvjByQh1J2oeHlY8W7Ue4gjJapylyRV1mn4qw",
+    "j7PkUR52lN8B7uycGud_Nn3nVlysCjw8_ZRD7MpLrxk",
+    "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
+    "uap-usRu37-s94Snwb_WuOOaHGmN6fmmihx8FE5PswQ",
+    "U0sb1o7nPSdGHtf3TKqtLMTdNnUwGVZo8SV3rnEBbWA",
+    "eB4N1Paaj3N7lYbElgvMepJ0jDTrPadHNZmRuPxU71s",
+    "dWg6EvnBZuQz6nUQ0JhzYxLvDk-r4MD42Ks9tgt4aCU",
+    "a9NmDOP0F4DoTk0MGa15q6SE0hVZwt9BtCY_TGNRZeA",
+    "-omG9yDCNVEDcUnJMHgHhaJSEwSSupv4zYwTPQj40RE",
+    "_mn6_mTkNXfzsX7NxddouqxFQ3I_OFTtuBvKKQKAb28",
+    "pD83-hyZpujbx1TcbU4EtNaZuodVMf0Ji3AKTQlI6iA",
+    "F0zquKCqlQBbCxylWN9JujIoHYKTWyCfxR1vA69UEAc",
+    "PmmIwaYbv58bVXRplYIJ9QCDXrjNfcoLyodTgd3n-TM",
+    "0jl63Jrpmk4QDbaUuXcDyWSXrjsextyoPOb_ToeWRu4",
+    "eYeXTuK_8WYeLBN8j095c2cZj6GHG5Vk3BJsAde8ynE",
+    "af9N-ZLrsQ27buMjB2fXIQBc_w0bXUEx1jYIjbdhokU",
+    "FtuhrdqmM9BNmm5c2-QsfZuly563tyzU9Er3Ts0fYMM",
+    "vrPPXqQxOFrOnCUQUC_nzqjNCRNE4kt3aayUDd3JYgM"
   ],
   "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
   "web_commit": "91d71cba101c010ccc811173834ce7109219bf55"

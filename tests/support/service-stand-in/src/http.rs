@@ -113,6 +113,13 @@ async fn connection(mut socket: TcpStream, web: Arc<StorageWeb>) {
             "A managed-service request is bounded JSON.",
         )),
     };
+    let handled = match handled {
+        Handled::Slow(epoch, answer) => {
+            web.held_until_released(epoch).await;
+            Handled::Answer(answer)
+        }
+        other => other,
+    };
     match handled {
         Handled::Answer(answer) => {
             let content_type =
@@ -134,6 +141,7 @@ async fn connection(mut socket: TcpStream, web: Arc<StorageWeb>) {
         // The connection ends with no answer, as one does that the network lost.
         Handled::Lost => {}
         Handled::Held(epoch) => web.held_until_released(epoch).await,
+        Handled::Slow(..) => {}
     }
 }
 

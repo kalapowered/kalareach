@@ -534,9 +534,11 @@ async fn run_the_script(
     let read = host.read_object(archive, object, 5_000, 100).await;
     journal.decoded(decoded(&read, debug));
 
-    // An upload begun and given up.
+    // An upload begun and given up, which declared it might send more than it did: what the
+    // abandonment gives back is what the creation reserved.
     let given_up = NewUpload {
         object_id: second,
+        declared_max_bytes: 3000,
         ..upload
     };
     journal.step("create an upload to give up");
@@ -691,7 +693,7 @@ async fn run_the_script(
         .fetch(
             archive,
             Some(BackupGeneration::new(1)),
-            Some(&checkpoint(2, newest, archive)),
+            Some(&checkpoint(4, newest, archive)),
         )
         .await;
     journal.decoded(decoded(&answer, fetched_showing));
