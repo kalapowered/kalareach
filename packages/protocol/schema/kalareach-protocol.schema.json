@@ -35592,7 +35592,7 @@
             }
           ],
           "default": null,
-          "description": "The broker's origin: an absolute `https` or `http` address in lower case, with no path,\nno trailing slash and no port its scheme already implies."
+          "description": "The broker's origin: an absolute `https` address, or an `http` one on `localhost`,\n`127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path, no trailing\nslash and no port its scheme already implies. An `http` origin cannot be combined with\n`network.proxy_url`, because a proxy would carry the account token in clear text."
         }
       },
       "type": "object"

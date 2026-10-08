@@ -198,8 +198,8 @@ an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
-| `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
+| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -219,8 +219,8 @@ carries it.
 
 One rule covers the proxy. Every outbound HTTPS connection this host makes goes through it when the
 document names one: the endpoint's relays and Pkarr servers, the rendezvous it reserves a code's
-locator at and opens the room at, delivery to the push gateway and to webhook addresses, and plugin
-repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook
+locator at and opens the room at, delivery to the push gateway and to webhook addresses, the
+managed voice broker, and plugin repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook
 included. Mail submission is SMTP and connects directly, and name lookups go directly too. Without
 a proxy every one of those connections goes directly, apart from iroh's relay latency probe and
 captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
