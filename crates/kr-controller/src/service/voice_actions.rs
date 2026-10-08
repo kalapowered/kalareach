@@ -61,22 +61,25 @@ impl Controller {
     fn managed_voice_provider(&self) -> Option<Arc<dyn ManagedVoiceService>> {
         let origin = self.started.voice.broker_origin()?;
         let unavailable = |reason: &dyn std::fmt::Display| {
-            eprintln!(
-                "kr-controller: managed voice is not attached: voice.broker_origin in this host's \
-                 configuration document is not usable: {reason}"
-            );
+            eprintln!("kr-controller: managed voice is not attached: {reason}");
+        };
+        let origin_unusable = |error: &dyn std::fmt::Display| {
+            unavailable(&format_args!(
+                "voice.broker_origin in this host's configuration document is not usable: {error}"
+            ));
         };
         let gateway = GatewayOrigin::new(origin)
-            .inspect_err(|error| unavailable(error))
+            .inspect_err(|error| origin_unusable(error))
             .ok()?;
-        // A proxy the document selects and this host cannot read is never gone around.
+        // A proxy the document selects and this host cannot read is never gone around; the error
+        // names `network.proxy_url` itself.
         let proxy = self
             .started_proxy()
             .inspect_err(|error| unavailable(error))
             .ok()?;
         let transport = Arc::new(crate::voice::VoiceTransport::new(gateway, proxy));
         crate::voice::VoiceModule::managed_provider(origin, transport, self.paths.runtime_root())
-            .inspect_err(|error| unavailable(error))
+            .inspect_err(|error| origin_unusable(error))
             .ok()
     }
 

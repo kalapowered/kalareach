@@ -1,11 +1,12 @@
 //! How the host reaches the managed voice service.
 //!
-//! The transport is built when the first request needs it, as delivery's is. A host whose platform
-//! cannot set up certificate verification still starts, serves everything that needs no managed
-//! service, and says why whenever a voice request needs the service, rather than failing to start
-//! over a feature it may never use.
+//! The transport is built when a request first needs it and kept once it is built, as delivery's
+//! is. A host whose platform cannot set up certificate verification still starts, serves
+//! everything that needs no managed service, and says why whenever a voice request needs the
+//! service. A failed build is not kept, so a host whose platform is repaired reaches the service
+//! at its next request without a restart.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use kr_client::error::ClientError;
 use kr_client::services::{
@@ -33,7 +34,7 @@ pub const VOICE_DEADLINES: HttpDeadlines = HttpDeadlines {
 pub struct VoiceTransport {
     origin: GatewayOrigin,
     proxy: Option<ProxyUrl>,
-    built: OnceLock<Option<HttpService>>,
+    built: Mutex<Option<HttpService>>,
 }
 
 impl VoiceTransport {
@@ -43,22 +44,27 @@ impl VoiceTransport {
         Self {
             origin,
             proxy,
-            built: OnceLock::new(),
+            built: Mutex::new(None),
         }
     }
 
-    fn transport(&self) -> Option<&HttpService> {
-        self.built
-            .get_or_init(|| {
-                HttpService::through(
-                    self.origin.clone(),
-                    VOICE_DEADLINES,
-                    ResponseLimits::default(),
-                    self.proxy.as_ref(),
-                )
-                .ok()
-            })
-            .as_ref()
+    /// The built transport, building it now when none is kept; `None` when the platform cannot.
+    /// A clone shares the connection pool of the kept one.
+    fn transport(&self) -> Option<HttpService> {
+        let mut built = self
+            .built
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if built.is_none() {
+            *built = HttpService::through(
+                self.origin.clone(),
+                VOICE_DEADLINES,
+                ResponseLimits::default(),
+                self.proxy.as_ref(),
+            )
+            .ok();
+        }
+        built.clone()
     }
 }
 
@@ -88,12 +94,18 @@ impl ServiceHttp for VoiceTransport {
 mod tests {
     use super::*;
 
-    /// The service takes up to 30 seconds to answer a start (its creation window), so this host
-    /// waits longer than that for the answer's head and for the whole exchange.
+    /// The service takes up to 30 seconds to answer a start (its creation window), so the
+    /// transport this host builds waits longer than that for the answer's head and for the whole
+    /// exchange.
     #[test]
-    fn this_host_waits_longer_for_a_start_than_the_service_takes() {
+    fn the_transport_waits_longer_for_a_start_than_the_service_takes() {
         const SERVICE_CREATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
-        assert!(VOICE_DEADLINES.read > SERVICE_CREATION_WINDOW);
-        assert!(VOICE_DEADLINES.total > VOICE_DEADLINES.read);
+        let origin = GatewayOrigin::new("https://voice.example.test").expect("an origin");
+        let transport = VoiceTransport::new(origin, None)
+            .transport()
+            .expect("a transport on a platform with certificate verification");
+        let deadlines = transport.deadlines();
+        assert!(deadlines.read > SERVICE_CREATION_WINDOW);
+        assert!(deadlines.total > deadlines.read);
     }
 }

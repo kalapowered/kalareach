@@ -328,7 +328,7 @@ impl InForce {
 pub struct Started {
     /// The network section this daemon joined, or did not join, the network under.
     pub network: configuration::NetworkSelection,
-    /// The voice broker this daemon names to its paired devices.
+    /// The voice broker this daemon starts its paired devices' calls at.
     pub voice: configuration::VoiceSelection,
 }
 
