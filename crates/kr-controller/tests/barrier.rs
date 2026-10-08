@@ -448,9 +448,9 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
             .await
             .expect("the waiting thread finishes");
     if !reached {
-        // What the announcement had met when the wait ended, for the failure message: whether the
-        // client's task had an answer (a refusal or a transport failure among them), and how many
-        // announcements the worker has refused for the boundary.
+        // What the announcement has met, read as this message is made: whether the client's task
+        // has finished with an answer (a refusal or a transport failure among them), and how many
+        // announcements the worker has refused for the boundary so far.
         let met = if announcing.is_finished() {
             format!(
                 "answered {:?}",
@@ -2170,19 +2170,15 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
 /// do in its own process, and apart from each other. It ends, with its runtimes, when this is
 /// dropped.
 ///
-/// The session's own tasks (its monitor wakes on every child process that ends in this test
-/// binary, and each wakes into a wait for the session) run on a runtime of their own, and the
-/// connections on another. A case holds the session for seconds, where a worker's process holds it
-/// for one operation, and the task that waits for it blocks the thread it runs on. A task made
-/// runnable on a thread and then left behind by a task that blocks it waits in that thread's run
-/// slot, where no other thread of the runtime takes it from, until the block ends: on one runtime a
-/// connection's task could wait there for as long as the hold lasted, and the announcement it was
-/// to read would go unread. Only the connections' runtime serves a connection. The worker's own
-/// tasks that take the session or the boundary with a blocking lock still run on it, and a case
-/// that holds either holds up the ones it meets, which is what holding it is for. What the split
-/// takes off that runtime is the session's own tasks, which the signal for a finished child
-/// process wakes from outside the runtime whatever a case is doing, because every test of this
-/// binary shares that signal.
+/// The session's own tasks (its monitor among them, which wakes at times no case chooses) run on a
+/// runtime of their own, and the service with its connections on another. A case holds the session
+/// for seconds, where a worker's process holds it for one operation, and a task that waits for it
+/// blocks the thread it runs on. A task made runnable on a thread and then left behind by a task
+/// that blocks it waits in that thread's run slot, where no other thread of the runtime takes it
+/// from, until the block ends: with the monitor on the connections' runtime, a connection's task
+/// could wait there for as long as a hold lasted, and the announcement it was to read would go
+/// unread. The service's own tasks that take the session or the boundary still run on the
+/// connections' runtime, and a case that holds either holds up the ones it meets.
 struct ApartWorker {
     /// The thread that keeps the connections' runtime polling, ended before that runtime is told to
     /// stop.
