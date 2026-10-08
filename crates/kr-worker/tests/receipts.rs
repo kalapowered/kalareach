@@ -4255,6 +4255,7 @@ fn a_worker_follows_an_establishment_once_and_not_when_its_clock_was_stepped_bac
         "an establishment the worker met and could not follow is spent"
     );
 
+    machine.runs(std::time::Duration::from_secs(1));
     machine.owner_establishes(&floor);
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Trusted);
@@ -4264,6 +4265,7 @@ fn a_worker_follows_an_establishment_once_and_not_when_its_clock_was_stepped_bac
     machine.steps_back(a_minute);
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    machine.runs(std::time::Duration::from_secs(1));
     machine.owner_establishes(&floor);
     machine.wall.advance(an_hour);
     session.observe_time();
@@ -4765,19 +4767,22 @@ fn a_restatement_a_worker_takes_does_not_lower_its_mark() {
     );
 }
 
-/// KR-REQ-09.18, KR-REQ-09.19: a rollback the worker finds in a look is not cleared by a
-/// confirmation that is older than the rollback, although the clock is right again by the second
-/// reading of the look. In both cases the wall clock goes back a minute, the worker's first
-/// reading of its look finds that against its mark, and the clock is put right before its second,
-/// so that neither the confirmation nor the mark shows a rollback any more.
+/// KR-REQ-09.18, KR-REQ-09.19: a confirmation is followed only if every reading the worker took
+/// at or after the time the owner made it agrees with it, and the worker has found no rollback
+/// against a reading it proved after that time. Each look below moves the wall clock between the
+/// worker's two readings, through a wall clock that runs a closure after its next reading, so the
+/// clock is right again by the second reading and only what the worker kept of the first refuses.
 ///
-/// In the first the owner confirms the clock after the worker began, and the rollback comes
-/// after: the worker's mark is older than the confirmation, but its first reading is a minute
-/// behind what the owner said, after the owner said it. In the second the owner confirmed the
-/// clock before the worker began, and the daemon publishes that late, while the worker looks: the
-/// worker's mark is later than the confirmation. The control is the owner correcting a clock that
-/// had run ahead: the worker's first reading is just as far behind its own mark, but it agrees
-/// with the confirmation, so the owner's word stands.
+/// The owner confirms the clock after the worker began and the clock goes back a minute: the
+/// worker's mark is older than the confirmation, but its first reading is a minute behind what the
+/// owner said, after the owner said it. The owner confirmed the clock before the worker began,
+/// which was on a clock ten minutes ahead of that, and the daemon publishes it late while the
+/// worker looks: the first reading agrees with the confirmation, but the worker's mark is later
+/// than it and the first reading is behind the mark. The owner sets the clock ten minutes forward
+/// and confirms it, and the clock goes back a minute: the first reading is behind the owner's word
+/// and not behind the mark. The control is the owner correcting a clock that had run ahead: the
+/// first reading is as far behind the worker's own mark, but it agrees with the confirmation, so
+/// the owner's word stands.
 #[test]
 fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_after_it() {
     use kr_ipc::clock::SharedClock as _;
@@ -4787,6 +4792,7 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
         AnOwnerCorrectedAClockThatRanAhead,
         ARollbackCameAfterTheOwnerSpoke,
         AnOwnerSpokeBeforeTheWorkerBegan,
+        AnOwnerSetTheClockForward,
     }
     let looked = |look: Look| {
         let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
@@ -4800,6 +4806,9 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
             machine.wall.now_ms().get(),
             machine.continuous.boot_elapsed_ms(),
         );
+        if matches!(look, Look::AnOwnerSpokeBeforeTheWorkerBegan) {
+            machine.wall.advance(std::time::Duration::from_secs(600));
+        }
         machine.runs(std::time::Duration::from_secs(1));
         let mut session = Session::open(SessionConfig {
             time: kr_worker::action::time::TimeSources {
@@ -4842,6 +4851,15 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
                     published.establish(spoke.0, spoke.1);
                 }));
             }
+            Look::AnOwnerSetTheClockForward => {
+                machine.wall.advance(std::time::Duration::from_secs(600));
+                machine.owner_establishes(&floor);
+                machine.runs(std::time::Duration::from_secs(5));
+                machine.steps_back(std::time::Duration::from_secs(60));
+                after_the_first_reading(Box::new(move || {
+                    clock_put_right.set(clock_put_right.now_ms().get() + 60_000);
+                }));
+            }
         }
         session.observe_time();
         (
@@ -4862,6 +4880,11 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
             "a confirmation older than the worker's mark is older than the rollback it found",
         ),
         (
+            Look::AnOwnerSetTheClockForward,
+            (WallClockTrust::Unresolved, false),
+            "a reading behind the owner's word, taken after it, refutes it although the mark is lower",
+        ),
+        (
             Look::AnOwnerCorrectedAClockThatRanAhead,
             (WallClockTrust::Trusted, true),
             "the control: a clock that agrees with the owner's word is the owner's clock",
@@ -4877,11 +4900,13 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
 
 /// KR-REQ-09.18, KR-REQ-09.19: a confirmation the daemon publishes late does not clear a rollback
 /// the worker found after the owner made it. The owner confirms the clock and the daemon stops
-/// before it publishes; a worker begins, and the wall clock goes back a minute, which the worker
-/// finds. The clock recovers, with the worker restarted or not, and the daemon then completes the
-/// publication of the old confirmation: the clock agrees with it and with the worker's mark, but
-/// it is older than what the worker found, and only the next action of the owner ends the
-/// distrust. The control is that next action.
+/// before it publishes; the wall clock runs ten minutes ahead of what the owner said; a worker
+/// begins and proves that clock, and the wall clock then goes back a minute, still ahead of the
+/// owner's word, which the worker finds against its mark. The clock is right again, with the
+/// worker restarted or not, and the daemon then completes the publication of the old
+/// confirmation: every reading agrees with it, but the worker proved its clock after the owner
+/// spoke, so the confirmation cannot have seen the rollback, and only the next action of the owner
+/// ends the distrust. The control is that next action.
 #[test]
 fn a_confirmation_published_late_does_not_clear_a_rollback_found_after_it() {
     use kr_ipc::clock::SharedClock as _;
@@ -4895,6 +4920,7 @@ fn a_confirmation_published_late_does_not_clear_a_rollback_found_after_it() {
             machine.wall.now_ms().get(),
             machine.continuous.boot_elapsed_ms(),
         );
+        machine.wall.advance(std::time::Duration::from_secs(600));
         machine.runs(std::time::Duration::from_secs(1));
         let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
         machine.runs(AN_HOUR);
@@ -4902,11 +4928,11 @@ fn a_confirmation_published_late_does_not_clear_a_rollback_found_after_it() {
         machine.steps_back(std::time::Duration::from_secs(60));
         session.observe_time();
         assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+        machine.wall.advance(std::time::Duration::from_secs(60));
         if restarts {
             drop(session);
             session = a_worker_on_floor(&machine, &floor, &environment, session_id);
         }
-        machine.wall.advance(std::time::Duration::from_secs(60));
         machine.runs(std::time::Duration::from_secs(1));
         if owner_acts_after {
             machine.owner_establishes(&floor);
@@ -4933,6 +4959,128 @@ fn a_confirmation_published_late_does_not_clear_a_rollback_found_after_it() {
     assert!(
         wrong.is_empty(),
         "a confirmation older than the rollback leaves the worker distrusting, and the next action of the owner ends it; these did not: {wrong:?}"
+    );
+}
+
+/// KR-REQ-09.18, KR-REQ-09.19: a later look does not forget the rollback an earlier look found.
+/// The clock runs ten minutes ahead and the worker proves it; the owner sets it right and confirms
+/// it, and the daemon stops before it publishes; the clock goes back a minute more, which the
+/// worker finds, a minute behind the owner's word; the clock is put right again and the daemon
+/// completes the publication. The worker's next look reads a clock that agrees with the
+/// confirmation, and finds it behind its mark all the same, as it did before; the reading that
+/// refuted the confirmation is still what the worker holds against it. The control is the same
+/// without the second step back, where the owner's correction is followed.
+#[test]
+fn a_later_look_does_not_forget_the_rollback_an_earlier_look_found() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::WallClock as _;
+
+    let looked = |rolls_back_after_the_owner_spoke: bool| {
+        let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+        let machine = DriftingMachine::fast_by(0);
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+        machine.wall.advance(std::time::Duration::from_secs(600));
+        session.observe_time();
+        machine.runs(std::time::Duration::from_secs(1));
+        machine.steps_back(std::time::Duration::from_secs(600));
+        let (confirmed_wall, confirmed_boot) = (
+            machine.wall.now_ms().get(),
+            machine.continuous.boot_elapsed_ms(),
+        );
+        machine.runs(std::time::Duration::from_secs(1));
+        if rolls_back_after_the_owner_spoke {
+            machine.steps_back(std::time::Duration::from_secs(60));
+        }
+        session.observe_time();
+        if rolls_back_after_the_owner_spoke {
+            machine.wall.advance(std::time::Duration::from_secs(60));
+        }
+        machine.runs(std::time::Duration::from_secs(1));
+        floor.establish(confirmed_wall, confirmed_boot);
+        session.observe_time();
+        session.time().trust()
+    };
+    assert_eq!(
+        looked(true),
+        WallClockTrust::Unresolved,
+        "the reading a minute behind the owner's word still refutes it, although a later look agrees"
+    );
+    assert_eq!(
+        looked(false),
+        WallClockTrust::Trusted,
+        "the control: the owner's correction, published late, is followed"
+    );
+}
+
+/// KR-REQ-09.18, KR-REQ-09.19: a confirmation the worker met and refused leaves the next one to
+/// answer to the same readings. The owner confirms the clock (A), and then confirms it again (B),
+/// but the daemon stops before it publishes B; the worker looks, loads A, and its second reading
+/// finds the clock a minute behind both, so it refuses A. The clock is right again and the daemon
+/// completes the publication of B. B is older than the minute the clock lost, so it does not end
+/// the distrust, although the clock agrees with it by then. The control is a second action of the
+/// owner made after the clock was right again.
+#[test]
+fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readings() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::WallClock as _;
+
+    let looked = |b_is_older_than_the_lost_minute: bool| {
+        let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+        let machine = DriftingMachine::fast_by(0);
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let wall = Arc::new(WallThatMovesAfterItsNextReading {
+            inner: machine.wall.clone(),
+            after: std::sync::Mutex::new(None),
+        });
+        let mut session = Session::open(SessionConfig {
+            time: kr_worker::action::time::TimeSources {
+                wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+                ..machine.sources_on(&floor)
+            },
+            ..session_config(&environment, session_id)
+        })
+        .expect("opens");
+        machine.runs(AN_HOUR);
+        machine.owner_establishes(&floor);
+        machine.runs(std::time::Duration::from_secs(1));
+        let b = (
+            machine.wall.now_ms().get(),
+            machine.continuous.boot_elapsed_ms(),
+        );
+        machine.runs(std::time::Duration::from_secs(1));
+        let lost = machine.wall.clone();
+        *wall
+            .after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            lost.set(lost.now_ms().get() - 60_000);
+        }));
+        session.observe_time();
+        assert_eq!(
+            session.time().trust(),
+            WallClockTrust::Unresolved,
+            "the clock a minute behind A at the second reading refuses A"
+        );
+        machine.wall.advance(std::time::Duration::from_secs(60));
+        machine.runs(std::time::Duration::from_secs(1));
+        if b_is_older_than_the_lost_minute {
+            floor.establish(b.0, b.1);
+        } else {
+            machine.owner_establishes(&floor);
+        }
+        session.observe_time();
+        session.time().trust()
+    };
+    assert_eq!(
+        looked(true),
+        WallClockTrust::Unresolved,
+        "B was made before the clock lost its minute"
+    );
+    assert_eq!(
+        looked(false),
+        WallClockTrust::Trusted,
+        "the control: an action made after the clock was right again ends the distrust"
     );
 }
 
