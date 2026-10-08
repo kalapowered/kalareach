@@ -2130,14 +2130,6 @@ impl SignedInAccount {
         })
     }
 
-    /// Takes one revocation back out of the list.
-    fn unqueue(&self, grant_id: &str, refresh_token: &RefreshToken) -> Result<()> {
-        let mut entries = self.read_pending()?;
-        entries
-            .retain(|entry| !(entry.grant_id == grant_id && entry.refresh_token == *refresh_token));
-        self.write_pending(&entries)
-    }
-
     /// Adds a revocation to the list, dropping entries whose grants have ended by themselves and,
     /// past the limit, the oldest.
     fn queue(&self, grant_id: &str, refresh_token: RefreshToken) -> Result<()> {
@@ -2161,47 +2153,68 @@ impl SignedInAccount {
     /// number of revocations the service has still not acknowledged is returned.
     ///
     /// The token is sent to the service at least once. When the queue cannot be written, or the lock
-    /// cannot be taken, it is sent once without being queued, and the failure is returned.
+    /// cannot be taken, or sending the queue fails, it is sent once more on its own, and the failure
+    /// is returned.
     ///
     /// # Errors
     ///
     /// Returns an error when the store or the lock failed. After an input or output failure the
     /// state of the queue is uncertain: a write that failed at the last step of installing the
     /// entry can have left it there, and the token is then sent again at the next recovery, which
-    /// the service does not mind. A failure after the service acknowledged the token can leave its
-    /// entry in the queue for the same reason.
+    /// the service does not mind.
     pub async fn revoke_unkept(&self, refresh_token: RefreshToken) -> Result<usize> {
         let queued = match self.hold().await {
             Ok(_held) => self.queue("unkept", refresh_token.clone()),
             Err(error) => Err(error),
         };
-        if let Err(error) = queued {
+        let sent = match queued {
+            Ok(()) => self.send_pending().await,
+            Err(error) => Err(error),
+        };
+        if sent.is_err() {
             let _ = self.service.revoke(&refresh_token).await;
-            return Err(error);
         }
-        self.send_pending().await
+        sent
     }
 
     /// Keeps a sign-in's tokens, replacing any grant this device held, whose revocation is queued.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot keep the grant; nothing is kept then.
+    /// Returns an error when the store cannot keep the grant; nothing is kept then, and the queue
+    /// of revocations is put back as it was. A write that fails after the grant is in place counts
+    /// as kept. When the queue cannot be put back either, the grant that was replaced stays with
+    /// its own revocation queued: a send does not send an entry for the grant this device holds,
+    /// and the next recovery removes that grant and sends it.
     pub async fn commit(&self, issued: IssuedGrant, nonce: &str) -> Result<()> {
         let replaced = {
             let _held = self.hold().await?;
             let grant = StoredGrant::new(issued, self.client, nonce, (self.clock_ms)())?;
             let replaced = self.read_grant()?;
+            // The queue as it is, to be put back whole if the new grant is not written: the old
+            // grant is the one still kept then, and its revocation is not owed.
+            let before = match &replaced {
+                Some(_) => Some(self.read_pending()?),
+                None => None,
+            };
             if let Some(old) = &replaced {
                 self.queue(&old.grant_id, old.refresh_token.clone())?;
             }
             if let Err(error) = self.write_grant(&grant) {
-                // The old grant is the one still kept, so its revocation is not owed: left in the
-                // queue, a later send would end a grant this device goes on holding.
-                if let Some(old) = &replaced {
-                    let _ = self.unqueue(&old.grant_id, &old.refresh_token);
+                // A write can fail at its last step, after the grant is in place. What the store
+                // holds decides: a grant that landed is the commit, and the queue stays as it is.
+                let landed = matches!(
+                    self.read_grant(),
+                    Ok(Some(held)) if held.grant_id == grant.grant_id
+                );
+                if !landed {
+                    if let Some(before) = &before {
+                        // If this fails too, the old grant and its own queued revocation are both
+                        // there, which `send_pending` does not send and the next recovery settles.
+                        let _ = self.write_pending(before);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
             self.ended.store(false, Ordering::SeqCst);
             self.publish();
@@ -2323,18 +2336,27 @@ impl SignedInAccount {
         self.send_pending().await
     }
 
-    /// Sends every queued revocation and removes each one the service acknowledges. Returns how
-    /// many are still waiting.
+    /// Sends every queued revocation and removes each one the service acknowledges, except the one
+    /// that names the grant this device still holds. Returns how many are still waiting.
     ///
     /// # Errors
     ///
     /// Returns an error when the store cannot be read or changed.
     pub async fn send_pending(&self) -> Result<usize> {
-        let entries = {
+        let (entries, kept) = {
             let _held = self.hold().await?;
-            self.read_pending()?
+            (
+                self.read_pending()?,
+                self.read_grant()?.map(|grant| grant.grant_id),
+            )
         };
         for entry in entries {
+            // A grant this device still holds is not ended by a send: its own queued revocation
+            // means a sign-out stopped before it removed the grant, and recovery removes the grant
+            // first and sends the entry after.
+            if kept.as_deref() == Some(entry.grant_id.as_str()) {
+                continue;
+            }
             if self.service.revoke(&entry.refresh_token).await.is_ok() {
                 let _held = self.hold().await?;
                 let mut current = self.read_pending()?;
