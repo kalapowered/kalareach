@@ -421,6 +421,16 @@ export interface VoiceScope {
   readonly actions: readonly VoiceScopeAction[]
 }
 
+/**
+ * What allowing voice came to: the sentences the grant states and what it could not carry. The
+ * device the grant is for is not in it; native code holds that identity.
+ */
+export interface VoiceAllowed {
+  readonly statement: VoiceGrantResult['statement']
+  /** The actions asked for that this device's own access to the host does not include. */
+  readonly not_held_by_device: readonly VoiceAction[]
+}
+
 /** What the page asks when the person allows voice for some of a host's sessions. */
 export interface VoiceAllowRequest {
   /** The sessions a call may reach. A call is bound to sessions the grant names. */
@@ -792,7 +802,7 @@ export interface HostPort {
    * answer states every action the grant permits and every one the device's own grant could not
    * carry.
    */
-  voiceAllow(request: VoiceAllowRequest, subject: SessionSubject): Promise<Settled<VoiceGrantResult>>
+  voiceAllow(request: VoiceAllowRequest, subject: SessionSubject): Promise<Settled<VoiceAllowed>>
 
   /**
    * Starts a call.
