@@ -1483,10 +1483,7 @@ impl Registry {
         at_ms: TimestampMs,
     ) -> Result<()> {
         let boot = boot.get().to_be_bytes();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ControllerError::registry)?;
+        let transaction = begin_write(&mut self.connection)?;
         transaction
             .execute(
                 "UPDATE utc_floors SET in_force = 0 WHERE boot_epoch = ?1",
@@ -1517,10 +1514,7 @@ impl Registry {
     /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
     pub fn lose_clock_continuity(&mut self, boot: BootEpoch, at_ms: TimestampMs) -> Result<()> {
         let boot = boot.get().to_be_bytes();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ControllerError::registry)?;
+        let transaction = begin_write(&mut self.connection)?;
         transaction
             .execute(
                 "UPDATE utc_floors SET in_force = 0 WHERE boot_epoch = ?1",
@@ -1712,10 +1706,7 @@ impl Registry {
                 limit,
             });
         }
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(ControllerError::registry)?;
+        let transaction = begin_write(&mut self.connection)?;
         let next_display: i64 = transaction
             .query_row(
                 "SELECT next_display FROM environment WHERE environment_id = ?1",
@@ -1814,10 +1805,7 @@ impl Registry {
         reservation_id: ReservationId,
         worker_public_key: AuthorisationKey,
     ) -> Result<Reservation> {
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(ControllerError::registry)?;
+        let transaction = begin_write(&mut self.connection)?;
         let phase: Option<String> = transaction
             .query_row(
                 "SELECT phase FROM reservations WHERE reservation_id = ?1",
@@ -2073,10 +2061,7 @@ impl Registry {
     ) -> Result<()> {
         let recorded = self.to_record(worker.session_id, &worker.process_identity)?;
         let (desktop_session, login_generation) = desktop_columns(desktop);
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(ControllerError::registry)?;
+        let transaction = begin_write(&mut self.connection)?;
         transaction
             .execute(
                 "INSERT INTO workers (session_id, display_number, public_key, process_pid,
@@ -2318,10 +2303,7 @@ impl Registry {
     /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
     pub fn record_closure(&mut self, record: &ClosureRecord) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(record).map_err(ControllerError::registry)?;
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(ControllerError::registry)?;
+        let transaction = begin_write(&mut self.connection)?;
         transaction
             .execute(
                 "INSERT INTO tombstones (session_id, record, closed_at_ms) VALUES (?1, ?2, ?3)
@@ -2365,10 +2347,7 @@ impl Registry {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
     pub fn forget_workers_of_closed_sessions(&mut self) -> Result<Vec<SessionId>> {
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(ControllerError::registry)?;
+        let transaction = begin_write(&mut self.connection)?;
         let forgotten = {
             let mut statement = transaction
                 .prepare(
@@ -2518,6 +2497,21 @@ const fn source_name(source: ProcessStartSource) -> &'static str {
         // worker states the creation time.
         ProcessStartSource::WindowsProcessStartSeconds => "windows_process_start_seconds",
     }
+}
+
+/// Begins a transaction that holds the registry file's write lock from its first statement.
+///
+/// Other connections of the daemon write this file too: the device directory records the host's
+/// clock in it. A transaction that begins deferred and reads before it writes holds a read
+/// snapshot when it asks for the write lock, and SQLite then refuses it at once while another
+/// connection holds that lock, without waiting for it, which a create sees as an unavailable
+/// registry. Taking the write lock first is what lets the wait for another writer happen.
+///
+/// Every transaction the registry begins once it is open starts here.
+fn begin_write(connection: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
+    connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(ControllerError::registry)
 }
 
 /// The table that records, for each boot, that its clock continuity was lost and when its owner
