@@ -137,17 +137,22 @@ struct Gateway {
     /// What a route answers with whatever it is asked, for a deployment, a proxy or a fault that
     /// does not answer as the Worker does.
     replies: Mutex<BTreeMap<&'static str, ServiceHttpAnswer>>,
-    /// An answer held back until the test lets it go.
-    gate: Mutex<Option<Gate>>,
+    /// Requests, or answers, held back until the test lets them go.
+    gates: Mutex<Vec<Gate>>,
+    /// The last time the gateway stamped a credential with, so that two credentials never carry
+    /// one time.
+    stamped_ms: std::sync::atomic::AtomicU64,
 }
 
-/// An answer the gateway has decided and not yet given: the exchange it belongs to has changed the
-/// gateway's records, and the caller waits for the answer.
+/// An exchange the gateway holds back until the test lets it go: either the request, before the
+/// gateway has acted on it, or the answer, after it has and before the caller has heard.
 #[derive(Debug)]
 struct Gate {
     route: &'static str,
-    /// How many requests to the route are answered before the one that is held.
+    /// How many requests to the route pass before the one that is held.
     skip: usize,
+    /// Whether the request is held before the gateway acts on it.
+    before: bool,
     held: Arc<Held>,
 }
 
@@ -191,7 +196,7 @@ impl Gateway {
     ) -> PushDeliveryCredential {
         let mut secret = [0_u8; 32];
         kr_crypto::random_bytes(&mut secret).expect("a secret");
-        let issued = now();
+        let issued = self.stamp();
         let authorisation = Authorisation {
             installation_id,
             host_signing_key,
@@ -221,6 +226,21 @@ impl Gateway {
             revision: PushSenderRevision::new(authorisation.revision),
             secret: SecretBytes32::from_bytes(authorisation.secret),
             sender_record_id,
+        }
+    }
+
+    /// The time the gateway stamps a credential with: its clock, never the same twice.
+    fn stamp(&self) -> u64 {
+        let mut last = self.stamped_ms.load(Ordering::SeqCst);
+        loop {
+            let next = now().max(last + 1);
+            match self
+                .stamped_ms
+                .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return next,
+                Err(seen) => last = seen,
+            }
         }
     }
 
@@ -258,13 +278,40 @@ impl Gateway {
     /// Holds back the answer to the request to `route` after `skip` others, once the gateway has
     /// acted on it. The request is not answered until [`Held::release`].
     fn hold(&self, route: &'static str, skip: usize) -> Hold {
+        self.gate(route, skip, false)
+    }
+
+    /// Holds back the request to `route` after `skip` others before the gateway acts on it, so
+    /// that what else happens meanwhile happens first.
+    fn hold_before(&self, route: &'static str, skip: usize) -> Hold {
+        self.gate(route, skip, true)
+    }
+
+    fn gate(&self, route: &'static str, skip: usize, before: bool) -> Hold {
         let held = Arc::new(Held::default());
-        *self.gate.lock().expect("the gateway is not poisoned") = Some(Gate {
-            route,
-            skip,
-            held: Arc::clone(&held),
-        });
+        self.gates
+            .lock()
+            .expect("the gateway is not poisoned")
+            .push(Gate {
+                route,
+                skip,
+                before,
+                held: Arc::clone(&held),
+            });
         Hold(held)
+    }
+
+    /// The gate the request meets, if it is one a test holds. A request counts against the first
+    /// gate for its route that it does not pass.
+    fn met(&self, url: &str) -> Option<(Arc<Held>, bool)> {
+        let mut gates = self.gates.lock().expect("the gateway is not poisoned");
+        let index = gates.iter().position(|gate| url.ends_with(gate.route))?;
+        if gates[index].skip > 0 {
+            gates[index].skip -= 1;
+            return None;
+        }
+        let gate = gates.remove(index);
+        Some((gate.held, gate.before))
     }
 
     /// Makes the credentials it issues from now on last `lifetime_ms`.
@@ -499,7 +546,7 @@ impl Gateway {
                 }
                 // And an active one renews in the last week of its credential's life, or within
                 // an hour of a renewal whose answer was lost: never on the day it was issued.
-                let issued = now();
+                let issued = self.stamp();
                 let due = held.expires_at_ms.saturating_sub(RENEWAL_WINDOW_MS) <= issued;
                 let recovering = held.renewed_at_ms > 0
                     && issued.saturating_sub(held.renewed_at_ms) <= RENEWAL_RECOVERY_MS;
@@ -580,13 +627,14 @@ impl Gateway {
     }
 }
 
-impl ServiceHttp for Gateway {
-    fn post_json<'a>(
-        &'a self,
-        url: &'a str,
-        body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
-    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+impl Gateway {
+    /// What the gateway answers, and the record that it was asked.
+    fn respond(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<ServiceHttpAnswer, kr_client::ClientError> {
         let replied = self
             .replies
             .lock()
@@ -612,24 +660,38 @@ impl ServiceHttp for Gateway {
         if let Ok(answered) = &answer {
             self.state().asked.push((url.to_owned(), answered.status));
         }
-        let held = {
-            let mut gate = self.gate.lock().expect("the gateway is not poisoned");
-            match gate.as_mut() {
-                Some(open) if url.ends_with(open.route) && open.skip > 0 => {
-                    open.skip -= 1;
-                    None
-                }
-                Some(open) if url.ends_with(open.route) => gate.take().map(|open| open.held),
-                _ => None,
-            }
-        };
-        Box::pin(async move {
-            if let Some(held) = held {
+        answer
+    }
+}
+
+impl ServiceHttp for Gateway {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        match self.met(url) {
+            // Held before the gateway acts: what happens meanwhile happens first.
+            Some((held, true)) => Box::pin(async move {
                 held.reached.notify_one();
                 held.release.notified().await;
+                self.respond(url, body, headers)
+            }),
+            // Held after: the gateway has acted, and the caller has not heard.
+            Some((held, false)) => {
+                let answer = self.respond(url, body, headers);
+                Box::pin(async move {
+                    held.reached.notify_one();
+                    held.release.notified().await;
+                    answer
+                })
             }
-            answer
-        })
+            None => {
+                let answer = self.respond(url, body, headers);
+                Box::pin(async move { answer })
+            }
+        }
     }
 }
 
@@ -2239,9 +2301,10 @@ async fn only_the_gateways_own_success_confirms_a_bearer() {
         environment.phone().await,
         environment.phone().await,
         environment.phone().await,
+        environment.phone().await,
     ];
     let unauthenticated = r#"{"ok":false,"error":{"code":"UNAUTHENTICATED","message":"no"}}"#;
-    let cases: [(u16, &str, kr_protocol::error::ErrorCode); 8] = [
+    let cases: [(u16, &str, kr_protocol::error::ErrorCode); 9] = [
         (200, r#"{"ok":true}"#, UpstreamUnavailable),
         (200, r#"{"ok":true,"data":{}}"#, UpstreamUnavailable),
         (
@@ -2250,6 +2313,12 @@ async fn only_the_gateways_own_success_confirms_a_bearer() {
             UpstreamUnavailable,
         ),
         (200, unauthenticated, UpstreamUnavailable),
+        // A refusal whose `data` is not nothing is not the gateway's refusal either.
+        (
+            401,
+            r#"{"ok":false,"data":{},"error":{"code":"UNAUTHENTICATED","message":"no"}}"#,
+            UpstreamUnavailable,
+        ),
         (401, "unauthorised", UpstreamUnavailable),
         (403, "<html>blocked</html>", UpstreamUnavailable),
         (
@@ -2296,10 +2365,10 @@ async fn only_the_gateways_own_success_confirms_a_bearer() {
     environment.gateway.answer_route_with(STATUS_ROUTE, None);
     let credential = environment.gateway.issue(
         PushSenderRecordId::new(uuid(0x7f)),
-        phones[2].installation(),
+        phones[3].installation(),
         host_key,
     );
-    phones[2]
+    phones[3]
         .register(&environment, &credential)
         .await
         .expect("the gateway's success confirms the bearer");
@@ -2316,18 +2385,33 @@ async fn a_refusal_of_the_nonce_that_is_not_the_gateways_blames_nobody() {
 
     let environment = Environment::start().await;
     let host_key = environment.host_signing_key();
-    let phone = environment.phone().await;
-    let other_phone = environment.phone().await;
-    let cases: [(u16, &str, kr_protocol::error::ErrorCode); 3] = [
-        (403, "forbidden", UpstreamUnavailable),
-        (401, "<html>sign in</html>", UpstreamUnavailable),
+    let phones = [
+        environment.phone().await,
+        environment.phone().await,
+        environment.phone().await,
+    ];
+    // A nonce with an error beside it is not the gateway's success, and is not its refusal.
+    let contradictory = serde_json::json!({
+        "ok": true,
+        "data": {
+            "gateway_nonce": Nonce256::from_bytes([1; 32]),
+            "expires_at_ms": TimestampMs::new(now() + 60_000),
+        },
+        "error": { "code": "FORBIDDEN", "message": "no" },
+    })
+    .to_string();
+    let cases: [(u16, String, kr_protocol::error::ErrorCode); 4] = [
+        (403, "forbidden".to_owned(), UpstreamUnavailable),
+        (401, "<html>sign in</html>".to_owned(), UpstreamUnavailable),
+        (200, contradictory, UpstreamUnavailable),
         (
             403,
-            r#"{"ok":false,"error":{"code":"FORBIDDEN","message":"no"}}"#,
+            r#"{"ok":false,"error":{"code":"FORBIDDEN","message":"no"}}"#.to_owned(),
             InvalidArgument,
         ),
     ];
     for (index, (status, body, code)) in cases.iter().enumerate() {
+        let phone = &phones[index % 3];
         let credential = environment.gateway.issue(
             PushSenderRecordId::new(uuid(0x80 + u8::try_from(index).expect("a few cases"))),
             phone.installation(),
@@ -2346,10 +2430,10 @@ async fn a_refusal_of_the_nonce_that_is_not_the_gateways_blames_nobody() {
     environment.gateway.answer_route_with(RENEW_ROUTE, None);
     let credential = environment.gateway.issue(
         PushSenderRecordId::new(uuid(0x8f)),
-        other_phone.installation(),
+        phones[1].installation(),
         host_key,
     );
-    other_phone
+    phones[1]
         .register(&environment, &credential)
         .await
         .expect("the gateway's nonce confirms the authorisation");
@@ -2361,9 +2445,9 @@ async fn a_refusal_of_the_nonce_that_is_not_the_gateways_blames_nobody() {
 
 /// KR-REQ-16.09: the gateway counts the host's renewals and revocations together, and a
 /// registration that asks for a nonce spends from the same allowance. So the host allows itself a
-/// few registrations an hour whichever devices make them, and says to wait: a seventh device with
-/// a bearer the gateway takes is not put to the question that spends the allowance, while a bearer
-/// that fails the first question costs it nothing.
+/// few registrations an hour whichever devices make them, and says to wait: the third device's
+/// seventh registration, with a bearer the gateway takes, is not put to the question that spends
+/// the allowance, while a bearer that fails the first question costs it nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn devices_registering_cannot_spend_the_gateways_allowance_for_renewing_and_revoking() {
     let environment = Environment::start().await;
@@ -2559,26 +2643,33 @@ async fn a_renewal_leaves_the_bearer_a_device_registered_while_the_gateway_was_a
 // One sweep of owed revocations at a time
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-16.10: a sweep that finds another still asking leaves the debt to it. Two sweeps that
-/// asked about one debt would each ask the gateway for a nonce and for the revocation, and the
-/// gateway counts all four against the host's allowance for renewing and revoking.
+/// KR-REQ-16.10: a sweep that finds another still asking leaves the debts to it, and the one that
+/// is asking goes round again before it lets go. Two sweeps that asked about one debt would each
+/// ask the gateway for a nonce and for the revocation, and the gateway counts all four against the
+/// host's allowance for renewing and revoking; and a debt written after the running sweep read
+/// its list would otherwise wait for the next round of questions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_second_sweep_does_not_ask_about_a_debt_the_first_is_asking_about() {
     let environment = Environment::start().await;
-    let phone = environment.phone().await;
-    let sender = PushSenderRecordId::new(uuid(0x69));
-    let credential =
-        environment
-            .gateway
-            .issue(sender, phone.installation(), environment.host_signing_key());
-    phone
-        .register(&environment, &credential)
-        .await
-        .expect("the credential is registered");
+    let phones = [environment.phone().await, environment.phone().await];
+    let senders = [
+        PushSenderRecordId::new(uuid(0x69)),
+        PushSenderRecordId::new(uuid(0x6b)),
+    ];
+    for (phone, sender) in phones.iter().zip(senders) {
+        let credential =
+            environment
+                .gateway
+                .issue(sender, phone.installation(), environment.host_signing_key());
+        phone
+            .register(&environment, &credential)
+            .await
+            .expect("the credential is registered");
+    }
 
-    // The unpairing starts a sweep, whose first question is held at the gateway.
+    // The first unpairing starts a sweep, whose first question is held at the gateway.
     let held = environment.gateway.hold(REVOKE_ROUTE, 0);
-    unpair(&environment, phone.device_id()).await;
+    unpair(&environment, phones[0].device_id()).await;
     held.reached().await;
     let runtime = Arc::clone(environment.controller().delivery_runtime());
     tokio::task::spawn_blocking(move || runtime.sweep_revocations())
@@ -2590,11 +2681,164 @@ async fn a_second_sweep_does_not_ask_about_a_debt_the_first_is_asking_about() {
         "the second sweep asked nothing while the first was asking"
     );
 
-    held.release();
-    until("the debt being paid", || owed(&environment).is_empty()).await;
+    // Another device is unpaired meanwhile. Its debt was written after the first sweep read its
+    // list, and is asked about as soon as that sweep is done, not at the next round of questions.
+    unpair(&environment, phones[1].device_id()).await;
     assert_eq!(
         environment.gateway.answers_on(REVOKE_ROUTE),
-        vec![200, 200],
-        "a nonce, and the revocation, once"
+        vec![200],
+        "and nothing was asked for the second debt either"
     );
+    held.release();
+    until("both debts being paid", || owed(&environment).is_empty()).await;
+    assert_eq!(
+        environment.gateway.answers_on(REVOKE_ROUTE),
+        vec![200; 4],
+        "a nonce and the revocation, once for each"
+    );
+    for sender in senders {
+        assert_eq!(
+            environment
+                .gateway
+                .authorisation(sender)
+                .expect("held")
+                .state,
+            PushSenderState::Revoked
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A renewal that fails ahead of need, and one that comes back late
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-16.09, KR-REQ-16.12: a bearer the gateway has not refused works until its expiry, so a
+/// renewal ahead of need that fails does not hold a notification back. The gateway cannot be
+/// reached for a renewal, or refuses it because the expiry the device wrote is earlier than the
+/// gateway's; the question is delivered under the bearer held all the same, and the host goes on
+/// asking for the renewal after a wait, not at every attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_renewal_ahead_of_need_that_fails_does_not_hold_a_notification_back() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x6c));
+    // Two days left: inside the last week, where the host renews ahead of need.
+    environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let renewals = environment.gateway.answers_on(RENEW_ROUTE).len();
+
+    environment
+        .gateway
+        .answer_route_with(RENEW_ROUTE, Some((503, "unavailable")));
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert!(
+        environment.gateway.answers_on(RENEW_ROUTE).len() > renewals,
+        "the renewal was asked for and failed"
+    );
+    assert_eq!(
+        environment.gateway.state().bearers_refused,
+        0,
+        "and the bearer held was the one that works"
+    );
+
+    // The next question is delivered in the wait without the gateway being asked again.
+    let asked = environment.gateway.answers_on(RENEW_ROUTE).len();
+    let before = environment.gateway.delivered().len();
+    environment
+        ._worker
+        .ask("deploy-2", "Deploy the release again?");
+    until("the next question being delivered", || {
+        environment.gateway.delivered().len() > before
+    })
+    .await;
+    assert_eq!(
+        environment.gateway.answers_on(RENEW_ROUTE).len(),
+        asked,
+        "the host waits before it asks for the renewal again"
+    );
+}
+
+/// KR-REQ-16.09: the gateway renews a credential, and the device's installation issues another,
+/// and the host hears of the two in whichever order the answers arrive. The device's bearer is
+/// confirmed while a renewal is on its way, the gateway then renews and retires it, and the host
+/// keeps the device's bearer before the renewal's answer reaches it. The renewal is the later
+/// issue, so it is the one kept; the gateway issued the bearer the device handed over earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_bearer_confirmed_before_a_renewal_that_retired_it_does_not_outlast_the_renewal() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x6a));
+    let host_key = environment.host_signing_key();
+    environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
+    let first = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    phone
+        .register(&environment, &first)
+        .await
+        .expect("the first credential is registered");
+    let credentials = Arc::clone(environment.controller().delivery_runtime().credentials());
+
+    // The device is issued another bearer, which retires the first, and hands it over. Its
+    // registration is held at the nonce, after the gateway took the bearer; the renewal then goes
+    // through, retires that bearer too, and its answer is held.
+    let second = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    let registering = environment.gateway.hold_before(RENEW_ROUTE, 0);
+    let renewal_answer = environment.gateway.hold(RENEW_ROUTE, 1);
+    let driver = async {
+        registering.reached().await;
+        let current = credentials.held(sender).expect("held");
+        let renewing = tokio::task::spawn_blocking({
+            let credentials = Arc::clone(&credentials);
+            move || kr_delivery::push::SenderCredentials::renew(credentials.as_ref(), &current)
+        });
+        renewal_answer.reached().await;
+        registering.release();
+        until("the host keeping the device's bearer", || {
+            credentials
+                .held(sender)
+                .is_some_and(|held| held.secret == second.secret)
+        })
+        .await;
+        renewal_answer.release();
+        renewing
+            .await
+            .expect("a thread")
+            .expect("the renewal is answered")
+    };
+    let (registered, renewed) = tokio::join!(phone.register(&environment, &second), driver);
+    registered.expect("the second credential is registered");
+
+    assert_ne!(
+        renewed.secret, second.secret,
+        "the renewal retired the bearer"
+    );
+    assert_eq!(
+        credentials.held(sender).expect("held").secret,
+        renewed.secret,
+        "the host holds the bearer the gateway issued last"
+    );
+    assert_eq!(
+        stored_credential(&environment, sender).map(|stored| stored.secret),
+        Some(renewed.secret)
+    );
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("a question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert_eq!(environment.gateway.state().bearers_refused, 0);
 }

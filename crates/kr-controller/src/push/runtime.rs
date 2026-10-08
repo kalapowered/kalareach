@@ -95,7 +95,9 @@ pub const CONFIRMATIONS_PER_DEVICE: StatusAllowance = StatusAllowance {
 /// The gateway counts this host's renewals and revocations together, sixty requests an hour, and
 /// every renewal and every revocation takes two. A registration's nonce comes out of the same
 /// count, so what registrations may spend is a share of it that leaves most to the work the host
-/// owes: at most twelve in any hour, and eighteen when the daemon starts again inside the hour.
+/// owes: at most twelve nonces in any hour, and eighteen when the daemon starts again inside the
+/// hour. A registration that replaces an authorisation also owes a revocation of the old one, two
+/// requests more, which is the host's own work and outside this share.
 pub const CONFIRMATIONS_PER_HOST: StatusAllowance = StatusAllowance {
     burst: 6,
     per_hour: 6,
@@ -149,6 +151,8 @@ pub struct DeliveryRuntime {
     nonces: StatusBudget,
     /// One sweep of owed revocations at a time: a debt two sweeps ask about costs four requests.
     sweeping: Mutex<()>,
+    /// Whether a sweep was asked for while another was running, which then goes round again.
+    sweep_wanted: AtomicBool,
     cadence: Cadence,
     runtime: tokio::runtime::Handle,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -180,6 +184,7 @@ impl DeliveryRuntime {
             confirmations: Mutex::new(std::collections::BTreeMap::new()),
             nonces: StatusBudget::new(CONFIRMATIONS_PER_HOST),
             sweeping: Mutex::new(()),
+            sweep_wanted: AtomicBool::new(false),
             cadence,
             runtime,
             tasks: Mutex::new(Vec::new()),
@@ -394,32 +399,40 @@ impl DeliveryRuntime {
 
     /// Asks the gateways for the revocations this host owes, when there is a transport to ask
     /// through. Blocks.
+    ///
+    /// One sweep runs at a time. A sweep asked for while another is running leaves the asking to
+    /// it, and the running one goes round again before it lets go: a debt written after it read
+    /// its list is then asked about as soon as it is done, and a debt two sweeps asked about would
+    /// cost four requests of the gateway's allowance for renewing and revoking.
     pub fn sweep_revocations(&self) {
         let Some(adapters) = self.adapters.get() else {
             return;
         };
-        // A sweep that finds another asking leaves its debts to it: they are not settled until it
-        // has asked, so a second sweep would ask about the same ones, and the gateway counts every
-        // request against this host's allowance for renewing and revoking.
+        self.sweep_wanted.store(true, Ordering::SeqCst);
         let Ok(_one_sweep) = self.sweeping.try_lock() else {
             return;
         };
-        let credentials = Arc::clone(&self.credentials);
-        let forget = move |sender_record_id| match credentials.forget(sender_record_id) {
-            Ok(()) => true,
-            Err(detail) => {
-                eprintln!(
-                    "kr-controller: a delivery credential could not be removed from the secret \
-                     store: {detail}"
-                );
-                false
+        // Cleared before each round reads the list, and read after it: a request that comes in
+        // between is either answered by this round, which reads the list after it, or seen here.
+        while self.sweep_wanted.swap(false, Ordering::SeqCst) {
+            let credentials = Arc::clone(&self.credentials);
+            let forget = move |sender_record_id| match credentials.forget(sender_record_id) {
+                Ok(()) => true,
+                Err(detail) => {
+                    eprintln!(
+                        "kr-controller: a delivery credential could not be removed from the \
+                         secret store: {detail}"
+                    );
+                    false
+                }
+            };
+            if let Err(error) =
+                self.module
+                    .settle_revocations(adapters.senders.as_ref(), &forget, &SystemClock)
+            {
+                eprintln!("kr-controller: owed revocations were not asked about: {error}");
+                return;
             }
-        };
-        if let Err(error) =
-            self.module
-                .settle_revocations(adapters.senders.as_ref(), &forget, &SystemClock)
-        {
-            eprintln!("kr-controller: owed revocations were not asked about: {error}");
         }
     }
 
