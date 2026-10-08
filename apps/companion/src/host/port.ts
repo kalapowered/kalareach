@@ -73,7 +73,9 @@ import type {
   SessionReadResult,
   ShellLaunchResult,
   VoiceContextResult,
+  VoiceAction,
   VoiceDelegateResult,
+  VoiceGrantResult,
   VoicePrepareResult,
   VoiceStartResult,
   VoiceStopResult
@@ -296,6 +298,13 @@ export interface InvitationSummary {
 
 /** One host this computer is paired with. */
 export interface HostRow {
+  /**
+   * What this application names the host by when it is asked to use it. It is made by native code,
+   * and says nothing of the host's identity.
+   */
+  readonly reference: string
+  /** True when this application's commands go to this host now. */
+  readonly in_use: boolean
   readonly name: string
   readonly owner: boolean
   /** What this computer may do there, in words. */
@@ -396,6 +405,28 @@ export interface VoiceStartRequest {
    * version that is no longer current, and the answer carries the rate as it is now.
    */
   readonly expectedRateVersion: string
+}
+
+/** One action a voice grant permits by default, as the person is shown it before allowing it. */
+export interface VoiceScopeAction {
+  readonly action: VoiceAction
+  /** The sentence the protocol states the action in. */
+  readonly sentence: string
+  /** True when using it still takes a confirmation on an unlocked screen every time. */
+  readonly needs_unlocked_screen: boolean
+}
+
+/** What allowing voice on this device permits when the person chooses nothing further. */
+export interface VoiceScope {
+  readonly actions: readonly VoiceScopeAction[]
+}
+
+/** What the page asks when the person allows voice for some of a host's sessions. */
+export interface VoiceAllowRequest {
+  /** The sessions a call may reach. A call is bound to sessions the grant names. */
+  readonly sessionIds: readonly string[]
+  /** The actions to permit, or null for the default scope. */
+  readonly actions: readonly VoiceAction[] | null
 }
 
 /** Which of the two local silences a control acts on. */
@@ -751,6 +782,19 @@ export interface HostPort {
   voicePrepare(params: unknown): Promise<VoicePrepareResult>
 
   /**
+   * What allowing voice permits by default, from the protocol's own table, so the question the
+   * person is asked is worded as the host states it.
+   */
+  voiceScope(): Promise<VoiceScope>
+
+  /**
+   * Allows voice on this device for some of the host's sessions. Native code names the device; the
+   * answer states every action the grant permits and every one the device's own grant could not
+   * carry.
+   */
+  voiceAllow(request: VoiceAllowRequest, subject: SessionSubject): Promise<Settled<VoiceGrantResult>>
+
+  /**
    * Starts a call.
    *
    * The offer is the native layer's, which is why the page passes a request rather than protocol
@@ -779,6 +823,13 @@ export interface HostPort {
 
   /** What the native call is doing right now. */
   voiceCallState(): Promise<VoiceCallState>
+
+  /**
+   * Takes a host this computer is paired with, named by its pairing-screen reference, as the one
+   * this application's commands go to. Resolves once the first attempt to reach it has ended, with
+   * where the connection stands.
+   */
+  hostsUse(reference: string): Promise<ConnectionState>
 
   /** Everything the pairing screen shows. */
   pairingView(): Promise<PairingView>
