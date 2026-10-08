@@ -5041,6 +5041,21 @@ async fn an_identity_that_is_there_and_not_trusted_still_stops_the_update() {
 /* Going back                                                                                    */
 /* -------------------------------------------------------------------------------------------- */
 
+/// The stores of a release that reads transfer journals from version 2, and every other store as the
+/// code writes it.
+fn reading_transfers_from_2() -> Vec<ReleaseStore> {
+    release_stores()
+        .into_iter()
+        .map(|store| match store.store.as_str() {
+            "transfers" => ReleaseStore {
+                migrates_from: 2,
+                ..store
+            },
+            _ => store,
+        })
+        .collect()
+}
+
 /// The stores a release assembled here declares it reads, with the registry's versions given.
 fn reading_the_registry_at(migrates_from: u32, version: u32) -> Vec<ReleaseStore> {
     release_stores()
@@ -5497,16 +5512,7 @@ async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
 
     // The release reads transfer journals from version 2, and the record of enrolments as a JSON
     // object that states its version.
-    let stores: Vec<ReleaseStore> = release_stores()
-        .into_iter()
-        .map(|store| match store.store.as_str() {
-            "transfers" => ReleaseStore {
-                migrates_from: 2,
-                ..store
-            },
-            _ => store,
-        })
-        .collect();
+    let stores: Vec<ReleaseStore> = reading_transfers_from_2();
     assert!(
         stores.iter().any(|store| store.store == "environments"),
         "the release lists the record of enrolments"
@@ -6209,16 +6215,7 @@ async fn a_rescue_the_older_release_cannot_read_the_stores_for_is_refused_and_th
     let mut host = Host::bare();
     let log = host.tree.root().join("starts.log");
     // The older release reads transfer journals from version 2.
-    let stores = release_stores()
-        .into_iter()
-        .map(|store| match store.store.as_str() {
-            "transfers" => ReleaseStore {
-                migrates_from: 2,
-                ..store
-            },
-            _ => store,
-        })
-        .collect();
+    let stores = reading_transfers_from_2();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(stores);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
     host.install(&one);
@@ -6525,16 +6522,7 @@ async fn a_rollback_goes_on_past_a_rescue_whose_own_daemon_did_not_start() {
 async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
     let mut host = Host::bare();
     let log = host.tree.root().join("starts.log");
-    let stores = release_stores()
-        .into_iter()
-        .map(|store| match store.store.as_str() {
-            "transfers" => ReleaseStore {
-                migrates_from: 2,
-                ..store
-            },
-            _ => store,
-        })
-        .collect();
+    let stores = reading_transfers_from_2();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(stores);
     let controller_state = host.tree.paths().state_root().to_path_buf();
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
@@ -6630,16 +6618,7 @@ async fn a_rescue_whose_undo_cannot_start_the_daemon_again_is_finished_by_the_ne
     let mut host = Host::bare();
     let log = host.tree.root().join("starts.log");
     let held = host.tree.root().join("held");
-    let stores = release_stores()
-        .into_iter()
-        .map(|store| match store.store.as_str() {
-            "transfers" => ReleaseStore {
-                migrates_from: 2,
-                ..store
-            },
-            _ => store,
-        })
-        .collect();
+    let stores = reading_transfers_from_2();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(stores);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
         .whose_daemon_cannot_start_while(&held, &log);
@@ -6694,8 +6673,8 @@ async fn a_rescue_whose_undo_cannot_start_the_daemon_again_is_finished_by_the_ne
         "{record}"
     );
 
-    // Put right, the next rescue starts what both owe from the older release.
-    std::fs::remove_file(&held).expect("the daemon is let go");
+    // The stores put right, the next rescue starts what both owe from the older release. The daemon
+    // of the release that failed is still held: the rescue has no use for it.
     set(kr_transfer::store::SCHEMA_VERSION);
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(
@@ -6953,16 +6932,7 @@ async fn a_rescue_keeps_the_root_the_failed_update_recorded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_the_stores_refuse_leaves_the_failed_update_owing_the_daemon_as_it_now_is() {
     let host = Host::bare();
-    let stores = release_stores()
-        .into_iter()
-        .map(|store| match store.store.as_str() {
-            "transfers" => ReleaseStore {
-                migrates_from: 2,
-                ..store
-            },
-            _ => store,
-        })
-        .collect();
+    let stores = reading_transfers_from_2();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(stores);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);

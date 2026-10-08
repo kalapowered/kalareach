@@ -72,10 +72,8 @@ mod teardown;
 mod user_manager;
 
 #[cfg(target_os = "linux")]
-use user_manager::UserManager;
-use user_manager::{
-    REQUIRE_SERVICE_MANAGER, STREAMS_DEADLINE, TEARDOWN_BOUND, bounded, read_aside, spawning,
-};
+use user_manager::{REQUIRE_SERVICE_MANAGER, UserManager};
+use user_manager::{STREAMS_DEADLINE, TEARDOWN_BOUND, bounded, read_aside, spawning};
 
 /// How long a command, or anything a test waits for, is given. It fails when the thing never
 /// happens.
@@ -1908,7 +1906,7 @@ impl Drop for ServiceHost {
 
 impl ServiceHost {
     /// A tree with a user service manager, or none where this host has no manager to test with,
-    /// having said why; a host that sets [`REQUIRE_SERVICE_MANAGER`] fails instead.
+    /// having said why; a host that sets `KR_REQUIRE_SERVICE_MANAGER` fails instead.
     fn create() -> Option<Self> {
         let tree = teardown::Tree::create();
         let home = tree.root().join("home");

@@ -39,13 +39,13 @@ pub fn not_tested_here(why: &str) {
 #[cfg(target_os = "linux")]
 const COMES_UP: Duration = Duration::from_secs(120);
 
-/// Starts every process these suites start, one at a time.
+/// Starts one process at a time.
 ///
 /// A pipe is made and only then marked to close when a program is started, and on macOS those are
 /// two steps. A process another test's thread starts in between inherits both ends, and a `kr`
 /// that inherits them hands them on to the daemon it starts, which outlives it: the pipe then
 /// never reaches its end, and the command that made it looks as if it had left something holding
-/// its output. Starting one process at a time closes that window for every pipe these suites make.
+/// its output. Starting one process at a time closes that window for every pipe made through it.
 pub fn spawning<T>(start: impl FnOnce() -> T) -> T {
     static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one_at_a_time = SPAWNING
