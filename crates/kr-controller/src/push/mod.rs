@@ -679,6 +679,10 @@ impl DeliveryModule {
             external::check_destination(external).map_err(ControllerError::InvalidArgument)?;
         }
         self.with(|producer| {
+            // A credential kept for what this replaces goes after the write, not before: a write
+            // the admission then refuses leaves the old destination with the credential it sends
+            // with, and one that stops between the two leaves a credential nothing reads.
+            let mut forget_old_secret = false;
             match &mut record.destination {
                 Destination::External(external) => match external.kind.credential() {
                     Some(kind) => {
@@ -702,12 +706,12 @@ impl DeliveryModule {
                     }
                     None => {
                         external.credential = None;
-                        self.secrets.remove(&record.id)?;
+                        forget_old_secret = true;
                     }
                 },
                 // A paired device replaces whatever was configured under its identifier, and a
                 // credential kept for what it replaced goes with it.
-                Destination::Push(_) => self.secrets.remove(&record.id)?,
+                Destination::Push(_) => forget_old_secret = true,
             }
             let mut refused = None;
             let wrote = producer
@@ -724,10 +728,19 @@ impl DeliveryModule {
                     owing,
                 )
                 .map_err(unavailable)?;
-            match refused {
-                Some(refusal) => Err(refusal),
-                None => Ok(wrote),
+            if let Some(refusal) = refused {
+                return Err(refusal);
             }
+            if wrote
+                && forget_old_secret
+                && let Err(error) = self.secrets.remove(&record.id)
+            {
+                eprintln!(
+                    "kr-controller: a credential kept for a destination it replaced could not be \
+                     removed: {error}"
+                );
+            }
+            Ok(wrote)
         })
     }
 
@@ -1357,17 +1370,35 @@ impl DeliveryModule {
         {
             match credentials.renew(&held) {
                 Ok(renewed) => renewed,
-                // A renewal ahead of need that did not happen leaves the bearer working until its
-                // expiry: the gateway has not refused it, and holding the notification back would
-                // lose it for a credential the host will get to renewing again. A bearer the
-                // gateway refused, and one past its expiry, are another matter.
-                Err(_)
-                    if delivery.next == NextAction::Send && now_ms < held.expires_at_ms.get() =>
-                {
-                    held
-                }
                 Err(error) => {
-                    return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
+                    // A renewal ahead of need that did not happen leaves the bearer working until
+                    // its expiry: the gateway has not refused it, and holding the notification
+                    // back would lose it for a credential the host will get to renewing again.
+                    // What is presented is what is held now, read again, and only while it has
+                    // not expired by the clock now: the renewal waited on the gateway, and the
+                    // authorisation can have been let go of or given a new bearer meanwhile. A
+                    // bearer the gateway refused, and one past its expiry, are another matter.
+                    if delivery.next != NextAction::Send {
+                        return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
+                    }
+                    match credentials.current(push.sender_record_id) {
+                        None => {
+                            return self.settle(
+                                delivery,
+                                DeliveryState::Revoked,
+                                "this host holds no delivery credential for that authorisation",
+                                clock.now_ms().max(now_ms),
+                            );
+                        }
+                        Some(current)
+                            if clock.now_ms().max(now_ms) < current.expires_at_ms.get() =>
+                        {
+                            current
+                        }
+                        Some(_) => {
+                            return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
+                        }
+                    }
                 }
             }
         } else {
