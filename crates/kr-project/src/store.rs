@@ -2788,8 +2788,9 @@ fn rebuild_retained_items(transaction: &Transaction<'_>) -> Result<()> {
 /// Adds the columns a store written by an earlier build does not have.
 ///
 /// Every one of them is nullable and means "not recorded", which is what an older row holds
-/// anyway: a staging directory an earlier build created has no recorded identity, and the cleanup
-/// leaves such a name alone rather than deleting whatever now holds it.
+/// anyway, or has a default that says the same: a staging directory an earlier build created has
+/// no recorded identity, and the cleanup leaves such a name alone rather than deleting whatever
+/// now holds it.
 ///
 /// Each entry serves a store written by a build whose shape of that table lacked the column. Remove
 /// an entry once no supported upgrade starts from such a store, and the function with the last one.

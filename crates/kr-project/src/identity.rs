@@ -310,8 +310,8 @@ impl OpenedRepository {
     ///
     /// The directory is opened and decided first, and Git starts in that object: a directory that
     /// took the place of the recorded tree, or a filesystem mounted over it, is refused before Git
-    /// is asked anything. For a repository the owner registered through a directory below its top
-    /// level the directory at the path may lie inside the recorded tree
+    /// is asked anything. For a repository the owner registered whose record does not say that its
+    /// path is the top level the directory at the path may lie inside the recorded tree
     /// ([`GitDirectory::Named`], `require_within`); for a tree this host made
     /// ([`GitDirectory::AtTree`], [`GitDirectory::InsideTree`]) and for one the owner registered
     /// at its top level it is the tree itself, and for a
@@ -336,9 +336,9 @@ impl OpenedRepository {
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] when the directory is not the recorded tree (nor
-    /// inside it, for a repository the owner registered below its top level), when the top level Git
-    /// reports is not the recorded tree, when the Git directory is not the recorded one, or what
-    /// [`Self::open`] returns.
+    /// inside it, for a repository whose record does not say that its path is the top level), when
+    /// the top level Git reports is not the recorded tree, when the Git directory is not the
+    /// recorded one, or what [`Self::open`] returns.
     pub fn open_recorded_tree(
         profile: &RestrictedProfile,
         environment_id: EnvironmentId,

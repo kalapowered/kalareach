@@ -2780,7 +2780,7 @@ it was; a failure after it has begun changing the journal goes back with its tra
 After a migration or an import, the code that reads the worker journal reads one current schema, and
 no branch of it reads two. Not every store works that way. The project, delivery, transfer and
 grants stores each bring a store that an earlier build wrote forward when they open it, and the
-project store also adds any nullable column that a store at its current version lacks. The contact
+project store also adds any column that a store at its current version lacks. The contact
 skill's installation records are still found under the name an earlier build gave a user record. A
 comment at each of these paths says what it serves and when it can be removed.
 
