@@ -277,12 +277,15 @@ pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Re
 /// does, from a private copy of the registry that is brought to the schema this release reads, and
 /// returns what holds the rollback.
 ///
-/// The registry itself is read and not changed, not even to take in a log: a rollback goes to a
-/// release older than the one now current, which reads a registry no newer than its own schema,
-/// so bringing the registry forward to this release's would put it out of that release's reach. The
-/// copy is what the registry would be if a daemon of this release had started in the environment, and
-/// holds the same records, so a worker the registry names that no daemon of this release has met is
-/// classed all the same. The copy goes when this returns.
+/// The registry itself is not migrated and no record of it changes: a rollback goes to a release
+/// older than the one now current, which reads a registry no newer than its own schema, so bringing
+/// the registry forward to this release's would put it out of that release's reach. (The check of
+/// the stores that runs before this takes into the file what a daemon that ended by a signal left in
+/// its log, as an update's does.) The copy is what the registry would be if a daemon of this release
+/// had started in the environment, and holds the same records, so a worker the registry names that no
+/// daemon of this release has met is classed all the same. The copy is made in the temporary
+/// directory and goes when this returns; a registry too large for that directory refuses the
+/// rollback, naming the environment.
 ///
 /// # Errors
 ///

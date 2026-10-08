@@ -275,6 +275,31 @@ pub async fn install_lock(
     }
 }
 
+/// The refusal `error`, a wait for the store's install lock that ran out, with the process that holds
+/// each of `environments` added where one does: a daemon that hangs in its start holds the install
+/// lock and its environment, and is the person's to stop.
+pub fn naming_holders(error: CliError, environments: &[Environment]) -> CliError {
+    let CliError::UpdateDeferred(said) = error else {
+        return error;
+    };
+    let mut said = said;
+    for environment in environments {
+        if let Some(pid) = SingletonLock::holder(&environment.paths.singleton_lock())
+            .ok()
+            .flatten()
+        {
+            said = shown!(
+                "{}; the control daemon of environment {} is process {}, and `kill {}` stops it",
+                said,
+                environment.environment_id,
+                pid,
+                pid
+            );
+        }
+    }
+    CliError::UpdateDeferred(said)
+}
+
 /// Whether a daemon holds an environment.
 ///
 /// Asked under the store's install lock: a starting daemon holds that lock, shared, from its look
