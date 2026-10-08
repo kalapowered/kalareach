@@ -476,20 +476,22 @@ impl Shared {
                 let wait = self.absorb(&report, backoff);
                 // A refusal only a person can mend, met by a host whose token has stopped being
                 // usable since the check, is the token to wait for and not a five-minute wait.
-                if !fenced
-                    && report.hold.is_some_and(|hold| hold.needs_a_person())
+                if report.hold.is_some_and(|hold| hold.needs_a_person())
                     && !self.token_usable().await
                 {
                     // What was refused was the host's own token and not a thing at the service, so
-                    // the doctor says the token and not a refusal.
+                    // the doctor says the token and not a refusal. Under a fence that is so as well,
+                    // and the fence keeps the wait it asked for.
                     let mut observed = self.observed();
                     observed.token_blocked = true;
                     observed.pass_hold = None;
                     drop(observed);
-                    return Wait::Timed {
-                        duration: TOKEN_CHECK,
-                        wakeable: true,
-                    };
+                    if !fenced {
+                        return Wait::Timed {
+                            duration: TOKEN_CHECK,
+                            wakeable: true,
+                        };
+                    }
                 }
                 wait
             }
@@ -797,8 +799,9 @@ impl BackupRuntime {
                 observed.status_refusal
             } else {
                 match (observed.pass_hold, observed.status_refusal) {
-                    // What only a person can mend outranks what passes by itself.
-                    (Some(pass), Some(refusal)) => Some(pass.and(refusal)),
+                    // What only a person can mend outranks what passes by itself, and between two
+                    // that need one the question asked last decides.
+                    (Some(pass), Some(refusal)) => Some(refusal.and(pass)),
                     (pass, refusal) => pass.or(refusal),
                 }
             };
