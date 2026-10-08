@@ -12,6 +12,9 @@
 //! | KR-REQ-13.08 | `a_host_chosen_before_is_reached_again_when_the_application_starts` |
 //! | KR-REQ-13.08 | `choosing_between_two_paired_hosts_goes_to_the_one_chosen_last` |
 //! | KR-REQ-13.08 | `a_choice_of_host_that_cannot_be_kept_is_not_made` |
+//! | KR-REQ-13.08 | `a_phone_its_host_revoked_can_forget_that_host` |
+//! | KR-REQ-13.08 | `forgetting_the_host_in_use_ends_the_connection_to_it` |
+//! | KR-REQ-13.08 | `forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_other` |
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
@@ -27,7 +30,9 @@ use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretStore};
 use kr_protocol::invitation::{InviteEntry, InviteGrantKind};
+use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
@@ -576,6 +581,181 @@ async fn a_choice_of_host_that_cannot_be_kept_is_not_made() {
         .call("hosts_use", json!({ "reference": other }))
         .expect("the choice is kept now");
     assert_eq!(used["environment_id"], second.environment_id.to_string());
+    first.stop().await;
+    second.stop().await;
+}
+
+/// The identity `host` gave the one phone paired with it.
+fn the_phone_of(host: &Host) -> kr_protocol::ids::DeviceId {
+    let owner = host.owner.as_ref().map(|owner| owner.device_id);
+    host.controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| record.is_paired() && owner != Some(record.device_id))
+        .expect("the paired phone")
+        .device_id
+}
+
+/// KR-REQ-13.08: a phone that its host revoked can forget that host. Forgetting is the phone's own
+/// action and reaches nothing: the host is no longer listed, no longer the one in use, no longer
+/// tried, and not taken up again when the application starts. The commands that named it are
+/// refused as naming a host this computer is not paired with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phone_its_host_revoked_can_forget_that_host() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    let reference = the_host(companion);
+
+    let mut client = host.client().await;
+    let _: RevocationResult = calls::mutate(
+        host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &DeviceRevokeParams {
+            device_id: the_phone_of(&host),
+        },
+    )
+    .await
+    .expect("the host revokes the phone");
+    let lost = connection(companion, false).await;
+    assert!(
+        lost["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "a phone its host turned away says it is not connected, and why: {lost}"
+    );
+    // The phone keeps its record of the host: nothing told it more than that the host does not
+    // answer it.
+    assert_eq!(
+        companion
+            .call("pairing_view", json!({}))
+            .expect("the pairing screen")["hosts"][0]["reference"],
+        reference.as_str()
+    );
+
+    let forgotten = companion
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the phone forgets the host that revoked it");
+    assert_eq!(forgotten["connected"], false, "{forgotten}");
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    assert_eq!(view["hosts"], json!([]), "no host is listed: {view}");
+    for command in ["hosts_use", "hosts_forget"] {
+        let refused = companion
+            .call(command, json!({ "reference": reference }))
+            .expect_err("this computer is no longer paired with that host");
+        assert_eq!(refused["code"], "INVALID_ARGUMENT", "{command}: {refused}");
+    }
+    assert!(
+        companion.device().host_in_use().is_none(),
+        "no host is the one in use"
+    );
+
+    // The application starts again over the same records: the host is not taken up.
+    let restarted = Companion::start(
+        phone.data.path(),
+        support::parts(Arc::clone(&phone.secrets), Arc::clone(&phone.room)),
+        Arc::new(NoOwner),
+        StubPaste::holding("", false),
+    );
+    companion_tauri::hosts::resume(restarted.app.handle());
+    assert_eq!(
+        restarted
+            .call("pairing_view", json!({}))
+            .expect("the pairing screen")["hosts"],
+        json!([])
+    );
+    assert_eq!(
+        restarted
+            .call("connection_state", json!({}))
+            .expect("the connection's state")["connected"],
+        false
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-13.08: forgetting the host in use, one that still answers, ends the connection to it at
+/// once: the answer says there is none, no command goes down it, and no host is in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_the_host_in_use_ends_the_connection_to_it() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion
+        .call("session_list", every_session())
+        .expect("the host answers before it is forgotten");
+
+    let forgotten = companion
+        .call("hosts_forget", json!({ "reference": the_host(companion) }))
+        .expect("the host in use is forgotten");
+    assert_eq!(forgotten["connected"], false, "{forgotten}");
+    assert!(
+        forgotten["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "the connection says why there is none: {forgotten}"
+    );
+    let refused = companion
+        .call("session_list", every_session())
+        .expect_err("no command goes to a host that was forgotten");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    assert!(companion.device().host_in_use().is_none());
+    host.stop().await;
+}
+
+/// KR-REQ-13.08: forgetting a host that is not the one in use changes nothing about the one that
+/// is: the commands still go there, over the connection they had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_other() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = phone_paired_with(&first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let rows = view["hosts"].as_array().expect("hosts");
+    let reference_of = |in_use: bool| {
+        rows.iter()
+            .find(|row| row["in_use"] == in_use)
+            .and_then(|row| row["reference"].as_str())
+            .expect("a host")
+            .to_owned()
+    };
+    let (in_use, other) = (reference_of(true), reference_of(false));
+
+    let forgotten = companion
+        .call("hosts_forget", json!({ "reference": other }))
+        .expect("the host not in use is forgotten");
+    assert_eq!(forgotten["connected"], true, "{forgotten}");
+    assert_eq!(
+        forgotten["environment_id"],
+        first.environment_id.to_string()
+    );
+    let after = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let remaining: Vec<&str> = after["hosts"]
+        .as_array()
+        .expect("hosts")
+        .iter()
+        .map(|row| row["reference"].as_str().expect("a reference"))
+        .collect();
+    assert_eq!(remaining, [in_use.as_str()], "{after}");
+    companion
+        .call("session_list", every_session())
+        .expect("the host in use still answers");
     first.stop().await;
     second.stop().await;
 }
