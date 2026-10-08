@@ -756,6 +756,13 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-ipc --test windows
 
+      # Stopping a process that was recorded by its identifier and start, and no other: through an
+      # open handle, with the creation time compared on that handle, so a number that has passed to
+      # another process is left alone.
+      - name: Test stopping a recorded process by its identity
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-ipc --test stop
+
       # The crate's own tests, among them the environment identity's list and the profile it is
       # kept in, and the two frame-writer tests that used to be skipped here: on this platform a
       # named pipe has no writability of its own the writer can hold while the reader holds the other
@@ -991,6 +998,13 @@ jobs:
       - name: Test the persistence suite
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test persistence
+
+      # What the archive does for a crashed session on this platform: it stops the processes the
+      # worker recorded and no other, acts on no record from another boot, and names a process it
+      # could not stop. The cases that need a Unix shell are not compiled here.
+      - name: Test the archive's cleanup of a crashed session
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-controller --test archive
 
       # The suites that drive a session through the worker's pseudo-console, and the control
       # daemon's project, shell, privacy and description methods over a worker, one to a step. A case
