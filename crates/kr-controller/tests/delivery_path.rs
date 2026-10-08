@@ -1163,6 +1163,21 @@ impl Environment {
         }
     }
 
+    /// Pairs a device whose grant carries no history bound, as `kr pair --view` gives one, and
+    /// connects it.
+    async fn phone_with_no_history_bound(&self) -> Phone {
+        let device = Device::with_keys(DeviceKeys::generate().expect("device keys")).await;
+        let grant = proposal(&[ActionRight::SessionView]);
+        assert!(grant.history.lower_bound_ms.0.is_none());
+        let record = pair_with(&self.host, &device, &self.owner, grant).await;
+        let connection = RawDevice::connect(&self.host, &device, &record).await;
+        Phone {
+            device,
+            record,
+            connection,
+        }
+    }
+
     /// Pairs a device that holds `keys`, and connects it.
     async fn phone_with(&self, keys: DeviceKeys) -> Phone {
         let device = Device::with_keys(keys).await;
@@ -1589,9 +1604,9 @@ async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_i
 /// attention store reads the broker's transitions and raises a pending approval, and the daemon
 /// delivers it through the gateway under the device's credential as the generic approval alert, with
 /// nothing of the request in the clear. The control is a request nothing gives a meaning (the
-/// connector's package is not bound to its application): the daemon has read and decided it before
-/// the interpreted one is relayed, and delivered nothing for it. Exactly one notification is written
-/// for the approval, though the broker records several transitions of it.
+/// connector's package is not bound to its application): it is relayed first and recorded by the
+/// broker, and raises nothing. Exactly one notification is written for the approval, though the
+/// broker records several transitions of it and a transition of the other request before them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_approval_a_worker_relays_through_its_channel_is_delivered_as_an_approval_alert() {
     let environment = Environment::start().await;
@@ -1606,16 +1621,13 @@ async fn an_approval_a_worker_relays_through_its_channel_is_delivered_as_an_appr
         .await
         .expect("the credential is registered");
 
-    // The control: recorded by the broker, read by the store, and no approval to deliver.
+    // The control: recorded by the broker, and no approval to deliver.
     let mut unbound = environment._worker.open_channel(3, false);
     unbound.channel.relay("fghij").await;
     environment
         ._worker
         .until_relayed(&unbound, "fghij", false)
         .await;
-    until_the_approvals_are_settled(&environment).await;
-    assert_eq!(environment.deliveries(), 0, "no notification was written");
-    assert!(environment.gateway.delivered().is_empty());
 
     let mut bound = environment._worker.open_channel(2, true);
     bound.channel.relay("abcde").await;
@@ -1647,6 +1659,11 @@ async fn an_approval_a_worker_relays_through_its_channel_is_delivered_as_an_appr
             .len(),
         1,
         "one notification for the approval, whatever the broker recorded of it"
+    );
+    assert_eq!(
+        environment.deliveries(),
+        1,
+        "and none for the request nothing interprets"
     );
     assert_eq!(environment.gateway.delivered().len(), 1);
 
@@ -4056,8 +4073,7 @@ async fn a_destination_is_refused_unless_the_owner_may_make_it_under_a_grant_tha
 /// KR-REQ-18.08, KR-REQ-25.23: what an external message names is checked against the grant of the
 /// rule that sends it. Two webhooks under two paired devices' grants: one reaches every session,
 /// and its message names the session a worker's question was asked in; the other reaches one other
-/// session, and is told nothing of this one, neither a message nor a record of one. The session
-/// the second grant reaches is asked about too, and its message names that session alone.
+/// session, and is told nothing of this one, neither a message nor a record of one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_external_message_names_only_the_sessions_its_grant_reaches() {
     const WORDS: &str = "Deploy the release to production?";
@@ -4096,11 +4112,8 @@ async fn an_external_message_names_only_the_sessions_its_grant_reaches() {
     assert_eq!(posted[0].url, "https://hooks.example.test/in/everywhere");
     let text = posted[0].text();
     assert!(
-        text.contains(&format!(
-            "A question is waiting in session {}.",
-            environment.worker_session
-        )),
-        "{text}"
+        text.contains(&environment.worker_session.to_string()),
+        "the message names the session the grant reaches: {text}"
     );
     assert!(
         !text.contains(&other_session.to_string()),
@@ -4109,6 +4122,40 @@ async fn an_external_message_names_only_the_sessions_its_grant_reaches() {
     assert!(
         environment.deliveries_to("elsewhere").is_empty(),
         "nothing was written for the webhook whose grant does not reach the session"
+    );
+}
+
+/// KR-REQ-25.23: a grant with no history bound reaches what was first seen at or after its own
+/// start, as the audience decides, and the message composed for it says the same: it names the
+/// session and does not say that anything was left out. The grant is the one `kr pair --view`
+/// gives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_external_message_under_a_grant_with_no_history_bound_leaves_nothing_out() {
+    let environment = Environment::start().await;
+    let phone = environment.phone_with_no_history_bound().await;
+    environment
+        .configure(&webhook(
+            "ops",
+            "https://hooks.example.test/in/ops",
+            None,
+            phone.record.grant.grant_id,
+        ))
+        .await
+        .expect("the owner creates a webhook");
+
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the webhook being posted to", || {
+        !environment.gateway.posted().is_empty()
+    })
+    .await;
+    let text = environment.gateway.posted().remove(0).text();
+    assert!(
+        text.contains(&environment.worker_session.to_string()),
+        "the message names the session the grant reaches: {text}"
+    );
+    assert!(
+        !text.contains("left out"),
+        "and nothing the grant reaches is said to be left out: {text}"
     );
 }
 
@@ -4187,11 +4234,8 @@ async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_ow
         let text = posted.text();
         assert!(text.contains("waiting for an answer"), "{text}");
         assert!(
-            text.contains(&format!(
-                "A question is waiting in session {}.",
-                environment.worker_session
-            )),
-            "{text}"
+            text.contains(&environment.worker_session.to_string()),
+            "the message names the session: {text}"
         );
         assert!(text.contains("can read"), "{text}");
         for private in [SLACK, DISCORD, TELEGRAM_TOKEN, "Deploy the release?"] {
