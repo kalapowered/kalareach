@@ -30,6 +30,15 @@ pub enum ServiceError {
         /// The refusal, or what was wrong with the answer.
         detail: String,
     },
+    /// The host is of a build that does not do what was asked.
+    ///
+    /// Nothing was sent. A host that has not announced a request ends the connection on receiving
+    /// it, and every binding on that connection with it, so the caller is told here instead.
+    #[error("the plugin runtime does not support this: {detail}")]
+    Unsupported {
+        /// What the host does not do, and what a person can do about it.
+        detail: String,
+    },
     /// A call did not answer inside the deadline the caller set.
     ///
     /// This is the caller's own deadline, not the component's. It exists so that nothing on the

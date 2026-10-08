@@ -47,7 +47,8 @@ use crate::launcher::{self, LaunchError};
 use crate::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream, Offered};
 use crate::protocol::{
     BindingRegistration, CallValue, ComponentSource, Frame, HostDescriptor, HostHealth, Notice,
-    Request, RequestBody, ResponseBody,
+    PrepareActionCall, Request, RequestBody, ResponseBody, WireNamedArgument, WirePlan, WireToken,
+    feature,
 };
 use crate::vocabulary::{
     Admission, BindingFacts, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, ScopedSourceEvent,
@@ -277,13 +278,18 @@ impl Drop for Waiting<'_> {
 pub struct PluginClient {
     writer: Writer,
     pending: Arc<Pending>,
-    notices: NoticeStream,
+    /// Behind a lock so that a caller reading notices and a caller making a call hold the client
+    /// by shared reference together: one task waits for news while others ask the host to prepare
+    /// an action.
+    notices: tokio::sync::Mutex<NoticeStream>,
     /// The other end of the notice queue, so a binding that goes takes its records with it.
     sink: NoticeSink,
     offered: tokio::sync::mpsc::Sender<Request>,
     offered_bytes: Arc<AtomicU64>,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
+    /// What the host announced it answers beyond the first release's requests.
+    features: Vec<String>,
     reader_task: tokio::task::JoinHandle<()>,
     offer_task: tokio::task::JoinHandle<()>,
 }
@@ -361,15 +367,16 @@ impl PluginClient {
             offered_bytes: Arc::clone(&offered_bytes),
         });
 
-        let client = Self {
+        let mut client = Self {
             writer,
             pending,
-            notices,
+            notices: tokio::sync::Mutex::new(notices),
             sink: sink_for_client,
             offered,
             offered_bytes,
             next_request: AtomicU64::new(1),
             descriptor,
+            features: Vec::new(),
             reader_task,
             offer_task,
         };
@@ -379,7 +386,10 @@ impl PluginClient {
                 protocol: crate::protocol::PROTOCOL.to_owned(),
             })
             .await?;
-        let ResponseBody::Hello { protocol, .. } = hello else {
+        let ResponseBody::Hello {
+            protocol, features, ..
+        } = hello
+        else {
             return Err(protocol_error(&hello));
         };
         if protocol != crate::protocol::PROTOCOL {
@@ -387,6 +397,7 @@ impl PluginClient {
                 detail: format!("the host speaks {protocol}"),
             });
         }
+        client.features = features;
 
         // The challenge. Until it is answered, the descriptor is a file and the endpoint is a path.
         let nonce = launcher::fresh_challenge().map_err(unavailable)?;
@@ -655,13 +666,56 @@ impl PluginClient {
     }
 
     /// Takes the next notice a binding produced, if one is waiting.
-    pub fn try_notice(&mut self) -> Option<Notice> {
-        self.notices.try_recv()
+    pub fn try_notice(&self) -> Option<Notice> {
+        self.notices.try_lock().ok()?.try_recv()
     }
 
     /// Waits for the next notice a binding produced.
-    pub async fn notice(&mut self) -> Option<Notice> {
-        self.notices.recv().await
+    pub async fn notice(&self) -> Option<Notice> {
+        self.notices.lock().await.recv().await
+    }
+
+    /// Asks a binding's component to turn an invoked control into a proposed effect.
+    ///
+    /// The component returns a plan and sends nothing. What it returns is a proposal: the caller
+    /// compares it with the invocation and the declaration before anything happens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Unsupported`] when the host did not announce the request, the host's
+    /// refusal or [`ServiceError::Disabled`], and [`ServiceError::Unavailable`] when the host is
+    /// gone.
+    pub async fn prepare_action(
+        &self,
+        binding_id: BindingId,
+        token: WireToken,
+        arguments: Vec<WireNamedArgument>,
+        deadline: core::time::Duration,
+    ) -> ServiceResult<Called> {
+        if !self.supports(feature::PREPARE_ACTION) {
+            return Err(ServiceError::Unsupported {
+                detail: "the plugin runtime is an older build that cannot prepare an action; it \
+                         ends with the login session or a restart of the machine, and the next \
+                         one the daemon starts can"
+                    .to_owned(),
+            });
+        }
+        self.call(
+            RequestBody::PrepareAction(Box::new(PrepareActionCall {
+                binding_id: binding_id.get(),
+                token,
+                arguments,
+                deadline_ms: millis(deadline),
+            })),
+            deadline,
+        )
+        .await
+    }
+
+    /// Returns true when the host announced that it answers a request.
+    #[must_use]
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|announced| announced == feature)
     }
 
     async fn call(
@@ -680,14 +734,19 @@ impl PluginClient {
                 value,
                 fault,
                 document,
-            } => Ok(Called {
-                state: match value {
-                    Some(CallValue::State(state)) => Some(state),
-                    Some(CallValue::Document) | None => None,
-                },
-                fault,
-                document,
-            }),
+            } => {
+                let (state, plan) = match value {
+                    Some(CallValue::State(state)) => (Some(state), None),
+                    Some(CallValue::Plan(plan)) => (None, Some(*plan)),
+                    Some(CallValue::Document) | None => (None, None),
+                };
+                Ok(Called {
+                    state,
+                    plan,
+                    fault,
+                    document,
+                })
+            }
             ResponseBody::Refused {
                 detail, disabled, ..
             } => {
@@ -834,6 +893,8 @@ pub struct Registration {
 pub struct Called {
     /// A component's own resumable state, where the call returns one.
     pub state: Option<Vec<u8>>,
+    /// The effect the component proposed, where the call is `prepare-action` and it answered.
+    pub plan: Option<WirePlan>,
     /// The fault the component declared, where it declared one.
     pub fault: Option<String>,
     /// Which of this binding's documents the call drew, where it drew one.
@@ -1014,12 +1075,14 @@ mod tests {
     fn a_call_that_declared_a_fault_did_not_answer() {
         let answered = Called {
             state: None,
+            plan: None,
             fault: None,
             document: Some(1),
         };
         assert!(answered.answered());
         let refused = Called {
             state: None,
+            plan: None,
             fault: Some("refused: not mine".to_owned()),
             document: None,
         };

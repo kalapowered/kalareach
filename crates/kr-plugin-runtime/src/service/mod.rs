@@ -11,5 +11,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`host`] | Serving workers: the accept loop, peer credentials and the request handling |
+//! | `wire` | The conversions between what a call carries and what a component reads |
 
 pub mod host;
+mod wire;

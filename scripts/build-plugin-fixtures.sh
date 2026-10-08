@@ -45,6 +45,7 @@ sandboxed=(
     infinite-loop
     memory-hog
     oversized-output
+    preparing
     slow-compile
     slow-observe
     well-behaved

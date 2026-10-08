@@ -35,8 +35,8 @@ use kr_protocol::scalars::Uuid;
 use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult};
 use kr_plugin_service::notices::{NoticeSink, NoticeStream, Offered, node_bytes};
 use kr_plugin_service::protocol::{
-    BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, Notice, Request,
-    RequestBody, ResponseBody, WireNode,
+    BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, Notice, PrepareActionCall,
+    Request, RequestBody, ResponseBody, WireNode, feature,
 };
 use kr_plugin_service::vocabulary::{
     Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, event_of, facts_of,
@@ -49,6 +49,7 @@ use crate::runtime::binding::{
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::CompileOrigin;
 use crate::runtime::error::RuntimeError;
+use crate::service::wire;
 
 /// How long a registration may keep a worker waiting.
 ///
@@ -446,6 +447,7 @@ impl PluginHost {
                 Ok(ResponseBody::Hello {
                     protocol: kr_plugin_service::protocol::PROTOCOL.to_owned(),
                     descriptor: Box::new(self.descriptor()),
+                    features: vec![feature::PREPARE_ACTION.to_owned()],
                 })
             }
             RequestBody::Verify { nonce } => {
@@ -477,6 +479,30 @@ impl PluginHost {
                         (result.answer.map(|()| CallValue::Document), result.document)
                     }),
                 )
+            }
+            RequestBody::PrepareAction(call) => {
+                let PrepareActionCall {
+                    binding_id,
+                    token,
+                    arguments,
+                    deadline_ms,
+                } = *call;
+                let binding = self.binding(served.owner, binding_id)?;
+                let result = binding
+                    .prepare_action(
+                        wire::token_of(token),
+                        wire::arguments_of(arguments),
+                        core::time::Duration::from_millis(deadline_ms),
+                    )
+                    .await;
+                called_of(result.map(|result| {
+                    (
+                        result
+                            .answer
+                            .map(|plan| CallValue::Plan(Box::new(wire::wire_plan_of(plan)))),
+                        result.document,
+                    )
+                }))
             }
             RequestBody::Checkpoint {
                 binding_id,
@@ -1208,7 +1234,12 @@ fn node_of(node: &crate::runtime::host::EmittedNode) -> WireNode {
 /// either, because it happens inside a registration.
 #[must_use]
 pub fn callable() -> &'static [CallKind] {
-    &[CallKind::Snapshot, CallKind::Checkpoint, CallKind::Restore]
+    &[
+        CallKind::Snapshot,
+        CallKind::PrepareAction,
+        CallKind::Checkpoint,
+        CallKind::Restore,
+    ]
 }
 
 /// Returns the rights a component is told about by default.

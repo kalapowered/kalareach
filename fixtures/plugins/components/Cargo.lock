@@ -114,6 +114,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-fixture-preparing"
+version = "0.1.0"
+dependencies = [
+ "kr-fixture-support",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "kr-fixture-slow-compile"
 version = "0.1.0"
 dependencies = [

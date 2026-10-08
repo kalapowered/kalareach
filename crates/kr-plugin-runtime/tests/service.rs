@@ -824,6 +824,7 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
                         protocol: PROTOCOL.to_owned(),
                         descriptor: Box::new(descriptor.clone()),
+                        features: Vec::new(),
                     },
                     RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
                         identity
@@ -884,4 +885,253 @@ fn admission_name(admission: &Admission) -> &'static str {
         Admission::QueuedWithGap { .. } => "queued_with_gap",
         Admission::Refused { .. } => "refused",
     }
+}
+
+/// The token a worker presents to a component for one invocation, and its arguments.
+fn invocation(action: &str) -> kr_plugin_service::protocol::WireToken {
+    kr_plugin_service::protocol::WireToken {
+        actor_id: "local:501".to_owned(),
+        grant_id: String::new(),
+        binding_revision: 3,
+        thread_revision: None,
+        action_id: action.to_owned(),
+        parameter_hash: vec![7; 32],
+        expires_at_ms: 1_700_000_005_000,
+    }
+}
+
+/// Registers the component that prepares actions, and returns the client and the binding.
+async fn preparing(
+    served: &Served,
+) -> Option<(PluginClient, kr_plugin_service::vocabulary::BindingId)> {
+    let wasm = components::component("preparing")?;
+    let client = served.client().await;
+    let (path, digest, bytes) = served.install("preparing", &wasm);
+    let request = components::request("preparing", 5);
+    client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &ComponentSource {
+                path,
+                digest,
+                bytes,
+            },
+        )
+        .await
+        .expect("the binding registers");
+    Some((client, request.binding_id))
+}
+
+// A component's plan travels back as the plain data it is, whatever it proposes: the plan it was
+// invited to prepare, and each way of proposing something else. The host does not judge any of
+// them; the worker compares them with the invocation and the declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_asks_the_component_to_prepare_an_action_and_is_given_its_plan_as_proposed() {
+    use kr_plugin_sdk::effect::EffectClass;
+    use kr_plugin_service::protocol::{WireArgument, WireNamedArgument, WireOperation};
+
+    let served = Served::start().await;
+    let Some((client, binding_id)) = preparing(&served).await else {
+        return;
+    };
+    let given = vec![WireNamedArgument {
+        name: "reason".to_owned(),
+        value: WireArgument::Text("because".to_owned()),
+    }];
+    let deadline = core::time::Duration::from_millis(500);
+
+    // The plan the action is invited to prepare comes back as it was proposed.
+    let called = client
+        .prepare_action(
+            binding_id,
+            invocation("turn.cancel"),
+            given.clone(),
+            deadline,
+        )
+        .await
+        .expect("the call runs");
+    let plan = called.plan.expect("the component answered with a plan");
+    assert_eq!(plan.action_id, "turn.cancel");
+    assert_eq!(plan.class, EffectClass::UpstreamCancel);
+    assert_eq!(plan.operation, WireOperation::UpstreamCancel);
+    assert_eq!(plan.arguments, given);
+
+    // A plan for another action, one that fills in a field and one that names another method are
+    // each returned as proposed, so the worker can see what was proposed and refuse it by name.
+    let other = client
+        .prepare_action(
+            binding_id,
+            invocation("cancel.other_action"),
+            given.clone(),
+            deadline,
+        )
+        .await
+        .expect("the call runs")
+        .plan
+        .expect("a plan");
+    assert_eq!(other.action_id, "turn.cancel");
+    let fields = client
+        .prepare_action(
+            binding_id,
+            invocation("cancel.with_fields"),
+            given.clone(),
+            deadline,
+        )
+        .await
+        .expect("the call runs")
+        .plan
+        .expect("a plan");
+    let WireOperation::UpstreamMethod { fields, .. } = fields.operation else {
+        panic!("the operation was not a routed method");
+    };
+    assert_eq!(fields.len(), 1);
+    let altered = client
+        .prepare_action(
+            binding_id,
+            invocation("cancel.other_arguments"),
+            given.clone(),
+            deadline,
+        )
+        .await
+        .expect("the call runs")
+        .plan
+        .expect("a plan");
+    assert_ne!(altered.arguments, given);
+
+    // A fault the component declares is an answer: no plan, and what it said.
+    let declined = client
+        .prepare_action(
+            binding_id,
+            invocation("cancel.fault"),
+            given.clone(),
+            deadline,
+        )
+        .await
+        .expect("the call runs");
+    assert!(declined.plan.is_none());
+    assert!(
+        declined
+            .fault
+            .is_some_and(|fault| fault.contains("not something to do"))
+    );
+}
+
+// A component that never returns costs its own call and nothing else: the call ends at the
+// component's deadline, the host refuses it by name, and the connection serves the next call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_component_that_never_prepares_its_action_costs_its_call_and_not_the_connection() {
+    let served = Served::start().await;
+    let Some((client, binding_id)) = preparing(&served).await else {
+        return;
+    };
+    let deadline = core::time::Duration::from_millis(500);
+    let stuck = client
+        .prepare_action(binding_id, invocation("cancel.loop"), Vec::new(), deadline)
+        .await
+        .expect_err("a call that used its whole allowance is refused by the host");
+    assert!(
+        matches!(&stuck, ServiceError::Protocol { detail } if detail.contains("prepare-action")),
+        "{stuck}"
+    );
+    let next = client
+        .prepare_action(binding_id, invocation("turn.cancel"), Vec::new(), deadline)
+        .await
+        .expect("the host answers the next call")
+        .plan;
+    assert!(next.is_some(), "and the binding still prepares");
+}
+
+// A host that did not announce the request is not sent it: it would end the connection, and every
+// binding on it, for a request it does not know.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_an_older_host_did_not_announce_is_not_sent_to_it() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
+    let endpoint = host_endpoint(&environment).expect("an endpoint");
+    let descriptor = HostDescriptor {
+        protocol: PROTOCOL.to_owned(),
+        environment_id: temp.environment_id(),
+        reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+        endpoint: endpoint.as_text(),
+        boot_identity: identity.boot_identity().clone(),
+        process_start_identity: identity.process_start_identity().clone(),
+        host_public_key: *identity.public_key(),
+    };
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a listener");
+    // A host of an earlier build: it answers the handshake and the challenge, announces nothing,
+    // and reads whatever else it is sent, recording it.
+    let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let serving = tokio::spawn({
+        let descriptor = descriptor.clone();
+        let received = Arc::clone(&received);
+        async move {
+            let (connection, _peer) = listener.accept().await.expect("a connection");
+            let (mut reader, mut writer) =
+                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+            while let Ok(request) = reader
+                .read_message_without_schema::<kr_plugin_service::protocol::Request>()
+                .await
+            {
+                let body = match request.body {
+                    RequestBody::Hello { .. } => ResponseBody::Hello {
+                        protocol: PROTOCOL.to_owned(),
+                        descriptor: Box::new(descriptor.clone()),
+                        features: Vec::new(),
+                    },
+                    RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
+                        identity
+                            .answer(&nonce, &descriptor.endpoint)
+                            .expect("an answer"),
+                    )),
+                    other => {
+                        received
+                            .lock()
+                            .expect("not poisoned")
+                            .push(other.name().to_owned());
+                        return;
+                    }
+                };
+                writer
+                    .write_message(&Frame::Response {
+                        reply_to: request.request_id,
+                        body,
+                    })
+                    .await
+                    .expect("the answer is written");
+            }
+        }
+    });
+    let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("connects");
+    let client = PluginClient::over(connection, descriptor)
+        .await
+        .expect("the handshake and the challenge");
+    assert!(!client.supports(kr_plugin_service::protocol::feature::PREPARE_ACTION));
+
+    let refused = client
+        .prepare_action(
+            new_binding_id(),
+            invocation("turn.cancel"),
+            Vec::new(),
+            core::time::Duration::from_millis(500),
+        )
+        .await
+        .expect_err("a request the host did not announce is not made");
+    assert!(
+        matches!(refused, ServiceError::Unsupported { .. }),
+        "{refused}"
+    );
+    // The host is not asked anything it would end the connection over, and the connection is
+    // still one it answers on.
+    serving.abort();
+    assert!(
+        received.lock().expect("not poisoned").is_empty(),
+        "the older host was sent {:?}",
+        received.lock().expect("not poisoned")
+    );
 }
