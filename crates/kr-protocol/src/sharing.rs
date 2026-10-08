@@ -347,6 +347,27 @@ pub struct LiveScreenPreview {
     pub truncated: bool,
 }
 
+/// Parameters of `session.screen.preview`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionScreenPreviewParams {
+    /// The session whose screen is previewed.
+    pub session_id: SessionId,
+    /// The history scope the preview is cut to: the scope of the grant that would be written.
+    pub history: HistoryScope,
+}
+
+/// The result of `session.screen.preview`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionScreenPreviewResult {
+    /// The visible lines, or null when the scope does not include the live screen.
+    ///
+    /// Cut to [`MAX_PREVIEW_LINES`] lines of [`MAX_PREVIEW_LINE_CHARS`] characters, and marked
+    /// when it was: a caller that must show all of it refuses a cut one.
+    pub screen: Nullable<LiveScreenPreview>,
+}
+
 /// One current question an invitation names explicitly.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
