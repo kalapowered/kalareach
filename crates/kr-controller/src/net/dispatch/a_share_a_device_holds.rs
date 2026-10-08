@@ -52,6 +52,20 @@ fn share(
     activated: bool,
     expiry: GrantExpiry,
 ) -> Grant {
+    share_with(world, device, actions, named, activated, expiry, false)
+}
+
+/// As [`share`], for a share whose issuer was shown the session's live screen when
+/// `includes_the_screen` says so.
+fn share_with(
+    world: &fake::Silent,
+    device: &crate::service::net::devices::DeviceRecord,
+    actions: &[ActionRight],
+    named: &[kr_protocol::ids::QuestionId],
+    activated: bool,
+    expiry: GrantExpiry,
+    includes_the_screen: bool,
+) -> Grant {
     let (mut grant, _) =
         crate::service::net::tests::granted(expiry, world.controller.policy().authority_revision());
     grant.issuer_device_id = world.controller.sharing().host_device_id();
@@ -61,6 +75,7 @@ fn share(
     };
     grant.actions = actions.iter().copied().collect();
     grant.history.lower_bound_ms = Nullable::some(TimestampMs::new(1));
+    grant.history.include_live_screen = includes_the_screen;
     grant.history.named_questions = named.iter().copied().collect();
     world
         .controller
@@ -94,6 +109,22 @@ fn holds_results() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         kr_protocol::local::FORWARDED_HISTORY_SCOPE,
         kr_protocol::local::FORWARDED_QUESTION_SCOPE,
         kr_protocol::local::FORWARDED_RESULT_SCOPE,
+    ]
+    .into_iter()
+    .map(|capability| {
+        kr_protocol::ids::CapabilityId::new(capability).expect("a capability identifier")
+    })
+    .collect()
+}
+
+/// What a worker of this build states when it also draws an attachment under a share the screen
+/// its issuer was shown.
+fn narrows_to_previewed_screens() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+    [
+        kr_protocol::local::FORWARDED_HISTORY_SCOPE,
+        kr_protocol::local::FORWARDED_QUESTION_SCOPE,
+        kr_protocol::local::FORWARDED_RESULT_SCOPE,
+        kr_protocol::local::FORWARDED_PREVIEWED_SCREEN,
     ]
     .into_iter()
     .map(|capability| {
@@ -145,6 +176,31 @@ fn answering(
         })
         .expect("encodes"),
     }
+}
+
+/// An attach of a terminal's observer, acting under `grant` when it names one.
+fn attaching(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    byte: u8,
+    grant: Option<GrantId>,
+) -> kr_protocol::envelope::MutationRequest {
+    let mut attach = answering(world, connection, byte, grant);
+    attach.method = Method::SessionAttach.into();
+    attach.params = kr_protocol::envelope::ParamsValue::from_typed(
+        &kr_protocol::attachment::SessionAttachParams {
+            session_id: world.session_id,
+            mode: kr_protocol::attachment::AttachMode::Semantic,
+            claim_geometry: false,
+            dimensions: Nullable::null(),
+            terminal_profile_id: Nullable::null(),
+            requested: [kr_protocol::attachment::AttachmentCapability::ObserveTerminal]
+                .into_iter()
+                .collect(),
+        },
+    )
+    .expect("encodes");
+    attach
 }
 
 /// The refusal an answer carries.
@@ -918,6 +974,15 @@ async fn kr_req_25_10_a_connection_is_ended_with_a_share_it_only_read_under() {
             },
         );
         let connection = super::RemoteConnection::for_test(&world.controller, device);
+        // The watch is waiting, as it is from the moment a connection is served, before any
+        // request: its pairing grant outlasts the share, so it has no deadline of its own to
+        // look at and only a share taken up wakes it.
+        let ended = connection.grant_ended();
+        tokio::pin!(ended);
+        assert!(
+            !has_ended(&mut ended).await,
+            "nothing has ended yet (continuous clock: {on_the_continuous_clock})"
+        );
         let acting = connection
             .acting_for(Some(world.session_id), Some(held_share.grant_id))
             .expect("the share is held");
@@ -929,12 +994,9 @@ async fn kr_req_25_10_a_connection_is_ended_with_a_share_it_only_read_under() {
                 false,
             )
             .expect("the read is decided under the share");
-
-        let ended = connection.grant_ended();
-        tokio::pin!(ended);
         assert!(
             !has_ended(&mut ended).await,
-            "nothing has ended yet (continuous clock: {on_the_continuous_clock})"
+            "and nothing has ended once it has read under the share"
         );
         // The control: a second short of the end, on the clock that ends it.
         if on_the_continuous_clock {
@@ -960,6 +1022,97 @@ async fn kr_req_25_10_a_connection_is_ended_with_a_share_it_only_read_under() {
                      {on_the_continuous_clock})"
                 )
             });
+        world.serving.abort();
+    }
+}
+
+/// KR-REQ-10.50: an attach decided under a share asks the worker to draw the screen the share's
+/// issuer was shown, and an attach decided under the device's pairing grant does not. A worker that
+/// does not state it narrows an attachment so is not asked to attach a share, since it would draw
+/// more than was shown, and is still asked to attach the device under its pairing grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_an_attach_under_a_share_asks_for_the_previewed_screen_and_one_under_a_pairing_grant_does_not()
+ {
+    for worker_narrows in [true, false] {
+        let (world, holding) = world(
+            Holding::default(),
+            if worker_narrows {
+                narrows_to_previewed_screens()
+            } else {
+                holds_results()
+            },
+        )
+        .await;
+        // A pairing grant that admits the session and its screen, and a share of the same.
+        let (mut grant, _) = crate::service::net::tests::granted(
+            GrantExpiry::Never,
+            world.controller.policy().authority_revision(),
+        );
+        grant.history.include_live_screen = true;
+        let device = holding_grant(&world.controller, 41, grant);
+        let viewing = share_with(
+            &world,
+            &device,
+            &[ActionRight::SessionView],
+            &[],
+            true,
+            GrantExpiry::Never,
+            true,
+        );
+
+        let under_the_pairing_grant =
+            super::RemoteConnection::for_test(&world.controller, device.clone());
+        drop(
+            under_the_pairing_grant
+                .mutate(&attaching(&world, &under_the_pairing_grant, 51, None))
+                .await,
+        );
+        let under_the_share = super::RemoteConnection::for_test(&world.controller, device);
+        let answer = under_the_share
+            .mutate(&attaching(
+                &world,
+                &under_the_share,
+                52,
+                Some(viewing.grant_id),
+            ))
+            .await;
+
+        let held = holding.lock().expect("held");
+        let attached: Vec<(Nullable<GrantId>, bool)> = held
+            .mutations
+            .iter()
+            .filter(|forwarded| forwarded.mutation.method == Method::SessionAttach.into())
+            .map(|forwarded| (forwarded.actor.grant_id, forwarded.previewed_screen))
+            .collect();
+        if worker_narrows {
+            assert_eq!(
+                attached.len(),
+                2,
+                "both attaches reached the worker: {attached:?}"
+            );
+            assert!(
+                !attached[0].1,
+                "a device under its pairing grant is drawn the live screen"
+            );
+            assert_eq!(
+                (attached[1].0, attached[1].1),
+                (Nullable::some(viewing.grant_id), true),
+                "and the recipient of a share the screen its issuer was shown"
+            );
+        } else {
+            assert_eq!(
+                attached.len(),
+                1,
+                "only the attach under the pairing grant reached an earlier worker: {attached:?}"
+            );
+            assert!(!attached[0].1);
+            let refused = refusal_of(&answer);
+            assert_eq!(
+                refused.code,
+                ErrorCode::UnsupportedCapability,
+                "{refused:?}"
+            );
+        }
         world.serving.abort();
     }
 }

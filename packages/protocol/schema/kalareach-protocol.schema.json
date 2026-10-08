@@ -14744,6 +14744,10 @@
         "mutation": {
           "$ref": "#/$defs/MutationRequest",
           "description": "The caller's mutation, exactly as it arrived at the host."
+        },
+        "previewed_screen": {
+          "description": "Whether the host decided this mutation under a share, whose issuer was shown the session's\nscreen as text before the share existed.\n\nA `session.attach` that sets it is drawn that screen and no more: the text and how it is\ndrawn, and no window title, no title stack and no link target, which the preview did not\nshow. A mutation decided under a device's pairing grant sets nothing, and its attachment is\ndrawn the live screen as before.\n\nIt is absent from the wire when it is false, so a frame without one is byte for byte what a\nworker built before it read, and a daemon sends it only to a worker that states\n[`FORWARDED_PREVIEWED_SCREEN`].",
+          "type": "boolean"
         }
       },
       "required": [

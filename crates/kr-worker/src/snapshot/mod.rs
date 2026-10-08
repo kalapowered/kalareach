@@ -506,13 +506,12 @@ pub fn install(
     // why some of the session is missing from this screen. It is what the header says out loud.
     let mut cut = false;
     let mut held = 0_usize;
-    let paged_buffers: &[ProjectedBuffer] = match scope {
-        crate::render::Scope::WholeScreen => {
-            &[wire::buffer(snapshot.active_buffer), inactive_buffer]
-        }
-        // The buffer that is not showing is outside this client's authority, so it is not converted
-        // and not sent. What it holds is neither drawn nor described.
-        crate::render::Scope::LiveScreen => &[wire::buffer(snapshot.active_buffer)],
+    let paged_buffers: &[ProjectedBuffer] = if scope.shows_the_other_buffer() {
+        &[wire::buffer(snapshot.active_buffer), inactive_buffer]
+    } else {
+        // The buffer that is not showing is outside this client's authority, so it is not
+        // converted and not sent. What it holds is neither drawn nor described.
+        &[wire::buffer(snapshot.active_buffer)]
     };
     for buffer in paged_buffers.iter().copied() {
         let mut kept: Vec<ProjectedRow> = Vec::new();

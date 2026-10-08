@@ -198,9 +198,10 @@ pub enum Keyboard {
 /// is that exception is served [`Scope::LiveScreen`], and the rows of the other buffer are counted
 /// among what the restoration did not carry rather than painted into it.
 ///
-/// The same caller is shown the screen as its issuer previewed it: the text and how it is drawn.
-/// The window title, the title stack and the target of every link are behind that text and are
-/// not in the preview, so they are not sent either, whichever way the screen is carried.
+/// A caller acting under a share is served less: the screen as the share's issuer previewed it,
+/// which is the text and how it is drawn ([`Scope::PreviewedScreen`]). The window title, the title
+/// stack and the target of every link are behind that text and are not in the preview, so they are
+/// not sent, whichever way the screen is carried.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
     /// Everything the snapshot describes, including the buffer that is not showing.
@@ -208,14 +209,23 @@ pub enum Scope {
     WholeScreen,
     /// The currently visible screen only.
     LiveScreen,
+    /// The currently visible screen as a share's issuer previewed it: its text and how it is
+    /// drawn, and no title and no link target.
+    PreviewedScreen,
 }
 
 impl Scope {
+    /// Whether a caller served this scope is shown the buffer that is not showing.
+    #[must_use]
+    pub const fn shows_the_other_buffer(self) -> bool {
+        matches!(self, Self::WholeScreen)
+    }
+
     /// Whether a caller served this scope is told the titles and the link targets behind the
     /// screen's text.
     #[must_use]
     pub const fn names_titles_and_links(self) -> bool {
-        matches!(self, Self::WholeScreen)
+        !matches!(self, Self::PreviewedScreen)
     }
 }
 
@@ -997,7 +1007,7 @@ impl Writer {
             return;
         }
         let rows = std::mem::take(&mut self.inactive);
-        if self.scope == Scope::LiveScreen {
+        if !self.scope.shows_the_other_buffer() {
             // Outside this caller's authority. The rows are counted among what the restoration did
             // not carry, which is the same accounting a row a byte stream cannot paint gets: what
             // the screen holds and the caller was not shown is never silently dropped.

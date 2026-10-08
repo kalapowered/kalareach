@@ -282,6 +282,24 @@ pub fn holds_results_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> boo
         .any(|capability| capability.as_str() == FORWARDED_RESULT_SCOPE)
 }
 
+/// The capability a worker states when it narrows an attachment to the screen a share's issuer
+/// previewed, which a forwarded `session.attach` asks for
+/// ([`ForwardedMutation::previewed_screen`]).
+///
+/// A worker of an earlier build ends the link a frame with a member it does not know arrived on,
+/// and would draw such an attachment more than the preview showed, so a daemon refuses a share's
+/// attach to a worker that does not state this.
+pub const FORWARDED_PREVIEWED_SCREEN: &str = "forwarded.previewed-screen/1";
+
+/// Returns true when a worker's statement says it narrows an attachment to a share's previewed
+/// screen ([`FORWARDED_PREVIEWED_SCREEN`]).
+#[must_use]
+pub fn narrows_to_previewed_screens(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == FORWARDED_PREVIEWED_SCREEN)
+}
+
 /// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
 /// identity, as 32 lowercase hexadecimal digits.
 pub const UTC_FLOOR_PREFIX: &str = "utc-floor/";
@@ -408,6 +426,19 @@ pub struct ForwardedMutation {
     /// [`FORWARDED_RESULT_SCOPE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::grant::HistoryScope>,
+    /// Whether the host decided this mutation under a share, whose issuer was shown the session's
+    /// screen as text before the share existed.
+    ///
+    /// A `session.attach` that sets it is drawn that screen and no more: the text and how it is
+    /// drawn, and no window title, no title stack and no link target, which the preview did not
+    /// show. A mutation decided under a device's pairing grant sets nothing, and its attachment is
+    /// drawn the live screen as before.
+    ///
+    /// It is absent from the wire when it is false, so a frame without one is byte for byte what a
+    /// worker built before it read, and a daemon sends it only to a worker that states
+    /// [`FORWARDED_PREVIEWED_SCREEN`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub previewed_screen: bool,
 }
 
 /// The rights beside a forwarded mutation, as they are encoded and decoded: a set that holds
@@ -668,6 +699,7 @@ mod tests {
                 grant_rights: rights.iter().copied().collect(),
                 accepted_deadline_boot_ms: U64::new(5),
                 history: None,
+                previewed_screen: false,
             }))
         };
 
@@ -835,6 +867,7 @@ mod tests {
             grant_rights: CanonicalSet::new(),
             accepted_deadline_boot_ms: U64::new(5),
             history,
+            previewed_screen: false,
         };
         let limits = kr_cbor::Limits::DEFAULT;
 
@@ -852,6 +885,19 @@ mod tests {
         assert_eq!(
             decoded, unscoped,
             "an earlier daemon's frame reads as unscoped"
+        );
+
+        let previewed = super::ForwardedMutation {
+            previewed_screen: true,
+            ..mutation(None)
+        };
+        let bytes = kr_cbor::to_canonical_vec(&previewed).expect("encodes");
+        let decoded: super::ForwardedMutation =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
+        assert_eq!(decoded, previewed);
+        assert!(
+            kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
+            "an earlier worker cannot read a frame that asks for a share's previewed screen"
         );
 
         let scoped = mutation(Some(HistoryScope {
@@ -881,6 +927,16 @@ mod tests {
                 .map(|capability| CapabilityId::new(*capability).expect("a capability identifier"))
                 .collect()
         };
+        assert_eq!(
+            super::FORWARDED_PREVIEWED_SCREEN,
+            "forwarded.previewed-screen/1"
+        );
+        assert!(super::narrows_to_previewed_screens(&statement(&[
+            super::FORWARDED_PREVIEWED_SCREEN
+        ])));
+        assert!(!super::narrows_to_previewed_screens(&statement(&[
+            super::FORWARDED_RESULT_SCOPE
+        ])));
         assert_eq!(super::FORWARDED_RESULT_SCOPE, "forwarded.result-scope/1");
         assert!(super::holds_results_to_scopes(&statement(&[
             super::FORWARDED_RESULT_SCOPE

@@ -8034,6 +8034,20 @@ export interface ForwardedMutation {
    */
   history?: HistoryScope | null
   mutation: MutationRequest1
+  /**
+   * Whether the host decided this mutation under a share, whose issuer was shown the session's
+   * screen as text before the share existed.
+   *
+   * A `session.attach` that sets it is drawn that screen and no more: the text and how it is
+   * drawn, and no window title, no title stack and no link target, which the preview did not
+   * show. A mutation decided under a device's pairing grant sets nothing, and its attachment is
+   * drawn the live screen as before.
+   *
+   * It is absent from the wire when it is false, so a frame without one is byte for byte what a
+   * worker built before it read, and a daemon sends it only to a worker that states
+   * [`FORWARDED_PREVIEWED_SCREEN`].
+   */
+  previewed_screen?: boolean
 }
 /**
  * The actor the host verified, with the ingress it arrived on.

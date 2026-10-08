@@ -2384,10 +2384,11 @@ What the grant decides, for every request:
   and "the live screen" means the screen that is showing: a device's attachment is drawn the active
   buffer alone, and the rows of the buffer that is not showing are counted among what its
   restoration did not carry. The exception section 10 names is the visible screen, and never the
-  inactive buffer, the scrollback or the backing transcript. It is the screen's text and how that
-  is drawn: no title, no title stack and no link target is sent to a device, in its restoration, in
-  a rendering of the grid, in an update or in the stream that follows, because none of them is in
-  the preview the issuer of a share was shown.
+  inactive buffer, the scrollback or the backing transcript. A device attached through a share is
+  drawn less: the screen's text and how that is drawn, because that is what the share's issuer was
+  previewed. It is sent no title, no title stack and no link target, in its restoration, in a
+  rendering of the grid, in an update or in the stream that follows. A device under its pairing
+  grant is drawn the live screen with them.
 
 What a subscription carries is a read that goes on after it was answered, so the same decision is
 taken again, as a subscription to the attached session, before each batch the host writes to it,

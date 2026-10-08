@@ -8,7 +8,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-10.49 | `one_filter_covers_every_surface_a_grant_reaches`, `a_summary_made_now_from_pre_cutoff_content_is_withheld_or_recomputed`, `derived_data_names_the_interval_and_resources_it_was_built_from` |
-//! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope`, `kr_req_10_50_a_live_screen_restoration_carries_no_title_and_no_link_target`, `kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now_or_later` |
+//! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope`, `kr_req_10_50_a_previewed_screen_restoration_carries_no_title_and_no_link_target`, `kr_req_10_50_a_previewed_screen_projection_carries_no_title_and_no_link_target_now_or_later` |
 //! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_named_question_is_excepted_only_while_it_is_open`, `a_named_approval_is_excepted_only_while_it_is_current`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
 
 use kr_protocol::gateway::PendingState;
@@ -324,6 +324,12 @@ fn the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing() {
         vec![ProjectedBuffer::Alternate]
     );
 
+    // A share's recipient is drawn the active buffer alone as well.
+    assert_eq!(
+        installed_buffers(&mut engine, Scope::PreviewedScreen),
+        vec![ProjectedBuffer::Alternate]
+    );
+
     // The host owner in front of the machine is a different matter: its authority is the operating
     // system account the session already runs as.
     assert_eq!(
@@ -388,27 +394,31 @@ fn carried_by(events: &[kr_worker::snapshot::Outgoing]) -> String {
     )
 }
 
+/// Every scope's restoration of the screen above, as the bytes a terminal is sent.
+fn restored_as(engine: &mut TerminalEngine, scope: Scope) -> String {
+    let (_, restoration, _) = engine.restoration(
+        dimensions(80, 24),
+        LaneGate::default(),
+        kr_worker::render::Keyboard::Install,
+        scope,
+    );
+    String::from_utf8_lossy(&restoration.bytes).into_owned()
+}
+
 #[test]
-fn kr_req_10_50_a_live_screen_restoration_carries_no_title_and_no_link_target() {
+fn kr_req_10_50_a_previewed_screen_restoration_carries_no_title_and_no_link_target() {
     let mut engine = engine_whose_text_hides_titles_and_links();
-    let mut restored = |scope| {
-        let (_, restoration, _) = engine.restoration(
-            dimensions(80, 24),
-            LaneGate::default(),
-            kr_worker::render::Keyboard::Install,
-            scope,
-        );
-        String::from_utf8_lossy(&restoration.bytes).into_owned()
-    };
-    let whole = restored(Scope::WholeScreen);
-    for told in [ICON_TITLE, WINDOW_TITLE, LINK_TARGET, OPEN_LINK_TARGET] {
-        assert!(
-            whole.contains(told),
-            "the unrestricted owner is told {told}: {whole:?}"
-        );
+    // The owner and a device under its pairing grant are told every one: nothing was previewed
+    // to either, and a terminal that is to show a title or open a link holds them.
+    for scope in [Scope::WholeScreen, Scope::LiveScreen] {
+        let told = restored_as(&mut engine, scope);
+        for named in [ICON_TITLE, WINDOW_TITLE, LINK_TARGET, OPEN_LINK_TARGET] {
+            assert!(told.contains(named), "{scope:?} is told {named}: {told:?}");
+        }
     }
 
-    let live = restored(Scope::LiveScreen);
+    // The recipient of a share is sent what its issuer was shown: the text.
+    let previewed = restored_as(&mut engine, Scope::PreviewedScreen);
     for hidden in [
         ICON_TITLE,
         KEPT_TITLE,
@@ -417,18 +427,18 @@ fn kr_req_10_50_a_live_screen_restoration_carries_no_title_and_no_link_target() 
         OPEN_LINK_TARGET,
     ] {
         assert!(
-            !live.contains(hidden),
-            "a caller shown the live screen is not told {hidden}: {live:?}"
+            !previewed.contains(hidden),
+            "a caller shown a share's previewed screen is not told {hidden}: {previewed:?}"
         );
     }
     assert!(
-        live.contains("a linked word") && live.contains("and plain text"),
-        "the text the preview shows is drawn: {live:?}"
+        previewed.contains("a linked word") && previewed.contains("and plain text"),
+        "the text the preview shows is drawn: {previewed:?}"
     );
 }
 
 #[test]
-fn kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now_or_later() {
+fn kr_req_10_50_a_previewed_screen_projection_carries_no_title_and_no_link_target_now_or_later() {
     let mut engine = engine_whose_text_hides_titles_and_links();
     let window = Window::live(dimensions(80, 24));
     let mut installed = |scope| {
@@ -443,22 +453,21 @@ fn kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now
             .expect("a snapshot")
             .0
     };
-    let whole = carried_by(&installed(Scope::WholeScreen).events);
-    for told in [
-        ICON_TITLE,
-        KEPT_TITLE,
-        WINDOW_TITLE,
-        LINK_TARGET,
-        OPEN_LINK_TARGET,
-    ] {
-        assert!(
-            whole.contains(told),
-            "the unrestricted owner is told {told}: {whole:?}"
-        );
+    for scope in [Scope::WholeScreen, Scope::LiveScreen] {
+        let told = carried_by(&installed(scope).events);
+        for named in [
+            ICON_TITLE,
+            KEPT_TITLE,
+            WINDOW_TITLE,
+            LINK_TARGET,
+            OPEN_LINK_TARGET,
+        ] {
+            assert!(told.contains(named), "{scope:?} is told {named}: {told:?}");
+        }
     }
 
-    let live = installed(Scope::LiveScreen);
-    let screen = carried_by(&live.events);
+    let previewed = installed(Scope::PreviewedScreen);
+    let screen = carried_by(&previewed.events);
     for hidden in [
         ICON_TITLE,
         KEPT_TITLE,
@@ -468,7 +477,7 @@ fn kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now
     ] {
         assert!(
             !screen.contains(hidden),
-            "a caller shown the live screen is not told {hidden}: {screen:?}"
+            "a caller shown a share's previewed screen is not told {hidden}: {screen:?}"
         );
     }
     assert!(
@@ -479,11 +488,12 @@ fn kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now
     // What the application sets afterwards is held to the same rule: a title or a link the issuer
     // could not have been shown is not sent in an update either.
     let held = kr_worker::snapshot::Held {
-        base: live.base,
+        base: previewed.base,
         viewport: engine.anchored_viewport(window),
         screen_top_row: engine.live_top_row(),
     };
-    // A new title, kept on the stack, a linked word, and a link left open with the cursor saved in it.
+    // A new title, kept on the stack, a linked word, and a link left open with the cursor saved
+    // in it.
     let later = format!(
         "\r\n\x1b]2;{LATER_TITLE}\x1b\\\x1b[22;2t\
          \x1b]8;;{LATER_LINK_TARGET}\x1b\\a later word\x1b]8;;\x1b\\\
@@ -500,18 +510,17 @@ fn kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now
         };
         carried_by(&update.events)
     };
-    let owner = advanced(Scope::WholeScreen);
-    for told in [LATER_TITLE, LATER_LINK_TARGET, LATER_OPEN_LINK_TARGET] {
-        assert!(
-            owner.contains(told),
-            "the unrestricted owner is told {told}: {owner:?}"
-        );
+    for scope in [Scope::WholeScreen, Scope::LiveScreen] {
+        let told = advanced(scope);
+        for named in [LATER_TITLE, LATER_LINK_TARGET, LATER_OPEN_LINK_TARGET] {
+            assert!(told.contains(named), "{scope:?} is told {named}: {told:?}");
+        }
     }
-    let update = advanced(Scope::LiveScreen);
+    let update = advanced(Scope::PreviewedScreen);
     for hidden in [LATER_TITLE, LATER_LINK_TARGET, LATER_OPEN_LINK_TARGET] {
         assert!(
             !update.contains(hidden),
-            "a caller shown the live screen is not told {hidden}: {update:?}"
+            "a caller shown a share's previewed screen is not told {hidden}: {update:?}"
         );
     }
     assert!(

@@ -219,7 +219,11 @@ impl RemoteConnection {
     }
 
     /// Resolves once a grant this connection stands on has ended: the pairing grant that lets the
-    /// device in, or the share it acts under for its session.
+    /// device in, or any share it has decided a request under, whether or not it opened a link to
+    /// a worker under it.
+    ///
+    /// A share a request was refused after it was decided under is held all the same, so the
+    /// connection ends with it; that is the safe direction, as a revocation reaching it is.
     ///
     /// A connection that sends nothing is served nothing after its grant ends, because the
     /// connection ends with it. The share's end is a time bound of its own, so ending it writes
@@ -228,8 +232,8 @@ impl RemoteConnection {
     /// the grants it withdrew when it takes effect.
     pub(in crate::service::net) async fn grant_ended(&self) {
         loop {
-            // Asked for before the grants are looked at, so a share fixed while they are looked at
-            // is not missed.
+            // Asked for before the grants are looked at, so a share taken up while they are looked
+            // at is not missed.
             let changed = self.acting_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
