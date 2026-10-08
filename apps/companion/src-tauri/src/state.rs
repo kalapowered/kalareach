@@ -27,7 +27,19 @@ pub struct AppState {
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
-    supervision: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    supervision: Mutex<Supervision>,
+}
+
+/// The task that keeps the connection to the host the commands go to, and which choice of host it
+/// belongs to.
+///
+/// Each choice has a number. A task installs a connection, or records that it has none, only while
+/// its own choice is the current one, so a task that was ended after it had already reached the
+/// host can never put that host's connection back.
+#[derive(Debug, Default)]
+struct Supervision {
+    choice: u64,
+    task: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
 impl AppState {
@@ -45,33 +57,71 @@ impl AppState {
             drafts: Mutex::new(None),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
-            supervision: Mutex::new(None),
+            supervision: Mutex::new(Supervision::default()),
         }
     }
 
-    /// Takes on the task that keeps a connection to the paired host the commands go to, ending the
-    /// one before it.
-    pub fn supervise(&self, task: tauri::async_runtime::JoinHandle<()>) {
-        let before = self
+    /// Makes a new choice of host: ends the task of the choice before it, records that there is no
+    /// connection while the new host is reached, and starts the task `start` makes for the new
+    /// choice's number.
+    ///
+    /// All of it happens under one lock, so two choices made at once are made one after the other
+    /// and the later one stands, and what `start` records about the choice (which host is in use)
+    /// is never at odds with the task that keeps its connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `start` returns, and then nothing has changed.
+    pub fn choose_host(
+        &self,
+        reason: &str,
+        start: impl FnOnce(u64) -> Result<tauri::async_runtime::JoinHandle<()>>,
+    ) -> Result<()> {
+        let mut supervision = self
             .supervision
             .lock()
-            .expect("the supervision lock is not poisoned")
-            .replace(task);
-        if let Some(before) = before {
+            .expect("the supervision lock is not poisoned");
+        let choice = supervision.choice + 1;
+        let task = start(choice)?;
+        supervision.choice = choice;
+        if let Some(before) = supervision.task.replace(task) {
             before.abort();
         }
+        self.disconnected(reason);
+        Ok(())
     }
 
-    /// Ends the task that keeps a connection to a paired host, when there is one.
-    pub fn end_supervision(&self) {
-        if let Some(task) = self
+    /// Whether `choice` is still the choice of host in force.
+    fn current(supervision: &Supervision, choice: u64) -> bool {
+        supervision.choice == choice
+    }
+
+    /// Records a live connection made for `choice`, unless another host has been chosen since.
+    /// Returns whether it was kept.
+    pub fn connected_for(&self, choice: u64, connection: Connection) -> bool {
+        let supervision = self
             .supervision
             .lock()
-            .expect("the supervision lock is not poisoned")
-            .take()
-        {
-            task.abort();
+            .expect("the supervision lock is not poisoned");
+        if !Self::current(&supervision, choice) {
+            return false;
         }
+        self.connected(connection);
+        true
+    }
+
+    /// Records that `choice` has no connection and why, unless another host has been chosen since.
+    /// Returns whether it was recorded.
+    pub fn disconnected_for(&self, choice: u64, reason: impl Into<String>) -> bool {
+        let supervision = self
+            .supervision
+            .lock()
+            .expect("the supervision lock is not poisoned");
+        if !Self::current(&supervision, choice) {
+            return false;
+        }
+        self.disconnected(reason);
+        true
     }
 
     /// Records a live connection.
@@ -121,26 +171,31 @@ impl AppState {
         }
     }
 
-    /// The identity the host gave this device, when the commands go to a host it is paired with.
+    /// The identity the host gave this device, the environment and the session of one connection,
+    /// read together so they cannot belong to two hosts.
     ///
     /// # Errors
     ///
     /// Returns `HOST_NOT_CONFIGURED` when there is no connection, and a refusal when the
     /// connection is to the host on this machine, where this application is the owner and not a
     /// paired device.
-    pub fn paired_device_id(&self) -> Result<kr_protocol::ids::DeviceId> {
-        match self
+    pub fn paired_snapshot(
+        &self,
+    ) -> Result<(kr_protocol::ids::DeviceId, EnvironmentId, Arc<Session>)> {
+        let held = self
             .connection
             .read()
-            .expect("the state lock is not poisoned")
-            .as_ref()
-            .map(Connection::standing)
-        {
-            Some(Standing::Paired { device_id, .. }) => Ok(*device_id),
-            Some(Standing::Owner) => Err(CommandError::refused(
+            .expect("the state lock is not poisoned");
+        let connection = held.as_ref().ok_or_else(CommandError::not_connected)?;
+        match connection.standing() {
+            Standing::Paired { device_id, .. } => Ok((
+                *device_id,
+                connection.environment_id(),
+                connection.session(),
+            )),
+            Standing::Owner => Err(CommandError::refused(
                 "this application is the owner of the host it is connected to, not a paired device",
             )),
-            None => Err(CommandError::not_connected()),
         }
     }
 
