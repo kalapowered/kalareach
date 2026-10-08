@@ -23,9 +23,9 @@ use kr_client::services::{
     BackupManifestService, HttpService, ManagedBackupManifestService, ServiceHttp, ServiceSigner,
     managed_response_limits,
 };
-use kr_controller::backup::quiet::{LONGEST_DELAY, Timer};
 use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK};
 use kr_controller::backup::store::{AttemptStatus, Production, Remote};
+use kr_controller::quiet::{LONGEST_DELAY, Timer};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::backup::{
@@ -551,7 +551,7 @@ async fn start_daemon(
     let secrets = environment.secrets_dir();
     let controller = kr_controller::testing::taken_over(|| {
         let secrets = secrets.clone();
-        Controller::start_on_backup_timer(
+        Controller::start_on_timer(
             ControllerSetup {
                 paths: environment.clone(),
                 environment_id,
