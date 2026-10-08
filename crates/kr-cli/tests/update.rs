@@ -1859,6 +1859,62 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
 }
 
+/// KR-REQ-26.10: a transaction an earlier build began holds no root, and settles on the roots of its
+/// two releases that can be read, each on its own: the root file of the release left is damaged,
+/// and the second root the release switched to carries is still the root the host trusts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_with_no_root_settles_on_the_release_roots_that_can_be_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut host = Host::bare();
+    let rotated = channel_root_naming(2, &keys().root, &keys().next_targets, &[&keys().root]);
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::new(
+        "0.2.0+bbbbbbbbbbbb",
+        2,
+        CompatibilityLevel::of(PACKAGE_VERSION),
+        &rotated,
+    );
+    host.install(&one);
+    host.put(&two);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    host.record_a_switched_update(&one, &two);
+    assert!(
+        host.record()["update"]["trusted_root"].is_null(),
+        "the transaction is one an earlier build began"
+    );
+    // The root of the release left cannot be read.
+    let share = host.store.release_directory(one.name()).join("share");
+    std::fs::set_permissions(&share, std::fs::Permissions::from_mode(0o755)).expect("opened");
+    let root_file = share.join("update-root.json");
+    std::fs::set_permissions(&root_file, std::fs::Permissions::from_mode(0o644)).expect("opened");
+    std::fs::write(&root_file, b"{ not a root").expect("damaged");
+
+    let archive = host.scratch("archives").join("two.tar.gz");
+    // Release two carries the second root, so the host that has switched to it checks an archive
+    // against that root: the manifest is signed with the key it names.
+    two.archive_signed(&archive, &keys().next_targets);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(
+        record["trusted_root"]["signed"]["version"], 2,
+        "the root the release switched to carries is the one trusted: {record}"
+    );
+}
+
 /// KR-REQ-26.09: an update an earlier run left after its switch finds the environment held by a
 /// daemon of the release before it, which resumes and goes on answering as that release: the update
 /// says what it answered as, and then names the daemon with how to stop it, and keeps the update.
@@ -5011,7 +5067,7 @@ async fn an_update_is_refused_naming_a_store_the_new_release_cannot_read() {
 /// serving.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_listed_in_a_way_this_kr_does_not_know_refuses_the_switch_before_anything_stops() {
-    let (host, one, _two, _archive) = host_to_update().await;
+    let (mut host, one, _two, _archive) = host_to_update().await;
     let mut stores = release_stores();
     stores.push(ReleaseStore {
         store: "ledgers".to_owned(),
@@ -5064,10 +5120,15 @@ async fn a_store_listed_in_a_way_this_kr_does_not_know_refuses_the_switch_before
         host.store.current().expect("reads"),
         Some(one.name().clone())
     );
+    assert!(
+        host.daemons
+            .iter_mut()
+            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+        "the daemon this test started was never stopped"
+    );
     assert_eq!(
         host.daemon_build().await,
-        format!("kr-controller/{}", one.name()),
-        "the daemon was never stopped"
+        format!("kr-controller/{}", one.name())
     );
 }
 
@@ -5477,6 +5538,151 @@ async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
     assert_eq!(
         host.store.current().expect("reads"),
         Some(three.name().clone())
+    );
+}
+
+/// KR-REQ-26.10: a switch an earlier run left after it happened settles on the root that run decided
+/// on before it began, and reads no release to do so. An update to release two, which carries the
+/// second root, switches and then stops because its daemon does not start; the transaction it
+/// leaves holds the second root, and the root file of release two is gone when the next run settles
+/// it. A rollback then goes on, and the host still trusts the second root: going back did not give
+/// up the trust the switch earned, and the key the second root retired stays retired.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_left_after_it_happened_settles_on_the_root_decided_before_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut host = Host::bare();
+    let rotated = channel_root_naming(2, &keys().root, &keys().next_targets, &[&keys().root]);
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::new(
+        "0.2.0+bbbbbbbbbbbb",
+        2,
+        CompatibilityLevel::of(PACKAGE_VERSION),
+        &rotated,
+    );
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+
+    let (output, said) = host.update_whose_daemons_fail(&archive.display().to_string());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the daemon does not start from the new release: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = host.record();
+    assert_eq!(record["update"]["state"], "switched", "{record}");
+    assert_eq!(
+        record["update"]["trusted_root"]["signed"]["version"], 2,
+        "the transaction holds the root decided before the switch: {record}"
+    );
+    assert!(
+        record["trusted_root"].is_null(),
+        "and nothing is trusted on it yet: {record}"
+    );
+    // Release two's own copy of that root is gone by the time the next run settles it.
+    let share = host.store.release_directory(two.name()).join("share");
+    std::fs::set_permissions(&share, std::fs::Permissions::from_mode(0o755)).expect("opened");
+    let root_file = share.join("update-root.json");
+    std::fs::set_permissions(&root_file, std::fs::Permissions::from_mode(0o644)).expect("opened");
+    std::fs::remove_file(&root_file).expect("removed");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+    assert_eq!(
+        record["trusted_root"]["signed"]["version"], 2,
+        "the second root is the root the host trusts: {record}"
+    );
+}
+
+/// KR-REQ-26.10: a rollback to a release whose update channel root has the version of the root the
+/// host trusts and is another document is refused: the host trusts neither, nothing is switched or
+/// recorded, and the root it recorded stays what it was. The control, in the same store, is the
+/// rollback to a release whose root is the first, which goes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_to_a_release_with_another_root_of_the_trusted_version_is_refused() {
+    let mut host = Host::bare();
+    let level = CompatibilityLevel::of(PACKAGE_VERSION);
+    let trusted = channel_root_naming(2, &keys().root, &keys().next_targets, &[&keys().root]);
+    let other = channel_root_naming(2, &keys().root, &keys().targets, &[&keys().root]);
+    assert_ne!(trusted, other, "two roots of one version that differ");
+    let one = Assembled::new("0.2.0+aaaaaaaaaaaa", 2, level, the_root());
+    let elder = Assembled::new("0.1.0+eeeeeeeeeeee", 1, level, &other);
+    let two = Assembled::new("0.3.0+bbbbbbbbbbbb", 3, level, &trusted);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = host.record();
+    assert_eq!(before["trusted_root"]["signed"]["version"], 2, "{before}");
+    // An older release, put in the store now that the update has collected what nothing needs,
+    // whose root is another document of the version the host trusts.
+    host.put(&elder);
+
+    let (output, said) =
+        host.kr_json(&["host", "rollback", "--to", elder.name().as_str(), "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("trusts neither"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    let after = host.record();
+    assert!(after["update"].is_null(), "{after}");
+    assert_eq!(
+        after["trusted_root"], before["trusted_root"],
+        "and the root the host trusts is what it was"
+    );
+
+    // The control: the release before it, whose root is the first, goes back.
+    let (output, said) = host.kr_json(&["host", "rollback", "--to", one.name().as_str(), "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
     );
 }
 

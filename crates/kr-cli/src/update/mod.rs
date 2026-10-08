@@ -107,8 +107,9 @@ pub fn said(error: &InstallError) -> Shown {
 /// The store record's format this build writes, and the newest it reads.
 pub const RECORD_FORMAT: u32 = 1;
 
-/// The longest store record this build reads: it holds a channel root, of which a release may
-/// carry one up to 1 MiB, written out in the record's own indented form, with room to spare.
+/// The longest store record this build reads: it holds the channel roots of the host and of an
+/// update under way, of which a release may carry one up to 1 MiB each, written out in the
+/// record's own indented form, with room to spare.
 const RECORD_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// The store's record, `install.json`: what an update needs that the store's directories do not
@@ -138,7 +139,7 @@ pub struct Record {
 kr_client::debug_as_name!(Record);
 
 /// An update under way.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transaction {
     /// The release that was current when it began.
     pub source: ReleaseName,
@@ -148,6 +149,12 @@ pub struct Transaction {
     pub state: TransactionState,
     /// How each daemon it stopped is started again, recorded before it is told to stop.
     pub restarts: Vec<Restart>,
+    /// The update channel root this host trusts once the switch settles: worked out from the root
+    /// the store recorded and the roots of the two releases, each checked, before any daemon is
+    /// stopped. Settling takes it from here and reads no release, so a root file that is gone by
+    /// then cannot lower the trust the host holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_root: Option<tough::schema::Signed<tough::schema::Root>>,
 }
 
 kr_client::debug_as_name!(Transaction);
@@ -1030,9 +1037,9 @@ async fn carry_out(
         return Err(formats::refusal(&target, &unlookable));
     }
     // The root this host will trust once the switch settles is worked out before anything is
-    // stopped: a root that cannot be read, or two of one version that differ, would otherwise be
-    // found only after the switch, when settling it could not lower the trust it holds.
-    trusted_after(store, record, &source, &target.release)?;
+    // surveyed or stopped, and recorded with the transaction: a root that cannot be read, or two of
+    // one version that differ, is found here, while nothing has changed.
+    let trusted = trusted_after(store, record, &source, &target.release)?;
     let inventory::Surveyed {
         environments,
         unreached,
@@ -1050,7 +1057,7 @@ async fn carry_out(
         update_lock,
         record,
         (&environments, &reached),
-        (&source, &target),
+        (&source, &target, trusted.map(|root| root.to_kept())),
         &mut report,
     )
     .await
@@ -1146,7 +1153,11 @@ async fn proceed(
     update_lock: &kr_ipc::install::StoreLock,
     record: &mut Record,
     (environments, reached): (&[inventory::Environment], &[(PathBuf, EnvironmentId)]),
-    (source, target): (&ReleaseName, &kr_protocol::update::ReleaseManifest),
+    (source, target, trusted): (
+        &ReleaseName,
+        &kr_protocol::update::ReleaseManifest,
+        Option<tough::schema::Signed<tough::schema::Root>>,
+    ),
     report: &mut Report,
 ) -> Result<Vec<EnvironmentId>> {
     // Nothing is stopped for the first look: a worker at a level the new release does not retain
@@ -1174,6 +1185,7 @@ async fn proceed(
         target: target.release.clone(),
         state: TransactionState::Prepared,
         restarts: Vec::new(),
+        trusted_root: trusted,
     });
     record.write(store)?;
     hand_over(
@@ -1195,28 +1207,13 @@ fn trusted_root(
     record: &Record,
     source: &ReleaseName,
 ) -> Result<release::ChannelRoot> {
-    let current =
-        release::ChannelRoot::read(&store.release_directory(source))?.ok_or_else(|| {
-            CliError::Other(shown!(
-                "release {} carries no update channel root, so no release can be checked for this \
-             host; the update is refused",
-                crate::shown::release(source)
-            ))
-        })?;
-    let Some(kept) = record.trusted_root.clone() else {
-        return Ok(current);
-    };
-    let kept = release::ChannelRoot::kept(kept)?;
-    match kept.version().cmp(&current.version()) {
-        std::cmp::Ordering::Greater => Ok(kept),
-        std::cmp::Ordering::Less => Ok(current),
-        std::cmp::Ordering::Equal if kept.is(&current) => Ok(current),
-        std::cmp::Ordering::Equal => Err(CliError::Other(shown!(
-            "release {} carries an update channel root, and the store recorded another of the same \
-             version: this host trusts neither, and no release can be checked for it",
+    trusted_after(store, record, source, source)?.ok_or_else(|| {
+        CliError::Other(shown!(
+            "release {} carries no update channel root and the store recorded none, so no release \
+             can be checked for this host; the update is refused",
             crate::shown::release(source)
-        ))),
-    }
+        ))
+    })
 }
 
 /// The manifest of a release already in the store.
@@ -1756,13 +1753,14 @@ fn forget_update(store: &Store, record: &mut Record) {
 
 /// The update channel root this host trusts after a switch from `source` to `target`: the newest
 /// by version of the one recorded, the source's and the target's, each of which was trusted when it
-/// was current. Going back to a release never gives a newer root up.
+/// was current. Going back to a release never gives a newer root up. A release that carries no root
+/// adds none.
 ///
 /// # Errors
 ///
-/// Returns a refusal when the recorded root, or either release's, cannot be read or does not
-/// verify against itself, and when two roots of one version are not the same document: the trust
-/// this host holds is never settled on a root it cannot establish.
+/// Returns a refusal when the recorded root, or a root a release carries, cannot be read or does
+/// not verify against itself, and when two of them have one version and are not the same document:
+/// the trust this host holds is never settled on a root it cannot establish.
 #[cfg(unix)]
 fn trusted_after(
     store: &Store,
@@ -1770,39 +1768,69 @@ fn trusted_after(
     source: &ReleaseName,
     target: &ReleaseName,
 ) -> Result<Option<release::ChannelRoot>> {
-    let mut newest = record
-        .trusted_root
-        .clone()
-        .map(release::ChannelRoot::kept)
-        .transpose()?;
+    let mut roots = Vec::new();
+    if let Some(kept) = record.trusted_root.clone() {
+        roots.push((None, release::ChannelRoot::kept(kept)?));
+    }
     for release in [source, target] {
-        let Some(root) = release::ChannelRoot::read(&store.release_directory(release))? else {
-            continue;
-        };
-        match &newest {
-            Some(known) if root.version() == known.version() && !root.is(known) => {
-                return Err(CliError::Other(shown!(
-                    "release {} carries an update channel root, and this host trusts another of \
-                     the same version: it trusts neither, and nothing was switched",
-                    crate::shown::release(release)
-                )));
-            }
-            Some(known) if root.version() <= known.version() => {}
-            _ => newest = Some(root),
+        if let Some(root) = release::ChannelRoot::read(&store.release_directory(release))? {
+            roots.push((Some(release), root));
         }
     }
-    Ok(newest)
+    let called = |origin: &Option<&ReleaseName>| match origin {
+        Some(release) => shown!("the root of release {}", crate::shown::release(release)),
+        None => Shown::said("the root this host recorded"),
+    };
+    for (index, (origin, root)) in roots.iter().enumerate() {
+        for (other_origin, other) in &roots[index + 1..] {
+            if root.version() == other.version() && !root.is(other) {
+                return Err(CliError::Other(shown!(
+                    "{} and {} are update channel roots of one version that are not the same \
+                     document: this host trusts neither, and nothing was switched",
+                    called(origin),
+                    called(other_origin)
+                )));
+            }
+        }
+    }
+    Ok(roots
+        .into_iter()
+        .map(|(_, root)| root)
+        .max_by_key(release::ChannelRoot::version))
 }
 
-/// Records an update as settled: its target current, its source the previous release, and the root
-/// [`trusted_after`] names the root this host trusts from now on. A root that cannot be established
-/// leaves the update recorded, for the next run to settle.
+/// Records an update as settled: its target current, its source the previous release, and the
+/// update channel root the transaction recorded as the root this host trusts from now on, where it
+/// is not older than the one recorded. It reads no release, unless the transaction holds no root
+/// because an earlier build began it: the roots of its two releases that can be read are then
+/// taken, and the newest of them.
 #[cfg(unix)]
 fn settle(store: &Store, record: &mut Record) -> Result<()> {
-    if let Some(update) = record.update.clone() {
-        let trusted = trusted_after(store, record, &update.source, &update.target)?;
-        record.update = None;
-        record.trusted_root = trusted.map(|root| root.to_kept());
+    if let Some(update) = record.update.take() {
+        let newer = |root: &tough::schema::Signed<tough::schema::Root>| {
+            record
+                .trusted_root
+                .as_ref()
+                .is_none_or(|known| root.signed.version >= known.signed.version)
+        };
+        // A transaction an earlier build began holds no root: the roots of the two releases are
+        // read as they were before the root was recorded with it, each on its own, and one that
+        // cannot be read adds none. Remove this once no supported updater begins a transaction
+        // without the root.
+        let trusted = update.trusted_root.or_else(|| {
+            [&update.source, &update.target]
+                .into_iter()
+                .filter_map(|release| {
+                    release::ChannelRoot::read(&store.release_directory(release))
+                        .ok()
+                        .flatten()
+                })
+                .max_by_key(release::ChannelRoot::version)
+                .map(|root| root.to_kept())
+        });
+        if let Some(trusted) = trusted.filter(newer) {
+            record.trusted_root = Some(trusted);
+        }
         record.previous = Some(update.source);
         if record.staged.as_ref() == Some(&update.target) {
             record.staged = None;
@@ -1987,6 +2015,7 @@ mod tests {
             source: release("0.1.0+aaaaaaaaaaaa"),
             target: release("0.2.0+bbbbbbbbbbbb"),
             state: TransactionState::Prepared,
+            trusted_root: None,
             restarts: vec![Restart {
                 environment: environment.environment_id,
                 runtime_root: "/runtime".to_owned(),

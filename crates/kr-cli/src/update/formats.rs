@@ -376,7 +376,8 @@ enum Member {
 /// cannot be read as a JSON object with a whole number there is refused, unless `lenient`, which is
 /// the configuration document: every release loads one it cannot read as defaults, so a document
 /// that states no version it can make out has none to refuse a switch for. A whole number it can
-/// make out is a version like any other, and one outside the range is refused.
+/// make out is a version like any other, and one outside the range, or too large to be any
+/// release's, is refused.
 fn json(file: &Path, member: &str, absent: u32, lenient: bool) -> Result<Option<u32>, Shown> {
     let bytes = match kr_ipc::install::read_regular_file(file, super::RECORD_LIMIT) {
         Ok(bytes) => bytes,
@@ -401,9 +402,9 @@ fn json(file: &Path, member: &str, absent: u32, lenient: bool) -> Result<Option<
     };
     match document.get(member) {
         None => Ok(Some(absent)),
-        // A whole number too large for any release to read is far above every range, and is read
-        // as the largest version there is, so that it is refused as above them.
-        Some(Member::Number(stated)) => Ok(Some(u32::try_from(*stated).unwrap_or(u32::MAX))),
+        Some(Member::Number(stated)) => u32::try_from(*stated).map(Some).map_err(|_| {
+            Shown::said("it records a version larger than any version a release reads")
+        }),
         Some(Member::Other(_)) if lenient => Ok(None),
         Some(Member::Other(_)) => Err(Shown::said(
             "the member that records its version is not a whole number",
@@ -453,12 +454,12 @@ mod tests {
                 "the configuration document is not refused for it: {refused}"
             );
         }
-        // A whole number too large for any release to read is above every range, not no version.
+        // A whole number too large for any release to read is refused, not read as no version or as
+        // the largest there is, which a range may reach.
         for lenient in [false, true] {
-            assert_eq!(
-                read(&at(r#"{"version": 4294967296}"#), 0, lenient),
-                Some(Some(u32::MAX)),
-                "a version far above any range is read as the largest there is (lenient: {lenient})"
+            assert!(
+                version(&at(r#"{"version": 4294967296}"#), 0, lenient).is_err(),
+                "a version no release reads is refused (lenient: {lenient})"
             );
         }
         assert_eq!(
