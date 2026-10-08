@@ -52,13 +52,17 @@ struct EvidenceBudget {
 }
 
 /// How far one restrictive change reaches when the barrier that retires it fences connections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Reach {
     /// Every connection this daemon has admitted.
     Host,
     /// The connections of one revoked device. Every other connection is admitted again at the
     /// revision the barrier advances to, so one device's revocation is not everybody's reconnect.
     Device(kr_protocol::ids::DeviceId),
+    /// The connections acting under these grants, which a share's revocation withdrew with its
+    /// descendants. A connection that acts under any other grant, and the owner's own, are
+    /// admitted again at the revision the barrier advances to.
+    Grants(std::collections::BTreeSet<kr_protocol::ids::GrantId>),
 }
 
 /// The restrictive changes whose fence debt no barrier has retired (section 26).
@@ -87,7 +91,7 @@ pub(super) struct Debts {
 }
 
 /// One published debt ([`Debts`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Published {
     /// How far the barrier that retires it fences connections.
     pub(super) reach: Reach,
@@ -692,7 +696,7 @@ impl Controller {
             held.published.insert(
                 *debt,
                 Published {
-                    reach: *reach,
+                    reach: reach.clone(),
                     covered: true,
                 },
             );
@@ -775,7 +779,7 @@ impl Controller {
                 .published
                 .iter()
                 .filter(|(_, published)| capture == Capture::Every || !published.covered)
-                .map(|(debt, published)| (*debt, published.reach))
+                .map(|(debt, published)| (*debt, published.reach.clone()))
                 .collect();
             if captured.is_empty() {
                 None
@@ -786,6 +790,15 @@ impl Controller {
                 registry.advance_authority_revision()?;
                 let revision = registry.authority_revision()?;
                 let host_wide = captured.values().any(|reach| *reach == Reach::Host);
+                let revoked_grants: std::collections::BTreeSet<kr_protocol::ids::GrantId> =
+                    captured
+                        .values()
+                        .filter_map(|reach| match reach {
+                            Reach::Grants(grants) => Some(grants.iter().copied()),
+                            Reach::Host | Reach::Device(_) => None,
+                        })
+                        .flatten()
+                        .collect();
                 let mut admitted = self.admitted_table();
                 if host_wide {
                     admitted.retain(|_, connection| connection.admitted_revision >= revision);
@@ -796,14 +809,19 @@ impl Controller {
                             Reach::Device(device_id) => {
                                 Some(kr_transport::listener::device_principal(device_id))
                             }
-                            Reach::Host => None,
+                            Reach::Host | Reach::Grants(_) => None,
                         })
                         .collect();
                     // The connections that were not withdrawn hold authority these changes did not
                     // touch, so they are admitted at the revision now in force. Work they had
                     // already admitted still carries the revision it was admitted under, and is
                     // refused inside its own transaction as before.
-                    admitted.retain(|_, connection| !revoked.contains(&connection.actor_id));
+                    admitted.retain(|_, connection| {
+                        !revoked.contains(&connection.actor_id)
+                            && !connection
+                                .acting
+                                .is_some_and(|grant| revoked_grants.contains(&grant))
+                    });
                     for connection in admitted.values_mut() {
                         connection.admitted_revision = revision;
                     }
@@ -824,10 +842,10 @@ impl Controller {
                     debts.published.remove(debt);
                     debts.retiring.insert(*debt);
                 }
-                Some((revision, captured, host_wide))
+                Some((revision, captured))
             }
         };
-        let Some((revision, captured, host_wide)) = captured else {
+        let Some((revision, captured)) = captured else {
             return Ok(None);
         };
         // The host policy decides a paired device's request against the revision in force, so it
@@ -837,11 +855,10 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .advance_authority_revision(revision);
-        if host_wide {
-            // The registrations are gone; the connections that held them are told. A frame already
-            // waiting for its peer is stopped by its connection closing, not by the next check.
-            self.fence_network_connections().await;
-        }
+        // The registrations are gone; the connections that held them are told. A frame already
+        // waiting for its peer is stopped by its connection closing, not by the next check. Only a
+        // connection whose registration went is closed, so a narrower reach closes only its own.
+        self.fence_network_connections().await;
         Ok(Some(captured.into_keys().collect()))
     }
 

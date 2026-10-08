@@ -91,7 +91,10 @@ impl Controller {
             }
             None => self.sharing.revoke(grant_id, now_ms, || Ok(()), claim)?,
         };
-        let own = self.publish_debts(&Self::host_wide(revocation.debt));
+        let own = self.publish_debts(&Self::under_the_grants(
+            revocation.debt,
+            &revocation.revoked,
+        ));
         self.complete_revocation(revocation.revoked.iter().copied().collect(), own)
             .await
     }
@@ -101,6 +104,17 @@ impl Controller {
         debt: Option<crate::grants::store::DebtId>,
     ) -> Vec<(crate::grants::store::DebtId, Reach)> {
         debt.into_iter().map(|debt| (debt, Reach::Host)).collect()
+    }
+
+    /// A revocation's debt, when it wrote one, as one that reaches the connections acting under
+    /// the grants it withdrew and no others.
+    fn under_the_grants(
+        debt: Option<crate::grants::store::DebtId>,
+        revoked: &[kr_protocol::ids::GrantId],
+    ) -> Vec<(crate::grants::store::DebtId, Reach)> {
+        debt.into_iter()
+            .map(|debt| (debt, Reach::Grants(revoked.iter().copied().collect())))
+            .collect()
     }
 
     /// Revokes every grant one device holds, then revokes the device itself.
@@ -264,7 +278,10 @@ impl Controller {
                 .transfer_control(plan, confirmation, &PairingTime, revision, now_ms);
         self.settle_floor();
         let transfer = transfer?;
-        let own = self.publish_debts(&Self::host_wide(transfer.revoked.debt));
+        let own = self.publish_debts(&Self::under_the_grants(
+            transfer.revoked.debt,
+            &transfer.revoked.revoked,
+        ));
         let completed = self
             .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), own)
             .await?;
