@@ -500,7 +500,7 @@ fn results_that_disagree_with_themselves_are_refused() {
             .contains("no case under it failed")
     );
     // A case reported twice.
-    let mut repeated = value.clone();
+    let mut repeated: serde_json::Value = serde_json::from_str(&tree).expect("JSON");
     let suite = repeated
         .pointer_mut("/testNodes/0/children/0/children/0/children")
         .and_then(|children| children.as_array_mut())
