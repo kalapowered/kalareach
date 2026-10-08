@@ -2397,6 +2397,203 @@ fn a_pass_sends_to_the_destination_its_claim_validated() {
     );
 }
 
+/// A secret store that stops the first read made while it is armed until the test lets it go,
+/// which is how a test holds a pass in the middle of reading a credential.
+struct SecretsThatCanBeHeld {
+    inner: kr_crypto::store::MemoryStore,
+    armed: std::sync::atomic::AtomicBool,
+    reading: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl kr_crypto::store::SecretStore for SecretsThatCanBeHeld {
+    fn set(&self, name: &kr_crypto::store::SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
+        self.inner.set(name, secret)
+    }
+
+    fn get(
+        &self,
+        name: &kr_crypto::store::SecretName,
+    ) -> kr_crypto::Result<Option<kr_crypto::secret::SecretVec>> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.reading
+                .lock()
+                .expect("not poisoned")
+                .send(())
+                .expect("the test is waiting");
+            self.release
+                .lock()
+                .expect("not poisoned")
+                .recv()
+                .expect("the test lets the read go");
+        }
+        self.inner.get(name)
+    }
+
+    fn delete(&self, name: &kr_crypto::store::SecretName) -> kr_crypto::Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn describe(&self) -> String {
+        "a store a test can hold".to_owned()
+    }
+}
+
+/// Grants what `Granted` does until the test takes the grant away.
+#[derive(Debug)]
+struct Revocable {
+    revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecipientAuthority for Revocable {
+    fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+        (!self.revoked.load(std::sync::atomic::Ordering::SeqCst))
+            .then(|| Granted(BTreeSet::new()).scope())
+    }
+
+    fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+        (!self.revoked.load(std::sync::atomic::Ordering::SeqCst))
+            .then(|| Granted(BTreeSet::new()).scope())
+    }
+}
+
+/// KR-REQ-25.23: a message to an external destination is sent only while its recipient's grant
+/// stands, and the grant is asked again after the credential is read from the secret store, which
+/// can take as long as the store does. A grant that ends while the credential is being read sends
+/// nothing and says why. The control is the same pass with the grant left standing, which sends.
+#[test]
+fn a_grant_that_ends_while_a_credential_is_read_sends_nothing() {
+    for revoked_meanwhile in [false, true] {
+        let (reading, reads) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let store = Arc::new(SecretsThatCanBeHeld {
+            inner: kr_crypto::store::MemoryStore::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            reading: Mutex::new(reading),
+            release: Mutex::new(released),
+        });
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        let module = DeliveryModule::open_at(
+            &path,
+            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            kr_controller::push::secrets::DestinationSecrets::new(
+                Arc::clone(&store) as Arc<dyn kr_crypto::store::SecretStore>,
+                kr_protocol::ids::EnvironmentId::new(uuid(0xee)),
+            ),
+        )
+        .expect("a delivery module");
+        let environment = Environment {
+            module,
+            device_preview: kr_crypto::keys::NotificationPreviewKeyPair::generate()
+                .expect("a keypair"),
+            _directory: directory,
+            path,
+        };
+        let id = DestinationId::new("chat").expect("an identifier");
+        environment
+            .module
+            .store_secret(
+                &id,
+                &kr_protocol::delivery::DestinationSecret::Slack {
+                    webhook_url: kr_protocol::delivery::SecretText::new(
+                        "https://hooks.slack.com/services/T000/B000/not-a-real-hook",
+                    )
+                    .expect("a credential"),
+                },
+            )
+            .expect("the credential is kept");
+        let destination = DestinationRecord {
+            id,
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Slack,
+                endpoint: "#alerts".to_owned(),
+                idempotency: Idempotency::Unsupported,
+                credential: None,
+            }),
+            rule: Some(DeliveryRule {
+                name: "on a failed command".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(NOW),
+        };
+        environment
+            .module
+            .configure(&destination)
+            .expect("a destination");
+        // Configuration writes the stamp of the credential kept, so the notification is admitted
+        // for the record as it was stored.
+        let destination = environment
+            .module
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .destination(&destination.id)
+                    .expect("a read"))
+            })
+            .expect("a read")
+            .expect("the destination");
+        take_and_produce(
+            &environment,
+            &notice(1, "a command failed"),
+            std::slice::from_ref(&destination),
+            1,
+        );
+
+        let external = ExternalDouble::answering(Vec::new());
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority = Revocable {
+            revoked: Arc::clone(&revoked),
+        };
+        store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let pass = scope.spawn(|| {
+                environment
+                    .module
+                    .run_due(
+                        &GatewayDouble::queued(),
+                        &GatewayDouble::queued(),
+                        &held(NOW + 30 * 24 * 60 * 60 * 1000),
+                        &external,
+                        &authority,
+                        &at(NOW),
+                    )
+                    .expect("a pass")
+            });
+            reads
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the pass is reading the credential");
+            if revoked_meanwhile {
+                revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            release.send(()).expect("the pass is waiting");
+            pass.join().expect("the pass finished");
+        });
+
+        let record = environment
+            .module
+            .with(|producer| Ok(producer.journal().deliveries().expect("a read").remove(0)))
+            .expect("a read");
+        if revoked_meanwhile {
+            assert!(external.sent().is_empty(), "nothing is sent");
+            assert_eq!(record.state, DeliveryState::Revoked);
+            assert!(
+                record
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("recipient's authority")),
+                "{:?}",
+                record.detail
+            );
+        } else {
+            assert_eq!(external.sent().len(), 1, "the control sends");
+            assert_eq!(record.state, DeliveryState::Accepted);
+        }
+    }
+}
+
 /// A rotation neither store will take changes neither of them: section 16 keeps one replaced key,
 /// so a rotation while an earlier replacement still has notifications outstanding is refused, and
 /// the device directory is left at the revision it held.

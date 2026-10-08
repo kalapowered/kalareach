@@ -1192,7 +1192,7 @@ impl DeliveryModule {
                     clock,
                 )?;
             } else {
-                self.attempt_external(&claimed, &record, external, now_ms, clock)?;
+                self.attempt_external(&claimed, &record, external, authority, now_ms, clock)?;
             }
         }
         Ok(attempted)
@@ -1550,6 +1550,7 @@ impl DeliveryModule {
         delivery: &ClaimedDelivery,
         record: &DestinationRecord,
         external: &dyn ExternalSender,
+        authority: &dyn RecipientAuthority,
         now_ms: u64,
         clock: &dyn Clock,
     ) -> Result<()> {
@@ -1599,6 +1600,17 @@ impl DeliveryModule {
         };
         let message = client::message_from(&delivery.content)?;
         let attempt = delivery.attempt;
+        // The recipient's authority is asked once more, after the credential is read: the secret
+        // store can take as long as it takes, and a grant that ended or a device that was unpaired
+        // meanwhile stops the message here, the last time anything is asked before it is sent.
+        if !self.authority_still_holds(record, delivery, authority) {
+            return self.settle(
+                delivery,
+                DeliveryState::Revoked,
+                "the recipient's authority is not the one this was admitted under",
+                clock.now_ms().max(now_ms),
+            );
+        }
         // Presented only under an admission of the generation this was admitted under, held until
         // the answer is recorded.
         let Some(_admission) = self.admitted(delivery) else {
