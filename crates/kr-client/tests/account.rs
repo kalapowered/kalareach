@@ -1459,6 +1459,10 @@ struct FaultyStore {
     session: Mutex<SessionWrite>,
     /// For each next write of the revocation queue, whether it is refused; none left means writes work.
     queue_plan: Mutex<VecDeque<bool>>,
+    /// For each next read of the session item, whether it fails; none left means reads work.
+    session_reads: Mutex<VecDeque<bool>>,
+    /// Whether the next write of the revocation queue lands and then reports a failure.
+    queue_lands: std::sync::atomic::AtomicBool,
 }
 
 impl FaultyStore {
@@ -1467,7 +1471,18 @@ impl FaultyStore {
             inner: MemoryStore::new(),
             session: Mutex::new(SessionWrite::Works),
             queue_plan: Mutex::new(VecDeque::new()),
+            session_reads: Mutex::new(VecDeque::new()),
+            queue_lands: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Has the next write of the revocation queue install its contents and then report a failure.
+    fn queue_write_lands_then_fails(&self) {
+        self.queue_lands.store(true, Ordering::SeqCst);
+    }
+
+    fn session_reads(&self, failing: &[bool]) {
+        *self.session_reads.lock().expect("the plan") = failing.iter().copied().collect();
     }
 
     fn session_next(&self, write: SessionWrite) {
@@ -1517,10 +1532,26 @@ impl SecretStore for FaultyStore {
             }
         }
         self.queue_write_allowed(name)?;
+        if name.as_str().ends_with("account/revoke")
+            && self.queue_lands.swap(false, Ordering::SeqCst)
+        {
+            self.inner.set(name, secret)?;
+            return Err(refused());
+        }
         self.inner.set(name, secret)
     }
 
     fn get(&self, name: &SecretName) -> kr_crypto::Result<Option<kr_crypto::secret::SecretVec>> {
+        if name.as_str().ends_with("account/session")
+            && self
+                .session_reads
+                .lock()
+                .expect("the plan")
+                .pop_front()
+                .unwrap_or(false)
+        {
+            return Err(refused());
+        }
         self.inner.get(name)
     }
 
@@ -1569,17 +1600,31 @@ async fn a_commit_that_cannot_write_the_new_grant_leaves_the_old_one_whole() {
         .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
         .await
         .expect("A");
+    assert_eq!(
+        queue_text(&store),
+        None,
+        "nothing is queued before the commit"
+    );
     store.session_next(SessionWrite::Refused);
     signed_in
         .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
         .await
         .expect_err("the new grant cannot be written");
+    assert_eq!(
+        queue_text(&store),
+        None,
+        "the queue is as the failed commit found it: it holds nothing of A"
+    );
 
     // Ending a token that was never kept sends the queue too. The queue holds nothing of A.
-    signed_in
-        .revoke_unkept(RefreshToken::new("grant-b").expect("a token"))
-        .await
-        .expect("the token is sent");
+    assert_eq!(
+        signed_in
+            .revoke_unkept(RefreshToken::new("grant-b").expect("a token"))
+            .await
+            .expect("the token is sent"),
+        0,
+        "nothing is left waiting"
+    );
     assert_eq!(stub.revoked(), ["grant-b"], "A's token was not sent");
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
     assert!(matches!(
@@ -1663,6 +1708,83 @@ async fn a_grant_whose_queue_could_not_be_put_back_is_not_ended_while_it_is_held
         restarted.status().expect("a status"),
         AccountStatus::SignedOut
     );
+}
+
+/// A queue write that fails at its last step, after its contents are in place, does not leave the
+/// replaced grant's entry behind when the grant write never starts: the queue is put back, so a full
+/// queue gets its oldest entry back and the old grant is not signed out at the next start.
+#[tokio::test]
+async fn a_queue_write_that_lands_and_then_fails_is_given_back_whole() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    assert_eq!(queue_text(&store), None);
+    // The write of A's entry installs its contents and then reports a failure; putting the queue back
+    // works. (The test store applies a refused queue write after the fact when it is told to.)
+    store.queue_write_lands_then_fails();
+    signed_in
+        .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+        .await
+        .expect_err("the queue cannot be written");
+    assert_eq!(
+        queue_text(&store),
+        None,
+        "the queue is as the failed commit found it"
+    );
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    let restarted = account_on(&stub, &store);
+    assert_eq!(restarted.recover().await.expect("a recovery"), 0);
+    assert!(
+        matches!(
+            restarted.status().expect("a status"),
+            AccountStatus::SignedIn { .. }
+        ),
+        "A is still signed in at the next start"
+    );
+    assert!(stub.revoked().is_empty(), "nothing was sent");
+}
+
+/// When the new grant's write fails and the store then cannot be read to say which grant it holds,
+/// the queue stays as it stands, with the replaced grant's revocation in it: that is the one state in
+/// which no token is lost. If the new grant did land, the replaced one is ended at the next send; if
+/// it did not, the replaced one is held, and a send does not end it.
+#[tokio::test]
+async fn a_commit_whose_result_cannot_be_read_keeps_the_replaced_grants_revocation() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    // The write of B lands and reports a failure, and the next read of the session item fails (the
+    // commit's first read, before the write, is the one that works).
+    store.session_next(SessionWrite::LandsThenFails);
+    store.session_reads(&[false, true]);
+    signed_in
+        .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+        .await
+        .expect_err("the result cannot be read");
+    let kept = queue_text(&store).expect("the queue was left as it stood");
+    assert!(
+        kept.contains("grant-a"),
+        "A's revocation is still owed: {kept}"
+    );
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-b"));
+    // B is what the store holds, so the next send ends A: no token is lost.
+    signed_in
+        .revoke_unkept(RefreshToken::new("grant-c").expect("a token"))
+        .await
+        .expect("the token is sent");
+    assert_eq!(stub.revoked(), ["grant-a", "grant-c"]);
 }
 
 /// A write that fails at its last step, after the new grant is in place, is the commit: the queue
