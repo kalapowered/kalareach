@@ -105,6 +105,10 @@ describe('allowing voice for the first time', () => {
     const result = await screen.findByTestId('voice-grant-result')
     expect(result).toHaveTextContent('Allowed, except compose prompt')
     expect(screen.queryByRole('button', { name: 'Start voice session' })).toBeNull()
+    // What was granted is what is shown: the sessions can no longer be changed under the result,
+    // and the way on has the focus.
+    for (const box of screen.getAllByRole('checkbox')) expect(box).toBeDisabled()
+    expect(screen.getByTestId('voice-grant-continue')).toHaveFocus()
     await userEvent.click(screen.getByTestId('voice-grant-continue'))
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
   })
