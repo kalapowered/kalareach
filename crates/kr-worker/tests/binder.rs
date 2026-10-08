@@ -2043,7 +2043,12 @@ fn kr_req_23_30_a_component_action_is_waited_for_until_its_component_is_register
         };
         worker
             .broker
-            .prepare_request(&caller, binding(1), &params)
+            .prepare_request(
+                &caller,
+                kr_protocol::ids::ActionId::new(Uuid::from_bytes([1; 16])),
+                binding(1),
+                &params,
+            )
             .expect_err("no component is registered to prepare it")
     };
 

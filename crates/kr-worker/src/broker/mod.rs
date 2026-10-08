@@ -266,6 +266,8 @@ pub struct Binding {
     pub revocation_disabled: bool,
     /// The component its package ships, as the admissions named it when the binding was made.
     pub component: Option<component::BoundComponent>,
+    /// How the package contributes attachments, as its manifest declares it, where it does.
+    pub attachments: Option<kr_plugin_sdk::effect::AttachmentContribution>,
 }
 
 impl Binding {
@@ -832,6 +834,8 @@ pub struct Broker {
     /// How a component is asked to prepare an action: the plugin runtime's client, once the link
     /// has one, and the bound on how many preparations are under way.
     component_calls: Arc<prepare::ComponentCalls>,
+    /// What this worker asks the control daemon about drafts.
+    drafts: Arc<crate::daemon_link::Drafts>,
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
     #[cfg(feature = "testing")]
     recovery_pause: Mutex<Option<RecoveryPause>>,
@@ -966,6 +970,7 @@ impl Broker {
             recorder: Mutex::new(recorder),
             description_facts: std::sync::OnceLock::new(),
             component_calls: Arc::new(prepare::ComponentCalls::new()),
+            drafts: Arc::new(crate::daemon_link::Drafts::new()),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -1511,6 +1516,7 @@ impl Broker {
             connector_digest: None,
             revocation_disabled: false,
             component: None,
+            attachments: None,
         };
         let record = binding.record(now);
         state.stored(now, "binding a component", |ledger| {

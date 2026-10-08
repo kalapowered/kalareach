@@ -31,8 +31,12 @@ use kr_plugin_service::vocabulary::BindingId;
 use kr_protocol::admission::ComponentState;
 use kr_protocol::agent::PluginActionInvokeParams;
 use kr_protocol::broker::{PreparedEffect, PreparedOperation};
-use kr_protocol::ids::BrokerBindingId;
-use kr_protocol::scalars::{Digest256, Nullable};
+use kr_protocol::ids::{ActionId, ActorId, BrokerBindingId, TransferId};
+use kr_protocol::insertion::{DraftFacts, InsertionBegin};
+use kr_protocol::scalars::{Digest256, Nullable, U64};
+use kr_protocol::transfer::{DraftState, InsertionMethod, InsertionState};
+
+use crate::daemon_link::{ClaimHold, ReportSlot};
 
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::methods::{Caller, RegisteredAction};
@@ -91,7 +95,7 @@ impl ComponentCalls {
 }
 
 /// What the first pass of an action established, which preparing it needs.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PreparationRequest {
     /// The binding whose component prepares the action.
     pub binding_id: BrokerBindingId,
@@ -105,6 +109,22 @@ pub struct PreparationRequest {
     pub argument_hash: Digest256,
     /// The invocation's authority, as the component reads it.
     pub token: WireToken,
+    /// What an action that offers an attachment to the agent needs besides.
+    pub draft: Option<DraftNeeds>,
+}
+
+/// What an action that offers an attachment from a draft needs to be prepared: the actor it is for,
+/// the action that owns the claim, what the package contributes, the attachment the invocation
+/// names, and the place its report will take.
+#[derive(Debug)]
+pub struct DraftNeeds {
+    actor: ActorId,
+    action_id: ActionId,
+    contribution: kr_plugin_sdk::effect::AttachmentContribution,
+    application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+    transfer_id: TransferId,
+    /// Taken by the claim, which is the only thing that uses it.
+    slot: std::sync::Mutex<Option<ReportSlot>>,
 }
 
 /// What preparation hands the second pass.
@@ -118,6 +138,8 @@ pub struct Preparation {
     pub draft: Option<DraftSnapshot>,
     /// The effect to compare, or why there is none.
     pub effect: Result<PreparedEffect>,
+    /// The offer the control daemon claimed for the action, until the action reports it.
+    pub claim: Option<ClaimHold>,
 }
 
 /// Where a binding's component stands, as an action meets it.
@@ -164,6 +186,32 @@ impl Standing {
 }
 
 impl Broker {
+    /// Returns what this worker asks the control daemon about drafts.
+    #[must_use]
+    pub fn drafts(&self) -> Arc<crate::daemon_link::Drafts> {
+        Arc::clone(&self.drafts)
+    }
+
+    /// Records how the package of one binding contributes attachments, as its manifest declares
+    /// it. A binding made from a package has this from its manifest; this is for a binding made
+    /// without one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such binding.
+    pub fn register_attachments(
+        &self,
+        binding_id: BrokerBindingId,
+        attachments: Option<kr_plugin_sdk::effect::AttachmentContribution>,
+    ) -> Result<()> {
+        self.state()
+            .bindings
+            .get_mut(&binding_id)
+            .ok_or_else(|| crate::broker::unknown_binding(binding_id))?
+            .attachments = attachments;
+        Ok(())
+    }
+
     /// Returns the handle the plugin runtime's link publishes its connection through.
     #[must_use]
     pub fn component_calls(&self) -> Arc<ComponentCalls> {
@@ -202,10 +250,11 @@ impl Broker {
     pub fn prepare_request(
         &self,
         caller: &Caller,
+        action_id: ActionId,
         binding_id: BrokerBindingId,
         params: &PluginActionInvokeParams,
     ) -> Result<PreparationRequest> {
-        let (declared, standing) = {
+        let (declared, standing, attachments) = {
             let held = self.state();
             let binding = held
                 .bindings
@@ -224,6 +273,7 @@ impl Broker {
             (
                 declared,
                 Standing::of(binding, held.component_states.get(&binding_id)),
+                binding.attachments.clone(),
             )
         };
         if !declared.component {
@@ -232,15 +282,22 @@ impl Broker {
                 params.action
             )));
         }
-        if declared.needs_draft {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "{} acts on a draft, and this worker does not read drafts from the control \
-                     daemon yet",
-                    params.action
-                ),
-            });
-        }
+        let encoded = Self::executable_arguments(params)?;
+        let invocation = read_arguments(&declared, &encoded)?;
+        // What an action that offers an attachment needs is settled before the component's
+        // standing, because what can only be mended by a change is said before what can pass.
+        let draft = if declared.needs_draft {
+            Some(self.draft_needs(
+                caller,
+                action_id,
+                params,
+                &declared,
+                &invocation,
+                attachments.as_ref(),
+            )?)
+        } else {
+            None
+        };
         let action = &params.action;
         match standing {
             Standing::Registered => {}
@@ -267,8 +324,6 @@ impl Broker {
                 detail: "the plugin runtime is not connected".to_owned(),
             });
         }
-        let encoded = Self::executable_arguments(params)?;
-        let invocation = read_arguments(&declared, &encoded)?;
         let hash = Digest256::from_bytes(kr_cbor::sha256(&encoded));
         let token = WireToken {
             actor_id: caller.actor_id.to_string(),
@@ -289,27 +344,211 @@ impl Broker {
             arguments: invocation.iter().map(wire_argument_of).collect(),
             argument_hash: hash,
             token,
+            draft,
+        })
+    }
+
+    /// Checks what an action that offers an attachment needs before the component is asked.
+    ///
+    /// The package must contribute attachments by an upload to the upstream (the only way a worker
+    /// offers one), the action must declare the one parameter that names the attachment, this
+    /// worker must have a control daemon to read the draft from, and a place for the report of the
+    /// offer must be free.
+    fn draft_needs(
+        &self,
+        caller: &Caller,
+        action_id: ActionId,
+        params: &PluginActionInvokeParams,
+        declared: &RegisteredAction,
+        invocation: &[ActionArgument],
+        attachments: Option<&kr_plugin_sdk::effect::AttachmentContribution>,
+    ) -> Result<DraftNeeds> {
+        use kr_plugin_sdk::effect::AttachmentInsertion;
+        let action = &params.action;
+        if !params.draft_id.is_present() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("{action} acts on a draft and this call named none"),
+            });
+        }
+        let contribution = attachments.ok_or_else(|| BrokerError::UnsupportedCapability {
+            detail: format!(
+                "{action} offers an attachment and its package declares no attachments"
+            ),
+        })?;
+        if contribution.insertion != AttachmentInsertion::UpstreamUpload {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "{action}'s package inserts an attachment by {:?}, and a worker offers one only \
+                     by an upload to the upstream",
+                    contribution.insertion
+                ),
+            });
+        }
+        let mut handles = declared
+            .parameters
+            .parameters
+            .iter()
+            .filter(|parameter| matches!(parameter.kind, ParameterKind::AttachmentHandle {}));
+        let (Some(parameter), None) = (handles.next(), handles.next()) else {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!("{action} declares no single parameter that names its attachment"),
+            });
+        };
+        let named = invocation
+            .iter()
+            .find(|argument| argument.name == parameter.name)
+            .and_then(|argument| match &argument.value {
+                ArgumentValue::AttachmentHandle { handle } => Some(handle.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                BrokerError::invalid(format!("{action} names no attachment to offer"))
+            })?;
+        let transfer_id = named.parse::<TransferId>().map_err(|_| {
+            BrokerError::invalid(format!("{named} is not the identifier of an attachment"))
+        })?;
+        if self.drafts.link().is_none() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: "this worker has no control daemon to read a draft from".to_owned(),
+            });
+        }
+        let slot = self
+            .drafts
+            .reserve()
+            .ok_or_else(|| BrokerError::ResourceUnavailable {
+                detail: "reports of earlier offers are still waiting for the control daemon"
+                    .to_owned(),
+            })?;
+        Ok(DraftNeeds {
+            actor: caller.actor_id.clone(),
+            action_id,
+            contribution: contribution.clone(),
+            application_instance_id: params.target.subject.application_instance_id,
+            transfer_id,
+            slot: std::sync::Mutex::new(Some(slot)),
         })
     }
 
     /// Asks the component to prepare the action, and compares what it proposes with the
     /// invocation and the declaration.
     ///
-    /// Nothing here is held across the call: not this broker's lock, not the session's.
-    pub async fn prepare(&self, request: &PreparationRequest, within: Duration) -> Preparation {
-        let effect = self.propose(request, within).await;
+    /// An action that offers an attachment first reads the draft from the control daemon and checks
+    /// the binding against what its package declares; and once the plan is the invocation's own,
+    /// and only if `still_accepted` says the action has not been cancelled or fenced meanwhile, it
+    /// claims the binding for the offer. The claim is last, so that everything that can refuse the
+    /// action has refused it before a binding is marked.
+    ///
+    /// One bound covers all of it, from the read of the draft to the claim.
+    ///
+    /// Nothing here is held across a call: not this broker's lock, not the session's.
+    pub async fn prepare(
+        &self,
+        request: &PreparationRequest,
+        within: Duration,
+        still_accepted: &(dyn Fn() -> bool + Sync),
+    ) -> Preparation {
+        let until = tokio::time::Instant::now() + within.min(PREPARATION_DEADLINE);
+        let mut claim = None;
+        let mut snapshot = None;
+        let effect = async {
+            // The attempt the binding was at when the draft was read: the claim is made for it, so a
+            // binding bound again since is a claim the daemon refuses.
+            let mut attempt = None;
+            if let Some(needs) = request.draft.as_ref() {
+                attempt = Some(self.read_draft(needs, request, until).await?);
+            }
+            let effect = self.propose(request, until).await?;
+            if let (Some(needs), Some(attempt)) = (request.draft.as_ref(), attempt) {
+                if !still_accepted() {
+                    return Err(BrokerError::PreconditionFailed {
+                        detail: format!(
+                            "{} was cancelled or revoked while it was prepared",
+                            request.params.action
+                        ),
+                    });
+                }
+                let (hold, facts) = self.claim_draft(needs, request, attempt, until).await?;
+                snapshot = Some(DraftSnapshot {
+                    draft_id: facts.draft_id,
+                    revision: U64::new(facts.revision.get()),
+                });
+                claim = Some(hold);
+            }
+            Ok(effect)
+        }
+        .await;
         Preparation {
             binding_id: request.binding_id,
             declared: request.declared.clone(),
-            draft: None,
+            draft: snapshot,
             effect,
+            claim,
         }
+    }
+
+    /// Reads the draft the invocation names and checks that the binding it offers is the one its
+    /// package declares an offer for.
+    async fn read_draft(
+        &self,
+        needs: &DraftNeeds,
+        request: &PreparationRequest,
+        until: tokio::time::Instant,
+    ) -> Result<U64> {
+        let draft_id = request.params.draft_id.as_ref().copied().ok_or_else(|| {
+            BrokerError::PreconditionFailed {
+                detail: "this call named no draft".to_owned(),
+            }
+        })?;
+        let facts = self
+            .drafts
+            .facts(&needs.actor, draft_id, left_until(until))
+            .await?;
+        check_declared_attachment(needs, &facts, &request.params.action)
+    }
+
+    /// Claims the binding for the offer, and holds the claim until the action reports it.
+    async fn claim_draft(
+        &self,
+        needs: &DraftNeeds,
+        request: &PreparationRequest,
+        attempt: U64,
+        until: tokio::time::Instant,
+    ) -> Result<(ClaimHold, DraftFacts)> {
+        let draft_id = request.params.draft_id.as_ref().copied().ok_or_else(|| {
+            BrokerError::PreconditionFailed {
+                detail: "this call named no draft".to_owned(),
+            }
+        })?;
+        let slot = needs
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: "the place for this action's report was already used".to_owned(),
+            })?;
+        let begin =
+            InsertionBegin {
+                action_id: needs.action_id,
+                draft_id,
+                transfer_id: needs.transfer_id,
+                attempt,
+                max_count: U64::new(u64::from(needs.contribution.max_count.get())),
+                deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms().saturating_add(
+                    u64::try_from(left_until(until).as_millis()).unwrap_or(u64::MAX),
+                )),
+            };
+        let (hold, claimed) = self
+            .drafts
+            .begin(&needs.actor, slot, begin, left_until(until))
+            .await?;
+        Ok((hold, claimed.facts))
     }
 
     async fn propose(
         &self,
         request: &PreparationRequest,
-        within: Duration,
+        until: tokio::time::Instant,
     ) -> Result<PreparedEffect> {
         let client =
             self.component_calls
@@ -319,8 +558,6 @@ impl Broker {
                 })?;
         // One bound for the whole of it: the wait for a place and the call both spend the time
         // that is left, and the token the component is given expires with it.
-        let deadline = within.min(PREPARATION_DEADLINE);
-        let until = tokio::time::Instant::now() + deadline;
         let place = tokio::time::timeout_at(
             until,
             Arc::clone(&self.component_calls.running).acquire_owned(),
@@ -505,6 +742,104 @@ fn wire_argument_of(argument: &ActionArgument) -> WireNamedArgument {
     }
 }
 
+/// What is left of a bound.
+fn left_until(until: tokio::time::Instant) -> Duration {
+    until.saturating_duration_since(tokio::time::Instant::now())
+}
+
+/// Checks the draft against what the action's package declares it offers: the draft is open, is
+/// for the instance the call names, holds the attachment as a binding nothing has claimed yet, and
+/// the binding is what the package's contribution accepts.
+fn check_declared_attachment(
+    needs: &DraftNeeds,
+    facts: &DraftFacts,
+    action: &kr_protocol::broker::ActionName,
+) -> Result<U64> {
+    let contribution = &needs.contribution;
+    let moved = |detail: String| BrokerError::PreconditionFailed { detail };
+    if facts.state != DraftState::Open {
+        return Err(moved(format!(
+            "{action} acts on a draft that is {}",
+            facts.state.as_str()
+        )));
+    }
+    if let Some(named) = facts.application_instance_id.as_ref()
+        && *named != needs.application_instance_id
+    {
+        return Err(moved(format!(
+            "{action} acts on a draft for another application instance"
+        )));
+    }
+    let binding = facts
+        .bindings
+        .iter()
+        .find(|binding| binding.transfer_id == needs.transfer_id)
+        .ok_or_else(|| {
+            BrokerError::invalid(format!(
+                "{} is not bound to the draft {action} acts on",
+                needs.transfer_id
+            ))
+        })?;
+    if binding.state != InsertionState::Recorded {
+        return Err(moved(format!(
+            "{} is {} on the draft, and only a recorded binding is offered",
+            needs.transfer_id,
+            binding.state.as_str()
+        )));
+    }
+    if binding.insertion_method != InsertionMethod::TypedSubmission {
+        return Err(moved(format!(
+            "{} was recorded to be inserted by {}, which is not how this package offers it",
+            needs.transfer_id,
+            binding.insertion_method.as_str()
+        )));
+    }
+    if facts.bindings.len() as u64 > u64::from(contribution.max_count.get()) {
+        return Err(moved(format!(
+            "the package accepts {} attachments and the draft holds {}",
+            contribution.max_count.get(),
+            facts.bindings.len()
+        )));
+    }
+    if binding.byte_len.get() > contribution.max_bytes.get() {
+        return Err(BrokerError::invalid(format!(
+            "the package accepts {} bytes of an attachment and this one is {}",
+            contribution.max_bytes.get(),
+            binding.byte_len.get()
+        )));
+    }
+    let media_type = binding.media_type.to_ascii_lowercase();
+    let accepted = contribution.accepted_media_types.iter().any(|accepted| {
+        let accepted = accepted.to_ascii_lowercase();
+        accepted.strip_suffix("/*").map_or_else(
+            || accepted == media_type,
+            |family| {
+                media_type
+                    .split_once('/')
+                    .is_some_and(|(kind, _)| kind == family)
+            },
+        )
+    });
+    if !accepted {
+        return Err(BrokerError::invalid(format!(
+            "the package does not accept {} as an attachment",
+            binding.media_type
+        )));
+    }
+    let declared = contribution
+        .external_destination
+        .as_ref()
+        .map(|label| label.as_str());
+    if binding.external_destination.as_ref().map(String::as_str) != declared {
+        return Err(moved(format!(
+            "the attachment was recorded to go to {:?} and the package declares {:?}",
+            binding.external_destination.as_ref(),
+            declared
+        )));
+    }
+    Ok(binding.attempt)
+}
+
 /// Builds the effect to compare from the invocation, refusing a plan that disagrees with it.
 ///
 /// The worker checks what only it can see: that the plan is for the action invoked, that it is of
@@ -550,7 +885,20 @@ fn effect_of(plan: &WirePlan, request: &PreparationRequest) -> Result<PreparedEf
             PreparedOperation::UpstreamSubmit
         }
         WireOperation::UpstreamCancel => PreparedOperation::UpstreamCancel,
-        WireOperation::UpstreamAttachment { .. } => PreparedOperation::UpstreamAttachment,
+        WireOperation::UpstreamAttachment { attachment_id } => {
+            let named = request
+                .draft
+                .as_ref()
+                .map(|needs| needs.transfer_id.to_string());
+            if named.as_deref() != Some(attachment_id.as_str()) {
+                return Err(BrokerError::invalid(format!(
+                    "the component's plan for {action} offers {attachment_id}, and the \
+                     invocation names {}",
+                    named.as_deref().unwrap_or("no attachment")
+                )));
+            }
+            PreparedOperation::UpstreamAttachment
+        }
         WireOperation::TerminalText(_) => PreparedOperation::TerminalText,
         WireOperation::Present => {
             return Err(BrokerError::invalid(format!(

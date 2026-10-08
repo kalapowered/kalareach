@@ -43,9 +43,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use kr_ipc::endpoint::Connection;
-use kr_ipc::framed::split;
-use kr_ipc::paths::{Endpoint, EnvironmentPaths};
+use kr_ipc::paths::EnvironmentPaths;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::ids::RepositoryGeneration;
@@ -58,11 +56,7 @@ use kr_protocol::admission::{
     ComponentState, PluginRuntimeState, PluginRuntimeUnavailable, PluginRuntimeWanted,
 };
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::frame::StreamKind;
-use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::ids::{BrokerBindingId, SessionId};
-use kr_protocol::local::{LocalClientKind, LocalHello};
-use kr_protocol::scalars::CanonicalSet;
 
 use crate::broker::Broker;
 use crate::broker::component::ComponentWant;
@@ -558,54 +552,17 @@ impl Link {
 
     /// One request to the control daemon's rendezvous endpoint, and its answer.
     async fn ask(&self) -> Result<PluginRuntimeState, String> {
-        let exchange = async {
-            let endpoint =
-                Endpoint::from_path(&self.request.rendezvous).map_err(|error| error.to_string())?;
-            let connection = Connection::connect(&endpoint)
-                .await
-                .map_err(|error| error.to_string())?;
-            let (mut reader, mut writer) = split(connection, StreamKind::Control);
-            writer
-                .write_message(&ControlFrame::Hello(LocalHello {
-                    offered_versions: vec![PROTOCOL_VERSION],
-                    build_id: crate::build_id(),
-                    client: LocalClientKind::Worker,
-                    capabilities: CanonicalSet::new(),
-                    max_receive: ReceiveLimits::default(),
-                    origin: None,
-                }))
-                .await
-                .map_err(|error| error.to_string())?;
-            let acknowledged: ControlFrame = reader
-                .read_message()
-                .await
-                .map_err(|error| error.to_string())?;
-            if !matches!(acknowledged, ControlFrame::HelloAck(_)) {
-                return Err("the control daemon did not acknowledge the request".to_owned());
-            }
-            writer
-                .write_message(&ControlFrame::PluginRuntimeWanted(PluginRuntimeWanted {
-                    session_id: self.request.session_id,
-                }))
-                .await
-                .map_err(|error| error.to_string())?;
-            let answer: ControlFrame = reader
-                .read_message()
-                .await
-                .map_err(|error| error.to_string())?;
-            match answer {
-                ControlFrame::PluginRuntimeState(state) => Ok(state),
-                _ => Err("the control daemon answered with something else".to_owned()),
-            }
-        };
-        match tokio::time::timeout(ASK_DEADLINE, exchange).await {
-            Ok(answer) => {
-                answer.map_err(|why| format!("the control daemon could not be asked: {why}"))
-            }
-            Err(_elapsed) => Err(format!(
-                "the control daemon did not answer within {} seconds",
-                ASK_DEADLINE.as_secs()
-            )),
+        let wanted = ControlFrame::PluginRuntimeWanted(PluginRuntimeWanted {
+            session_id: self.request.session_id,
+        });
+        match crate::daemon_link::exchange(&self.request.rendezvous, wanted, ASK_DEADLINE).await {
+            Ok(ControlFrame::PluginRuntimeState(state)) => Ok(state),
+            Ok(_) => Err(
+                "the control daemon could not be asked: the control daemon answered with \
+                 something else"
+                    .to_owned(),
+            ),
+            Err(why) => Err(format!("the control daemon could not be asked: {why}")),
         }
     }
 }
