@@ -370,6 +370,10 @@ impl<'a> Writer<'a> {
     /// cell pushes its neighbours along the row. None of that is corrected by repositioning
     /// afterwards, so all of it is cleared before the first cell and the session's own is put back
     /// after the last.
+    ///
+    /// A hyperlink the destination had open when the frame began is closed too. The writer opens
+    /// only the links the session holds, and a link it did not open would otherwise be the one
+    /// every cell it draws belongs to.
     fn begin(&mut self) {
         self.mode(ORIGIN_MODE, false);
         self.mode(LEFT_RIGHT_MARGINS, false);
@@ -385,6 +389,7 @@ impl<'a> Writer<'a> {
         // the last row, for the application that may write to this terminal itself.
         self.out.extend_from_slice(b"\x1b(B\x1b)B");
         self.out.push(SHIFT_IN);
+        self.close_link();
     }
 
     /// Puts the session's own autowrap and geometry back and places the cursor.
@@ -1487,6 +1492,10 @@ struct Destination {
     g1: char,
     /// Whether G1 is the set in use.
     shifted: bool,
+    /// Whether a hyperlink is open, so that a cell drawn now belongs to it.
+    link_open: bool,
+    /// How many cells were drawn inside an open hyperlink.
+    linked: usize,
 }
 
 #[cfg(test)]
@@ -1511,6 +1520,8 @@ impl Destination {
             g0: 'B',
             g1: 'B',
             shifted: false,
+            link_open: false,
+            linked: 0,
         }
     }
 
@@ -1551,13 +1562,21 @@ impl Destination {
                         }
                         Some(']') => {
                             // A string, consumed to its terminator. Nothing a colour or a title
-                            // command does can move a cell.
+                            // command does can move a cell; a link command decides which cells
+                            // belong to a link.
                             let mut previous = '\0';
+                            let mut string = String::new();
                             for next in chars.by_ref() {
                                 if next == '\u{7}' || (previous == '\u{1b}' && next == '\\') {
                                     break;
                                 }
+                                string.push(next);
                                 previous = next;
+                            }
+                            if let Some(link) = string.strip_prefix("8;") {
+                                // `params;target`, and an empty target closes the link.
+                                let target = link.split_once(';').map_or("", |(_, target)| target);
+                                self.link_open = !target.trim_end_matches('\u{1b}').is_empty();
                             }
                         }
                         Some('D') | Some('E') | Some('M') => self.scrolled = true,
@@ -1774,6 +1793,9 @@ impl Destination {
                 }
                 if let Some(cell) = row.get_mut(self.column) {
                     *cell = cluster;
+                }
+                if self.link_open {
+                    self.linked += 1;
                 }
                 for offset in 1..width {
                     if let Some(cell) = row.get_mut(self.column + offset) {
@@ -2278,50 +2300,50 @@ mod fixtures {
 
     /// The SHA-256 of each frame [`every_frame_is_the_bytes_the_painter_writes`] paints.
     const FRAMES: &[&str] = &[
-        "emoji_then_ascii install f2de8a108314cc6c12a04f0cc04567683439001d5e7816dc5c77adb749eff907",
-        "emoji_then_ascii install-nothing e96e7f8739b6f0c36d9525b79829ecf67eb68694ccf52b16f8dc28d457ecf22e",
-        "emoji_then_ascii update 85bc95ef7a5031b34a8bc815a80f8c8595011e87efe4fb2207c83f8fb488b0a9",
-        "emoji_then_ascii update-rows 1668007387cc6d0a491d34e403107584bcd18563ed57b7653acd1b54603027c5",
-        "right_margin_splits_a_wide_cluster install 8520efa740775e48f6794a229270aeb96f51f8e332000a1531d346bf9026e9dc",
-        "right_margin_splits_a_wide_cluster install-nothing c9a6a41729faccd12e946a8a9e7bffd6987fe063d90a4ae658ea557f5520c579",
-        "right_margin_splits_a_wide_cluster update f02db9d13504e59dd95b417a09868940fe19d8886583f9bbedb821fd503ff3b1",
-        "right_margin_splits_a_wide_cluster update-rows fde3a3d620b81a3be02e2fd0e9d2cc8d922a5ccbc1d2089a156fea556a482599",
-        "left_margin_splits_a_wide_cluster install bc313677463edc464d6e0a6cde209a420fbac932b8df8372783a884c23421ad4",
-        "left_margin_splits_a_wide_cluster install-nothing 419fbe27dcc282e192a2c3bf42e889e42f7320aa7c24c03aec800213a0b354cf",
-        "left_margin_splits_a_wide_cluster update 8a171c0b9744c223c3010b9dbd2425f30465cd8dbf7dfc0c7becda368965e55c",
-        "left_margin_splits_a_wide_cluster update-rows b3151db334dd9cb266bd3a3b29710c602d1e1b8cc4228c28b7aee6885bce8f7a",
-        "the_last_column_and_a_delayed_wrap install 7728c8630db2c51848196ca738268a9584085ec77a16ac10586ea2d28dbb80f0",
-        "the_last_column_and_a_delayed_wrap install-nothing 01ecf8fd3f7fecaf562e6841df073a6af5b3bb0ad9907708bb90f2ae711d63a2",
-        "the_last_column_and_a_delayed_wrap update 74c99a9b23bf952a5675dd002f173050d59fcf4826d24c57cbe52972d83f19f4",
-        "the_last_column_and_a_delayed_wrap update-rows 43c6e0089c66d32aaca9dffed3d581a25e857bf2b2bf0a52bd42e60d0f30ed75",
-        "the_bottom_row_scrolls_without_scrolling_the_destination install 359be8653c538543eb1bb6eae3a873c0dd652bc67ca5f6175229a7496aae27bd",
-        "the_bottom_row_scrolls_without_scrolling_the_destination install-nothing cd9b24b2b9c975521535319babadff9c6651356d30137000bf7ccdd36b0d07e8",
-        "the_bottom_row_scrolls_without_scrolling_the_destination update b52c293176f84948d23556a9255668ea984fd911d36513585a602c46d1d3bae9",
-        "the_bottom_row_scrolls_without_scrolling_the_destination update-rows c1205bd420028864e84bfe9ca677a36ae089cf28287dba2c6ae7a01a164fb099",
-        "a_width_disagreement_is_rejected install 4cf587e0ecce961d23903030b979e0afcdf5ecfe663121539524bd715511337a",
-        "a_width_disagreement_is_rejected install-nothing 1a62caf8fd3ae213d9c55a57a81fb1782beb5714a6640bf7fbccd8e242c54ff2",
-        "a_width_disagreement_is_rejected update 93a8b76814cd5d2c99539c0ce6dc88dae62685b251c78941ae03b3710180f8b8",
-        "a_width_disagreement_is_rejected update-rows c090b85f4a149b16084598f6d947fd4e1139cdc95e8de981d4adbb1905798903",
-        "a_cursor_outside_the_window_is_hidden install f0856040bf06a080ff5c5e032999d576614e0bd94baea9e8b496b71f3967a7a9",
-        "a_cursor_outside_the_window_is_hidden install-nothing 265941860f308db411361b2efdde77282cf3c48b8bd8ae347fd6c686c5b12a8e",
-        "a_cursor_outside_the_window_is_hidden update da6945461a98cb8554c58d6033a463d312b07dc852283c1cd7e66e25508864a4",
-        "a_cursor_outside_the_window_is_hidden update-rows 8c30ade96697fdcdfbec252c2aa79ad9beb5ca6fde6804f6f4c5cc8c25a92d50",
-        "a_row_clears_what_was_on_the_line install e3e5f0293df1f4970145e868c15c25f0a1e489d7c87564a0998a8240a22d88a8",
-        "a_row_clears_what_was_on_the_line install-nothing b0f654b268d094e1701b7162d34603819cc45fa1d0f0986e770d9011e6dd0435",
-        "a_row_clears_what_was_on_the_line update 32259689f49de720049a0a2b0c2c9c356f5e1548136c426ac49172100bb905bb",
-        "a_row_clears_what_was_on_the_line update-rows cb6170cbd151c8b91d87e187b400fdf0d68e437a794b372cd57bef8011e74c10",
-        "edges install cdaddf95bd3752cf8be7129f9e2b2dcc3b01326fc659484d92ea8e3b7d770d11",
-        "edges install-nothing e58e8464d05d2fd50f5aeb6474b048d407dbf2fa1893fa9f4b5c7cda4c424a78",
-        "edges update 84479a9e5209613cdffb6b8bddab2ad6c76b701251add1aa0541fd978dc92fe2",
-        "edges update-rows efd00f8c0b73b0530237a475a3410549d4ca056d5aef7efef7c0a8dbef60f615",
-        "styled install c098012df4ff8efdeaa352e8176e113a6a9d9509a8e9c2b9413ed3879d78986b",
-        "styled install-nothing 621c30aaf3506f1e4e63cf2abc4c453f7305b0c229083ce722b225ebc96a693a",
-        "styled update d009c8fc97e0447edc9f427c715c6dfc719a49dac1dd9dfe4f0086c62c9e116d",
-        "styled update-rows 0f9af589d5e2dd7f7f8b5acfaceec5726f2db6ccb09adb0ca3981a7e3f392009",
-        "overlap install 9c6534b8f6eb1eddc90d09989bb6933c54b459e535a69e7a508064ee0a0509cb",
-        "overlap install-nothing 894a5b439ff2643d74888cd1a0848ff2434647f5fbd786231990abed42ffa4f0",
-        "overlap update d727110534e1438c782a857dd154730fb5749d8f2867853bfea2470e0ae72719",
-        "overlap update-rows a1fd8719ae9e2f32d473a9ec4992c2800ee1e8af84183812b8ce956cdcc00adb",
+        "emoji_then_ascii install 430e86851b7433589c990c65f2a6b0b5218434ee940e3710c8016c08a1902e6b",
+        "emoji_then_ascii install-nothing 470ee9e8d7912448149949039d531ab68c3fb6c6643c0759cbd03cffc2d6edc7",
+        "emoji_then_ascii update e5af3bd2e25ae9a50b0729b22d6eb5376e8641add8e7e809ae101a74f21be6b5",
+        "emoji_then_ascii update-rows 4c2eaab36bac776e68987ba5bd12d7f784dd153caf901ce10fa84202eea13a5e",
+        "right_margin_splits_a_wide_cluster install ae1bc707229fa7922bc75e30849565993ef7c40e2d22e5d5c6232496d056f8ff",
+        "right_margin_splits_a_wide_cluster install-nothing 16598f9c681e2d091b0651b3ddc880c0c09e530d25791fe55b58c490ac6febc4",
+        "right_margin_splits_a_wide_cluster update 6c339326a29cabdd78a729dbd134a9fbfbc64f09bf6c54c88a7fc93c5cdffdc3",
+        "right_margin_splits_a_wide_cluster update-rows 97f20ca96e1d27db9e5c3b8499a49d9964a7b50ed2c7aca0d2d9a4060d4742bd",
+        "left_margin_splits_a_wide_cluster install 74a455a0f4106fc13d60ac5c8309a35a7eb04d1de8136f91e7420058246272ab",
+        "left_margin_splits_a_wide_cluster install-nothing b11303fe023fe020648a05bc5996cb30f20340e9191b1cd8db11b33ef5465214",
+        "left_margin_splits_a_wide_cluster update 8ca7fdcba3def72fb3d58c5811dca2d057a021d259d6779342d5c42107e8e998",
+        "left_margin_splits_a_wide_cluster update-rows 1dab4a2c76372c1cc4ad26f2867b80ad356c317d1b4711b9d0599d8968541d7c",
+        "the_last_column_and_a_delayed_wrap install 1135aa14bf59f295c17b5ad29278268e66934029fd581947f66e0e51000e7d97",
+        "the_last_column_and_a_delayed_wrap install-nothing 6e761deb9219c8042c532376ab1ff3f02c77f37a5b9132430417e5bd0d23a778",
+        "the_last_column_and_a_delayed_wrap update 0109e866d22226ba0cc81e0a2f2a9ef743b89142ce02994f932d0a281480cd57",
+        "the_last_column_and_a_delayed_wrap update-rows 1e226ef9133509ffd56f370084b4faba0cce29bb27c5b7fc51d51b731b79326c",
+        "the_bottom_row_scrolls_without_scrolling_the_destination install 806684b365cc09d090d7addff56ed9bff77aa2c974317404aa49c9100c6b367f",
+        "the_bottom_row_scrolls_without_scrolling_the_destination install-nothing 9b8939640107a9ac0504827032576ed1578115993b18bd26889108f4065528ad",
+        "the_bottom_row_scrolls_without_scrolling_the_destination update 084f3d80a01e55ae290e3431be904b12e59c11a75414a0991761bbe2f3106049",
+        "the_bottom_row_scrolls_without_scrolling_the_destination update-rows 4164370bad719d319ef5962116fef752be4b5c30cc4832193a903a840557ef9e",
+        "a_width_disagreement_is_rejected install d7806c1113833f7f11035caba189f4dd9cd302ceae8db4eef274ec6b060ea17e",
+        "a_width_disagreement_is_rejected install-nothing 165db5a98a855486935a01e9cf233a5db6c837a58aec74a74689a45d792c7011",
+        "a_width_disagreement_is_rejected update 01f0d61ce1293ef8d037523af046d50ce6e5a1e643504a35ed180dde573037f7",
+        "a_width_disagreement_is_rejected update-rows f48ccc7aceebe034335b11d70042768e1cfbdcd8d67417d0dea72e9ff84eeced",
+        "a_cursor_outside_the_window_is_hidden install 157bd2c1f2ca9e54cca848fdc43b6b3ab29ca3d5f732f4eb2c0d14a0a6dde2a3",
+        "a_cursor_outside_the_window_is_hidden install-nothing aaf12f0b58cbe684b54047f8320b471162e8950d7069e5d8bd5e9fc267761d64",
+        "a_cursor_outside_the_window_is_hidden update 17c20a41ce5757a092385a3da195830f10c9c3e9cfb263bc0dd947273ec70e51",
+        "a_cursor_outside_the_window_is_hidden update-rows 9367c1f0bf2804da3412f406f0b7306f44727a7c3c235c0aeb16e4be834bfa12",
+        "a_row_clears_what_was_on_the_line install 4705ef54693825d71822daecac0e5e736e1f8a6490e9e80aa03917b2c472cf05",
+        "a_row_clears_what_was_on_the_line install-nothing cf3dd1cf5ecbd51012b404a206b16b29eadb644be7ad4494bdd291e6b8f4890c",
+        "a_row_clears_what_was_on_the_line update d957a8bcb1515acae3a8046833922fcf841bcc74fd9a6ea5b22683e4015f834e",
+        "a_row_clears_what_was_on_the_line update-rows 1d73de7b64ed211e14df662588f39599cfc078317da31d5e6c8efcf8ce78d4cd",
+        "edges install f41d39ede549e64c234a2f35c74ebf71d5390de80cbb31253603b098507a2d75",
+        "edges install-nothing bd9a45af2e51121386063d912ac348c1bab4e3529ec9cf6c65dcc5e78a4e713a",
+        "edges update 072bc7367d0827c250bdcb3152ee7432fdf234cc5f78978441964926f65d71a1",
+        "edges update-rows 390960d486b1645e4f8d5861a761767803f003071b8df8531f71f385a2286bb5",
+        "styled install b07663e8df849d5a7eb835717e84f334a6dd89e415805aa11564cb53c7ccff42",
+        "styled install-nothing bf4e79508428c662b6e01cf7b061b5ef1fda99588b3c2668f189b20c103a2ee5",
+        "styled update 5be6e59ec052d3eb05da26918b02b992e2e8381e55ebea65437013fcb384e78f",
+        "styled update-rows 0663453f93c14c4aa1c8e8ae94d8a3ea4bfb5dc07bdd5130a1d3df643127d2b1",
+        "overlap install 0e132bc368345c7b294462ebf815429f5be405e9ebe3ccdd09b97956c3753e8e",
+        "overlap install-nothing 67e35ea0e399c73df37e8f792ed0b032197e65315f3ab0edc463f4a709ad31c9",
+        "overlap update 0a88704335dd745de740ac2bb2c0196652ea761c28cb4cca252ef853252e5598",
+        "overlap update-rows ee94a2da938ff933d8f75218fda897ad3417ed7ce85f10fef8a5cc1706ebf976",
     ];
 
     /// A screen with a scroll region of its own, and origin mode on.
@@ -2655,6 +2677,73 @@ mod fixtures {
             drawn[..opened].contains("read"),
             "and the run before it was drawn outside the link"
         );
+    }
+
+    /// KR-ACC-002: a frame draws outside a link the destination already had open.
+    ///
+    /// A destination that was being forwarded the stream a moment ago can have a link open that
+    /// the application opened. A frame that did not close it first would draw every cell it writes
+    /// inside that link, and a person activating any of them would follow the application's
+    /// target. Only the cells the session holds a link over are inside one, and the destination
+    /// is not left with one open.
+    #[test]
+    fn a_frame_draws_outside_a_link_the_destination_already_had_open() {
+        let case = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 1, "columns": 12},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 4, "text": "read"},
+                {"column": 4, "cells": 4, "text": "here"},
+                {"column": 8, "cells": 4, "text": "then"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (mut screen, window) = screen_of(&case);
+        let inherited = "\u{1b}]8;;https://earlier.invalid/\u{1b}\\";
+        for (name, linked_run, linked_cells) in
+            [("no link in the session", false, 0), ("one", true, 4)]
+        {
+            if linked_run && let Some(row) = screen.rows.get_mut(&(ProjectedBuffer::Primary, 0)) {
+                row.runs[1].hyperlink = kr_protocol::scalars::Nullable::some(link_to(
+                    "https://example.invalid/guide",
+                    "",
+                ));
+            }
+            let visible = screen.visible_rows();
+            for (pass, painted) in [
+                ("installed", install(&screen, window, Keyboard::NOTHING)),
+                (
+                    "updated with state",
+                    update(&screen, window, &visible, true, Keyboard::NOTHING),
+                ),
+                (
+                    "updated with rows alone",
+                    update(&screen, window, &visible, false, Keyboard::NOTHING),
+                ),
+            ] {
+                let mut destination = Destination::new(1, 12);
+                destination.feed(inherited.as_bytes());
+                assert!(
+                    destination.link_open,
+                    "{name} ({pass}): the destination starts inside the application's link"
+                );
+                destination.feed(&painted.bytes);
+                assert_eq!(
+                    destination.cells[0].concat(),
+                    "readherethen",
+                    "{name} ({pass}): every cell was drawn"
+                );
+                assert_eq!(
+                    destination.linked,
+                    linked_cells,
+                    "{name} ({pass}): only the cells the session links are inside a link: {}",
+                    String::from_utf8_lossy(&painted.bytes).escape_debug()
+                );
+                assert!(
+                    !destination.link_open,
+                    "{name} ({pass}): and no link is left open"
+                );
+            }
+        }
     }
 
     /// KR-REQ-08.29: two links to one target are two links on the terminal a frame is drawn into.
