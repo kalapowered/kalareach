@@ -23,7 +23,7 @@ use kr_client::shown;
 use kr_client::shown::Shown;
 use std::path::{Path, PathBuf};
 
-use kr_client::services::account::{scope_names, scope_words};
+use kr_client::services::account::{BACKUP_WRITE_SCOPE, scope_names, scope_words};
 use kr_client::services::voice::{
     ACCOUNT_TOKEN_FILE_LIMIT, StoredAccountToken, VOICE_SCOPE, account_token_path,
 };
@@ -48,13 +48,16 @@ pub struct Imported {
     pub expires_at_ms: Option<u64>,
     /// True when it carries the scope managed voice needs.
     pub carries_voice_scope: bool,
+    /// True when it carries the scope managed backup storage needs.
+    pub carries_backup_scope: bool,
 }
 
 kr_client::debug_fields!(Imported {
     scopes,
     unknown_scopes,
     expires_at_ms,
-    carries_voice_scope
+    carries_voice_scope,
+    carries_backup_scope
 });
 
 impl Imported {
@@ -87,6 +90,12 @@ impl Imported {
                 VOICE_SCOPE
             ));
         }
+        if !self.carries_backup_scope {
+            lines.push(shown!(
+                "Managed backup storage needs the {} scope, which this token does not carry.",
+                BACKUP_WRITE_SCOPE
+            ));
+        }
         lines
     }
 
@@ -101,6 +110,7 @@ impl Imported {
             .with("unknown_scopes", self.unknown_scopes)
             .with("expires_at_ms", self.expires_at_ms)
             .with("carries_voice_scope", self.carries_voice_scope)
+            .with("carries_backup_scope", self.carries_backup_scope)
     }
 }
 
@@ -238,6 +248,7 @@ pub fn import_into(source: &Path, runtime_root: &Path) -> Result<Imported> {
         unknown_scopes,
         expires_at_ms: stored.expires_at_ms,
         carries_voice_scope: stored.carries(VOICE_SCOPE),
+        carries_backup_scope: stored.carries(BACKUP_WRITE_SCOPE),
     })
 }
 
@@ -301,6 +312,11 @@ mod tests {
 
         let imported = import_into(&source, root.path()).expect("the token is imported");
         assert!(imported.carries_voice_scope);
+        assert!(!imported.carries_backup_scope);
+        assert!(
+            written(&imported.lines()).contains("backup.write"),
+            "a token without the scope backup storage needs says so"
+        );
         assert_eq!(imported.origin.as_str(), "https://reach.example");
 
         // Nothing a person or a script reads carries the value.
