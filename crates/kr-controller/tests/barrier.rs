@@ -146,7 +146,7 @@ async fn worker() -> Worker {
     worker_serving(false).await
 }
 
-/// As [`worker`], with the worker's session runtime and connections on a runtime of their own, as
+/// As [`worker`], with the worker's session runtime and connections on runtimes of their own, as
 /// [`hosted_worker_apart`] has them.
 async fn worker_apart() -> Worker {
     worker_serving(true).await
@@ -386,11 +386,12 @@ impl Pause {
 /// kills nothing.
 ///
 /// In production the worker is its own process; here its session runtime and its connections run
-/// on a runtime of their own, so isolating it blocks the tasks of that runtime that want the
-/// session and cannot stop the threads that serve this test. With the worker on this test's
-/// runtime, a task of the session that woke while the session was held (its monitor wakes on every
-/// child process this test binary's other cases end) could stop the thread that drives the
-/// runtime's sockets, and the announcement would never be read.
+/// on runtimes of their own, apart from each other, so isolating it blocks the session's tasks that
+/// want the session on the threads of the runtime they run on, and stops neither the threads that
+/// serve this test nor the ones that serve the connection. With them on one runtime, a task of the
+/// session that woke while the session was held (its monitor wakes on every child process this
+/// test binary's other cases end) could block the thread a connection's task had been made
+/// runnable on, and the announcement that task was to read would go unread until the hold ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_resumes() {
     let worker = worker_apart().await;
@@ -1958,8 +1959,8 @@ async fn hosted_worker_apart() -> Hosted {
 
 /// Creates one more session through `daemon` and performs the worker's side of the rendezvous in
 /// this process, so the daemon has one more verified worker it can announce to. The worker's
-/// session runtime, and the connections the worker serves, run on this test's runtime, or on a
-/// runtime of their own when `apart`.
+/// session runtime, and the connections the worker serves, run on this test's runtime, or on
+/// runtimes of their own when `apart`.
 async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
     let environment = daemon.environment.clone();
     let environment_id = daemon.environment_id;
@@ -2164,83 +2165,143 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
     }
 }
 
-/// A worker whose session runtime and connections run on a runtime of their own, on a thread of
-/// their own, as a worker's do in its own process. It ends, with its runtime, when this is dropped.
+/// A worker whose session runtime and connections run apart from this test's runtime, as a worker's
+/// do in its own process, and apart from each other. It ends, with its runtimes, when this is
+/// dropped.
 ///
-/// A case holds one of the worker's tasks for seconds, where the product's worker holds the
-/// boundary for one transition at a time, so this worker's runtime is kept polling ([`Awake`]) and
-/// a product worker's need not be.
+/// The session's own tasks (its monitor wakes on every child process that ends in this test
+/// binary, and each wakes into a wait for the session) run on a runtime of their own, and the
+/// connections on another. A case holds the session for seconds, where a worker's process holds it
+/// for one operation, and the task that waits for it blocks the thread it runs on. A task made
+/// runnable on a thread and then left behind by a task that blocks it waits in that thread's run
+/// slot, where no other thread of the runtime takes it from, until the block ends: on one runtime a
+/// connection's task could wait there for as long as the hold lasted, and the announcement it was
+/// to read would go unread. Only the connections' runtime serves a connection, and nothing on it
+/// waits for the session but the announcement the case is about.
 struct ApartWorker {
-    /// The thread that keeps the runtime polling, ended before the runtime is told to stop.
+    /// The thread that keeps the connections' runtime polling, ended before that runtime is told to
+    /// stop.
     awake: Option<Awake>,
+    connections: Option<Apart>,
+    session: Option<Apart>,
+}
+
+/// A runtime on a thread of its own, which runs until this is dropped.
+struct Apart {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+impl Apart {
+    /// Starts a runtime of `threads` threads named `name` on a thread of its own, and runs `serve`
+    /// on it with that runtime's handle. `serve` ends when the runtime is stopped.
+    fn start<F, Fut>(name: &'static str, threads: usize, serve: F) -> Self
+    where
+        F: FnOnce(tokio::runtime::Handle, tokio::sync::oneshot::Receiver<()>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let apart = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(threads)
+                    .thread_name(name)
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the worker");
+                let handle = apart.handle().clone();
+                apart.block_on(serve(handle, stopped));
+            })
+            .expect("a thread for the worker's runtime");
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+
+    /// Ends the runtime and waits for it, so the worker is gone when the tree under it is removed;
+    /// a runtime that has not ended in ten seconds is left to end on its own.
+    fn end(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let waiting = std::time::Instant::now();
+            while !thread.is_finished() && waiting.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
 impl ApartWorker {
-    /// Starts `session`'s runtime and a service for it on a runtime of their own, bound at
-    /// `endpoint` before this returns.
+    /// Starts `session`'s runtime on a runtime of its own, and a service for it on another, bound
+    /// at `endpoint` before this returns.
     async fn start(
         session: Session,
         identity: Arc<WorkerIdentity>,
         endpoint: kr_ipc::paths::Endpoint,
         binding: ServiceBinding,
     ) -> (Arc<SessionRuntime>, Arc<WorkerService>, Self) {
-        let (ready, started) = tokio::sync::oneshot::channel();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            let apart = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .build()
-                .expect("a runtime for the worker");
-            let handle = apart.handle().clone();
-            apart.block_on(async move {
-                let runtime = Arc::new(
-                    SessionRuntime::start(
-                        session,
-                        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
-                    )
-                    .expect("starts the runtime"),
-                );
-                let service = Arc::new(
-                    WorkerService::new(Arc::clone(&runtime), identity, endpoint.clone(), binding)
-                        .expect("a worker service"),
-                );
-                let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
-                let _ = ready.send((Arc::clone(&runtime), Arc::clone(&service), handle));
-                tokio::select! {
-                    _ = service.serve(listener) => {}
-                    _ = stopped => {}
-                }
-            });
+        let (made, session_made) = tokio::sync::oneshot::channel();
+        let session_apart = Apart::start("apart-session", 2, move |_, stopped| async move {
+            let runtime = Arc::new(
+                SessionRuntime::start(
+                    session,
+                    std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+                )
+                .expect("starts the runtime"),
+            );
+            let _ = made.send(Arc::clone(&runtime));
+            let _ = stopped.await;
         });
-        let (runtime, service, handle) = started.await.expect("the worker starts");
+        let runtime = session_made.await.expect("the session starts");
+
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let served = Arc::clone(&runtime);
+        let connections = Apart::start("apart-worker", 4, move |handle, stopped| async move {
+            let service = Arc::new(
+                WorkerService::new(served, identity, endpoint.clone(), binding)
+                    .expect("a worker service"),
+            );
+            let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
+            let _ = ready.send((Arc::clone(&service), handle));
+            tokio::select! {
+                _ = service.serve(listener) => {}
+                _ = stopped => {}
+            }
+        });
+        let (service, handle) = started.await.expect("the worker starts");
         (
             runtime,
             service,
             Self {
                 awake: Some(Awake::start(handle)),
-                stop: Some(stop),
-                thread: Some(thread),
+                connections: Some(connections),
+                session: Some(session_apart),
             },
         )
     }
 }
 
-/// What keeps a worker's runtime reading its sockets and firing its timers while one of its tasks
-/// is stopped: a thread that hands the runtime a task every few milliseconds, for as long as the
-/// worker lives.
+/// What keeps a worker's connections' runtime reading its sockets and firing its timers while one
+/// of its tasks is stopped: a thread that hands the runtime a task every few milliseconds, for as
+/// long as the worker lives.
 ///
-/// A worker task that waits, inside a pause or for a lock, holds a thread of the runtime it runs
-/// on, as the worker's own process would hold one of its own. When that is the thread that was
-/// reading the runtime's sockets and every other thread is asleep, nothing reads a socket or fires
-/// a timer until it comes back: the daemon's announcement would sit unread until the daemon's own
-/// bound on the exchange ran out, and a case that waits for the worker to refuse it would be
-/// waiting for the release it has not yet given. A task handed to the runtime from outside wakes a
-/// sleeping thread, which polls the sockets and timers when it goes to sleep again. A task comes
-/// every few milliseconds, which is far inside the daemon's exchange bound; a thread of the runtime
-/// has to be free to take it, and a case never stops more than three of the four.
+/// A task of that runtime that waits, inside a pause or for a lock, holds a thread of it, as the
+/// worker's own process would hold one of its own. When that is the thread that was reading the
+/// runtime's sockets and every other thread is asleep, nothing reads a socket or fires a timer
+/// until it comes back: the daemon's announcement would sit unread until the daemon's own bound on
+/// the exchange ran out, and a case that waits for the worker to refuse it would be waiting for the
+/// release it has not yet given. A task handed to the runtime from outside wakes a sleeping thread,
+/// which polls the sockets and timers when it goes to sleep again. A task comes every few
+/// milliseconds, which is far inside the daemon's exchange bound; a thread of the runtime has to be
+/// free to take it, and on this runtime only the announcement a case is about waits for the session
+/// or the boundary.
 struct Awake {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -2276,17 +2337,13 @@ impl Drop for Awake {
 impl Drop for ApartWorker {
     fn drop(&mut self) {
         drop(self.awake.take());
-        drop(self.stop.take());
-        // Waited for, so the worker is gone when the tree under it is removed; a worker that has
-        // not ended in ten seconds is left to end on its own.
-        if let Some(thread) = self.thread.take() {
-            let waiting = std::time::Instant::now();
-            while !thread.is_finished() && waiting.elapsed() < Duration::from_secs(10) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-            }
+        // The connections first: they hold the session's runtime, and a connection that was
+        // waiting for the session is let go of when this is dropped, not before.
+        if let Some(connections) = self.connections.as_mut() {
+            connections.end();
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.end();
         }
     }
 }
@@ -2296,7 +2353,7 @@ impl Drop for ApartWorker {
 /// barrier reported pending in the meantime, and no affected undispatched action executed.
 ///
 /// The worker is held for the daemon's whole round, which is as long as the daemon bounds its
-/// steps, and the worker's session runtime and connections run on a runtime of their own for it,
+/// steps, and the worker's session runtime and connections run on runtimes of their own for it,
 /// so that the worker's stopped tasks cannot stop this runtime's threads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_through_the_daemon_holds_only_once_the_isolated_worker_has_fenced() {
