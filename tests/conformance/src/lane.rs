@@ -388,7 +388,9 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
         let mut parentheses = 0_i32;
         let mut declared = None;
         while let Some(word) = words.next() {
-            if parentheses > 0 || word.starts_with('@') {
+            // A quoted name after an annotation's `@` is part of the annotation; the masker leaves
+            // its closing backtick as a word of its own.
+            if parentheses > 0 || word.starts_with('@') || word.starts_with('`') {
                 parentheses += i32::try_from(word.matches('(').count()).unwrap_or(0)
                     - i32::try_from(word.matches(')').count()).unwrap_or(0);
                 continue;
@@ -434,12 +436,13 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
     Ok(found)
 }
 
-/// The source with every comment, string, character literal and quoted identifier blanked out, each newline kept: what
-/// is left is code, so a brace or a keyword in it is one. Block comments nest (Java's do not, and no
-/// lane holds a Java file). A triple-quoted string spans lines; a Kotlin one has no escapes, and a
-/// Swift one does. A Swift raw string (`#"..."#`) ends at its own number of `#`, and an expression
-/// interpolated into a string (`\(...)` in Swift, `${...}` in Kotlin) is blanked with the strings
-/// and comments inside it.
+/// The source with every comment, string, character literal and quoted identifier blanked out, each
+/// newline kept: what is left is code, so a brace or a keyword in it is one. A quoted identifier
+/// keeps its closing backtick, so that what follows `class` is not read as a name. Block comments
+/// nest (Java's do not, and no lane holds a Java file). A triple-quoted string spans lines; a
+/// Kotlin one has no escapes, and a Swift one does. A Swift raw string (`#"..."#`) ends at its own
+/// number of `#`, and an expression interpolated into a string (`\(...)` in Swift, `${...}` in
+/// Kotlin) is blanked with the strings and comments inside it.
 fn mask(source: &str, swift: bool) -> String {
     let mut masker = Masker {
         chars: source.chars().collect(),
@@ -478,7 +481,7 @@ impl Masker {
     }
 
     /// One piece of code: a character it keeps, or a comment, string, literal or quoted identifier
-    /// it blanks.
+    /// it blanks (a quoted identifier keeps its closing backtick).
     fn code(&mut self) {
         if !self.blanked() {
             self.out.push(self.chars[self.at]);
@@ -487,7 +490,7 @@ impl Masker {
     }
 
     /// Blanks a comment, string, literal or quoted identifier that starts here, and says whether
-    /// there was one.
+    /// there was one. A quoted identifier keeps its closing backtick.
     fn blanked(&mut self) -> bool {
         let c = self.chars[self.at];
         if self.swift && c == '#' && self.raw_string() {
@@ -741,6 +744,11 @@ mod tests {
         assert!(error.contains("line 2"), "{error}");
         assert!(declared_classes("A.kt", "class `Login test` {\n}\n").is_err());
         assert!(declared_classes("A.kt", "class\nA {\n}\n").is_err());
+        // A quoted annotation name before `class` is part of the annotation.
+        assert_eq!(
+            declared_classes("A.kt", "@`Slow` class FooTest {}\n").expect("readable"),
+            ["FooTest"]
+        );
         // The words around a class that are not a name stay as they were.
         assert_eq!(
             declared_classes("A.swift", "nonisolated final class B: XCTestCase {}\n")
