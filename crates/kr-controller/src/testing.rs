@@ -3,7 +3,14 @@
 //! Compiled for this crate's own tests and with the `testing` feature, which no build this product
 //! ships enables.
 
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Notify;
+
+use crate::quiet::Timer;
 
 use crate::error::{ControllerError, Result};
 
@@ -40,6 +47,131 @@ where
             outcome => return outcome,
         }
         tokio::time::sleep(RETRY_INTERVAL).await;
+    }
+}
+
+/// The wait between two passes of a carrier, held by the test.
+///
+/// Each wait the daemon asks for is recorded with its length and goes on only when the test
+/// releases it, or at once once the test lets the timer run by itself. A timer that runs by itself
+/// releases the waits it already holds as well, because the daemon may have asked for one the test
+/// has not looked at.
+///
+/// The clock a delay the service named is counted against stands still too, until the test moves
+/// it, so what is left of a delay is exactly what the test made it, however long the test takes.
+#[derive(Debug)]
+pub struct HeldTimer {
+    automatic: AtomicBool,
+    waits: Mutex<Vec<Held>>,
+    asked: Notify,
+    now: Mutex<std::time::Instant>,
+}
+
+impl Default for HeldTimer {
+    fn default() -> Self {
+        Self {
+            automatic: AtomicBool::new(false),
+            waits: Mutex::default(),
+            asked: Notify::new(),
+            now: Mutex::new(std::time::Instant::now()),
+        }
+    }
+}
+
+/// One wait the daemon asked for.
+#[derive(Debug)]
+struct Held {
+    duration: Duration,
+    release: Arc<Notify>,
+    /// Whether the test has taken it from [`HeldTimer::next_wait`].
+    taken: bool,
+}
+
+impl Timer for HeldTimer {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // The flag and the list are read and changed under one lock, so a wait is either released
+        // by the test or held for it, never both missed.
+        let mut waits = self.waits.lock().expect("the waits");
+        if self.automatic.load(Ordering::SeqCst) {
+            return Box::pin(tokio::task::yield_now());
+        }
+        let release = Arc::new(Notify::new());
+        waits.push(Held {
+            duration,
+            release: Arc::clone(&release),
+            taken: false,
+        });
+        drop(waits);
+        self.asked.notify_one();
+        Box::pin(async move { release.notified().await })
+    }
+
+    fn now(&self) -> std::time::Instant {
+        *self.now.lock().expect("the clock")
+    }
+}
+
+impl HeldTimer {
+    /// A timer that lets every wait end at once.
+    pub fn automatic() -> Arc<Self> {
+        let timer = Arc::new(Self::default());
+        timer.automatic.store(true, Ordering::SeqCst);
+        timer
+    }
+
+    /// A timer that holds every wait until the test releases it.
+    pub fn held() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The next wait the daemon asked for that the test has not looked at, with the means to let
+    /// it end.
+    pub async fn next_wait(&self) -> (Duration, Arc<Notify>) {
+        loop {
+            let asked = self.asked.notified();
+            if let Some(held) = self
+                .waits
+                .lock()
+                .expect("the waits")
+                .iter_mut()
+                .find(|held| !held.taken)
+            {
+                held.taken = true;
+                return (held.duration, Arc::clone(&held.release));
+            }
+            asked.await;
+        }
+    }
+
+    /// Moves the clock a delay is counted against.
+    pub fn advance(&self, by: Duration) {
+        *self.now.lock().expect("the clock") += by;
+    }
+
+    /// Every wait the daemon has asked for so far.
+    pub fn asked_for(&self) -> Vec<Duration> {
+        self.waits
+            .lock()
+            .expect("the waits")
+            .iter()
+            .map(|held| held.duration)
+            .collect()
+    }
+
+    /// Lets every wait held now end, and holds those to come.
+    pub fn release_held(&self) {
+        for held in self.waits.lock().expect("the waits").iter() {
+            held.release.notify_one();
+        }
+    }
+
+    /// Lets every wait, those held and those to come, end at once.
+    pub fn run_by_itself(&self) {
+        let waits = self.waits.lock().expect("the waits");
+        self.automatic.store(true, Ordering::SeqCst);
+        for held in waits.iter() {
+            held.release.notify_one();
+        }
     }
 }
 
