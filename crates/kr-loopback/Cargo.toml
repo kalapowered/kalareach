@@ -1,0 +1,36 @@
+[package]
+name = "kr-loopback"
+description = "KalaReach's loopback listener: the address a desktop sign-in's answer comes back to"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The registered redirect the listener's answers are expressed as.
+kr-client.workspace = true
+# The listener reads one request and writes one page.
+tokio = { workspace = true, features = ["io-util", "net"] }
+tracing.workspace = true
+
+# Windows binds the loopback listener with SO_EXCLUSIVEADDRUSE, which needs the socket before it
+# binds and one Winsock call.
+[target.'cfg(windows)'.dependencies]
+socket2 = "=0.6.5"
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+url.workspace = true
+
+# The workspace forbids unsafe code, which one platform call cannot honour: the Windows loopback
+# listener's SO_EXCLUSIVEADDRUSE is a Winsock call with a raw pointer to the value. This crate
+# denies unsafe code and allows it on exactly that function, `exclusive`. Nothing else here may
+# relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

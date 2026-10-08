@@ -1235,12 +1235,10 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "socket2",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.20",
  "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1256,6 +1254,7 @@ dependencies = [
  "kr-crypto",
  "kr-describe",
  "kr-ipc",
+ "kr-loopback",
  "kr-pairing",
  "kr-protocol",
  "kr-transport",
@@ -4583,6 +4582,18 @@ dependencies = [
  "tokio",
  "uuid",
  "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "kr-loopback"
+version = "0.1.0"
+dependencies = [
+ "kr-client",
+ "socket2",
+ "tokio",
+ "tracing",
+ "url",
  "windows-sys 0.61.2",
 ]
 

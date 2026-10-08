@@ -152,7 +152,7 @@ jobs:
             -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
             -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
             -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
-            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing -p kr-perf \
+            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-loopback -p kr-pairing -p kr-perf \
             -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
             -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol \
             -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer \
@@ -1030,7 +1030,7 @@ jobs:
           -p companion-platform -p companion-tauri -p kr-attention -p kr-automation
           -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance
           -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents
-          -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing -p kr-perf
+          -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-loopback -p kr-pairing -p kr-perf
           -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk
           -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol
           -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer -p kr-transport
@@ -1568,7 +1568,7 @@ jobs:
             -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
             -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
             -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
-            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing -p kr-perf \
+            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-loopback -p kr-pairing -p kr-perf \
             -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
             -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol \
             -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer \
