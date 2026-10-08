@@ -123,22 +123,53 @@ describe('the lists of a phone', () => {
 
 describe('the lists of a phone, when the host changes', () => {
   // KR-REQ-13.08: choosing another host while one is reached shows nothing of the first host's
-  // sessions, before the second answers and when it refuses to: a row of one host is never a row
-  // that asks another.
-  it('shows no row of the first host once the connection goes to another', async () => {
+  // sessions: not before the second answers, not when it answers, and not when it refuses to. A row
+  // of one host is never a row that asks another.
+  it('shows no session of the first host before the second answers, or when it answers or refuses', async () => {
     const { controls } = start()
     await openTab('Sessions')
     expect(await screen.findByText('Session 1')).toBeInTheDocument()
 
+    const held = controls.hold('sessionList')
+    act(() => {
+      controls.switchHost('another-environment')
+    })
+    await waitFor(() => {
+      expect(held.count).toBeGreaterThan(0)
+    })
+    expect(screen.queryByText('Session 1')).toBeNull()
+    held.release()
+    expect(await screen.findByText('No sessions on this host.')).toBeInTheDocument()
+    expect(screen.queryByText('Session 1')).toBeNull()
+  })
+
+  it('shows no session of the first host when the second refuses to list its own', async () => {
+    const { controls } = start()
+    await openTab('Sessions')
+    expect(await screen.findByText('Session 1')).toBeInTheDocument()
     act(() => {
       controls.switchHost('another-environment', { refuseSessionList: true })
     })
-    expect(await screen.findByTestId('voice-entry')).toBeInTheDocument()
-    await waitFor(() => {
-      expect(screen.queryByText('Session 1')).toBeNull()
-    })
     expect(await screen.findByText(/may not list the sessions of this host/)).toBeInTheDocument()
     expect(screen.queryByText('Session 1')).toBeNull()
+  })
+
+  it('shows no host of the first connection before the second answers, and then the second', async () => {
+    const { controls } = start()
+    await openTab('Hosts')
+    expect(await screen.findByText('studio · macOS')).toBeInTheDocument()
+
+    const held = controls.hold('environmentList')
+    act(() => {
+      controls.switchHost('another-environment')
+    })
+    await waitFor(() => {
+      expect(held.count).toBeGreaterThan(0)
+    })
+    expect(screen.queryByText('studio · macOS')).toBeNull()
+    held.release()
+    expect(await screen.findByText('another host · Linux')).toBeInTheDocument()
+    expect(screen.queryByText('studio · macOS')).toBeNull()
   })
 })
 

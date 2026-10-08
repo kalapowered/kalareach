@@ -71,6 +71,22 @@ describe('allowing voice for the first time', () => {
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
   })
 
+  // KR-REQ-15.21: what is granted is what was chosen when the person pressed the control: the
+  // sessions cannot be changed while the host is answering, so the result never describes a
+  // selection other than the one it was granted for.
+  it('keeps the chosen sessions fixed while the host answers', async () => {
+    const { controls } = start()
+    const held = controls.hold('voiceAllow')
+    await screen.findAllByRole('checkbox')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    for (const box of screen.getAllByRole('checkbox')) expect(box).toBeDisabled()
+    held.release()
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+  })
+
   it('allows nothing until a session is chosen', async () => {
     const { controls } = start()
     const sessions = await screen.findAllByRole('checkbox')
@@ -109,6 +125,10 @@ describe('allowing voice for the first time', () => {
     // and the way on has the focus.
     for (const box of screen.getAllByRole('checkbox')) expect(box).toBeDisabled()
     expect(screen.getByTestId('voice-grant-continue')).toHaveFocus()
+    // The result is read with the control, not apart from it.
+    expect(screen.getByTestId('voice-grant-continue')).toHaveAccessibleDescription(
+      /Allowed, except compose prompt/
+    )
     await userEvent.click(screen.getByTestId('voice-grant-continue'))
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
   })
