@@ -1,12 +1,9 @@
 //! Managed storage's client and the backup manifest's client, against a service that answers as the
 //! managed service does.
 //!
-//! Nothing here talks to a real service. `support/storage_web.rs` checks every request the way the
+//! Nothing here talks to a real service. `kr-service-stand-in` checks every request the way the
 //! service checks it, the signature, the method, the installation and the account token, and keeps
 //! what the service keeps, so each answer here is one the service can give.
-
-#[path = "support/storage_web.rs"]
-mod storage_web;
 
 use std::sync::{Arc, Mutex};
 
@@ -37,7 +34,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Digest256, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use storage_web::{ACCOUNT, Moment, StaleRefusal, StorageWeb, TOKEN};
+use kr_service_stand_in::{ACCOUNT, Moment, StaleRefusal, StorageWeb, TOKEN};
 
 /* -------------------------------------------------------------------------- */
 /* A device, its account, and its two clients                                  */
@@ -585,7 +582,7 @@ impl kr_client::services::ServiceHttp for BusyWeb {
         _headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         Box::pin(async {
-            Ok(storage_web::refusal(
+            Ok(kr_service_stand_in::refusal(
                 501,
                 "NOT_CONFIGURED",
                 "Managed storage is not configured in this deployment.",

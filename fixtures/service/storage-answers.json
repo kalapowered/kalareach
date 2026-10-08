@@ -1,0 +1,557 @@
+{
+  "exchanges": [
+    {
+      "path": "/api/storage/status",
+      "shape": {
+        "error": {
+          "code": "QUOTA_EXHAUSTED",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 402,
+      "step": "status of a token the service did not issue"
+    },
+    {
+      "path": "/api/storage/status",
+      "shape": {
+        "data": {
+          "allowance_bytes": "string",
+          "backup": "off",
+          "limits": {
+            "max_object_bytes": "string",
+            "max_parts": "number",
+            "max_read_bytes": "string",
+            "outstanding_uploads": "number",
+            "part_size_bytes": "string",
+            "upload_lifetime_seconds": "number"
+          },
+          "principal": "string",
+          "retention": {
+            "daily_snapshots": "number",
+            "provider_recovery_days": "number",
+            "tombstone_days": "number"
+          },
+          "retention_revision": "string",
+          "stored": {
+            "bytes": "string",
+            "objects": "number"
+          },
+          "tombstoned": {
+            "bytes": "string",
+            "next_purge": "null",
+            "objects": "number"
+          },
+          "uploading": {
+            "bytes": "string",
+            "objects": "number",
+            "reserved_bytes": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "status with the account"
+    },
+    {
+      "path": "/api/storage/retention",
+      "shape": {
+        "data": {
+          "backup": "on",
+          "retention": {
+            "daily_snapshots": "number",
+            "provider_recovery_days": "number",
+            "tombstone_days": "number"
+          },
+          "revision": "number",
+          "state": "set"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "turn backup storage on"
+    },
+    {
+      "path": "/api/storage/retention",
+      "shape": {
+        "error": {
+          "code": "CONFLICT",
+          "current": {
+            "backup": "on",
+            "retention": {
+              "daily_snapshots": "number",
+              "provider_recovery_days": "number",
+              "tombstone_days": "number"
+            },
+            "revision": "string"
+          },
+          "message": "string",
+          "reason": "retention_changed"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "turn backup storage on against a revision it has left"
+    },
+    {
+      "path": "/api/storage/status",
+      "shape": {
+        "data": {
+          "allowance_bytes": "string",
+          "backup": "on",
+          "limits": {
+            "max_object_bytes": "string",
+            "max_parts": "number",
+            "max_read_bytes": "string",
+            "outstanding_uploads": "number",
+            "part_size_bytes": "string",
+            "upload_lifetime_seconds": "number"
+          },
+          "principal": "string",
+          "retention": {
+            "daily_snapshots": "number",
+            "provider_recovery_days": "number",
+            "tombstone_days": "number"
+          },
+          "retention_revision": "string",
+          "stored": {
+            "bytes": "string",
+            "objects": "number"
+          },
+          "tombstoned": {
+            "bytes": "string",
+            "next_purge": "null",
+            "objects": "number"
+          },
+          "uploading": {
+            "bytes": "string",
+            "objects": "number",
+            "reserved_bytes": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "status after the change"
+    },
+    {
+      "path": "/api/storage/upload/create",
+      "shape": {
+        "data": {
+          "expires_at": "string",
+          "layout": {
+            "final_part_bytes": "string",
+            "part_count": "number",
+            "part_size_bytes": "string",
+            "total_bytes": "string"
+          },
+          "limits": {
+            "max_object_bytes": "string",
+            "max_parts": "number",
+            "max_read_bytes": "string",
+            "outstanding_uploads": "number",
+            "part_size_bytes": "string",
+            "upload_lifetime_seconds": "number"
+          },
+          "principal": "string",
+          "reserved_bytes": "string",
+          "state": "created",
+          "upload_id": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "create an upload"
+    },
+    {
+      "path": "/api/storage/upload/create",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "create it again while it is open"
+    },
+    {
+      "path": "/api/storage/upload/part",
+      "shape": {
+        "data": {
+          "bytes_stored": "string",
+          "length_bytes": "string",
+          "part_number": "number",
+          "parts_stored": "number",
+          "state": "stored"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "send a part"
+    },
+    {
+      "path": "/api/storage/upload/part",
+      "shape": {
+        "data": {
+          "bytes_stored": "string",
+          "length_bytes": "string",
+          "part_number": "number",
+          "parts_stored": "number",
+          "state": "duplicate"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "send it again"
+    },
+    {
+      "path": "/api/storage/upload/complete",
+      "shape": {
+        "data": {
+          "archive_id": "string",
+          "backup_generation": "string",
+          "committed_bytes": "string",
+          "object": {
+            "encrypted_len": "string",
+            "encrypted_object_hash": "string",
+            "object_id": "string"
+          },
+          "principal": "string",
+          "size_bucket_bytes": "string",
+          "state": "stored",
+          "stored_at": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "complete the upload"
+    },
+    {
+      "path": "/api/storage/upload/complete",
+      "shape": {
+        "data": {
+          "archive_id": "string",
+          "backup_generation": "string",
+          "committed_bytes": "string",
+          "object": {
+            "encrypted_len": "string",
+            "encrypted_object_hash": "string",
+            "object_id": "string"
+          },
+          "principal": "string",
+          "size_bucket_bytes": "string",
+          "state": "duplicate",
+          "stored_at": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "complete it again"
+    },
+    {
+      "path": "/api/storage/object/read",
+      "shape": "content",
+      "status": 200,
+      "step": "read the object"
+    },
+    {
+      "path": "/api/storage/object/read",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "read past its end"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "publish before any writer is enrolled"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": null
+            }
+          },
+          "state": "enrolled",
+          "writer": {
+            "enrolled_at": "string",
+            "writer_key_id": "string",
+            "writer_revision": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "enrol the writer"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": null
+            }
+          },
+          "state": "unchanged",
+          "writer": {
+            "enrolled_at": "string",
+            "writer_key_id": "string",
+            "writer_revision": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "enrol the same writer again"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish a generation"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "duplicate"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish it again"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "duplicate"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish a generation with no account"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "string",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "current_writer": {
+            "enrolled_at": "string",
+            "writer_key_id": "string",
+            "writer_revision": "string"
+          },
+          "publication": {
+            "payload": {
+              "descriptor": {
+                "archive_id": "string",
+                "backup_generation": "string",
+                "encrypted_manifest": {
+                  "encrypted_len": "string",
+                  "encrypted_object_hash": "string",
+                  "object_id": "string"
+                },
+                "manifest_key_wraps": {
+                  "array": {
+                    "ciphertext": "string",
+                    "context": {
+                      "archive_id": "string",
+                      "backup_generation": "string",
+                      "encrypted_object_hash": "string",
+                      "format": "string",
+                      "object_id": "string",
+                      "purpose": "string",
+                      "recipient_key_id": "string",
+                      "sender_key_id": "string"
+                    },
+                    "nonce": "string"
+                  }
+                },
+                "version": "string"
+              },
+              "published_at_ms": "string",
+              "writer_key_id": "string"
+            },
+            "signature": "string"
+          },
+          "published_at": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fetch the newest generation"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fetch a generation that is not held"
+    },
+    {
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fetch an archive that is not held"
+    },
+    {
+      "path": "/api/storage/object/delete",
+      "shape": {
+        "data": {
+          "deleted_at": "string",
+          "purge_after": "string",
+          "retained_bytes": "string",
+          "retention": {
+            "daily_snapshots": "number",
+            "provider_recovery_days": "number",
+            "tombstone_days": "number"
+          },
+          "state": "tombstoned"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "delete the object"
+    },
+    {
+      "path": "/api/storage/object/delete",
+      "shape": {
+        "data": {
+          "deleted_at": "string",
+          "purge_after": "string",
+          "retained_bytes": "string",
+          "retention": {
+            "daily_snapshots": "number",
+            "provider_recovery_days": "number",
+            "tombstone_days": "number"
+          },
+          "state": "already_tombstoned"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "delete it again"
+    },
+    {
+      "path": "/api/storage/object/delete",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "delete an object that is not held"
+    }
+  ],
+  "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
+  "web_commit": "91d71cba1"
+}
