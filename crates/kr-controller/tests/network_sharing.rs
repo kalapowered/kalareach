@@ -291,7 +291,6 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
     let host = Host::start(&owner).await;
     let (device, record) = recipient(&host, &owner).await;
     let session_id = SessionId::new(kr_ipc::new_uuid());
-    let shared_at = std::time::Instant::now();
     let short = shared_for(&host, session_id, record.device_id, Some(30_000)).await;
     let other = shared(&host, SessionId::new(kr_ipc::new_uuid()), record.device_id).await;
 
@@ -318,7 +317,7 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
         .await;
 
     let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
-    connection
+    let held = connection
         .submit(
             Method::GrantRedeem,
             ActionId::new(kr_ipc::new_uuid()),
@@ -337,15 +336,18 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
         "the request is pending: nothing was written"
     );
 
-    // The share ends thirty seconds after it was written. A request that waits for the store gives
-    // up on its own after the host's wait for an effect, forty-five seconds on, and a connection
-    // that is only looked at between requests is ended then and not before. Both are the host's
-    // own times, and the bound is between them: this is the one place the test must tell two
-    // behaviours apart by when the connection ends, since they differ in nothing else.
-    let patience = std::time::Duration::from_secs(40).saturating_sub(shared_at.elapsed());
+    // The connection is closed at the share's end and the held request is never answered. A
+    // connection that is only looked at between requests is closed after the host's own wait for
+    // the held request gives up, and that request is answered first. The wait here is a guard
+    // against a hang, longer than either.
+    let answered = connection
+        .answered_before_closing(held, std::time::Duration::from_secs(120))
+        .await
+        .expect("the connection was closed");
     assert!(
-        connection.is_closed_within(patience).await,
-        "the connection was ended with its share while a request of its was still pending"
+        !answered,
+        "the connection was ended with its share while a request of its was still pending, and \
+         not after the request had given up"
     );
     go.send(()).expect("the held redemption is let go");
     host.stop().await;

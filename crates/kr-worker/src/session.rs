@@ -2227,7 +2227,7 @@ impl Session {
                         | kr_protocol::attachment::PresentationReason::AwaitingParserBoundary
                 )
             )
-            && self.content_scope(attachment_id) != crate::render::Scope::LiveScreen
+            && self.content_scope(attachment_id).shows_the_other_buffer()
         {
             // What the last screen could not carry says nothing about the one this window is drawn
             // next, and a screen that was carried when it was drawn can have changed since. A
@@ -3174,7 +3174,7 @@ impl Session {
             };
             let keyboard = self.attachments.keyboard_control(attachment_id);
             let scope = self.content_scope(attachment_id);
-            if scope == crate::render::Scope::LiveScreen {
+            if !scope.shows_the_other_buffer() {
                 // The other buffer's rows are always left out of what a caller shown the live
                 // screen alone is drawn, so such a terminal never has a screen to be handed the
                 // stream from.
@@ -4013,7 +4013,7 @@ impl Session {
                 kr_protocol::attachment::ViewportPosition::Row(_)
                     | kr_protocol::attachment::ViewportPosition::Above(_)
             )
-        ) && self.content_scope(attachment_id) == crate::render::Scope::LiveScreen
+        ) && !self.content_scope(attachment_id).shows_the_other_buffer()
         {
             return Err(WorkerError::PresentationUnsupported {
                 detail: "this attachment is shown the live screen and no retained rows above it, \

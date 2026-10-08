@@ -939,9 +939,12 @@ mod tests {
         crate::render::Scope::WholeScreen
     }
 
-    /// The caller of attachment 2 is shown the live screen alone, and nobody else is narrowed.
-    fn second_is_shown_the_live_screen(attachment_id: AttachmentId) -> crate::render::Scope {
+    /// The caller of attachment 2 acts under a share whose issuer was shown the screen as text,
+    /// the caller of attachment 3 under a pairing grant, and nobody else is narrowed.
+    fn second_is_shown_the_previewed_screen(attachment_id: AttachmentId) -> crate::render::Scope {
         if attachment_id == identifier(2) {
+            crate::render::Scope::PreviewedScreen
+        } else if attachment_id == identifier(3) {
             crate::render::Scope::LiveScreen
         } else {
             crate::render::Scope::WholeScreen
@@ -1122,13 +1125,14 @@ mod tests {
     }
 
     /// A span with a title and a link's target in it is sent whole to a caller drawn the whole
-    /// screen, and to a caller shown the live screen alone as the pieces between them, each at
-    /// the position of the raw stream it starts at.
+    /// screen and to a device under its pairing grant, and to the recipient of a share as the
+    /// pieces between them, each at the position of the raw stream it starts at.
     #[tokio::test]
-    async fn a_live_screen_subscriber_is_sent_the_span_without_what_only_describes_the_screen() {
+    async fn a_share_recipient_is_sent_the_span_without_what_only_describes_the_screen() {
         let mut hub = OutputHub::new();
         let mut owner = hub.subscribe(identifier(1), 1024, Presentation::Direct);
         let mut viewer = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+        let mut device = hub.subscribe(identifier(3), 1024, Presentation::Direct);
         // `ab` `<title>` `cd` `<link>` `ef`, from position 100.
         let span = Arc::new(b"abTITLEcdLINKef".to_vec());
         hub.publish_direct(
@@ -1136,7 +1140,7 @@ mod tests {
             &span,
             &[2..7, 9..13],
             0,
-            second_is_shown_the_live_screen,
+            second_is_shown_the_previewed_screen,
         );
 
         let received = |stream: &mut OutputStream| -> Vec<(u64, Vec<u8>)> {
@@ -1158,6 +1162,11 @@ mod tests {
             vec![(100, b"abTITLEcdLINKef".to_vec())]
         );
         assert_eq!(
+            received(&mut device),
+            vec![(100, b"abTITLEcdLINKef".to_vec())],
+            "a device under its pairing grant is sent what the application wrote"
+        );
+        assert_eq!(
             received(&mut viewer),
             vec![
                 (100, b"ab".to_vec()),
@@ -1175,7 +1184,7 @@ mod tests {
             &only,
             std::slice::from_ref(&(0..5)),
             0,
-            second_is_shown_the_live_screen,
+            second_is_shown_the_previewed_screen,
         );
         assert_eq!(viewer.queued_bytes(), 0);
         assert!(received(&mut viewer).is_empty());

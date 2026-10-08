@@ -750,17 +750,17 @@ impl RawDevice {
         (request_id, frame)
     }
 
-    /// Submits one mutation and does not wait for the answer.
+    /// Submits one mutation and does not wait for the answer, and returns the request it is.
     pub async fn submit<P: serde::Serialize + ?Sized>(
         &self,
         method: Method,
         action_id: kr_protocol::ids::ActionId,
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
-    ) {
+    ) -> kr_protocol::ids::RequestId {
         use kr_client::transport::ControlTransport as _;
 
-        let (_, frame) = self.mutation_frame(
+        let (request_id, frame) = self.mutation_frame(
             self.action_window_id.clone(),
             method,
             action_id,
@@ -771,19 +771,33 @@ impl RawDevice {
             .send(&frame)
             .await
             .expect("the frame is sent");
+        request_id
     }
 
-    /// Reads whatever the host still sends until it closes the control stream, and says whether it
-    /// did within `within`.
-    pub async fn is_closed_within(&self, within: Duration) -> bool {
+    /// Reads what the host sends until it closes the control stream, and says whether it answered
+    /// `request` before it did. Gives up on a stream that is still open after `patience`, which is
+    /// a guard against a hang and decides nothing.
+    ///
+    /// `None` when the stream was still open at the end of `patience`.
+    pub async fn answered_before_closing(
+        &self,
+        request: kr_protocol::ids::RequestId,
+        patience: Duration,
+    ) -> Option<bool> {
         use kr_client::transport::ControlTransport as _;
+        use kr_protocol::envelope::ControlFrame;
 
-        let deadline = tokio::time::Instant::now() + within;
+        let deadline = tokio::time::Instant::now() + patience;
         loop {
             match tokio::time::timeout_at(deadline, self.transport.recv()).await {
-                Err(_) => return false,
+                Err(_) => return None,
+                Ok(Ok(Some(ControlFrame::Response(response))))
+                    if response.request_id == request =>
+                {
+                    return Some(true);
+                }
                 Ok(Ok(Some(_))) => {}
-                Ok(Ok(None) | Err(_)) => return true,
+                Ok(Ok(None) | Err(_)) => return Some(false),
             }
         }
     }
