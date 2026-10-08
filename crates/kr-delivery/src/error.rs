@@ -70,6 +70,18 @@ pub enum DeliveryError {
     /// settled is offered again, and that is the behaviour the sources are built for.
     #[error("a delivery source could not be read: {0}")]
     Source(String),
+    /// A credential's renewal was not asked for, because the gateway refused the last ask and the
+    /// wait that follows a refusal has not ended.
+    ///
+    /// Nothing was sent anywhere. A caller that needed the renewal can say when it will be asked
+    /// for again, and has used nothing up.
+    #[error("{said}; this host asks again in {} seconds", remaining_ms.div_ceil(1000))]
+    RenewalWaits {
+        /// What the last refusal said, in this host's own words.
+        said: String,
+        /// How long until the gateway may be asked again, in milliseconds.
+        remaining_ms: u64,
+    },
     /// Privacy mode is fencing this environment's content-bearing outboxes.
     ///
     /// Section 24 fences them *at once*, so a send offered after the fence is refused rather than

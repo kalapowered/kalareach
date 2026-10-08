@@ -58,6 +58,11 @@
 //! hour for as long as the credential lasts. The wait holds for a credential past its expiry too,
 //! because the same word can make a credential expire at once, and the gateway counts two
 //! requests of the sixty an hour for this host key against every ask.
+//!
+//! A renewal not asked for because of the wait says so
+//! ([`kr_delivery::DeliveryError::RenewalWaits`]), as a refusal does not: nothing was sent, so a
+//! delivery that needed the renewal is looked at again shortly without using up an attempt, and
+//! goes out as soon as the wait ends or a new bearer ends it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -499,11 +504,10 @@ impl HeldCredentials {
         };
         let steady_ms = (self.steady.0)();
         match last.wait.until_steady_ms.checked_sub(steady_ms) {
-            Some(remaining) if remaining > 0 => Err(kr_delivery::DeliveryError::Source(format!(
-                "{}; this host asks again in {} seconds",
-                last.said,
-                remaining.div_ceil(1000)
-            ))),
+            Some(remaining) if remaining > 0 => Err(kr_delivery::DeliveryError::RenewalWaits {
+                said: last.said.clone(),
+                remaining_ms: remaining,
+            }),
             _ => Ok(last.wait.refusals),
         }
     }
