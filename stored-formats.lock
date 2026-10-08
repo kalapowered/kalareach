@@ -374,7 +374,7 @@
         "version": 8,
         "migrates_from": 1
       },
-      "digest": "0a5dc6ed1006d79d3e58a2e7fa768d521438eadcd16bd92fb2206ca6f48c56a5",
+      "digest": "a04e78cd7a6451295fe31d2423e4bf5c3fa8e98e2ece73179c4b6c487099b8e2",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -392,7 +392,7 @@
         "OwnerConfirmationRequest",
         "OwnerConfirmationProof",
         "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation (crates/kr-controller/src/grants/durable.rs)",
-        "StoredCommitment (crates/kr-controller/src/net/invitations.rs)",
+        "StoredCommitment, ActionSubject (crates/kr-controller/src/net/invitations.rs)",
         "KeyDeclaration (crates/kr-controller/src/net/devices.rs)",
         "words of launch phases"
       ]
