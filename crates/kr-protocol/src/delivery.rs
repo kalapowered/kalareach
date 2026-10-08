@@ -368,8 +368,12 @@ pub struct DeliveryDestinationRemoveResult {
     pub found: bool,
     /// How many queued notifications nothing had sent were taken back unsent.
     pub revoked: U64,
-    /// How many notifications an earlier attempt had sent now have an outcome nobody can settle.
+    /// How many queued notifications an earlier attempt had sent now have an outcome nobody can
+    /// settle.
     pub unresolved: U64,
+    /// How many attempts were on the wire when the destination was removed. Each finishes and
+    /// reports its answer, and the destination may still receive that message.
+    pub fenced: U64,
 }
 
 #[cfg(test)]

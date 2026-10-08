@@ -565,13 +565,6 @@ impl Controller {
             name: params.rule_name.clone(),
             grant_id: Some(params.grant_id),
         };
-        if self.delivery_runtime().recipient_scope(&rule).is_none() {
-            return Err(ControllerError::InvalidArgument(
-                "that grant does not stand: it was not found, has not been redeemed, has run out \
-                 or was revoked, or its device is no longer paired"
-                    .to_owned(),
-            ));
-        }
         let kind = kr_delivery::destination::DestinationKind::for_external(params.kind);
         let record = kr_delivery::destination::DestinationRecord {
             id: destination_id,
@@ -586,12 +579,26 @@ impl Controller {
                     credential: None,
                 },
             ),
-            rule: Some(rule),
+            rule: Some(rule.clone()),
             enabled: true,
             configured_at_ms: kr_protocol::scalars::TimestampMs::new(self.settled_now_ms()),
         };
         let registry = self.registry.lock().await;
-        let admitted = || self.check_admission(&registry, &carried);
+        // Asked where the row is written, under the registry's lock and the journal's: a grant
+        // that stops standing while this waited, or that is revoked by a call that holds the
+        // registry, is found here and not after.
+        let admitted = || {
+            self.check_admission(&registry, &carried)?;
+            if self.delivery_runtime().recipient_scope(&rule).is_none() {
+                return Err(ControllerError::InvalidArgument(
+                    "that grant does not stand: it was not found, has not been redeemed, has run \
+                     out or was revoked, its device is no longer paired, or it carries no right a \
+                     notification can ask for"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        };
         admitted()?;
         if !self.delivery.configure_if(&record, &admitted)? {
             return Err(ControllerError::PermissionDenied {
@@ -629,6 +636,7 @@ impl Controller {
             found: removal.found,
             revoked: kr_protocol::scalars::U64::new(removal.revoked),
             unresolved: kr_protocol::scalars::U64::new(removal.unresolved),
+            fenced: kr_protocol::scalars::U64::new(removal.fenced),
         })
     }
 
@@ -1041,7 +1049,14 @@ impl Controller {
         admitted()?;
         // An authorisation this destination sent under before, and does not now, is revoked: the
         // debt is written in the transaction that moves the destination off it.
+        // A record out of service with no rule is one an earlier removal or unpairing ended, whose
+        // revocation is owed or paid: it is not owed a second time.
         let replaced = previous
+            .filter(|_| {
+                existing
+                    .as_ref()
+                    .is_some_and(|record| record.enabled || record.rule.is_some())
+            })
             .map(|held| held.sender_record_id)
             .filter(|old| *old != offered.sender_record_id);
         let owing_origin = replaced.map(|old| {
@@ -1574,6 +1589,18 @@ pub(super) fn remove_params(
     })
 }
 
+/// The headers a request is framed with, which a destination's retry claim cannot name: the
+/// transport sets them, and a value of the owner's would break every request to the destination.
+const FRAMING_HEADERS: [&str; 7] = [
+    "connection",
+    "content-length",
+    "content-type",
+    "host",
+    "te",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// Checks what a configuration asks that does not depend on this host's records, and returns the
 /// identifier it names.
 ///
@@ -1609,10 +1636,14 @@ pub(super) fn validate_configuration(
             || header.len() > 64
             || !header
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || FRAMING_HEADERS
+                .iter()
+                .any(|framing| framing.eq_ignore_ascii_case(header)))
     {
         return Err(ControllerError::InvalidArgument(
-            "an idempotency header is a header name of letters, digits and hyphens, up to 64 bytes"
+            "an idempotency header is a header name of letters, digits and hyphens, up to 64 \
+             bytes, that is not one a request is framed with"
                 .to_owned(),
         ));
     }
