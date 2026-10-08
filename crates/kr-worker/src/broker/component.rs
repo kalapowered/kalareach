@@ -207,3 +207,33 @@ impl Broker {
         }
     }
 }
+
+#[cfg(feature = "testing")]
+impl Broker {
+    /// Gives a binding made from a test's own descriptor the release, the program and the component
+    /// that a binding made from admissions has, so that the plugin runtime is wanted for it and the
+    /// link registers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::BrokerError::UnknownSubject`] when this broker holds no such binding.
+    pub fn ship_component(
+        &self,
+        binding_id: BrokerBindingId,
+        release: kr_protocol::admission::LiveRelease,
+        executable: crate::broker::ledger::BoundExecutable,
+        component: BoundComponent,
+    ) -> super::Result<()> {
+        let mut state = self.state();
+        let binding = state
+            .bindings
+            .get_mut(&binding_id)
+            .ok_or_else(|| super::unknown_binding(binding_id))?;
+        binding.release = Some(release);
+        binding.executable = Some(executable);
+        binding.component = Some(component);
+        state.component_states.remove(&binding_id);
+        state.component_changes.notify_one();
+        Ok(())
+    }
+}

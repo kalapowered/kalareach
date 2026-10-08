@@ -22,7 +22,6 @@ use std::time::Duration;
 
 use kr_ipc::client::LocalClient;
 use kr_protocol::admission::ComponentState;
-use kr_protocol::broker::BrokerGrant;
 use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, ParamsValue};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, RequestId};
@@ -30,13 +29,13 @@ use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::{ActionCancelParams, ActionReadParams, ActionReadResult};
 use kr_protocol::receipt::{Receipt, ReceiptState};
-use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{DurationMs, Nullable, Uuid};
 
 mod plugin_world;
 
 use plugin_world::acting::{
-    ACTIONS, Acting, answer, binding, declared, instance, presented, read_receipt, send, signal,
-    until_receipt, until_settled,
+    ACTIONS, Acting, Change, answer, binding, read_receipt, send, signal, until_receipt,
+    until_settled,
 };
 use plugin_world::kill;
 
@@ -272,31 +271,11 @@ async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_a
     );
 }
 
-/// What changes while an action's component prepares it, between the action's admission and the
-/// moment it comes back to be dispatched.
-enum Change {
-    /// The binding's grant is withdrawn.
-    Grant,
-    /// The package registers the action again as another class its component prepares.
-    Declaration,
-    /// The package registers the action again as one the host carries out itself, which needs
-    /// nothing from the plan it was prepared for.
-    Presentation,
-    /// The binding moves to another revision, as a thread selection does.
-    Binding,
-    /// The daemon announces an authority revision, which revokes what was admitted under the one
-    /// before.
-    Authority,
-    /// The connection the action was accepted on ends.
-    Connection,
-}
-
 /// Accepts one action, holds its component, makes `change`, lets the component go and shows the
 /// action rejected with nothing written to the upstream. Returns the rejected receipt, or nothing
 /// where the test components are not built.
 async fn rejected_after(change: Change) -> Option<Receipt> {
     let acting = Acting::start().await?;
-    let broker = acting.hosted._service.broker();
     let mut watcher = acting.client().await;
     let mut asking = acting.client().await;
     let mutation = acting.invocation(&asking, "turn.cancel", b"{}");
@@ -309,41 +288,7 @@ async fn rejected_after(change: Change) -> Option<Receipt> {
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
     let mut asking = Some(asking);
-    match change {
-        Change::Grant => broker
-            .withdraw_grant(binding(), BrokerGrant::UpstreamAction)
-            .expect("the grant is withdrawn"),
-        Change::Declaration => {
-            broker
-                .register_actions(binding(), &[declared("turn.cancel", "upstream.prompt")])
-                .expect("the package re-registers the action as another class");
-        }
-        Change::Presentation => {
-            broker
-                .register_actions(binding(), &[presented("turn.cancel")])
-                .expect("the package re-registers the action as a presentation");
-        }
-        Change::Binding => {
-            broker
-                .advance_binding(instance(), None, TimestampMs::new(2))
-                .expect("the binding moves");
-        }
-        Change::Authority => {
-            let mut daemon = acting
-                .hosted
-                .daemon_connection(ControllerConnectionRole::Authority)
-                .await;
-            daemon
-                .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
-                    environment_id: acting.hosted.environment_id,
-                    revision: kr_protocol::ids::AuthorityRevision::new(2),
-                    evidence_from: 0,
-                })
-                .await
-                .expect("the worker installs the revision");
-        }
-        Change::Connection => drop(asking.take()),
-    }
+    acting.change(change, "turn.cancel", &mut asking).await;
     signal(&host, rustix::process::Signal::CONT);
     // The action has come back from its component and been answered, so that what was not written
     // was left unwritten by the second pass and not by a preparation still waiting.

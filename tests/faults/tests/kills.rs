@@ -49,6 +49,7 @@ use kr_protocol::ids::{
     InputSequence, SessionEpoch, SessionId,
 };
 use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+use kr_protocol::insertion::{InsertionBegin, InsertionReport, ReportedOutcome};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSnapshotParams, EventsSnapshotResult};
@@ -62,7 +63,8 @@ use kr_protocol::session::{
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
     AttachmentHandle, ChunkDescriptor, DraftCreateParams, DraftCreateResult, DraftRecord,
-    InsertionMethod, InsertionState, UploadBeginParams, UploadChunkParams, UploadFinishParams,
+    DraftState, InsertionMethod, InsertionState, UploadBeginParams, UploadChunkParams,
+    UploadFinishParams,
 };
 
 #[path = "../../../crates/kr-controller/tests/teardown/mod.rs"]
@@ -113,6 +115,27 @@ const HALF_READY: &str = "KR_KILLS_READY";
 
 /// The client half's name, as the test harness selects it.
 const CLIENT_HALF: &str = "serve_a_client_half_for_the_kill_stage";
+
+/// An offer of one attachment to a session's agent that a worker claimed.
+struct Offer {
+    action_id: ActionId,
+    draft_id: DraftId,
+    transfer_id: kr_protocol::ids::TransferId,
+    attempt: U64,
+}
+
+impl Offer {
+    /// The report of what became of the offer.
+    fn reported(&self, outcome: ReportedOutcome) -> InsertionReport {
+        InsertionReport {
+            action_id: self.action_id,
+            draft_id: self.draft_id,
+            transfer_id: self.transfer_id,
+            attempt: self.attempt,
+            outcome,
+        }
+    }
+}
 
 /// The principal the daemon makes of a local client of this user.
 fn local_actor() -> ActorId {
@@ -294,6 +317,21 @@ impl Host {
         session_id: SessionId,
         bytes: &[u8],
     ) -> (DraftId, AttachmentHandle) {
+        self.offer_attachment_by(
+            session_id,
+            bytes,
+            InsertionMethod::VerifiedComposerInsertion,
+        )
+        .await
+    }
+
+    /// The same, for an attachment to be inserted by `method`.
+    async fn offer_attachment_by(
+        &self,
+        session_id: SessionId,
+        bytes: &[u8],
+        method: InsertionMethod,
+    ) -> (DraftId, AttachmentHandle) {
         let handle = self.publish_for(session_id, bytes);
         let draft: DraftCreateResult = self
             .daemon()
@@ -321,6 +359,7 @@ impl Host {
                 draft.draft.draft_id,
                 draft.draft.revision,
                 &handle,
+                method,
             )
             .await
             .unwrap_or_else(|error| panic!("the daemon refused the binding: {error}"));
@@ -335,6 +374,7 @@ impl Host {
         draft_id: DraftId,
         expected_revision: kr_protocol::ids::DraftRevision,
         handle: &AttachmentHandle,
+        method: InsertionMethod,
     ) -> Result<AgentDraftAddAttachmentResult, kr_protocol::error::ProtocolError> {
         self.daemon()
             .await
@@ -351,7 +391,7 @@ impl Host {
                         accepted_media_types: vec![handle.declared_media_type.clone()],
                         max_byte_len: U64::new(1024),
                         max_count: U64::new(2),
-                        insertion_method: InsertionMethod::VerifiedComposerInsertion,
+                        insertion_method: method,
                         external_destination: Nullable::null(),
                         model_media_capability: false,
                     },
@@ -360,6 +400,38 @@ impl Host {
             .await
             .expect("the call reaches the daemon")
             .map(|answer| answer.to_typed().expect("decodes the binding"))
+    }
+
+    /// Claims the one attachment of a draft for an offer to the session's agent, as the session's
+    /// worker does, and returns what the claim is for.
+    fn claim(&self, session_id: SessionId, draft_id: DraftId, handle: &AttachmentHandle) -> Offer {
+        let service = self.controller.transfer().service();
+        let facts = service
+            .insertion_facts(&local_actor(), session_id, draft_id)
+            .expect("the draft's facts");
+        let now = kr_ipc::clock::boot_elapsed_ms();
+        let offer = Offer {
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            draft_id,
+            transfer_id: handle.transfer_id,
+            attempt: facts.bindings[0].attempt,
+        };
+        service
+            .insertion_begin(
+                &local_actor(),
+                session_id,
+                &InsertionBegin {
+                    action_id: offer.action_id,
+                    draft_id,
+                    transfer_id: handle.transfer_id,
+                    attempt: offer.attempt,
+                    max_count: U64::new(2),
+                    deadline_boot_ms: U64::new(now + 60_000),
+                },
+                now,
+            )
+            .expect("the attachment is claimed for the offer");
+        offer
     }
 
     /// The draft as the transfer service holds it.
@@ -1029,6 +1101,11 @@ async fn a_dead_workers_unconfirmed_insertion_fails_and_its_completed_upload_kee
     .await;
     assert!(after.revision.get() > before.revision.get(), "{after:?}");
     assert_eq!(
+        after.state,
+        DraftState::Orphaned,
+        "a draft whose session ended is kept for explicit retargeting"
+    );
+    assert_eq!(
         after.attachments[0].handle, ended_handle,
         "the completed file's identity is what it was"
     );
@@ -1043,7 +1120,13 @@ async fn a_dead_workers_unconfirmed_insertion_fails_and_its_completed_upload_kee
     // Nothing is offered to the agent of a session that has ended: a later binding is refused.
     let late = host.publish_for(ended, b"too late for the session that ended");
     let refusal = host
-        .bind(ended, ended_draft, after.revision, &late)
+        .bind(
+            ended,
+            ended_draft,
+            after.revision,
+            &late,
+            InsertionMethod::VerifiedComposerInsertion,
+        )
         .await
         .expect_err("a binding for an ended session is refused");
     assert_eq!(
@@ -1059,7 +1142,109 @@ async fn a_dead_workers_unconfirmed_insertion_fails_and_its_completed_upload_kee
         InsertionState::Recorded,
         "{held:?}"
     );
+    assert_eq!(held.state, DraftState::Open, "{held:?}");
     assert_eq!(held.attachments[0].handle, kept_handle);
+}
+
+/// KR-REQ-24.09: a worker killed while an attachment is being offered to its agent leaves the offer
+/// ended, the draft that targeted the session orphaned and the completed file's identity alone, and
+/// a report that arrives afterwards is refused as one for a session that has ended. The session
+/// whose worker lives keeps its offer in flight and its draft open, and the offer is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_workers_offer_in_flight_fails_its_draft_is_orphaned_and_a_late_report_is_refused() {
+    let host = Host::start().await;
+    let (ended_work, kept_work) = (host.work("offer-ended"), host.work("offer-kept"));
+    let (ended, _) = host.create(&ended_work).await;
+    let (kept, _) = host.create(&kept_work).await;
+    let (ended_draft, ended_handle) = host
+        .offer_attachment_by(
+            ended,
+            b"offered to the session that ends",
+            InsertionMethod::TypedSubmission,
+        )
+        .await;
+    let (kept_draft, kept_handle) = host
+        .offer_attachment_by(
+            kept,
+            b"offered to the session that stays",
+            InsertionMethod::TypedSubmission,
+        )
+        .await;
+    let ended_offer = host.claim(ended, ended_draft, &ended_handle);
+    let kept_offer = host.claim(kept, kept_draft, &kept_handle);
+    let claimed = host.draft(ended_draft);
+    assert_eq!(claimed.attachments[0].state, InsertionState::Inserting);
+    assert_eq!(
+        host.draft(kept_draft).attachments[0].state,
+        InsertionState::Inserting
+    );
+
+    let worker = host.worker_of(ended).await;
+    kill_worker(&worker).await;
+    let closure = host.closure(ended).await;
+    assert_eq!(closure.reason, ClosureReason::WorkerCrash, "{closure:?}");
+
+    let after = until("the dead worker's offer to fail", || {
+        let draft = host.draft(ended_draft);
+        (draft.attachments[0].state == InsertionState::Failed).then_some(draft)
+    })
+    .await;
+    assert_eq!(after.state, DraftState::Orphaned, "{after:?}");
+    assert_eq!(
+        after.revision.get(),
+        claimed.revision.get() + 1,
+        "the closure moved the draft once"
+    );
+    assert_eq!(
+        after.attachments[0].handle, ended_handle,
+        "the upload is kept"
+    );
+    assert_eq!(after.text, claimed.text, "and so is the draft's text");
+
+    // The worker's report of what its agent answered arrives too late to change what the end
+    // decided.
+    let service = host.controller.transfer().service();
+    let late = service
+        .record_insertion_outcome(
+            &local_actor(),
+            ended,
+            &ended_offer.reported(ReportedOutcome::AcceptedByAgent {
+                provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+                evidence: "upstream request 1".to_owned(),
+            }),
+        )
+        .expect_err("a report for a session that has ended is refused");
+    assert_eq!(
+        late.code(),
+        kr_protocol::error::ErrorCode::SessionClosed,
+        "{late:?}"
+    );
+    assert_eq!(
+        host.draft(ended_draft).attachments[0].state,
+        InsertionState::Failed
+    );
+
+    // The control: the session whose worker lives keeps its offer in flight, and the report of it
+    // is recorded.
+    let held = host.draft(kept_draft);
+    assert_eq!(held.state, DraftState::Open, "{held:?}");
+    assert_eq!(held.attachments[0].state, InsertionState::Inserting);
+    service
+        .record_insertion_outcome(
+            &local_actor(),
+            kept,
+            &kept_offer.reported(ReportedOutcome::AcceptedByAgent {
+                provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+                evidence: "upstream request 1".to_owned(),
+            }),
+        )
+        .expect("the live session's report is recorded");
+    let reported = host.draft(kept_draft);
+    assert_eq!(
+        reported.attachments[0].state,
+        InsertionState::AcceptedByAgent
+    );
+    assert_eq!(reported.attachments[0].handle, kept_handle);
 }
 
 /// The control: the same session closed on request instead is closed as requested, every terminal

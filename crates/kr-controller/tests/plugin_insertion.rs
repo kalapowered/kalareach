@@ -9,7 +9,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-23.30 | an action that offers an attachment names a draft the daemon holds, is validated against it, and transmits nothing when the draft moved, the action was cancelled or the plan was not the invocation's own |
+//! | KR-REQ-23.30 | an action that offers an attachment names a draft the daemon holds, is validated against it, and transmits nothing when the draft moved, the package does not declare an offer of it, the action was cancelled, lost its ground or its connection while its component prepared it, or the plan was not the invocation's own; it is prepared over the connection the worker's own link holds to the plugin runtime, and again after that runtime was lost; a repeat of it is answered with its receipt and claims nothing again |
 //! | KR-REQ-24.09 | what the agent answered is recorded on the binding: accepted with the upstream's evidence, failed when it refused, unknown when it did not answer, and a claim the worker could not make is settled by a report |
 
 #![cfg(unix)]
@@ -27,9 +27,10 @@ use kr_protocol::transfer::{AttachmentHandle, DraftRecord, InsertionState};
 mod plugin_world;
 
 use plugin_world::acting::{
-    Acting, Upstream, answer, read_receipt, send, signal, supersede, until_receipt, until_settled,
+    Acting, Change, Upstream, answer, contribution, read_receipt, send, signal, supersede,
+    until_receipt, until_settled,
 };
-use plugin_world::until;
+use plugin_world::{PATIENCE, kill, until};
 
 /// The state of one binding of a draft.
 fn state_of(draft: &DraftRecord, handle: &AttachmentHandle) -> InsertionState {
@@ -589,4 +590,397 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
     let after = acting.draft(draft.draft_id);
     assert_eq!(state_of(&after, &handle), InsertionState::Recorded);
     assert_eq!(after.revision, draft.revision, "no claim was made");
+}
+
+/// Writes a mutation to the worker without waiting for its answer.
+async fn write(
+    client: &mut kr_ipc::client::LocalClient,
+    mutation: kr_protocol::envelope::MutationRequest,
+) {
+    client
+        .writer()
+        .write_message(&kr_protocol::envelope::ControlFrame::Mutation(Box::new(
+            mutation,
+        )))
+        .await
+        .expect("writes the mutation");
+}
+
+/// KR-REQ-23.30: an offer that was prepared and claimed when its connection ended is rejected, its
+/// claim is settled, and nothing is written to the upstream.
+///
+/// The connection's loop is inside the dispatch boundary with a repeat of the offer when the
+/// component answers, so the finished preparation waits for the loop. The client then goes, and the
+/// loop finds the connection ended with the preparation unfinished. Which of the two ways the
+/// worker ends such an action is the loop's to decide: it settles what is waiting for it when it
+/// leaves, and a preparation that finishes later finds the connection gone and settles its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_claimed_when_its_connection_ends_is_rejected_and_its_claim_settled()
+{
+    let Some((acting, draft, handle)) = offering().await else {
+        return;
+    };
+    let service = Arc::clone(&acting.hosted._service);
+    let mut watcher = acting.client().await;
+    let mut asking = acting.client().await;
+    // What holds the service when nothing is being prepared: the connections and this test.
+    let idle = Arc::strong_count(&service);
+    let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
+    let action_id = mutation.action_id;
+    let host = acting.stop_host();
+    write(&mut asking, mutation.clone()).await;
+    until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+
+    // A repeat of the offer holds the connection's loop inside the dispatch boundary.
+    let (arrived, release) = service.pause_inside_boundary();
+    let mut repeat = mutation;
+    repeat.request_id = RequestId::new(2);
+    write(&mut asking, repeat).await;
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(PATIENCE))
+        .await
+        .expect("the waiting thread finishes")
+        .expect("the repeat reached the dispatch boundary");
+
+    // The component answers and the offer is claimed. The task that prepared it has handed it to
+    // the connection once it no longer holds the service.
+    signal(&host, rustix::process::Signal::CONT);
+    until_binding(&acting, draft.draft_id, &handle, InsertionState::Inserting).await;
+    until("the preparation to be handed to the connection", || async {
+        (Arc::strong_count(&service) == idle).then_some(())
+    })
+    .await;
+
+    // The client goes, and the loop is let go to find it so.
+    drop(asking);
+    release.send(()).expect("lets the repeat go");
+    let receipt = until_settled(&mut watcher, action_id).await;
+    assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+    assert_eq!(
+        receipt.reason.as_ref(),
+        Some(&kr_protocol::receipt::RejectionReason::AdmissionFailed),
+        "{receipt:?}"
+    );
+    assert!(
+        acting.frames().is_empty(),
+        "nothing was written to the upstream: {:?}",
+        acting.frames()
+    );
+    let settled = until_binding(&acting, draft.draft_id, &handle, InsertionState::Failed).await;
+    assert_eq!(settled.attachments[0].handle, handle, "the upload is kept");
+    until("the report to be recorded", || async {
+        (acting.hosted._service.broker().drafts().reports_waiting() == 0).then_some(())
+    })
+    .await;
+}
+
+/// KR-REQ-23.30: what changes while an offer is prepared decides where its claim ends. An offer
+/// whose action was revoked before the component answered claims nothing, and one whose binding
+/// moved after its attachment was claimed is rejected with the claim settled as an offer that was
+/// never made; in both, nothing is written to the upstream and the upload is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_that_loses_its_ground_while_prepared_settles_what_it_claimed() {
+    for (change, claimed, reason) in [
+        (
+            Change::Authority,
+            false,
+            kr_protocol::receipt::RejectionReason::Revoked,
+        ),
+        (
+            Change::Binding,
+            true,
+            kr_protocol::receipt::RejectionReason::StalePreconditions,
+        ),
+    ] {
+        let Some((acting, draft, handle)) = offering().await else {
+            return;
+        };
+        let mut watcher = acting.client().await;
+        let mut asking = acting.client().await;
+        let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
+        let action_id = mutation.action_id;
+        let host = acting.stop_host();
+        write(&mut asking, mutation).await;
+        until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+        let mut asking = Some(asking);
+        acting.change(change, "attach.photo", &mut asking).await;
+        signal(&host, rustix::process::Signal::CONT);
+        if let Some(asking) = asking.as_mut() {
+            answer(asking, Some(1)).await;
+        }
+        let receipt = until_settled(&mut watcher, action_id).await;
+        assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+        assert_eq!(receipt.reason.as_ref(), Some(&reason), "{receipt:?}");
+        assert!(
+            acting.frames().is_empty(),
+            "nothing was written to the upstream: {:?}",
+            acting.frames()
+        );
+        if claimed {
+            let settled =
+                until_binding(&acting, draft.draft_id, &handle, InsertionState::Failed).await;
+            assert_eq!(settled.attachments[0].handle, handle, "the upload is kept");
+        } else {
+            let after = acting.draft(draft.draft_id);
+            assert_eq!(state_of(&after, &handle), InsertionState::Recorded);
+            assert_eq!(after.revision, draft.revision, "nothing was claimed");
+        }
+    }
+}
+
+/// KR-REQ-23.30: a repeat of an offer is answered with the receipt the offer has and claims nothing
+/// again, and the same action identifier with another attachment is a conflict that changes
+/// nothing; the offer is claimed, written and reported once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_a_repeat_of_an_offer_claims_nothing_again_and_a_changed_one_conflicts() {
+    let Some((acting, draft, first)) = offering().await else {
+        return;
+    };
+    let second = acting.publish(&[12; 64], "second.png");
+    let draft = acting.bind(&draft, &second);
+    let mut asking = acting.client().await;
+    let mut other = acting.client().await;
+    let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, first.transfer_id);
+    let action_id = mutation.action_id;
+    let host = acting.stop_host();
+    write(&mut asking, mutation.clone()).await;
+    until_receipt(&mut other, action_id, ReceiptState::Accepted).await;
+
+    // The same offer from another connection is answered with the receipt as it stands.
+    let mut repeat = mutation.clone();
+    repeat.request_id = RequestId::new(5);
+    let Outcome::Ok(repeated) = send(&mut other, repeat).await else {
+        panic!("a repeat is answered with the receipt");
+    };
+    assert!(
+        format!("{:?}", repeated.as_value()).contains("accepted"),
+        "{repeated:?}"
+    );
+
+    // The same identifier for another attachment is another request under the same identifier.
+    let mut changed = acting.offering(&other, "attach.photo", draft.draft_id, second.transfer_id);
+    changed.action_id = action_id;
+    changed.request_id = RequestId::new(6);
+    let Outcome::Error(conflict) = send(&mut other, changed).await else {
+        panic!("a changed request under the same identifier was carried");
+    };
+    assert_eq!(conflict.code, ErrorCode::IdConflict, "{conflict:?}");
+
+    signal(&host, rustix::process::Signal::CONT);
+    let finished = answer(&mut asking, Some(1)).await;
+    assert!(matches!(finished, Outcome::Ok(_)), "{finished:?}");
+    let accepted = until_binding(
+        &acting,
+        draft.draft_id,
+        &first,
+        InsertionState::AcceptedByAgent,
+    )
+    .await;
+    assert_eq!(acting.frames().len(), 1, "the offer was written once");
+    assert_eq!(
+        state_of(&accepted, &second),
+        InsertionState::Recorded,
+        "the other attachment was not touched"
+    );
+    assert_eq!(
+        accepted.revision.get(),
+        draft.revision.get() + 2,
+        "one claim and one report, whatever was repeated"
+    );
+}
+
+/// KR-REQ-23.30: an offer is refused before anything is claimed when the package's declaration does
+/// not admit it, one row for each thing the declaration decides: the media type and its family, the
+/// size, the destination, the number of attachments, the way the binding was recorded to be
+/// inserted, and the application instance the draft is for. The control is a declaration that
+/// admits it, which is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_the_packages_declaration_does_not_admit_is_refused_before_a_claim() {
+    use kr_plugin_sdk::effect::AttachmentContribution;
+    use kr_plugin_sdk::scalars::{Count, U64 as Size};
+    use kr_plugin_sdk::text::Label;
+    let Some((acting, draft, handle)) = offering().await else {
+        return;
+    };
+    let broker = acting.hosted._service.broker();
+    let mut client = acting.client().await;
+    let declaring = |change: &dyn Fn(&mut AttachmentContribution)| {
+        let mut declared = contribution();
+        change(&mut declared);
+        broker
+            .register_attachments(plugin_world::acting::binding(), Some(declared))
+            .expect("the contribution is registered");
+    };
+    let mut number = 100_u64;
+
+    // The draft holds a second image for the row about the count, and the draft of another
+    // instance and the draft recorded for a composer are made for their rows.
+    let second = acting.publish(&[13; 64], "second.png");
+    let crowded = acting.bind(&acting.new_draft(), &handle);
+    let crowded = acting.bind(&crowded, &second);
+    let elsewhere = acting.bind(
+        &acting.new_draft_for(kr_protocol::ids::ApplicationInstanceId::new(
+            Uuid::from_bytes([3; 16]),
+        )),
+        &handle,
+    );
+    let composer = acting.bind_by(
+        &acting.new_draft(),
+        &handle,
+        kr_protocol::transfer::InsertionMethod::VerifiedComposerInsertion,
+    );
+
+    type Alter = Box<dyn Fn(&mut AttachmentContribution)>;
+    let rows: Vec<(&str, kr_protocol::ids::DraftId, Alter, ErrorCode)> = vec![
+        (
+            "a media type the package does not accept",
+            draft.draft_id,
+            Box::new(|declared| declared.accepted_media_types = vec!["image/jpeg".to_owned()]),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a family of media types the package does not accept",
+            draft.draft_id,
+            Box::new(|declared| declared.accepted_media_types = vec!["audio/*".to_owned()]),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a file larger than the package accepts",
+            draft.draft_id,
+            Box::new(|declared| declared.max_bytes = Size::new(63)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a destination the package does not declare",
+            draft.draft_id,
+            Box::new(|declared| {
+                declared.external_destination =
+                    Nullable(Some(Label::new("elsewhere").expect("a label")));
+            }),
+            ErrorCode::DraftConflict,
+        ),
+        (
+            "more attachments than the package accepts",
+            crowded.draft_id,
+            Box::new(|declared| declared.max_count = Count::new(1)),
+            ErrorCode::DraftConflict,
+        ),
+        (
+            "a binding recorded to be inserted another way",
+            composer.draft_id,
+            Box::new(|_| {}),
+            ErrorCode::DraftConflict,
+        ),
+        (
+            "a draft for another application instance",
+            elsewhere.draft_id,
+            Box::new(|_| {}),
+            ErrorCode::DraftConflict,
+        ),
+    ];
+    for (what, draft_id, alter, code) in &rows {
+        declaring(&**alter);
+        let before = acting.draft(*draft_id);
+        number += 1;
+        let mut mutation = acting.offering(&client, "attach.photo", *draft_id, handle.transfer_id);
+        mutation.request_id = RequestId::new(number);
+        let action_id = mutation.action_id;
+        let Outcome::Error(refusal) = send(&mut client, mutation).await else {
+            panic!("{what}: the offer was carried");
+        };
+        assert_eq!(refusal.code, *code, "{what}: {refusal:?}");
+        assert_eq!(
+            read_receipt(&mut client, action_id)
+                .await
+                .expect("a receipt")
+                .state,
+            ReceiptState::Rejected,
+            "{what}"
+        );
+        let after = acting.draft(*draft_id);
+        assert_eq!(
+            after.revision, before.revision,
+            "{what}: nothing was claimed"
+        );
+        assert_eq!(
+            state_of(&after, &handle),
+            InsertionState::Recorded,
+            "{what}"
+        );
+    }
+    assert!(
+        acting.frames().is_empty(),
+        "no refused offer wrote anything: {:?}",
+        acting.frames()
+    );
+
+    // The control: a family that admits the image, which carries the offer.
+    declaring(&|declared| declared.accepted_media_types = vec!["image/*".to_owned()]);
+    let mut control = acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
+    control.request_id = RequestId::new(number + 1);
+    let outcome = send(&mut client, control).await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    until_binding(
+        &acting,
+        draft.draft_id,
+        &handle,
+        InsertionState::AcceptedByAgent,
+    )
+    .await;
+}
+
+/// KR-REQ-23.30: the connection the worker's own link holds to the plugin runtime is the one a
+/// component is asked to prepare actions over. The link asks the daemon for the runtime, registers
+/// the package's component and hands the broker the connection; an action is refused as one that
+/// can be asked again until then, is prepared and carried once the component is registered, is
+/// refused again when the runtime is lost, and is prepared once more when the link has registered
+/// the component with the replacement the daemon started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_action_is_prepared_over_the_links_connection_and_again_after_the_runtime_is_lost()
+ {
+    let Some(acting) = Acting::start_linked().await else {
+        return;
+    };
+    let mut client = acting.client().await;
+    let mut number = 0_u64;
+
+    // Refused as one that can be asked again, and carried as soon as the link has registered the
+    // component.
+    async fn until_carried(
+        acting: &Acting,
+        client: &mut kr_ipc::client::LocalClient,
+        number: &mut u64,
+    ) {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            *number += 1;
+            let mut mutation = acting.invocation(client, "turn.cancel", b"{}");
+            mutation.request_id = RequestId::new(*number);
+            match send(client, mutation).await {
+                Outcome::Ok(_) => return,
+                Outcome::Error(refusal) => assert_eq!(
+                    refusal.code,
+                    ErrorCode::ResourceUnavailable,
+                    "an action that cannot be prepared yet can be asked again: {refusal:?}"
+                ),
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waited {PATIENCE:?} for an action to be prepared and carried"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    until_carried(&acting, &mut client, &mut number).await;
+    assert_eq!(acting.frames().len(), 1);
+    let first_host = acting.hosted.published().expect("a runtime is published");
+
+    // The runtime is lost, and the daemon starts another when the link asks.
+    kill(&first_host);
+    until_carried(&acting, &mut client, &mut number).await;
+    assert_eq!(acting.frames().len(), 2);
+    let second_host = acting.hosted.published().expect("a runtime is published");
+    assert_ne!(
+        first_host, second_host,
+        "the second action was prepared over a connection to the replacement"
+    );
 }
