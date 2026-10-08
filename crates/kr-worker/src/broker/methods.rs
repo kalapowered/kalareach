@@ -123,6 +123,12 @@ pub enum UpstreamBody {
         /// its identifier and changes its content. The revision the host checked travels with it,
         /// so the upstream acts on the draft this invocation was admitted against or on nothing.
         draft_revision: Option<kr_protocol::scalars::U64>,
+        /// The attachment an offer claimed from that draft, with the grant over its file.
+        ///
+        /// The receiver of the request reads the file the grant names and checks it against the
+        /// digest and size here before it acknowledges the request, so that an acknowledgement
+        /// follows the file being available to it.
+        attachment: Option<crate::broker::ClaimedAttachment>,
         /// The action's own parameters, canonically encoded.
         parameters: Vec<u8>,
         /// The operation the validated plan prepares.
@@ -1483,6 +1489,9 @@ impl Broker {
                 // frame carries it, so what the upstream acts on is the draft this host checked
                 // rather than whatever the identifier denotes by the time the bytes land.
                 draft_revision: draft.as_ref().map(|snapshot| snapshot.revision),
+                attachment: draft
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.attachment.clone()),
                 parameters: arguments.clone(),
                 operation: None,
                 token: None,

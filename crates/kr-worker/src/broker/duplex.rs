@@ -1272,6 +1272,7 @@ impl Dispatch {
                 action,
                 draft_id,
                 draft_revision,
+                attachment,
                 parameters,
                 operation,
                 token,
@@ -1302,7 +1303,7 @@ impl Dispatch {
                         "a draft-bearing action carries the revision its draft was admitted at",
                     ));
                 }
-                serde_json::json!({
+                let mut frame = serde_json::json!({
                     "plugin_id": plugin_id.as_str(),
                     "action": action.as_str(),
                     "operation": operation.as_str(),
@@ -1312,7 +1313,30 @@ impl Dispatch {
                     // Section 11: the effect plan may use only what this invocation permits, and
                     // the token is what says which invocation that is.
                     "action_token": token.as_ref().map(|token| token.token_id.as_str()),
-                })
+                });
+                // An offered attachment travels as identifiers and the read grant over its file:
+                // where it is, until when, and what its bytes must hash to. Its original name is
+                // metadata and is not sent.
+                if let Some(attachment) = attachment {
+                    if draft_id.is_none() {
+                        return Err(BrokerError::invalid(
+                            "an attachment is offered from a draft, and this action names none",
+                        ));
+                    }
+                    frame["attachment"] = serde_json::json!({
+                        "transfer_id": attachment.transfer_id.to_string(),
+                        "media_type": attachment.media_type,
+                        "byte_len": attachment.byte_len.get(),
+                        "content_digest": serde_json::to_value(attachment.content_digest)
+                            .map_err(|error| BrokerError::invalid(error.to_string()))?,
+                        "read_grant": {
+                            "path": attachment.path,
+                            "expires_at_ms": attachment.expires_at_ms.get(),
+                            "environment_id": attachment.environment_id.to_string(),
+                        },
+                    });
+                }
+                frame
             }
         };
         if let Some(turn_id) = request.turn_id.as_ref() {
@@ -2563,6 +2587,7 @@ mod tests {
                 action: kr_protocol::broker::ActionName::new("draft.attach").expect("valid"),
                 draft_id,
                 draft_revision,
+                attachment: None,
                 parameters: b"{}".to_vec(),
                 operation: Some(kr_protocol::broker::PreparedOperation::UpstreamAttachment),
                 token: None,

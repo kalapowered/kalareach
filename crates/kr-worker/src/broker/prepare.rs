@@ -39,7 +39,7 @@ use crate::daemon_link::{ClaimHold, ReportSlot};
 
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::methods::{Caller, RegisteredAction};
-use crate::broker::{Broker, DraftSnapshot};
+use crate::broker::{Broker, ClaimedAttachment, DraftSnapshot};
 
 /// How many preparations may be inside a component at once, across every connection.
 ///
@@ -467,10 +467,12 @@ impl Broker {
                         ),
                     });
                 }
-                let (hold, facts) = self.claim_draft(needs, request, attempt, until).await?;
+                let (hold, facts, attachment) =
+                    self.claim_draft(needs, request, attempt, until).await?;
                 snapshot = Some(DraftSnapshot {
                     draft_id: facts.draft_id,
                     revision: U64::new(facts.revision.get()),
+                    attachment: Some(attachment),
                 });
                 claim = Some(hold);
             }
@@ -513,7 +515,7 @@ impl Broker {
         request: &PreparationRequest,
         attempt: U64,
         until: tokio::time::Instant,
-    ) -> Result<(ClaimHold, DraftFacts)> {
+    ) -> Result<(ClaimHold, DraftFacts, ClaimedAttachment)> {
         let draft_id = request.params.draft_id.as_ref().copied().ok_or_else(|| {
             BrokerError::PreconditionFailed {
                 detail: "this call named no draft".to_owned(),
@@ -542,7 +544,10 @@ impl Broker {
             .drafts
             .begin(&needs.actor, slot, begin, left_until(until))
             .await?;
-        Ok((hold, claimed.facts))
+        // What the frame to the upstream names comes from the claim and from nowhere else: the
+        // binding as the daemon holds it now, and the grant it issued over the one file.
+        let attachment = claimed_attachment(&claimed, needs.transfer_id)?;
+        Ok((hold, claimed.facts, attachment))
     }
 
     async fn propose(
@@ -740,6 +745,34 @@ fn wire_argument_of(argument: &ActionArgument) -> WireNamedArgument {
             ArgumentValue::NodeRef { node_id } => WireArgument::NodeRef(node_id.to_string()),
         },
     }
+}
+
+/// The attachment a claim made over, as the frame to the upstream names it.
+///
+/// A claim whose grant covers another file than the binding it claimed is not one this worker
+/// offers: the frame would send the receiver to a file that is not the attachment.
+fn claimed_attachment(
+    claim: &kr_protocol::insertion::InsertionClaim,
+    transfer_id: TransferId,
+) -> Result<ClaimedAttachment> {
+    let binding = claim
+        .facts
+        .bindings
+        .iter()
+        .find(|binding| binding.transfer_id == transfer_id)
+        .filter(|_| claim.grant.transfer_id == transfer_id)
+        .ok_or_else(|| BrokerError::PreconditionFailed {
+            detail: format!("the claim made for {transfer_id} does not cover it"),
+        })?;
+    Ok(ClaimedAttachment {
+        transfer_id,
+        media_type: binding.media_type.clone(),
+        byte_len: binding.byte_len,
+        content_digest: binding.content_digest,
+        path: claim.grant.host_path.clone(),
+        expires_at_ms: claim.grant.expires_at_ms,
+        environment_id: claim.grant.environment_id,
+    })
 }
 
 /// What is left of a bound.
