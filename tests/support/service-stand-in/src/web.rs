@@ -31,6 +31,10 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::service::{ServiceRequestSignature, canonical_body_digest, installation_id};
 use tokio::sync::watch;
 
+/// The backup allowance the service reports for the one account it knows: the free tier a local
+/// deployment's catalogue gives, which the recording was made against.
+const ALLOWANCE_BYTES: &str = "67108864";
+
 /// The origin the in-process service answers as.
 pub const IN_PROCESS_ORIGIN: &str = "https://reach.kala.to";
 
@@ -258,19 +262,6 @@ impl StorageWeb {
     #[must_use]
     pub fn origin(&self) -> &str {
         &self.origin
-    }
-
-    /// Issues `token` for `account`, with `scopes` and live. A token this service did not issue
-    /// proves no account.
-    pub fn issue_token(&self, token: &str, account: &str, scopes: &[&str]) {
-        self.state.lock().expect("the state").tokens.insert(
-            token.to_owned(),
-            Token {
-                account: account.to_owned(),
-                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-                live: true,
-            },
-        );
     }
 
     /// `token` expires: from now on it proves no account.
@@ -818,7 +809,7 @@ fn status(state: &State, principal: &str, funded: bool) -> ServiceHttpAnswer {
         "stored": { "objects": owned("stored"), "bytes": "0" },
         "tombstoned": { "objects": owned("tombstoned"), "bytes": "0", "next_purge": null },
         "uploading": { "objects": 0, "bytes": "0", "reserved_bytes": "0" },
-        "allowance_bytes": "10737418240",
+        "allowance_bytes": ALLOWANCE_BYTES,
         "limits": limits(),
     }))
 }
@@ -1270,9 +1261,11 @@ fn abort(
         );
     }
     upload.state = UploadState::Cleaned;
+    // What the abandonment gives back is what the upload reserved: the most it declared.
+    let released = upload.total;
     let key = (upload.archive.clone(), upload.object.clone());
     state.objects.remove(&key);
-    answered(serde_json::json!({ "state": "cleaned", "released_bytes": "0" }))
+    answered(serde_json::json!({ "state": "cleaned", "released_bytes": released.to_string() }))
 }
 
 fn read(state: &State, body: &serde_json::Value, principal: &str) -> ServiceHttpAnswer {
@@ -1625,15 +1618,45 @@ fn manifest(
         serde_json::Value::Null => collection.generations.keys().next_back().copied(),
         named => counter(named),
     };
-    // A caller that holds a verified checkpoint is not answered with anything older: a service
-    // that cannot meet it says what it holds instead.
-    if let Some(held) = counter(&asked["checkpoint"]["backup_generation"])
-        && collection.checkpoint < held
+    // A caller that holds a verified checkpoint is not answered with anything older, and not with a
+    // chain it cannot join: the service says it holds nothing to answer with.
+    let checkpoint = &asked["checkpoint"];
+    let checkpoint_generation = if checkpoint.is_null() {
+        None
+    } else {
+        if identifier(&checkpoint["archive_id"]).is_none_or(|named| named != archive) {
+            return refusal(
+                400,
+                "INVALID_REQUEST",
+                "That checkpoint is about another archive.",
+            );
+        }
+        let Some(generation) = counter(&checkpoint["backup_generation"]) else {
+            return refusal(
+                400,
+                "INVALID_REQUEST",
+                "A checkpoint generation is a counter.",
+            );
+        };
+        Some(generation)
+    };
+    if checkpoint_generation.is_some_and(|held| held > collection.checkpoint) {
+        return refusal(
+            404,
+            "NOT_FOUND",
+            "This collection holds no generation as new as the checkpoint that was presented.",
+        );
+    }
+    let checkpointed = checkpoint_generation.and_then(|held| collection.generations.get(&held));
+    if let Some((_, held)) = checkpointed
+        && let hash = &checkpoint["encrypted_manifest_hash"]
+        && !hash.is_null()
+        && *hash != held["payload"]["descriptor"]["encrypted_manifest"]["encrypted_object_hash"]
     {
         return refusal(
-            409,
-            "CONFLICT",
-            "This collection holds an older generation than the checkpoint names.",
+            404,
+            "NOT_FOUND",
+            "This collection holds a different manifest at the generation that checkpoint names.",
         );
     }
     let Some((generation, (_, publication))) =
@@ -1641,11 +1664,17 @@ fn manifest(
     else {
         return refusal(404, "NOT_FOUND", "No such generation.");
     };
-    let _ = generation;
+    if checkpoint_generation.is_some_and(|held| *generation < held) {
+        return refusal(
+            404,
+            "NOT_FOUND",
+            "That generation is older than the checkpoint that was presented.",
+        );
+    }
     answered(serde_json::json!({
         "publication": publication,
         "published_at": "2026-09-25T17:00:00.000Z",
-        "collection": collection_summary(&archive, collection, Some("10737418240")),
+        "collection": collection_summary(&archive, collection, Some(ALLOWANCE_BYTES)),
         "current_writer": writer_summary(collection),
     }))
 }
@@ -1667,6 +1696,15 @@ fn writer_summary(collection: &Collection) -> serde_json::Value {
     })
 }
 
+/// How many bytes the canonical encoding of a held publication's descriptor takes, which is what
+/// a collection is charged for the generation.
+fn descriptor_bytes(publication: &serde_json::Value) -> u64 {
+    serde_json::from_value::<BackupGenerationPublication>(publication.clone())
+        .ok()
+        .and_then(|parsed| kr_cbor::to_canonical_value(&parsed.payload.descriptor).ok())
+        .map_or(0, |value| kr_cbor::encode(&value).len() as u64)
+}
+
 /// What one collection holds now, with the allowance the caller's storage has when the answer
 /// states it: a fetch reads the ledger for it, and an enrolment or a publication does not.
 fn collection_summary(
@@ -1683,7 +1721,12 @@ fn collection_summary(
             .rev()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        "bytes": "512",
+        "bytes": collection
+            .generations
+            .values()
+            .map(|(_, publication)| descriptor_bytes(publication))
+            .sum::<u64>()
+            .to_string(),
         "allowance_bytes": allowance,
     })
 }
