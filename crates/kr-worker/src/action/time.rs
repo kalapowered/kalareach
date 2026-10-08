@@ -1929,6 +1929,54 @@ mod tests {
         }
     }
 
+    /// KR-REQ-09.19: a worker that never trusted its clock has no mark, and a clock that reads
+    /// before the checkpoint it wrote down in an earlier boot is a rollback it found. The reading
+    /// the checkpoint was proved at belongs to that boot's continuous clock, so it is not a proof
+    /// after the owner spoke in this one, and the owner's next action in this boot frees the
+    /// worker.
+    #[test]
+    fn an_owner_in_this_boot_frees_a_worker_whose_clock_reads_before_an_earlier_boots_checkpoint() {
+        use kr_ipc::floor::SharedFloor;
+
+        let continuous = ManualSharedClock::new();
+        continuous.advance(Duration::from_secs(30));
+        let active = ManualActiveClock::new();
+        active.advance(Duration::from_secs(30));
+        let wall = ManualWallClock::new(WALL - 600_000);
+        let floor = Arc::new(SharedFloor::in_process(0));
+        let contract = TimeContract::restore(
+            boot(2),
+            AUTHORITY,
+            TimeSources {
+                continuous: Arc::new(continuous.clone()),
+                active: Arc::new(active.clone()),
+                wall: Arc::new(wall.clone()),
+                adapter: Arc::new(RecordedTimeAdapter::new(qualified())),
+                floor: Some(Arc::clone(&floor)),
+            },
+            Some(HostTimeState {
+                trust: WallClockTrust::Unresolved,
+                proven: Nullable::null(),
+                ..earlier_boot_state()
+            }),
+        );
+        assert!(
+            contract.observe().rolled_back,
+            "the clock reads before the checkpoint"
+        );
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+
+        continuous.advance(Duration::from_secs(1));
+        active.advance(Duration::from_secs(1));
+        wall.advance(Duration::from_secs(1));
+        floor.establish(wall.now_ms().get(), continuous.boot_elapsed_ms());
+        continuous.advance(Duration::from_secs(1));
+        active.advance(Duration::from_secs(1));
+        wall.advance(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+    }
+
     #[test]
     fn an_untrusted_wall_clock_across_a_reboot_cannot_reconstitute_a_grant() {
         // A grant signed with a UTC deadline, and a host that came up in a new boot with its wall
