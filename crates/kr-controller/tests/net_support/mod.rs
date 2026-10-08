@@ -273,6 +273,27 @@ impl Host {
         .await
     }
 
+    /// Starts a daemon on the clocks a suite moves by hand, with `owner` as its first owner. A
+    /// restart keeps the clocks.
+    pub async fn start_on_clocks(owner: &DeviceKeys, clocks: Clocks) -> Self {
+        let mut host = Self::start_on(
+            kr_ipc::testing::TempHost::create(),
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            clocks,
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
     /// Starts a daemon whose network selects the services `endpoint` names, with `owner` as its
     /// first owner.
     pub async fn start_with_endpoint(owner: &DeviceKeys, endpoint: EndpointConfig) -> Self {
