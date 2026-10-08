@@ -140,6 +140,7 @@ use kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
 use kr_worker::privacy::PrivacyGeneration;
 
 use crate::backup::BackupService;
+use crate::backup::quiet::{LONGEST_DELAY, Quiet};
 use crate::backup::store::{
     Attempt, AttemptStatus, GenerationRecord, ObjectRecord, PrivacyStatus, Production, Publication,
     Remote, Step, UploadRecord,
@@ -419,7 +420,8 @@ pub enum Idle {
 pub struct Hold {
     /// The code the refusal or the failure carried.
     pub code: ErrorCode,
-    /// How long the service asked to be left alone, when it said.
+    /// How long the service asked to be left alone, when it said, and no longer than
+    /// [`LONGEST_DELAY`].
     pub retry_after: Option<Duration>,
 }
 
@@ -431,7 +433,7 @@ impl Hold {
             ClientError::Refused {
                 retry_after_seconds,
                 ..
-            } => retry_after_seconds.map(Duration::from_secs),
+            } => retry_after_seconds.map(|seconds| Duration::from_secs(seconds).min(LONGEST_DELAY)),
             _ => None,
         };
         Self {
@@ -536,6 +538,9 @@ pub struct Uploader {
     disk: Disk,
     storage: Arc<dyn StorageService>,
     manifest: Arc<dyn BackupManifestService>,
+    /// When the service said it may be asked again. A pass stops between requests while it is owed,
+    /// and a privacy fence's cleanup does not.
+    quiet: Arc<Quiet>,
     /// The writer's key, which signs every publication and whose generations this uploader
     /// publishes.
     writer: AuthorisationKeyPair,
@@ -566,19 +571,22 @@ impl Uploader {
     ///
     /// It uploads through `storage` and publishes through `manifest` as `writer`. The service
     /// takes a publication only when the request carrying it is signed by the writer that signed
-    /// it, so `manifest` signs its requests with the same key.
+    /// it, so `manifest` signs its requests with the same key. `quiet` holds what the service
+    /// asked to be left alone for, which this uploader adds to when it meets such a delay.
     #[must_use]
     pub fn new(
         backup: Arc<BackupService>,
         storage: Arc<dyn StorageService>,
         manifest: Arc<dyn BackupManifestService>,
         writer: AuthorisationKeyPair,
+        quiet: Arc<Quiet>,
         now: TimestampMs,
     ) -> Self {
         Self {
             disk: Disk { backup },
             storage,
             manifest,
+            quiet,
             writer,
             started_at_ms: now.get(),
             dispatched_here: BTreeSet::new(),
@@ -614,8 +622,18 @@ impl Uploader {
             else {
                 continue;
             };
-            if !matches!(self.held(&generation).await, Ok(true)) {
-                continue;
+            match self.held(&generation).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    // A service that asked to be left alone is not asked about the next
+                    // publication either, and not by the first pass.
+                    if let Some(delay) = Hold::of(&error).retry_after {
+                        self.quiet.owe(delay);
+                        break;
+                    }
+                    continue;
+                }
             }
             settled.push(
                 match self.disk.run(|backup| {
@@ -660,6 +678,10 @@ impl Uploader {
             return Ok(report);
         }
         let fenced = privacy.inhibited_at().is_some();
+        if !fenced && self.quiet.left().is_some() {
+            // The service asked to be left alone, and asked it of whoever put it a question.
+            return Ok(report);
+        }
         if !fenced {
             match self.storage.status().await {
                 Ok(status) if status.backup == BackupState::On => report.status = Some(status),
@@ -687,15 +709,15 @@ impl Uploader {
             let Some(hold) = held else {
                 continue;
             };
-            let met = report.hold.map_or(hold, |earlier| earlier.and(hold));
-            report.hold = Some(met);
+            report.hold = Some(report.hold.map_or(hold, |earlier| earlier.and(hold)));
             // A service that asked to be left alone is not asked about the next attempt either:
-            // the answer would be the same. A refusal that names no delay may be about this
-            // attempt alone, an object the service already holds for example, so the pass goes on.
-            // Under a privacy fence it goes on in every case, because what a fence owes is ending
-            // work, and an attempt that needs no answer from the service ends anyway.
-            if !fenced && met.retry_after.is_some() {
-                break;
+            // the answer would be the same, so the pass ends at the next step. A refusal that
+            // names no delay may be about this attempt alone, an object the service already holds
+            // for example, so the pass goes on. Under a privacy fence it goes on in every case,
+            // because what a fence owes is ending work, and an attempt that needs no answer from
+            // the service ends anyway.
+            if let Some(delay) = hold.retry_after {
+                self.quiet.owe(delay);
             }
         }
         Ok(report)
@@ -718,6 +740,9 @@ impl Uploader {
             return Ok(None);
         }
         let privacy = self.disk.run(|backup| backup.privacy_status())?;
+        if privacy.inhibited_at().is_none() && self.quiet.left().is_some() {
+            return Ok(None);
+        }
         let outbox = self.disk.run(|backup| backup.outbox())?;
         for attempt in &outbox {
             if turn.waited.contains(&attempt.sequence)
@@ -944,8 +969,10 @@ impl Uploader {
                 return Ok(not_carried());
             }
             let disk = &self.disk;
+            let quiet = &self.quiet;
             let mut failure: Option<ControllerError> = None;
             let mut withdrawn = false;
+            let mut asked_to_wait = false;
             let sent = {
                 // Each acknowledgement is recorded before the next part leaves, and the next part
                 // leaves only while the store still holds this attempt for this uploader.
@@ -961,6 +988,11 @@ impl Uploader {
                         )
                     });
                     match recorded.and_then(|()| disk.run(|backup| may_send(backup, attempt))) {
+                        // The service may have asked, since the last part, to be left alone.
+                        Ok(true) if quiet.left().is_some() => {
+                            asked_to_wait = true;
+                            Err(held_back())
+                        }
                         Ok(true) => Ok(()),
                         Ok(false) => {
                             withdrawn = true;
@@ -988,6 +1020,10 @@ impl Uploader {
                 }
                 Ok(ArchiveAnswer::UploadGone) => self.forget(record, turn),
                 Err(_) if withdrawn => Ok(not_carried()),
+                Err(_) if asked_to_wait => Ok(waiting(format!(
+                    "the service asked to be left alone, so the next part of object {} waits",
+                    object.object_id
+                ))),
                 Err(error) if not_permitted(&error) => {
                     self.abandon(record, &progress.upload_id, turn).await
                 }
@@ -1448,6 +1484,13 @@ impl Uploader {
                 // What the service says to the question asked next is part of what holds this
                 // publication back: a person to act and a delay to wait are both owed.
                 let mut hold = Hold::of(&error);
+                if hold.retry_after.is_some() {
+                    // The service asked to be left alone, so it is not asked what it holds now.
+                    return Ok(Stepped::Waiting {
+                        reason: format!("the service did not publish the generation: {error}"),
+                        hold: Some(hold),
+                    });
+                }
                 match self.passed_by(generation).await {
                     Ok(Some(held)) => {
                         let reason = format!(
@@ -2033,7 +2076,8 @@ enum Unstaged {
 /// Runs `work`, which blocks on the disk, without holding a thread the reactor runs other tasks on.
 ///
 /// The daemon's runtime has worker threads to give up, and `block_in_place` hands this one's tasks
-/// to another while it blocks. It needs a runtime with more than one thread, which is the daemon's.
+/// to another while it blocks. It needs a multi-thread runtime, which is the daemon's, and panics
+/// on a current-thread one.
 fn blocking<T>(work: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(work)
 }

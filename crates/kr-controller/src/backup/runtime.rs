@@ -33,10 +33,8 @@
 //! through a handle that hands the thread's other tasks to another thread while it blocks, so a
 //! slow disk holds one request's turn and not the reactor.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::voice::AccountTokenFile;
@@ -56,6 +54,7 @@ use kr_transport::config::ProxyUrl;
 use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
 
+use crate::backup::quiet::{Quiet, Timer};
 use crate::backup::uploader::{Hold, Idle, PassReport, Stepped, Uploader};
 use crate::backup::{BackupService, BackupSignals};
 use crate::error::{ControllerError, Result};
@@ -85,22 +84,6 @@ pub const STORAGE_DEADLINES: HttpDeadlines = HttpDeadlines {
     read: Duration::from_secs(60),
     total: Duration::from_secs(90),
 };
-
-/// What the host waits on between two passes.
-pub trait Timer: Send + Sync + std::fmt::Debug {
-    /// A wait of `duration`.
-    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-}
-
-/// The clock the daemon waits by.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RealTimer;
-
-impl Timer for RealTimer {
-    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-}
 
 /// The key this host signs its managed-storage requests and the generations it publishes with.
 ///
@@ -207,6 +190,9 @@ struct Observed {
     status_refusal: Option<Hold>,
     /// What held back the work of the last pass, when something did.
     pass_hold: Option<Hold>,
+    /// Whether the last question `kr doctor` put to the service went unanswered in the time it
+    /// has, which leaves the last answer in hand and not known to be current.
+    status_unanswered: bool,
     /// What the last pass did.
     last_pass: Option<LastPass>,
     /// Whether the carrier found work and no usable account token the last time it looked.
@@ -288,8 +274,9 @@ struct Shared {
     signals: Arc<BackupSignals>,
     observed: Mutex<Observed>,
     /// When the service said it may be asked again, if it asked for a delay that has not passed.
-    /// Every question to the service waits for it, whoever asks, except the ones a fence owes.
-    owed: Mutex<Option<Instant>>,
+    /// Every question to the service waits for it, whoever asks, except the ones a fence owes. The
+    /// uploader holds the same record and stops between requests when it is owed.
+    quiet: Arc<Quiet>,
     /// How many passes have finished, for whatever waits on one.
     passes: tokio::sync::watch::Sender<u64>,
 }
@@ -297,25 +284,6 @@ struct Shared {
 impl Shared {
     fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
         self.observed.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn owed(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
-        self.owed.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Records that the service asked to be left alone for `delay`.
-    fn owe(&self, delay: Duration) {
-        let until = Instant::now() + delay;
-        let mut owed = self.owed();
-        *owed = Some(owed.map_or(until, |earlier| earlier.max(until)));
-    }
-
-    /// What is left of the delay the service asked for, when some is.
-    fn owed_for(&self) -> Option<Duration> {
-        let until = (*self.owed())?;
-        until
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
     }
 
     /// Whether a request may carry the host's account token now.
@@ -327,11 +295,14 @@ impl Shared {
     fn after(&self, hold: Hold, backoff: &mut Backoff) -> Wait {
         match hold.retry_after {
             Some(delay) => {
-                self.owe(delay);
+                self.quiet.owe(delay);
+                // At least what is left of every delay the service named, so that the wait ends
+                // the debt it settles.
+                let owed = self.quiet.left().unwrap_or(delay).max(delay);
                 Wait::Owed(if hold.needs_a_person() {
-                    delay
+                    owed
                 } else {
-                    backoff.next_delay().max(delay)
+                    backoff.next_delay().max(owed)
                 })
             }
             None if hold.needs_a_person() => Wait::Timed {
@@ -360,13 +331,14 @@ impl Shared {
             if let Some(status) = &report.status {
                 observed.status = Some(status.clone());
                 observed.status_refusal = None;
+                observed.status_unanswered = false;
             }
             if matches!(report.idle, Some(Idle::Unavailable { .. })) {
-                // The pass asked the service about backup storage and was turned back, so it did
-                // no work, and the work it held back earlier is not what to say now.
                 observed.status_refusal = report.hold;
-                observed.pass_hold = None;
-            } else {
+            }
+            // What held the work back stands until a pass carries work again: a pass that was
+            // turned back at its first question did none, and says nothing of what held it before.
+            if report.idle.is_none() {
                 observed.pass_hold = report.hold;
             }
             observed.last_pass = Some(LastPass {
@@ -386,6 +358,11 @@ impl Shared {
         }
         if let Some(hold) = report.hold {
             return self.after(hold, backoff);
+        }
+        // The service may have asked to be left alone while the pass ran, by way of the question
+        // `kr doctor` put to it: the work that is left waits for that.
+        if let Some(left) = self.quiet.left() {
+            return Wait::Owed(left);
         }
         match report.idle {
             Some(Idle::BackupOff) => Wait::Timed {
@@ -433,16 +410,11 @@ impl Shared {
                 }
             }
             Wait::Owed(duration) => {
-                let asked = *self.owed();
+                let seen = self.quiet.deadline();
                 tokio::select! {
-                    () = timer.sleep(duration) => {
-                        // What was asked for has passed, unless the service asked for more while
-                        // this waited.
-                        let mut owed = self.owed();
-                        if *owed == asked {
-                            *owed = None;
-                        }
-                    }
+                    // What was asked for has passed, unless the service asked for more while this
+                    // waited.
+                    () = timer.sleep(duration) => self.quiet.passed(seen),
                     () = signals.fence.notified() => {}
                 }
             }
@@ -460,15 +432,18 @@ impl Shared {
             let fenced = backup
                 .privacy_status()
                 .is_ok_and(|privacy| privacy.inhibited_at().is_some());
-            (
-                fenced,
-                backup.outbox().is_ok_and(|outbox| outbox.is_empty()),
-            )
+            // The test `Uploader::pass` makes before it asks the service anything.
+            let nothing = backup.outbox().is_ok_and(|outbox| outbox.is_empty())
+                && backup
+                    .store()
+                    .uploads()
+                    .is_ok_and(|uploads| uploads.is_empty());
+            (fenced, nothing)
         });
         // A fence is answered whatever the service asked and whatever token the host holds: ending
         // work in flight is what the host owes, and a request that cannot be signed in is not sent.
         if !fenced {
-            if let Some(left) = self.owed_for() {
+            if let Some(left) = self.quiet.left() {
                 return Wait::Owed(left);
             }
             if !self.token_usable().await {
@@ -496,7 +471,12 @@ impl Shared {
                     && report.hold.is_some_and(|hold| hold.needs_a_person())
                     && !self.token_usable().await
                 {
-                    self.observed().token_blocked = true;
+                    // What was refused was the host's own token and not a thing at the service, so
+                    // the doctor says the token and not a refusal.
+                    let mut observed = self.observed();
+                    observed.token_blocked = true;
+                    observed.pass_hold = None;
+                    drop(observed);
                     return Wait::Timed {
                         duration: TOKEN_CHECK,
                         wakeable: true,
@@ -522,13 +502,18 @@ impl Shared {
                 let mut observed = self.observed();
                 observed.status = Some(status);
                 observed.status_refusal = None;
+                observed.status_unanswered = false;
                 None
             }
             Err(error) => {
                 let hold = Hold::of(&error);
-                self.observed().status_refusal = Some(hold);
+                {
+                    let mut observed = self.observed();
+                    observed.status_refusal = Some(hold);
+                    observed.status_unanswered = false;
+                }
                 if let Some(delay) = hold.retry_after {
-                    self.owe(delay);
+                    self.quiet.owe(delay);
                 }
                 Some(hold)
             }
@@ -586,6 +571,7 @@ impl BackupRuntime {
             ));
         };
         let writer_public = *writer.public();
+        let quiet = Arc::new(Quiet::new(Arc::clone(&timer)));
         let shared = Arc::new(Shared {
             storage: Arc::clone(storage),
             account: Arc::clone(&tokens) as Arc<dyn AccountTokenSource>,
@@ -594,7 +580,7 @@ impl BackupRuntime {
             writer_key_id: writer.key_id(),
             signals: backup.signals(),
             observed: Mutex::default(),
-            owed: Mutex::default(),
+            quiet: Arc::clone(&quiet),
             passes: tokio::sync::watch::channel(0).0,
         });
         let uploader = Uploader::new(
@@ -602,6 +588,7 @@ impl BackupRuntime {
             Arc::clone(storage),
             Arc::clone(manifest),
             writer,
+            quiet,
             kr_ipc::now_ms(),
         );
         Ok(Self {
@@ -691,8 +678,13 @@ impl BackupRuntime {
     /// the last answer stands.
     pub async fn doctor_check(&self) -> DoctorCheck {
         let usable = self.shared.token_usable().await;
-        if usable && self.shared.owed_for().is_none() {
-            let _ = tokio::time::timeout(DOCTOR_STATUS_READ, self.shared.read_status()).await;
+        if usable && self.shared.quiet.left().is_none() {
+            if tokio::time::timeout(DOCTOR_STATUS_READ, self.shared.read_status())
+                .await
+                .is_err()
+            {
+                self.shared.observed().status_unanswered = true;
+            }
             // A token that has become usable since the carrier looked and found none is a reason
             // to look again.
             if self.shared.observed().token_blocked {
@@ -755,6 +747,12 @@ impl BackupRuntime {
                 writer,
             );
         }
+        if observed.status_unanswered {
+            detail = detail.stated(
+                "; the service did not answer the last question in time, so the answer above may \
+                 be out of date",
+            );
+        }
         let backup_on = observed
             .status
             .as_ref()
@@ -762,7 +760,8 @@ impl BackupRuntime {
         let well = state == TokenState::Usable
             && backup_on
             && observed.status_refusal.is_none()
-            && observed.pass_hold.is_none();
+            && observed.pass_hold.is_none()
+            && !observed.status_unanswered;
         let remedy = if well {
             None
         } else if state != TokenState::Usable {
@@ -773,10 +772,10 @@ impl BackupRuntime {
         } else {
             match (observed.pass_hold.or(observed.status_refusal), backup_on) {
                 (Some(hold), _) => Some(remedy_for(hold)),
-                (None, false) if observed.status.is_some() => {
+                (None, false) if observed.status.is_some() && !observed.status_unanswered => {
                     Some("Turn backup storage on for the account.")
                 }
-                _ => Some("Run `kr doctor` again once the host has asked the service."),
+                _ => Some("Run `kr doctor` again once the service answers."),
             }
         };
         DoctorCheck::new(
@@ -833,7 +832,11 @@ async fn drive(
     // to it binds the carrier like any other answer: a delay it names is waited out before the
     // first pass, and a refusal only a person can mend is waited for as one.
     let mut next = None;
-    if shared.token_usable().await
+    if let Some(left) = shared.quiet.left() {
+        // The question the host asked about a publication an earlier run sent was turned back with
+        // a delay, which binds this one too.
+        next = Some(Wait::Owed(left));
+    } else if shared.token_usable().await
         && let Some(hold) = shared.read_status().await
     {
         next = Some(shared.after(hold, &mut backoff));
@@ -858,7 +861,8 @@ fn hold_sentence(detail: Sentence, hold: Hold, writer: KeyId) -> Sentence {
         ErrorCode::PermissionDenied => detail
             .stated(
                 "the service refused a request as not permitted, which is what it answers when \
-                 nobody has enrolled this host's writer key (its identifier starts ",
+                 nobody has enrolled this host's writer key (its identifier starts, in \
+                 hexadecimal, ",
             )
             .hexadecimal(u64::from_be_bytes(
                 writer.as_bytes()[..8].try_into().unwrap_or([0; 8]),
@@ -881,7 +885,8 @@ const fn remedy_for(hold: Hold) -> &'static str {
             "Sign the host in to an account with a backup allowance, or raise the allowance."
         }
         ErrorCode::PermissionDenied => {
-            "Have the account's owner enrol this host's writer key as a backup writer."
+            "If nobody has yet, have the account's owner enrol this host's writer key as a \
+             backup writer."
         }
         ErrorCode::HostNotConfigured => {
             "Tell the service's operator that backup storage is not configured."

@@ -30,6 +30,7 @@
 //! generation is sealed; the filenames are inside the encrypted manifest. `backup.sqlite` holds
 //! identities, hashes, sizes, states and the paths of ciphertext.
 
+pub mod quiet;
 pub mod runtime;
 mod statements;
 pub mod store;
