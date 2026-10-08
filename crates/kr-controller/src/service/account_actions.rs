@@ -31,8 +31,10 @@ impl Controller {
     ///
     /// The account service is the one the browser signs in at, and a code is redeemable only
     /// there, so every request of the sign-in goes there and the voice broker is presented a token
-    /// only when it is that service. A host whose broker is another service, or none, signs in
-    /// nowhere; what stands in the way is said on standard error, as for the voice broker.
+    /// only when it is that service. A host whose broker is another service, or none, signs in and
+    /// presents nowhere, but still reaches the account service for what it holds: the grant it was
+    /// signed in with while its broker was the managed one can be seen, revoked and signed out.
+    /// What stands in the way is said on standard error, as for the voice broker.
     pub(super) fn build_host_account(
         started: &crate::config::Started,
         store: Arc<dyn kr_crypto::store::SecretStore>,
@@ -45,39 +47,31 @@ impl Controller {
             eprintln!("kr-controller: no host sign-in: {reason}");
             SignInUnavailable::NotUsable
         };
-        let service = match started.voice.broker_origin() {
-            None => Err(SignInUnavailable::NoBroker),
-            Some(broker) => {
-                let origin = account_origin();
-                if broker == origin {
-                    GatewayOrigin::new(&origin)
-                        .map_err(|error| unusable(&format_args!("the account service: {error}")))
-                        .and_then(|gateway| {
-                            let proxy =
-                                Self::proxy_of(started).map_err(|error| unusable(&error))?;
-                            let transport =
-                                Arc::new(crate::managed_transport::ManagedTransport::new(
-                                    gateway,
-                                    proxy,
-                                    kr_client::services::HttpDeadlines::default(),
-                                ));
-                            Ok(crate::account::Service {
-                                account: Arc::new(
-                                    kr_client::services::ManagedAccountService::at_origin(
-                                        origin.clone(),
-                                        transport,
-                                        kr_client::services::account::Client::Desktop,
-                                    ),
-                                ),
-                                origin,
-                            })
-                        })
-                } else {
-                    Err(SignInUnavailable::BrokerIsAnotherService)
-                }
-            }
+        let origin = account_origin();
+        let refused = match started.voice.broker_origin() {
+            None => Some(SignInUnavailable::NoBroker),
+            Some(broker) if broker == origin => None,
+            Some(_) => Some(SignInUnavailable::BrokerIsAnotherService),
         };
-        crate::account::HostAccount::new(store, environment_id, runtime_root, service)
+        let service = GatewayOrigin::new(&origin)
+            .map_err(|error| unusable(&format_args!("the account service: {error}")))
+            .and_then(|gateway| {
+                let proxy = Self::proxy_of(started).map_err(|error| unusable(&error))?;
+                let transport = Arc::new(crate::managed_transport::ManagedTransport::new(
+                    gateway,
+                    proxy,
+                    kr_client::services::HttpDeadlines::default(),
+                ));
+                Ok(crate::account::Service {
+                    account: Arc::new(kr_client::services::ManagedAccountService::at_origin(
+                        origin.clone(),
+                        transport,
+                        kr_client::services::account::Client::Desktop,
+                    )),
+                    origin: origin.clone(),
+                })
+            });
+        crate::account::HostAccount::new(store, environment_id, runtime_root, service, refused)
     }
 
     /// This host's own sign-in to the managed account service.

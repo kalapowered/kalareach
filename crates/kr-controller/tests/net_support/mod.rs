@@ -68,13 +68,16 @@ pub fn write_document(
 }
 
 /// Where the managed account service stands for a daemon a suite starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountAt {
     /// At its own fixed origin, which a suite's stand-in is not at.
     Managed,
     /// At the voice broker the configuration document names, as a deployment that serves both from
     /// one origin does: a suite stands its service up there.
     Broker,
+    /// At an origin the suite names, whatever the document's broker is: a host whose broker moved
+    /// while the account service stayed where it was.
+    Origin(String),
 }
 
 /// The voice broker the configuration document of `temp` names, when it names one.
@@ -307,9 +310,10 @@ impl Host {
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
-        let account_origin = match account_at {
+        let account_origin = match &account_at {
             AccountAt::Managed => None,
             AccountAt::Broker => broker_of(&temp),
+            AccountAt::Origin(origin) => Some(origin.clone()),
         };
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
@@ -482,6 +486,12 @@ impl Stopped {
     #[must_use]
     pub const fn settings(&self) -> &NetworkSettings {
         &self.settings
+    }
+
+    /// Has the next daemon find the account service at `origin`, wherever the document's voice
+    /// broker is.
+    pub fn account_service_stays_at(&mut self, origin: &str) {
+        self.account_at = AccountAt::Origin(origin.to_owned());
     }
 
     /// Starts a daemon on the stopped one's environment tree, with its network built from
