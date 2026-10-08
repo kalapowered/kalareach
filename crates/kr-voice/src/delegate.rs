@@ -384,25 +384,24 @@ impl Coordinator {
             .len()
     }
 
-    /// Whether any call can still need the account it was made under at `now_ms`: one that is live
-    /// and has not reached its own deadline, one whose start is waiting on the broker, one that is
-    /// being ended at the broker, and a replayed one this host has yet to close.
+    /// Whether any call can still need the account it was made under: one that is live, one whose
+    /// start is waiting on the broker, one that is being ended at the broker, and a replayed one
+    /// this host has yet to close.
     ///
-    /// A call past its deadline is over whatever its device did: the service ends it there, and
-    /// nothing a device does afterwards can keep it. It stops counting here, and
-    /// [`Self::end_calls_that_are_over`] takes its record out.
+    /// A live call counts until its record has been ended, past its own deadline too: only
+    /// [`Self::end_calls_that_are_over`] takes a record out, and it ends the close under the account
+    /// the call was made under before anything changes that account. A check that stopped counting
+    /// a call at its deadline could let the account change while the record was still there to be
+    /// closed.
     ///
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's lock panicked, which would mean the
     /// coordinator's own state is no longer known.
     #[must_use]
-    pub fn calls_open(&self, now_ms: u64) -> bool {
+    pub fn calls_open(&self) -> bool {
         let state = self.state.lock().expect("the coordinator's state");
-        state
-            .sessions
-            .iter()
-            .any(|record| record.closes_at_ms > now_ms)
+        !state.sessions.is_empty()
             || !state.starting.is_empty()
             || state.closing > 0
             || !state.deferred.is_empty()

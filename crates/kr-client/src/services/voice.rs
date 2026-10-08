@@ -1203,13 +1203,27 @@ impl ManagedVoiceBroker {
             .await
     }
 
-    /// Reads one authorised address and returns what came back.
-    async fn read(&self, path: &str) -> Result<ServiceHttpAnswer> {
+    /// Reads one authorised address and returns what came back, waiting at most `within` for the
+    /// service's answer.
+    ///
+    /// The limit is on the read alone. The token is taken first, under the account transport's own
+    /// deadlines, because a token request that is stopped part way can leave a refresh that the
+    /// service made and this host did not keep.
+    async fn read(&self, path: &str, within: std::time::Duration) -> Result<ServiceHttpAnswer> {
         let authorisation = self.authorisation().await?;
         let url = format!("{}{path}", self.origin);
-        self.http
-            .get_json(&url, &[("authorization", authorisation.as_str())])
-            .await
+        tokio::time::timeout(
+            within,
+            self.http
+                .get_json(&url, &[("authorization", authorisation.as_str())]),
+        )
+        .await
+        .map_err(|_| {
+            ClientError::refusal(
+                ErrorCode::UpstreamUnavailable,
+                Shown::said("the managed service did not answer in time"),
+            )
+        })?
     }
 
     /// Sends one authorised request and returns the `data` of its envelope.
@@ -1271,28 +1285,30 @@ impl ManagedVoiceService for ManagedVoiceBroker {
 
     fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool> {
         Box::pin(async move {
-            let answer = tokio::time::timeout(CALL_READ_WITHIN, self.read(VOICE_CURRENT_PATH))
-                .await
-                .map_err(|_| {
-                    ClientError::refusal(
-                        ErrorCode::UpstreamUnavailable,
-                        Shown::said("the managed service did not say whether it holds the call"),
-                    )
-                })??;
+            let answer = self.read(VOICE_CURRENT_PATH, CALL_READ_WITHIN).await?;
             // An account with no call open is an answer to this question, not a failure of it.
             if names_no_call(&answer) {
                 return Ok(false);
             }
-            let current: CurrentCall =
-                serde_json::from_value(data_of(&answer)?).map_err(|error| {
-                    unreadable(
-                        200,
-                        crate::shown!(
-                            "this client cannot read the call its account has: {}",
-                            Shown::json(&error)
-                        ),
-                    )
-                })?;
+            // The refusal a service gives names its own reason, and an answer that is a success in
+            // its body and not in its status is not one this client acts on: only a 200 describes
+            // the account's call.
+            let data = data_of(&answer)?;
+            if answer.status != 200 {
+                return Err(unreadable(
+                    answer.status,
+                    "the call its account has was not described by a plain success",
+                ));
+            }
+            let current: CurrentCall = serde_json::from_value(data).map_err(|error| {
+                unreadable(
+                    200,
+                    crate::shown!(
+                        "this client cannot read the call its account has: {}",
+                        Shown::json(&error)
+                    ),
+                )
+            })?;
             // The account's open call is another call, or this one on its way out: this one is
             // over. A state this client does not know is read as open, because the call then ends
             // at its own deadline and no sooner than the service says.
@@ -1311,10 +1327,23 @@ struct CurrentCall {
     state: String,
 }
 
+/// The words the service gives, with the code `NOT_FOUND`, when the account it was asked about has
+/// no call open.
+///
+/// The service answers an address it does not serve with the same status and code and other words,
+/// so the status and the code alone do not say that the account has no call. A call is read as over
+/// only on the service's own sentence for that: a service that words it differently leaves every
+/// call open until its own deadline, which ends it.
+///
+/// Delete this sentence, and read the answer by a reason the service names, when the service names
+/// one.
+const NO_CALL_ANSWER: &str = "This account has no managed call.";
+
 /// Whether the service answered that the account has no call open.
 ///
-/// Read from the answer's own words: a 404 that carries the service's `NOT_FOUND` for this route,
-/// and not one from something in front of it.
+/// Read from the answer's own words: a 404 that carries the service's `NOT_FOUND` for this route in
+/// its envelope, and not one from something in front of it or the service's answer for an address
+/// it does not serve.
 fn names_no_call(answer: &ServiceHttpAnswer) -> bool {
     #[derive(Deserialize)]
     struct Envelope {
@@ -1325,14 +1354,15 @@ fn names_no_call(answer: &ServiceHttpAnswer) -> bool {
     #[derive(Deserialize)]
     struct Named {
         code: String,
+        message: String,
     }
 
     answer.status == 404
         && super::json::read::<Envelope>(&answer.body).is_ok_and(|envelope| {
             !envelope.ok
-                && envelope
-                    .error
-                    .is_some_and(|error| error.code == "NOT_FOUND")
+                && envelope.error.is_some_and(|error| {
+                    error.code == "NOT_FOUND" && error.message == NO_CALL_ANSWER
+                })
         })
 }
 
@@ -2253,19 +2283,24 @@ mod tests {
 
     /// KR-REQ-17.23: a host asks the service whether it still holds a call open, with the account
     /// token and no body. Only the service's own word that the account has no such call, or has it
-    /// closing, reads as over; anything the host cannot read, or an answer from something in front
-    /// of the service, leaves the call open for the host to hold until its deadline.
+    /// closing, reads as over; anything the host cannot read, an answer from something in front of
+    /// the service, the service's answer for an address it does not serve, and an answer whose body
+    /// and status disagree, leave the call open for the host to hold until its deadline.
     #[tokio::test]
     async fn a_call_reads_as_over_only_when_the_service_says_it_holds_none() {
         let not_found = serde_json::json!({
             "ok": false,
             "error": { "code": "NOT_FOUND", "message": "This account has no managed call." }
         });
+        let no_such_route = serde_json::json!({
+            "ok": false,
+            "error": { "code": "NOT_FOUND", "message": "No such API route." }
+        });
         let internal = serde_json::json!({
             "ok": false,
             "error": { "code": "INTERNAL", "message": "Try again." }
         });
-        let cases: [(&str, (u16, serde_json::Value), Option<bool>); 8] = [
+        let cases: [(&str, (u16, serde_json::Value), Option<bool>); 12] = [
             (
                 "the account's call, live",
                 (200, current_call("call-1", "live")),
@@ -2291,12 +2326,34 @@ mod tests {
                 (200, current_call("call-1", "paused")),
                 Some(true),
             ),
-            ("no call", (404, not_found.clone()), Some(false)),
+            ("no call", (404, not_found), Some(false)),
+            // The same status and code, from a service that no longer serves the address.
+            (
+                "an address the service does not serve",
+                (404, no_such_route),
+                None,
+            ),
             ("a service that fails", (503, internal), None),
             // A gateway's 404 is not the service saying the account has no call.
             (
                 "a 404 that is not the service's",
                 (404, serde_json::json!("<html>not found</html>")),
+                None,
+            ),
+            // A status and a body that disagree describe nothing this client acts on.
+            (
+                "a 503 whose body describes another call",
+                (503, current_call("call-2", "live")),
+                None,
+            ),
+            (
+                "a 404 whose body describes another call",
+                (404, current_call("call-2", "live")),
+                None,
+            ),
+            (
+                "a 500 whose body describes this call as closing",
+                (500, current_call("call-1", "closing")),
                 None,
             ),
         ];
@@ -2305,7 +2362,7 @@ mod tests {
             let read = broker(&service).call_is_open("call-1").await;
             match over {
                 Some(open) => assert_eq!(
-                    read.unwrap_or_else(|e| panic!("{what}: {e}")),
+                    read.unwrap_or_else(|error| panic!("{what}: {error}")),
                     open,
                     "{what}"
                 ),
@@ -2338,6 +2395,39 @@ mod tests {
         let read = broker(&service).call_is_open("call-1").await;
         let error = read.expect_err("no answer came");
         assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+    }
+
+    /// KR-REQ-17.23: the limit on the read is on the read alone. A token request that is slow, as
+    /// one that refreshes is, is not stopped by it: a refresh the service made and this host did not
+    /// keep would be a sign-in that cannot be used.
+    #[tokio::test(start_paused = true)]
+    async fn the_limit_on_asking_about_a_call_does_not_stop_a_token_request() {
+        #[derive(Debug)]
+        struct SlowToken;
+
+        impl AccountTokenSource for SlowToken {
+            fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+                Box::pin(async {
+                    tokio::time::sleep(CALL_READ_WITHIN * 3).await;
+                    AccountToken::new("a-voice-token")
+                })
+            }
+        }
+
+        let service = Scripted::answering([(200, current_call("call-1", "live"))]);
+        let broker = ManagedVoiceBroker::new(
+            "https://reach.example",
+            Arc::clone(&service) as Arc<dyn ServiceHttp>,
+            Arc::new(SlowToken),
+        )
+        .expect("a broker client");
+        assert!(
+            broker
+                .call_is_open("call-1")
+                .await
+                .expect("the token came, and then the service answered"),
+            "a token that took three times the limit did not end the read"
+        );
     }
 
     fn start_request(version: Option<&str>) -> VoiceSessionRequest {
