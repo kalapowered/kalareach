@@ -2,10 +2,30 @@ name: conformance
 
 # The conformance report on each hosted platform: every identifier of the specification the tests
 # name, what each of those tests came to on that platform, the commands that reproduce them, and
-# the application matrix in a real session. docs/conformance/README.md states the result. It is
-# started by hand and every night; the landing workflow is core-ci.
+# the application matrix in a real session, and the phone applications' unit tests. docs/conformance/
+# README.md states the result. It is started by hand and every night; the landing workflow is
+# core-ci. A run started by hand can name the groups to run and leave a platform out, which is how
+# one group of the report is tried without a night's hours; the nightly run has every group on every
+# platform.
 on:
   workflow_dispatch:
+    inputs:
+      groups:
+        description: "The groups of the report to run, separated by spaces: rust, end-to-end, performance, typescript, applications, phones. Empty runs every group the platform runs. The nightly run is always empty."
+        type: string
+        default: ""
+      linux:
+        description: "Run the Linux job."
+        type: boolean
+        default: true
+      macos:
+        description: "Run the macOS job."
+        type: boolean
+        default: true
+      windows:
+        description: "Run the Windows job."
+        type: boolean
+        default: true
   schedule:
     - cron: "37 2 * * *"
 
@@ -20,6 +40,8 @@ concurrency:
 jobs:
   linux:
     name: linux
+    # A manual run can leave a job out; the nightly run has all three.
+    if: github.event_name != 'workflow_dispatch' || inputs.linux
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     env:
@@ -80,15 +102,19 @@ jobs:
           node-version: 22.23.1
           cache: pnpm
 
+      # The registry is restored by every run and saved, at the end of the job, by a green run on
+      # the default branch only: a cache saved from another branch is used by that branch alone and
+      # takes the room of one every branch uses.
       - name: Restore the cargo registry
+        id: cargo-cache
         timeout-minutes: 10
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: ./.github/actions/cargo-cache-restore
         with:
-          path: |
+          name: conformance-linux
+          paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: conformance-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
 
       - name: Build the test components
         timeout-minutes: 15
@@ -98,7 +124,15 @@ jobs:
       # tests/conformance/applications.lock. The step fails when the run did.
       - name: The conformance report
         timeout-minutes: 240
-        run: bash scripts/run-conformance.sh
+        env:
+          REPORT_GROUPS: ${{ inputs.groups }}
+        run: |
+          read -r -a names <<< "$REPORT_GROUPS"
+          arguments=()
+          for name in ${names[@]+"${names[@]}"}; do
+            arguments+=(--group "$name")
+          done
+          bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
@@ -109,8 +143,20 @@ jobs:
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
 
+      - name: Save the cargo registry
+        timeout-minutes: 10
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
+          paths: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+
   macos:
     name: macos
+    if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
     timeout-minutes: 300
     env:
@@ -200,15 +246,19 @@ jobs:
           node-version: 22.23.1
           cache: pnpm
 
+      # The registry is restored by every run and saved, at the end of the job, by a green run on
+      # the default branch only: a cache saved from another branch is used by that branch alone and
+      # takes the room of one every branch uses.
       - name: Restore the cargo registry
+        id: cargo-cache
         timeout-minutes: 10
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: ./.github/actions/cargo-cache-restore
         with:
-          path: |
+          name: conformance-macos
+          paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: conformance-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
 
       - name: Build the test components
         timeout-minutes: 15
@@ -216,7 +266,15 @@ jobs:
 
       - name: The conformance report
         timeout-minutes: 240
-        run: bash scripts/run-conformance.sh
+        env:
+          REPORT_GROUPS: ${{ inputs.groups }}
+        run: |
+          read -r -a names <<< "$REPORT_GROUPS"
+          arguments=()
+          for name in ${names[@]+"${names[@]}"}; do
+            arguments+=(--group "$name")
+          done
+          bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
@@ -227,12 +285,27 @@ jobs:
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
 
+      - name: Save the cargo registry
+        timeout-minutes: 10
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
+          paths: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+
   windows:
     name: windows
+    if: github.event_name != 'workflow_dispatch' || inputs.windows
     runs-on: windows-2025
     timeout-minutes: 180
     env:
       CARGO_INCREMENTAL: "0"
+      # The plugin runtime's tests run real components, which the steps below build; a component
+      # that is not there is a failure here rather than a skip.
+      KR_REQUIRE_PLUGIN_FIXTURES: "1"
       # The one case that writes this runner's credential store, which is the runner's own and
       # holds nobody's credentials; what it writes is named for the run and taken away again.
       KR_TEST_PLATFORM_SECRET_STORE: "1"
@@ -248,15 +321,28 @@ jobs:
           rustc --version
           cargo --version
 
+      # The registry is restored by every run and saved, at the end of the job, by a green run on
+      # the default branch only: a cache saved from another branch is used by that branch alone and
+      # takes the room of one every branch uses.
       - name: Restore the cargo registry
+        id: cargo-cache
         timeout-minutes: 10
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: ./.github/actions/cargo-cache-restore
         with:
-          path: |
+          name: conformance-windows
+          paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: conformance-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install the component target
+        timeout-minutes: 5
+        run: rustup target add wasm32-wasip2
+
+      - name: Build the test components
+        timeout-minutes: 15
+        shell: bash
+        run: bash scripts/build-plugin-fixtures.sh
 
       # The report reads the TypeScript tests with the packages' own compiler here too, to list them
       # as not run on this platform.
@@ -283,13 +369,23 @@ jobs:
       # The suites qualified on Windows, as the landing workflow's Windows job runs them, started
       # from PowerShell as they are there: a POSIX shell's runtime would enable privileges in their
       # token and change how the console's interrupt reaches them. The other groups and the
-      # applications are recorded as not run here, each with its reason.
+      # applications are recorded as not run here, each with its reason. The report runs whatever
+      # has come before, so that a component that could not be built is reported by the test that
+      # needs it, by name, and not by a job that stopped before the report.
       - name: The conformance report
+        if: ${{ !cancelled() }}
         timeout-minutes: 150
+        env:
+          REPORT_GROUPS: ${{ inputs.groups }}
         run: |
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR
+          $arguments = @()
+          foreach ($name in ($env:REPORT_GROUPS -split '\s+' | Where-Object { $_ })) {
+            $arguments += '--group'
+            $arguments += $name
+          }
+          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR @arguments
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
@@ -299,3 +395,14 @@ jobs:
           name: conformance-windows
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
+
+      - name: Save the cargo registry
+        timeout-minutes: 10
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
+          paths: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
