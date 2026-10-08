@@ -477,7 +477,8 @@ pub struct PassReport {
     pub idle: Option<Idle>,
     /// Every step the pass took, in order.
     pub steps: Vec<Stepped>,
-    /// The service's hold that ended the pass, when one did.
+    /// What the service held the pass's work back with, when it did, including an abandonment
+    /// that an ending attempt left owed.
     pub hold: Option<Hold>,
     /// What the storage service said about backup storage, when the pass asked.
     pub status: Option<StorageStatus>,
