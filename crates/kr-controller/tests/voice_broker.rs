@@ -24,6 +24,8 @@
 //! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_waits_and_is_refused_when_the_change_leaves_none` |
 //! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_waits_and_is_made_under_the_account_it_leaves` |
 //! | KR-REQ-17.23 | `a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service` |
+//! | KR-REQ-17.23 | `a_sign_in_the_host_cannot_keep_is_sent_to_the_service_to_be_ended` |
+//! | KR-REQ-17.23 | `a_sign_in_the_service_refuses_after_issuing_tokens_has_them_ended` |
 //! | KR-REQ-17.23 | `a_host_moved_off_the_managed_broker_can_still_end_the_sign_in_it_keeps` |
 //! | KR-REQ-17.23 | `an_account_the_store_could_not_settle_is_not_presented_until_it_is_settled` |
 //! | KR-REQ-17.23 | `each_refresh_presents_the_token_the_last_one_issued` |
@@ -94,6 +96,8 @@ struct Account {
     subject: String,
     /// The account the identity read names, when it is not the one the code was issued for.
     userinfo_subject: Option<String>,
+    /// A nonce the identity token carries in place of the one the sign-in asked for.
+    nonce_override: Option<String>,
     /// Whether a revocation is refused, as a service that cannot be reached refuses it.
     revoke_fails: bool,
     /// Every refresh token revoked at it, in order.
@@ -124,7 +128,7 @@ impl Account {
                 "iss": ISSUER,
                 "sub": self.subject,
                 "aud": Client::Desktop.id(),
-                "nonce": self.nonce,
+                "nonce": self.nonce_override.as_ref().unwrap_or(&self.nonce),
                 "iat": now - 5,
                 "exp": now + 3600,
             });
@@ -200,6 +204,7 @@ impl Broker {
                 label: listener_port.to_string(),
                 subject: "account-1".to_owned(),
                 userinfo_subject: None,
+                nonce_override: None,
                 revoke_fails: false,
                 revoked: Vec::new(),
             }),
@@ -297,6 +302,15 @@ impl Broker {
             .expect("the account")
             .revoked
             .clone()
+    }
+
+    /// Has the identity token carry a nonce the sign-in did not ask for, so its answer is refused.
+    fn answer_with_another_nonce(&self) {
+        self.shared
+            .account
+            .lock()
+            .expect("the account")
+            .nonce_override = Some("a-nonce-nobody-asked-for".to_owned());
     }
 
     /// Has the identity read name another account than the one the code was issued for.
@@ -1204,6 +1218,7 @@ async fn a_sign_in_request_sent_again_is_answered_from_the_first() {
     listen_for_sign_ins_on(&host, free_port());
     let action = ActionId::new(kr_ipc::new_uuid());
     let mut asked = Vec::new();
+    let mut waiting = Vec::new();
     // On one connection, as a retry of a request whose answer was lost is: the digest the host
     // keeps covers the window the request was sent under.
     let mut client = host.client().await;
@@ -1222,16 +1237,23 @@ async fn a_sign_in_request_sent_again_is_answered_from_the_first() {
                 .to_typed::<AccountSignInStarted>()
                 .expect("a started sign-in"),
         );
+        let AccountState::WaitingForBrowser {
+            authorise_url,
+            redirect_address,
+            ..
+        } = account_report(&host).await.state
+        else {
+            panic!("one sign-in is waiting");
+        };
+        waiting.push((authorise_url, redirect_address));
     }
     assert_eq!(asked[0], asked[1], "the repeat is the first one's answer");
-    let AccountState::WaitingForBrowser {
-        authorise_url,
-        redirect_address,
-        ..
-    } = account_report(&host).await.state
-    else {
-        panic!("one sign-in is waiting");
-    };
+    // The attempt is the same one: a repeat that started another would carry another state and nonce.
+    assert_eq!(
+        waiting[0], waiting[1],
+        "the repeat left the waiting attempt alone"
+    );
+    let (authorise_url, redirect_address) = waiting.remove(1);
     broker.expect_sign_in(&authorise_url);
     let page = browser_answers(&redirect_address, &authorise_url, "the-code").await;
     assert!(
@@ -1865,20 +1887,25 @@ async fn a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service(
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
     listen_for_sign_ins_on(&host, free_port());
     sign_in_with(&host, broker.issue_grant(600)).await;
+    // The preparation asks for a token, which settles what the daemon found when it started.
+    let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     let (url, address) = start_sign_in(&host).await;
     broker.expect_sign_in(&url);
     // The queue cannot be read: a directory stands where its file would be.
-    let session = account_item_in(&host.tree().environment().secrets_dir(), "session");
-    let queue = session.with_file_name("revoke");
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let queue = kept.with_file_name("revoke");
     std::fs::create_dir(&queue).expect("a directory in the queue's place");
     let exchange = broker.hold("/auth/oauth2/token");
 
-    let (_page, _call) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+    let (_page, started) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
         exchange.reached().await;
-        let started = start_a_call(&host, &owner).await;
+        let params = start_params(session_id, &prepared);
+        let started = mutate(&session, host.environment_id, Method::VoiceStart, &params).await;
         exchange.release();
         started
     });
+    let started: VoiceStartResult = started.to_typed().expect("a start result");
+    assert!(matches!(started.outcome, VoiceStartOutcome::Started { .. }));
     let report = settled(&host).await;
     assert_eq!(
         report.last_attempt.as_ref(),
@@ -1892,6 +1919,64 @@ async fn a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service(
         broker.revoked(),
         [broker.refresh(2)],
         "the grant that could not be queued was sent to the service once"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a sign-in the host cannot keep (its store cannot be read where the grant goes) is
+/// ended at the service: the token the exchange brought is queued or sent, and not dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_the_host_cannot_keep_is_sent_to_the_service_to_be_ended() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    // The kept grant cannot be read, so the new one cannot replace it: a directory stands in its
+    // place.
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    std::fs::remove_file(&kept).expect("the grant is set aside");
+    std::fs::create_dir(&kept).expect("a directory in its place");
+
+    let _ = browser_answers(&address, &url, "the-code").await;
+    let report = settled(&host).await;
+    assert_eq!(report.last_attempt.as_ref(), Some(&AccountAttempt::NotKept));
+    assert_eq!(
+        broker.revoked(),
+        [broker.refresh(2)],
+        "the token the exchange brought was ended"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: an answer the host refuses after the service issued tokens for it (here an identity
+/// token that carries a nonce the sign-in did not ask for) has those tokens ended, and leaves the host
+/// signed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_the_service_refuses_after_issuing_tokens_has_them_ended() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    broker.answer_with_another_nonce();
+
+    let _ = browser_answers(&address, &url, "the-code").await;
+    let report = settled(&host).await;
+    assert_eq!(report.state, AccountState::SignedOut, "{report:?}");
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::ServiceRefused)
+    );
+    assert_eq!(
+        broker.revoked(),
+        [broker.refresh(1)],
+        "the tokens issued for the refused answer were ended"
     );
     host.stop().await;
 }
