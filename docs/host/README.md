@@ -1244,6 +1244,12 @@ for it. A saved cursor the session holds for the buffer that is showing is insta
 except for a pending wrap it holds, which is counted as not carried. The one it holds for the other
 buffer is counted as not carried.
 
+The session's left and right margins are written straight after that save, with the saved state
+still in force. The sequence that sets them, `CSI Pl;Pr s`, saves the cursor on Alacritty, foot,
+tmux and GNU screen, which have no margin mode, and written anywhere else it would replace the
+cursor just saved. Where the restoration installs no saved cursor for the buffer that is showing,
+the plain state is saved again first and the margins follow it.
+
 A sequence the profile does not name is consumed rather than forwarded, and the engine counts it;
 `Session::terminal_diagnostics` reports those totals. A side effect that arrives while nothing holds
 the input lease has no destination, so it becomes a durable host event in the worker's own journal
