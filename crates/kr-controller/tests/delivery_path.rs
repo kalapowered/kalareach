@@ -1816,6 +1816,99 @@ async fn unpairing_a_device_ends_its_destination_and_the_gateway_revokes_the_aut
     assert_eq!(environment.gateway.delivered().len(), delivered);
 }
 
+/// KR-REQ-16.10: unpairing ends the device's destination before it answers, even when the device's
+/// record cannot be marked revoked. The grants are withdrawn by then and the destination sends
+/// under the device's own pairing grant, which the unmarked record still holds, so a host that
+/// answered the error and left the destination would go on delivering to a device it was told to
+/// unpair. The authorisation is owed to the gateway, and the unpairing, asked again once the record
+/// can be written, completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn unpairing_ends_the_destination_even_when_the_device_record_cannot_be_written() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x72));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    assert!(environment.destination(phone.device_id()).is_some());
+
+    // The registry refuses to mark any device revoked, as a full disk or a locked file would.
+    let registry = rusqlite::Connection::open(environment.host.registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_to_mark_a_device_revoked
+                 BEFORE UPDATE OF revoked_at_ms ON network_devices
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("plants the fault");
+    let mut client = environment.host.client().await;
+    let refused = net_support::pairing::mutate::<_, kr_protocol::sharing::RevocationResult>(
+        environment.environment_id(),
+        &mut client,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: phone.device_id(),
+        },
+    )
+    .await
+    .expect_err("the record cannot be marked revoked");
+    drop(refused);
+
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled && record.rule.is_none()),
+        "the destination is out of service"
+    );
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none()
+    );
+    until("the authorisation being revoked at the gateway", || {
+        environment
+            .gateway
+            .authorisation(sender)
+            .is_some_and(|held| held.state == PushSenderState::Revoked)
+    })
+    .await;
+
+    // Asked again once the record can be written, the unpairing completes.
+    registry
+        .execute_batch("DROP TRIGGER refuse_to_mark_a_device_revoked;")
+        .expect("removes the fault");
+    unpair(&environment, phone.device_id()).await;
+    let mut client = environment.host.client().await;
+    let listed: kr_protocol::sharing::DeviceListResult = net_support::pairing::read(
+        &mut client,
+        Method::DeviceList,
+        &kr_protocol::sharing::DeviceListParams {
+            include_revoked: false,
+        },
+    )
+    .await
+    .expect("the list");
+    assert!(
+        listed
+            .devices
+            .iter()
+            .all(|device| device.device_id != phone.device_id()),
+        "the device is unpaired"
+    );
+}
+
 /// KR-REQ-16.10: a revocation the gateway has not taken is owed, and is still owed after the
 /// daemon restarts. Here the daemon has no way to reach any gateway when the device is unpaired:
 /// the destination and its credential go at once, the debt is written down, and the revocation is
