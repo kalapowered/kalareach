@@ -431,6 +431,7 @@ impl Companion {
                 companion_tauri::commands::owner_confirmations,
                 companion_tauri::commands::owner_confirmation_review,
                 companion_tauri::commands::hosts_use,
+                companion_tauri::commands::hosts_forget,
                 companion_tauri::commands::connection_state,
                 companion_tauri::commands::session_list,
                 companion_tauri::commands::device_list,

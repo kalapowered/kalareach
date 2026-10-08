@@ -247,6 +247,8 @@ export function tauriPort(): HostPort {
 
     hostsUse: (reference) =>
       call<ConnectionState>('hosts_use', { reference }).then(receivedConnection),
+    hostsForget: (reference) =>
+      call<ConnectionState>('hosts_forget', { reference }).then(receivedConnection),
     pairingView: () => call<PairingView>('pairing_view', {}),
     pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
     pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),

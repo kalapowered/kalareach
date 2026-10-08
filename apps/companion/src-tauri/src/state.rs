@@ -91,6 +91,33 @@ impl AppState {
         Ok(())
     }
 
+    /// Forgets a host under the lock a choice of host is made under, and ends the connection to it
+    /// when it was the one in use.
+    ///
+    /// `forget` removes this computer's record of the host and says whether it was the host in
+    /// use. It runs inside the lock, so a choice made at the same time is made before it or after
+    /// it, and what it reports is what the task in force is for. When the host was in use its task
+    /// ends and no host is: the task of the choice may have been in the middle of reaching the
+    /// host, and its result is dropped because its choice is no longer the current one.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `forget` returns, and then nothing has changed.
+    pub fn forget_host(&self, reason: &str, forget: impl FnOnce() -> Result<bool>) -> Result<()> {
+        let mut supervision = self
+            .supervision
+            .lock()
+            .expect("the supervision lock is not poisoned");
+        if forget()? {
+            supervision.choice += 1;
+            if let Some(task) = supervision.task.take() {
+                task.abort();
+            }
+            self.disconnected(reason);
+        }
+        Ok(())
+    }
+
     /// Whether `choice` is still the choice of host in force.
     fn current(supervision: &Supervision, choice: u64) -> bool {
         supervision.choice == choice
