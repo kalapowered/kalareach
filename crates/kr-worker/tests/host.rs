@@ -2135,11 +2135,26 @@ fn worker_of(host: &Host, session_id: SessionId) -> kr_protocol::identity::Proce
 }
 
 /// Stops the worker where it is, without ending it: it runs nothing more until it is killed.
+/// Asks for the stop and returns whether every thread of the worker has stopped.
 #[cfg(target_os = "linux")]
-fn hold_still(worker: &kr_protocol::identity::ProcessStartIdentity) {
+fn hold_still(worker: &kr_protocol::identity::ProcessStartIdentity) -> bool {
     let pid = rustix::process::Pid::from_raw(i32::try_from(worker.pid.get()).expect("a pid"))
         .expect("a process number");
     rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stops it");
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{}/task", worker.pid.get())) else {
+        return false;
+    };
+    let mut all = true;
+    for thread in threads.flatten() {
+        let state = std::fs::read_to_string(thread.path().join("stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
+            });
+        all &= matches!(state.as_deref(), Some("T" | "t"));
+    }
+    all
 }
 
 /// Kills the worker, the way a crash does: no chance to say anything.
@@ -2324,7 +2339,19 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
     // shell makes it: the record the worker leaves cannot name it, and only the group can end it.
     #[cfg(target_os = "linux")]
     if drifts {
-        hold_still(&worker);
+        // The stop of the one process that ignores the request is refused, as the kernel refuses
+        // one that belongs to another account: only the service manager can end it, and the
+        // closure must say it was forced.
+        let stubborn = named
+            .iter()
+            .find(|(name, _)| *name == "stubborn")
+            .map(|(_, identity)| identity.clone())
+            .expect("the tree's stubborn member");
+        kr_controller::testing::refuse_stopping(stubborn);
+        until("the worker to stop, every thread of it", || {
+            hold_still(&worker).then_some(())
+        })
+        .await;
         std::fs::write(host.temp.root().join("kr-go"), b"").expect("lets the shell go on");
         let drifter = until("the drifter to write its number", || {
             member_of(&host, "drifter")
@@ -2430,6 +2457,16 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
         1,
         "the crash started no second worker"
     );
+    // The record the dead worker left does not name what only the service's group held: it was
+    // stopped before the shell made the process, so nothing could have written it in since.
+    #[cfg(target_os = "linux")]
+    if let Some((_, drifter)) = named.iter().find(|(name, _)| *name == "drifter") {
+        let record = recorded_by(&host, session_id).expect("the record the worker left");
+        assert!(
+            !record.processes.contains(drifter),
+            "the final record does not name the drifter either: {record:?}"
+        );
+    }
     drop(members);
     drop(client);
     daemon.stop().await;
