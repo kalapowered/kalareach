@@ -12,23 +12,33 @@
 //! The browser signs in at the account service, and the code it brings back is redeemable there and
 //! nowhere else, so the exchange, every refresh and every revocation go to that one service. The
 //! host's configuration names a voice broker; the host signs in, and presents a token to the broker,
-//! only when the broker is that service. A host whose broker is another service has nothing to sign
-//! in to and presents nothing.
+//! only when the broker is that service. A host whose broker is another service, or none, signs in
+//! nowhere and presents nothing.
 //!
 //! What the store holds is kept in a scope named by the service. A grant, and a revocation that
-//! waits to be sent, can therefore be read only through the service that issued them: a host that
-//! is configured for another service finds none of them and sends a token to no one. No check
-//! stands between a stored credential and the wrong service, because there is no path from one to
-//! the other.
+//! waits to be sent, can therefore be read only through the service that issued them, and a host
+//! never sends a token to a service that did not issue it. A host that is moved off the managed
+//! broker still reaches the account service for what it holds: it can see the grant, send the
+//! revocations that wait and sign out, because those requests go to the service that issued the
+//! grant whatever the broker is. No check stands between a stored credential and the wrong
+//! service, because there is no path from one to the other.
 //!
 //! The grant is refreshed when a call needs a token and the one held is about to end, never before,
 //! so a host that makes no call spends no refresh token.
 //!
+//! # The account never changes under a call
+//!
+//! A call closes under the account it started under, and a start or a close asks for a token of its
+//! own. Signing in or out is refused while a call is open, which includes a start that is waiting on
+//! the broker and a close that is not finished (the coordinator counts both). The commit of a
+//! sign-in and the removal of a sign-out then take a gate that refuses every token request while
+//! they run: a start that begins after the check is refused its token, and one that began before it
+//! was counted by the check. No call can hold a token of the old account across the change.
+//!
 //! Signing out removes the grant and asks the service to end it, under the same scope rule as
-//! signing in: a host can sign out of the account service it can sign in at, and of no other.
-//! Both are refused while a managed call is open, because a call closes under the account it
-//! started under.
+//! signing in.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -129,8 +139,11 @@ struct Inner {
     /// when an earlier run stopped is removed, and every revocation the service has not
     /// acknowledged is sent again.
     recovered: tokio::sync::OnceCell<()>,
-    /// Whether a managed call is open on this host, once the voice service exists.
+    /// Whether a managed call is open on this host, or about to open or close, once the voice
+    /// service exists.
     call_open: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// Set while the account is being changed: no token is handed out until it has been.
+    changing: AtomicBool,
     #[cfg(feature = "testing")]
     loopback: Mutex<Option<std::net::SocketAddr>>,
 }
@@ -150,8 +163,9 @@ impl std::fmt::Debug for HostAccount {
 }
 
 impl HostAccount {
-    /// The sign-in of one environment, kept in `store`, at `service` where this host can sign in,
-    /// or why it cannot.
+    /// The sign-in of one environment, kept in `store`, at `service` where this host can reach the
+    /// account service, or why it cannot. `refused` is why this host neither signs in nor presents
+    /// its account, when it does not: its voice broker is not the account service.
     ///
     /// Removes the account token file an earlier version of this host imported, under
     /// `runtime_root`, once, and starts settling what an earlier run left.
@@ -161,6 +175,7 @@ impl HostAccount {
         environment_id: EnvironmentId,
         runtime_root: &std::path::Path,
         service: std::result::Result<Service, SignInUnavailable>,
+        refused: Option<SignInUnavailable>,
     ) -> Self {
         match std::fs::remove_file(runtime_root.join(IMPORTED_TOKEN_FILE)) {
             Ok(()) => eprintln!(
@@ -188,7 +203,7 @@ impl HostAccount {
                         account: service.account,
                         signed_in,
                     }),
-                    None,
+                    refused,
                 )
             }
             Err(unavailable) => (None, Some(unavailable)),
@@ -201,19 +216,25 @@ impl HostAccount {
                 running: tokio::sync::Mutex::new(None),
                 recovered: tokio::sync::OnceCell::new(),
                 call_open: std::sync::OnceLock::new(),
+                changing: AtomicBool::new(false),
                 #[cfg(feature = "testing")]
                 loopback: Mutex::new(None),
             }),
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let inner = Arc::clone(&account.inner);
-            runtime.spawn(async move { inner.recover().await });
+            runtime.spawn(async move {
+                if let Err(error) = inner.recover().await {
+                    eprintln!("kr-controller: {error}");
+                }
+            });
         }
         account
     }
 
-    /// Tells the account how to find out whether a managed call is open on this host, so that a
-    /// sign-in never changes the account a call closes under.
+    /// Tells the account how to find out whether a managed call is open on this host, so that
+    /// signing in or out never changes the account a call closes under. A call is open from the
+    /// moment its start asks the broker until its close has been told.
     pub fn watch_calls(&self, open: impl Fn() -> bool + Send + Sync + 'static) {
         let _ = self.inner.call_open.set(Box::new(open));
     }
@@ -286,7 +307,7 @@ impl HostAccount {
     /// sign-in is finishing, a managed call is open, or another program holds the loopback
     /// address.
     pub async fn sign_in(&self) -> Result<AccountSignInStarted> {
-        self.inner.service()?;
+        self.inner.presenting()?;
         if self.inner.a_call_is_open() {
             return Err(Inner::call_is_open());
         }
@@ -348,12 +369,16 @@ impl HostAccount {
     }
 
     /// Signs the host out: ends the sign-in that is waiting, removes the grant and asks the service
-    /// to end it. A host with no account answers that there was none and changes nothing.
+    /// to end it. A host with no account answers that there was none and changes nothing. A host
+    /// moved off the managed broker signs out all the same: the account service it keeps its grant
+    /// for does not depend on the broker.
     ///
     /// # Errors
     ///
-    /// Returns why the host cannot sign out: it signs in nowhere, a sign-in is finishing, a managed
-    /// call is open, or the store could not be changed (the host is then still signed in).
+    /// Returns why the host cannot sign out: it cannot reach the account service, a sign-in is
+    /// finishing, a managed call is open, or the store could not be changed (the host then keeps
+    /// the grant, unless only its deletion failed after its revocation was queued, in which case
+    /// the next start removes it).
     pub async fn sign_out(&self) -> Result<AccountSignedOut> {
         let held = self.inner.service()?;
         if self.inner.a_call_is_open() {
@@ -365,7 +390,14 @@ impl HostAccount {
             let _ = older.cancel.send(true);
             let _ = older.task.await;
         }
-        self.inner.recover().await;
+        self.inner
+            .recover()
+            .await
+            .map_err(|detail| ControllerError::Storage {
+                operation: "settle this host's account before signing it out",
+                detail,
+            })?;
+        let _change = self.inner.begin_change()?;
         let done = held
             .signed_in
             .sign_out()
@@ -399,6 +431,17 @@ fn named_by(origin: &str) -> String {
         .collect()
 }
 
+/// The account being changed: no token is handed out while this is held.
+struct Change<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for Change<'_> {
+    fn drop(&mut self) {
+        self.inner.changing.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Inner {
     /// Where the grant stands when no attempt is running.
     fn settled(&self) -> AccountState {
@@ -418,41 +461,76 @@ impl Inner {
 
     /// Settles what an earlier run left, once: a grant whose own revocation was queued is removed,
     /// and every revocation the service has not acknowledged is sent again. Nothing is handed out
-    /// before this has run.
-    async fn recover(&self) {
+    /// before this has run, and a run that failed is tried again by the next caller.
+    async fn recover(&self) -> std::result::Result<(), String> {
         let Some(held) = &self.held else {
-            return;
+            return Ok(());
         };
         self.recovered
-            .get_or_init(|| async {
-                if let Err(error) = held.signed_in.recover().await {
-                    eprintln!("kr-controller: the host's sign-in could not be settled: {error}");
-                }
+            .get_or_try_init(|| async {
+                held.signed_in
+                    .recover()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("the host's sign-in could not be settled: {error}"))
             })
-            .await;
+            .await?;
+        Ok(())
     }
 
-    /// Where this host signs in and out, or why it cannot.
+    /// The account service, when this host could set up how to reach it, or why it could not.
     fn service(&self) -> Result<&Held> {
         self.held.as_ref().ok_or_else(|| {
-            ControllerError::NotConfigured(
-                match self.unavailable {
-                    Some(SignInUnavailable::BrokerIsAnotherService) => {
-                        "this host's voice.broker_origin names another service than the managed \
-                         account service it signs in at, so there is nothing to sign in to"
-                    }
-                    Some(SignInUnavailable::NotUsable) => {
-                        "this host cannot reach the managed account service the way its \
-                         configuration says: see the daemon's log"
-                    }
-                    Some(SignInUnavailable::NoBroker) | None => {
-                        "this host names no managed voice service: set voice.broker_origin in its \
-                         configuration document to the managed account service's origin"
-                    }
-                }
-                .to_owned(),
-            )
+            Self::not_configured(self.unavailable.unwrap_or(SignInUnavailable::NotUsable))
         })
+    }
+
+    /// The account service, when this host also signs in and presents its account there: its voice
+    /// broker is that service.
+    fn presenting(&self) -> Result<&Held> {
+        let held = self.service()?;
+        match self.unavailable {
+            Some(reason) => Err(Self::not_configured(reason)),
+            None => Ok(held),
+        }
+    }
+
+    fn not_configured(reason: SignInUnavailable) -> ControllerError {
+        ControllerError::NotConfigured(
+            match reason {
+                SignInUnavailable::BrokerIsAnotherService => {
+                    "this host's voice.broker_origin names another service than the managed \
+                     account service it signs in at, so there is nothing to sign in to"
+                }
+                SignInUnavailable::NotUsable => {
+                    "this host cannot reach the managed account service the way its \
+                     configuration says: see the daemon's log"
+                }
+                SignInUnavailable::NoBroker => {
+                    "this host names no managed voice service: set voice.broker_origin in its \
+                     configuration document to the managed account service's origin"
+                }
+            }
+            .to_owned(),
+        )
+    }
+
+    /// Begins changing the account: no token is handed out until the returned gate is dropped.
+    ///
+    /// The gate is raised before the calls are looked at. A start registers itself before it asks
+    /// for its token, so it is either seen here or finds the gate up when it asks.
+    fn begin_change(&self) -> Result<Change<'_>> {
+        if self.changing.swap(true, Ordering::SeqCst) {
+            return Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "this host's account is being changed; ask again when it has".to_owned(),
+            });
+        }
+        let change = Change { inner: self };
+        if self.a_call_is_open() {
+            return Err(Self::call_is_open());
+        }
+        Ok(change)
     }
 
     /// Refuses while a sign-in is finishing: its code is spent and its grant is being kept.
@@ -469,6 +547,7 @@ impl Inner {
         Ok(())
     }
 
+    /// Whether a call is open, or its start or its close is not finished.
     fn a_call_is_open(&self) -> bool {
         self.call_open.get().is_some_and(|open| open())
     }
@@ -527,7 +606,7 @@ impl Inner {
 
     /// Exchanges the code and keeps the grant.
     async fn finish(&self, grant: &AuthorisationGrant) -> AccountAttempt {
-        let Some(held) = &self.held else {
+        let Ok(held) = self.presenting() else {
             return AccountAttempt::Unreachable;
         };
         // A call closes under the account it started under. One that opened while the person was
@@ -535,10 +614,19 @@ impl Inner {
         if self.a_call_is_open() {
             return AccountAttempt::CallOpen;
         }
-        self.recover().await;
+        if let Err(error) = self.recover().await {
+            eprintln!("kr-controller: {error}");
+            return AccountAttempt::NotKept;
+        }
         match held.account.exchange(grant).await {
             Ok(Exchanged::Issued(issued)) => {
                 let refresh = issued.refresh_token.clone();
+                // The account changes now. A call that opened while the exchange was out leaves
+                // the new grant unused: it is revoked, and nothing the call holds changes.
+                let Ok(_change) = self.begin_change() else {
+                    let _ = held.account.revoke(&refresh).await;
+                    return AccountAttempt::CallOpen;
+                };
                 if let Err(error) = held.signed_in.commit(issued, grant.nonce()).await {
                     eprintln!("kr-controller: a host sign-in could not be kept: {error}");
                     let _ = held.account.revoke(&refresh).await;
@@ -589,7 +677,7 @@ impl std::fmt::Debug for HostTokens {
 impl AccountTokenSource for HostTokens {
     fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
         Box::pin(async move {
-            let Some(held) = &self.inner.held else {
+            let Ok(held) = self.inner.presenting() else {
                 return Err(kr_client::ClientError::refusal(
                     ErrorCode::HostNotConfigured,
                     kr_client::shown::Shown::said(
@@ -598,7 +686,24 @@ impl AccountTokenSource for HostTokens {
                     ),
                 ));
             };
-            self.inner.recover().await;
+            // While the account is being changed no token goes out, so that a call that starts
+            // then is not made under an account that is about to go.
+            if self.inner.changing.load(Ordering::SeqCst) {
+                return Err(kr_client::ClientError::refusal(
+                    ErrorCode::ResourceUnavailable,
+                    kr_client::shown::Shown::said(
+                        "this host's account is being changed, so no token is presented now",
+                    ),
+                ));
+            }
+            if self.inner.recover().await.is_err() {
+                return Err(kr_client::ClientError::refusal(
+                    ErrorCode::StorageUnavailable,
+                    kr_client::shown::Shown::said(
+                        "this host's account could not be settled because its secret store failed",
+                    ),
+                ));
+            }
             held.signed_in.token(scope).await
         })
     }

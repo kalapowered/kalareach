@@ -47,8 +47,9 @@ pub struct AccountSignOutParams {}
 pub struct AccountSignedOut {
     /// Whether an account was signed in. A host with none answers `false` and changes nothing.
     pub was_signed_in: bool,
-    /// Whether the service has acknowledged ending the grant. When it has not, the grant is gone
-    /// from this host and the daemon sends the revocation again when it next starts.
+    /// Whether the service has acknowledged every revocation this host holds: the one just sent
+    /// and any that were waiting. When it has not, the grant is gone from this host all the same,
+    /// and the daemon sends what is left again when it next starts.
     pub service_told: bool,
 }
 
@@ -61,11 +62,14 @@ pub struct AccountStatusParams {}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountReport {
-    /// The account service this host signs in at, which is also where its token is presented: the
-    /// voice broker its configuration names, when that is the account service. Null when it is
-    /// not, and `unavailable` says why.
+    /// The account service this host keeps its account for, which is also where its token is
+    /// presented when its voice broker is that service. Null when the host could not set up how to
+    /// reach it, and `unavailable` says why.
     pub service: Nullable<String>,
-    /// Why this host signs in nowhere, when `service` is null.
+    /// Why this host does not sign in or present its account: its configuration names no voice
+    /// broker, names another service than the account service, or the host could not set up how to
+    /// reach the account service. A grant the host already keeps still shows in `state`, and
+    /// `account.sign_out` ends it, whatever the broker is.
     pub unavailable: Nullable<SignInUnavailable>,
     /// The account this host is signed in as, or what stands in its way.
     pub state: AccountState,
@@ -86,7 +90,7 @@ impl fmt::Debug for AccountReport {
     }
 }
 
-/// Why a host signs in nowhere.
+/// Why a host does not sign in or present its account.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -121,7 +125,7 @@ pub enum AccountState {
     Finishing,
     /// An account is signed in.
     SignedIn {
-        /// The account service the sign-in was made at, which is also the voice broker.
+        /// The account service the sign-in was made at.
         origin: String,
         /// The account's address, when the service said it.
         email: Nullable<String>,
@@ -173,7 +177,8 @@ pub enum AccountAttempt {
     PortBusy,
     /// Nothing came back in time.
     TimedOut,
-    /// The service signed the account in and the host could not keep the grant.
+    /// The host's secret store failed, before the code was spent or after the service signed the
+    /// account in, so the host kept no grant.
     NotKept,
     /// The service could not be reached to exchange the answer.
     Unreachable,

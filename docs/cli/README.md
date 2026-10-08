@@ -1681,9 +1681,11 @@ refused while a voice call is open.
 document instead. `sign-out` prints `{ "ok", "was_signed_in", "service_told" }`. `show` prints `{ "ok", "state", "service", "unavailable", "email", "scopes",
 "last_attempt" }`, where `state` is `signed_out`, `waiting_for_browser`, `finishing`, `signed_in`
 or `ended`, and the other fields are present only when they apply: `service` is where the host signs
-in, and `unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it signs in
-nowhere. A host that signs in nowhere refuses `sign-in` and `sign-out` with `HOST_NOT_CONFIGURED`,
-and one with a voice call open refuses them with `RESOURCE_UNAVAILABLE`.
+in, and `unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it does not
+sign in or present an account. A host whose broker is not the account service refuses `sign-in` with
+`HOST_NOT_CONFIGURED`, shows a grant it still keeps, and signs it out; a host that cannot reach the
+account service at all refuses both. One with a voice call open refuses both with
+`RESOURCE_UNAVAILABLE`.
 
 ## `kr host paths`
 
