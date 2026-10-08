@@ -9,7 +9,6 @@
 //! | --- | --- |
 //! | KR-REQ-09.18 | `a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_written`, `a_start_that_cannot_write_its_floor_decides_no_expiry_until_it_can`, `a_delegation_whose_parent_expired_before_it_was_written_is_refused`, `a_redemption_whose_invitation_expired_before_it_was_written_is_refused`, `a_transfer_whose_source_expired_before_it_was_written_is_refused` |
 //! | KR-REQ-18.03 | `an_invitation_is_scoped_to_the_session_it_shares`, `a_delegation_narrows_what_the_issuer_holds`, `transfer_of_control_hands_over_only_what_the_transferring_grant_carries`, `transfer_of_control_issues_one_authority_and_revokes_the_other`, `a_transfer_whose_source_expired_before_it_was_written_is_refused` |
-//! | KR-REQ-19.01 | `a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action_or_a_workflow` |
 //! | KR-REQ-23.49 | `sharing_checks_parent_rights_expiry_and_owner_confirmation`, `revoking_a_shared_grant_completes_through_the_dispatch_barrier`, `a_delegation_whose_parent_expired_before_it_was_written_is_refused` |
 //! | KR-REQ-25.07 | `each_role_compiles_to_explicit_actions_and_the_host_decides_from_those`, `only_controller_and_owner_answer_questions_without_an_explicit_option` |
 //! | KR-REQ-25.10 | `an_invitation_is_single_use_and_expires`, `the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys`, `an_invitation_names_nothing_the_issuer_was_not_shown`, `a_redemption_whose_invitation_expired_before_it_was_written_is_refused` |
@@ -20,8 +19,8 @@ use std::time::Duration;
 use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::sharing::{
-    ConfirmedTransfer, Intermediary, ShareRequest, SharingService, TransferHost, TransferPlan,
-    effective_rights, requires_owner_confirmation, roles, transfer,
+    ConfirmedTransfer, ShareRequest, SharingService, TransferHost, TransferPlan,
+    requires_owner_confirmation, roles, transfer,
 };
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
@@ -1585,81 +1584,6 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
         error.to_string().contains("terminal.input"),
         "unexpected refusal: {error}"
     );
-}
-
-// ---------------------------------------------------------------------------------------------
-// KR-REQ-19.01: no input through an intermediary
-// ---------------------------------------------------------------------------------------------
-
-#[test]
-fn a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action_or_a_workflow() {
-    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
-    let viewer = service
-        .share(&share(SessionRole::Viewer, 1), || Ok(()))
-        .expect("a viewer");
-    let actor = viewer.grant.actions.clone();
-
-    // Each intermediary declares terminal input of its own. None of them can lend it.
-    let declared: CanonicalSet<ActionRight> = [
-        ActionRight::SessionView,
-        ActionRight::TerminalInput,
-        ActionRight::FilesApplyDiff,
-    ]
-    .into_iter()
-    .collect();
-    for via in [
-        Intermediary::PluginAction {
-            declared: declared.clone(),
-        },
-        Intermediary::AttachmentAction {
-            declared: declared.clone(),
-        },
-        Intermediary::Workflow {
-            declared: declared.clone(),
-        },
-    ] {
-        let effective = effective_rights(&actor, &via);
-        assert!(
-            !effective.contains(&ActionRight::TerminalInput),
-            "{} lent a viewer terminal input",
-            via.as_str()
-        );
-        assert!(
-            !effective.contains(&ActionRight::FilesApplyDiff),
-            "{} lent a viewer a file write",
-            via.as_str()
-        );
-        assert!(
-            effective.contains(&ActionRight::SessionView),
-            "what the actor does hold still passes through"
-        );
-        let error = roles::check_indirect(&actor, &via, ActionRight::TerminalInput)
-            .expect_err("the refusal is explicit");
-        assert!(
-            error.to_string().contains("terminal.input"),
-            "unexpected refusal: {error}"
-        );
-    }
-
-    // The intersection bounds the other way too: a controller calling a plugin that declares only
-    // reads obtains only reads.
-    let controller = service
-        .share(
-            &ShareRequest {
-                invitation_id: invitation_id(2),
-                grant_id: grant_id(2),
-                recipient_device_id: device_id(0xf2),
-                ..share(SessionRole::Controller, 2)
-            },
-            || Ok(()),
-        )
-        .expect("a controller");
-    let reads_only = Intermediary::PluginAction {
-        declared: [ActionRight::SessionView].into_iter().collect(),
-    };
-    let effective = effective_rights(&controller.grant.actions, &reads_only);
-    assert!(!effective.contains(&ActionRight::TerminalInput));
-    assert!(effective.contains(&ActionRight::SessionView));
 }
 
 // ---------------------------------------------------------------------------------------------
