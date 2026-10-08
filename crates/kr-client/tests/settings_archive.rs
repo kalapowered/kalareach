@@ -43,7 +43,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs, U64, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{StorageWeb, TOKEN};
+use kr_service_stand_in::{ServiceWeb, TOKEN};
 
 const ORIGIN: &str = "https://reach.kala.to";
 const LOCATOR: &str = "c4d2e6f8-settings-bundle";
@@ -108,7 +108,7 @@ fn origin() -> GatewayOrigin {
     GatewayOrigin::new(ORIGIN).expect("an origin")
 }
 
-fn storage(web: &Arc<StorageWeb>, device: &Arc<Device>) -> ManagedStorageService {
+fn storage(web: &Arc<ServiceWeb>, device: &Arc<Device>) -> ManagedStorageService {
     ManagedStorageService::new(
         origin(),
         Arc::clone(web) as Arc<_>,
@@ -117,7 +117,7 @@ fn storage(web: &Arc<StorageWeb>, device: &Arc<Device>) -> ManagedStorageService
     .presenting(Arc::new(Tokens))
 }
 
-fn manifest(web: &Arc<StorageWeb>, device: &Arc<Device>) -> ManagedBackupManifestService {
+fn manifest(web: &Arc<ServiceWeb>, device: &Arc<Device>) -> ManagedBackupManifestService {
     ManagedBackupManifestService::new(
         origin(),
         Arc::clone(web) as Arc<_>,
@@ -140,14 +140,14 @@ fn now() -> TimestampMs {
 /// arrived, which is how a test sees the order of the two.
 #[derive(Debug)]
 struct Bundles {
-    web: Arc<StorageWeb>,
+    web: Arc<ServiceWeb>,
     held: Mutex<BTreeMap<String, (SyncPosition, Vec<u8>)>>,
     manifest_requests_at_each_write: Mutex<Vec<usize>>,
     lose_the_next_write: Mutex<bool>,
 }
 
 impl Bundles {
-    fn beside(web: &Arc<StorageWeb>) -> Arc<Self> {
+    fn beside(web: &Arc<ServiceWeb>) -> Arc<Self> {
         Arc::new(Self {
             web: Arc::clone(web),
             held: Mutex::new(BTreeMap::new()),
@@ -266,7 +266,7 @@ impl SyncBackupService for Bundles {
 
 /// A device with its settings, its recovery seed and the services it backs up to.
 struct Owner {
-    web: Arc<StorageWeb>,
+    web: Arc<ServiceWeb>,
     bundles: Arc<Bundles>,
     device: Arc<Device>,
     seed: RecoverySeed,
@@ -281,7 +281,7 @@ struct Owner {
 impl Owner {
     /// A device holding its settings object, on an account whose backup storage is on.
     fn new() -> Self {
-        let web = Arc::new(StorageWeb::new());
+        let web = Arc::new(ServiceWeb::new());
         web.set_backup(true);
         let sync_disk = tempfile::tempdir().expect("a directory on the internal disk");
         let store = SyncStore::open(sync_disk.path().join("sync")).expect("a sync store");
@@ -627,7 +627,7 @@ fn change(store: &SyncStore, change: Change) {
 /// The transport to the service, with privacy mode changed once one request has been answered: a
 /// change that lands while the device is in the middle of a generation.
 struct Meddling {
-    web: Arc<StorageWeb>,
+    web: Arc<ServiceWeb>,
     store: SyncStore,
     after: After,
     change: Change,
@@ -709,7 +709,7 @@ impl ServiceHttp for Meddling {
 /// The account's tokens, with privacy mode turned on while the device waits for one of them: a
 /// fence that lands after a request's privacy was read and before the request leaves.
 struct FencingTokens {
-    web: Arc<StorageWeb>,
+    web: Arc<ServiceWeb>,
     store: SyncStore,
     at: usize,
     asked: Mutex<usize>,

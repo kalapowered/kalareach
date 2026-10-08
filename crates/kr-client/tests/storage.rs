@@ -34,7 +34,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Digest256, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{ACCOUNT, Moment, StaleRefusal, StorageWeb, TOKEN};
+use kr_service_stand_in::{ACCOUNT, Moment, ServiceWeb, StaleRefusal, TOKEN};
 
 /* -------------------------------------------------------------------------- */
 /* A device, its account, and its two clients                                  */
@@ -123,7 +123,7 @@ fn origin() -> GatewayOrigin {
 
 /// A storage client for `device`, presenting `tokens` when given.
 fn storage(
-    web: &Arc<StorageWeb>,
+    web: &Arc<ServiceWeb>,
     device: &Arc<Device>,
     tokens: Option<&Arc<Tokens>>,
 ) -> ManagedStorageService {
@@ -140,7 +140,7 @@ fn storage(
 
 /// A manifest client for `device`, presenting `tokens` when given.
 fn manifest(
-    web: &Arc<StorageWeb>,
+    web: &Arc<ServiceWeb>,
     device: &Arc<Device>,
     tokens: Option<&Arc<Tokens>>,
 ) -> ManagedBackupManifestService {
@@ -243,7 +243,7 @@ fn refused(error: &ClientError, code: ErrorCode, action: UserAction) {
 /// signing key derives.
 #[tokio::test]
 async fn each_storage_method_is_answered_as_the_service_answers_it() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let tokens = Tokens::signed_in();
     let client = storage(&web, &device, Some(&tokens));
@@ -390,7 +390,7 @@ async fn created_and_abandoned(
 /// the hash of what it carries; the body is the ciphertext and nothing else.
 #[tokio::test]
 async fn a_part_travels_as_its_ciphertext_beside_its_signed_request() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     backup_on(&client).await;
@@ -448,7 +448,7 @@ async fn a_part_travels_as_its_ciphertext_beside_its_signed_request() {
 /// change decided against a revision the record has left is answered rather than refused, below.
 #[tokio::test]
 async fn each_storage_method_meets_a_refusal_the_service_sends() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     let bytes = ciphertext(64);
@@ -623,7 +623,7 @@ impl kr_client::services::ServiceHttp for BusyWeb {
 /// against the revision it carries is made.
 #[tokio::test]
 async fn a_stale_retention_change_is_answered_with_the_retention_as_it_stands() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     // Another client turns backup storage on after this one read the record at revision nought.
@@ -673,7 +673,7 @@ async fn a_stale_retention_change_is_answered_with_the_retention_as_it_stands() 
 /// the caller learns its change is in effect, and it was made once.
 #[tokio::test]
 async fn a_retention_change_sent_again_after_its_answer_was_lost_learns_the_change_it_made() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     let change = RetentionChange {
@@ -768,7 +768,7 @@ async fn a_conflict_this_client_cannot_read_is_a_view_to_refresh() {
 /// reads either service.
 #[tokio::test]
 async fn a_stale_change_refused_as_a_request_the_service_does_not_read_is_read_as_before() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     web.refuse_stale_changes_as(StaleRefusal::InvalidRequest);
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
@@ -821,7 +821,7 @@ impl kr_client::services::ServiceHttp for Answering {
 /// the service acknowledged.
 #[tokio::test]
 async fn an_upload_interrupted_after_its_second_part_goes_on_without_sending_that_part_again() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     backup_on(&client).await;
@@ -875,7 +875,7 @@ async fn an_upload_interrupted_after_its_second_part_goes_on_without_sending_tha
 /// request, whose proof binds.
 #[tokio::test]
 async fn an_upload_whose_proof_the_service_could_not_bind_once_goes_on_under_the_next() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     backup_on(&client).await;
@@ -918,7 +918,7 @@ async fn an_upload_whose_proof_the_service_could_not_bind_once_goes_on_under_the
 /// takes it again whole: the refusal is an error about that body and not the end of the upload.
 #[tokio::test]
 async fn a_part_cut_short_on_its_way_is_refused_and_taken_again_whole() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     backup_on(&client).await;
@@ -954,7 +954,7 @@ async fn a_part_cut_short_on_its_way_is_refused_and_taken_again_whole() {
 #[tokio::test]
 async fn a_part_sent_again_is_answered_as_the_part_it_is_and_an_unkept_acknowledgement_stops_the_upload()
  {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     backup_on(&client).await;
@@ -1003,7 +1003,7 @@ async fn a_part_sent_again_is_answered_as_the_part_it_is_and_an_unkept_acknowled
 /// answer arrived or was lost, and the service stores the object once.
 #[tokio::test]
 async fn a_completion_asked_for_again_is_answered_with_the_result_it_already_gave() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let client = storage(&web, &device, Some(&Tokens::signed_in()));
     backup_on(&client).await;
@@ -1047,7 +1047,7 @@ async fn a_completion_asked_for_again_is_answered_with_the_result_it_already_gav
 /// it was deleted and that backing up again means enrolling a new collection, never an update.
 #[tokio::test]
 async fn a_deleted_collection_is_an_answer_of_its_own_to_an_upload_and_a_publication() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let tokens = Tokens::signed_in();
     let client = storage(&web, &device, Some(&tokens));
@@ -1227,7 +1227,7 @@ impl Archive {
 /// published; an enrolment and a fetch carry no token.
 #[tokio::test]
 async fn the_backup_manifest_enrols_publishes_and_fetches_as_the_service_answers() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let tokens = Tokens::signed_in();
     let publisher = manifest(&web, &device, Some(&tokens));
@@ -1317,7 +1317,7 @@ async fn the_backup_manifest_enrols_publishes_and_fetches_as_the_service_answers
 /// for a generation already published, and an enrolment by another owner, are refused.
 #[tokio::test]
 async fn a_publication_sent_again_is_a_duplicate_and_other_content_for_it_is_refused() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let publisher = manifest(&web, &device, Some(&Tokens::signed_in()));
     let archive = Archive::sealed(&device, 1);
@@ -1373,7 +1373,7 @@ async fn a_publication_sent_again_is_a_duplicate_and_other_content_for_it_is_ref
 /// either. An enrolment and a fetch, which spend nothing, still go.
 #[tokio::test]
 async fn nothing_is_sent_without_the_accounts_proof_where_the_service_asks_for_it() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let archive = Archive::sealed(&device, 1);
     let bytes = ciphertext(64);
@@ -1520,7 +1520,7 @@ async fn a_client_with_no_storage_service_answers_as_the_null_service_does() {
 /// error; one the service answered is its answer.
 #[tokio::test]
 async fn a_publication_says_whether_it_left_this_device() {
-    let web = Arc::new(StorageWeb::new());
+    let web = Arc::new(ServiceWeb::new());
     let device = Device::generate();
     let archive = Archive::sealed(&device, 1);
     manifest(&web, &device, None)

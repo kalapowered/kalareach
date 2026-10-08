@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::web::{Handled, StorageWeb, document_of};
+use crate::web::{Handled, ServiceWeb, document_of};
 
 /// The most a request's head and body may be, so a test that goes wrong stops rather than grows.
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -18,14 +18,14 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 /// A stand-in serving on a loopback port until it is dropped.
 #[derive(Debug)]
 pub struct Served {
-    web: Arc<StorageWeb>,
+    web: Arc<ServiceWeb>,
     task: JoinHandle<()>,
 }
 
 impl Served {
     /// The service that answers.
     #[must_use]
-    pub const fn web(&self) -> &Arc<StorageWeb> {
+    pub const fn web(&self) -> &Arc<ServiceWeb> {
         &self.web
     }
 
@@ -53,12 +53,12 @@ pub async fn serve() -> Served {
         .await
         .expect("a loopback listener");
     let port = listener.local_addr().expect("an address").port();
-    let web = Arc::new(StorageWeb::at(format!("http://127.0.0.1:{port}")));
+    let web = Arc::new(ServiceWeb::at(format!("http://127.0.0.1:{port}")));
     let task = tokio::spawn(accept(listener, Arc::clone(&web)));
     Served { web, task }
 }
 
-async fn accept(listener: TcpListener, web: Arc<StorageWeb>) {
+async fn accept(listener: TcpListener, web: Arc<ServiceWeb>) {
     let mut connections = JoinSet::new();
     while let Ok((socket, _)) = listener.accept().await {
         connections.spawn(connection(socket, Arc::clone(&web)));
@@ -81,7 +81,7 @@ impl Received {
     }
 }
 
-async fn connection(mut socket: TcpStream, web: Arc<StorageWeb>) {
+async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
     let Some(received) = read_request(&mut socket).await else {
         return;
     };

@@ -1,9 +1,9 @@
-//! A stand-in for the managed storage and backup manifest services.
+//! A stand-in for the managed storage, backup manifest and authority feed services.
 //!
 //! The service is the web repository's Worker, and what it answers is stated by that repository's
 //! service contract. This crate answers as the contract states, with the state the service keeps,
 //! so a test of a client or of a daemon can run against it on a machine with no Worker, no
-//! network and no account. [`StorageWeb`] is the service. It is handed requests in process, as an
+//! network and no account. [`ServiceWeb`] is the service. It is handed requests in process, as an
 //! HTTP transport would carry them, or it answers a socket on loopback ([`serve`]), which is how a
 //! daemon's own transport reaches it.
 //!
@@ -35,16 +35,26 @@
 //! | A fetch with a checkpoint newer than the collection, with a manifest the collection does not hold at that generation, or for a generation older than the checkpoint (one the checkpoint's own manifest names correctly) is `NOT_FOUND`, which the client reads as nothing to answer with; a checkpoint about another archive is `INVALID_REQUEST`, and the request is read before any collection is looked up, in the Worker's order: the archive, the generation, the checkpoint | recorded, apart from the order for an archive no collection holds, which no client sends and the Worker's source states | `backup/collection.ts:372-445`, `backup/index.ts:264-296` | same |
 //! | A new generation published with no account proof is `402 QUOTA_EXHAUSTED` | contract and source only: a local deployment's free tier includes backup storage, so the Worker accepts it there | `backup/index.ts:224`, the production catalogue | the daemon's `an_account_the_service_turns_away_is_waited_for_as_a_person` reaches it through the status route instead |
 //! | `RATE_LIMITED` and `SERVICE_UNAVAILABLE` carry `retryAfterSeconds`, and the `Retry-After` header | source only: a local Worker cannot be made to rate limit or to be unavailable | `object-call.ts:64-73`, `auth/routes.ts:369` | `Moment::Refuse`; the daemon's reaction table; the client's own reading of it in `services/signed.rs` |
-//! | A collection deleted from the account console is `410 COLLECTION_DELETED` | source only | `storage/index.ts:211`, `backup/collection.ts:531` | `StorageWeb::delete_collection`; `a_deleted_collection_stops_the_attempt` |
+//! | A collection deleted from the account console is `410 COLLECTION_DELETED` | source only | `storage/index.ts:211`, `backup/collection.ts:531` | `ServiceWeb::delete_collection`; `a_deleted_collection_stops_the_attempt` |
 //! | A transport fault: the request never arrives, its answer is lost, the connection is held open with no answer, the body arrives cut short | none: the Worker does not choose these | not applicable | `Moment::{Before, After, Hold, Slow, BodyCut}` |
+//! | A feed is the host's alone, addressed by the identifier of its authorisation key; a host reads, publishes to and removes only the feed its own key names | recorded | `authority-feed/index.ts:237-239` | `the_stand_in_answers_as_the_worker_did` in `authority_answers.rs` |
+//! | A publication is stored under the next sequence and sent again it is the same; another request under its identity is `403 FORBIDDEN`; one signed by a key other than the one that carried it, or altered after it was signed, is `403` | recorded | `authority-feed/index.ts:477-507`, `authority-feed/feed.ts:157-248` | same |
+//! | A host sees every record; any other reader sees what it published | recorded | `authority-feed/feed.ts:683-739` | same |
+//! | A revision follows the revision the feed holds, is above the one it names, and sent again is the same; another record under its number is `403`; a gap is `403`; one not above the revision it follows is `400` | recorded | `authority-feed/feed.ts:260-343` | same |
+//! | An acknowledgement names a revision the host issued and the request that revision applied; a pending one is progress, a complete one settles the record and cannot be taken back, an older one than the one held is refused, one for a request nobody published is `404`, and one for a request the host refused is `400` | recorded | `authority-feed/feed.ts:355-452` | same |
+//! | A refusal settles a record, sent again it is the same, and for a record nobody published it is `404` | recorded | `authority-feed/feed.ts:461-480` | same |
+//! | The host names the keys that may remove it; a key it did not name that asks to remove it is `403`; the host or a key it named removes it, which deletes every record, and the feed then answers its host `ok` with `removed` and answers a publication `404` | recorded | `authority-feed/feed.ts:489-527, 159-167, 741-766` | same |
+//! | One publisher holds at most 32 records the host has not finished with, a feed at most 1,000, and 256 of those are for the keys the host named; past each the answer is `402 QUOTA_EXHAUSTED` | source only: it would make the recording grow with every request | `authority-feed/feed.ts:185-233` | `feed.rs` in this crate |
+//! | A record the host finished with is dropped a week later | source only | `authority-feed/feed.ts:612-618` | `feed.rs` in this crate |
 //! | Uploads the service has lost answer `NOT_FOUND` | source only | `storage/upload.ts:607` | `Moment::UploadsLost`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | Storage not confirming the write of a part answers `INTERNAL` and closes the upload | source only | `storage/index.ts:830`, `storage/upload.ts:577` | `Moment::PartWriteFails`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 
+mod feed;
 mod http;
 mod web;
 
 pub use http::{Served, serve};
 pub use web::{
     ACCOUNT, Arrived, BACKUP_WRITE_SCOPE, Handled, IN_PROCESS_ORIGIN, MAX_GENERATIONS, Moment,
-    PART, StaleRefusal, StorageWeb, TOKEN, document_of, refusal, refusal_after,
+    PART, ServiceWeb, StaleRefusal, TOKEN, document_of, refusal, refusal_after,
 };
