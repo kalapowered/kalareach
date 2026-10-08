@@ -4783,6 +4783,13 @@ fn a_restatement_a_worker_takes_does_not_lower_its_mark() {
 /// and not behind the mark. The control is the owner correcting a clock that had run ahead: the
 /// first reading is as far behind the worker's own mark, but it agrees with the confirmation, so
 /// the owner's word stands.
+///
+/// Two looks put the fall between the readings instead. The owner's word is a second ahead of the
+/// worker's first reading, and the second is four and nine tenths of a second below the first:
+/// inside the tolerance of the worker's mark, but more than the tolerance behind the owner's word.
+/// And the owner confirmed the clock before the worker began, on a clock ten minutes ahead of
+/// that, which falls a minute between the readings: every reading agrees with the confirmation,
+/// but the second is behind a mark the worker proved after the owner spoke.
 #[test]
 fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_after_it() {
     use kr_ipc::clock::SharedClock as _;
@@ -4793,6 +4800,8 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
         ARollbackCameAfterTheOwnerSpoke,
         AnOwnerSpokeBeforeTheWorkerBegan,
         AnOwnerSetTheClockForward,
+        TheClockFellInsideTheMarksToleranceBetweenTheReadings,
+        AnOwnerSpokeBeforeTheWorkerBeganAndTheClockFellBetweenTheReadings,
     }
     let looked = |look: Look| {
         let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
@@ -4806,7 +4815,11 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
             machine.wall.now_ms().get(),
             machine.continuous.boot_elapsed_ms(),
         );
-        if matches!(look, Look::AnOwnerSpokeBeforeTheWorkerBegan) {
+        if matches!(
+            look,
+            Look::AnOwnerSpokeBeforeTheWorkerBegan
+                | Look::AnOwnerSpokeBeforeTheWorkerBeganAndTheClockFellBetweenTheReadings
+        ) {
             machine.wall.advance(std::time::Duration::from_secs(600));
         }
         machine.runs(std::time::Duration::from_secs(1));
@@ -4860,6 +4873,20 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
                     clock_put_right.set(clock_put_right.now_ms().get() + 60_000);
                 }));
             }
+            Look::TheClockFellInsideTheMarksToleranceBetweenTheReadings => {
+                machine.wall.advance(std::time::Duration::from_secs(1));
+                machine.owner_establishes(&floor);
+                machine.steps_back(std::time::Duration::from_secs(1));
+                after_the_first_reading(Box::new(move || {
+                    clock_put_right.set(clock_put_right.now_ms().get() - 4_900);
+                }));
+            }
+            Look::AnOwnerSpokeBeforeTheWorkerBeganAndTheClockFellBetweenTheReadings => {
+                floor.establish(spoke.0, spoke.1);
+                after_the_first_reading(Box::new(move || {
+                    clock_put_right.set(clock_put_right.now_ms().get() - 60_000);
+                }));
+            }
         }
         session.observe_time();
         (
@@ -4883,6 +4910,16 @@ fn a_confirmation_does_not_clear_a_rollback_the_first_reading_of_a_look_finds_af
             Look::AnOwnerSetTheClockForward,
             (WallClockTrust::Unresolved, false),
             "a reading behind the owner's word, taken after it, refutes it although the mark is lower",
+        ),
+        (
+            Look::TheClockFellInsideTheMarksToleranceBetweenTheReadings,
+            (WallClockTrust::Unresolved, false),
+            "the second reading refutes the owner's word by itself",
+        ),
+        (
+            Look::AnOwnerSpokeBeforeTheWorkerBeganAndTheClockFellBetweenTheReadings,
+            (WallClockTrust::Unresolved, false),
+            "a clock that falls between the readings, behind a mark proved after the owner spoke, is a rollback",
         ),
         (
             Look::AnOwnerCorrectedAClockThatRanAhead,
@@ -5287,6 +5324,11 @@ fn a_worker_started_after_an_establishment_does_not_follow_it() {
         "the establishment was made before this worker began"
     );
     assert_eq!(session.collect_expired(), 0);
+
+    // An establishment made at the very reading the worker restarted at is not an answer either.
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
 
     machine.runs(std::time::Duration::from_secs(1));
     machine.owner_establishes(&floor);
