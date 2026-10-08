@@ -109,6 +109,49 @@ impl Host {
         host
     }
 
+    /// Starts a daemon whose configuration document is `document`, which it reads once when it
+    /// starts, with `owner` as its first owner.
+    pub async fn start_with_document(
+        owner: &DeviceKeys,
+        document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+    ) -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let path = kr_protocol::hostinfo::configuration::document_path(
+            environment.state_dir(),
+            environment.state_root(),
+            environment.environment_id(),
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("the state directory");
+        }
+        kr_ipc::paths::write_owner_only_file(
+            &path,
+            kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
+        )
+        .expect("the configuration document");
+        let mut host = Self::start_on(
+            temp,
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
+    /// Where this daemon's runtime root is, which is where an operator puts what the host reads
+    /// at run time.
+    #[must_use]
+    pub fn runtime_root(&self) -> &Path {
+        self.temp.paths().runtime_root()
+    }
+
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
         Self::start_on(
