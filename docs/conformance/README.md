@@ -305,12 +305,17 @@ test in the file the comment sits above. A failing case therefore fails every ro
 The report reads the classes a file declares from the lines outside every brace, comment and
 string that begin with modifiers, attributes and `class` (a Kotlin or Java class by its
 package-qualified name). A class nested in another belongs to the file of the class around it
-(a JVM reports it as `Outer$Inner`). The report stops before it runs anything when a file that
-names a row declares no class, or declares one whose name it cannot read (a name in backticks). A
-case the lane reports that no file of the lane declares, or that two declare, is a problem of the
-result, and it fails every file of its lane: a result that cannot be given to one file cannot be
-given to any row, whichever way the reading of the sources went wrong. A file whose braces do not balance once comments and
-strings are blanked cannot be read for its classes, and the report stops before it runs anything.
+(a JVM reports it as `Outer$Inner`).
+
+The report stops before it runs anything when it cannot read a file of these lanes for its classes:
+its braces do not balance once comments and strings are blanked, it declares a class whose name is
+in backticks or on the next line, or it names a row and declares no class. A case the lane reports
+that no file of the lane declares, or that two declare, is a problem of the result, and it fails
+every file of its lane: a result that cannot be given to one file cannot be given to any row. That
+holds whichever way the reading of the sources went wrong, with one limit. A class that the reading
+misses in its own file and lists in exactly one other is given to the other file, so its cases count
+for that file's rows; a failure of it still fails the run, as a failure of those rows or as one
+listed outside any row.
 
 The two scripts run the tests unchanged and leave what the tool wrote at the path `--results` names:
 Gradle's JUnit files in a directory, and, for Xcode, the tree `xcrun xcresulttool get test-results

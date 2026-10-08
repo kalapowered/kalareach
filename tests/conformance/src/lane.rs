@@ -326,8 +326,9 @@ pub fn agree_with_exit(exit: Option<i32>, cases: &[Case]) -> Result<(), String> 
 ///
 /// # Errors
 ///
-/// Returns that the braces of the file do not balance once comments and strings are blanked: the
-/// reading of the file cannot be trusted, and a class after the place it went wrong could be missed.
+/// Returns that the file cannot be read for its classes: its braces do not balance once comments
+/// and strings are blanked, so a class after the place it went wrong could be missed, or a class
+/// is declared whose name is in backticks or on the next line.
 pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String> {
     const MODIFIERS: &[&str] = &[
         "public",
@@ -359,7 +360,6 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
     let mut package = String::new();
     let mut found = Vec::new();
     let mut depth = 0_i64;
-    let originals: Vec<&str> = source.lines().collect();
     for (number, line) in masked.lines().enumerate() {
         let at_top = depth == 0;
         for c in line.chars() {
@@ -410,18 +410,9 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
             }
             break;
         }
-        // A class name in backticks is blanked with the other quoted identifiers, so what follows
-        // `class` is not its name: the file cannot be read for its classes.
-        let quoted = originals.get(number).is_some_and(|original| {
-            original
-                .match_indices("class")
-                .any(|(at, word)| original[at + word.len()..].trim_start().starts_with('`'))
-        });
-        if declared
-            .as_ref()
-            .is_some_and(|name| !NOT_CLASSES.contains(&name.as_str()))
-            && (quoted || declared.as_ref().is_some_and(String::is_empty))
-        {
+        // A class name in backticks is blanked with the other quoted identifiers, which leaves a
+        // backtick where the name was, so what follows `class` is no name: the file cannot be read.
+        if declared.as_ref().is_some_and(String::is_empty) {
             return Err(format!(
                 "line {} declares a class whose name cannot be read",
                 number + 1
@@ -535,8 +526,10 @@ impl Masker {
             while self.at < self.chars.len() && !matches!(self.chars[self.at], '`' | '\n') {
                 self.blank(1);
             }
+            // The closing backtick stays, so that what follows `class` is not a name.
             if self.chars.get(self.at) == Some(&'`') {
-                self.blank(1);
+                self.out.push('`');
+                self.at += 1;
             }
         } else if c == '\''
             && (self.chars.get(self.at + 2) == Some(&'\'')
@@ -704,7 +697,8 @@ mod tests {
         // Four quotes close on the last three and keep the first as text.
         let quotes = "class A {\n    val l = listOf(\"\"\"a\"\"\"\", \"{\")\n}\nclass B {}\n";
         assert_eq!(classes(quotes), ["A", "B"]);
-        // An interpolation in a raw string is still an expression.
+        // A raw string still keeps a quoted string in an interpolation from ending it; the test
+        // below puts a raw string in one.
         let template = "class A {\n    val s = \"\"\"x ${f(\"{\")} y\"\"\"\n}\nclass B {}\n";
         assert_eq!(classes(template), ["A", "B"]);
     }
@@ -733,6 +727,18 @@ mod tests {
     fn a_class_whose_name_cannot_be_read_stops_the_reading() {
         // A quoted name, followed by a word that would pass for one, and a name on the next line.
         assert!(declared_classes("A.kt", "class `A` constructor() {}\n").is_err());
+        assert!(declared_classes("A.kt", "class /* c */ `A` constructor() {}\n").is_err());
+        assert!(declared_classes("A.kt", "class`A` constructor() {}\n").is_err());
+        // A backtick or the word class in a comment after a readable declaration is no stop.
+        assert_eq!(
+            declared_classes("A.kt", "class A {} // Example: class `B`\n").expect("readable"),
+            ["A"]
+        );
+        // The error names the line.
+        let error = declared_classes("A.kt", "class A\n\nclass `B` {}\n").expect_err("quoted");
+        assert!(error.contains("line 3"), "{error}");
+        let error = declared_classes("A.kt", "class A {}\n}\n").expect_err("a stray brace");
+        assert!(error.contains("line 2"), "{error}");
         assert!(declared_classes("A.kt", "class `Login test` {\n}\n").is_err());
         assert!(declared_classes("A.kt", "class\nA {\n}\n").is_err());
         // The words around a class that are not a name stay as they were.
@@ -740,6 +746,11 @@ mod tests {
             declared_classes("A.swift", "nonisolated final class B: XCTestCase {}\n")
                 .expect("balanced"),
             ["B"]
+        );
+        assert_eq!(
+            declared_classes("A.swift", "package final class P: XCTestCase {}\n")
+                .expect("balanced"),
+            ["P"]
         );
         assert_eq!(
             declared_classes("A.swift", "final class C {\n    class func make() {}\n}\n")

@@ -320,9 +320,17 @@ fn a_case_no_file_can_be_given_to_fails_every_row_of_its_lane() {
         .get_mut(swift)
         .expect("the file's classes")
         .retain(|class| class != "VoiceRecorderReaderTests");
+    // A class two files list: the first reading is wrong in one of them.
+    let mut twice = map_of(&fixtures().join("lanes"));
+    twice
+        .lane_classes
+        .get_mut("apps/companion/native/ios/Tests/LaunchPlanTests.swift")
+        .expect("the second file's classes")
+        .push("VoiceRecorderReaderTests".to_owned());
     for (map, cases, why) in [
         (&map, cases, "ElsewhereTests"),
         (&missed, xcode("ios.json"), "VoiceRecorderReaderTests"),
+        (&twice, xcode("ios.json"), "more than one file"),
     ] {
         let document = assemble(
             Platform::MacOs,
@@ -348,6 +356,37 @@ fn a_case_no_file_can_be_given_to_fails_every_row_of_its_lane() {
             "{swift_record:?}"
         );
     }
+}
+
+#[test]
+fn a_class_given_to_the_wrong_single_file_still_fails_the_run() {
+    // The limit of the rule: a class missed in its own file and listed in another that names no row
+    // stays attributed to that other file. Its failure then fails the run and is listed among the
+    // failures outside any row, though the rows of the file that holds the class read from its
+    // other classes.
+    let mut map = map_of(&fixtures().join("lanes"));
+    map.lane_classes
+        .get_mut("apps/companion/native/ios/Tests/VoiceCaptureStateTests.swift")
+        .expect("the file's classes")
+        .retain(|class| class != "VoiceRecorderReaderTests");
+    map.lane_classes
+        .get_mut("apps/companion/native/ios/Tests/LaunchPlanTests.swift")
+        .expect("the second file's classes")
+        .push("VoiceRecorderReaderTests".to_owned());
+    let mut cases = xcode("ios.json");
+    cases
+        .iter_mut()
+        .find(|case| case.class == "VoiceRecorderReaderTests")
+        .expect("a case of the class")
+        .outcome = LibtestOutcome::Failed;
+    let document = assemble(
+        Platform::MacOs,
+        &map,
+        &[executed(step(Platform::MacOs), 65, Ok(cases))],
+    );
+    assert!(!document.passed());
+    assert_eq!(document.failures_outside_identifiers.len(), 1);
+    assert!(document.failures_outside_identifiers[0].contains("VoiceRecorderReaderTests"));
 }
 
 #[test]
@@ -645,6 +684,12 @@ fn a_phone_test_file_whose_braces_do_not_balance_is_one_problem_that_names_it() 
     std::fs::write(&target, &text[..cut]).expect("a file");
     // The directory holds no Cargo workspace, which is a problem of its own; the file has one.
     let map = map_of(root.path());
+    assert!(
+        map.keys
+            .values()
+            .flat_map(|places| places.keys())
+            .any(|place| matches!(place, Place::Lane { file, .. } if file == kotlin))
+    );
     let own: Vec<&String> = map
         .problems
         .iter()

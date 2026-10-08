@@ -720,9 +720,12 @@ pub fn assemble(
 /// with why: no file declares it, or more than one does.
 ///
 /// The files' classes come from reading their sources, which can go wrong in ways no reading can
-/// rule out. What keeps a misreading from showing as a pass is that a case whose class cannot be
-/// given to one file fails every file of its lane (see `Resolver::lane`): the result then cannot be
-/// attributed to the rows, whichever way the reading went wrong.
+/// rule out. A case whose class cannot be given to one file fails every file of its lane (see
+/// `Resolver::lane`), so a class the reading missed, or listed twice, cannot show as a pass. The
+/// limit: a class the reading gives to exactly one file, and the wrong one, stays attributed to
+/// that file. That takes a class missed in its own file and listed in another, two misreadings that
+/// agree; the case then counts for the other file's rows, and a failure of it still fails the run
+/// (it fails those rows, or is listed among the failures outside any row).
 fn unattributed_classes(map: &Map, options: &Options, step: &Executed) -> Vec<String> {
     let (Some(cases), plan::Reading::Lane(tests)) = (&step.lane, &step.step.reading) else {
         return Vec::new();
