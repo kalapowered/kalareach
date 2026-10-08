@@ -60,6 +60,8 @@ async fn until_binding(
 /// A world with a draft that holds one published image, and the image.
 async fn offering() -> Option<(Acting, DraftRecord, AttachmentHandle)> {
     let acting = Acting::start().await?;
+    // The receiver of the offer reads the file the frame names before it acknowledges it.
+    *acting.upstream.lock().expect("not poisoned") = Upstream::Reads;
     let handle = acting.publish(
         &[7; 64],
         "a name with spaces and \"quotes\" and ünïcode.png",
@@ -93,6 +95,27 @@ async fn kr_req_23_30_a_component_offers_an_attachment_and_the_agent_taking_it_i
         frame["params"]["draft_revision"],
         draft.revision.get() + 1,
         "the draft as the claim left it, which is what the worker acted on"
+    );
+    let attachment = &frame["params"]["attachment"];
+    assert_eq!(attachment["transfer_id"], handle.transfer_id.to_string());
+    assert_eq!(attachment["media_type"], "image/png");
+    assert_eq!(attachment["byte_len"], 64);
+    let grant = &attachment["read_grant"];
+    assert_eq!(
+        grant["environment_id"],
+        acting.hosted.environment_id.to_string()
+    );
+    assert!(
+        grant["expires_at_ms"]
+            .as_u64()
+            .is_some_and(|expires| expires > kr_ipc::now_ms().get()),
+        "{grant}"
+    );
+    assert!(
+        std::path::Path::new(grant["path"].as_str().expect("a path"))
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(&staged_stem(&handle))),
+        "the file is named by the transfer's identifier: {grant}"
     );
     assert_eq!(
         read_receipt(&mut client, action_id)
@@ -779,6 +802,45 @@ impl Drop for Awake {
     }
 }
 
+/// What the staged file of an attachment is called before its extension: the transfer's identifier,
+/// in hexadecimal.
+fn staged_stem(handle: &AttachmentHandle) -> String {
+    handle
+        .transfer_id
+        .get()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The staged file of an attachment, found by what it is called and not by where the service keeps
+/// it.
+fn staged_file(acting: &Acting, handle: &AttachmentHandle) -> std::path::PathBuf {
+    fn find(directory: &std::path::Path, stem: &str) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(directory).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find(&path, stem) {
+                    return Some(found);
+                }
+            } else if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(stem))
+                && !path.to_string_lossy().ends_with(".part")
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+    find(
+        &acting.hosted.environment().state_dir(),
+        &staged_stem(handle),
+    )
+    .expect("the attachment's file is staged")
+}
+
 /// Writes a mutation to the worker without waiting for its answer.
 async fn write(
     client: &mut kr_ipc::client::LocalClient,
@@ -1173,5 +1235,206 @@ async fn kr_req_23_30_an_action_is_prepared_over_the_links_connection_and_again_
     assert_ne!(
         first_host, second_host,
         "the second action was prepared over a connection to the replacement"
+    );
+}
+
+/// KR-REQ-12.30 and KR-REQ-24.09: the receiver of an offer opens the file the frame names and
+/// checks it against the size and the digest the frame carries, so an acknowledgement follows a
+/// file that was there to read. A staged file that is not what the frame says makes a receiver that
+/// reads it refuse, the offer fails with the draft and the upload kept, and the same upload offered
+/// again once the file is as it was is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_09_a_staged_file_that_is_not_what_the_frame_says_is_refused_by_a_receiver_that_reads_it()
+ {
+    let Some((acting, draft, handle)) = offering().await else {
+        return;
+    };
+    let mut client = acting.client().await;
+    let staged = staged_file(&acting, &handle);
+    let original = std::fs::read(&staged).expect("reads the staged file");
+    let mut permissions = std::fs::metadata(&staged).expect("metadata").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+    std::fs::set_permissions(&staged, permissions).expect("the test may write the file");
+    std::fs::write(&staged, vec![0xff; original.len()]).expect("corrupts the file");
+
+    let mutation = acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
+    let action_id = mutation.action_id;
+    let Outcome::Error(refusal) = send(&mut client, mutation).await else {
+        panic!("a receiver that read another file acknowledged the offer");
+    };
+    assert_eq!(refusal.code, ErrorCode::InvalidArgument, "{refusal:?}");
+    assert_eq!(
+        read_receipt(&mut client, action_id)
+            .await
+            .expect("a receipt")
+            .state,
+        ReceiptState::Refused
+    );
+    assert_eq!(acting.frames().len(), 1, "the frame was written");
+    let failed = until_binding(&acting, draft.draft_id, &handle, InsertionState::Failed).await;
+    assert_eq!(failed.attachments[0].handle, handle, "the upload is kept");
+
+    // The file is as it was, the attachment is bound again, and the offer is accepted.
+    std::fs::write(&staged, &original).expect("restores the file");
+    acting.bind(&failed, &handle);
+    let mut again = acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
+    again.request_id = RequestId::new(2);
+    let outcome = send(&mut client, again).await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    until_binding(
+        &acting,
+        draft.draft_id,
+        &handle,
+        InsertionState::AcceptedByAgent,
+    )
+    .await;
+}
+
+/// KR-REQ-12.30: whatever a file is called, the frame to the upstream names it by identifiers and
+/// by the grant's path, which is derived from the transfer's identifier, and never by the name. The
+/// names are a name with spaces, quotes and non-ASCII letters, one that looks like a relative path
+/// out of a directory, a WSL path, a WSL network path and a Windows drive path; each is offered,
+/// read by the receiver and accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_12_30_an_attachment_is_named_to_the_upstream_by_identifiers_whatever_its_file_is_called()
+ {
+    let Some(acting) = Acting::start().await else {
+        return;
+    };
+    *acting.upstream.lock().expect("not poisoned") = Upstream::Reads;
+    let mut client = acting.client().await;
+    let names: [(&str, &[&str]); 5] = [
+        (
+            "a name with spaces and \"quotes\" and ünïcode.png",
+            &["spaces", "quotes", "ünïcode"],
+        ),
+        ("../../outside/escape.png", &["outside", "escape"]),
+        (
+            "/mnt/c/Users/me/Pictures/holiday.png",
+            &["holiday", "Pictures", "/mnt"],
+        ),
+        (
+            "\\\\wsl.localhost\\Ubuntu\\home\\me\\wslshot.png",
+            &["wslshot", "Ubuntu", "wsl.localhost"],
+        ),
+        (
+            "C:\\Users\\me\\Desktop\\desktopshot.png",
+            &["desktopshot", "Desktop", "C:"],
+        ),
+    ];
+    for (index, (name, forbidden)) in names.iter().enumerate() {
+        let handle = acting.publish(&[40 + index as u8; 64], name);
+        let draft = acting.bind(&acting.new_draft(), &handle);
+        let mut mutation =
+            acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
+        mutation.request_id = RequestId::new(10 + index as u64);
+        let outcome = send(&mut client, mutation).await;
+        assert!(matches!(outcome, Outcome::Ok(_)), "{name}: {outcome:?}");
+        let frames = acting.frames();
+        assert_eq!(frames.len(), index + 1, "{name}");
+        let frame = &frames[index];
+        for part in *forbidden {
+            assert!(
+                !frame.contains(part),
+                "{name}: the frame carries {part}: {frame}"
+            );
+        }
+        let parsed: serde_json::Value = serde_json::from_str(frame).expect("a JSON frame");
+        assert_eq!(
+            parsed["params"]["attachment"]["transfer_id"],
+            handle.transfer_id.to_string(),
+            "{name}"
+        );
+        let path = parsed["params"]["attachment"]["read_grant"]["path"]
+            .as_str()
+            .expect("a path");
+        assert_eq!(
+            std::path::Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            Some(format!("{}.png", staged_stem(&handle))),
+            "{name}"
+        );
+        until_binding(
+            &acting,
+            draft.draft_id,
+            &handle,
+            InsertionState::AcceptedByAgent,
+        )
+        .await;
+        assert_eq!(
+            acting.draft(draft.draft_id).attachments[0]
+                .handle
+                .original_file_name,
+            *name,
+            "the draft still shows the name the person gave it"
+        );
+    }
+}
+
+/// KR-REQ-12.30: a prompt that names a draft whose attachment is being offered is refused as a
+/// conflict, and the draft is not sent: the offer goes on to be reported, and its attachment is
+/// accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_12_30_a_prompt_naming_a_draft_whose_attachment_is_being_offered_is_a_conflict() {
+    let Some((acting, draft, handle)) = offering().await else {
+        return;
+    };
+    let release = Arc::new(tokio::sync::Notify::new());
+    *acting.upstream.lock().expect("not poisoned") = Upstream::Holds(Arc::clone(&release));
+    let mut client = acting.client().await;
+    let offer = acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
+    write(&mut client, offer).await;
+    until_binding(&acting, draft.draft_id, &handle, InsertionState::Inserting).await;
+
+    // A caller at this machine prompts the session's agent with the draft, through the daemon.
+    let mut caller = kr_ipc::client::LocalClient::connect(
+        &acting
+            .hosted
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        kr_protocol::local::LocalClientKind::Cli,
+        plugin_world::build(),
+    )
+    .await
+    .expect("connects to the daemon");
+    let prompt = acting.prompting(&caller, draft.draft_id);
+    let Outcome::Error(refusal) = plugin_world::submit(&mut caller, prompt).await else {
+        panic!("a prompt was sent for a draft whose attachment was being offered");
+    };
+    assert_eq!(refusal.code, ErrorCode::DraftConflict, "{refusal:?}");
+
+    release.notify_one();
+    let accepted = until_binding(
+        &acting,
+        draft.draft_id,
+        &handle,
+        InsertionState::AcceptedByAgent,
+    )
+    .await;
+    assert_eq!(accepted.attachments[0].handle, handle);
+
+    // The other order: a draft a prompt has already sent to the session is not offered from.
+    let sent = acting.publish(&[21; 64], "sent.png");
+    let sent_draft = acting.bind(&acting.new_draft(), &sent);
+    let prompt = acting.prompting(&caller, sent_draft.draft_id);
+    // The worker may answer the prompt or not; what matters is that the daemon recorded the draft
+    // as sent before it passed the prompt on.
+    let _ = plugin_world::submit(&mut caller, prompt).await;
+    let mut late = acting.offering(
+        &client,
+        "attach.photo",
+        sent_draft.draft_id,
+        sent.transfer_id,
+    );
+    late.request_id = RequestId::new(3);
+    let Outcome::Error(refusal) = send(&mut client, late).await else {
+        panic!("an attachment was offered from a draft a prompt had sent");
+    };
+    assert_eq!(refusal.code, ErrorCode::DraftConflict, "{refusal:?}");
+    assert_eq!(
+        state_of(&acting.draft(sent_draft.draft_id), &sent),
+        InsertionState::Recorded
     );
 }
