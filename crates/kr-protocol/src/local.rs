@@ -290,7 +290,7 @@ pub fn holds_results_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> boo
 /// and would draw a share's attachment more than the preview showed, so a daemon refuses a share's
 /// attach to a worker that does not state this, and sends a pairing grant's attach without the
 /// member.
-pub const FORWARDED_PREVIEWED_SCREEN: &str = "forwarded.previewed-screen/1";
+pub const FORWARDED_SCREEN_BASIS: &str = "forwarded.screen-basis/1";
 
 /// The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
 /// session's screen the attachment is drawn.
@@ -310,13 +310,13 @@ pub enum ScreenBasis {
     Share,
 }
 
-/// Returns true when a worker's statement says it narrows an attachment to a share's previewed
-/// screen ([`FORWARDED_PREVIEWED_SCREEN`]).
+/// Returns true when a worker's statement says it reads the screen basis of a forwarded
+/// `session.attach` ([`FORWARDED_SCREEN_BASIS`]).
 #[must_use]
-pub fn narrows_to_previewed_screens(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+pub fn reads_the_screen_basis(capabilities: &CanonicalSet<CapabilityId>) -> bool {
     capabilities
         .iter()
-        .any(|capability| capability.as_str() == FORWARDED_PREVIEWED_SCREEN)
+        .any(|capability| capability.as_str() == FORWARDED_SCREEN_BASIS)
 }
 
 /// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
@@ -455,7 +455,7 @@ pub struct ForwardedMutation {
     ///
     /// It is absent from the wire when it is absent, so a frame without one is byte for byte what a
     /// worker built before it read, and a daemon sends it only to a worker that states
-    /// [`FORWARDED_PREVIEWED_SCREEN`].
+    /// [`FORWARDED_SCREEN_BASIS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_basis: Option<ScreenBasis>,
 }
@@ -948,14 +948,11 @@ mod tests {
                 .map(|capability| CapabilityId::new(*capability).expect("a capability identifier"))
                 .collect()
         };
-        assert_eq!(
-            super::FORWARDED_PREVIEWED_SCREEN,
-            "forwarded.previewed-screen/1"
-        );
-        assert!(super::narrows_to_previewed_screens(&statement(&[
-            super::FORWARDED_PREVIEWED_SCREEN
+        assert_eq!(super::FORWARDED_SCREEN_BASIS, "forwarded.screen-basis/1");
+        assert!(super::reads_the_screen_basis(&statement(&[
+            super::FORWARDED_SCREEN_BASIS
         ])));
-        assert!(!super::narrows_to_previewed_screens(&statement(&[
+        assert!(!super::reads_the_screen_basis(&statement(&[
             super::FORWARDED_RESULT_SCOPE
         ])));
         assert_eq!(super::FORWARDED_RESULT_SCOPE, "forwarded.result-scope/1");

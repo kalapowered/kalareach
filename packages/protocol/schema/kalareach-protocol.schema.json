@@ -14754,7 +14754,7 @@
               "type": "null"
             }
           ],
-          "description": "The kind of grant the host decided this mutation under, for a `session.attach` only.\n\nAn attachment decided under a share is drawn the screen the share's issuer was shown: the\ntext and how it is drawn, and no window title, no title stack and no link target, which the\npreview did not show. One decided under a device's pairing grant is drawn the live screen.\nA frame that says nothing is drawn as a share's is, because the worker cannot tell which it\nis and the narrower reading discloses nothing the other does not.\n\nIt is absent from the wire when it is absent, so a frame without one is byte for byte what a\nworker built before it read, and a daemon sends it only to a worker that states\n[`FORWARDED_PREVIEWED_SCREEN`]."
+          "description": "The kind of grant the host decided this mutation under, for a `session.attach` only.\n\nAn attachment decided under a share is drawn the screen the share's issuer was shown: the\ntext and how it is drawn, and no window title, no title stack and no link target, which the\npreview did not show. One decided under a device's pairing grant is drawn the live screen.\nA frame that says nothing is drawn as a share's is, because the worker cannot tell which it\nis and the narrower reading discloses nothing the other does not.\n\nIt is absent from the wire when it is absent, so a frame without one is byte for byte what a\nworker built before it read, and a daemon sends it only to a worker that states\n[`FORWARDED_SCREEN_BASIS`]."
         }
       },
       "required": [

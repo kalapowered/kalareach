@@ -8054,7 +8054,7 @@ export interface ForwardedMutation {
    *
    * It is absent from the wire when it is absent, so a frame without one is byte for byte what a
    * worker built before it read, and a daemon sends it only to a worker that states
-   * [`FORWARDED_PREVIEWED_SCREEN`].
+   * [`FORWARDED_SCREEN_BASIS`].
    */
   screen_basis?: ScreenBasis | null
 }

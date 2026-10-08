@@ -298,10 +298,9 @@ impl RemoteConnection {
         // A share's issuer was shown the screen as text, so an attach decided under one is drawn
         // that screen and no more. A pairing grant has no preview, and its attach is drawn the
         // live screen.
-        let screen_basis = Some(if acting.held == super::acting::Held::Share {
-            kr_protocol::local::ScreenBasis::Share
-        } else {
-            kr_protocol::local::ScreenBasis::Pairing
+        let screen_basis = Some(match acting.held {
+            super::acting::Held::Share => kr_protocol::local::ScreenBasis::Share,
+            super::acting::Held::Pairing => kr_protocol::local::ScreenBasis::Pairing,
         });
         // The rights this request was decided with travel with the mutation: the grant as this
         // host's policy and its configured ceiling leave it. The worker admits an attachment and
