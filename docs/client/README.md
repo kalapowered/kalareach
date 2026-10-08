@@ -863,9 +863,11 @@ review is "confirmed" when the challenge is listed as answered and "unknown" oth
 
 `services` holds one trait per managed service section 17 names (account login, relay leases, push,
 encrypted sync and backup, managed inference), and `ServiceClients` holds one optional
-implementation of each. Encrypted sync and backup is three: a device's settings sync, and the
-managed storage and backup manifest clients a host uploads its backups through. The service counts
-as configured when any of the three is held. `services::account` is the account sign-in: the authorisation request a
+implementation of each. Encrypted sync and backup holds three clients: a device's settings sync, and
+the managed storage and backup manifest clients a host uploads its backups through. It counts as
+configured when any of the three is held.
+
+`services::account` is the account sign-in: the authorisation request a
 system browser is handed (S256 PKCE, a fresh state and nonce, the registered redirect byte for
 byte), the checks on what comes back (the redirect, one of each parameter, the state, the issuer,
 then a code used once), the exchange with its ID token checks, and `SignedInAccount`, which keeps
