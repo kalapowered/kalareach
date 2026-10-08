@@ -389,6 +389,33 @@ a 2xx is delivered (for Telegram, a 2xx that says `"ok": true`), a 429 is nothin
 credential, so a failure is recorded by what kind of failure it was and never with the transport's
 own message, which names the address.
 
+### Configuring and removing a destination
+
+The owner creates an external destination with `delivery.destination.configure`, on the host's own
+socket and nowhere else. The call names an identifier, the service (webhook, Slack, Discord,
+Telegram or email), where it sends, a rule's name, and a grant. A webhook may also name the header
+it deduplicates by. The other four take none, because none of those services recognises a repeat by
+an identifier the host chooses.
+
+Three checks come before anything is kept. The identifier is not a paired device's: that
+destination is made by the device's own registration, and a configuration under its identifier
+would take it over. The grant stands now, which means it is found, redeemed, inside its bounds and
+not revoked, and a grant issued to a paired device is only as good as that device's pairing. And a
+service that sends with a credential has one kept under the identifier already, handed over with
+`delivery.destination.secret.set`. Configuring under an identifier that is in use replaces that
+destination.
+
+The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
+told, and every pass asks the grant again, so a destination under a grant that stops standing is
+told nothing.
+
+`delivery.destination.remove` takes a destination away with the credential kept for it. What was
+queued for it and not sent is taken back, and the answer says how many notifications that was and
+how many were already on the wire and now have an outcome nobody can settle. Removing a paired
+device's destination ends its delivery as unpairing does, without unpairing the device. The host
+owes the gateway a revocation of the device's authorisation, so the device's installation issues
+another before the device registers again.
+
 ### Credentials
 
 A webhook's address is where it sends and nothing more. The other four send with a credential: a
