@@ -65,11 +65,11 @@ pub enum Moment {
     ProofUnread,
     /// The request's body arrives cut short, so the service reads less than was sent.
     BodyCut,
-    /// The service holds the request open and answers nothing, until [`StorageWeb::release_held`]
+    /// The service holds the request open and answers nothing, until [`ServiceWeb::release_held`]
     /// lets the connection go. It acts on nothing.
     Hold,
     /// The service acts on the request and is slow to answer: the answer is given when
-    /// [`StorageWeb::release_held`] is called, and is the one the service would have given at once.
+    /// [`ServiceWeb::release_held`] is called, and is the one the service would have given at once.
     Slow,
     /// The service refuses the request as stated, without acting on it, as a service does that is
     /// rate limiting, out of room or fenced for maintenance.
@@ -193,6 +193,8 @@ struct State {
     collections: BTreeMap<String, Collection>,
     nonces: BTreeSet<String>,
     tokens: BTreeMap<String, Token>,
+    /// The authority feeds, by the identifier of each host's authorisation key.
+    feeds: BTreeMap<String, crate::feed::Feed>,
 }
 
 /// What the service did with one request.
@@ -203,7 +205,7 @@ pub enum Handled {
     /// The connection was lost: the request never reached the service, or its answer was lost.
     Lost,
     /// The service holds the request open and answers nothing until it is released. The count is
-    /// the number of releases so far, which [`StorageWeb::held_until_released`] waits past.
+    /// the number of releases so far, which [`ServiceWeb::held_until_released`] waits past.
     Held(u64),
     /// The service acted on the request and gives its answer when it is released.
     Slow(u64, ServiceHttpAnswer),
@@ -211,7 +213,7 @@ pub enum Handled {
 
 /// Managed storage and the backup manifest.
 #[derive(Debug)]
-pub struct StorageWeb {
+pub struct ServiceWeb {
     /// The origin this service answers as, which every request must name.
     origin: String,
     state: Mutex<State>,
@@ -221,13 +223,13 @@ pub struct StorageWeb {
     arrivals: watch::Sender<usize>,
 }
 
-impl Default for StorageWeb {
+impl Default for ServiceWeb {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl StorageWeb {
+impl ServiceWeb {
     /// A service holding nothing, with backup storage off, answering as `https://reach.kala.to`
     /// to requests handed to it in process.
     #[must_use]
@@ -521,6 +523,7 @@ impl StorageWeb {
             "/api/storage/object/read" => "storage.object.read",
             "/api/storage/object/delete" => "storage.object.delete",
             "/api/backup/manifest" => "backup.manifest",
+            "/api/authority/sync" => "authority.sync",
             other => panic!("no route at {other}"),
         };
         let Ok(signature) =
@@ -579,6 +582,9 @@ impl StorageWeb {
         if method == "backup.manifest" {
             return manifest(&mut state, &signature, body, account.is_some());
         }
+        if method == "authority.sync" {
+            return crate::feed::sync(&mut state.feeds, &signature, body, now_ms());
+        }
         if body["installation_id"].as_str() != Some(caller.as_str()) {
             return refusal(
                 403,
@@ -612,7 +618,7 @@ impl StorageWeb {
     }
 }
 
-impl StorageWeb {
+impl ServiceWeb {
     /// What an in-process transport answers for one handled request.
     fn delivered(handled: Handled) -> kr_client::Result<ServiceHttpAnswer> {
         match handled {
@@ -638,7 +644,7 @@ fn bearer(headers: &[(&str, &str)]) -> Option<String> {
         })
 }
 
-impl ServiceHttp for StorageWeb {
+impl ServiceHttp for ServiceWeb {
     fn post_json<'a>(
         &'a self,
         url: &'a str,
@@ -713,7 +719,7 @@ fn verifies(signature: &ServiceRequestSignature) -> bool {
 }
 
 /// A success, in the service's envelope.
-fn answered(data: serde_json::Value) -> ServiceHttpAnswer {
+pub(crate) fn answered(data: serde_json::Value) -> ServiceHttpAnswer {
     ServiceHttpAnswer {
         status: 200,
         body: serde_json::to_vec(&serde_json::json!({ "ok": true, "data": data }))
@@ -1375,7 +1381,7 @@ fn delete(state: &mut State, body: &serde_json::Value, principal: &str) -> Servi
 }
 
 /// The identifier of an authorisation key, as the service derives it.
-fn key_id_of(key: &kr_protocol::scalars::AuthorisationKey) -> String {
+pub(crate) fn key_id_of(key: &kr_protocol::scalars::AuthorisationKey) -> String {
     let id = kr_crypto::keys::key_id(
         kr_protocol::pairing::KeyPurpose::Authorisation,
         key.as_bytes(),
@@ -1398,7 +1404,7 @@ fn digest_of(record: &serde_json::Value) -> String {
 }
 
 /// Whether `signature` verifies under the key that carried the request, in `domain`.
-fn record_verifies(
+pub(crate) fn record_verifies(
     carrier: &kr_protocol::scalars::AuthorisationKey,
     domain: &str,
     input: Result<Vec<u8>, kr_cbor::CborError>,
