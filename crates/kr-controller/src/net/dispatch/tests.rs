@@ -161,7 +161,10 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
         if !entry.ingress.contains(&ActorIngress::PairedDevice) {
             continue;
         }
-        let Ok(decision) = connection.check_grant(Some(world.session_id), entry, false) else {
+        let Ok(decision) = connection
+            .ask(Some(world.session_id), entry, false)
+            .map(|asked| asked.decision)
+        else {
             continue;
         };
         if decision
@@ -195,7 +198,8 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
     // door's own path from its window to the worker.
     let decided = |method: Method| {
         connection
-            .check_grant(Some(world.session_id), method.entry(), false)
+            .ask(Some(world.session_id), method.entry(), false)
+            .map(|asked| asked.decision)
             .expect("decided")
             .decided
             .permitted
@@ -255,6 +259,7 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             world.accepted,
             revision,
             with_voice.clone(),
+            &connection.pairing_acting(),
             &mut None,
         )
         .await;
@@ -1554,7 +1559,10 @@ async fn close_for_a_device_of(
     rights: &[kr_protocol::rights::ActionRight],
 ) -> crate::service::net::ClosedRemotely {
     let rights: CanonicalSet<_> = rights.iter().copied().collect();
-    let envelope = connection.envelope(controller.policy().authority_revision());
+    let envelope = connection.envelope(
+        connection.pairing_acting().grant.grant_id,
+        controller.policy().authority_revision(),
+    );
     let (answer, answered) = tokio::sync::oneshot::channel();
     // Nothing holds the link for a delivery: the acceptance is taken as delivered at once.
     let (_, delivered) = tokio::sync::oneshot::channel();
@@ -1905,7 +1913,9 @@ fn device_mutation(
 }
 
 /// The error an answer carries, when it is one.
-fn error_of(answer: &kr_protocol::envelope::ControlFrame) -> &kr_protocol::error::ProtocolError {
+pub(super) fn error_of(
+    answer: &kr_protocol::envelope::ControlFrame,
+) -> &kr_protocol::error::ProtocolError {
     let kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
         outcome: kr_protocol::envelope::Outcome::Error(error),
         ..
@@ -4053,12 +4063,22 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
         Method::VisitAcknowledge,
     ] {
         let read = viewer
-            .read_of_retained(method, &on_the_session(&viewer, method), &empty)
+            .read_of_retained(
+                method,
+                &on_the_session(&viewer, method),
+                &empty,
+                &viewer.pairing_acting(),
+            )
             .expect("a device that may view is answered")
             .expect("under the read of the receipt");
         assert_eq!(read.shown_as, method);
         let denied = blind
-            .read_of_retained(method, &on_the_session(&blind, method), &empty)
+            .read_of_retained(
+                method,
+                &on_the_session(&blind, method),
+                &empty,
+                &blind.pairing_acting(),
+            )
             .expect_err("a device that may not view is not");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
     }
@@ -4083,14 +4103,24 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
     });
     assert!(
         viewer
-            .read_of_retained(Method::SessionCreate, &create, &made)
+            .read_of_retained(
+                Method::SessionCreate,
+                &create,
+                &made,
+                &viewer.pairing_acting()
+            )
             .expect("answered")
             .is_some(),
         "decided over the session the create made"
     );
     assert!(
         blind
-            .read_of_retained(Method::SessionCreate, &create, &made)
+            .read_of_retained(
+                Method::SessionCreate,
+                &create,
+                &made,
+                &blind.pairing_acting()
+            )
             .is_err(),
         "and refused to a device that may not view it"
     );
@@ -4103,14 +4133,19 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
         let mut asked = on_the_session(&owner, method);
         asked.target.session_id = Nullable::null();
         let read = owner
-            .read_of_retained(method, &asked, &empty)
+            .read_of_retained(method, &asked, &empty, &owner.pairing_acting())
             .expect("a device that may manage the host is shown its challenge")
             .expect("under the read of the challenges");
         assert_eq!(read.shown_as, method);
         let mut refused = on_the_session(&nothing_to_manage, method);
         refused.target.session_id = Nullable::null();
         let denied = nothing_to_manage
-            .read_of_retained(method, &refused, &empty)
+            .read_of_retained(
+                method,
+                &refused,
+                &empty,
+                &nothing_to_manage.pairing_acting(),
+            )
             .expect_err("a device that no longer holds the right is not");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
 
@@ -4120,12 +4155,12 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
         let named = on_the_session(&nothing_to_manage, method);
         assert!(named.target.session_id.is_present());
         let denied = nothing_to_manage
-            .read_of_retained(method, &named, &empty)
+            .read_of_retained(method, &named, &empty, &nothing_to_manage.pairing_acting())
             .expect_err("the session its target names does not decide it");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
         let named = on_the_session(&owner, method);
         let read = owner
-            .read_of_retained(method, &named, &empty)
+            .read_of_retained(method, &named, &empty, &owner.pairing_acting())
             .expect("a device that may manage the host is shown its challenge")
             .expect("under the read of the challenges");
         assert_eq!(read.shown_as, method);
@@ -4136,7 +4171,12 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
     environment.target.session_id = Nullable::null();
     assert!(
         owner
-            .read_of_retained(Method::CatalogueAdd, &environment, &empty)
+            .read_of_retained(
+                Method::CatalogueAdd,
+                &environment,
+                &empty,
+                &owner.pairing_acting()
+            )
             .expect("no read is asked of it")
             .is_none()
     );
@@ -4393,7 +4433,8 @@ async fn a_voice_grant_that_ran_out_does_not_come_back_when_the_wall_clock_is_wo
     let entry = Method::VoiceStart.entry();
     let decides_with_voice = || {
         connection
-            .check_grant(None, entry, false)
+            .ask(None, entry, false)
+            .map(|asked| asked.decision)
             .map(|decision| {
                 decision
                     .decided
@@ -4436,7 +4477,8 @@ async fn a_voice_grant_whose_end_is_not_on_record_is_refused_as_unrecorded() {
     let connection = super::RemoteConnection::for_test(&controller, device);
     let entry = Method::VoiceStart.entry();
     connection
-        .check_grant(None, entry, false)
+        .ask(None, entry, false)
+        .map(|asked| asked.decision)
         .expect("the voice grant stands until it expires");
 
     // The store takes no record of an expiry, as on a full disk.
@@ -4451,7 +4493,8 @@ async fn a_voice_grant_whose_end_is_not_on_record_is_refused_as_unrecorded() {
         .expect("the fault is in place");
     wall.store(now + 120_000, Ordering::SeqCst);
     let refused = connection
-        .check_grant(None, entry, false)
+        .ask(None, entry, false)
+        .map(|asked| asked.decision)
         .expect_err("a lapse this host cannot record is not stated");
     assert_eq!(
         refused.message,

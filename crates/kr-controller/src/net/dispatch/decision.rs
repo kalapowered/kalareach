@@ -15,6 +15,7 @@ use crate::config::ceilings::CeilingRefusal;
 use crate::grants::policy::HeldBound;
 use crate::service::net::lifetimes::GrantStanding;
 
+use super::acting::{Acting, Held};
 use super::output::{RELAY_DECISIONS, Written};
 use super::{RemoteConnection, failure};
 
@@ -27,6 +28,9 @@ pub(super) struct Asked {
     entry: &'static MethodEntry,
     claims_geometry: bool,
     pub(super) decision: super::super::DeviceDecision,
+    /// The grant the request was decided under, which everything the answer and the forwarded
+    /// request carry of a grant is read from. It is never chosen again for the same request.
+    pub(super) acting: Acting,
     /// The method whose answer the frame carries, which is what decides how the answer is shown.
     ///
     /// It is the entry's own method for a request answered by what it asks for. A retained answer
@@ -86,7 +90,7 @@ impl RemoteConnection {
                 &frame,
                 asked.shown_as,
                 &asked.decision.decided.permitted.rights,
-                &self.device.grant.history,
+                &asked.acting.grant.history,
             );
             match self
                 .output
@@ -97,7 +101,12 @@ impl RemoteConnection {
                 Written::Withdrawn => return false,
                 Written::Undecided => {}
             }
-            match self.ask(asked.session_id, asked.entry, asked.claims_geometry) {
+            match self.ask_under(
+                asked.acting.clone(),
+                asked.session_id,
+                asked.entry,
+                asked.claims_geometry,
+            ) {
                 Ok(again) => asked = again.answering(asked.shown_as),
                 Err(error) => return self.output.send(&failure(request_id, error)).await,
             }
@@ -107,20 +116,46 @@ impl RemoteConnection {
             .await
     }
 
-    /// Decides this device's request through the one intersection ([`Self::check_grant`]), and
-    /// keeps what was asked with the decision.
+    /// Decides this device's request through the one intersection ([`Self::check_grant`]), under
+    /// the grant it acts under for the session ([`Self::acting_for`]), and keeps what was asked
+    /// with the decision.
     pub(super) fn ask(
         &self,
         session_id: Option<SessionId>,
         entry: &'static MethodEntry,
         claims_geometry: bool,
     ) -> std::result::Result<Asked, ProtocolError> {
-        let decision = self.check_grant(session_id, entry, claims_geometry)?;
+        self.ask_naming(session_id, entry, claims_geometry, None)
+    }
+
+    /// As [`Self::ask`], for a request that names the grant it acts under.
+    pub(super) fn ask_naming(
+        &self,
+        session_id: Option<SessionId>,
+        entry: &'static MethodEntry,
+        claims_geometry: bool,
+        named: Option<kr_protocol::ids::GrantId>,
+    ) -> std::result::Result<Asked, ProtocolError> {
+        let acting = self.acting_for(session_id, named)?;
+        self.ask_under(acting, session_id, entry, claims_geometry)
+    }
+
+    /// As [`Self::ask`], under a grant that was already chosen: a request decided again, or an
+    /// answer that is a read of what an earlier request produced.
+    pub(super) fn ask_under(
+        &self,
+        acting: Acting,
+        session_id: Option<SessionId>,
+        entry: &'static MethodEntry,
+        claims_geometry: bool,
+    ) -> std::result::Result<Asked, ProtocolError> {
+        let decision = self.check_grant(session_id, entry, claims_geometry, &acting)?;
         Ok(Asked {
             session_id,
             entry,
             claims_geometry,
             decision,
+            acting,
             shown_as: entry.method,
         })
     }
@@ -142,6 +177,8 @@ impl RemoteConnection {
         let now = self.controller.clock.now();
         let settled = self.controller.settled_utc_now();
         let bounds = asked.decision.bounds();
+        // The pairing grant's expiry bounds everything this device does, whichever grant a request
+        // acts under; a share's own end is among the bounds the decision loaded.
         let grant_expiry = match self.device.grant.expiry {
             kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
             kr_protocol::grant::GrantExpiry::Never => None,
@@ -176,7 +213,12 @@ impl RemoteConnection {
         if !passed {
             return Ok(until);
         }
-        match self.check_grant(asked.session_id, asked.entry, asked.claims_geometry) {
+        match self.check_grant(
+            asked.session_id,
+            asked.entry,
+            asked.claims_geometry,
+            &asked.acting,
+        ) {
             Err(refusal) => Err(refusal),
             Ok(_) => Err(authority_kept_moving()),
         }
@@ -342,6 +384,22 @@ impl RemoteConnection {
             crate::service::machine_group::check_step(entry.method, &mutation.params)
                 .map_err(|error| error.to_protocol_error())?;
         }
+        // A redemption acts on an invitation, which belongs to this host rather than to a session:
+        // the grant it activates names the session, and the caller learns which from the answer.
+        if entry.method == Method::GrantRedeem {
+            if mutation.target.session_id.as_ref().is_some() {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    "an invitation belongs to this host, not to one session",
+                ));
+            }
+            mutation
+                .params
+                .to_typed::<kr_protocol::sharing::GrantRedeemParams>()
+                .map_err(|error| {
+                    ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+                })?;
+        }
         // A voice mutation's subject is this host. A voice session is not a shell session, so the
         // target names none, and the session a delegation acts on travels in the parameters where
         // the coordinator checks it against what that voice session may reach. Its own subject
@@ -401,15 +459,15 @@ impl RemoteConnection {
             }
             _ => {}
         }
-        // The caller states the grant it is acting under. It may only be the one this device holds:
-        // a device cannot name another device's grant, and the host records the grant it checked
-        // rather than the one the request claimed.
+        // The caller states the grant it is acting under. It may only be a grant this device
+        // holds, and it is the one the request was decided under: the host records the grant it
+        // checked rather than the one the request claimed.
         if let Some(claimed) = mutation.grant_id.as_ref()
-            && *claimed != self.device.grant.grant_id
+            && *claimed != asked.acting.grant.grant_id
         {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
-                "that grant is not the one this device holds",
+                "that grant is not the one this request was decided under",
             ));
         }
         // The requested lifetime is the caller's request, not its decision.
@@ -470,24 +528,16 @@ impl RemoteConnection {
         session_id: Option<SessionId>,
         entry: &'static MethodEntry,
         claims_geometry: bool,
+        acting: &Acting,
     ) -> std::result::Result<super::super::DeviceDecision, ProtocolError> {
+        // The pairing grant is what lets this device in at all, whichever grant a request acts
+        // under, so its own end is checked first and ends the connection as it always did.
         if !self.grant_is_current() {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "this device's grant has expired",
             ));
         }
-        let grant = self.decided_grant(entry)?;
-        // The device's record is where its grant's standing is written: when it was committed,
-        // which is when its invitation was redeemed, and when it was revoked.
-        let record = crate::grants::GrantRecord {
-            grant: grant.clone(),
-            session_id: None,
-            issued_at_ms: self.device.paired_at_ms.get(),
-            activated_at_ms: Some(self.device.paired_at_ms.get()),
-            revoked_at_ms: self.device.revoked_at_ms.map(|at| at.get()),
-            revoked_by_parent: None,
-        };
         let request = crate::grants::AccessRequest {
             method: entry.method,
             ingress: ActorIngress::PairedDevice,
@@ -498,33 +548,91 @@ impl RemoteConnection {
             now_ms: self.controller.wall_now_ms(),
             continuous_now: self.controller.clock.now(),
         };
+        let decision = match acting.held {
+            Held::Pairing => {
+                let grant = self.decided_grant(entry)?;
+                // The device's record is where its grant's standing is written: when it was
+                // committed, which is when its invitation was redeemed, and when it was revoked.
+                let record = self.pairing_record(&grant);
+                self.controller
+                    .decide_for_device(&grant, &record, request)
+                    .map_err(|refusal| match refusal {
+                        CeilingRefusal::Refused(crate::grants::Refusal::MissingRight {
+                            right: ActionRight::VoiceUse,
+                        }) => ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this device holds no voice grant on this host",
+                        ),
+                        // The grant ran out by this host's wall clock, or by the floor under it,
+                        // while the deadline this connection anchored still has time on it: a
+                        // clock stepped forward, or a floor another decision raised. It is the
+                        // same observation the deadline makes, so it goes where that one goes: the
+                        // latch stops every frame this connection would write next, its
+                        // subscription's output among them, and the record keeps the device from
+                        // coming back on another connection.
+                        expired @ CeilingRefusal::Refused(
+                            crate::grants::Refusal::Expired { .. }
+                            | crate::grants::Refusal::ExpiryUnrecorded { .. },
+                        ) => {
+                            self.authority.expire();
+                            expired.to_protocol_error()
+                        }
+                        other => other.to_protocol_error(),
+                    })?
+            }
+            Held::Share => self.decide_share(&acting.grant, request)?,
+        };
+        self.check_history(entry, &acting.grant)?;
+        Ok(decision)
+    }
+
+    /// The record of this device's pairing grant, as its device record states it.
+    fn pairing_record(&self, grant: &kr_protocol::grant::Grant) -> crate::grants::GrantRecord {
+        crate::grants::GrantRecord {
+            grant: grant.clone(),
+            session_id: None,
+            issued_at_ms: self.device.paired_at_ms.get(),
+            activated_at_ms: Some(self.device.paired_at_ms.get()),
+            revoked_at_ms: self.device.revoked_at_ms.map(|at| at.get()),
+            revoked_by_parent: None,
+        }
+    }
+
+    /// Decides a request under a share this device was given, through the same intersection.
+    ///
+    /// The share is read from the grant store as it stands now, so one revoked since the last
+    /// request is refused as revoked, and its standing is read on both clocks. The device's pairing
+    /// grant has to stand under this host's policy as well: a share is something a device holds
+    /// while it is paired, and a member whose organisation lease lapsed does not keep working
+    /// through a grant that names none. A share's end is not the pairing grant's end, so it is
+    /// refused here and written nowhere on the device's record, and it is held as a bound of its
+    /// own, which the write boundary keeps a response or a relayed batch to.
+    fn decide_share(
+        &self,
+        acting: &kr_protocol::grant::Grant,
+        request: crate::grants::AccessRequest,
+    ) -> std::result::Result<super::super::DeviceDecision, ProtocolError> {
+        let pairing = self.pairing_record(&self.device.grant);
+        self.controller
+            .decide_for_workflow(
+                &pairing,
+                ActorIngress::PairedDevice,
+                request.now_ms,
+                request.continuous_now,
+            )
+            .map_err(|refusal| {
+                ProtocolError::new(ErrorCode::PermissionDenied, refusal.to_string())
+            })?;
+        let record = self.share_record(acting.grant_id)?;
         let decided = self
             .controller
-            .decide_for_device(&grant, &record, request)
-            .map_err(|refusal| match refusal {
-                CeilingRefusal::Refused(crate::grants::Refusal::MissingRight {
-                    right: ActionRight::VoiceUse,
-                }) => ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this device holds no voice grant on this host",
-                ),
-                // The grant ran out by this host's wall clock, or by the floor under it, while
-                // the deadline this connection anchored still has time on it: a clock stepped
-                // forward, or a floor another decision raised. It is the same observation the
-                // deadline makes, so it goes where that one goes: the latch stops every frame
-                // this connection would write next, its subscription's output among them, and
-                // the record keeps the device from coming back on another connection.
-                expired @ CeilingRefusal::Refused(
-                    crate::grants::Refusal::Expired { .. }
-                    | crate::grants::Refusal::ExpiryUnrecorded { .. },
-                ) => {
-                    self.authority.expire();
-                    expired.to_protocol_error()
-                }
-                other => other.to_protocol_error(),
-            })?;
-        self.check_history(entry)?;
-        Ok(decided)
+            .decide_for_device(&record.grant, &record, request)
+            .map_err(|refusal| refusal.to_protocol_error())?;
+        let bound = self.share_bound(&record)?;
+        Ok(super::super::DeviceDecision {
+            share: Some(bound),
+            ..decided
+        })
     }
 
     /// The grant this device's requests are decided against ([`decided_with_voice`]).
@@ -578,8 +686,12 @@ impl RemoteConnection {
     }
 
     /// Refuses a read whose content is outside the grant's history scope.
-    fn check_history(&self, entry: &'static MethodEntry) -> std::result::Result<(), ProtocolError> {
-        let scope = &self.device.grant.history;
+    fn check_history(
+        &self,
+        entry: &'static MethodEntry,
+        acting: &kr_protocol::grant::Grant,
+    ) -> std::result::Result<(), ProtocolError> {
+        let scope = &acting.history;
         match entry.method {
             // The only method that returns *retained* history. Its scope is the grant's lower
             // bound, and nothing on this path can apply one: the bound is a moment in time and a

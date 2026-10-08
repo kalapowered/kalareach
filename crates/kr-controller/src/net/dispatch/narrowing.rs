@@ -11,6 +11,7 @@ use kr_protocol::ids::{ActorId, RequestId};
 use kr_protocol::method::Method;
 use kr_protocol::session::SessionListResult;
 
+use super::acting::Acting;
 use super::{RemoteConnection, failure};
 use crate::changeset::{OutOfScope, ScopedEnvironments, VersionScope};
 
@@ -22,7 +23,7 @@ impl RemoteConnection {
     /// "the sessions this actor may observe". And a session read carries the last command block,
     /// which is session content rather than metadata: a command line and the directory it ran in.
     /// The grant's history lower bound decides whether this device sees it.
-    pub(super) fn narrow(&self, answer: ControlFrame) -> ControlFrame {
+    pub(super) fn narrow(&self, answer: ControlFrame, acting: &Acting) -> ControlFrame {
         let ControlFrame::Response(Response {
             request_id,
             outcome: Outcome::Ok(value),
@@ -175,7 +176,7 @@ impl RemoteConnection {
             };
             return encoded(request_id, &narrowed);
         }
-        self.narrow_read(request_id, value)
+        self.narrow_read(request_id, value, acting)
     }
 
     /// Removes from a session read the content this device's grant does not reach.
@@ -185,7 +186,12 @@ impl RemoteConnection {
     /// the command started, or which retains no history at all, does not see it; the rest of the
     /// read is metadata and passes through. Anything that is not a session read passes through
     /// too: it named its session and was already checked against the selector.
-    fn narrow_read(&self, request_id: RequestId, value: ParamsValue) -> ControlFrame {
+    fn narrow_read(
+        &self,
+        request_id: RequestId,
+        value: ParamsValue,
+        acting: &Acting,
+    ) -> ControlFrame {
         let passed = |value| {
             ControlFrame::Response(Response {
                 request_id,
@@ -195,7 +201,7 @@ impl RemoteConnection {
         let Ok(read) = value.to_typed::<kr_protocol::session::SessionReadResult>() else {
             return passed(value);
         };
-        let bound = self.device.grant.history.lower_bound_ms.0;
+        let bound = acting.grant.history.lower_bound_ms.0;
         let admitted = read.last_command_block.as_ref().is_some_and(|block| {
             bound.is_some_and(|bound| block.started_at_ms.get() >= bound.get())
         });
