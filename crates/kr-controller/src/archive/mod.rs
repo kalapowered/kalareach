@@ -26,13 +26,13 @@
 //!   serves that content from here, and so does one whose last redaction failed. Recovery would
 //!   have to read the privacy generation under ownership and run both obligations, and a content
 //!   read would have to be refused while either is owed; neither is built.
-//! * **A worker crash closes the session.** The closure is recorded and nothing is rebuilt from
-//!   terminal history. Taking ownership removes the worker's published endpoint and descriptor.
-//!   What this module does *not* do is stop what the session still owned:
-//!   [`ArchiveService::fence_owned`] terminates no process. The closure's coverage says so, and
-//!   section 7's cleaning half - terminate or fence the remaining owned processes by cgroup or Job
-//!   identity before the session identity is released - is open, so KR-REQ-07.66 and 24.25 are
-//!   open with it.
+//! * **A worker crash closes the session, and what it still owned is stopped first.** The closure
+//!   is recorded and nothing is rebuilt from terminal history. Taking ownership removes the
+//!   worker's published endpoint and descriptor; [`ArchiveService::fence_owned`] then stops what
+//!   the worker recorded that the session still owned, and what a service manager's control group
+//!   still holds, and reports what it ended, what it forced and what it could not end. A process
+//!   that outlasts the attempt has no endpoint, no descriptor and no terminal of the session to act
+//!   through, is named in the closure with where it was, and is never claimed gone.
 //!
 //! Retention reaches a closed session as well. A session with no worker has no maintenance tick,
 //! so [`ArchiveService::collect`] applies the bounds that belong to it under recovery ownership:
@@ -56,8 +56,10 @@ use kr_worker::persistence::fault::RecoveryGap;
 
 use crate::error::{ControllerError, Result};
 
+mod fence;
 mod import;
 
+pub use fence::{Ended, Fenced};
 pub use import::{ImportOutcome, JournalImport, RefusalCause, UNACCOUNTED_WORKER};
 
 /// The most bytes one archive history page carries.
@@ -246,27 +248,6 @@ pub struct Collected {
     pub receipts_retained: Option<u64>,
     /// Why receipts past their retention are still there, when some are.
     pub receipts_left_behind: Option<String>,
-}
-
-/// What fencing a crashed session's owned processes did.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fenced {
-    /// The session.
-    pub session_id: SessionId,
-    /// The processes this pass terminated.
-    ///
-    /// Always empty in this build: nothing is terminated on the strength of an identifier the
-    /// kernel may have reused, and this pass stops no unit or Job.
-    pub stopped: Vec<ProcessStartIdentity>,
-    /// How many recorded processes had already ended.
-    pub already_gone: u64,
-    /// How many things this host could not account for. A fence in this build counts one: what
-    /// the unit or Job the worker ran in still holds, which this pass does not look at.
-    pub unaccounted: u64,
-    /// Resources known to survive, which are the user's rather than this host's.
-    pub surviving: Vec<kr_protocol::session::SurvivingResource>,
-    /// Whether every owned process was accounted for.
-    pub coverage: kr_protocol::session::OwnershipCoverage,
 }
 
 /// Exclusive recovery ownership of one session's stores.
@@ -484,69 +465,6 @@ impl ArchiveService {
             fenced = true;
         }
         fenced
-    }
-
-    /// Reports what a crashed session still owns, and what this host can do about it.
-    ///
-    /// Section 7: after a worker crash the controller fences its endpoints, uses the cgroup or
-    /// Job or the recorded identities for cleanup, and records any incomplete coverage. The
-    /// endpoint is fenced by [`Self::take_ownership`]. This is the second half. It terminates no
-    /// process: it counts the recorded processes the kernel confirms have ended, carries the
-    /// closure's surviving resources through, counts what the unit or Job the worker ran in still
-    /// holds as one thing it cannot account for, and reports incomplete coverage.
-    ///
-    /// **Nothing is inferred from a dead identifier.** A worker's descendants join the group it
-    /// led, and after the worker has gone the kernel is free to give its number to an unrelated
-    /// process, whose group would then answer to that number. Enumerating it and stopping what it
-    /// held would be stopping somebody else's processes on the strength of a coincidence. The
-    /// root shell also starts a session of its own, so its jobs need not be in the worker's group
-    /// even while the worker lives.
-    ///
-    /// What would work is the boundary the platform itself keeps: the transient unit or Job the
-    /// supervisor started this worker in, which is named from the reservation and cannot name
-    /// anything else. This pass does not stop it, so the coverage it returns is incomplete.
-    #[must_use]
-    pub fn fence_owned(&self, ownership: &RecoveryOwnership, closure: &ClosureRecord) -> Fenced {
-        Fenced {
-            session_id: ownership.session_id,
-            stopped: Vec::new(),
-            // What the session recorded as already stopped, confirmed against the kernel rather
-            // than taken on trust: the identifier may since have been reused.
-            already_gone: closure
-                .terminated
-                .iter()
-                .filter(|terminated| {
-                    matches!(
-                        kr_ipc::identity::process_state(&terminated.identity),
-                        kr_ipc::identity::ProcessState::Ended
-                    )
-                })
-                .count() as u64,
-            // What the worker's unit or Job still holds: this pass does not look, and that is one
-            // thing it cannot account for.
-            unaccounted: 1,
-            surviving: closure.surviving.clone(),
-            // Section 7 forbids claiming that every application a worker may have started was
-            // discovered, and a pass that stops no unit or Job is further from that than most.
-            coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
-        }
-    }
-
-    /// Returns what a closure records when this host had no chance to fence anything.
-    ///
-    /// A reconciliation that finds a worker already gone without taking ownership still writes a
-    /// closure, and this is what it carries: nothing stopped, nothing accounted for, coverage
-    /// incomplete.
-    #[must_use]
-    pub const fn nothing_fenced(session_id: SessionId) -> Fenced {
-        Fenced {
-            session_id,
-            stopped: Vec::new(),
-            already_gone: 0,
-            unaccounted: 1,
-            surviving: Vec::new(),
-            coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
-        }
     }
 
     /// Recovers a crashed session's journal, under ownership, without creating one.

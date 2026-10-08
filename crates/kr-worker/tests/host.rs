@@ -170,6 +170,9 @@ struct Host {
     worker_packages: Option<PathBuf>,
     /// Everything the daemon asked its supervisor to start, when a test keeps the list.
     launched: Option<Arc<std::sync::Mutex<Vec<Launch>>>>,
+    /// Whether the daemon starts its workers through the supervisor the shipping daemon chooses on
+    /// this platform, rather than as detached processes of its own.
+    platform_service: bool,
 }
 
 impl Host {
@@ -208,6 +211,7 @@ impl Host {
             shell_packages: None,
             worker_packages: None,
             launched: None,
+            platform_service: false,
         }
     }
 
@@ -223,7 +227,16 @@ impl Host {
         if let Some(task) = &self.task {
             return Box::new(task.supervisor(&self.paths()));
         }
+        if self.platform_service {
+            return kr_controller::supervision::detect();
+        }
         Box::new(DetachedSupervisor::new())
+    }
+
+    /// Starts the daemon's workers through the supervisor the shipping daemon chooses here.
+    fn through_the_platform(mut self) -> Self {
+        self.platform_service = true;
+        self
     }
 
     /// Installs a qualified Zsh package for the daemon, and none for the worker.
@@ -501,12 +514,32 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
 }
 
 async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
+    create_with(client, host, &[]).await
+}
+
+/// Creates a session whose shell is also given `extra` variables.
+async fn create_with(
+    client: &mut LocalClient,
+    host: &Host,
+    extra: &[(&str, &str)],
+) -> SessionCreateResult {
+    let mut params = create_params(host.environment_id, host.temp.root());
+    params
+        .environment_snapshot
+        .extend(
+            extra
+                .iter()
+                .map(|(name, value)| kr_protocol::session::EnvironmentVariable {
+                    name: (*name).to_owned(),
+                    value: (*value).to_owned(),
+                }),
+        );
     let outcome = client
         .mutate(
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
             ActionTarget::environment(host.environment_id),
-            &create_params(host.environment_id, host.temp.root()),
+            &params,
         )
         .await
         .expect("the call reaches the daemon");
@@ -1991,6 +2024,912 @@ async fn removing_the_environments_task_leaves_its_running_worker_running() {
     );
     let closed = close(&mut client, &host, session_id).await;
     assert_eq!(closed.session_id, session_id, "and closes as usual");
+    drop(client);
+    daemon.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-07.66, KR-REQ-24.25: what a crashed worker leaves, and who stops it
+// ---------------------------------------------------------------------------------------------
+
+/// The root shell's startup file, which builds the session's tree and writes each member's process
+/// number where the test reads it.
+///
+/// `plain` is a background job. `stubborn` ignores hang-up and terminate, and writes its number
+/// only once its traps are in place. `orphan` is the same with its parent gone. `escaped` (Unix)
+/// calls `setsid` in a child of its own, so it leaves the terminal's session, and keeps its parent
+/// alive. After the test creates `kr-go`, `drifter` (Unix) is made the same way with its parent
+/// gone at once, which is the moment it is in no list of the session's tree. `jobonly` (Windows)
+/// is made with a console of its own, so only the session's job holds it.
+const TREE: &str = r#"
+n() { p=$2; if [ -r "/proc/$p/winpid" ]; then p=$(cat "/proc/$p/winpid"); fi; printf '%s
+' "$p" > "$1.pid"; }
+sleep 600 &
+n plain $!
+case $(uname) in
+  MINGW*|MSYS*)
+    ( trap '' HUP TERM; exec sleep 601 ) &
+    n stubborn $!
+    ( ( trap '' HUP TERM; exec sleep 602 ) & n orphan $! )
+    powershell.exe -NoProfile -Command '$p = Start-Process -FilePath "$env:SystemRoot\System32\PING.EXE" -ArgumentList "-n","605","127.0.0.1" -WindowStyle Hidden -PassThru; Set-Content -Path jobonly.pid -Value $p.Id'
+    ;;
+  *)
+    sh -c 'trap "" HUP TERM; echo $$ > stubborn.pid; exec sleep 601' &
+    ( sh -c 'trap "" HUP TERM; echo $$ > orphan.pid; exec sleep 602' & )
+    perl -e 'use POSIX qw(setsid); $SIG{HUP} = "IGNORE"; $SIG{TERM} = "IGNORE"; if (fork() == 0) { setsid() or die "setsid: $!"; open(F, ">escaped.pid"); print F $$; close F; exec "sleep", "603"; } sleep 600' &
+    while [ ! -e kr-go ]; do sleep 0.05; done
+    perl -e 'use POSIX qw(setsid); $SIG{HUP} = "IGNORE"; $SIG{TERM} = "IGNORE"; exit 0 if fork(); setsid() or die "setsid: $!"; open(F, ">drifter.pid"); print F $$; close F; exec "sleep", "604";'
+    ;;
+esac
+"#;
+
+/// Everything the crash tests started, ended by identity when a test is over however it ended.
+struct Members(Vec<kr_protocol::identity::ProcessStartIdentity>);
+
+impl Drop for Members {
+    fn drop(&mut self) {
+        for identity in &self.0 {
+            let _ = kr_ipc::identity::stop_process(identity, kr_ipc::identity::Stop::Kill);
+        }
+    }
+}
+
+/// How a crash test starts its worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// As the daemon starts one on this platform without a service manager: a detached process on
+    /// Unix, and on Windows the environment's task.
+    Plain,
+    /// Through the service manager the shipping daemon chooses: launchd on macOS, a transient user
+    /// service on Linux.
+    Service,
+}
+
+/// Reads the number a member of the tree wrote, once it has written one.
+fn member_of(host: &Host, name: &str) -> Option<kr_protocol::identity::ProcessStartIdentity> {
+    let text = std::fs::read_to_string(host.temp.root().join(format!("{name}.pid"))).ok()?;
+    let pid = text.trim().parse::<u32>().ok()?;
+    kr_ipc::identity::process_start_identity(pid).ok()
+}
+
+/// Waits for `check` to give something, polling, for at most [`LIVENESS_DEADLINE`].
+async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let started = tokio::time::Instant::now();
+    loop {
+        if let Some(found) = check() {
+            return found;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// What the worker has recorded of its session's processes, read as the control daemon reads it.
+fn recorded_by(host: &Host, session_id: SessionId) -> Option<kr_worker::ownership::OwnedRecord> {
+    let journal =
+        kr_worker::journal::Journal::open_read_only(host.paths().journal_database(session_id))
+            .ok()?;
+    journal.read_owned(session_id).ok().flatten()
+}
+
+/// The identity of a session's worker, from the registry the daemon wrote.
+fn worker_of(host: &Host, session_id: SessionId) -> kr_protocol::identity::ProcessStartIdentity {
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    registry
+        .workers()
+        .expect("reads the worker records")
+        .into_iter()
+        .find(|worker| worker.session_id == session_id)
+        .expect("a worker record")
+        .process_identity
+}
+
+/// Kills the worker, the way a crash does: no chance to say anything.
+fn crash(worker: &kr_protocol::identity::ProcessStartIdentity) {
+    assert_eq!(
+        kr_ipc::identity::process_state(worker),
+        kr_ipc::identity::ProcessState::Running,
+        "the worker is running before it is killed"
+    );
+    #[cfg(unix)]
+    {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(worker.pid.get()).expect("a pid"))
+            .expect("a process number");
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("kills it");
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill.exe")
+            .args(["/PID", &worker.pid.get().to_string(), "/F"])
+            .status()
+            .expect("taskkill runs");
+        assert!(status.success(), "taskkill ended the worker");
+    }
+}
+
+/// Lists the closed sessions through the daemon until `session_id` is one, and returns its closure.
+async fn closure_of(
+    client: &mut LocalClient,
+    session_id: SessionId,
+) -> kr_protocol::session::ClosureRecord {
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed: SessionListResult = client
+            .request(
+                Method::SessionList,
+                &SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: true,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the list succeeds")
+            .to_typed()
+            .expect("decodes");
+        if let Some(closure) = listed
+            .sessions
+            .iter()
+            .find(|summary| {
+                summary.session_id == session_id && summary.state == SessionState::Closed
+            })
+            .and_then(|summary| summary.closure.0.clone())
+        {
+            return closure;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for the closure"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// What a crashed worker's session must have had stopped by the time its closure is visible, and
+/// what its coverage says.
+struct Expect {
+    /// The members the platform's boundary or the worker's record holds.
+    ended: Vec<&'static str>,
+    /// The members that ignore the request to end, which the cleanup has to force.
+    forced: Vec<&'static str>,
+    /// Whether the closure claims every owned process was accounted for.
+    complete: bool,
+}
+
+impl Expect {
+    fn of(start: Start) -> Self {
+        let mut ended = vec!["plain", "stubborn", "orphan"];
+        let mut forced = Vec::new();
+        let mut complete = false;
+        if cfg!(windows) {
+            ended.push("jobonly");
+            complete = true;
+        } else {
+            forced.extend(["stubborn", "orphan"]);
+            if cfg!(target_os = "linux") {
+                // The worker is the child subreaper, so a process that left the root's session
+                // while its parent lives is in its tree.
+                ended.push("escaped");
+                forced.push("escaped");
+                if start == Start::Service {
+                    // A process in no list at all, held by the service's control group.
+                    ended.push("drifter");
+                    forced.push("drifter");
+                    complete = true;
+                }
+            }
+        }
+        Self {
+            ended,
+            forced,
+            complete,
+        }
+    }
+}
+
+/// Builds the tree, crashes the worker and checks what is left when the closure can be read.
+///
+/// With `daemon_down` the daemon is stopped before the worker is killed and started again
+/// afterwards, so it is the start of a daemon that finds a worker dead.
+async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
+    start: Start,
+    daemon_down: bool,
+) {
+    let host = match start {
+        Start::Plain => Host::create(),
+        Start::Service => Host::create().through_the_platform(),
+    }
+    .recording_launches();
+    let script = host.temp.root().join("tree.sh");
+    std::fs::write(&script, TREE).expect("writes the tree");
+    let daemon = host.start().await;
+    let client_first = host.client().await;
+    let mut client = client_first;
+    let created = create_with(
+        &mut client,
+        &host,
+        &[("ENV", script.to_str().expect("a path"))],
+    )
+    .await;
+    let session_id = created.session.session_id;
+    let root = created
+        .session
+        .root_process
+        .as_ref()
+        .cloned()
+        .expect("the session names its root shell");
+    let expect = Expect::of(start);
+    let mut named: Vec<(&str, kr_protocol::identity::ProcessStartIdentity)> =
+        vec![("root", root.clone())];
+    for name in &expect.ended {
+        if *name == "drifter" {
+            continue;
+        }
+        let identity = until(&format!("{name} to write its number"), || {
+            member_of(&host, name)
+        })
+        .await;
+        named.push((*name, identity));
+    }
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix adds a late member"))]
+    let mut members = Members(named.iter().map(|(_, identity)| identity.clone()).collect());
+    // The worker has recorded them: this is what the cleanup acts on.
+    until("the worker to record its session's processes", || {
+        let record = recorded_by(&host, session_id)?;
+        named
+            .iter()
+            .all(|(_, identity)| record.processes.contains(identity))
+            .then_some(())
+    })
+    .await;
+    // A process in no list: made after the worker's last look, by a parent that is gone.
+    #[cfg(unix)]
+    {
+        std::fs::write(host.temp.root().join("kr-go"), b"").expect("lets the shell go on");
+        let drifter = until("the drifter to write its number", || {
+            member_of(&host, "drifter")
+        })
+        .await;
+        members.0.push(drifter.clone());
+        if expect.ended.contains(&"drifter") {
+            let record = recorded_by(&host, session_id).expect("the record");
+            assert!(
+                !record.processes.contains(&drifter),
+                "the record does not name the drifter, so only the service's group can end it: {record:?}"
+            );
+            named.push(("drifter", drifter));
+        }
+    }
+
+    let worker = worker_of(&host, session_id);
+    let descriptor = kr_ipc::descriptor::read(&host.paths(), session_id)
+        .expect("reads the runtime directory")
+        .expect("the session's descriptor is published");
+    let (daemon, mut client) = if daemon_down {
+        drop(client);
+        daemon.stop().await;
+        crash(&worker);
+        (host.start().await, host.client().await)
+    } else {
+        crash(&worker);
+        (daemon, client)
+    };
+    let closure = closure_of(&mut client, session_id).await;
+
+    // Nothing more is waited for from here: the closure is written after the cleanup.
+    assert_eq!(
+        closure.reason,
+        kr_protocol::session::ClosureReason::WorkerCrash
+    );
+    for (name, identity) in &named {
+        assert_eq!(
+            kr_ipc::identity::process_state(identity),
+            kr_ipc::identity::ProcessState::Ended,
+            "{name} was still there when the closure was written: {closure:?}"
+        );
+        let listed = closure
+            .terminated
+            .iter()
+            .find(|terminated| terminated.identity == *identity);
+        if *name != "drifter" {
+            // The control group's members are ended by the manager, which this host does not list
+            // by identity; a process the worker recorded is listed whoever ended it.
+            let listed = listed.unwrap_or_else(|| panic!("{name} is named in the closure"));
+            assert_eq!(
+                listed.forced,
+                expect.forced.contains(name),
+                "{name} forced or not as expected: {closure:?}"
+            );
+        }
+    }
+    assert_eq!(
+        closure.ownership_coverage,
+        if expect.complete {
+            kr_protocol::session::OwnershipCoverage::Complete
+        } else {
+            kr_protocol::session::OwnershipCoverage::Incomplete
+        },
+        "{closure:?}"
+    );
+    if !expect.complete {
+        assert!(
+            closure
+                .surviving
+                .iter()
+                .any(|resource| resource.kind == "unestablished"),
+            "an incomplete closure says what was not found: {closure:?}"
+        );
+    }
+    // The worker's endpoint and descriptor are gone, and the daemon started one worker.
+    assert!(
+        kr_ipc::descriptor::read(&host.paths(), session_id)
+            .expect("reads the runtime directory")
+            .is_none(),
+        "the descriptor was fenced"
+    );
+    #[cfg(unix)]
+    assert!(
+        !Path::new(&descriptor.endpoint).exists(),
+        "the endpoint was fenced"
+    );
+    #[cfg(windows)]
+    let _ = descriptor;
+    assert_eq!(
+        host.launches()
+            .iter()
+            .filter(|launch| matches!(launch, Requested::Worker(_)))
+            .count(),
+        1,
+        "the crash started no second worker"
+    );
+    drop(members);
+    drop(client);
+    daemon.stop().await;
+}
+
+/// KR-REQ-07.66, KR-REQ-24.25: a crash is cleaned up before the session's identity is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_workers_tree_is_stopped_before_its_closure_is_recorded() {
+    a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Plain, false).await;
+}
+
+/// The same when it is the start of a daemon that finds the worker dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_workers_tree_is_stopped_by_the_daemon_that_starts_after_it() {
+    a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Plain, true).await;
+}
+
+/// The same under the service manager the shipping daemon chooses, whose control group also holds
+/// what the worker never saw.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
+              runner's account does not have; it runs with --ignored on a Linux host whose account \
+              has one"
+)]
+async fn a_crashed_workers_tree_is_stopped_under_the_platforms_service_manager() {
+    a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Service, false)
+        .await;
+}
+
+/// The client half of the survivor test, run only as the survivor process itself.
+///
+/// It is started by the session's root shell with hang-up and terminate ignored, and it waits for
+/// the test to say the worker is gone. Then it does what a process left behind by a session can do
+/// to act as that session, and writes down what came of each attempt: it reaches for the worker's
+/// old endpoint, asks the daemon to attach to the old session, and writes to the terminal it was
+/// given.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "the client half of the survivor test, run only as its own process"]
+async fn a_survivor_of_a_crashed_session_tries_to_act_as_it() {
+    let Some(directory) = std::env::var_os("KR_SURVIVOR_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let config = loop {
+        if directory.join("survivor.go").exists()
+            && let Ok(text) = std::fs::read_to_string(directory.join("survivor.config"))
+        {
+            break text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let mut lines = config.lines();
+    let (worker_endpoint, controller_endpoint, session) = (
+        lines.next().expect("the worker's endpoint").to_owned(),
+        lines.next().expect("the daemon's endpoint").to_owned(),
+        lines.next().expect("the session").to_owned(),
+    );
+    let session_id: SessionId = session.parse().expect("the session identifier");
+    let mut said = Vec::new();
+
+    // The worker's own endpoint, which the session's worker answered on.
+    said.push(match kr_ipc::paths::Endpoint::from_path(&worker_endpoint) {
+        Ok(endpoint) => {
+            match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+                Ok(_) => "worker_endpoint=connected".to_owned(),
+                Err(_) => "worker_endpoint=refused".to_owned(),
+            }
+        }
+        Err(_) => "worker_endpoint=refused".to_owned(),
+    });
+
+    // The daemon, asked to put a prompt to the agent of the session this process belongs to.
+    let endpoint = kr_ipc::paths::Endpoint::from_path(&controller_endpoint).expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("the daemon is there to be asked");
+    let environment_id = EnvironmentId::new(
+        std::env::var("KR_SURVIVOR_ENVIRONMENT")
+            .expect("the environment")
+            .parse()
+            .expect("an environment identifier"),
+    );
+    let instance = kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let outcome = client
+        .mutate(
+            Method::AgentPromptSubmit,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::some(instance),
+                agent_binding_revision: Nullable::some(
+                    kr_protocol::ids::AgentBindingRevision::new(1),
+                ),
+            },
+            &kr_protocol::agent::AgentPromptParams {
+                target: kr_protocol::agent::AgentMutationTarget {
+                    subject: kr_protocol::agent::AgentSubject {
+                        session_id,
+                        application_instance_id: instance,
+                    },
+                    binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+                },
+                draft_id: Nullable::null(),
+                text: Nullable::some(
+                    kr_protocol::agent::PromptText::new("run this").expect("a prompt"),
+                ),
+            },
+        )
+        .await;
+    said.push(match outcome {
+        Ok(Err(error)) => format!("daemon_prompt=refused:{}", error.code.as_str()),
+        Err(error) => format!("daemon_prompt=failed:{error}"),
+        Ok(Ok(_)) => "daemon_prompt=accepted".to_owned(),
+    });
+
+    // The terminal this process was given, whose other end went with the worker.
+    let written = {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        out.write_all(b"x\n").and_then(|()| out.flush())
+    };
+    said.push(if written.is_err() {
+        "terminal_write=refused".to_owned()
+    } else {
+        "terminal_write=written".to_owned()
+    });
+
+    std::fs::write(directory.join("survivor.out"), said.join("\n"))
+        .expect("writes what came of it");
+    // And stays, as a survivor does, until the test ends it.
+    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+}
+
+/// D-1083's contract for a process that outlasts the cleanup: it is named in the closure by
+/// identifier, start and where it ran, with incomplete coverage; the session's endpoint,
+/// descriptor and terminal are gone, so nothing it holds lets it act as the session; and no later
+/// session shares its identity.
+///
+/// The process is real, started by the session's shell, and keeps running. The platform's refusal
+/// to stop it is the only part supplied (a test has no second account to make a process that
+/// refuses a signal), through the hook the controller offers its tests.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_process_that_outlasts_the_cleanup_is_named_and_cannot_act_as_the_session() {
+    let host = Host::create().recording_launches();
+    let half = host.temp.root().join("survivor-half");
+    kr_ipc::testing::place_and_start_once(
+        &std::env::current_exe().expect("this test's own path"),
+        &half,
+        &["--list"],
+    );
+    let script = host.temp.root().join("survivor.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "export KR_SURVIVOR_DIR='{root}' KR_SURVIVOR_ENVIRONMENT='{environment}'\n\
+             sleep 600 &\n\
+             echo $! > plain.pid\n\
+             sh -c 'trap \"\" HUP TERM; echo $$ > survivor.pid; exec \"$0\" --ignored --exact \
+             a_survivor_of_a_crashed_session_tries_to_act_as_it --nocapture' '{half}' &\n",
+            root = host.temp.root().display(),
+            environment = host.environment_id,
+            half = half.display(),
+        ),
+    )
+    .expect("writes the startup file");
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create_with(
+        &mut client,
+        &host,
+        &[("ENV", script.to_str().expect("a path"))],
+    )
+    .await;
+    let session_id = created.session.session_id;
+    let plain = until("plain to write its number", || member_of(&host, "plain")).await;
+    let survivor = until("the survivor to write its number", || {
+        member_of(&host, "survivor")
+    })
+    .await;
+    let _members = Members(vec![plain.clone(), survivor.clone()]);
+    until("the worker to record the survivor", || {
+        recorded_by(&host, session_id)?
+            .processes
+            .contains(&survivor)
+            .then_some(())
+    })
+    .await;
+    let descriptor = kr_ipc::descriptor::read(&host.paths(), session_id)
+        .expect("reads the runtime directory")
+        .expect("the session's descriptor is published");
+    let cgroup = recorded_by(&host, session_id).and_then(|record| record.cgroup);
+    kr_controller::testing::refuse_stopping(survivor.clone());
+    std::fs::write(
+        host.temp.root().join("survivor.config"),
+        format!(
+            "{}\n{}\n{}\n",
+            descriptor.endpoint,
+            host.paths()
+                .controller_endpoint()
+                .expect("an endpoint")
+                .as_text(),
+            session_id
+        ),
+    )
+    .expect("writes the survivor's instructions");
+
+    crash(&worker_of(&host, session_id));
+    let closure = closure_of(&mut client, session_id).await;
+
+    // The closure names it, and does not claim it gone.
+    assert_eq!(
+        closure.reason,
+        kr_protocol::session::ClosureReason::WorkerCrash
+    );
+    let named = closure
+        .surviving
+        .iter()
+        .find(|resource| resource.kind == "process")
+        .unwrap_or_else(|| panic!("the survivor is in the closure: {closure:?}"));
+    assert!(
+        named
+            .detail
+            .contains(&format!("process {} ", survivor.pid.get()))
+            && named
+                .detail
+                .contains(&format!("started {}", survivor.start_value.get())),
+        "by identifier and start: {named:?}"
+    );
+    assert!(
+        named.detail.contains("ran in"),
+        "and by where it ran: {named:?} (the worker's group was {cgroup:?})"
+    );
+    assert!(
+        !closure
+            .terminated
+            .iter()
+            .any(|terminated| terminated.identity == survivor),
+        "it is not claimed gone"
+    );
+    assert_eq!(
+        closure.ownership_coverage,
+        kr_protocol::session::OwnershipCoverage::Incomplete
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&survivor),
+        kr_ipc::identity::ProcessState::Running,
+        "it is still there"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&plain),
+        kr_ipc::identity::ProcessState::Ended,
+        "and what could be stopped was"
+    );
+
+    // Nothing it holds lets it act as the session.
+    assert!(
+        kr_ipc::descriptor::read(&host.paths(), session_id)
+            .expect("reads the runtime directory")
+            .is_none(),
+        "the descriptor is gone"
+    );
+    std::fs::write(host.temp.root().join("survivor.go"), b"").expect("lets the survivor try");
+    let said = until("the survivor to say what came of its attempts", || {
+        std::fs::read_to_string(host.temp.root().join("survivor.out")).ok()
+    })
+    .await;
+    eprintln!("what the survivor's attempts came to: {said}");
+    assert!(said.contains("worker_endpoint=refused"), "{said}");
+    assert!(
+        said.contains("daemon_prompt=refused:SESSION_CLOSED"),
+        "{said}"
+    );
+    assert!(said.contains("terminal_write=refused"), "{said}");
+
+    // And no later session shares its identity.
+    let second = create(&mut client, &host).await;
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let first_reservation = registry
+        .reservation_for_session(session_id)
+        .expect("reads")
+        .expect("the first session's reservation");
+    let second_reservation = registry
+        .reservation_for_session(second.session.session_id)
+        .expect("reads")
+        .expect("the second session's reservation");
+    assert_ne!(
+        first_reservation.reservation_id, second_reservation.reservation_id,
+        "so the service and the control group named from it differ"
+    );
+    assert!(
+        second_reservation.display_number.get() > first_reservation.display_number.get(),
+        "and so does the number of the endpoint"
+    );
+    drop(registry);
+    close(&mut client, &host, second.session.session_id).await;
+    drop(client);
+    daemon.stop().await;
+}
+
+/// Adds one variable to the environment of the worker the daemon starts, as every supervisor here
+/// hands the process it starts.
+#[cfg(unix)]
+#[derive(Debug)]
+struct WorkerWithVariable {
+    name: &'static str,
+    value: String,
+    inner: Box<dyn WorkerSupervisor>,
+}
+
+#[cfg(unix)]
+impl WorkerSupervisor for WorkerWithVariable {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        let mut told = launch.clone();
+        told.desktop_environment
+            .push((self.name.to_owned(), self.value.clone()));
+        self.inner.start(&told)
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        self.inner.start_service(launch)
+    }
+
+    fn describe(&self) -> &'static str {
+        "this host's supervisor, with a variable added to the worker's environment"
+    }
+}
+
+/// KR-REQ-07.66, KR-REQ-24.25: a worker that dies after its claim and before it reports itself has
+/// started a shell, and what that shell started is stopped before the session identity is released.
+///
+/// The worker is held between its shell and its ready report by a seam compiled in for tests, so
+/// the state is reached by construction: the registry shows the reservation claimed and no worker
+/// row, and the create that was waiting for the report gives up when the worker dies.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_dies_after_its_claim_and_before_it_reports_has_its_tree_stopped() {
+    let host = Host::create().recording_launches();
+    let release = host.temp.root().join("kr-ready-go");
+    let script = host.temp.root().join("tree.sh");
+    std::fs::write(&script, TREE).expect("writes the tree");
+    // The worker is started with the hold; the daemon's supervisor adds the variable.
+    let environment = host.paths();
+    let supervisor = host.temp.supervisor(Box::new(WorkerWithVariable {
+        name: "KR_TEST_HOLD_READY",
+        value: release.display().to_string(),
+        inner: Box::new(DetachedSupervisor::new()),
+    }));
+    let daemon = start_daemon(&environment, supervisor, host.worker.clone(), None)
+        .await
+        .expect("the daemon starts");
+    let mut client = host.client().await;
+    let mut params = create_params(host.environment_id, host.temp.root());
+    params
+        .environment_snapshot
+        .push(kr_protocol::session::EnvironmentVariable {
+            name: "ENV".to_owned(),
+            value: script.display().to_string(),
+        });
+    let create = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::SessionCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(params.environment_id),
+                &params,
+            )
+            .await
+    });
+    let session_id = until("the reservation to be claimed", || {
+        let registry =
+            Registry::open(host.paths().registry_database(), host.environment_id).ok()?;
+        let claimed = registry
+            .reservations_in(kr_controller::registry::LaunchPhase::Claimed)
+            .ok()?;
+        claimed.first().map(|reservation| reservation.session_id)
+    })
+    .await;
+    let mut named = Vec::new();
+    for name in ["plain", "stubborn", "orphan"] {
+        named.push((
+            name,
+            until(&format!("{name} to write its number"), || {
+                member_of(&host, name)
+            })
+            .await,
+        ));
+    }
+    let _members = Members(named.iter().map(|(_, identity)| identity.clone()).collect());
+    until("the worker to record its session's processes", || {
+        let record = recorded_by(&host, session_id)?;
+        named
+            .iter()
+            .all(|(_, identity)| record.processes.contains(identity))
+            .then_some(())
+    })
+    .await;
+    let launcher = {
+        let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+            .expect("opens the registry");
+        registry
+            .reservation_for_session(session_id)
+            .expect("reads")
+            .expect("the reservation")
+            .launcher_identity
+            .expect("the launch recorded the worker")
+    };
+    assert!(
+        Registry::open(host.paths().registry_database(), host.environment_id)
+            .expect("opens the registry")
+            .workers()
+            .expect("reads")
+            .iter()
+            .all(|worker| worker.session_id != session_id),
+        "the worker has not reported, so the registry holds no worker for the session"
+    );
+    crash(&launcher);
+    let _ = create.await;
+
+    let mut client = host.client().await;
+    let closure = closure_of(&mut client, session_id).await;
+    assert_eq!(
+        closure.reason,
+        kr_protocol::session::ClosureReason::WorkerCrash
+    );
+    for (name, identity) in &named {
+        assert_eq!(
+            kr_ipc::identity::process_state(identity),
+            kr_ipc::identity::ProcessState::Ended,
+            "{name} was still there when the closure was written: {closure:?}"
+        );
+        assert!(
+            closure
+                .terminated
+                .iter()
+                .any(|terminated| terminated.identity == *identity),
+            "{name} is named in the closure: {closure:?}"
+        );
+    }
+    assert_eq!(
+        closure.ownership_coverage,
+        kr_protocol::session::OwnershipCoverage::Incomplete
+    );
+    drop(client);
+    daemon.stop().await;
+}
+
+/// KR-REQ-07.66, KR-REQ-24.25: a worker that accepted a close and died before it recorded its own
+/// closure is a crash, and what its session owned is stopped before the daemon records the closure.
+///
+/// The worker is stopped (not ended) once it has accepted the close, so it can neither signal its
+/// tree nor write a closure, and then ended; the test reads the journal to show it left none.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_dies_after_accepting_a_close_has_its_tree_stopped_by_the_daemon() {
+    let host = Host::create().recording_launches();
+    let script = host.temp.root().join("tree.sh");
+    std::fs::write(&script, TREE).expect("writes the tree");
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create_with(
+        &mut client,
+        &host,
+        &[("ENV", script.to_str().expect("a path"))],
+    )
+    .await;
+    let session_id = created.session.session_id;
+    let mut named = Vec::new();
+    for name in ["plain", "stubborn", "orphan"] {
+        named.push((
+            name,
+            until(&format!("{name} to write its number"), || {
+                member_of(&host, name)
+            })
+            .await,
+        ));
+    }
+    let _members = Members(named.iter().map(|(_, identity)| identity.clone()).collect());
+    until("the worker to record its session's processes", || {
+        let record = recorded_by(&host, session_id)?;
+        named
+            .iter()
+            .all(|(_, identity)| record.processes.contains(identity))
+            .then_some(())
+    })
+    .await;
+    let worker = worker_of(&host, session_id);
+    let pid = rustix::process::Pid::from_raw(i32::try_from(worker.pid.get()).expect("a pid"))
+        .expect("a process number");
+
+    // The close is accepted, and the worker is stopped before it can do anything with it.
+    let accepted: SessionCloseResult = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &SessionCloseParams { session_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|value| value.to_typed().expect("decodes"))
+        .unwrap_or_else(|error| panic!("the close failed: {error}"));
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stops the worker");
+    assert!(
+        accepted.closure.0.is_none(),
+        "the worker accepted the close and had recorded no closure: {accepted:?}"
+    );
+    let journal =
+        kr_worker::journal::Journal::open_read_only(host.paths().journal_database(session_id))
+            .expect("opens the journal");
+    assert!(
+        journal.read_closure(session_id).expect("reads").is_none(),
+        "the journal holds no closure, so what follows is the daemon's"
+    );
+    drop(journal);
+    crash(&worker);
+
+    let closure = closure_of(&mut client, session_id).await;
+    for (name, identity) in &named {
+        assert_eq!(
+            kr_ipc::identity::process_state(identity),
+            kr_ipc::identity::ProcessState::Ended,
+            "{name} was still there when the closure was written: {closure:?}"
+        );
+    }
+    assert!(
+        closure
+            .terminated
+            .iter()
+            .any(|terminated| terminated.identity == named[1].1 && terminated.forced),
+        "the process that ignores the request was forced by the daemon: {closure:?}"
+    );
     drop(client);
     daemon.stop().await;
 }

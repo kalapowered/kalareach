@@ -207,12 +207,12 @@ impl Controller {
                 .launcher_identity
                 .clone()
                 .expect("the identity was just read");
-            self.record_final(
+            // What the session owned is stopped, as it is for any other crash.
+            self.crash_flight(
                 reservation.session_id,
-                ClosureReason::WorkerCrash,
+                reservation.display_number,
                 &identity,
-                &crate::archive::ArchiveService::nothing_fenced(reservation.session_id),
-                true,
+                ClosureReason::WorkerCrash,
             )
             .await?;
         }
@@ -336,6 +336,7 @@ impl Controller {
             let registry = self.registry.lock().await;
             registry.workers()?
         };
+        let mut reconciling = Vec::new();
         for row in rows {
             if self.directory.lock().await.get(row.session_id).is_some() {
                 continue;
@@ -384,9 +385,19 @@ impl Controller {
                 // kernel; only a confirmed death produces a closure record.
                 Err(refused) => {
                     report_unretained(row.display_number, &refused);
-                    let _ = self.reconcile(row.session_id).await;
+                    // Every crashed session's cleanup is started before any is waited for: a
+                    // daemon that starts beside several of them costs one bound, not one each.
+                    match self.reconcile_soon(row.session_id) {
+                        Some(task) => reconciling.push(task),
+                        None => {
+                            let _ = self.reconcile(row.session_id).await;
+                        }
+                    }
                 }
             }
+        }
+        for task in reconciling {
+            let _ = task.await;
         }
         Ok(())
     }
