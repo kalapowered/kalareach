@@ -534,6 +534,26 @@ pub struct GrantRevokeParams {
     pub grant_id: GrantId,
 }
 
+/// Parameters of `grant.redeem`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantRedeemParams {
+    /// The invitation to redeem. Its issuer hands it to the recipient; the host answers only the
+    /// device it names.
+    pub invitation_id: InvitationId,
+}
+
+/// The result of `grant.redeem`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantRedeemResult {
+    /// The invitation that was redeemed.
+    pub invitation_id: InvitationId,
+    /// The grant it carried, now active. It names the session it covers and what it reaches; the
+    /// text the issuer was shown stays with the issuer.
+    pub grant: Grant,
+}
+
 /// The result of `grant.revoke` and `device.revoke`.
 ///
 /// A revocation is not complete when the host records it. It is complete for a worker once that
