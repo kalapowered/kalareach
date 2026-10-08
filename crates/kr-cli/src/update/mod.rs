@@ -1579,11 +1579,22 @@ async fn hand_over(
     {
         Ok(install) => install,
         Err(error) => {
+            // The holder of an environment whose daemon answered is a daemon that makes way and
+            // goes on serving: only an environment nothing answered for has a holder to name.
+            let unanswered: Vec<&inventory::Environment> = environments
+                .iter()
+                .filter(|environment| {
+                    !prepared
+                        .iter()
+                        .any(|(answered, _)| answered.environment_id == environment.environment_id)
+                })
+                .collect();
+            let error = handover::naming_holders(error, &unanswered);
             for (environment, daemon) in prepared {
                 handover::resume(daemon, environment, &target.release).await;
             }
             forget_update(store, record);
-            return Err(handover::naming_holders(error, environments));
+            return Err(error);
         }
     };
     let stopped: Vec<EnvironmentId> = prepared

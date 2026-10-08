@@ -2777,8 +2777,15 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
     two.archive(&archive);
     let archive = archive.display().to_string();
 
-    // A daemon that never finishes starting holds the install lock, shared, past the update's bound.
+    // A daemon that never finishes starting holds the install lock, shared, past the update's bound,
+    // and its environment, which no daemon answers for: this process stands in for it.
     let starting = host.store.lock_start().expect("the start lock");
+    let idle = Idle::new(&host.store);
+    let hanging = kr_controller::singleton::SingletonLock::acquire(
+        &idle.temp.environment().singleton_lock(),
+        idle.temp.environment_id(),
+    )
+    .expect("holds the environment");
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2792,6 +2799,15 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
             && message.contains("run kr host update again"),
         "{said}"
     );
+    assert!(
+        message.contains(&format!("kill {}", std::process::id())),
+        "the process that holds the environment nothing answers for is named: {said}"
+    );
+    assert!(
+        !message.contains(&format!("kill {}", host.daemons[0].id())),
+        "and the daemon that made way is not: {said}"
+    );
+    drop(hanging);
     assert_eq!(
         host.store.current().expect("reads"),
         Some(one.name().clone())

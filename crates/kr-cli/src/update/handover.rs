@@ -276,9 +276,9 @@ pub async fn install_lock(
 }
 
 /// The refusal `error`, a wait for the store's install lock that ran out, with the process that holds
-/// each of `environments` added where one does: a daemon that hangs in its start holds the install
-/// lock and its environment, and is the person's to stop.
-pub fn naming_holders(error: CliError, environments: &[Environment]) -> CliError {
+/// each of `environments`, which are those no daemon answered for, added where one does: a daemon
+/// that hangs in its start holds the install lock and its environment, and is the person's to stop.
+pub fn naming_holders(error: CliError, environments: &[&Environment]) -> CliError {
     let CliError::UpdateDeferred(said) = error else {
         return error;
     };
