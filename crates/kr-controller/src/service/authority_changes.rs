@@ -1142,10 +1142,11 @@ fn answered_as<T: kr_protocol::wire::WireMessage>(
 
 /// The visible lines of the session's screen, as the share's recipient would first see them.
 ///
-/// The worker cuts them to the scope the share would carry, and a screen it had to cut is not
-/// shared: the issuer is shown what the recipient will read, and a preview that says less than the
-/// recipient will see is the thing the preview is there to prevent. A worker of an earlier build
-/// does not know the read, and the screen is not shared through it.
+/// The worker cuts them to the scope the share would carry and says when it had to cut them;
+/// [`crate::sharing::SharingService::preview`] then refuses a screen that was cut, because a
+/// preview that says less than the recipient will see is the thing the preview is there to
+/// prevent. A worker of an earlier build does not know the read, and the screen is not shared
+/// through it.
 async fn read_screen(
     client: &mut LocalClient,
     session_id: SessionId,
@@ -1163,11 +1164,12 @@ async fn read_screen(
         .map_err(PreviewFailure::Link)?;
     let result: kr_protocol::sharing::SessionScreenPreviewResult = match answered {
         Ok(value) => answered_as(&value)?,
-        // A worker of an earlier build answers a read it does not know as one it does not serve.
+        // A worker of an earlier build lists no such read, and answers it as it answers any method
+        // it does not list.
         Err(error)
             if error.code == ErrorCode::UnsupportedCapability
-                || (error.code == ErrorCode::InvalidArgument
-                    && error.message.ends_with("is not a read this worker serves")) =>
+                || (error.code == ErrorCode::PermissionDenied
+                    && error.message == kr_protocol::local::METHOD_NOT_REACHABLE) =>
         {
             return Err(PreviewFailure::Refused(ControllerError::Refused {
                 code: ErrorCode::UnsupportedCapability,
@@ -1183,13 +1185,6 @@ async fn read_screen(
             "the session's worker showed no screen for a share that includes it".to_owned(),
         )));
     };
-    if screen.truncated {
-        return Err(PreviewFailure::Refused(ControllerError::InvalidArgument(
-            "this session's screen is larger than a preview can show, so its issuer cannot be \
-             shown all of what the share would give"
-                .to_owned(),
-        )));
-    }
     Ok(screen)
 }
 

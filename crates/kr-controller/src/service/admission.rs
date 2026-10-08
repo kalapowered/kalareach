@@ -373,9 +373,13 @@ impl Controller {
         )
     }
 
-    /// Records the grant a connection acts under, so that a revocation of it reaches this
-    /// connection. Returns whether the connection is still registered: one that is not has been
-    /// withdrawn and acts under nothing.
+    /// Records that a connection decides a request under `grant_id`, so that a revocation of it
+    /// reaches this connection. Returns whether the connection is still registered: one that is
+    /// not has been withdrawn and acts under nothing.
+    ///
+    /// Called before the grant's record is read, so a revocation either finds this connection
+    /// registered under the grant and withdraws it, or has committed already and the record read
+    /// after this call says so.
     pub(crate) fn note_acting(
         &self,
         connection_id: ConnectionId,
@@ -383,7 +387,7 @@ impl Controller {
     ) -> bool {
         self.admitted_table()
             .get_mut(&connection_id)
-            .map(|registration| registration.acting = Some(grant_id))
+            .map(|registration| registration.acting.insert(grant_id))
             .is_some()
     }
 
@@ -886,10 +890,11 @@ pub(super) struct AdmittedConnection {
     pub(super) admitted_revision: kr_protocol::ids::AuthorityRevision,
     /// The latch of the write boundary this registration lets write, when it has one.
     latch: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// The grant a network connection acts under for its session, once its link to that session's
-    /// worker is open. A revocation that reaches a grant fences the connections acting under it
-    /// and no others ([`super::barrier::Reach::Grants`]).
-    pub(super) acting: Option<kr_protocol::ids::GrantId>,
+    /// The shares a network connection has decided a request under, noted before the share's
+    /// record is read for it. A revocation that reaches a grant withdraws the connections that
+    /// decided a request under it, whether they answered from the daemon itself or through a link
+    /// to a worker, and no others ([`super::barrier::Reach::Grants`]).
+    pub(super) acting: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
     /// The door the connection came through.
     door: Door,
 }
@@ -920,7 +925,7 @@ impl AdmittedConnection {
             actor_id,
             admitted_revision,
             latch: None,
-            acting: None,
+            acting: std::collections::BTreeSet::new(),
             door: Door::Network,
         }
     }
@@ -936,7 +941,7 @@ impl AdmittedConnection {
             actor_id,
             admitted_revision,
             latch: None,
-            acting: None,
+            acting: std::collections::BTreeSet::new(),
             door: Door::Local(kind),
         }
     }

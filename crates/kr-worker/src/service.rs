@@ -8456,7 +8456,7 @@ fn not_negotiated() -> ProtocolError {
 fn unlisted() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::PermissionDenied,
-        "the method is not reachable from a local caller",
+        kr_protocol::local::METHOD_NOT_REACHABLE,
     )
 }
 

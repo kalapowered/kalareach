@@ -527,9 +527,10 @@ impl RemoteConnection {
     /// policy and the configured rights ceiling leave it. A right the configuration removed is
     /// refused by name, and the pairing grant that decision finds expired ends this connection
     /// exactly as its own deadline passing would; a share found expired refuses the request and
-    /// writes nothing on the device's record. Last comes the history scope. A requirement that depends on the resolved
-    /// subject - resource ownership, a local caller's token - is the subject's to answer, and the
-    /// worker answers it inside its own dispatch barrier where the subject cannot move.
+    /// writes nothing on the device's record. Last comes the history scope. A requirement that
+    /// depends on the resolved subject - resource ownership, a local caller's token - is the
+    /// subject's to answer, and the worker answers it inside its own dispatch barrier where the
+    /// subject cannot move.
     pub(super) fn check_grant(
         &self,
         session_id: Option<SessionId>,
@@ -632,7 +633,22 @@ impl RemoteConnection {
                 }
                 other => ProtocolError::new(ErrorCode::PermissionDenied, other.to_string()),
             })?;
+        // The share is noted on this connection's registration before its record is read, so a
+        // revocation of it either withdraws this connection or has committed already and the
+        // record says so.
+        if !self
+            .controller
+            .note_acting(self.connection_id, acting.grant_id)
+        {
+            return Err(super::acting::withdrawn());
+        }
         let record = self.share_record(acting.grant_id)?;
+        if record.revoked_at_ms.is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this grant has been revoked",
+            ));
+        }
         let decided = self
             .controller
             .decide_for_device(&record.grant, &record, request)

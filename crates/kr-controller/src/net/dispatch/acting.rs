@@ -34,8 +34,13 @@ use crate::service::net::lifetimes::{Anchored, GrantStanding};
 
 use super::RemoteConnection;
 
-/// How long a connection waits for a grant to end before it looks at the grants again.
-const GRANT_WATCH: std::time::Duration = std::time::Duration::from_secs(1);
+/// The longest a connection waits for a grant to end before it looks at the grants again, which a
+/// clock stepped forward can have ended sooner than the time they had left.
+#[cfg(not(test))]
+const GRANT_WATCH: std::time::Duration = std::time::Duration::from_secs(15);
+/// A test moves its clocks by hand and waits for the connection to notice.
+#[cfg(test)]
+const GRANT_WATCH: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Where a grant a request is decided under comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +76,14 @@ fn not_held() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::PermissionDenied,
         "this device holds no such grant for this session",
+    )
+}
+
+/// What a connection is told when the host has withdrawn its registration.
+pub(super) fn withdrawn() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        "the authority this connection was admitted under has been withdrawn; open a new connection",
     )
 }
 
@@ -122,14 +135,14 @@ impl RemoteConnection {
     /// The grant this connection acts under, once `acting` has opened its link to `session_id`.
     ///
     /// Taken under the lock that guards the link, so two requests that open it at once do not fix
-    /// two grants. A share is registered with the host as the grant this connection acts under, so
-    /// that revoking it reaches this connection and no other, and it is read again once registered:
-    /// a revocation that landed before the registration found nothing to reach, and this finds it.
+    /// two grants. A share is noted on the connection's registration first and its record is read
+    /// after, so a revocation of it either withdraws this connection or has committed already and
+    /// the record says so.
     ///
     /// # Errors
     ///
-    /// Refuses a grant other than the one already fixed for the session, and a share that has been
-    /// revoked or whose connection has been withdrawn.
+    /// Refuses a grant other than the one already fixed for the connection, a second session, and a
+    /// share that has been revoked or whose connection has been withdrawn.
     pub(super) fn fix(
         &self,
         session_id: SessionId,
@@ -137,9 +150,13 @@ impl RemoteConnection {
     ) -> std::result::Result<(), ProtocolError> {
         let mut fixed = self.fixed.lock().unwrap_or_else(PoisonError::into_inner);
         match *fixed {
-            Some((fixed_session, fixed_grant))
-                if fixed_session != session_id || fixed_grant != acting.grant.grant_id =>
-            {
+            Some((fixed_session, _)) if fixed_session != session_id => {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    "this connection already serves another session; open another connection",
+                ));
+            }
+            Some((_, fixed_grant)) if fixed_grant != acting.grant.grant_id => {
                 return Err(ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "this connection acts for this session under another grant; open another \
@@ -150,13 +167,13 @@ impl RemoteConnection {
             None => {}
         }
         if acting.held == Held::Share {
-            let record = self.share_record(acting.grant.grant_id)?;
             if !self
                 .controller
                 .note_acting(self.connection_id, acting.grant.grant_id)
             {
-                return Err(not_held());
+                return Err(withdrawn());
             }
+            let record = self.share_record(acting.grant.grant_id)?;
             if record.revoked_at_ms.is_some() {
                 return Err(ProtocolError::new(
                     ErrorCode::PermissionDenied,
@@ -270,23 +287,25 @@ impl RemoteConnection {
         }
         let lifetimes = self.controller.lifetimes();
         let grants = self.controller.sharing().grants();
-        let mut shares: Vec<Grant> = grants
+        let mut shares: Vec<Grant> = Vec::new();
+        for record in grants
             .records_for_device(self.device.device_id)
             .map_err(|error| error.to_protocol_error())?
-            .into_iter()
-            .filter(|record| {
-                record.is_active()
-                    && record.revoked_at_ms.is_none()
-                    && !record.grant.permits(ActionRight::VoiceUse)
-                    && self.admits(&record.grant, session_id)
-                    // A share that has ended on either clock is not one to choose among.
-                    && matches!(
-                        lifetimes.stored_standing(grants, record),
-                        Ok(GrantStanding::InForce)
-                    )
-            })
-            .map(|record| record.grant)
-            .collect();
+        {
+            if record.is_active()
+                && record.revoked_at_ms.is_none()
+                && !record.grant.permits(ActionRight::VoiceUse)
+                && self.admits(&record.grant, session_id)
+                // A share that has ended on either clock is not one to choose among. A store that
+                // cannot say is a refusal of its own, not a share that has ended.
+                && lifetimes
+                    .stored_standing(grants, &record)
+                    .map_err(|error| error.to_protocol_error())?
+                    == GrantStanding::InForce
+            {
+                shares.push(record.grant);
+            }
+        }
         match shares.len() {
             // Nothing admits it, and the decision under the pairing grant says so.
             0 => Ok(Acting::pairing(pairing)),
