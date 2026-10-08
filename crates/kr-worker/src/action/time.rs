@@ -479,7 +479,7 @@ fn refuting_level(established: &Establishment) -> i128 {
 /// second of each other stand for one another, at the lower level and the later time, which can
 /// refuse a confirmation by up to a second that the readings taken would not have refused. And at
 /// most [`Readings::CAPACITY`] readings are kept: the oldest is let go, and a confirmation made at
-/// or before the time of the oldest one let go is refused, whatever the readings kept say.
+/// or before the time of the latest reading let go is refused, whatever the readings kept say.
 #[derive(Debug, Default)]
 struct Readings {
     kept: Vec<Kept>,
@@ -517,7 +517,8 @@ impl Readings {
         }
     }
 
-    /// Whether a reading taken at or after the time `established` was made is behind it.
+    /// Whether `established` is refused: it was made at or before the latest reading let go, or a
+    /// reading kept that was taken at or after it is behind it.
     fn refute(&self, established: &Establishment) -> bool {
         let refuting = refuting_level(established);
         self.let_go.is_some_and(|time| established.boot_ms <= time)
@@ -623,8 +624,9 @@ pub struct TimeContract {
     adapter: Arc<dyn TimeAdapter>,
     /// The host's clock floor, which every reading taken here is published in.
     floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
-    /// Every reading of the wall clock this contract took, kept for what a confirmation the owner
-    /// made before it is held to ([`Readings`]). Locked alone, or after `state`, never before it.
+    /// The readings of the wall clock this contract took, as [`Readings`] keeps them: what a
+    /// confirmation the owner made before them is held to. Locked alone, or after `state`, never
+    /// before it.
     readings: Mutex<Readings>,
     state: Mutex<TimeState>,
 }
@@ -1392,7 +1394,8 @@ impl TimeContract {
     /// does not clear it, whether it is met in the look that found the rollback, in a later one,
     /// or after a restart, and the clock reading right again by the second reading of the look
     /// does not change that. One made after that time clears it if the readings since agree with
-    /// it. An owner who corrects a clock that ran ahead of the truth is followed all the same: the
+    /// it, except that a worker that restarted on a distrusted record answers only to a
+    /// confirmation made after it restarted. An owner who corrects a clock that ran ahead of the truth is followed all the same: the
     /// worker's mark was proved before the owner spoke, and the owner's word is what the clock
     /// agrees with since. A restatement answers to the worker's mark whatever its age, since it
     /// adds nothing to what the worker knows, and never lowers it.
@@ -1551,7 +1554,7 @@ impl TimeContract {
         wall_ms
     }
 
-    /// Whether a reading taken since the owner made `established` is behind it.
+    /// Whether the readings this contract took refuse `established` ([`Readings::refute`]).
     fn readings_refute(&self, established: &Establishment) -> bool {
         self.readings
             .lock()
@@ -1666,6 +1669,22 @@ mod tests {
                 ..confirmation(10_001)
             }),
             "and the readings kept still refute a confirmation they are behind"
+        );
+
+        // The reading let go counted against nothing made after it: this confirmation is one the
+        // reading let go would have refuted by its level, which no reading kept refutes, and it is
+        // not refused, so the level of the reading let go was not handed to the next one.
+        let after = Establishment {
+            wall_ms: WALL + 16_001,
+            ..confirmation(10_001)
+        };
+        assert!(
+            level_of(10_000, WALL + 10_000) < refuting_level(&after),
+            "the reading let go is behind it"
+        );
+        assert!(
+            !kept.refute(&after),
+            "and the readings kept, all of which agree with it, do not refuse it"
         );
     }
 

@@ -4464,7 +4464,8 @@ fn a_worker_judges_an_establishment_against_a_reading_taken_after_it() {
 /// worker reads the wall clock a minute low; the owner corrects it and confirms it; the worker
 /// stamps the reading, which now looks like one taken after the owner spoke, a minute behind the
 /// owner's word. The worker holds it against the confirmation, and the owner's next action frees
-/// it. (Were the stamp taken first, the reading would predate the owner's word and be followed.)
+/// it. (Were the stamp taken first, the reading would predate the owner's word, and the worker
+/// would follow the confirmation.)
 #[test]
 fn an_owner_acting_inside_a_reading_costs_that_reading_a_refusal() {
     use kr_ipc::clock::SharedClock as _;
