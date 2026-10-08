@@ -355,10 +355,15 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
     let mut depth = 0_i64;
     for line in masked.lines() {
         let at_top = depth == 0;
-        depth += i64::try_from(line.matches('{').count()).unwrap_or(0)
-            - i64::try_from(line.matches('}').count()).unwrap_or(0);
-        if depth < 0 {
-            return Err("a brace closes what was never opened".to_owned());
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth < 0 {
+                return Err("a brace closes what was never opened".to_owned());
+            }
         }
         let line = line.trim();
         if !at_top || line.is_empty() {
@@ -401,17 +406,17 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
         }
     }
     if depth != 0 {
-        return Err(format!("{depth} braces are still open at the end"));
+        return Err(format!("the file ends with braces still open ({depth})"));
     }
     Ok(found)
 }
 
 /// The source with every comment, string and character literal blanked out, each newline kept: what
 /// is left is code, so a brace or a keyword in it is one. Block comments nest (Java's do not, and no
-/// lane holds a Java file), a triple-quoted
-/// string spans lines, a Swift raw string (`#"..."#`) ends at its own number of `#`, and an
-/// expression interpolated into a string (`\(...)` in Swift, `${...}` in Kotlin) is blanked with the
-/// strings and comments inside it.
+/// lane holds a Java file). A triple-quoted string spans lines; a Kotlin one has no escapes, and a
+/// Swift one does. A Swift raw string (`#"..."#`) ends at its own number of `#`, and an expression
+/// interpolated into a string (`\(...)` in Swift, `${...}` in Kotlin) is blanked with the strings
+/// and comments inside it.
 fn mask(source: &str, swift: bool) -> String {
     let mut masker = Masker {
         chars: source.chars().collect(),
@@ -531,7 +536,19 @@ impl Masker {
             "#".repeat(hashes)
         );
         let escape: String = format!("\\{}", "#".repeat(hashes));
+        // A Kotlin raw string has no escapes, so a backslash in it is text, and it closes on the
+        // last three of a run of quotes. Java's text blocks keep their escapes, and no lane holds
+        // a Java file.
+        let kotlin_raw = triple && !self.swift;
         while self.at < self.chars.len() {
+            if kotlin_raw && self.starts("\"\"\"") {
+                let run = self.chars[self.at..]
+                    .iter()
+                    .take_while(|&&c| c == '"')
+                    .count();
+                self.blank(run);
+                return;
+            }
             if self.starts(&close) {
                 self.blank(close.chars().count());
                 return;
@@ -539,7 +556,7 @@ impl Masker {
             if !triple && self.chars[self.at] == '\n' {
                 return;
             }
-            if self.starts(&escape) {
+            if !kotlin_raw && self.starts(&escape) {
                 self.blank(escape.chars().count());
                 if self.swift && self.chars.get(self.at) == Some(&'(') {
                     self.blank(1);
@@ -628,6 +645,41 @@ mod tests {
     fn a_file_whose_braces_do_not_balance_is_not_read() {
         assert!(declared_classes("A.kt", "class A {\n").is_err());
         assert!(declared_classes("A.kt", "}\nclass A\n").is_err());
+        // The order within a line counts: the first brace closes nothing.
+        assert!(declared_classes("A.kt", "}{\nclass A {}\n").is_err());
+    }
+
+    #[test]
+    fn a_kotlin_raw_string_has_no_escapes_and_closes_on_the_last_of_its_quotes() {
+        let classes = |source: &str| declared_classes("A.kt", source).expect("balanced");
+        // A backslash before the closing quotes is text.
+        assert_eq!(classes("val root = \"\"\"C:\\\"\"\"\nclass B {}\n"), ["B"]);
+        let body = "class A {\n    val root = \"\"\"C:\\\"\"\"\n}\nclass B {}\n";
+        assert_eq!(classes(body), ["A", "B"]);
+        // Four quotes close on the last three and keep the first as text.
+        let quotes = "class A {\n    val l = listOf(\"\"\"a\"\"\"\", \"{\")\n}\nclass B {}\n";
+        assert_eq!(classes(quotes), ["A", "B"]);
+        // An interpolation in a raw string is still an expression.
+        let template = "class A {\n    val s = \"\"\"x ${f(\"{\")} y\"\"\"\n}\nclass B {}\n";
+        assert_eq!(classes(template), ["A", "B"]);
+    }
+
+    #[test]
+    fn a_swift_string_keeps_its_escapes_and_a_raw_string_its_hashes() {
+        let classes = |source: &str| declared_classes("A.swift", source).expect("balanced");
+        // `\"""` inside a multi-line string is an escaped quote, not the end of it.
+        let multiline = "final class A {\n    let s = \"\"\"\n    a \\\"\"\" {\n    \"\"\"\n}\nfinal class B {}\n";
+        assert_eq!(classes(multiline), ["A", "B"]);
+        // In a raw string `\#(` interpolates and `\(` does not.
+        let raw = "final class A {\n    let t = #\"\\#(f(\"a\\\"#{\"))\"#\n    let r = #\"\\(x\"#\n}\nfinal class B {}\n";
+        assert_eq!(classes(raw), ["A", "B"]);
+    }
+
+    #[test]
+    fn comments_are_blanked_wherever_they_start() {
+        let kotlin =
+            "/*\nclass InAComment {\n*/\n// {\nclass A { // }\n    /* class Inner { */\n}\n";
+        assert_eq!(declared_classes("A.kt", kotlin).expect("balanced"), ["A"]);
     }
 
     #[test]

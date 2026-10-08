@@ -315,13 +315,14 @@ Gradle's JUnit files in a directory, and, for Xcode, the tree `xcrun xcresulttoo
 tests` prints for the result bundle, in one file with the bundle beside it. They print
 `kr-tool: <name>: <value>` lines for the JDK and Gradle, or Xcode, the simulator and its runtime
 build, and the result lists them under `run.toolchain.phones`: the first line of a name stands and an
-empty value is `unknown`. The report checks the results before it uses them. A JUnit
-file has to agree with the counts its test suite states. A suite recorded as failed has to have a
-failed case under it. A case reported twice is refused. A result the report does not know
-(`unknown`) is refused, and the tool's exit
-status has to agree with the failed cases. An expected failure is a failure of its case, with that
-as the reason, and does not count against the exit status, which Xcode leaves at 0 for it. Results
-that fail a check fail the lane's step and every file of the lane. A skipped case is not run, never
+empty value is `unknown`.
+
+The report checks the results before it uses them. A JUnit file has to agree with the counts its
+test suite states. A suite recorded as failed has to have a failed case under it. A case reported
+twice is refused, and so is a result the report does not know (`unknown`). The tool's exit status
+has to agree with the failed cases. An expected failure is a failure of its case, with that as the
+reason, and does not count against the exit status, which Xcode leaves at 0 for it. Results that
+fail a check fail the lane's step and every file of the lane. A skipped case is not run, never
 passed.
 
 In the report of a platform that does not run a lane, that lane's files are shown as not run, with

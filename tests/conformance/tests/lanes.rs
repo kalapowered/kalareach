@@ -591,6 +591,26 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
 }
 
 #[test]
+fn a_phone_test_file_whose_braces_do_not_balance_is_one_problem_that_names_it() {
+    let root = tempfile::tempdir().expect("a directory");
+    let kotlin = "apps/companion/native/android/src/test/kotlin/to/kala/reach/companion/mobile/VoiceCaptureGateTest.kt";
+    let source = fixtures().join("lanes").join(kotlin);
+    let target = root.path().join(kotlin);
+    std::fs::create_dir_all(target.parent().expect("a directory")).expect("directories");
+    let text = std::fs::read_to_string(&source).expect("the fixture");
+    let cut = text.rfind('}').expect("a closing brace");
+    std::fs::write(&target, &text[..cut]).expect("a file");
+    let map = map_of(root.path());
+    assert_eq!(map.problems.len(), 1, "{:?}", map.problems);
+    assert!(
+        map.problems[0].starts_with(kotlin)
+            && map.problems[0].contains("cannot be read for its classes"),
+        "{:?}",
+        map.problems
+    );
+}
+
+#[test]
 fn every_phone_test_file_of_the_repository_that_names_a_row_declares_the_class_of_its_tests() {
     let map = map_of(&repository());
     assert!(map.problems.is_empty(), "{:?}", map.problems);
