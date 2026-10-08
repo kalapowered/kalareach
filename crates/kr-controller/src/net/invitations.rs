@@ -16,8 +16,8 @@
 //!
 //! Section 9 keys a mutation by its verified actor and its action identifier, answers an exact
 //! repeat with the existing outcome and refuses the identifier reused with another payload as
-//! `ID_CONFLICT`. `pairing_actions` is that key for the five pairing mutations, one table for all
-//! five, so an identifier spent on one of them is spent on every one. A mutation's row is written in
+//! `ID_CONFLICT`. `pairing_actions` is that key for the six pairing mutations, one table for all
+//! six, so an identifier spent on one of them is spent on every one. A mutation's row is written in
 //! the transaction that writes its effect, so no effect exists without it and no row exists for an
 //! effect that did not happen; an answer that wrote nothing else, such as a repeat confirmation of
 //! a pairing that already committed, writes its row on its own before it is given. A retained answer
@@ -1117,6 +1117,7 @@ fn commit_pairing(
 /// another payload, for this pairing method or any other, is refused as `ID_CONFLICT`, which rolls
 /// the caller's transaction back with everything else it wrote.
 fn claim_action(transaction: &Connection, action: &PairingAction) -> Result<Option<PairingAction>> {
+    recorded(action.subject.method())?;
     if let Some(raw) = read_action_row(transaction, &action.actor, action.action_id)
         .map_err(ControllerError::registry)?
     {
@@ -1210,6 +1211,18 @@ pub const RECORDED_METHODS: [Method; 6] = [
     Method::PairConfirm,
     Method::PairCancel,
 ];
+
+/// Refuses to record a method that [`RECORDED_METHODS`] does not list: a row of it would be one that
+/// the reader of this release refuses, and the stored-format lock would not have moved for it.
+fn recorded(method: Method) -> Result<()> {
+    if RECORDED_METHODS.contains(&method) {
+        return Ok(());
+    }
+    Err(ControllerError::registry(format!(
+        "{} is not a method a pairing action records",
+        method.as_str()
+    )))
+}
 
 /// Decodes the row of one actor's pairing action.
 fn decode_action(actor: &ActorId, action_id: ActionId, raw: RawAction) -> Result<PairingAction> {
@@ -1837,6 +1850,15 @@ pub fn from_store_failure(error: &kr_pairing::PairingError) -> ControllerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pairing action is recorded under a method the reader of its row matches, and under no other.
+    #[test]
+    fn a_method_the_reader_of_the_row_does_not_match_is_not_recorded() {
+        for method in RECORDED_METHODS {
+            recorded(method).expect("a listed method is recorded");
+        }
+        assert!(recorded(Method::EventsSnapshot).is_err());
+    }
 
     #[test]
     fn a_consumed_reason_is_stored_under_its_protocol_name() {
