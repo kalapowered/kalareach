@@ -4500,8 +4500,8 @@ registration.
 
 A Slack, Discord, Telegram or email destination sends with a credential: a webhook address that is
 itself a bearer secret, a bot token, or a mail submission account. The owner hands it over with
-`delivery.destination.secret.set` on this host's own socket, never from a paired device, and the
-answer says who will be able to read what the destination delivers. The daemon keeps the credential
+the configuration, or with `delivery.destination.secret.set`, on this host's own socket, never from
+a paired device, and the answer says who will be able to read what the destination delivers. The daemon keeps the credential
 in its secret store under the destination's identifier, beside its own keys and nowhere else: not in
 the delivery journal, an answer, a log or an error. The journal holds a random stamp in its place,
 so a credential replaced under a configured destination never carries a notification admitted

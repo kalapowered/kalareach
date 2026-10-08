@@ -224,7 +224,7 @@
       "resource_selectors": [
         "environment"
       ],
-      "summary": "Create or replace an external notification destination: a webhook, Slack, Discord, Telegram or email, with where it sends, whether it deduplicates by an identifier, and the grant whose authority the content is intersected with. The grant has to stand, a paired device's identifier is not one a destination takes, and a service that sends with a credential needs one kept first with delivery.destination.secret.set.",
+      "summary": "Create or replace an external notification destination: a webhook, Slack, Discord, Telegram or email, with where it sends, whether it deduplicates by an identifier, and the grant whose authority the content is intersected with. The grant has to stand, a paired device's identifier is not one a destination takes, and a service that sends with a credential is configured with it in the request, or with one kept earlier with delivery.destination.secret.set.",
       "version": 1
     },
     {
@@ -282,7 +282,7 @@
       "resource_selectors": [
         "environment"
       ],
-      "summary": "List the notification destinations that have a rule: a paired device's and the ones the owner configured, each with where it sends, the grant it is told under and whether it is in force. A removed destination is not listed. It never carries a credential.",
+      "summary": "List the notification destinations that have a rule: a paired device's and the ones the owner configured, each with where it sends, the grant it is told under and whether it is in force. A removed destination is not listed. It never carries a credential, and a webhook's address is given without its query and fragment.",
       "version": 1
     },
     {

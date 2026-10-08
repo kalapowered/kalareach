@@ -675,6 +675,11 @@ impl Controller {
             rights_ceiling,
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
             debt_pass: Arc::new(tokio::sync::Notify::new()),
+            device_watch: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "testing")]
+            device_watch_every: std::sync::Mutex::new(DEVICE_WATCH_INTERVAL),
+            #[cfg(feature = "testing")]
+            device_watch_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             before_presentation_lock: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
@@ -979,28 +984,68 @@ impl Controller {
     /// again an ending that failed: the expiry is on record by then, so nothing writes it a second
     /// time to wake the first.
     fn start_device_watch(self: &Arc<Self>) {
-        let woken = Arc::new(tokio::sync::Notify::new());
-        let waking = Arc::clone(&woken);
+        let woken = Arc::clone(&self.device_watch);
         self.lifetimes()
             .pending_expiry()
-            .on_recorded(move |_device| waking.notify_one());
+            .on_recorded(move |_device| woken.notify_one());
+        let woken = Arc::clone(&self.device_watch);
         let daemon = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
-                let _ = tokio::time::timeout(DEVICE_WATCH_INTERVAL, woken.notified()).await;
+                let Some(every) = daemon.upgrade().map(|held| held.device_watch_interval()) else {
+                    return;
+                };
+                let _ = tokio::time::timeout(every, woken.notified()).await;
                 // The daemon is held for the length of one pass, and let go of across the wait.
                 let Some(held) = daemon.upgrade() else {
                     return;
                 };
+                let looked = Arc::clone(&held);
                 if let Ok(Err(error)) =
-                    tokio::task::spawn_blocking(move || held.recover_push_destinations()).await
+                    tokio::task::spawn_blocking(move || looked.recover_push_destinations()).await
                 {
                     eprintln!(
                         "kr-controller: the paired devices' destinations were not looked at: {error}"
                     );
                 }
+                #[cfg(feature = "testing")]
+                held.device_watch_looks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         });
+    }
+
+    /// How long the watch over paired devices waits between two looks.
+    fn device_watch_interval(&self) -> std::time::Duration {
+        #[cfg(feature = "testing")]
+        {
+            *self
+                .device_watch_every
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            DEVICE_WATCH_INTERVAL
+        }
+    }
+
+    /// Makes the watch over paired devices look every `every` from now on, and look now. For this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn watch_devices_every(&self, every: std::time::Duration) {
+        *self
+            .device_watch_every
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = every;
+        self.device_watch.notify_one();
+    }
+
+    /// How many looks the watch over paired devices has finished. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn device_watch_looks(&self) -> u64 {
+        self.device_watch_looks
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Starts privacy mode's tick, which runs until the daemon goes.

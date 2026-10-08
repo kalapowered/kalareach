@@ -183,8 +183,8 @@ expired, or a record the gateway has revoked. Each ask is two requests of the ga
 Asked at every round of questions it would cost twenty-four requests an hour for as long as the
 credential lasts, and sixteen more for every notification that waits on it; with the wait it costs
 eight in the first hour and two an hour after that, expired or not. A new bearer from the device
-ends the wait, because it opens the hour after an issue in which the gateway renews again. The same
-bearer handed over again does not.
+opens the hour after an issue in which the gateway renews again, so the renewal that follows can
+succeed; the same bearer handed over again opens nothing.
 
 A renewal that fails does not hold a notification back while the bearer held still works. The
 gateway has not refused it, and it works until its expiry, so the notification is sent under it and
@@ -195,10 +195,11 @@ the gateway refused, one past its expiry, and a question about what became of a 
 bearer is inside its renewal window are renewed first, and wait for it. While the host waits out a
 refusal, the notification stays pending and is looked at again every few seconds. A look asks the
 gateway nothing, uses no attempt, and takes nothing from the host's allowance for status questions,
-so the wait costs the notification none of its eight. It goes out as soon as a renewal succeeds. A
-new bearer from the device ends the wait, and the renewal of it that follows succeeds in the hour
-after an issue. An attempt is spent only when the gateway is asked and refuses or does not answer. A
-notification that expires before the renewal comes expires; it is never sent late.
+so the wait costs the notification none of its eight. It goes out as soon as a renewal succeeds,
+which a new bearer from the device makes possible and does not guarantee: the gateway can still
+refuse the renewal or not answer, and the notification then goes on waiting. An attempt is spent
+only when the gateway is asked and refuses or does not answer. A notification that expires before
+the renewal comes expires; it is never sent late.
 
 ### Unpairing
 
@@ -269,7 +270,8 @@ An external destination asks three times: when the notification is produced, whe
 and once more after the send has read the destination's credential from the secret store, which can
 take as long as the store does. A grant that ends, or a device that is unpaired, while the
 credential is being read sends nothing. The last asking comes before the send takes the privacy
-admission. A bound or a deadline that ends in that wait for the admission is not caught.
+admission, and the notification's own deadline is read once more after that admission, just before
+the send. A grant's bound that ends in that wait for the admission is not caught.
 
 ## Two sizes, measured rather than estimated
 
@@ -429,14 +431,17 @@ is asked where the destination is written, under the locks a revocation of a gra
 every pass asks it again. And a service that sends with a credential has one: the one in the call,
 or the one already kept under the identifier, handed over with `delivery.destination.secret.set`.
 
-A credential in the call is kept together with the destination or not at all. It goes to the secret
-store just before the record is written, because the record names the stamp it is kept under, and a
-write that is then refused puts back what the store held under the identifier before, stamp
-included. A destination being replaced goes on sending to where it was configured to send, under
-the credential and the grant it had, and a first configuration that is refused leaves no credential
-kept. Configuring under an identifier that is in use replaces that destination. A webhook, which
-sends with none, takes away any credential kept for what it replaced, once the new destination is
-written.
+A credential in the call is kept together with the destination or not at all. The record is written
+first, under the admission the journal asks once its lock is held, and it names the stamp the
+credential will be kept under; the credential is kept only after the record stands. A configuration
+that is refused therefore asks nothing of the secret store: a destination being replaced goes on
+sending to where it was configured to send, under the credential and the grant it had, and a first
+configuration that is refused leaves no credential kept. If the secret store then refuses the
+credential, or the host stops between the two writes, the destination is configured and sends
+nothing, because a pass sends only with the credential its record names; the answer says so, and
+handing the credential over again repairs it. Configuring under an identifier that is in use
+replaces that destination. A webhook, which sends with none, takes away any credential kept for
+what it replaced, once the new destination is written.
 
 The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
 told, and every pass asks the grant again, so a destination under a grant that stops standing is
@@ -444,12 +449,13 @@ told nothing.
 
 `delivery.destination.list` lists the destinations that have a rule: the paired devices' and the
 owner's, with where each sends, the grant it is told under and whether it is in force. It never
-carries a credential, and it does not say whether one is kept.
+carries a credential, and it does not say whether one is kept. A webhook's address is listed
+without its query and fragment, which can carry a token.
 
 `delivery.destination.remove` takes a destination away with the credential kept for it. What was
 queued for it and not sent is taken back, and the answer says how many notifications that was, how
-many had been sent once and now have an outcome nobody can settle, and how many attempts were on
-the wire at that moment: each of those finishes and reports its answer, and the destination may
+many had been sent once and now have an outcome nobody can settle, and how many attempts were
+under way at that moment: each of those finishes and reports its answer, and the destination may
 still receive the message. Removing a paired device's destination ends its delivery as unpairing
 does, without unpairing the device. The host owes the gateway a revocation of the device's
 authorisation, so the device's installation issues another before the device registers again, and
@@ -475,8 +481,8 @@ destination delivers. Nothing ever answers with the credential. It is never writ
 journal, a log or an error, and a refusal of a malformed request says what shape was expected
 without repeating anything the request carried.
 
-A destination of one of those kinds is configured only once its credential is kept, and without a
-delivery identifier: none of the four services recognises a repeat by one. The journal records a
+A destination of one of those kinds is configured with its credential, or after one is kept, and
+without a delivery identifier: none of the four services recognises a repeat by one. The journal records a
 random stamp in place of the credential, and the stamp is part of what binds a notification to its
 destination. Storing a new credential under a configured destination changes that binding, so a
 notification admitted while the old credential was in force is taken back at its claim rather than

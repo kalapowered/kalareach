@@ -11287,8 +11287,9 @@ export interface DeliveryDestinationSummary {
    */
   destination_id: string
   /**
-   * Where an owner's destination sends, as it was configured. Null for a paired device's, which
-   * the push gateway reaches.
+   * Where an owner's destination sends, as it was configured, except that a webhook's address is
+   * given without its query and fragment, which can carry a token. Null for a paired device's,
+   * which the push gateway reaches.
    */
   endpoint: string | null
   /**

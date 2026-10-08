@@ -1681,7 +1681,9 @@ it: a Slack or Discord webhook address, a Telegram bot token, or for email a JSO
 `server`, `port`, `security` (`implicit_tls` or `starttls`), `username`, `password` and
 `from_address`. The command reads the file once and hands it to the daemon in the same request as
 the configuration, and the daemon keeps it in its secret store together with the destination: a
-configuration the daemon refuses leaves the credential kept before it as it was. It is never an
+configuration the daemon refuses asks nothing of the secret store and leaves the credential kept
+before it as it was. If the secret store itself refuses the credential after the destination is
+written, the command fails and says the destination sends nothing until you run it again. It is never an
 argument, because the process list and the shell's history would keep
 it, and the command never prints it: not in its text, in `--json`, in `list`, or in an error. A file
 that holds no credential of its kind is refused with its name and what it should hold, and nothing is

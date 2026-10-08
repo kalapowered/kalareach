@@ -418,6 +418,17 @@ pub struct Controller {
     debts: Arc<std::sync::Mutex<Debts>>,
     /// Wakes the debt pass for a debt left to it ([`OwnBarrier`]).
     debt_pass: Arc<tokio::sync::Notify>,
+    /// Wakes the watch over paired devices ([`Controller::start_device_watch`]), which an expiry
+    /// written down does.
+    device_watch: Arc<tokio::sync::Notify>,
+    /// How long the watch over paired devices waits between two looks, where this host's own tests
+    /// want it shorter than the one the constant names. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    device_watch_every: std::sync::Mutex<std::time::Duration>,
+    /// How many looks the watch over paired devices has finished. Compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    device_watch_looks: std::sync::atomic::AtomicU64,
     /// Where this host's own tests stop a lease presentation that has read the clock, before it
     /// waits for the policy's lock. Compiled away in every shipped build.
     #[cfg(feature = "testing")]

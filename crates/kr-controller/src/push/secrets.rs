@@ -119,39 +119,30 @@ impl DestinationSecrets {
         secret: &DestinationSecret,
     ) -> Result<CredentialStamp> {
         let stamp = CredentialStamp::fresh();
+        self.put_stamped(destination_id, secret, &stamp)?;
+        Ok(stamp)
+    }
+
+    /// Stores one destination's credential under `stamp`, replacing whatever was stored for it.
+    ///
+    /// The stamp is the caller's because a destination's record can name it before the credential
+    /// is written, which lets a configuration the journal refuses leave the store untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the store refuses the write. The error names the
+    /// store's reason and never the credential.
+    pub fn put_stamped(
+        &self,
+        destination_id: &DestinationId,
+        secret: &DestinationSecret,
+        stamp: &CredentialStamp,
+    ) -> Result<()> {
         let item = StoredItem {
             stamp: stamp.as_str().to_owned(),
             secret: secret.clone(),
         };
         // The encoded item holds the credential, so it lives in a buffer that clears itself.
-        let encoded =
-            SecretVec::new(
-                serde_json::to_vec(&item).map_err(|_| ControllerError::Storage {
-                    operation: "keep a destination's credential",
-                    detail: "the credential could not be encoded".to_owned(),
-                })?,
-            );
-        self.store
-            .set(&self.name(destination_id)?, encoded.expose())
-            .map_err(unavailable)?;
-        Ok(stamp)
-    }
-
-    /// Puts back what [`Self::get`] read before a replacement, with the stamp it had: the
-    /// destination it belongs to is still configured with that stamp. `None` puts back nothing,
-    /// which removes what the replacement wrote.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::Storage`] when the store refuses the write or the removal.
-    pub fn restore(&self, destination_id: &DestinationId, held: Option<&HeldSecret>) -> Result<()> {
-        let Some(held) = held else {
-            return self.remove(destination_id);
-        };
-        let item = StoredItem {
-            stamp: held.stamp.as_str().to_owned(),
-            secret: held.secret.clone(),
-        };
         let encoded =
             SecretVec::new(
                 serde_json::to_vec(&item).map_err(|_| ControllerError::Storage {
