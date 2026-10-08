@@ -210,6 +210,38 @@ pub fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
     platform::controlling_terminal(pid)
 }
 
+/// A process's identity together with the facts that tie it to a session, read from one reading.
+///
+/// A process identifier is a hint. A list of the processes on a terminal, in a group or below a
+/// parent names identifiers, and an identifier read from such a list may belong to a different
+/// process by the time its start is read. So the start and the facts that put the process in a
+/// session are taken from the one reading of the process, and the caller keeps the process only
+/// when those facts agree with the list it came from: a process that took an identifier after the
+/// one listed under it ended does not agree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lineage {
+    /// The process and its start.
+    pub identity: ProcessStartIdentity,
+    /// The process that is its parent now.
+    pub parent: u32,
+    /// The process group it is in.
+    pub group: u32,
+    /// The session it is in, where the platform names one.
+    pub session: Option<u32>,
+    /// The controlling terminal it holds, if any.
+    pub terminal: Option<u32>,
+}
+
+/// Reads a process's identity and lineage from one reading.
+///
+/// # Errors
+///
+/// Returns [`IpcError::IdentityUnavailable`] when the process does not exist or the operating
+/// system does not answer, and on a platform that has no process groups or terminals to name.
+pub fn process_lineage(pid: u32) -> Result<Lineage> {
+    platform::lineage(pid)
+}
+
 /// Reads this process's own start identity.
 ///
 /// # Errors
@@ -304,6 +336,51 @@ pub enum ProcessState {
 #[must_use]
 pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
     current_process(identity).into()
+}
+
+/// How hard to stop a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// Ask it to end: terminate, hang up and continue, which a stopped process needs to see the
+    /// other two. A platform with no such request ([`Stopped::Unsupported`]) is waited on instead.
+    Terminate,
+    /// End it, with no chance to refuse.
+    Kill,
+}
+
+/// What stopping one recorded process came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stopped {
+    /// The signal was delivered to the process that was recorded.
+    Signalled,
+    /// The recorded process is not there: it has ended, or its identifier belongs to a different
+    /// process now, which is left alone.
+    Gone,
+    /// The system refused to let this process signal that one.
+    Refused(String),
+    /// The recorded process could not be told apart from a stranger by this system, so it was not
+    /// signalled: a system that cannot hold a process by more than its number does not get to
+    /// signal by the number.
+    Unsafe(String),
+    /// This platform has no such request.
+    Unsupported,
+}
+
+/// Stops one process that was recorded by its identifier and start, and no other.
+///
+/// The process is held by something other than its number for the length of the check and the
+/// signal, so a number that passes to a different process between the two is never signalled:
+/// Linux holds it by a process descriptor, macOS by the kernel's own version of the process
+/// (which the kernel checks again as it signals) and Windows by an open handle. Where a system
+/// offers none of these, the process is not signalled at all, and the answer says so.
+///
+/// This process is never stopped by it.
+#[must_use]
+pub fn stop_process(identity: &ProcessStartIdentity, stop: Stop) -> Stopped {
+    if identity.pid.get() == u64::from(std::process::id()) {
+        return Stopped::Refused("that is the process asking".to_owned());
+    }
+    platform::stop(identity, stop)
 }
 
 /// What the kernel says now about a recorded process, with the identity this build reads for it.
@@ -483,6 +560,10 @@ mod platform {
     const STAT_PROCESS_GROUP: usize = 2;
     /// The controlling terminal's device number, field 7 of the line.
     const STAT_TERMINAL: usize = 4;
+    /// The parent's identifier, field 4 of the line.
+    const STAT_PARENT: usize = 1;
+    /// The session's identifier, field 6 of the line.
+    const STAT_SESSION: usize = 3;
 
     /// Where this platform's start value comes from.
     pub(super) const START_IDENTITY_SOURCE: ProcessStartSource = ProcessStartSource::LinuxProcStat;
@@ -956,6 +1037,94 @@ mod platform {
         ))
     }
 
+    /// One reading of one `/proc/<pid>/stat` line: the start and the facts that tie the process to
+    /// its parent, group, session and terminal are the same process's.
+    pub(super) fn lineage(pid: u32) -> Result<super::Lineage> {
+        let text = read_process_file(pid, "stat").map_err(|error| {
+            unavailable("process lineage", format!("/proc/{pid}/stat: {error}"))
+        })?;
+        lineage_of(pid, &text)
+    }
+
+    /// Reads a lineage from a `/proc/<pid>/stat` line.
+    pub(super) fn lineage_of(pid: u32, text: &str) -> Result<super::Lineage> {
+        let incomplete = |what: &str| {
+            unavailable(
+                "process lineage",
+                format!("/proc/{pid}/stat: field {what} is missing"),
+            )
+        };
+        let start = parse_start_ticks(text).ok_or_else(|| incomplete("22"))?;
+        Ok(super::Lineage {
+            identity: ProcessStartIdentity::new(
+                u64::from(pid),
+                ProcessStartSource::LinuxProcStat,
+                start,
+            ),
+            parent: stat_field(text, STAT_PARENT).ok_or_else(|| incomplete("4"))?,
+            group: stat_field(text, STAT_PROCESS_GROUP).ok_or_else(|| incomplete("5"))?,
+            session: Some(stat_field(text, STAT_SESSION).ok_or_else(|| incomplete("6"))?),
+            terminal: stat_field(text, STAT_TERMINAL).filter(|terminal| *terminal != 0),
+        })
+    }
+
+    /// Signals the process holding `identity`, through a process descriptor.
+    ///
+    /// The identity is read before the descriptor is opened and again after, and both readings
+    /// must be the recorded one: a process that held the number through both is the one the
+    /// descriptor refers to, because the descriptor was opened between them. A kernel that gives
+    /// no descriptor (before 5.3, or a seccomp filter) gets no signal by number.
+    pub(super) fn stop(identity: &ProcessStartIdentity, stop: super::Stop) -> super::Stopped {
+        use rustix::io::Errno;
+        use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+
+        let Some(raw) = u32::try_from(identity.pid.get()).ok() else {
+            return super::Stopped::Gone;
+        };
+        let Some(pid) = i32::try_from(raw).ok().and_then(Pid::from_raw) else {
+            return super::Stopped::Gone;
+        };
+        let held = || match super::query_process(raw) {
+            super::ProcessQuery::Present(now) if now.start_value == identity.start_value => Ok(()),
+            super::ProcessQuery::Present(_) | super::ProcessQuery::Gone => {
+                Err(super::Stopped::Gone)
+            }
+            super::ProcessQuery::CannotEstablish(error) => {
+                Err(super::Stopped::Unsafe(error.to_string()))
+            }
+        };
+        if let Err(answer) = held() {
+            return answer;
+        }
+        let descriptor = match pidfd_open(pid, PidfdFlags::empty()) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::SRCH) => return super::Stopped::Gone,
+            Err(error) => {
+                return super::Stopped::Unsafe(format!(
+                    "this kernel gave no process descriptor ({error}), so the process is not \
+                     signalled by its number"
+                ));
+            }
+        };
+        if let Err(answer) = held() {
+            return answer;
+        }
+        let signals: &[Signal] = match stop {
+            super::Stop::Terminate => &[Signal::TERM, Signal::HUP, Signal::CONT],
+            super::Stop::Kill => &[Signal::KILL],
+        };
+        for (index, signal) in signals.iter().enumerate() {
+            match pidfd_send_signal(&descriptor, *signal) {
+                Ok(()) => {}
+                Err(Errno::SRCH) if index == 0 => return super::Stopped::Gone,
+                // It ended between two of the signals, which is the outcome asked for.
+                Err(Errno::SRCH) => break,
+                Err(error) => return super::Stopped::Refused(error.to_string()),
+            }
+        }
+        super::Stopped::Signalled
+    }
+
     pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
         let text = read_process_file(pid, "stat").map_err(|error| {
             unavailable("controlling terminal", format!("/proc/{pid}/stat: {error}"))
@@ -1195,6 +1364,71 @@ mod platform {
         })
     }
 
+    /// Signals the process holding `identity` through the kernel's version of it.
+    ///
+    /// One reading gives the start value and the process's version together, and the signal is
+    /// sent against that version, which the kernel checks again as it signals: a number that
+    /// passes to a different process, or a process that runs a new program, has a different
+    /// version and is refused with no such process rather than signalled. A system that does not
+    /// provide the call gets no signal by number.
+    pub(super) fn stop(identity: &ProcessStartIdentity, stop: super::Stop) -> super::Stopped {
+        use super::macos_signal::{Signalled, read_instance, signal_instance};
+
+        let Ok(pid) = u32::try_from(identity.pid.get()) else {
+            return super::Stopped::Gone;
+        };
+        let instance = match read_instance(pid) {
+            Ok(Some(instance)) => instance,
+            Ok(None) => return super::Stopped::Gone,
+            Err(detail) => return super::Stopped::Unsafe(detail),
+        };
+        if instance.start_value != identity.start_value.get() {
+            return super::Stopped::Gone;
+        }
+        let signals: &[i32] = match stop {
+            super::Stop::Terminate => &[libc::SIGTERM, libc::SIGHUP, libc::SIGCONT],
+            super::Stop::Kill => &[libc::SIGKILL],
+        };
+        for (index, signal) in signals.iter().enumerate() {
+            match signal_instance(&instance, *signal) {
+                Signalled::Delivered => {}
+                Signalled::NoSuchProcess if index == 0 => return super::Stopped::Gone,
+                Signalled::NoSuchProcess => break,
+                Signalled::Refused(detail) => return super::Stopped::Refused(detail),
+                Signalled::Unavailable(detail) => return super::Stopped::Unsafe(detail),
+            }
+        }
+        super::Stopped::Signalled
+    }
+
+    /// One `proc_pidinfo` reading: the start and the facts that tie the process to its parent,
+    /// group and terminal are the same process's. macOS names no session in it.
+    pub(super) fn lineage(pid: u32) -> Result<super::Lineage> {
+        let raw = i32::try_from(pid).map_err(|_| {
+            unavailable(
+                "process lineage",
+                format!("{pid} is not a process identifier"),
+            )
+        })?;
+        let info: BSDInfo = pidinfo(raw, 0)
+            .map_err(|error| unavailable("process lineage", format!("pid {pid}: {error}")))?;
+        let start = info
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec);
+        Ok(super::Lineage {
+            identity: ProcessStartIdentity::new(
+                u64::from(info.pbi_pid),
+                ProcessStartSource::MacosProcBsdInfo,
+                start,
+            ),
+            parent: info.pbi_ppid,
+            group: info.pbi_pgid,
+            session: None,
+            terminal: (info.e_tdev != u32::MAX).then_some(info.e_tdev),
+        })
+    }
+
     pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
         let pid = i32::try_from(pid).map_err(|_| {
             unavailable(
@@ -1288,6 +1522,177 @@ mod platform {
             .find(|character: char| !character.is_ascii_digit())
             .map_or(after, |end| &after[..end]);
         digits.parse().ok()
+    }
+}
+
+/// The one place on macOS that leaves safe Rust to signal a process by its version.
+///
+/// The crate denies unsafe code and relaxes the rule here, as for the Windows modules below: the
+/// kernel's reading that returns a process's start and its version together, and the call that
+/// signals a process only while it still has that version, have no safe interface. The layouts
+/// are the kernel's own (`proc_bsdinfowithuniqid` and `audit_token_t`); neither is in the public
+/// headers' structures, so their sizes are checked below against what the kernel returns.
+#[cfg(target_os = "macos")]
+mod macos_signal {
+    #![expect(
+        unsafe_code,
+        reason = "the kernel's reading of a process's version and the call that signals by it have \
+                  no safe interface"
+    )]
+
+    use std::sync::OnceLock;
+
+    use libproc::bsd_info::BSDInfo;
+
+    /// The flavour of `proc_pidinfo` that returns `proc_bsdinfo` and `proc_uniqidentifierinfo`
+    /// from one lookup of the process.
+    const PROC_PIDT_BSDINFOWITHUNIQID: libc::c_int = 18;
+
+    /// The kernel's `proc_uniqidentifierinfo`.
+    #[repr(C)]
+    struct UniqueIdentifier {
+        uuid: [u8; 16],
+        unique_id: u64,
+        parent_unique_id: u64,
+        /// The process's version: a counter that moves when the process is created and again each
+        /// time it runs a new program.
+        version: i32,
+        reserved_2: i32,
+        reserved_3: u64,
+        reserved_4: u64,
+    }
+
+    /// The kernel's `proc_bsdinfowithuniqid`.
+    #[repr(C)]
+    struct BsdInfoWithUniqueId {
+        bsd: BSDInfo,
+        unique: UniqueIdentifier,
+    }
+
+    const _: () = assert!(size_of::<BsdInfoWithUniqueId>() == 192);
+
+    /// The kernel's `audit_token_t`: eight words, of which the signal call reads the process
+    /// identifier and version and the user and group identifiers.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AuditToken {
+        value: [u32; 8],
+    }
+
+    /// One process as the kernel described it in one reading.
+    pub(super) struct Instance {
+        pid: u32,
+        /// Microseconds since the epoch at which it started.
+        pub(super) start_value: u64,
+        version: u32,
+        uid: u32,
+        gid: u32,
+        real_uid: u32,
+        real_gid: u32,
+    }
+
+    /// What signalling an instance came to.
+    pub(super) enum Signalled {
+        /// The kernel delivered it.
+        Delivered,
+        /// No process has that identifier and version.
+        NoSuchProcess,
+        /// The kernel would not let this process signal that one.
+        Refused(String),
+        /// The call is not there, or failed in a way that says nothing about the process.
+        Unavailable(String),
+    }
+
+    /// Reads one process, or none if the kernel has none under the identifier.
+    pub(super) fn read_instance(pid: u32) -> Result<Option<Instance>, String> {
+        let Ok(raw) = libc::c_int::try_from(pid) else {
+            return Ok(None);
+        };
+        let mut buffer = std::mem::MaybeUninit::<BsdInfoWithUniqueId>::zeroed();
+        // SAFETY: `buffer` is a live, writable allocation of exactly the size passed, and the
+        // kernel writes at most that many bytes into it and keeps no pointer to it.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                raw,
+                PROC_PIDT_BSDINFOWITHUNIQID,
+                0,
+                buffer.as_mut_ptr().cast(),
+                size_of::<BsdInfoWithUniqueId>() as libc::c_int,
+            )
+        };
+        if usize::try_from(written).ok() != Some(size_of::<BsdInfoWithUniqueId>()) {
+            let error = std::io::Error::last_os_error();
+            return if written <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "pid {pid}: the kernel's reading of the process failed: {error}"
+                ))
+            };
+        }
+        // SAFETY: the kernel wrote the whole structure, which has no invalid bit patterns.
+        let read = unsafe { buffer.assume_init() };
+        Ok(Some(Instance {
+            pid,
+            start_value: read
+                .bsd
+                .pbi_start_tvsec
+                .saturating_mul(1_000_000)
+                .saturating_add(read.bsd.pbi_start_tvusec),
+            version: read.unique.version.cast_unsigned(),
+            uid: read.bsd.pbi_uid,
+            gid: read.bsd.pbi_gid,
+            real_uid: read.bsd.pbi_ruid,
+            real_gid: read.bsd.pbi_rgid,
+        }))
+    }
+
+    /// `proc_signal_with_audittoken`, looked up when first needed so a system without it links.
+    fn signal_call() -> Option<unsafe extern "C" fn(*mut AuditToken, libc::c_int) -> libc::c_int> {
+        static CALL: OnceLock<Option<usize>> = OnceLock::new();
+        let address = CALL.get_or_init(|| {
+            // SAFETY: the name is a NUL-terminated string that outlives the call.
+            let found =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"proc_signal_with_audittoken".as_ptr()) };
+            (!found.is_null()).then_some(found as usize)
+        });
+        // SAFETY: the symbol is the system's `proc_signal_with_audittoken`, declared in
+        // `libproc.h` as `int (audit_token_t *, int)`.
+        address.map(|address| unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(*mut AuditToken, libc::c_int) -> libc::c_int,
+            >(address)
+        })
+    }
+
+    /// Signals `instance` only if the kernel still has a process of that identifier and version.
+    pub(super) fn signal_instance(instance: &Instance, signal: libc::c_int) -> Signalled {
+        let Some(call) = signal_call() else {
+            return Signalled::Unavailable(
+                "this system has no signal by a process's version, so the process is not \
+                 signalled by its number"
+                    .to_owned(),
+            );
+        };
+        let mut token = AuditToken { value: [0; 8] };
+        token.value[1] = instance.uid;
+        token.value[2] = instance.gid;
+        token.value[3] = instance.real_uid;
+        token.value[4] = instance.real_gid;
+        token.value[5] = instance.pid;
+        token.value[7] = instance.version;
+        // SAFETY: `token` is a live, writable token and the call reads it and nothing else.
+        let result = unsafe { call(&raw mut token, signal) };
+        if result == 0 {
+            return Signalled::Delivered;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Signalled::NoSuchProcess,
+            Some(libc::EPERM | libc::EACCES) => Signalled::Refused(error.to_string()),
+            _ => Signalled::Unavailable(format!("the signal call failed: {error}")),
+        }
     }
 }
 
@@ -1404,6 +1809,20 @@ mod platform {
         ))
     }
 
+    pub(super) fn lineage(pid: u32) -> Result<super::Lineage> {
+        Err(unavailable(
+            "process lineage",
+            format!("pid {pid}: {SANDBOXED}"),
+        ))
+    }
+
+    pub(super) fn stop(
+        _identity: &kr_protocol::identity::ProcessStartIdentity,
+        _stop: super::Stop,
+    ) -> super::Stopped {
+        super::Stopped::Unsafe(SANDBOXED.to_owned())
+    }
+
     /// Where a start value would come from if this system produced one.
     ///
     /// It never does. The constant exists because [`super::ended_process_identity`] names the
@@ -1441,6 +1860,15 @@ mod platform {
 
     pub(super) fn controlling_terminal(_pid: u32) -> Result<Option<u32>> {
         Ok(None)
+    }
+
+    pub(super) fn lineage(pid: u32) -> Result<super::Lineage> {
+        // A Windows process is tied to a session by its job object, which is read through the
+        // process's own handle by the caller that owns the job.
+        Err(unavailable(
+            "process lineage",
+            format!("pid {pid}: a Windows process belongs to a session by its job, not by a group"),
+        ))
     }
 
     /// Reads the kernel's boot counter and its System process's creation time, the pair
@@ -1493,6 +1921,52 @@ mod platform {
         }
     }
 
+    /// Ends the process holding `identity` through one open handle: the handle is what ties the
+    /// creation time that was compared to the process that is ended.
+    ///
+    /// There is no request to end a process on this platform that is not also the end of it, so
+    /// [`super::Stop::Terminate`] is [`super::Stopped::Unsupported`]: a caller that wants a
+    /// grace period waits for the session's job to do its work, and ends what is left.
+    pub(super) fn stop(
+        identity: &kr_protocol::identity::ProcessStartIdentity,
+        stop: super::Stop,
+    ) -> super::Stopped {
+        use super::Stopped;
+
+        if stop == super::Stop::Terminate {
+            return Stopped::Unsupported;
+        }
+        let Ok(pid) = u32::try_from(identity.pid.get()) else {
+            return Stopped::Gone;
+        };
+        let (reading, process) = look(pid, process_times::Rights::Terminate);
+        match super::windows_answer(pid, reading, process_times::now()) {
+            ProcessQuery::Present(current) if current.start_value == identity.start_value => {}
+            ProcessQuery::Present(_) | ProcessQuery::Gone => return Stopped::Gone,
+            ProcessQuery::CannotEstablish(error) => return Stopped::Unsafe(error.to_string()),
+        }
+        let Some(process) = process else {
+            return Stopped::Unsafe(format!("pid {pid}: described without a handle"));
+        };
+        match process.has_exited() {
+            Ok(true) => return Stopped::Gone,
+            Ok(false) => {}
+            Err(error) => {
+                return Stopped::Unsafe(format!("pid {pid}: whether it has exited: {error}"));
+            }
+        }
+        match process.terminate() {
+            Ok(()) => Stopped::Signalled,
+            Err(error) => {
+                // A process that ended between the question and the call is the outcome asked for.
+                match process.has_exited() {
+                    Ok(true) => Stopped::Gone,
+                    _ => Stopped::Refused(error.to_string()),
+                }
+            }
+        }
+    }
+
     pub(super) fn query_process(pid: u32) -> ProcessQuery {
         // Asking when a process started takes the right to ask that and nothing more: a process
         // whose list grants this account that right alone is still one it can identify.
@@ -1542,7 +2016,7 @@ mod process_times {
     };
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        WaitForSingleObject,
+        PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
     /// One process, opened for the questions its rights allow.
@@ -1555,6 +2029,8 @@ mod process_times {
         Query,
         /// When it was created, and whether it has exited.
         QueryAndWait,
+        /// When it was created, whether it has exited, and the right to end it.
+        Terminate,
     }
 
     /// What opening a process by its identifier produced.
@@ -1583,6 +2059,9 @@ mod process_times {
         let access = match rights {
             Rights::Query => PROCESS_QUERY_LIMITED_INFORMATION,
             Rights::QueryAndWait => PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            Rights::Terminate => {
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE
+            }
         };
         // SAFETY: the call takes three plain values and returns either a new handle the caller
         // owns or null; it has no other effect.
@@ -1621,6 +2100,19 @@ mod process_times {
                 return Err(std::io::Error::last_os_error());
             }
             Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+        }
+
+        /// Ends the process through this handle, which holds the process the handle was opened
+        /// on whatever happens to its identifier.
+        ///
+        /// A handle opened without the right to end it is refused here.
+        pub(super) fn terminate(&self) -> std::io::Result<()> {
+            // SAFETY: the handle is open for as long as `self` is, and the call takes the handle
+            // and an exit code and has no other effect.
+            if unsafe { TerminateProcess(self.0.as_raw_handle(), 1) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         /// Returns whether the process has exited, without waiting for it to.
