@@ -394,6 +394,12 @@ export type ControlFrame =
       plugin_admissions_ack: PluginAdmissionsAck
     }
   | {
+      plugin_runtime_wanted: PluginRuntimeWanted
+    }
+  | {
+      plugin_runtime_state: PluginRuntimeState
+    }
+  | {
       forwarded: ForwardedMutation
     }
   | {
@@ -498,6 +504,14 @@ export type DesktopSessionId = string
  * speaks for, and only the holder of the environment's signing key can produce that proof.
  */
 export type ControllerConnectionRole = 'authority' | 'proxy' | 'attention' | 'descriptions'
+/**
+ * The control daemon's answer to a [`PluginRuntimeWanted`].
+ */
+export type PluginRuntimeState =
+  | 'running'
+  | {
+      unavailable: PluginRuntimeUnavailable
+    }
 /**
  * One permitted action in a grant.
  */
@@ -7936,6 +7950,34 @@ export interface PackageRefusal {
    * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   package_digest: string
+}
+/**
+ * A worker's request that the plugin runtime be running, sent to the control daemon on its
+ * rendezvous endpoint.
+ *
+ * The runtime is started when a binding first needs a component and not before, so this is what a
+ * worker sends when one of its bindings holds a package that ships one. The daemon accepts it only
+ * from the process it recorded for the session, as the kernel names that process; the reply is a
+ * [`PluginRuntimeState`].
+ */
+export interface PluginRuntimeWanted {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Why the plugin runtime cannot be reached, and when to ask again.
+ */
+export interface PluginRuntimeUnavailable {
+  /**
+   * Why, cut to the report's bound.
+   */
+  reason: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retry_after_ms: string
 }
 /**
  * A mutation the host admitted for a caller, passed to the component that owns its subject.

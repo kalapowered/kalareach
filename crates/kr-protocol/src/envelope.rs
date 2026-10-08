@@ -507,6 +507,11 @@ pub enum ControlFrame {
     /// One part of a worker's report on a complete snapshot of admissions, on the connection the
     /// snapshot arrived on.
     PluginAdmissionsAck(Box<crate::admission::PluginAdmissionsAck>),
+    /// A worker's request, on the control daemon's rendezvous endpoint, that the plugin runtime
+    /// be running.
+    PluginRuntimeWanted(crate::admission::PluginRuntimeWanted),
+    /// The control daemon's answer to that request.
+    PluginRuntimeState(crate::admission::PluginRuntimeState),
     /// A mutation the control daemon admitted, passed to the worker that owns its subject.
     Forwarded(Box<crate::local::ForwardedMutation>),
     /// A read the control daemon admitted for a caller it authenticated elsewhere.

@@ -8968,6 +8968,32 @@
         },
         {
           "additionalProperties": false,
+          "description": "A worker's request, on the control daemon's rendezvous endpoint, that the plugin runtime\nbe running.",
+          "properties": {
+            "plugin_runtime_wanted": {
+              "$ref": "#/$defs/PluginRuntimeWanted"
+            }
+          },
+          "required": [
+            "plugin_runtime_wanted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The control daemon's answer to that request.",
+          "properties": {
+            "plugin_runtime_state": {
+              "$ref": "#/$defs/PluginRuntimeState"
+            }
+          },
+          "required": [
+            "plugin_runtime_state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A mutation the control daemon admitted, passed to the worker that owns its subject.",
           "properties": {
             "forwarded": {
@@ -23581,6 +23607,62 @@
       "required": [
         "plugin_id",
         "affected_bindings"
+      ],
+      "type": "object"
+    },
+    "PluginRuntimeState": {
+      "description": "The control daemon's answer to a [`PluginRuntimeWanted`].",
+      "oneOf": [
+        {
+          "const": "running",
+          "description": "The runtime is running and its descriptor is published: the worker connects to it and\nregisters its bindings.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The runtime cannot be reached now.",
+          "properties": {
+            "unavailable": {
+              "$ref": "#/$defs/PluginRuntimeUnavailable"
+            }
+          },
+          "required": [
+            "unavailable"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PluginRuntimeUnavailable": {
+      "additionalProperties": false,
+      "description": "Why the plugin runtime cannot be reached, and when to ask again.",
+      "properties": {
+        "reason": {
+          "description": "Why, cut to the report's bound.",
+          "type": "string"
+        },
+        "retry_after_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "How long the worker leaves before it asks again, in milliseconds."
+        }
+      },
+      "required": [
+        "reason",
+        "retry_after_ms"
+      ],
+      "type": "object"
+    },
+    "PluginRuntimeWanted": {
+      "additionalProperties": false,
+      "description": "A worker's request that the plugin runtime be running, sent to the control daemon on its\nrendezvous endpoint.\n\nThe runtime is started when a binding first needs a component and not before, so this is what a\nworker sends when one of its bindings holds a package that ships one. The daemon accepts it only\nfrom the process it recorded for the session, as the kernel names that process; the reply is a\n[`PluginRuntimeState`].",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose worker asks."
+        }
+      },
+      "required": [
+        "session_id"
       ],
       "type": "object"
     },

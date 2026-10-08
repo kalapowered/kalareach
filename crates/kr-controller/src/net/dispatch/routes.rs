@@ -220,6 +220,8 @@ impl RemoteConnection {
             | ControlFrame::AuthorityRevisionAck(_)
             | ControlFrame::PluginAdmissions(_)
             | ControlFrame::PluginAdmissionsAck(_)
+            | ControlFrame::PluginRuntimeWanted(_)
+            | ControlFrame::PluginRuntimeState(_)
             | ControlFrame::Forwarded(_)
             | ControlFrame::ForwardedRead(_)
             | ControlFrame::RetainedResponse(_)
