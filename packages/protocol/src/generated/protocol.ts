@@ -2680,8 +2680,9 @@ export interface AccountReport {
   /**
    * Why this host does not sign in or present its account: its configuration names no voice
    * broker, names another service than the account service, or the host could not set up how to
-   * reach the account service. A grant the host already keeps still shows in `state`, and
-   * `account.sign_out` ends it, whatever the broker is.
+   * reach the account service. For the first two, a grant the host already keeps still shows in
+   * `state`, and `account.sign_out` ends it, whatever the broker is; for the third the host
+   * reaches no account service, shows `signed_out` and refuses to sign out.
    */
   unavailable: SignInUnavailable | null
 }
