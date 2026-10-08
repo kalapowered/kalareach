@@ -35,12 +35,23 @@ impl Timer for RealTimer {
     }
 }
 
+/// What the service asked to be left alone for, as it stands at one moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owed {
+    /// When the delay ends. A wait that ends it clears exactly this deadline, so that a delay the
+    /// service asked for after the wait began is not cleared with it.
+    pub until: Instant,
+    /// What is left of it now.
+    pub left: Duration,
+}
+
 /// When the service said it may be asked again.
 ///
-/// One deadline for everything that asks the service: the uploader's passes, the question the host
-/// asks as it starts and the one `kr doctor` asks. A delay the service names is recorded here by
-/// whoever met it, and every question that follows waits for it, except the ones a privacy fence
-/// owes, whose cleanup ends work in flight whatever the service asked.
+/// One deadline for everything that asks the service. The uploader's clients record every delay a
+/// service answer names, as it arrives, and refuse to send anything while one is owed (except for
+/// the cleanup a privacy fence owes), so no request of the uploader's can leave inside a delay
+/// whichever step makes it. The question the host asks as it starts and the one `kr doctor` asks
+/// are the runtime's own, and the runtime records and honours the delays they meet.
 #[derive(Debug)]
 pub struct Quiet {
     timer: Arc<dyn Timer>,
@@ -72,26 +83,25 @@ impl Quiet {
         *owed = Some(owed.map_or(until, |earlier| earlier.max(until)));
     }
 
+    /// The delay the service asked for, when some of it is left, read once so that its deadline and
+    /// what is left of it agree.
+    #[must_use]
+    pub fn owed(&self) -> Option<Owed> {
+        let until = (*self.until())?;
+        let left = until.checked_duration_since(self.timer.now())?;
+        (!left.is_zero()).then_some(Owed { until, left })
+    }
+
     /// What is left of the delay the service asked for, when some is.
     #[must_use]
     pub fn left(&self) -> Option<Duration> {
-        let until = (*self.until())?;
-        until
-            .checked_duration_since(self.timer.now())
-            .filter(|left| !left.is_zero())
+        self.owed().map(|owed| owed.left)
     }
 
-    /// The deadline as it stands, so that a wait that ends it can tell whether the service asked
-    /// for more while it waited.
-    #[must_use]
-    pub(super) fn deadline(&self) -> Option<Instant> {
-        *self.until()
-    }
-
-    /// Ends a delay that has passed, unless the service has asked for more since `seen`.
-    pub(super) fn passed(&self, seen: Option<Instant>) {
+    /// Ends a delay that has passed, unless the service has asked for more since `until`.
+    pub fn passed(&self, until: Instant) {
         let mut owed = self.until();
-        if *owed == seen {
+        if *owed == Some(until) {
             *owed = None;
         }
     }

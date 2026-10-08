@@ -75,14 +75,14 @@ async fn within<T>(what: &str, work: impl Future<Output = T>) -> T {
 /// releases the waits it already holds as well, because the daemon may have asked for one the test
 /// has not looked at.
 ///
-/// The clock a delay the service named is counted against stands still too, so what is left of a
-/// delay is exactly what it was when it was named, however long a test takes.
+/// The clock a delay the service named is counted against stands still too, until the test moves
+/// it, so what is left of a delay is exactly what the test made it, however long the test takes.
 #[derive(Debug)]
 struct HeldTimer {
     automatic: AtomicBool,
     waits: Mutex<Vec<Held>>,
     asked: Notify,
-    now: std::time::Instant,
+    now: Mutex<std::time::Instant>,
 }
 
 impl Default for HeldTimer {
@@ -91,7 +91,7 @@ impl Default for HeldTimer {
             automatic: AtomicBool::new(false),
             waits: Mutex::default(),
             asked: Notify::new(),
-            now: std::time::Instant::now(),
+            now: Mutex::new(std::time::Instant::now()),
         }
     }
 }
@@ -125,7 +125,7 @@ impl Timer for HeldTimer {
     }
 
     fn now(&self) -> std::time::Instant {
-        self.now
+        *self.now.lock().expect("the clock")
     }
 }
 
@@ -157,6 +157,11 @@ impl HeldTimer {
             }
             asked.await;
         }
+    }
+
+    /// Moves the clock a delay is counted against.
+    fn advance(&self, by: Duration) {
+        *self.now.lock().expect("the clock") += by;
     }
 
     /// Every wait the daemon has asked for so far.
@@ -767,7 +772,7 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
         AtMost(Duration),
         Exactly(Duration),
     }
-    let cases: [(&str, &str, Moment, Expect); 5] = [
+    let cases: [(&str, &str, Moment, Expect); 6] = [
         (
             "rate limited, asking for a second",
             CREATE,
@@ -787,6 +792,16 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
                 retry_after_seconds: Some(300),
             },
             Expect::AtLeast(Duration::from_secs(300)),
+        ),
+        (
+            "a person's refusal that asks for a delay of nothing",
+            CREATE,
+            Moment::Refuse {
+                status: 403,
+                code: "FORBIDDEN",
+                retry_after_seconds: Some(0),
+            },
+            Expect::Exactly(OPERATOR_CEILING),
         ),
         (
             "unavailable, asking for longer than any number of seconds could say",
@@ -1325,6 +1340,86 @@ async fn a_service_that_does_not_say_what_became_of_a_publication_does_not_hold_
     );
 }
 
+/// A carrier woken inside a delay waits only for what is left of it: the delay is counted from when
+/// the service named it and not from when the carrier looks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_woken_carrier_waits_only_for_what_is_left_of_a_delay() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    // Something only a person can mend, and a delay longer than the five minutes a person is given.
+    web.fail(
+        CREATE,
+        1,
+        Moment::Refuse {
+            status: 403,
+            code: "FORBIDDEN",
+            retry_after_seconds: Some(600),
+        },
+    );
+    rig.admit(1, &[(1, plaintext(2048))]);
+    let (waited, _) = within("the refusal", timer.next_wait()).await;
+    assert_eq!(waited, Duration::from_secs(600));
+
+    // A hundred seconds go by, and new work wakes the carrier. It looks, finds the service still
+    // asked to be left alone, and waits the rest.
+    timer.advance(Duration::from_secs(100));
+    rig.admit(2, &[(3, plaintext(2048))]);
+    let (left, _) = within("the rest of the delay", timer.next_wait()).await;
+    assert_eq!(left, Duration::from_secs(500));
+    assert!(!rig.published(1));
+}
+
+/// A request that is on its way when the service asks `kr doctor` to leave it alone does not make
+/// another inside the delay: the refusal it meets is kept for the next pass, and the question about
+/// what the service holds is not put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_met_inside_a_delay_does_not_send_the_question_that_follows_it() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            enrolled: false,
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    // The publication is slow to be refused, and while it is on its way the doctor is told to wait.
+    web.fail(MANIFEST, 1, Moment::Slow);
+    rig.admit(1, &[(1, plaintext(2048))]);
+    within(
+        "the publication is on its way",
+        web.requests_reach(MANIFEST, 1),
+    )
+    .await;
+    web.fail(
+        STATUS,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(600),
+        },
+    );
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+
+    web.release_held();
+    let (waited, _) = within("the publication is refused", timer.next_wait()).await;
+    assert_eq!(waited, Duration::from_secs(600));
+    assert_eq!(
+        web.requests_to(MANIFEST),
+        1,
+        "the question about what the service holds was not sent inside the delay"
+    );
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    assert!(detail.contains("enrolled"), "{detail}");
+}
+
 /// A service that turns the start's question about an earlier publication back with a delay is left
 /// alone for that long: the daemon starts, and its first question about backup storage waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1406,10 +1501,12 @@ async fn a_delay_named_to_the_doctor_in_the_middle_of_an_upload_holds_what_comes
         "no upload was begun inside the delay"
     );
 
-    // When the delay has passed, the work goes on until there is none left.
+    // When the delay has passed, the work goes on until both generations are published.
     timer.run_by_itself();
-    rig.until("every attempt has ended", Rig::every_attempt_ended)
-        .await;
+    rig.until("both generations are published", |rig| {
+        rig.published(1) && rig.published(2)
+    })
+    .await;
 }
 
 /// A publication left unanswered when the daemon stopped, which the service holds, is found when the

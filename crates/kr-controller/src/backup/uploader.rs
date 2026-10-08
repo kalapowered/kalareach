@@ -123,9 +123,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::error::ClientError;
+use kr_client::retry::UserAction;
 use kr_client::services::{
     ArchiveAnswer, BackupManifestService, BackupState, Dispatched, NewUpload, PartTable,
-    StorageService, StorageStatus, UploadId, UploadProgress, upload_parts,
+    ServiceFuture, StorageService, StorageStatus, UploadId, UploadProgress, upload_parts,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::SigningTranscript;
@@ -140,7 +141,7 @@ use kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
 use kr_worker::privacy::PrivacyGeneration;
 
 use crate::backup::BackupService;
-use crate::backup::quiet::{LONGEST_DELAY, Quiet};
+use crate::backup::quiet::{Owed, Quiet};
 use crate::backup::store::{
     Attempt, AttemptStatus, GenerationRecord, ObjectRecord, PrivacyStatus, Production, Publication,
     Remote, Step, UploadRecord,
@@ -420,8 +421,8 @@ pub enum Idle {
 pub struct Hold {
     /// The code the refusal or the failure carried.
     pub code: ErrorCode,
-    /// How long the service asked to be left alone, when it said, and no longer than
-    /// [`LONGEST_DELAY`].
+    /// How long the service asked to be left alone, when it said. [`Quiet`] holds it to
+    /// [`crate::backup::quiet::LONGEST_DELAY`] when it records it.
     pub retry_after: Option<Duration>,
 }
 
@@ -433,7 +434,7 @@ impl Hold {
             ClientError::Refused {
                 retry_after_seconds,
                 ..
-            } => retry_after_seconds.map(|seconds| Duration::from_secs(seconds).min(LONGEST_DELAY)),
+            } => retry_after_seconds.map(Duration::from_secs),
             _ => None,
         };
         Self {
@@ -481,6 +482,9 @@ pub struct PassReport {
     pub hold: Option<Hold>,
     /// What the storage service said about backup storage, when the pass asked.
     pub status: Option<StorageStatus>,
+    /// The delay the pass stopped at, when it stopped because the service asked to be left alone
+    /// and work remained. The deadline and what is left of it are those of the moment it stopped.
+    pub quiet: Option<Owed>,
 }
 
 impl PassReport {
@@ -533,6 +537,207 @@ impl Disk {
     }
 }
 
+/// What lets a request of the uploader's leave.
+///
+/// The service may ask to be left alone, in an answer to any request and in the one `kr doctor`
+/// puts to it, and every request after that waits. So the rule is kept where the requests leave and
+/// not at each place that makes one: [`QuietStorage`] and [`QuietManifest`] refuse to send while a
+/// delay is owed, with a refusal that carries what is left of it, and record every delay an answer
+/// names as it arrives. Cleanup under a privacy fence is the one exception, because ending work in
+/// flight must not wait out a delay.
+#[derive(Clone)]
+struct Gate {
+    quiet: Arc<Quiet>,
+    disk: Disk,
+}
+
+impl Gate {
+    /// Whether a request may leave now.
+    async fn open(&self) -> kr_client::Result<()> {
+        let Some(left) = self.quiet.left() else {
+            return Ok(());
+        };
+        let fenced = self
+            .disk
+            .run(|backup| backup.privacy_status())
+            .is_ok_and(|privacy| privacy.inhibited_at().is_some());
+        if fenced {
+            return Ok(());
+        }
+        Err(ClientError::Refused {
+            error: ProtocolError::new(
+                ErrorCode::ServiceCapacity,
+                "the service asked to be left alone, so this request was not sent".to_owned(),
+            ),
+            retry_after_seconds: Some(left.as_secs().saturating_add(1)),
+            action: UserAction::Wait,
+        })
+    }
+
+    /// Remembers a delay the service named in an answer.
+    fn note(&self, error: &ClientError) {
+        if let Some(delay) = Hold::of(error).retry_after {
+            self.quiet.owe(delay);
+        }
+    }
+
+    /// Sends `request` if a request may leave, and remembers what the service answers.
+    async fn through<'a, T>(
+        &self,
+        request: impl FnOnce() -> ServiceFuture<'a, T>,
+    ) -> kr_client::Result<T> {
+        self.open().await?;
+        let answer = request().await;
+        if let Err(error) = &answer {
+            self.note(error);
+        }
+        answer
+    }
+}
+
+/// A storage client that sends nothing while the service has asked to be left alone.
+#[derive(Debug)]
+struct QuietStorage {
+    inner: Arc<dyn StorageService>,
+    gate: Gate,
+}
+
+impl fmt::Debug for Gate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Gate").finish_non_exhaustive()
+    }
+}
+
+impl StorageService for QuietStorage {
+    fn status(&self) -> ServiceFuture<'_, StorageStatus> {
+        Box::pin(self.gate.through(move || self.inner.status()))
+    }
+
+    fn set_retention<'a>(
+        &'a self,
+        change: &'a kr_client::services::RetentionChange,
+    ) -> ServiceFuture<'a, kr_client::services::RetentionAnswer> {
+        Box::pin(self.gate.through(move || self.inner.set_retention(change)))
+    }
+
+    fn create_upload<'a>(
+        &'a self,
+        upload: &'a NewUpload,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadCreated>> {
+        Box::pin(self.gate.through(move || self.inner.create_upload(upload)))
+    }
+
+    fn upload_part<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        part: kr_client::services::UploadPart<'a>,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::PartStored>> {
+        Box::pin(
+            self.gate
+                .through(move || self.inner.upload_part(upload_id, part)),
+        )
+    }
+
+    fn complete_upload<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        table: &'a PartTable,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadCompleted>> {
+        Box::pin(
+            self.gate
+                .through(move || self.inner.complete_upload(upload_id, table)),
+        )
+    }
+
+    fn abort_upload<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadAborted>> {
+        Box::pin(
+            self.gate
+                .through(move || self.inner.abort_upload(upload_id)),
+        )
+    }
+
+    fn read_object(
+        &self,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
+        offset: u64,
+        length: u64,
+    ) -> ServiceFuture<'_, kr_client::services::ObjectRange> {
+        Box::pin(self.gate.through(move || {
+            self.inner
+                .read_object(archive_id, object_id, offset, length)
+        }))
+    }
+
+    fn delete_object(
+        &self,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
+    ) -> ServiceFuture<'_, kr_client::services::ObjectDeleted> {
+        Box::pin(
+            self.gate
+                .through(move || self.inner.delete_object(archive_id, object_id)),
+        )
+    }
+}
+
+/// A backup manifest client that sends nothing while the service has asked to be left alone.
+#[derive(Debug)]
+struct QuietManifest {
+    inner: Arc<dyn BackupManifestService>,
+    gate: Gate,
+}
+
+impl BackupManifestService for QuietManifest {
+    fn enrol<'a>(
+        &'a self,
+        record: &'a kr_protocol::archive::BackupWriterRecord,
+    ) -> ServiceFuture<'a, kr_client::services::Enrolled> {
+        Box::pin(self.gate.through(move || self.inner.enrol(record)))
+    }
+
+    fn publish<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::Published>> {
+        Box::pin(self.gate.through(move || self.inner.publish(publication)))
+    }
+
+    fn publish_dispatched<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, Dispatched<ArchiveAnswer<kr_client::services::Published>>> {
+        Box::pin(async move {
+            // A request that was not sent is not a request that may have left: it is not a
+            // publication to ask the service about afterwards.
+            if let Err(error) = self.gate.open().await {
+                return Ok(Dispatched::NotSent(error));
+            }
+            let answer = self.inner.publish_dispatched(publication).await;
+            match &answer {
+                Err(error) | Ok(Dispatched::NotSent(error)) => self.gate.note(error),
+                Ok(Dispatched::Answered(_)) => {}
+            }
+            answer
+        })
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        archive_id: ArchiveId,
+        generation: Option<BackupGeneration>,
+        checkpoint: Option<&'a kr_protocol::pairing::GenerationCheckpoint>,
+    ) -> ServiceFuture<'a, Option<kr_client::services::FetchedGeneration>> {
+        Box::pin(
+            self.gate
+                .through(move || self.inner.fetch(archive_id, generation, checkpoint)),
+        )
+    }
+}
+
 /// The executor that carries the backup outbox.
 pub struct Uploader {
     disk: Disk,
@@ -582,10 +787,21 @@ impl Uploader {
         quiet: Arc<Quiet>,
         now: TimestampMs,
     ) -> Self {
+        let disk = Disk { backup };
+        let gate = Gate {
+            quiet: Arc::clone(&quiet),
+            disk: disk.clone(),
+        };
         Self {
-            disk: Disk { backup },
-            storage,
-            manifest,
+            disk,
+            storage: Arc::new(QuietStorage {
+                inner: storage,
+                gate: gate.clone(),
+            }),
+            manifest: Arc::new(QuietManifest {
+                inner: manifest,
+                gate,
+            }),
             quiet,
             writer,
             started_at_ms: now.get(),
@@ -622,18 +838,11 @@ impl Uploader {
             else {
                 continue;
             };
-            match self.held(&generation).await {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => {
-                    // A service that asked to be left alone is not asked about the next
-                    // publication either, and not by the first pass.
-                    if let Some(delay) = Hold::of(&error).retry_after {
-                        self.quiet.owe(delay);
-                        break;
-                    }
-                    continue;
-                }
+            // A service that asked to be left alone is not asked about the next publication either,
+            // and not by the first pass: the delay is recorded where the answer arrived, and the
+            // clients send nothing while it is owed.
+            if !matches!(self.held(&generation).await, Ok(true)) {
+                continue;
             }
             settled.push(
                 match self.disk.run(|backup| {
@@ -671,15 +880,13 @@ impl Uploader {
         let uploads = self.disk.run(|backup| backup.store().uploads())?;
         let outbox = self.disk.run(|backup| backup.outbox())?;
         let privacy = self.disk.run(|backup| backup.privacy_status())?;
-        if outbox.is_empty()
-            && uploads.is_empty()
-            && self.reclaimable(&outbox, &privacy)?.is_empty()
-        {
+        if !self.has_work_in(&outbox, &uploads, &privacy)? {
             return Ok(report);
         }
         let fenced = privacy.inhibited_at().is_some();
-        if !fenced && self.quiet.left().is_some() {
-            // The service asked to be left alone, and asked it of whoever put it a question.
+        if !fenced && let Some(owed) = self.quiet.owed() {
+            // The service asked to be left alone, in an answer to someone's question.
+            report.quiet = Some(owed);
             return Ok(report);
         }
         if !fenced {
@@ -700,27 +907,61 @@ impl Uploader {
             }
         }
         let mut turn = Turn::default();
-        while let Some(stepped) = self.next(now, &mut turn).await? {
+        loop {
+            // A service that asked to be left alone is not asked about the next step either: its
+            // clients send nothing while the delay is owed, so the pass says where it stopped. A
+            // refusal that names no delay may be about one attempt alone, an object the service
+            // already holds for example, so the pass goes on. Under a privacy fence it goes on in
+            // every case, because what a fence owes is ending work, and an attempt that needs no
+            // answer from the service ends anyway.
+            // The fence is read afresh: privacy mode may have been turned on since the pass began.
+            let fenced_now = self
+                .disk
+                .run(|backup| backup.privacy_status())?
+                .inhibited_at()
+                .is_some();
+            if !fenced_now && let Some(owed) = self.quiet.owed() {
+                report.quiet = Some(owed);
+                break;
+            }
+            let Some(stepped) = self.next(now, &mut turn).await? else {
+                break;
+            };
             let held = match &stepped {
                 Stepped::Waiting { hold, .. } => *hold,
                 _ => None,
             };
             report.steps.push(stepped);
-            let Some(hold) = held else {
-                continue;
-            };
-            report.hold = Some(report.hold.map_or(hold, |earlier| earlier.and(hold)));
-            // A service that asked to be left alone is not asked about the next attempt either:
-            // the answer would be the same, so the pass ends at the next step. A refusal that
-            // names no delay may be about this attempt alone, an object the service already holds
-            // for example, so the pass goes on. Under a privacy fence it goes on in every case,
-            // because what a fence owes is ending work, and an attempt that needs no answer from
-            // the service ends anyway.
-            if let Some(delay) = hold.retry_after {
-                self.quiet.owe(delay);
+            if let Some(hold) = held {
+                report.hold = Some(report.hold.map_or(hold, |earlier| earlier.and(hold)));
             }
         }
         Ok(report)
+    }
+
+    /// Whether there is anything for a pass to do: an attempt in the outbox, an upload in hand, or
+    /// storage a generation left behind that is owed back. The carrier asks the same question to
+    /// know whether a missing account token costs anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn has_work(&self) -> Result<bool> {
+        let uploads = self.disk.run(|backup| backup.store().uploads())?;
+        let outbox = self.disk.run(|backup| backup.outbox())?;
+        let privacy = self.disk.run(|backup| backup.privacy_status())?;
+        self.has_work_in(&outbox, &uploads, &privacy)
+    }
+
+    fn has_work_in(
+        &self,
+        outbox: &[Attempt],
+        uploads: &[UploadRecord],
+        privacy: &PrivacyStatus,
+    ) -> Result<bool> {
+        Ok(!outbox.is_empty()
+            || !uploads.is_empty()
+            || !self.reclaimable(outbox, privacy)?.is_empty())
     }
 
     /// Takes the next step, or answers none when nothing can be done now.
@@ -740,9 +981,6 @@ impl Uploader {
             return Ok(None);
         }
         let privacy = self.disk.run(|backup| backup.privacy_status())?;
-        if privacy.inhibited_at().is_none() && self.quiet.left().is_some() {
-            return Ok(None);
-        }
         let outbox = self.disk.run(|backup| backup.outbox())?;
         for attempt in &outbox {
             if turn.waited.contains(&attempt.sequence)
@@ -969,10 +1207,8 @@ impl Uploader {
                 return Ok(not_carried());
             }
             let disk = &self.disk;
-            let quiet = &self.quiet;
             let mut failure: Option<ControllerError> = None;
             let mut withdrawn = false;
-            let mut asked_to_wait = false;
             let sent = {
                 // Each acknowledgement is recorded before the next part leaves, and the next part
                 // leaves only while the store still holds this attempt for this uploader.
@@ -988,11 +1224,6 @@ impl Uploader {
                         )
                     });
                     match recorded.and_then(|()| disk.run(|backup| may_send(backup, attempt))) {
-                        // The service may have asked, since the last part, to be left alone.
-                        Ok(true) if quiet.left().is_some() => {
-                            asked_to_wait = true;
-                            Err(held_back())
-                        }
                         Ok(true) => Ok(()),
                         Ok(false) => {
                             withdrawn = true;
@@ -1020,10 +1251,6 @@ impl Uploader {
                 }
                 Ok(ArchiveAnswer::UploadGone) => self.forget(record, turn),
                 Err(_) if withdrawn => Ok(not_carried()),
-                Err(_) if asked_to_wait => Ok(waiting(format!(
-                    "the service asked to be left alone, so the next part of object {} waits",
-                    object.object_id
-                ))),
                 Err(error) if not_permitted(&error) => {
                     self.abandon(record, &progress.upload_id, turn).await
                 }
@@ -1484,13 +1711,6 @@ impl Uploader {
                 // What the service says to the question asked next is part of what holds this
                 // publication back: a person to act and a delay to wait are both owed.
                 let mut hold = Hold::of(&error);
-                if hold.retry_after.is_some() {
-                    // The service asked to be left alone, so it is not asked what it holds now.
-                    return Ok(Stepped::Waiting {
-                        reason: format!("the service did not publish the generation: {error}"),
-                        hold: Some(hold),
-                    });
-                }
                 match self.passed_by(generation).await {
                     Ok(Some(held)) => {
                         let reason = format!(
