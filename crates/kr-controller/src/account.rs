@@ -64,6 +64,10 @@ use crate::error::{ControllerError, Result};
 /// How long the daemon waits for the person's browser to come back.
 const WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// How many times, and how far apart, a refused bind of the loopback address is tried again.
+const BIND_TRIES: u32 = 40;
+const BIND_PAUSE: Duration = Duration::from_millis(25);
+
 /// The file an earlier version of this host kept an imported account token in, under the runtime
 /// root. It held an access token and no refresh credential, so it cannot become a sign-in.
 ///
@@ -317,7 +321,7 @@ impl HostAccount {
             let _ = older.cancel.send(true);
             let _ = older.task.await;
         }
-        let listener = match self.listener() {
+        let listener = match self.listener().await {
             Ok(listener) => listener,
             Err(error) => {
                 let (attempt, detail) = match error {
@@ -414,7 +418,27 @@ impl HostAccount {
         })
     }
 
-    fn listener(&self) -> std::result::Result<Listener, BindError> {
+    /// Binds the address a sign-in comes back to.
+    ///
+    /// An address that is refused is tried again for a short while before it is called held. The
+    /// daemon's own earlier listener on it has been closed, but the kernel lets the address go only
+    /// when the last copy of that socket is closed, and a process that another part of this program
+    /// is starting at that moment holds a copy until it has started: on a busy machine that is
+    /// longer than the close.
+    async fn listener(&self) -> std::result::Result<Listener, BindError> {
+        let mut tries = 0;
+        loop {
+            match self.bind() {
+                Err(BindError::Busy) if tries < BIND_TRIES => {
+                    tries += 1;
+                    tokio::time::sleep(BIND_PAUSE).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn bind(&self) -> std::result::Result<Listener, BindError> {
         #[cfg(feature = "testing")]
         if let Some(address) = *self.inner.loopback.lock().expect("the test address") {
             return Listener::open_at(address, &address.to_string());
