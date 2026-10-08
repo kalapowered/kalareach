@@ -23,6 +23,7 @@ mod authority;
 mod context;
 mod host;
 mod submit;
+mod transport;
 
 use std::sync::Arc;
 
@@ -41,6 +42,7 @@ pub use context::{
 };
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use submit::{HostDispatch, ProposalSubmitter, method_for};
+pub use transport::{VOICE_DEADLINES, VoiceTransport};
 
 use crate::error::{ControllerError, Result};
 
@@ -127,31 +129,30 @@ impl VoiceModule {
         &self.broker_origin
     }
 
-    /// Builds the managed broker client for a host that has one configured.
+    /// Builds the managed broker client for the origin the configuration document names.
     ///
-    /// `None` when no origin is configured, which is a complete host: a person's own provider
-    /// credential and the agent already running in the session both still work.
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns why the broker client refuses the origin, which a host that started anyway would
+    /// hide behind a refusal that says no service is configured.
     pub fn managed_provider(
-        origin: Option<String>,
+        origin: &str,
         http: Arc<dyn ServiceHttp>,
         runtime_root: &std::path::Path,
-    ) -> Option<Arc<dyn ManagedVoiceService>> {
-        let origin = origin?;
+    ) -> std::result::Result<Arc<dyn ManagedVoiceService>, kr_client::ClientError> {
         // Bound to the origin this host is configured to reach, so a token issued for another
         // service is refused before a request carries it.
         let tokens = Arc::new(
-            kr_voice::broker::AccountTokenFile::under(runtime_root).for_origin(origin.clone()),
+            kr_voice::broker::AccountTokenFile::under(runtime_root).for_origin(origin.to_owned()),
         );
-        ManagedVoiceBroker::new(origin, http, tokens)
-            .ok()
-            .map(|broker| Arc::new(broker) as Arc<dyn ManagedVoiceService>)
+        let broker = ManagedVoiceBroker::new(origin, http, tokens)?;
+        Ok(Arc::new(broker))
     }
 
     /// Replaces the provider this service brokers through.
     ///
-    /// An embedder with an HTTP exchange of its own attaches the managed broker here, or attaches
-    /// a backend of the person's own. Nothing above the seam knows which one answered.
+    /// A caller with a provider of its own, a backend of the person's own or a stand-in, builds the
+    /// service with it here. Nothing above the seam knows which one answered.
     #[must_use]
     pub fn with_provider(mut self, provider: Option<Arc<dyn ManagedVoiceService>>) -> Self {
         self.coordinator = self.coordinator.with_provider(provider);
@@ -160,10 +161,10 @@ impl VoiceModule {
 
     /// Attaches a provider to the service this host has already registered.
     ///
-    /// The daemon registers its voice service while it starts, and nothing inside it reaches a
-    /// network: an embedder brings the HTTP exchange and attaches the managed broker afterwards,
-    /// or attaches a backend of the person's own. Until one is attached this host brokers no
-    /// managed call, which is a complete host and says so.
+    /// The daemon builds the managed broker itself when its configuration document names one, so
+    /// this is for a provider that document cannot name: a backend of the person's own, or a
+    /// stand-in. Until a provider is attached this host brokers no managed call, which is a
+    /// complete host and says so.
     pub fn attach_provider(&self, provider: Option<Arc<dyn ManagedVoiceService>>) {
         self.coordinator.attach_provider(provider);
     }
@@ -516,6 +517,7 @@ mod tests {
             "https://Voice.example.com",
             "https://voice.example.com/",
             "https://xn--zz.example",
+            "http://voice.example.com",
         ];
         let mut accepted = 0;
         for origin in corpus {
@@ -526,13 +528,12 @@ mod tests {
             }
             accepted += 1;
             assert!(
-                VoiceModule::managed_provider(
-                    Some(origin.to_owned()),
-                    Arc::new(NoExchange),
-                    root.path(),
-                )
-                .is_some(),
+                VoiceModule::managed_provider(origin, Arc::new(NoExchange), root.path()).is_ok(),
                 "{origin} validated and the managed broker refused it"
+            );
+            assert!(
+                kr_protocol::service::GatewayOrigin::new(origin).is_ok(),
+                "{origin} validated and the transport that reaches it refused it"
             );
         }
         assert_eq!(

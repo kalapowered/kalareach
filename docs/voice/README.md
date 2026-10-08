@@ -5,14 +5,17 @@ asks for, and it decides each action against the grants the host already keeps. 
 an explicit data-access boundary, separate from the encryption of terminal transport, and this
 document is that boundary written down.
 
-This daemon attaches no voice provider, managed or of a person's own, so no call starts:
-`voice.start` answers that the host has no voice service configured. `voice.grant` acts as this
-document describes, and `voice.prepare` returns the scope a call would have, with no managed terms.
-With no call there is no voice session, so `voice.context` and `voice.delegate` are refused as naming
-no such session. The sections on what a call may read and send, where it goes, the managed operator,
-what is never authority, the session-bound grant, the rate and the account token describe what the
-coordinator does once a provider is attached, which its code and its tests establish. The section on
-what this daemon performs and supplies says which of that this daemon carries out itself.
+A host whose configuration document names a managed broker (`voice.broker_origin`) attaches it when
+the daemon starts. The daemon reaches the broker over a transport of its own, through the proxy the
+same document selects, and presents the account token an operator put on the host. A host whose
+document names no broker attaches no provider, so no call starts on it: `voice.start` answers that
+the host has no voice service configured. `voice.grant` acts as this document describes, and
+`voice.prepare` returns the scope a call would have, with no managed terms. With no call there is no
+voice session, so `voice.context` and `voice.delegate` are refused as naming no such session. The
+sections on what a call may read and send, where it goes, the managed operator, what is never
+authority, the session-bound grant, the rate and the account token describe what the coordinator
+does once a provider is attached, which its code and its tests establish. The section on what this
+daemon performs and supplies says which of that this daemon carries out itself.
 
 ## What the parts are
 
@@ -87,7 +90,7 @@ carries them when it starts, and every context selection for that call carries t
 keeps no wording of its own for this.
 
 Using a provider credential of your own would change who can read it, and nothing else about how
-the host decides what a call may do. This daemon attaches none.
+the host decides what a call may do. This daemon attaches only the managed broker.
 
 ## What an append acknowledgement does not mean
 
@@ -133,9 +136,9 @@ A voice grant is an ordinary grant in the host's one authority store. There is n
 Two kinds exist per device. The **standing** grant says which voice actions the person chose to
 permit and survives calls. The **session-bound** grant is delegated from it when a call starts,
 narrows to the sessions that call may reach and to the call's own deadline, and is revoked the
-moment the call stops, immediately and independently of the service's billing finalisation. This
-daemon starts no call, so none exists on it. Revoking the standing grant revokes its descendants, so
-withdrawing it ends any call running under it.
+moment the call stops, immediately and independently of the service's billing finalisation. A host
+that names no broker starts no call, so none exists on it. Revoking the standing grant revokes its
+descendants, so withdrawing it ends any call running under it.
 
 The default grant permits session navigation, status queries, briefing and prompt composition, and
 nothing else. Broadening it is a choice a person makes, and the change states which actions it
@@ -225,4 +228,4 @@ token issued without the `voice` scope is refused before any request carries it.
 A host with no token and a host with no provider attached are both complete hosts. They start no
 managed call, and nothing else on them depends on one: sessions, agents and their questions work as
 they do without voice. The coordinator takes its provider through a seam, so a provider of a
-person's own can stand where the managed one does, and this daemon attaches none.
+person's own can stand where the managed one does, and this daemon attaches only the managed one.

@@ -200,9 +200,9 @@ pub struct Coordinator {
     submitter: Arc<dyn ActionSubmitter>,
     /// The provider this coordinator brokers a managed call through, when one is configured.
     ///
-    /// Replaceable while the coordinator runs, because the host that owns it has no way to reach
-    /// a network of its own: the embedder brings the HTTP exchange and attaches the broker to the
-    /// service the daemon has already registered.
+    /// Replaceable while the coordinator runs, so that a provider the host's configuration cannot
+    /// name, a backend of the person's own or a stand-in, can be attached to the service the
+    /// daemon has already registered.
     provider: Mutex<Option<Arc<dyn ManagedVoiceService>>>,
     host_device_id: DeviceId,
     environment_id: EnvironmentId,
@@ -320,8 +320,8 @@ impl Coordinator {
 
     /// Replaces the provider on a coordinator that is already running.
     ///
-    /// The host registers its voice service while it starts, before anything that can reach a
-    /// network exists; the embedder attaches the broker afterwards. A call already running keeps
+    /// The host registers its voice service while it starts, and a provider the configuration
+    /// does not name is attached afterwards. A call already running keeps
     /// the provider it started on until it is stopped, because stopping it is what tells the
     /// provider the call has ended.
     ///
