@@ -731,8 +731,9 @@ impl RemoteConnection {
     /// request is, as a subscription to the session this connection is attached to: its grant,
     /// this host's policy and the configured ceiling as they stand at that moment. The batch is
     /// then written under that decision, which the write boundary holds it to until the last byte
-    /// goes. A grant the decision finds expired is latched and written down, as a request's is.
-    /// Any other refusal leaves the grant alone, because nothing about the grant has ended: a
+    /// goes. A pairing grant the decision finds expired is latched and written down, as a request's
+    /// is; a share it finds expired ends the batch and the connection and writes nothing on the
+    /// device's record. Any other refusal leaves the grant alone, because nothing about the grant has ended: a
     /// lapsed offline bound, for one, holds again once the authority feed synchronises, and the
     /// device is told why by the next request it makes. Either way the batch is not written, and
     /// the relay ends the connection.

@@ -657,9 +657,10 @@ async fn kr_req_10_50_a_share_is_written_only_for_a_screen_its_issuer_was_shown_
             }),
         })
     };
+    // What a worker that does not know the read answers, in the words it answers an unknown read.
     let earlier_build = Err(ProtocolError::new(
-        ErrorCode::UnsupportedCapability,
-        "this worker has no such method",
+        ErrorCode::InvalidArgument,
+        "session.screen.preview is not a read this worker serves",
     ));
     for (action, answer, refused) in [
         (0x72, screen(true), Some(ErrorCode::InvalidArgument)),
@@ -2564,7 +2565,15 @@ async fn kr_req_10_51_a_device_reads_the_decisions_its_grant_names_while_they_ar
             None,
         )
         .expect("the invitation is redeemed");
-    let device = holding_grant(&served.controller, 31, redeemed);
+    // The device is paired under a grant of its own that reaches no session; what it reads of this
+    // one it reads under the share it redeemed.
+    let (mut pairing, _) = crate::service::net::tests::granted(
+        kr_protocol::grant::GrantExpiry::Never,
+        served.controller.policy().authority_revision(),
+    );
+    pairing.recipient_device_id = redeemed.recipient_device_id;
+    pairing.session_selector = kr_protocol::grant::SessionSelector::None;
+    let device = holding_grant(&served.controller, 31, pairing);
     let connection = super::RemoteConnection::for_test(&served.controller, device);
     let questions = |request_id: u64| {
         device_read(
