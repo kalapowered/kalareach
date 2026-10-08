@@ -105,8 +105,9 @@ export function MobileSessions({
           style={{ minBlockSize: target }}
           onClick={onOpenVoice}
         >
+          {/* One line, and nothing under it: at the largest text size the sessions below it must
+              still come within reach of the screen, and the voice screen says what a call is. */}
           <span className="m-row-title">Talk to your host</span>
-          <span className="m-row-detail">Voice, for the sessions you choose</span>
         </button>
       )}
       {error ? (
