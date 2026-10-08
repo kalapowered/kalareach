@@ -342,10 +342,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 9,
+        "version": 10,
         "migrates_from": 1
       },
-      "digest": "6009bb613da1dc6f1c68fc830f58255e72f3903d01cdcdad2b1ec2a38f5b338f",
+      "digest": "da78a08ad2fcbe7d09edd4ac7a0fb5d62780825ccd8ceb504475ecde73e6ac68",
       "kept": [
         "ProjectInitResult",
         "ProjectCloneResult",
