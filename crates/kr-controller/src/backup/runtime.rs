@@ -4,8 +4,8 @@
 //! [`Uploader`] does one step at a time and says what it did. This is what runs it for as long as
 //! the daemon lives. It builds the managed storage and backup manifest clients from the
 //! configuration document's `storage.origin`, signs as the writer key only this host holds, and
-//! presents the account token the operator imported. It never decides what a refusal means: the
-//! uploader and the service do. What it decides is when to ask again.
+//! presents the account token of the sign-in the host holds. It never decides what a refusal means:
+//! the uploader and the service do. What it decides is when to ask again.
 //!
 //! # When it asks again
 //!
@@ -20,9 +20,9 @@
 //!   to it, the one `kr doctor` asks and the one the host asks when it starts as well as a pass.
 //! * **Only a person can clear the cause** (backup storage off, no backup allowance, a writer
 //!   nobody enrolled, no usable account token): after five minutes, or when work or a writer
-//!   arrives. The host's own account token is checked first and every 30 seconds, because
-//!   importing one only writes a file, and no request that carries the token leaves the host
-//!   without a usable one. Requests that carry no token are not held back by that check: the host
+//!   arrives. The host's own account token is checked first and every 30 seconds, because a person
+//!   signs in at a command line that tells the carrier nothing, and no request that carries the
+//!   token leaves the host without a usable one. Requests that carry no token are not held back by that check: the host
 //!   settles what an earlier run sent, and ends work in flight under a fence, whatever the token.
 //! * **Nothing is owed**: when something changes.
 //!
@@ -37,7 +37,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
-use kr_client::services::voice::AccountTokenFile;
 use kr_client::services::{
     BackupState, HttpDeadlines, HttpService, ManagedBackupManifestService, ManagedStorageService,
     ServiceClients, ServiceHttp, ServiceSigner, StorageService, StorageStatus,
@@ -46,6 +45,7 @@ use kr_client::services::{
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::host_account::AccountState;
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::scalars::{AuthorisationKey, KeyId, Signature64};
@@ -54,6 +54,7 @@ use kr_transport::config::ProxyUrl;
 use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
 
+use crate::account::HostAccount;
 use crate::backup::quiet::{Owed, Quiet, Timer};
 use crate::backup::uploader::{Hold, Idle, PassReport, Stepped, Uploader};
 use crate::backup::{BackupService, BackupSignals};
@@ -63,7 +64,7 @@ use crate::error::{ControllerError, Result};
 pub const OPERATOR_CEILING: Duration = Duration::from_secs(5 * 60);
 
 /// How often the host looks again at the account token it holds, while there is work and no usable
-/// token. A token is imported by writing a file, which nothing tells the daemon about.
+/// token. A person signs in at a command line, which tells the carrier nothing.
 pub const TOKEN_CHECK: Duration = Duration::from_secs(30);
 
 /// How long a status read made for `kr doctor` may take.
@@ -128,14 +129,20 @@ impl ServiceSigner for WriterSigner {
 /// What this host holds for the account token it presents, as the doctor words it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokenState {
-    /// Nothing has been imported.
+    /// No account is signed in.
     Absent,
-    /// The imported token was issued for another service.
+    /// A sign-in is waiting for the person's browser, and nothing is signed in yet.
+    SigningIn,
+    /// The account was signed in at another service than the one storage is selected at.
     OtherService,
-    /// The imported token has stopped being accepted.
-    Expired,
-    /// The imported token was not issued with the scope backup storage needs.
+    /// The service ended the sign-in.
+    Ended,
+    /// The account is signed in and its grant lacks the scope backup storage needs, as one made
+    /// before storage was selected does.
     WithoutScope,
+    /// The sign-in looks whole and no token could be had from it just now, as when the account
+    /// service does not answer a renewal.
+    NotRenewed,
     /// The token is usable now.
     Usable,
 }
@@ -143,37 +150,65 @@ enum TokenState {
 impl TokenState {
     const fn words(self) -> &'static str {
         match self {
-            Self::Absent => "no account token is imported",
-            Self::OtherService => "the imported account token belongs to another service",
-            Self::Expired => "the imported account token has expired",
-            Self::WithoutScope => "the imported account token lacks the backup.write scope",
-            Self::Usable => "an account token with the backup.write scope is imported",
+            Self::Absent => "no account is signed in on this host",
+            Self::SigningIn => "a sign-in on this host is waiting to finish",
+            Self::OtherService => "the account signed in on this host belongs to another service",
+            Self::Ended => "the service ended the sign-in on this host",
+            Self::WithoutScope => "the account signed in on this host lacks the backup.write scope",
+            Self::NotRenewed => {
+                "this host could not renew the token of the account signed in on this host"
+            }
+            Self::Usable => "an account with the backup.write scope is signed in on this host",
+        }
+    }
+
+    /// What a person does about it: the sign-in is the one thing that mends each.
+    const fn remedy(self) -> &'static str {
+        match self {
+            Self::Absent => "Sign this host in with `kr account sign-in`.",
+            Self::SigningIn => "Finish the sign-in at the address `kr account sign-in` printed.",
+            Self::OtherService => {
+                "Sign this host in again with `kr account sign-in`, at the service storage.origin \
+                 names."
+            }
+            Self::Ended => "Sign this host in again with `kr account sign-in`.",
+            Self::WithoutScope => {
+                "Sign this host in again with `kr account sign-in`, which asks for backup \
+                 storage because storage.origin is set."
+            }
+            Self::NotRenewed => {
+                "This host asks again by itself. Check that the account service is reachable, or \
+                 sign this host in again with `kr account sign-in`."
+            }
+            Self::Usable => "",
         }
     }
 }
 
-/// Reads the token file as the doctor describes it, without sending anything: what state it is in,
-/// and when it stops being accepted, if it says.
+/// Reads the sign-in as the doctor describes it when the token source gave no token, without
+/// sending anything.
 ///
 /// Whether a request may carry the token is decided by asking the [`AccountTokenSource`], which is
 /// what the clients ask. This only says why, and it is read for no other purpose.
-fn describe_token(tokens: &AccountTokenFile, origin: &str) -> (TokenState, Option<u64>) {
-    let Ok(stored) = tokens.stored() else {
-        return (TokenState::Absent, None);
-    };
-    let state = if stored.origin != origin {
-        TokenState::OtherService
-    } else if stored
-        .expires_at_ms
-        .is_some_and(|expires| expires <= kr_ipc::now_ms().get())
-    {
-        TokenState::Expired
-    } else if !stored.carries(BACKUP_WRITE_SCOPE) {
-        TokenState::WithoutScope
-    } else {
-        TokenState::Usable
-    };
-    (state, stored.expires_at_ms)
+fn describe_token(account: &HostAccount, origin: &str) -> TokenState {
+    match account.report().state {
+        AccountState::SignedIn {
+            origin: signed_in_at,
+            scopes,
+            ..
+        } => {
+            if signed_in_at != origin {
+                TokenState::OtherService
+            } else if !scopes.iter().any(|scope| scope == BACKUP_WRITE_SCOPE) {
+                TokenState::WithoutScope
+            } else {
+                TokenState::NotRenewed
+            }
+        }
+        AccountState::Ended => TokenState::Ended,
+        AccountState::WaitingForBrowser { .. } | AccountState::Finishing => TokenState::SigningIn,
+        AccountState::SignedOut => TokenState::Absent,
+    }
 }
 
 /// What the carrier knows of the service, for `kr doctor`.
@@ -229,7 +264,7 @@ pub fn managed_clients(
     origin: &GatewayOrigin,
     proxy: Option<&ProxyUrl>,
     writer: &AuthorisationKeyPair,
-    tokens: &Arc<AccountTokenFile>,
+    tokens: &Arc<dyn AccountTokenSource>,
 ) -> Result<ServiceClients> {
     let http: Arc<dyn ServiceHttp> = Arc::new(
         HttpService::through(
@@ -250,7 +285,7 @@ pub fn managed_clients(
     let signer: Arc<dyn ServiceSigner> = Arc::new(WriterSigner {
         key: writer.clone(),
     });
-    let source: Arc<dyn AccountTokenSource> = Arc::clone(tokens) as _;
+    let source = Arc::clone(tokens);
     Ok(ServiceClients {
         storage: Some(Arc::new(
             ManagedStorageService::new(origin.clone(), Arc::clone(&http), Arc::clone(&signer))
@@ -269,8 +304,8 @@ struct Shared {
     storage: Arc<dyn StorageService>,
     /// What decides whether a request may carry an account: the same source the clients ask.
     account: Arc<dyn AccountTokenSource>,
-    /// The imported token's file, read only to say what is wrong with it.
-    token_file: Arc<AccountTokenFile>,
+    /// The host's sign-in, read only to say what is wrong with it.
+    sign_in: Arc<HostAccount>,
     origin: String,
     writer_key_id: KeyId,
     signals: Arc<BackupSignals>,
@@ -568,7 +603,7 @@ impl BackupRuntime {
         clients: &ServiceClients,
         writer: AuthorisationKeyPair,
         origin: &GatewayOrigin,
-        tokens: Arc<AccountTokenFile>,
+        account: Arc<HostAccount>,
         timer: Arc<dyn Timer>,
     ) -> Result<Self> {
         let (Some(storage), Some(manifest)) = (&clients.storage, &clients.backup_manifest) else {
@@ -580,8 +615,8 @@ impl BackupRuntime {
         let quiet = Arc::new(Quiet::new(Arc::clone(&timer)));
         let shared = Arc::new(Shared {
             storage: Arc::clone(storage),
-            account: Arc::clone(&tokens) as Arc<dyn AccountTokenSource>,
-            token_file: tokens,
+            account: account.tokens(),
+            sign_in: account,
             origin: origin.as_str().to_owned(),
             writer_key_id: writer.key_id(),
             signals: backup.signals(),
@@ -697,22 +732,15 @@ impl BackupRuntime {
                 self.wake();
             }
         }
-        let (state, expires_at_ms) = describe_token(&self.shared.token_file, &self.shared.origin);
-        let state = if usable { TokenState::Usable } else { state };
+        let state = if usable {
+            TokenState::Usable
+        } else {
+            describe_token(&self.shared.sign_in, &self.shared.origin)
+        };
         let observed = self.shared.observed();
         let writer = self.shared.writer_key_id;
 
-        let mut detail = Sentence::new().stated(state.words());
-        if let Some(left) = expires_at_ms
-            .filter(|_| state == TokenState::Usable)
-            .map(|at| at.saturating_sub(kr_ipc::now_ms().get()) / 1000)
-        {
-            detail = detail
-                .stated(", accepted for another ")
-                .number(left)
-                .stated(" seconds");
-        }
-        detail = detail.stated("; ");
+        let mut detail = Sentence::new().stated(state.words()).stated("; ");
         detail = match (&observed.status, observed.status_refusal) {
             (Some(status), _) if status.backup == BackupState::On => {
                 let detail = detail.stated("backup storage is on for the account");
@@ -780,10 +808,7 @@ impl BackupRuntime {
         let remedy = if well {
             None
         } else if state != TokenState::Usable {
-            Some(
-                "Import an account token with the backup.write scope with `kr account token \
-                 import`.",
-            )
+            Some(state.remedy())
         } else if backup_off {
             Some("Turn backup storage on for the account.")
         } else {

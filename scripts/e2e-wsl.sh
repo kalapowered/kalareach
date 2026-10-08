@@ -76,9 +76,9 @@ set -euo pipefail
 #
 # **Which directories.** The product derives its runtime and state roots from the directories this
 # OS user's environment names. Every one of those inputs is mirrored into a directory of this run's
-# own, the installed helper is asked where it then reads an account token (which lies directly in
-# the runtime root) and where it publishes the identity it allocates on a first use (which lies
-# directly in the state root), and each answer is mapped back through the input it came from. What
+# own, the installed helper is asked where its runtime root is and where it publishes the identity
+# it allocates on a first use (which lies directly in the state root), and each answer is mapped
+# back through the input it came from. What
 # is removed is the exact value that input holds, followed by the plain path the helper named below
 # its mirror. Every root the product derives on Linux lies inside one of those inputs, and below a
 # home or an XDG directory it lies in a directory named kalareach. So an answer outside every
@@ -177,10 +177,10 @@ inherited_reset='
     done
     # The value is read as the helper wrote it, with nothing taken out of it. A path the document
     # had to escape keeps its backslash, which the plain-path rule below refuses.
-    token="$("$helper" --json account token show |
-      sed -n "s/.*\"path\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
-    [ -n "$token" ] ||
-      refuse "the helper did not say where it reads an account token, so its runtime root is not known"
+    runtime_named="$("$helper" --json host paths |
+      sed -n "s/.*\"runtime_root\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
+    [ -n "$runtime_named" ] ||
+      refuse "the helper did not say where its runtime root is, so it is not known"
     # This has no daemon to reach and fails once it has allocated the identity, which is the part
     # being read here.
     "$helper" list >/dev/null 2>&1 || true
@@ -197,7 +197,7 @@ inherited_reset='
     # A root joins the list of what is removed only once every check below has passed for it, and
     # nothing is removed until both have been measured, so a refusal for one leaves both alone.
     count=0
-    for named in "${token%/*}" "${marker%/*}"; do
+    for named in "$runtime_named" "${marker%/*}"; do
       # What is removed is the exact value an input holds, followed by the plain path the helper
       # named below the mirror of that input. A path outside every mirror, or one whose part below
       # its mirror is not a plain path, is not one this run can map back exactly, so the run stops
@@ -441,7 +441,7 @@ self_test_ordinary_tree() {
   printf x >"$state/registry" || return 1
   printf x >"$state/sessions/one" || return 1
   printf x >"$d/home/.local/state/beside/kept" || return 1
-  printf x >"$d/run/kalareach/account-token" || return 1
+  printf x >"$d/run/kalareach/socket" || return 1
   self_test_reset "$d" "$self_test_work" "$d/tmp" HOME="$d/home" XDG_RUNTIME_DIR="$d/run" ||
     return 1
   [ ! -e "$state" ] && [ ! -e "$d/run/kalareach" ] && [ -f "$d/home/.local/state/beside/kept" ]
@@ -590,7 +590,7 @@ self_test_state_outside_kalareach() {
 # A name below a mirror that is not a plain path is refused, and nothing beside it is removed: a
 # component of `..` leads out of the directory the helper named, and a backslash or a newline is
 # what a document or a listing would split or escape a name with. The first goes through the path
-# the helper prints for its token, the other two through the file it makes. Each is a case of its
+# the helper prints for its runtime root, the other two through the file it makes. Each is a case of its
 # own, so that each is shown to depend on the rule.
 self_test_unplain_root() {
   local d="$self_test_work/${FUNCNAME[1]}" variant="$1" below kept
@@ -955,7 +955,7 @@ self_test() {
   cat >"$self_test_work/helper" <<'STAND_IN' || return 2
 #!/bin/sh
 # Stands in for the installed helper. It names the roots the way the product names them on Linux,
-# says where it reads an account token, and publishes an identity the way a first use does. A case
+# says where its runtime root is, and publishes an identity the way a first use does. A case
 # can give it a runtime root of its own, as a product that read one from somewhere else would, name
 # a root below the home directory, or have it keep its state in the home directory itself.
 if [ -n "${STAND_IN_RUNTIME_ROOT-}" ]; then
@@ -981,8 +981,8 @@ else
   state="$HOME/.local/state/kalareach"
 fi
 case "$*" in
-  "--json account token show")
-    printf '{\n  "ok": true,\n  "path": "%s/account-token",\n  "imported": false\n}\n' "$runtime"
+  "--json host paths")
+    printf '{\n  "ok": true,\n  "runtime_root": "%s",\n  "state_root": "%s"\n}\n' "$runtime" "$state"
     ;;
   list)
     mkdir -p "$state" && printf 'environment\n' >"$state/environment-id"

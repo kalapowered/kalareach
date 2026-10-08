@@ -782,65 +782,6 @@ mod cases {
         }
     }
 
-    /// An account token document names its origin by scheme, host and port and its scopes by the
-    /// names this build knows, whatever the file holds, and a document that cannot be read says
-    /// where and nothing of what.
-    #[test]
-    fn an_account_token_names_its_origin_and_scopes_and_nothing_else() {
-        use crate::services::voice::{AccountTokenFile, StoredAccountToken};
-
-        let document = serde_json::json!({
-            "origin": "https://reach.example",
-            "accessToken": "a-value-that-is-never-shown",
-            "scopes": ["voice", "billing.read"],
-            "expiresAtMs": 1_700_000_000_000_u64,
-        });
-        for planted in json_plantings(&document, MARKER) {
-            let bytes = serde_json::to_vec(&planted.input).expect("a document");
-            match StoredAccountToken::read(&bytes) {
-                Ok(stored) => {
-                    assert_unmarked(&planted.at, &debug_renderings(&stored));
-                    assert_unmarked(&planted.at, &[stored.description().into_string()]);
-                }
-                Err(error) => assert_unmarked(&planted.at, &failure_renderings(error)),
-            }
-        }
-        for origin in [
-            format!("https://{MARKER}:{MARKER}@reach.example"),
-            format!("https://{MARKER}@reach.example"),
-            format!("https://reach.example/{MARKER}"),
-            format!("https://reach.example?{MARKER}"),
-            format!("https://reach.example#{MARKER}"),
-        ] {
-            let bytes = serde_json::to_vec(&serde_json::json!({
-                "origin": origin,
-                "accessToken": MARKER,
-                "scopes": [MARKER, "voice"],
-            }))
-            .expect("a document");
-            match StoredAccountToken::read(&bytes) {
-                Ok(stored) => {
-                    assert_unmarked(&origin, &debug_renderings(&stored));
-                    let described = stored.description().into_string();
-                    assert_unmarked(&origin, std::slice::from_ref(&described));
-                    assert!(
-                        described.contains("voice and 1 scope(s) this build does not know"),
-                        "{described}"
-                    );
-                }
-                Err(error) => assert_unmarked(&origin, &failure_renderings(error)),
-            }
-            let file = AccountTokenFile::at(std::path::PathBuf::from("/runtime/token.json"))
-                .for_origin(origin.clone());
-            assert_unmarked(&origin, &debug_renderings(&file));
-        }
-        let broken = StoredAccountToken::read(format!("{{\"origin\": {MARKER}").as_bytes())
-            .expect_err("not a document");
-        let said = broken.to_string();
-        assert!(said.contains("line 1"), "{said}");
-        assert_unmarked("a broken document", &failure_renderings(broken));
-    }
-
     /// A stored sign-in names none of what it holds, whatever the file says: every text leaf, key and
     /// other leaf of the document planted in turn and read through the store's own reader.
     #[test]

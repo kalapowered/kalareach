@@ -689,6 +689,16 @@ impl Controller {
                 crate::push::external::check_secret(&params.secret)
                     .map_err(ControllerError::InvalidArgument)?;
             }
+            // The host's sign-in belongs to the environment, not to a session.
+            Method::AccountSignIn => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "this host's sign-in belongs to this environment, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                let _: kr_protocol::host_account::AccountSignInParams = parse(&mutation.params)?;
+            }
             // Privacy mode belongs to the environment, not to a session.
             Method::PrivacySet => {
                 if mutation.target.session_id.as_ref().is_some() {

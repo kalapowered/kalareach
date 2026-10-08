@@ -1773,31 +1773,3 @@ fn generation_of(signed_in: &SignedInAccount) -> String {
         other => panic!("not signed in: {other:?}"),
     }
 }
-
-/// The scoped source on a host: an imported token is refused for a scope it was not issued with,
-/// and handed out for one it was.
-#[tokio::test]
-async fn an_imported_token_is_refused_for_a_scope_it_was_not_issued_with() {
-    use kr_client::services::voice::{AccountTokenFile, StoredAccountToken, account_token_path};
-
-    let directory = tempfile::tempdir().expect("a directory on the internal disk");
-    let path = account_token_path(directory.path());
-    let stored = StoredAccountToken::read(
-        br#"{"origin":"https://reach.example","accessToken":"an-imported-token","scopes":["voice"]}"#,
-    )
-    .expect("a token document");
-    kr_ipc::paths::write_owner_only_file(&path, &stored.write().expect("bytes"))
-        .expect("the stored token");
-    let source = AccountTokenFile::at(path).for_origin("https://reach.example");
-    let refused = source.token(LEASE_SCOPE).await.expect_err("no lease scope");
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
-    assert!(!refused.to_string().contains("an-imported-token"));
-    assert_eq!(
-        source
-            .token("voice")
-            .await
-            .expect("the voice scope")
-            .expose(),
-        "an-imported-token"
-    );
-}

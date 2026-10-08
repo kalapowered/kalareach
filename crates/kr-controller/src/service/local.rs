@@ -201,6 +201,7 @@ impl Controller {
                 | Method::DevicePreviewKeyUpdate
                 | Method::DeliveryDestinationSecretSet
                 | Method::PrivacySet
+                | Method::AccountSignIn
                 | Method::SessionRename
                 | Method::DescriptionConfigure
                 | Method::DescriptionDownload
