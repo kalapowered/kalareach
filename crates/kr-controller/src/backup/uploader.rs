@@ -1725,8 +1725,11 @@ impl Uploader {
             // The service answered and published nothing. One that already holds a generation of
             // the archive at or above this one never takes it, whatever the refusal said, so the
             // attempt ends there; otherwise the same publication sent again is the first one that
-            // can land.
-            Err(error @ ClientError::Refused { .. }) => {
+            // can land. An outcome the service says it cannot settle is not that: the publication
+            // may have taken effect, so it stays unanswered below and the next pass asks.
+            Err(error @ ClientError::Refused { .. })
+                if error.code() != ErrorCode::OutcomeUnknown =>
+            {
                 self.unanswered.remove(&sequence);
                 // What the service says to the question asked next is part of what holds this
                 // publication back: a person to act and a delay to wait are both owed.
