@@ -38,7 +38,6 @@
 //! Signing out removes the grant and asks the service to end it, under the same scope rule as
 //! signing in.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -146,8 +145,8 @@ struct Inner {
     /// Whether a managed call is open on this host, or about to open or close, once the voice
     /// service exists.
     call_open: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
-    /// Set while the account is being changed: no token is handed out until it has been.
-    changing: AtomicBool,
+    /// True while the account is being changed: a request for a token waits until it has been.
+    changing: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "testing")]
     loopback: Mutex<Option<std::net::SocketAddr>>,
 }
@@ -220,7 +219,7 @@ impl HostAccount {
                 running: tokio::sync::Mutex::new(None),
                 recovered: tokio::sync::OnceCell::new(),
                 call_open: std::sync::OnceLock::new(),
-                changing: AtomicBool::new(false),
+                changing: tokio::sync::watch::channel(false).0,
                 #[cfg(feature = "testing")]
                 loopback: Mutex::new(None),
             }),
@@ -455,14 +454,14 @@ fn named_by(origin: &str) -> String {
         .collect()
 }
 
-/// The account being changed: no token is handed out while this is held.
+/// The account being changed: a request for a token waits while this is held.
 struct Change<'a> {
     inner: &'a Inner,
 }
 
 impl Drop for Change<'_> {
     fn drop(&mut self) {
-        self.inner.changing.store(false, Ordering::SeqCst);
+        self.inner.changing.send_replace(false);
     }
 }
 
@@ -539,12 +538,14 @@ impl Inner {
         )
     }
 
-    /// Begins changing the account: no token is handed out until the returned gate is dropped.
+    /// Begins changing the account: a request for a token waits until the returned gate is dropped.
     ///
     /// The gate is raised before the calls are looked at. A start registers itself before it asks
-    /// for its token, so it is either seen here or finds the gate up when it asks.
+    /// for its token, so it is either counted here or finds the gate up when it asks, and then
+    /// waits for the change to end and takes the token of the account the change leaves. A call
+    /// this check counts, and so refuses the change for, waits at most as long as the check.
     fn begin_change(&self) -> Result<Change<'_>> {
-        if self.changing.swap(true, Ordering::SeqCst) {
+        if self.changing.send_replace(true) {
             return Err(ControllerError::Refused {
                 code: ErrorCode::ResourceUnavailable,
                 detail: "this host's account is being changed; ask again when it has".to_owned(),
@@ -647,8 +648,14 @@ impl Inner {
                 let refresh = issued.refresh_token.clone();
                 // The account changes now. A call that opened while the exchange was out leaves
                 // the new grant unused: it is revoked, and nothing the call holds changes.
+                // Another change is not one this attempt can be told apart from: a sign-out waits
+                // for an attempt, so only a call can refuse it here.
                 let Ok(_change) = self.begin_change() else {
-                    let _ = held.account.revoke(&refresh).await;
+                    // Queued before it is sent, so a service that cannot be reached is told again
+                    // when the daemon next starts.
+                    if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
+                        eprintln!("kr-controller: a refused sign-in could not be revoked: {error}");
+                    }
                     return AccountAttempt::CallOpen;
                 };
                 if let Err(error) = held.signed_in.commit(issued, grant.nonce()).await {
@@ -710,16 +717,15 @@ impl AccountTokenSource for HostTokens {
                     ),
                 ));
             };
-            // While the account is being changed no token goes out, so that a call that starts
-            // then is not made under an account that is about to go.
-            if self.inner.changing.load(Ordering::SeqCst) {
-                return Err(kr_client::ClientError::refusal(
-                    ErrorCode::ResourceUnavailable,
-                    kr_client::shown::Shown::said(
-                        "this host's account is being changed, so no token is presented now",
-                    ),
-                ));
-            }
+            // While the account is being changed a request waits for the change to end, so that a
+            // call that starts then is made under the account the change leaves and not under one
+            // that is about to go.
+            let _ = self
+                .inner
+                .changing
+                .subscribe()
+                .wait_for(|changing| !*changing)
+                .await;
             if self.inner.recover().await.is_err() {
                 return Err(kr_client::ClientError::refusal(
                     ErrorCode::StorageUnavailable,

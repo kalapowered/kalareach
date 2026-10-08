@@ -158,16 +158,25 @@ impl AppState {
     }
 
     /// Records that the connection `session` belongs to has ended, and why, unless a newer
-    /// connection has already taken its place.
+    /// connection has already taken its place. The comparison and the removal are one step.
     pub fn disconnected_from(&self, session: &Arc<Session>, reason: impl Into<String>) {
-        let ours = self
-            .connection
-            .read()
-            .expect("the state lock is not poisoned")
-            .as_ref()
-            .is_some_and(|held| Arc::ptr_eq(&held.session(), session));
-        if ours {
-            self.disconnected(reason);
+        let removed = {
+            let mut held = self
+                .connection
+                .write()
+                .expect("the state lock is not poisoned");
+            if held
+                .as_ref()
+                .is_some_and(|connection| Arc::ptr_eq(&connection.session(), session))
+            {
+                *held = None;
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            *self.reason.write().expect("the state lock is not poisoned") = Some(reason.into());
         }
     }
 
