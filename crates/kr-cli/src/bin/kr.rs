@@ -1024,6 +1024,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                 kr_cli::account::sign_in(&arguments.selector, cli.json).await?;
                 Ok(Completion::Done)
             }
+            AccountCommand::SignOut(arguments) => {
+                kr_cli::account::sign_out(&arguments.selector, cli.json).await?;
+                Ok(Completion::Done)
+            }
             AccountCommand::Show(arguments) => {
                 kr_cli::account::show(&arguments.selector, cli.json).await?;
                 Ok(Completion::Done)

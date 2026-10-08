@@ -39,7 +39,7 @@ worker directly for what a session owns.
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
 | `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
-| `kr account [sign-in/show]` | — | Sign this host in to the managed account service, in a browser, or show where the sign-in stands |
+| `kr account [sign-in/sign-out/show]` | — | Sign this host in to the managed account service, in a browser, sign it out, or show where the sign-in stands |
 | `kr host paths` | — | Show where this installation keeps its runtime files and its state |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
@@ -1656,6 +1656,7 @@ control daemon alone holds the sign-in:
 
 ```sh
 kr account sign-in    # print the address to open in a browser, and open it
+kr account sign-out   # remove the account and ask the service to end the sign-in
 kr account show       # signed out, waiting for the browser, signed in, or ended
 ```
 
@@ -1664,18 +1665,23 @@ client is registered with, and prints the address to open with the port to forwa
 no display (`ssh -L 8765:127.0.0.1:8765 <host>`). It opens the address in the default browser where
 there is one and always prints it. The command ends when the daemon is listening; the browser's page
 says how the sign-in ended, and `kr account show` says it again, with how the last attempt that ended
-ended. Nothing either command prints is a token. The host signs in at the managed account service,
-which must be the voice broker its configuration names; `docs/host/README.md` has the rest, and
-`docs/voice/README.md` what a call does with the account.
+ended. Nothing any of the commands prints is a token. The host signs in at the managed account
+service, which must be the voice broker its configuration names; `docs/host/README.md` has the rest,
+and `docs/voice/README.md` what a call does with the account.
+
+`kr account sign-out` has the daemon end a sign-in that is waiting, remove the account and ask the
+service to end it. When the service cannot be told, the account is gone from this host all the
+same, the command says so, and the daemon sends the revocation again when it next starts. It is
+refused while a voice call is open.
 
 `--json` prints `{ "ok", "opened", "authorise_url", "redirect_address", "expires_at_ms" }` for
 `sign-in`; when the attempt had already ended by the time the command looked, it prints the `show`
-document instead. `show` prints `{ "ok", "state", "service", "unavailable", "email", "scopes",
+document instead. `sign-out` prints `{ "ok", "was_signed_in", "service_told" }`. `show` prints `{ "ok", "state", "service", "unavailable", "email", "scopes",
 "last_attempt" }`, where `state` is `signed_out`, `waiting_for_browser`, `finishing`, `signed_in`
 or `ended`, and the other fields are present only when they apply: `service` is where the host signs
 in, and `unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it signs in
-nowhere. A host that signs in nowhere refuses `sign-in` with `HOST_NOT_CONFIGURED`, and one with a
-voice call open refuses it with `RESOURCE_UNAVAILABLE`.
+nowhere. A host that signs in nowhere refuses `sign-in` and `sign-out` with `HOST_NOT_CONFIGURED`,
+and one with a voice call open refuses them with `RESOURCE_UNAVAILABLE`.
 
 ## `kr host paths`
 

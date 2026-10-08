@@ -90,6 +90,16 @@
           "const": "superseded",
           "description": "A newer attempt ended this one.",
           "type": "string"
+        },
+        {
+          "const": "listener_failed",
+          "description": "The loopback address could not be opened for a reason other than another program holding\nit.",
+          "type": "string"
+        },
+        {
+          "const": "call_open",
+          "description": "A managed voice call was open, and a call closes under the account it started under.",
+          "type": "string"
         }
       ]
     },
@@ -112,7 +122,7 @@
               "type": "null"
             }
           ],
-          "description": "How the last attempt ended, until the next one begins. It is null before any attempt since\nthe daemon started."
+          "description": "How the most recent attempt that has ended ended. It stays while a newer attempt waits, and\nis null before any attempt has ended since the daemon started or the host was signed out."
         },
         "service": {
           "anyOf": [
@@ -123,15 +133,27 @@
               "type": "null"
             }
           ],
-          "description": "The managed service this host's configuration names as its voice broker, which is where a\nsign-in is made and where its token is presented. Null when the host names none."
+          "description": "The account service this host signs in at, which is also where its token is presented: the\nvoice broker its configuration names, when that is the account service. Null when it is\nnot, and `unavailable` says why."
         },
         "state": {
           "$ref": "#/$defs/AccountState",
           "description": "The account this host is signed in as, or what stands in its way."
+        },
+        "unavailable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SignInUnavailable"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why this host signs in nowhere, when `service` is null."
         }
       },
       "required": [
         "service",
+        "unavailable",
         "state",
         "last_attempt"
       ],
@@ -153,6 +175,30 @@
       },
       "required": [
         "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "AccountSignOutParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `account.sign_out`. The environment is the one the connection reaches.",
+      "type": "object"
+    },
+    "AccountSignedOut": {
+      "additionalProperties": false,
+      "description": "What `account.sign_out` answers: whether there was an account to sign out, and whether the\nservice has been told to end it.",
+      "properties": {
+        "service_told": {
+          "description": "Whether the service has acknowledged ending the grant. When it has not, the grant is gone\nfrom this host and the daemon sends the revocation again when it next starts.",
+          "type": "boolean"
+        },
+        "was_signed_in": {
+          "description": "Whether an account was signed in. A host with none answers `false` and changes nothing.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "was_signed_in",
+        "service_told"
       ],
       "type": "object"
     },
@@ -232,7 +278,7 @@
               "description": "The account's address, when the service said it."
             },
             "origin": {
-              "description": "The service the sign-in belongs to. A call is brokered at the service the host's\nconfiguration names, and a token from another service is never presented to it.",
+              "description": "The account service the sign-in was made at, which is also the voice broker.",
               "type": "string"
             },
             "scopes": {
@@ -18968,7 +19014,12 @@
         },
         {
           "const": "account.sign_in",
-          "description": "Start this host's own sign-in to the managed account service: listen on the loopback address the desktop client is registered with, answer the address a person opens in a browser, and keep the grant that comes back in this host's secret store. Nothing in the answer is a token.",
+          "description": "Start this host's own sign-in to the managed account service: listen on the loopback address the desktop client is registered with, and keep the grant that comes back from the person's browser in this host's secret store. The address the person opens is read with account.status. Nothing in the answer is a token.",
+          "type": "string"
+        },
+        {
+          "const": "account.sign_out",
+          "description": "End this host's own sign-in to the managed account service: remove the grant from this host's secret store and ask the service to end it. Refused while a voice call is open, because a call closes under the account it started under. The answer says whether an account was signed in and whether the service acknowledged ending it; nothing in it is a token.",
           "type": "string"
         },
         {
@@ -20335,7 +20386,7 @@
             }
           ],
           "default": null,
-          "description": "The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays\nand Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker, and\nplugin repositories. Nothing goes around it, so an address it cannot reach fails. Name lookups and mail\nsubmission do not use it. It is this machine's own choice: no invitation or host bundle\ncarries it. It names no user and no password, because a proxy that needs credentials is\nnot supported."
+          "description": "The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays\nand Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and\naccount service, and plugin repositories. Nothing goes around it, so an address it\ncannot reach fails. Name lookups and mail submission do not use it. It is this machine's\nown choice: no invitation or host bundle carries it. It names no user and no password,\nbecause a proxy that needs credentials is not supported."
         },
         "relay_only": {
           "anyOf": [
@@ -33054,6 +33105,26 @@
       "pattern": "^[1-9A-HJ-NP-Za-km-z]{4}-[1-9A-HJ-NP-Za-km-z]{3}-[1-9A-HJ-NP-Za-km-z]{3}$",
       "type": "string"
     },
+    "SignInUnavailable": {
+      "description": "Why a host signs in nowhere.",
+      "oneOf": [
+        {
+          "const": "no_broker",
+          "description": "The host's configuration names no voice broker.",
+          "type": "string"
+        },
+        {
+          "const": "broker_is_another_service",
+          "description": "The voice broker it names is another service than the account service the host signs in at.",
+          "type": "string"
+        },
+        {
+          "const": "not_usable",
+          "description": "The host could not set up how to reach the account service the way its configuration says.",
+          "type": "string"
+        }
+      ]
+    },
     "Signature64": {
       "contentEncoding": "base64url",
       "description": "A 64-byte Ed25519 detached signature. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
@@ -38093,6 +38164,12 @@
     },
     "account_sign_in_started": {
       "$ref": "#/$defs/AccountSignInStarted"
+    },
+    "account_sign_out_params": {
+      "$ref": "#/$defs/AccountSignOutParams"
+    },
+    "account_signed_out": {
+      "$ref": "#/$defs/AccountSignedOut"
     },
     "account_state": {
       "$ref": "#/$defs/AccountState"
