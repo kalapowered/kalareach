@@ -917,6 +917,26 @@ impl Controller {
                     detail: "the backup service could not be reconciled".to_owned(),
                 })??;
         }
+        // A device whose grant runs out while the daemon runs is no longer paired, and its
+        // destination, the credential held for it and the authorisation behind it end with that,
+        // as they do at its unpairing. Whatever finds the end writes it down, and the writing
+        // starts the ending, on a blocking thread of its own: the finder may hold a lock the
+        // ending needs.
+        {
+            let daemon = Arc::downgrade(&controller);
+            let runtime = tokio::runtime::Handle::current();
+            controller
+                .lifetimes()
+                .pending_expiry()
+                .on_recorded(move |device_id| {
+                    let daemon = daemon.clone();
+                    drop(runtime.spawn_blocking(move || {
+                        if let Some(daemon) = daemon.upgrade() {
+                            daemon.retire_push_destination(device_id);
+                        }
+                    }));
+                });
+        }
         // Delivery the same way: what an earlier daemon left on the wire becomes an outcome
         // nobody knows, and what is no longer authorised is taken back, before a pass can claim
         // anything. The loop then drives the outbox until the daemon goes.

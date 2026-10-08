@@ -546,12 +546,41 @@ impl DeliveryRuntime {
             .spawn_blocking(move || sweeping.sweep_revocations());
     }
 
+    /// Asks where each paired device's grant stands, so that one that has run out is found while
+    /// nothing is being delivered to it.
+    ///
+    /// A grant's end is found by whatever asks about it, and the host records it when it does.
+    /// Left to the deliveries, a device that no notification reaches would keep its destination
+    /// and have its credential renewed at the gateway until one did. The answer is not used here:
+    /// asking is what finds the end, and what the end does to the device's destination is done by
+    /// whoever is told it is on record.
+    fn observe_devices(&self) {
+        let destinations = match self
+            .module
+            .with(|producer| producer.journal().destinations().map_err(storage))
+        {
+            Ok(destinations) => destinations,
+            Err(error) => {
+                eprintln!(
+                    "kr-controller: the paired devices' grants were not asked about: {error}"
+                );
+                return;
+            }
+        };
+        for destination in destinations {
+            if destination.enabled && destination.as_push().is_some() {
+                let _ = self.authority.device_scope(&destination);
+            }
+        }
+    }
+
     /// Runs one sweep of questions, and returns whether there was a transport to run it with.
     fn ask(&self) -> bool {
         let Some(adapters) = self.adapters.get() else {
             return false;
         };
         self.sweep_revocations();
+        self.observe_devices();
         let _ = self.credentials.renew_due(SystemClock.now_ms());
         if let Err(error) = self.module.resolve_unknown(
             &adapters.unknown,

@@ -59,12 +59,32 @@ pub struct HostRecords {
 /// database another process is holding. The connection that observed it then ends, and the record
 /// is still owed, so it is kept here and written by the host's own task. Section 9 does not let
 /// withdrawn authority come back, and a tombstone that was never written is how it would.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PendingExpiry {
     owed: std::sync::Mutex<std::collections::BTreeMap<DeviceId, TimestampMs>>,
+    /// Told of each expiry once it is written, so what depends on a device being paired can end.
+    on_recorded: std::sync::OnceLock<Box<dyn Fn(DeviceId) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for PendingExpiry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingExpiry")
+            .field("owed", &self.owed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PendingExpiry {
+    /// Has `hook` told of every expiry from here on, once it is on record and not before.
+    ///
+    /// It runs on whichever thread writes the record, after the write and with nothing of this
+    /// directory held, and it must not wait for anything that thread may be holding: a hook that
+    /// has work to do starts it elsewhere. Once: a second hook is ignored.
+    pub fn on_recorded(&self, hook: impl Fn(DeviceId) + Send + Sync + 'static) {
+        let _ = self.on_recorded.set(Box::new(hook));
+    }
+
     /// Records that one device's grant was found to have run out.
     ///
     /// The first moment observed for a device stays: a later observation of the same expiry is the
@@ -93,6 +113,9 @@ impl PendingExpiry {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&device_id);
+                    if let Some(hook) = self.on_recorded.get() {
+                        hook(device_id);
+                    }
                 }
                 Err(error) => eprintln!(
                     "kr-controller: could not record that device {device_id} has run out of \

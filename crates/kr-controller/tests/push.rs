@@ -2397,6 +2397,84 @@ fn a_pass_sends_to_the_destination_its_claim_validated() {
     );
 }
 
+/// Grants what `Granted` does, and keeps the destinations it was asked where a device's grant
+/// stands for.
+#[derive(Debug, Default)]
+struct WatchedDevices {
+    asked: Mutex<Vec<DestinationId>>,
+}
+
+impl WatchedDevices {
+    fn asked(&self) -> usize {
+        self.asked.lock().expect("not poisoned").len()
+    }
+}
+
+impl RecipientAuthority for WatchedDevices {
+    fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+        Some(Granted(BTreeSet::new()).scope())
+    }
+
+    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
+        self.asked
+            .lock()
+            .expect("not poisoned")
+            .push(destination.id.clone());
+        Some(Granted(BTreeSet::new()).scope())
+    }
+}
+
+/// KR-REQ-16.10: where a paired device's grant stands is asked in each round of questions, so
+/// that a grant that has run out is found while nothing is being delivered to the device. The
+/// recovery at the start asks once; the control is that nothing else asks while nothing is queued,
+/// and the round does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_of_questions_asks_where_each_devices_grant_stands() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let module = Arc::new(environment.module);
+    let authority = Arc::new(WatchedDevices::default());
+    let runtime = kr_controller::push::runtime::DeliveryRuntime::new(
+        Arc::clone(&module),
+        Arc::new(HeldCredentials::new()),
+        Arc::clone(&authority) as Arc<dyn RecipientAuthority + Send + Sync>,
+        Arc::new(kr_controller::push::sender::HostSigner::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+        )),
+        kr_controller::push::runtime::Cadence {
+            pass: std::time::Duration::from_millis(20),
+            questions: std::time::Duration::from_millis(20),
+            ..kr_controller::push::runtime::Cadence::DEFAULT
+        },
+        tokio::runtime::Handle::current(),
+    );
+    runtime.start().await;
+    let after_recovery = authority.asked();
+    assert_eq!(after_recovery, 1, "recovery asked once");
+    // Several passes, with nothing queued and no transport to ask through: nothing asks.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(authority.asked(), after_recovery);
+
+    assert!(
+        runtime.attach_transport(Arc::new(OneTransport(Arc::new(
+            RecordingHttp::answering(Vec::new())
+        )
+            as Arc<dyn kr_client::services::ServiceHttp>)))
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while authority.asked() == after_recovery {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no round of questions asked where the device's grant stands"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// A secret store that stops the first read made while it is armed until the test lets it go,
 /// which is how a test holds a pass in the middle of reading a credential.
 struct SecretsThatCanBeHeld {
