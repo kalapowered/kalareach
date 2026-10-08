@@ -526,6 +526,89 @@ async fn nohup_and_disown_do_not_take_a_process_out_of_the_session() {
     assert_eq!(record.ownership_coverage, OwnershipCoverage::Incomplete);
 }
 
+/// Ends the process it holds when it is dropped, so that a failed case leaves nothing running.
+#[cfg(unix)]
+struct Job(kr_protocol::identity::ProcessStartIdentity);
+
+#[cfg(unix)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        if kr_ipc::identity::process_state(&self.0) == kr_ipc::identity::ProcessState::Running
+            && let Some(pid) = i32::try_from(self.0.pid.get())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+/// A forced close ends what the session owns whether or not the root shell's status can be read.
+/// Here the shell is ended and collected by somebody else, so asking after it fails, and a job of
+/// the session that ignores a hang-up is still running when the close is forced: it is ended, and
+/// the close still says that the shell could not be asked after.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_close_ends_what_the_session_owns_when_the_root_shells_status_cannot_be_read() {
+    let host = kr_ipc::testing::TempHost::create();
+    let named = host.root().join("job");
+    let config = configuration(
+        &host,
+        &format!(
+            "nohup sleep 300 >/dev/null 2>&1 & echo $! > '{}'; exec cat",
+            named.display()
+        ),
+    );
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let started = std::time::Instant::now();
+    let job = loop {
+        if let Some(pid) = std::fs::read_to_string(&named)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the root shell names the job it started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let job = Job(kr_ipc::identity::process_start_identity(job).expect("the job is running"));
+    session.observe_owned();
+    assert!(
+        session
+            .owned()
+            .expect("a launched session owns its processes")
+            .surviving()
+            .contains(&job.0),
+        "the session owns the job"
+    );
+
+    let root = session.root_identity().expect("a root shell").pid.get();
+    let root = i32::try_from(root)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("a process identifier");
+    rustix::process::kill_process(root, rustix::process::Signal::KILL).expect("the shell is ended");
+    rustix::process::waitpid(Some(root), rustix::process::WaitOptions::empty())
+        .expect("the shell is collected");
+
+    assert!(
+        session.force_close().is_err(),
+        "the shell's status was collected elsewhere, so it cannot be read"
+    );
+    let started = std::time::Instant::now();
+    while kr_ipc::identity::process_state(&job.0) == kr_ipc::identity::ProcessState::Running {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the forced close ended the job the session owns"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
     let host = kr_ipc::testing::TempHost::create();

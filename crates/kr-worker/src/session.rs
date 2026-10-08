@@ -4637,9 +4637,13 @@ impl Session {
 
     /// Forces whatever is left of the owned group to stop.
     ///
+    /// The owned processes are forced to stop whatever became of the root shell, because a shell
+    /// that cannot be asked after is no reason to leave its descendants running.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the signal cannot be sent.
+    /// Returns an error when the root shell's status cannot be read or the signal to it cannot be
+    /// sent.
     pub fn force_close(&mut self) -> Result<bool> {
         if let Some(owned) = self.owned.as_mut() {
             owned.observe();
@@ -4653,15 +4657,23 @@ impl Session {
         if let Some(owned) = self.owned.as_mut() {
             owned.note_forced_now();
         }
-        if let Some(shell) = self.shell.as_mut()
-            && shell.try_wait()?.is_none()
-        {
-            shell.force_stop()?;
-        }
+        // A shell whose status cannot be read may be running, so it is signalled as well. The
+        // identity recorded for it is checked before any signal, so one that has ended is skipped.
+        let shell = self
+            .shell
+            .as_mut()
+            .map_or(Ok(()), |shell| match shell.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => shell.force_stop(),
+                Err(error) => {
+                    let _ = shell.force_stop();
+                    Err(error)
+                }
+            });
         if let Some(owned) = self.owned.as_ref() {
             crate::ownership::force_stop(owned);
         }
-        Ok(remaining)
+        shell.map(|()| remaining)
     }
 
     /// Writes the final record and moves the session to `closed`.
