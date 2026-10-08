@@ -132,6 +132,33 @@ pub async fn produced_times(runtime: &SessionRuntime, marker: &[u8], count: usiz
     retained_carrying(runtime, marker, count, LIVENESS_DEADLINE).await;
 }
 
+/// Waits until the session's retained output carries `marker` after its first `already` bytes.
+///
+/// For an application that writes the same thing again, and for a terminal that draws something of
+/// its own before the application writes anything: a Windows pseudo-console starts by clearing
+/// the screen, so a wait for a clear that the application is about to write would be satisfied by
+/// the console's. The bytes already there are the ones that are not waited on.
+pub async fn produced_after(runtime: &SessionRuntime, marker: &[u8], already: usize) {
+    let marker = on_this_terminal(marker);
+    let started = tokio::time::Instant::now();
+    loop {
+        let seen = retained(runtime);
+        let after = &seen[already.min(seen.len())..];
+        if carried_times(after, &marker) >= 1 {
+            return;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for {} after the first {already} bytes of the session's retained output, \
+             which ends {}",
+            started.elapsed(),
+            String::from_utf8_lossy(&marker).escape_debug(),
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// What `marker` is on this platform's terminal.
 ///
 /// A marker names what the terminal carried. A Unix terminal's line discipline turns the line feed
