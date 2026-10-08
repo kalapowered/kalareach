@@ -98,6 +98,10 @@ pub enum Command {
     /// Turn this environment's privacy mode on or off, or show where it stands.
     #[command(subcommand)]
     Privacy(PrivacyCommand),
+    /// List, create and remove the places this host sends notifications besides paired devices: a
+    /// webhook, Slack, Discord, Telegram or email.
+    #[command(subcommand)]
+    Destination(DestinationCommand),
 }
 
 /// The environment one command acts in.
@@ -519,6 +523,92 @@ pub enum PrivacyCommand {
 /// `kr privacy on`, `off` and `status`.
 #[derive(Args)]
 pub struct PrivacyArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr destination` operation.
+#[derive(Subcommand)]
+pub enum DestinationCommand {
+    /// List the notification destinations in service: paired devices' and the ones you configured.
+    List(DestinationListArguments),
+    /// Create an external notification destination, or replace the one with the same identifier.
+    ///
+    /// Whoever can read the destination can read what it is sent, and every message says so. What
+    /// the destination is told is decided by the grant you name: only the sessions, rights and
+    /// history that grant reaches, and only while it stands.
+    Configure(DestinationConfigureArguments),
+    /// Remove a notification destination, the credential kept for it, and what was queued for it
+    /// and not sent.
+    Remove(DestinationRemoveArguments),
+}
+
+/// `kr destination list`.
+#[derive(Args)]
+pub struct DestinationListArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// Which service an external notification destination sends to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DestinationKindArgument {
+    /// An HTTPS endpoint, which receives one POST for each message. It sends with no credential.
+    Webhook,
+    /// A Slack channel, through an incoming webhook.
+    Slack,
+    /// A Discord channel, through a webhook.
+    Discord,
+    /// A Telegram chat, through a bot.
+    Telegram,
+    /// An email recipient, through a mail submission account.
+    Email,
+}
+
+/// `kr destination configure`.
+#[derive(Args)]
+pub struct DestinationConfigureArguments {
+    /// The identifier to configure the destination under.
+    pub destination: String,
+    /// The service it sends to.
+    #[arg(long, value_enum)]
+    pub kind: DestinationKindArgument,
+    /// Where it sends: a webhook's HTTPS address; for Slack and Discord the name of the channel
+    /// the credential's webhook posts to; for Telegram the chat; for email the recipient's
+    /// address. Never a credential.
+    #[arg(long)]
+    pub endpoint: String,
+    /// The grant whose authority the content is intersected with, by identifier. It has to stand.
+    #[arg(long, value_name = "GRANT")]
+    pub grant: String,
+    /// What to call the rule that sends to this destination. The destination's identifier when
+    /// absent.
+    #[arg(long, value_name = "NAME")]
+    pub rule_name: Option<String>,
+    /// The header a webhook deduplicates by, such as `Idempotency-Key`. This host sends each
+    /// message's identifier under it, so a repeat is not a second message. Without it a webhook
+    /// is never retried after an outcome nobody knows.
+    #[arg(long, value_name = "HEADER")]
+    pub idempotency_header: Option<String>,
+    /// The file that holds the credential, for every service but a webhook: Slack's or Discord's
+    /// webhook address, Telegram's bot token, or for email a JSON document with `server`, `port`,
+    /// `security`, `username`, `password` and `from_address`. It is read once, kept in this host's
+    /// secret store and never printed.
+    #[arg(long, value_name = "PATH")]
+    pub credential_file: Option<PathBuf>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr destination remove`.
+#[derive(Args)]
+pub struct DestinationRemoveArguments {
+    /// The destination, by identifier. A paired device's is named by the device's identifier:
+    /// removing it ends delivery to the device without unpairing it.
+    pub destination: String,
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,
