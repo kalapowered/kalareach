@@ -35,6 +35,8 @@ kr-pairing.workspace = true
 kr-protocol.workspace = true
 kr-shell-integration.workspace = true
 kr-term.workspace = true
+# The sign-in address, opened in the default browser.
+open.workspace = true
 qrcodegen.workspace = true
 rmcp.workspace = true
 schemars.workspace = true

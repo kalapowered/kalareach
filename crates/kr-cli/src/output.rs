@@ -74,6 +74,8 @@ pub enum Request {
     /// What session descriptions offer on this host: the model's name, where its files come from
     /// and why a fetch failed: `kr host descriptions`.
     Descriptions,
+    /// The address a sign-in is opened at and the account it signed in: `kr account`.
+    Account,
 }
 
 /// Content the person asked to read.

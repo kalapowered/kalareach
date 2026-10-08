@@ -35,6 +35,7 @@
 //! | [`privacy`] | The environment's privacy record, and the composition root that drives each daemon subsystem through privacy mode |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
+pub mod account;
 pub mod agent_tools;
 pub mod archive;
 pub mod attention;
@@ -51,6 +52,7 @@ pub mod directory;
 pub mod error;
 pub mod grants;
 pub mod machine;
+pub mod managed_transport;
 pub mod privacy;
 pub mod project;
 pub mod push;

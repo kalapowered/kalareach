@@ -167,9 +167,9 @@ answering, and none of them settles it.
 ### The network and the voice broker
 
 Whether this host joins the network, and every service it uses there, is the document's `network`
-section. The managed voice broker it starts its paired devices' calls at is the `voice` section. Nothing
-else chooses either. No environment variable reaches them, so a daemon started with the variables
-an older build read joins nothing because of them.
+section. The managed voice broker it starts its paired devices' calls at is the `voice` section.
+Nothing else chooses either. No environment variable reaches them, so a daemon started with the
+variables an older build read joins nothing because of them.
 
 ```json
 "network": {
@@ -200,7 +200,7 @@ an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and account service, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 
@@ -223,8 +223,9 @@ carries it.
 One rule covers the proxy. Every outbound HTTPS connection this host makes goes through it when the
 document names one: the endpoint's relays and Pkarr servers, the rendezvous it reserves a code's
 locator at and opens the room at, delivery to the push gateway and to webhook addresses, the
-managed voice broker, and plugin repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook
-included. Mail submission is SMTP and connects directly, and name lookups go directly too. Without
+managed voice broker and the account service it signs in at, and plugin repositories. Nothing goes
+around it, so an address the proxy cannot reach fails, a webhook included. Mail submission is SMTP
+and connects directly, and name lookups go directly too. Without
 a proxy every one of those connections goes directly, apart from iroh's relay latency probe and
 captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
 set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
@@ -240,6 +241,35 @@ document now selects something other than what the daemon started with, the chec
 edit applies at the next start. What only the start can find out, a trust anchor file that is
 missing or empty or a bind address somebody else holds, stops the start with the key named, rather
 than leaving a host that appears to run and cannot be reached.
+
+### Account sign-in
+
+Brokering a managed call spends an account's balance, so the host signs an account in on its own,
+at this machine. `kr account sign-in` asks the control daemon over its local socket
+(`account.sign_in`, served there alone and asking for host management). The daemon listens on the
+loopback address the desktop client is registered with, `127.0.0.1:8765`, and answers the address a
+person opens in a browser; the command opens it and always prints it, with a note for a host
+without a display: forward the port from the machine that has the browser,
+`ssh -L 8765:127.0.0.1:8765 <host>`, and open the printed address there. The daemon exchanges the
+answer with the service, keeps the grant in the host's secret store, and records the service's
+origin beside it. `kr account show` (`account.status`) says whether the host is signed out, waiting
+for the browser, signed in at which service, or ended, and how the last attempt ended. Nothing it
+prints or answers is a token.
+
+The grant is the one the companion keeps on a desktop: an access token that lasts ten minutes, and
+a refresh token that rotates on every use, so a second holder would end the sign-in. That is why
+only the daemon holds it. A call that needs a token asks for one when it needs it, and the daemon
+refreshes the grant then, never before. A token is presented only to the service the grant was
+signed in at. When the document names another broker origin than the one recorded, no token is
+presented, and the host says so until a person signs in again against the new origin. Signing in
+again replaces the grant and queues the old one for revocation. A host whose service ended the
+sign-in (a refresh token it no longer accepts) shows `ended` until then.
+
+The sign-in is single use and local: one attempt waits at a time, a newer one ends the older one,
+and nothing is waiting after fifteen minutes. A program that already holds the loopback address
+stops the attempt with `port_busy`. A host that held an account token file from an earlier version
+removes it once, when the daemon starts, because that file held no refresh credential; the person
+signs in.
 
 ### How the daemon is started
 
@@ -3188,14 +3218,15 @@ store and starts carrying the outbox. A service that does not answer in time doe
 start: reconciliation records the generation as unknown, as it does for a publication nothing could
 ask about. That question carries no account token, so it is asked whatever token the host holds.
 
-Requests that spend an account's storage carry the account token the operator imported with `kr
-account token import`, beside the writer's signature. The client reads the file for each request,
-so a token imported while the daemon runs is used from then on. Nothing leaves the host with a token
-that is absent, that was issued for another service, that lacks the `backup.write` scope or that the
-file says has expired. While there is work and no usable token, the daemon looks at the file again
-every 30 seconds. The token is an access token with no refresh, so an upload that outlasts it stops
-until the operator imports another. A host that signs in for itself needs a grant it can renew, and
-this carrier has none.
+Requests that spend an account's storage carry the account token of the sign-in held by the daemon
+(`kr account sign-in`), beside the writer's signature. The daemon will renew this token as needed,
+allowing uploads to last longer than the life of any one token. Nothing leaves the host with a token
+if no account is signed in, if the account was signed in to a service other than the one
+`storage.origin` names, if the service has ended the sign-in, or if the grant lacks `backup.write`.
+In each of these cases, `kr doctor` says which holds and names signing in again as the remedy. As
+long as there is work to be done and the host has no usable token, the daemon looks again every 30
+seconds. This is needed because a person signs in at a command line, which tells the carrier
+nothing.
 
 The carrier waits between passes as the service and the cause allow:
 
