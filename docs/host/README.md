@@ -1198,7 +1198,7 @@ history keeps the raw stream underneath.
 
 | What arrives | What an attached terminal gets |
 | --- | --- |
-| Ordinary output | the same bytes, forwarded unchanged, in direct mode; a caller shown the live screen alone is sent them without the commands that only describe the screen |
+| Ordinary output | the same bytes, forwarded unchanged, in direct mode; the recipient of a share is sent them without the commands that only describe the screen |
 | A query | nothing; the host answers it once, into the application's own input |
 | A bell, clipboard write, notification or progress report | delivered to the one attachment holding the input lease, and to nobody else |
 | A sequence the profile does not name | nothing; it is consumed with a rate-limited diagnostic |

@@ -657,7 +657,7 @@ impl LocalClient {
                     grant_rights: grant_rights.clone(),
                     accepted_deadline_boot_ms,
                     history: None,
-                    previewed_screen: false,
+                    screen_basis: None,
                 },
             )))
             .await?;

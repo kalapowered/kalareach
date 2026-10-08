@@ -24,7 +24,7 @@ use kr_protocol::envelope::{
 use kr_protocol::grant::HistoryScope;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
-    ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalClientKind,
+    ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalClientKind, ScreenBasis,
 };
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -53,13 +53,15 @@ pub struct Vouched<'a> {
     /// it holds results to a scope ([`kr_protocol::local::FORWARDED_RESULT_SCOPE`]), because an
     /// earlier worker ends the link a frame with a member it does not know arrived on.
     pub history: Option<&'a HistoryScope>,
-    /// Whether the grant the host decided this request under is a share, whose issuer was shown
-    /// the session's screen as text. A `session.attach` is then drawn that screen and no more.
+    /// The kind of grant the host decided this request under, for a `session.attach`: a share,
+    /// whose issuer was shown the session's screen as text and is drawn that and no more, or the
+    /// device's pairing grant.
     ///
     /// It goes only to a worker that states
-    /// [`kr_protocol::local::FORWARDED_PREVIEWED_SCREEN`], and an attach under a share is
-    /// refused for a worker that does not, since the worker would draw it more than was shown.
-    pub previewed_screen: bool,
+    /// [`kr_protocol::local::FORWARDED_PREVIEWED_SCREEN`]. An attach under a share is refused for a
+    /// worker that does not, since the worker would draw it more than was shown, and an attach
+    /// under a pairing grant is sent without it, as it always was.
+    pub screen_basis: Option<ScreenBasis>,
 }
 use crate::service::Controller;
 
@@ -401,9 +403,10 @@ impl WorkerProxy {
         }
         // An attachment under a share is drawn the screen its issuer was shown, which a worker that
         // does not state it narrows to would draw more of; it is not asked.
-        let previewed_screen =
-            vouched.previewed_screen && mutation.method.method() == Some(Method::SessionAttach);
-        if previewed_screen && !self.narrows_to_previewed_screens {
+        let screen_basis = vouched
+            .screen_basis
+            .filter(|_| mutation.method.method() == Some(Method::SessionAttach));
+        if screen_basis == Some(ScreenBasis::Share) && !self.narrows_to_previewed_screens {
             return Err(ControllerError::Refused {
                 code: kr_protocol::error::ErrorCode::UnsupportedCapability,
                 detail: "this session's worker is of a build that cannot draw a shared session's \
@@ -425,7 +428,7 @@ impl WorkerProxy {
                 .history
                 .filter(|_| self.holds_results_to_scopes)
                 .cloned(),
-            previewed_screen,
+            screen_basis: screen_basis.filter(|_| self.narrows_to_previewed_screens),
         }));
         let mut answered = self.call(request_id, &frame).await?;
         answered.holds_results_to_scopes = self.holds_results_to_scopes;
