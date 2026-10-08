@@ -1253,6 +1253,7 @@ dependencies = [
  "kr-controller",
  "kr-crypto",
  "kr-describe",
+ "kr-flush",
  "kr-ipc",
  "kr-loopback",
  "kr-pairing",
