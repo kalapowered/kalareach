@@ -41,7 +41,7 @@ use kr_worker::snapshot::PaletteChoice;
 
 mod common;
 
-use common::{LIVENESS_DEADLINE, carries, produced};
+use common::{LIVENESS_DEADLINE, carries, produced, produced_after, retained};
 
 /// The session's own size. An attachment of exactly this size takes the stream directly.
 const CANONICAL: (u64, u64) = (80, 24);
@@ -2310,10 +2310,6 @@ async fn a_terminal_kept_off_the_stream_by_its_screen_is_handed_it_when_the_scre
 /// when it returns after the application has cleared the screen, with no output from the
 /// application to prompt it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
-)]
 async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_screen_can_be_carried() {
     let narrow = Dimensions::new(4, 5);
     let smaller = Dimensions::new(3, 5);
@@ -2358,8 +2354,9 @@ async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_scree
     // The window shrinks again and the application clears the screen while that is so, so nothing
     // keeps the terminal off the stream but its own size.
     report_viewport(&host, &mut attached, smaller, None).await;
+    let already = retained(&host.runtime).len();
     typist.release(&host).await;
-    produced(&host.runtime, b"\x1b[2J").await;
+    produced_after(&host.runtime, b"\x1b[2J", already).await;
 
     // The window is the session's size again, and the screen the session holds can be carried.
     let report = report_viewport(&host, &mut attached, narrow, None).await;
@@ -2436,15 +2433,12 @@ async fn a_terminal_back_from_history_is_told_what_the_screen_it_will_be_drawn_h
 /// reports now, and the line the application wrapped after that reached it as bytes: the report
 /// says it is still on the stream, and no resynchronisation follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
-)]
 async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_drawn() {
     let tall = Dimensions::new(4, 5);
     let short = Dimensions::new(4, 3);
     let host = host_with(
-        "stty -echo -echonl || exit 1; printf 'x'; read -r _; printf 'abcdef'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'x'; until read -r _; do :; done; printf 'abcdef'; \
+         read -r _",
         tall,
         None,
         1024 * 1024,
