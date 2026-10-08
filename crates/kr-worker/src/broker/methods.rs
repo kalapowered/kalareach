@@ -711,6 +711,36 @@ impl MutationInFlight {
     }
 }
 
+/// One admitted plugin action whose permit is taken and whose bytes the transport has not taken
+/// yet.
+#[derive(Debug)]
+pub struct TakenAction {
+    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    request: UpstreamRequest,
+    binding_revision: AgentBindingRevision,
+    action: ActionName,
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
+}
+
+impl TakenAction {
+    /// Returns what the transport is handed: the transport chosen at admission and the request.
+    #[must_use]
+    pub fn transmission(&self) -> (std::sync::Arc<dyn UpstreamDispatch>, UpstreamRequest) {
+        (std::sync::Arc::clone(&self.dispatch), self.request.clone())
+    }
+
+    /// The transport took the action: what follows is the wait for what the upstream did.
+    #[must_use]
+    pub fn submitted(self, pending: PendingTransmission) -> ActionInFlight {
+        ActionInFlight {
+            pending,
+            binding_revision: self.binding_revision,
+            action: self.action,
+            turn_id: self.turn_id,
+        }
+    }
+}
+
 /// One admitted plugin action whose bytes are on their way to the upstream.
 #[derive(Debug)]
 pub struct ActionInFlight {
@@ -776,8 +806,10 @@ pub struct RegisteredAction {
     /// it is admitted on its class's right and answered with its receipt, and nothing leaves the
     /// host.
     pub presentation: bool,
-    /// True for an action the package's component prepares, which nothing on this host runs.
+    /// True for an action the package's component prepares.
     pub component: bool,
+    /// The parameters the declaration names, which every invocation's arguments are read against.
+    pub parameters: kr_plugin_sdk::effect::ParameterSchema,
 }
 
 impl RegisteredAction {
@@ -881,6 +913,7 @@ impl RegisteredAction {
                 ActionImplementation::Presentation {}
             ),
             component: declaration.implementation.needs_component(),
+            parameters: declaration.parameters.clone(),
         })
     }
 }
@@ -1409,15 +1442,17 @@ impl Broker {
         caller: &Caller,
         binding_id: BrokerBindingId,
         params: &PluginActionInvokeParams,
+        draft: Option<crate::broker::DraftSnapshot>,
         now: TimestampMs,
     ) -> Result<MutationAdmission> {
-        // The draft is resolved before the lock, because the draft store is not the broker's and
-        // calling it under the broker's lock would hold every other caller behind it. What comes
-        // back is a snapshot, and the admission binds to that.
-        let draft = match params.draft_id.as_ref() {
-            Some(draft_id) => Some(self.resolve_draft(draft_id)?),
-            None => None,
-        };
+        // The draft arrives already read: the draft store is not the broker's, and calling it
+        // under the broker's lock would hold every other caller behind it. What the admission
+        // binds to is that snapshot.
+        if draft.is_some() != params.draft_id.is_present() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: "the draft this invocation names was not the one read for it".to_owned(),
+            });
+        }
         // The parameters are read once and written back in the one form this host will transmit.
         // What is hashed is that form, so the digest covers the bytes that go rather than a
         // spelling of them: two members of one name, or any other difference the encoder would
@@ -1563,35 +1598,18 @@ impl Broker {
         )
     }
 
-    /// Applies `plugin.action.invoke`.
+    /// Takes an admitted plugin action's permit without handing it to the transport, so the caller
+    /// can make the transport's own call wherever it chooses.
+    ///
+    /// Taking the permit is what refuses an invocation whose component returned a plan nobody
+    /// validated: an admission with no validated plan has no permit to take.
     ///
     /// # Errors
     ///
-    /// Returns whatever [`Broker::admit_plugin_action`] and the transport refuse.
-    pub async fn plugin_action_invoke(
-        &self,
-        caller: &Caller,
-        binding_id: BrokerBindingId,
-        params: &PluginActionInvokeParams,
-        effect: &kr_protocol::broker::PreparedEffect,
-        now: TimestampMs,
-    ) -> Result<PluginActionInvokeResult> {
-        let admitted = self.admit_plugin_action(caller, binding_id, params, now)?;
-        self.validate_effect(&admitted, effect)?;
-        self.record_plugin_action(&admitted, now)?.settled().await
-    }
-
-    /// Carries an admitted plugin action to its upstream and records the outcome.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever the transport refuses.
-    pub fn record_plugin_action(
-        &self,
-        admitted: &MutationAdmission,
-        now: TimestampMs,
-    ) -> Result<ActionInFlight> {
-        let _ = now;
+    /// Returns [`BrokerError::InvalidArgument`] for an admission that carries no action token,
+    /// [`BrokerError::PreconditionFailed`] for one whose plan was not validated, and
+    /// [`BrokerError::AlreadyTransmitted`] for a permit already taken.
+    pub fn take_plugin_action(&self, admitted: &MutationAdmission) -> Result<TakenAction> {
         // The kind is checked before the permit is taken. An approval handed to this entry point
         // comes back unspent, with its claim, rather than being consumed by the mistake.
         if admitted.action().is_none() {
@@ -1599,20 +1617,17 @@ impl Broker {
                 "this admission carries no action token",
             ));
         }
-        // Taking the permit is what refuses an invocation whose component returned a plan nobody
-        // validated: an admission with no validated plan has no permit to take.
         let permit = admitted.take()?;
         let token = permit
             .token
             .clone()
             .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
-        let turn_id = permit.request.turn_id.clone();
-        let pending = permit.dispatch.submit(&permit.request)?;
-        Ok(ActionInFlight {
-            pending,
+        Ok(TakenAction {
+            turn_id: permit.request.turn_id.clone(),
+            dispatch: permit.dispatch,
+            request: permit.request,
             binding_revision: token.binding_revision,
             action: token.action,
-            turn_id,
         })
     }
 
@@ -1734,7 +1749,7 @@ impl Broker {
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the arguments are not an encoding this host
     /// can carry to an upstream.
-    fn executable_arguments(params: &PluginActionInvokeParams) -> Result<Vec<u8>> {
+    pub(crate) fn executable_arguments(params: &PluginActionInvokeParams) -> Result<Vec<u8>> {
         let arguments: serde_json::Value = serde_json::from_slice(params.parameters.as_slice())
             .map_err(|error| {
                 BrokerError::invalid(format!(
@@ -1889,8 +1904,8 @@ impl Broker {
                 ),
             });
         }
-        // The draft store is not the broker's, so it is asked before the broker's lock is taken
-        // and its answer is what the transaction below is given.
+        // The draft store is not the broker's, so it was asked before this broker's lock was taken
+        // and its answer is what this transaction is given.
         if let Some(named) = effect.draft_id.as_ref() {
             if !effect.operation.may_act_on_a_draft() {
                 return Err(BrokerError::invalid(format!(
@@ -1906,20 +1921,6 @@ impl Broker {
                     detail: format!(
                         "this plan acts on {named} and the invocation was admitted against {}",
                         snapshot.draft_id
-                    ),
-                });
-            }
-            // And the revision it stood at. A draft that moved while the component was preparing
-            // its plan is `DRAFT_CONFLICT`: the plan was made against a draft that is not there
-            // any more.
-            let current = self.resolve_draft(named)?;
-            if current.revision != snapshot.revision {
-                return Err(BrokerError::PreconditionFailed {
-                    detail: format!(
-                        "{named} was at revision {} when this invocation was admitted and is at \
-                         {} now",
-                        snapshot.revision.get(),
-                        current.revision.get()
                     ),
                 });
             }

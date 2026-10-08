@@ -1899,7 +1899,7 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
     let details = reported(&worker, source.package_digest);
     assert_eq!(details.len(), 1, "{details:?}");
     assert!(
-        details[0].contains("calls none of its component's exports beyond registering it"),
+        details[0].contains("beyond registering it for a binding and preparing an action"),
         "{}",
         details[0]
     );
@@ -1985,5 +1985,107 @@ fn kr_req_11_13_actions_a_package_declares_that_cannot_register_are_reported() {
         named[0].detail.contains("status.refresh"),
         "{}",
         named[0].detail
+    );
+}
+
+/// A package that ships a component and declares `prompt.send` as an action that component
+/// prepares, written in `worker`'s store.
+fn component_action_package(worker: &Worker) -> ConnectorSource {
+    let source = worker.package(&fixture::Shape {
+        component: true,
+        ..fixture::Shape::claude_code()
+    });
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(source.package_dir.join(MANIFEST_FILE)).expect("reads"),
+    )
+    .expect("JSON");
+    manifest["actions"][0]["implementation"] = serde_json::json!({ "type": "component" });
+    let written = serde_json::to_string_pretty(&manifest).expect("encodes");
+    let digest = PayloadDigest::of(written.as_bytes());
+    let directory = worker
+        .packages
+        .path()
+        .join("packages")
+        .join(digest.to_string());
+    copy_tree(&source.package_dir, &directory);
+    std::fs::write(directory.join(MANIFEST_FILE), written).expect("written");
+    ConnectorSource {
+        package_digest: Digest256::from_bytes(*digest.as_bytes()),
+        package_dir: directory,
+        ..source
+    }
+}
+
+/// KR-REQ-23.30: what a component action is told when its component is not there to prepare it
+/// says whether asking again can help. A component the link has not registered yet is waited for.
+/// One the broker refused, because the admissions and the package's manifest name different
+/// components, is never registered, and one the worker disabled is not either.
+#[test]
+fn kr_req_23_30_a_component_action_is_waited_for_until_its_component_is_registered_or_refused_for_good()
+ {
+    use kr_protocol::agent::{AgentMutationTarget, PluginActionInvokeParams};
+
+    let invoke = |worker: &Worker| {
+        let caller = Caller {
+            actor_id: ActorId::new("device-1").expect("valid"),
+            grant_id: None,
+        };
+        let params = PluginActionInvokeParams {
+            target: AgentMutationTarget {
+                subject: kr_worker::broker::subject(session(), instance(1)),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach.claude-code").expect("valid"),
+            action: ActionName::new("prompt.send").expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id: Nullable::null(),
+            parameters: kr_protocol::scalars::Bytes::from(br#"{"text":"hello"}"#.to_vec()),
+        };
+        worker
+            .broker
+            .prepare_request(&caller, binding(1), &params)
+            .expect_err("no component is registered to prepare it")
+    };
+
+    // The component is what the manifest says, and nothing has registered it yet.
+    let worker = Worker::open();
+    let source = component_action_package(&worker);
+    let frame = worker.admit(1, vec![testing::admitted(&source)]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, frame)
+        .expect("the package binds");
+    assert!(
+        matches!(invoke(&worker), BrokerError::ResourceUnavailable { .. }),
+        "a component the link has not registered yet is asked for again"
+    );
+    worker
+        .broker
+        .disable_rich(binding(1), "the component faulted");
+    assert!(
+        matches!(invoke(&worker), BrokerError::UnsupportedCapability { .. }),
+        "a component the worker disabled is not"
+    );
+
+    // The admissions name another component than the manifest does.
+    let worker = Worker::open();
+    let source = component_action_package(&worker);
+    let mut admitted = testing::admitted(&source);
+    admitted.component = Nullable::some(kr_protocol::admission::AdmittedComponent {
+        digest: Digest256::from_bytes([0x11; 32]),
+        ..admitted
+            .component
+            .0
+            .clone()
+            .expect("the package ships a component")
+    });
+    let frame = worker.admit(1, vec![admitted]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, frame)
+        .expect("the package binds with its component refused");
+    assert!(
+        matches!(invoke(&worker), BrokerError::UnsupportedCapability { .. }),
+        "a component the broker refused is never registered"
     );
 }

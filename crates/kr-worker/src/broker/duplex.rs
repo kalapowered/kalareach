@@ -3224,6 +3224,7 @@ mod tests {
                     resource_id: kr_protocol::scalars::Nullable::null(),
                     parameters: kr_protocol::scalars::Bytes::from(b"{}".to_vec()),
                 },
+                None,
                 TimestampMs::new(2),
             )
             .expect("the invocation is admitted: the connection's table lists the method");

@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use kr_ipc::endpoint::Connection;
@@ -128,7 +128,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
 
 struct Link {
     request: RuntimeRequest,
-    client: Option<PluginClient>,
+    client: Option<Arc<PluginClient>>,
     /// The bindings registered on `client`.
     registered: BTreeSet<BrokerBindingId>,
     /// The bindings the runtime refused on `client`, and when each may be offered again.
@@ -264,7 +264,7 @@ impl Link {
         // is not kept.
         if wants.is_empty() {
             if self.registered.is_empty() {
-                self.client = None;
+                self.hold(broker, None);
                 self.last_reason = None;
                 self.pace.idle();
             }
@@ -304,7 +304,7 @@ impl Link {
             let Some(client) = self.reach(broker, &pending, &wants).await else {
                 return Some(self.pace.remaining(tokio::time::Instant::now()));
             };
-            self.client = Some(client);
+            self.hold(broker, Some(Arc::new(client)));
             self.last_reason = None;
             self.pace.connected(tokio::time::Instant::now());
         }
@@ -493,8 +493,9 @@ impl Link {
         changes: &tokio::sync::Notify,
         delay: Option<Duration>,
     ) {
-        // Taken out for the wait, so the notice that ends it can be handled with `self` free.
-        let mut client = self.client.take();
+        // Held for the wait by a reference of its own, so the notice that ends it can be handled
+        // with `self` free while another task makes calls on the same connection.
+        let client = self.client.clone();
         let event = {
             let timer = async {
                 match delay {
@@ -503,7 +504,7 @@ impl Link {
                 }
             };
             let notice = async {
-                match client.as_mut() {
+                match client.as_ref() {
                     Some(client) => client.notice().await,
                     None => std::future::pending().await,
                 }
@@ -514,7 +515,6 @@ impl Link {
                 notice = notice => Event::Notice(notice),
             }
         };
-        self.client = client;
         match event {
             Event::Changed | Event::Timer => {}
             Event::Notice(None) => self.lose(broker, "the plugin runtime ended its connection"),
@@ -542,9 +542,18 @@ impl Link {
             );
         }
         self.refused.clear();
-        self.client = None;
+        self.hold(broker, None);
         self.last_reason = Some(reason.to_owned());
         self.pace.lost(tokio::time::Instant::now());
+    }
+
+    /// Keeps the connection to the runtime, or lets it go, and tells the broker, which asks
+    /// components to prepare actions over it.
+    fn hold(&mut self, broker: &Weak<Broker>, client: Option<Arc<PluginClient>>) {
+        if let Some(broker) = broker.upgrade() {
+            broker.component_calls().set(client.clone());
+        }
+        self.client = client;
     }
 
     /// One request to the control daemon's rendezvous endpoint, and its answer.

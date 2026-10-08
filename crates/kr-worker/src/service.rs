@@ -63,6 +63,7 @@ use kr_transport::clock::{ContinuousClock, ContinuousInstant, SystemContinuousCl
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 use crate::broker::MAX_SNAPSHOT_RESOURCES;
+use crate::broker::prepare::{Preparation, PreparationRequest};
 use crate::error::{Result, WorkerError};
 use crate::history_filter::retained::{Disclosure, Occasion};
 use kr_protocol::projection::ProjectionEvent;
@@ -1305,12 +1306,21 @@ impl WorkerService {
         // The withdrawal is a latch rather than a single permit, so this loop acts on it once and
         // then stops watching it: the connection stays open to refuse the next request.
         let mut fenced = false;
+        // Where the actions this connection has accepted come back from being prepared. A task
+        // sends the result and the loop finishes the action, because finishing it is the part that
+        // needs this connection's state; the channel has no bound of its own because what feeds it
+        // is bounded by the outstanding actions the journal allows an actor.
+        let (prepared_tx, mut prepared_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ReadyPreparation>();
         loop {
-            let message: ControlFrame = tokio::select! {
+            let next: Next = tokio::select! {
                 message = reader.read_message::<ControlFrame>() => match message {
-                    Ok(message) => message,
+                    Ok(message) => Next::Frame(message),
                     Err(_) => break,
                 },
+                // An accepted action whose effect is prepared. It is finished here, with this
+                // connection's state, on the same path every other reply takes.
+                Some(ready) = prepared_rx.recv() => Next::Prepared(Box::new(ready)),
                 // The authority this connection was admitted under has been withdrawn. Whatever
                 // it had already subscribed to stops here: refusing its *next* request would leave
                 // a delivery task streaming this session's output down a connection that no longer
@@ -1366,7 +1376,29 @@ impl WorkerService {
             // must stop it. One produced afterwards is a refusal, and the caller is owed that
             // refusal rather than a socket that closed.
             let protected = !withdrawn.is_set();
-            let reply = self.handle(&mut state, &peer, message).await;
+            let reply = match next {
+                Next::Frame(message) => self.handle(&mut state, &peer, message).await,
+                Next::Prepared(ready) => Some(self.dispatch_prepared(&mut state, *ready)),
+            };
+            // An accepted action to be prepared is prepared on a task of its own, for the reason a
+            // launch and an upstream operation are answered on one: this socket carries the same
+            // client's next keystroke, its interrupt and its keepalive, and none of them waits
+            // behind a call to another process.
+            if let Some(pending) = state.pending_preparation.take() {
+                let service = Arc::clone(&self);
+                let ready = prepared_tx.clone();
+                tokio::spawn(async move {
+                    let preparation = service.prepare(&pending).await;
+                    let ready_preparation = ReadyPreparation {
+                        pending,
+                        preparation,
+                    };
+                    // The loop is gone when the send fails, and nothing will finish the action.
+                    if let Err(unsent) = ready.send(ready_preparation) {
+                        service.abandon_prepared(unsent.0);
+                    }
+                });
+            }
             // A page the control daemon asked for is read, and held while there is nothing to
             // answer with, on its own task too: the same connection carries the text requests the
             // daemon serves its readers from meanwhile. A newer request replaces a held one: the
@@ -1878,6 +1910,17 @@ impl WorkerService {
                     task.abort();
                 }
             }
+        }
+        // An action that was accepted on this connection and is not finished with it: one that was
+        // being prepared, and one prepared after the loop's last look. Each is rejected, because
+        // nothing is left to dispatch it, and a task that finishes later finds the channel closed
+        // and does the same itself.
+        if let Some(pending) = state.pending_preparation.take() {
+            self.abandon_pending(&pending);
+        }
+        prepared_rx.close();
+        while let Some(ready) = prepared_rx.recv().await {
+            self.abandon_prepared(ready);
         }
         // A close whose acceptance was never confirmed delivered still happens. The connection is
         // gone, so nothing is going to confirm it.
@@ -3557,6 +3600,22 @@ impl WorkerService {
             return failure(mutation.request_id, &unlisted());
         };
         let dispatched = self.receipted(state, mutation, method, entry, caller, freshness);
+        self.answered(state, mutation, caller, forwarded, dispatched)
+    }
+
+    /// Turns what a mutation came to into the frame that answers its request.
+    ///
+    /// A launch, an upstream operation and an action to be prepared are not finished when the
+    /// boundary ends. Each leaves what the connection's loop needs to finish it on a task of its
+    /// own, and answers the request with a keepalive until then.
+    fn answered(
+        &self,
+        state: &mut ConnectionState,
+        mutation: &MutationRequest,
+        caller: &Caller,
+        forwarded: bool,
+        dispatched: Result<Answered>,
+    ) -> ControlFrame {
         let answered = match dispatched {
             Ok(Answered::Launch {
                 transaction,
@@ -3599,6 +3658,15 @@ impl WorkerService {
                 // has said what the upstream did.
                 return ControlFrame::Event(ControlEvent::Keepalive);
             }
+            // The receipt is `accepted` and the effect is yet to be prepared. The loop prepares it
+            // and the action comes back through `dispatch_prepared`; nothing is written now.
+            Ok(Answered::Prepare(pending)) => {
+                state.pending_preparation = Some(PendingPreparation {
+                    forwarded,
+                    ..*pending
+                });
+                return ControlFrame::Event(ControlEvent::Keepalive);
+            }
             other => other,
         };
         match answered {
@@ -3617,16 +3685,183 @@ impl WorkerService {
                     ControlFrame::Response(response)
                 }
             }
-            // An upstream operation and a launch are both answered above.
-            Ok(Answered::Upstream { .. } | Answered::Launch { .. }) => failure(
-                mutation.request_id,
-                &ProtocolError::new(
-                    ErrorCode::ResourceUnavailable,
-                    "the launch transaction was not resolved",
-                ),
-            ),
+            // An upstream operation, a launch and an action to be prepared are all answered above.
+            Ok(Answered::Upstream { .. } | Answered::Launch { .. } | Answered::Prepare(_)) => {
+                failure(
+                    mutation.request_id,
+                    &ProtocolError::new(
+                        ErrorCode::ResourceUnavailable,
+                        "the launch transaction was not resolved",
+                    ),
+                )
+            }
             Err(error) => failure(mutation.request_id, &error.to_protocol_error()),
         }
+    }
+
+    /// Prepares one accepted action's effect, holding nothing of this worker.
+    ///
+    /// The preparation is bounded by what is left of the action's accepted deadline.
+    async fn prepare(&self, pending: &PendingPreparation) -> Preparation {
+        let within = pending.deadline.saturating_duration_since(self.clock.now());
+        self.broker.prepare(&pending.request, within).await
+    }
+
+    /// Finishes an accepted action whose effect has been prepared: the revalidation inside the
+    /// boundary, the dispatch marker and the effect, as for any action, and then the answer.
+    fn dispatch_prepared(
+        &self,
+        state: &mut ConnectionState,
+        ready: ReadyPreparation,
+    ) -> ControlFrame {
+        let ReadyPreparation {
+            pending,
+            preparation,
+        } = ready;
+        let dispatched = self.continue_prepared(state, &pending, preparation);
+        self.answered(
+            state,
+            &pending.mutation,
+            &pending.caller,
+            pending.forwarded,
+            dispatched,
+        )
+    }
+
+    /// The second pass of an action that was accepted and prepared.
+    ///
+    /// Everything the first pass checked is checked again, now, inside the boundary. First what
+    /// the connection holds: the authority it was admitted under. Then the action's own receipt,
+    /// because an action that was cancelled or fenced while it was prepared no longer has an
+    /// `accepted` one and is answered with the receipt it has. Then the revision the daemon
+    /// validated the action under, and whatever any mutation is revalidated against before its
+    /// marker.
+    ///
+    /// The receipt of a fenced action is read before the validated revision, where the first pass
+    /// checks the revision first, because the answer for a forwarded caller is a retained one: the
+    /// daemon holds a retained answer back from a device whose authority has moved, so the check
+    /// the first pass makes here is made on the daemon's side of the link, and an action that was
+    /// fenced answers with the receipt that says so.
+    fn continue_prepared(
+        &self,
+        state: &mut ConnectionState,
+        pending: &PendingPreparation,
+        preparation: Preparation,
+    ) -> Result<Answered> {
+        let mutation = &pending.mutation;
+        let caller = &pending.caller;
+        let method = Method::PluginActionInvoke;
+        let _barrier = self
+            .dispatch
+            .lock()
+            .expect("the dispatch barrier is not poisoned");
+        self.wait_inside_boundary();
+        self.revalidate_time();
+        if let Err(error) = self.check_authority(state) {
+            return Err(self.reject_accepted(
+                caller,
+                mutation,
+                kr_protocol::receipt::RejectionReason::Revoked,
+                error,
+            ));
+        }
+        let held = {
+            let mut session = self.runtime.session();
+            match session.journal_mut() {
+                Some(journal) => journal
+                    .read(caller.actor_id.clone(), mutation.action_id)
+                    .map(|receipt| receipt.map(|receipt| receipt.state)),
+                None => Err(WorkerError::JournalUnavailable {
+                    detail: "this session retains no receipts".to_owned(),
+                }),
+            }
+        };
+        match held {
+            Ok(Some(kr_protocol::receipt::ReceiptState::Accepted)) => {}
+            Ok(_) => {
+                let digest = kr_protocol::digest::mutation_digest(mutation, &caller.actor_id)
+                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+                return self
+                    .retained(caller, mutation, method, digest)?
+                    .map(Answered::Retained)
+                    .ok_or_else(|| WorkerError::PreconditionFailed {
+                        detail: "the action's receipt is no longer held".to_owned(),
+                    });
+            }
+            // A receipt that cannot be read is not one that is not `accepted`: answering with
+            // what the retained record says could hand the caller an `accepted` receipt for an
+            // action nothing will ever dispatch.
+            Err(error) => {
+                return Err(self.reject_accepted(
+                    caller,
+                    mutation,
+                    kr_protocol::receipt::RejectionReason::AdmissionFailed,
+                    error,
+                ));
+            }
+        }
+        if let Err(error) = self.check_validated_revision(caller) {
+            return Err(self.reject_accepted(
+                caller,
+                mutation,
+                kr_protocol::receipt::RejectionReason::Revoked,
+                error,
+            ));
+        }
+        let session = self.runtime.session();
+        self.dispatch_accepted(
+            session,
+            state,
+            mutation,
+            method,
+            caller,
+            pending.deadline,
+            true,
+            false,
+            Some(preparation),
+        )
+    }
+
+    /// Gives up an accepted action whose connection ended before it could be dispatched.
+    fn abandon_prepared(&self, ready: ReadyPreparation) {
+        self.abandon_pending(&ready.pending);
+    }
+
+    /// Rejects an accepted action nothing is left to dispatch.
+    fn abandon_pending(&self, pending: &PendingPreparation) {
+        let _ = self.reject_accepted(
+            &pending.caller,
+            &pending.mutation,
+            kr_protocol::receipt::RejectionReason::AdmissionFailed,
+            WorkerError::PreconditionFailed {
+                detail: "the connection this action was accepted on ended before it was dispatched"
+                    .to_owned(),
+            },
+        );
+    }
+
+    /// Rejects an action whose intent is committed and which will not be dispatched, and returns
+    /// the error for the caller to report.
+    ///
+    /// A receipt that is no longer `accepted` is left as it is.
+    fn reject_accepted(
+        &self,
+        caller: &Caller,
+        mutation: &MutationRequest,
+        reason: kr_protocol::receipt::RejectionReason,
+        error: WorkerError,
+    ) -> WorkerError {
+        let mut session = self.runtime.session();
+        if let Some(journal) = session.journal_mut() {
+            let _ = journal.reject(
+                caller.actor_id.clone(),
+                mutation.action_id,
+                reason,
+                Some(error.to_protocol_error()),
+                kr_ipc::now_ms(),
+            );
+        }
+        error
     }
 
     /// Waits for a launch the reader is deciding, records its outcome and answers the caller.
@@ -4127,6 +4362,41 @@ impl WorkerService {
             }
         };
 
+        self.dispatch_accepted(
+            session,
+            state,
+            mutation,
+            method,
+            caller,
+            deadline,
+            admitted,
+            volatile_permitted,
+            None,
+        )
+    }
+
+    /// Everything a mutation does once its intent is committed: the revalidation inside the
+    /// boundary, the dispatch marker, the effect and the recorded outcome.
+    ///
+    /// A mutation whose effect needs something prepared outside the boundary comes here twice. The
+    /// first time it has no preparation, finds it needs one and returns [`Answered::Prepare`] with
+    /// its receipt still `accepted`; the second time, called with the preparation, it is
+    /// revalidated against the present, as any accepted intent is before its marker.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_accepted(
+        &self,
+        mut session: std::sync::MutexGuard<'_, Session>,
+        state: &mut ConnectionState,
+        mutation: &MutationRequest,
+        method: Method,
+        caller: &Caller,
+        deadline: ContinuousInstant,
+        admitted: bool,
+        volatile_permitted: bool,
+        preparation: Option<Preparation>,
+    ) -> Result<Answered> {
+        let actor_id = caller.actor_id.clone();
+        let second_pass = preparation.is_some();
         // Revalidate inside the boundary. Anything that was true at acceptance may not be now, and
         // this is the last moment at which checking it still means something.
         let revalidated = self
@@ -4148,13 +4418,26 @@ impl WorkerService {
             // effect asked it: moving a refusal before the marker must not move it in front of a
             // precondition the caller stated or a deadline this host accepted. For a mutation the
             // broker owns, what comes back is the admission itself.
-            .and_then(|()| self.decidable(&session, mutation, method, caller));
+            .and_then(|()| self.decidable(&session, mutation, method, caller, preparation));
         let prepared = match revalidated {
             Ok(prepared) => prepared,
             Err(error) => {
                 if let Some(journal) = session.journal_mut() {
                     let reason = if matches!(error, WorkerError::WindowExpired { .. }) {
                         kr_protocol::receipt::RejectionReason::Expired
+                    } else if second_pass {
+                        // A fact the action stood on moved while it was prepared (the binding's
+                        // revision, a declaration, the precondition the caller stated) is a stale
+                        // precondition; a plan or an authority that did not hold is a failed
+                        // admission.
+                        if matches!(
+                            error.code(),
+                            ErrorCode::StaleSession | ErrorCode::DraftConflict
+                        ) {
+                            kr_protocol::receipt::RejectionReason::StalePreconditions
+                        } else {
+                            kr_protocol::receipt::RejectionReason::AdmissionFailed
+                        }
                     } else {
                         kr_protocol::receipt::RejectionReason::StalePreconditions
                     };
@@ -4169,6 +4452,27 @@ impl WorkerService {
                 return Err(error);
             }
         };
+        // An action whose effect is prepared outside the boundary stops here, with its receipt
+        // still `accepted` and no marker written. It comes back through `dispatch_prepared`.
+        if let Some(Prepared::NeedsPreparation(request)) = prepared {
+            return if admitted {
+                Ok(Answered::Prepare(Box::new(PendingPreparation {
+                    request: *request,
+                    mutation: mutation.clone(),
+                    caller: caller.clone(),
+                    deadline,
+                    forwarded: false,
+                })))
+            } else {
+                // The receipt is where a prepared action is remembered, and this session keeps
+                // none. Rich work is fenced then as well, so this is a refusal the host can make.
+                Err(WorkerError::JournalUnavailable {
+                    detail: "this session retains no receipts, so an action cannot wait to be \
+                             prepared"
+                        .to_owned(),
+                })
+            };
+        }
         if admitted && let Some(journal) = session.journal_mut() {
             // The dispatch marker is committed before the effect. A stop whose marker cannot be
             // written proceeds on the worker's current authority and reports volatile durability,
@@ -4962,6 +5266,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
+        preparation: Option<Preparation>,
     ) -> Result<Option<Prepared>> {
         // Whether this session is still running, for the methods that need it to be. Each of those
         // effects asks this first, so this does too.
@@ -5093,6 +5398,22 @@ impl WorkerService {
                     params.target.subject.application_instance_id,
                 )?;
                 let registered = self.broker.registered_action(binding_id, &params.action)?;
+                // What was prepared is what the first pass checked: the same binding, under the
+                // same declaration, whichever route the declaration names now. A package replaced
+                // while its action was prepared is a different action, and the plan prepared for
+                // the first is carried by no route of the second.
+                if let Some(prepared) = preparation.as_ref()
+                    && (prepared.binding_id != binding_id
+                        || registered.as_ref() != Some(&prepared.declared))
+                {
+                    return Err(crate::broker::BrokerError::PreconditionFailed {
+                        detail: format!(
+                            "{} was prepared under one declaration and another is registered now",
+                            params.action
+                        ),
+                    }
+                    .into());
+                }
                 // The rights this call intersects are the action's own: the ones its declared
                 // class needs. A caller acting under a grant holds them, or the call is refused
                 // here, before the marker. An action nobody registered is refused below for that.
@@ -5110,6 +5431,11 @@ impl WorkerService {
                 {
                     self.broker.admit_presentation(binding_id, &params)?;
                     return Ok(Some(Prepared::Presentation(params.action)));
+                }
+                // The arguments are the declared ones, on each route an action is carried by. A
+                // presentation action reads none, and is checked by no one.
+                if let Some(registered) = registered.as_ref() {
+                    crate::broker::Broker::check_declared_arguments(registered, &params)?;
                 }
                 let answers = registered
                     .as_ref()
@@ -5147,30 +5473,51 @@ impl WorkerService {
                         kr_ipc::now_ms(),
                     )?;
                 }
-                // And the refusal this host makes whatever the caller does. It is decided here,
-                // before the marker, so it is a rejection rather than an outcome nobody can
-                // establish. An action the package's component prepares needs the component's
-                // `prepare-action` export, which this host does not call; any other such action
-                // needs an upstream method this host does
-                // not send for a plugin, and the broker transmits nothing it has not validated
-                // against the invocation it was prepared under.
-                let detail = if registered
+                // An action the package's component prepares. Preparing it is a call to another
+                // process, so it is not made here, inside the boundary: this pass finds the action
+                // fit to be prepared and hands it back with the receipt still `accepted`, and the
+                // second pass is given what was prepared. It admits the invocation, which issues
+                // and spends the token, and validates the prepared effect against it in one step.
+                if registered
                     .as_ref()
                     .is_some_and(|registered| registered.component)
                 {
-                    format!(
-                        "{} is prepared by its package's component, and this host calls no export \
-                         of a component to prepare an effect, so nothing is transmitted for it",
-                        params.action
-                    )
-                } else {
-                    format!(
+                    let broker_caller = Self::broker_caller(caller);
+                    let Some(prepared) = preparation else {
+                        let request =
+                            self.broker
+                                .prepare_request(&broker_caller, binding_id, &params)?;
+                        return Ok(Some(Prepared::NeedsPreparation(Box::new(request))));
+                    };
+                    let effect = prepared.effect?;
+                    let admitted = self.broker.admit_plugin_action(
+                        &broker_caller,
+                        binding_id,
+                        &params,
+                        prepared.draft,
+                        kr_ipc::now_ms(),
+                    )?;
+                    if let Err(error) = self.broker.validate_effect(&admitted, &effect) {
+                        // The admission spent a token and holds a permit; a refused plan leaves
+                        // neither behind.
+                        self.broker.abandon(&admitted);
+                        return Err(error.into());
+                    }
+                    return Ok(Some(self.handoff(admitted, UpstreamKind::PluginAction)));
+                }
+                // The refusal this host makes for the rest, whatever the caller does. It is
+                // decided here, before the marker, so it is a rejection rather than an outcome
+                // nobody can establish: such an action needs an upstream method this host does
+                // not send for a plugin, and the broker transmits nothing it has not validated
+                // against the invocation it was prepared under.
+                Err(crate::broker::BrokerError::UnsupportedCapability {
+                    detail: format!(
                         "{} is admitted, and this host does not send the upstream method it \
                          declares yet, so nothing is transmitted for it",
                         params.action
-                    )
-                };
-                Err(crate::broker::BrokerError::UnsupportedCapability { detail }.into())
+                    ),
+                }
+                .into())
             }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
@@ -6623,10 +6970,10 @@ impl WorkerService {
             Method::PluginActionInvoke => {
                 // An answer through the connector table's decision destination was admitted
                 // before the marker, and its admission leaves this boundary as an approval
-                // answer's does. An action the host carries out itself was admitted on its
+                // answer's does, and so does an action whose component's prepared effect the
+                // broker validated. An action the host carries out itself was admitted on its
                 // class's right, and its receipt is all it is answered with. Every other action
-                // was refused before the marker, so only a component's prepared effect, which does
-                // not reach this broker, meets the refusal.
+                // was refused before the marker.
                 match prepared {
                     Some(Prepared::Upstream(handoff)) => {
                         return Ok((ParamsValue::empty(), AfterEffect::Upstream(handoff)));
@@ -6640,7 +6987,8 @@ impl WorkerService {
                             AfterEffect::None,
                         ));
                     }
-                    None => {}
+                    // Stopped before the marker and never applied.
+                    Some(Prepared::NeedsPreparation(_)) | None => {}
                 }
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(params)?;
                 Err(crate::broker::BrokerError::UnsupportedCapability {
@@ -6709,6 +7057,11 @@ enum Answered {
         /// The principal whose action it is.
         actor_id: ActorId,
     },
+    /// An accepted action whose effect is being prepared outside the boundary.
+    ///
+    /// Nothing durable beyond its accepted receipt has happened. The connection's loop prepares it
+    /// on a task of its own and the action comes back for its revalidation and its marker.
+    Prepare(Box<PendingPreparation>),
     /// A launch the reader is deciding.
     ///
     /// Every method but this one is finished when the boundary ends. A launch's effect is the
@@ -7193,6 +7546,10 @@ pub struct ConnectionState {
     /// socket carry the same client's next keystroke, its interrupt, its detach and its keepalive,
     /// and none of those waits behind an upstream that is slow to answer.
     pub pending_upstream: Option<PendingUpstream>,
+    /// An accepted action whose effect is to be prepared outside the boundary.
+    ///
+    /// The connection's own loop takes it and hands it to a task of its own, for the same reason.
+    pending_preparation: Option<PendingPreparation>,
     /// A close whose acceptance was written and whose delivery a proxy has not yet confirmed.
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
@@ -7260,6 +7617,7 @@ impl ConnectionState {
             page_task: None,
             page_cancel: None,
             pending_upstream: None,
+            pending_preparation: None,
             pending_delivery: None,
             pending_challenge: None,
             admissions_parts: Vec::new(),
@@ -8217,6 +8575,39 @@ pub struct PendingUpstream {
     handoff: Box<UpstreamHandoff>,
 }
 
+/// What a connection's loop waits for next.
+enum Next {
+    /// A frame the peer sent.
+    Frame(ControlFrame),
+    /// An accepted action whose effect has been prepared.
+    Prepared(Box<ReadyPreparation>),
+}
+
+/// An accepted action and what its preparation came to.
+#[derive(Debug)]
+pub struct ReadyPreparation {
+    pending: PendingPreparation,
+    preparation: Preparation,
+}
+
+/// One accepted action whose effect is being prepared outside the boundary.
+///
+/// Everything the second pass needs, carried off the connection's read loop so the preparation
+/// holds nothing up.
+#[derive(Debug)]
+pub struct PendingPreparation {
+    /// What preparing it needs.
+    request: PreparationRequest,
+    /// The request as it arrived, for the request identifier and the action.
+    mutation: MutationRequest,
+    /// Who asked, with the rights the control daemon decided the request under.
+    caller: Caller,
+    /// The deadline the first pass accepted, which the second pass keeps.
+    deadline: ContinuousInstant,
+    /// Whether the answer goes to a proxy rather than to the actor whose action it is.
+    forwarded: bool,
+}
+
 /// How long an admitted operation has to reach its upstream.
 ///
 /// Section 11 makes a framing connection that cannot safely continue `UPSTREAM_UNAVAILABLE` rather
@@ -8237,6 +8628,9 @@ enum UpstreamKind {
         /// The action.
         action: kr_protocol::broker::ActionName,
     },
+    /// A package's action whose effect its component prepared and the broker validated: carried
+    /// as the plan it was validated as.
+    PluginAction,
 }
 
 /// What an admission before the dispatch marker hands the effect after it.
@@ -8244,6 +8638,12 @@ enum UpstreamKind {
 pub enum Prepared {
     /// An admitted operation whose transport work happens once the session boundary ends.
     Upstream(Box<UpstreamHandoff>),
+    /// An action whose effect the package's component prepares, which has passed every check that
+    /// can be made before it is prepared.
+    ///
+    /// Preparing it is a call to another process, so it happens outside the boundary, with the
+    /// receipt still `accepted`; the action comes back with the preparation attached.
+    NeedsPreparation(Box<PreparationRequest>),
     /// An action the host carries out itself by redrawing the package's own document, admitted on
     /// its class's right: its receipt is all it is answered with, and nothing leaves the host.
     Presentation(kr_protocol::broker::ActionName),
@@ -8254,7 +8654,7 @@ impl Prepared {
     fn abandon(self) {
         match self {
             Self::Upstream(handoff) => handoff.abandon(),
-            Self::Presentation(_) => {}
+            Self::Presentation(_) | Self::NeedsPreparation(_) => {}
         }
     }
 }
@@ -8303,6 +8703,12 @@ impl UpstreamHandoff {
             UpstreamKind::Approval => {
                 let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
                 encode(&answered)
+            }
+            UpstreamKind::PluginAction => {
+                let taken = self.broker.take_plugin_action(&self.admitted)?;
+                let pending = submit_within(taken.transmission(), deadline).await?;
+                let flight = taken.submitted(pending);
+                encode(&within(deadline, flight.settled()).await??)
             }
             UpstreamKind::PluginAnswer { action } => {
                 let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
