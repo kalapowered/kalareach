@@ -535,17 +535,15 @@ impl Group {
         #[cfg(target_os = "linux")]
         {
             let unit = self.unit.clone();
-            return match tokio::task::spawn_blocking(move || {
-                crate::supervision::kill_unit(&unit, FORCED)
-            })
-            .await
+            match tokio::task::spawn_blocking(move || crate::supervision::kill_unit(&unit, FORCED))
+                .await
             {
                 Ok(Ok(())) => Forced::Killed,
                 Ok(Err(why)) => Forced::Refused(why),
                 Err(_) => {
                     Forced::Refused("the call to the service manager did not finish".to_owned())
                 }
-            };
+            }
         }
         #[cfg(not(target_os = "linux"))]
         Forced::Nothing
