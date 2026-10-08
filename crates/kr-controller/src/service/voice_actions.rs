@@ -16,6 +16,40 @@ use crate::error::{ControllerError, Result};
 use super::authority_changes::decoded;
 use super::{Controller, parse};
 
+/// The managed calls on this host, as the host's account sees them.
+///
+/// Held weakly: the account is the daemon's, and the daemon holds the voice service.
+struct VoiceCalls {
+    module: std::sync::Weak<crate::voice::VoiceModule>,
+    daemon: std::sync::Weak<Controller>,
+}
+
+impl VoiceCalls {
+    /// The coordinator and the time on the clock every voice deadline is decided on.
+    fn coordinator(&self) -> Option<(Arc<crate::voice::VoiceModule>, u64)> {
+        let module = self.module.upgrade()?;
+        let daemon = self.daemon.upgrade()?;
+        Some((module, daemon.settled_now_ms()))
+    }
+}
+
+impl crate::account::Calls for VoiceCalls {
+    fn open(&self) -> bool {
+        self.coordinator()
+            .is_some_and(|(module, now_ms)| module.coordinator().calls_open(now_ms))
+    }
+
+    fn end_those_that_are_over(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if let Some((module, now_ms)) = self.coordinator() {
+                module.coordinator().end_calls_that_are_over(now_ms).await;
+            }
+        })
+    }
+}
+
 impl Controller {
     /// Registers the voice coordinator beside the other services.
     ///
@@ -51,12 +85,10 @@ impl Controller {
         let module = Arc::new(module);
         // The account never changes under a call: from the moment a start asks the broker to the
         // moment the close has been told, the call is open, and signing in or out waits for it.
-        let calls = Arc::downgrade(&module);
-        self.account.watch_calls(move || {
-            calls
-                .upgrade()
-                .is_some_and(|module| module.coordinator().calls_open())
-        });
+        self.account.watch_calls(Arc::new(VoiceCalls {
+            module: Arc::downgrade(&module),
+            daemon: Arc::downgrade(self),
+        }));
         let _ = self.voice.set(module);
     }
 

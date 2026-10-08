@@ -580,6 +580,19 @@ impl ServiceHttp for HttpService {
             .await
         })
     }
+
+    /// The same exchange, under the same deadlines and bounds, with no body.
+    fn get_json<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let target = self.target(url)?;
+            self.exchange(reqwest::Method::GET, target, None, headers)
+                .await
+        })
+    }
 }
 
 impl AccountHttp for HttpService {

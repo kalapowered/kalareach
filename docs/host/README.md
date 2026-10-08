@@ -302,8 +302,16 @@ A sign-in that replaces a grant and then undoes itself sends up to two rounds of
 sixteen each), the read of the account's identity and, when its access token is near its end, a
 refresh, all behind the one gate; a refresh that a request outside a call (a preparation's) was
 making when the change began is waited for as well. A start that meets the gate waits at most the
-sum of those deadlines. A call record stays until its device stops the call; a phone that is lost during a call
-keeps `kr account sign-in` and `sign-out` refused until the daemon restarts.
+sum of those deadlines.
+
+A phone that is lost during a call never stops it, and its call does not keep `kr account sign-in`
+and `sign-out` refused for good. A call is over when its own deadline passes, and when the managed
+service says it no longer holds the call open (`GET /api/voice/sessions/current` names no call for the
+account, another call, or this one closing). Before it refuses a sign-in or a sign-out for a call,
+the daemon ends the calls that are over as a stop from the device would: the call's record leaves,
+its voice grant is revoked, and the service is told, under the account the call was made under, so
+it can finalise the call. A service that cannot be asked within ten seconds leaves the call open,
+and the call's deadline ends it.
 
 `kr account sign-out` (`account.sign_out`, served on the local socket alone, asking for host
 management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret
