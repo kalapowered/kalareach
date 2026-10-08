@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::services::account::{
     AccountService, AccountStatus, AccountUsage, Answer, AnswerFault, AuthorisationGrant,
-    AuthorisationRequest, Exchanged, GrantUsage, IdentityRead, PendingAuthorisation,
+    AuthorisationRequest, Commit, Exchanged, GrantUsage, IdentityRead, PendingAuthorisation,
     SignedInAccount, USAGE_SCOPE, UsageResource,
 };
 use serde::Serialize;
@@ -356,15 +356,22 @@ impl Account {
     async fn finish(&self, grant: &AuthorisationGrant) -> Option<Outcome> {
         match self.service.exchange(grant).await {
             Ok(Exchanged::Issued(issued)) => {
-                let refresh = issued.refresh_token.clone();
-                match self.signed_in.commit(issued, grant.nonce()).await {
-                    Ok(()) => match self.signed_in.complete_identity().await {
+                // The tokens are kept, or ended at the service when the store is known not to hold
+                // them; a store that cannot say is settled, never revoked while it may hold them.
+                match self.signed_in.keep(issued, grant.nonce()).await {
+                    Ok(Commit::Kept) => match self.signed_in.complete_identity().await {
                         Ok(IdentityRead::Disagreed) => Some(Outcome::NotForThisSignIn),
                         _ => None,
                     },
+                    Ok(Commit::Unsettled) => {
+                        tracing::warn!(
+                            "the store could not say whether a sign-in was kept, so it is settled \
+                             at the next start, sign-out or sign-in where it was not settled now"
+                        );
+                        Some(Outcome::NotKept)
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "a sign-in could not be kept");
-                        let _ = self.service.revoke(&refresh).await;
                         Some(Outcome::NotKept)
                     }
                 }
@@ -448,9 +455,7 @@ pub const fn message(outcome: Outcome) -> &'static str {
         Outcome::TimedOut => {
             "The browser did not come back within 15 minutes, so signing in stopped."
         }
-        Outcome::NotKept => {
-            "KalaReach could not keep the sign-in safely on this device, so it kept nothing."
-        }
+        Outcome::NotKept => "KalaReach could not keep the sign-in safely on this device.",
         Outcome::ServiceRefused => "reach.kala.to refused the sign-in.",
         Outcome::BrowserFailed => "The browser could not be opened, so signing in stopped.",
         Outcome::SignedOut => "Signed out on this device.",

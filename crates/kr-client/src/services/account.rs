@@ -59,8 +59,8 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kr_crypto::store::{SecretName, SecretStore};
@@ -1833,6 +1833,32 @@ pub struct SignOut {
     pub service_told: bool,
 }
 
+/// What keeping a sign-in came to when the store did not refuse it outright.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Commit {
+    /// The new grant is the one this device holds.
+    Kept,
+    /// The store reported a failure writing the new grant, and then could not say which grant it
+    /// holds, so neither can be said to be held. No token is ended while the store may hold it: the
+    /// new grant's revocation is queued under its own grant beside the replaced grant's, or, when
+    /// the queue cannot take it, the token is kept in memory and moves into the queue at the first
+    /// send that can read the store and write the queue. A send leaves the grant the store holds
+    /// alone. The next settlement, which [`SignedInAccount::keep`] makes at once and the next start
+    /// makes again, removes a held grant whose own revocation is queued and ends every other token:
+    /// so the device ends up signed out when the new grant was queued, and signed in with the new
+    /// grant when the store holds it and nothing queued it.
+    ///
+    /// A token that is only in memory is lost if the process stops before a send has queued it or
+    /// the service has acknowledged it, and its family then stays live at the service until it
+    /// expires. That needs the grant write, the read of the store and the queue write to fail
+    /// together, and the process to stop before a send runs that can read the store and then queue
+    /// the token or have it acknowledged. A send runs only when the account is next changed, or
+    /// when a sign-in is kept; nothing sends when a failing store works again. A token that
+    /// [`SignedInAccount::revoke_unkept`] could neither queue nor send is held in memory the same
+    /// way, and lost the same way.
+    Unsettled,
+}
+
 /// The account signed in on this device: the grant in secure storage, one lock over every change
 /// to it, and the token source every managed resource asks.
 pub struct SignedInAccount {
@@ -1849,6 +1875,10 @@ pub struct SignedInAccount {
     item_scope: Option<String>,
     clock_ms: fn() -> u64,
     ended: AtomicBool,
+    /// Tokens that wait to be ended and that the queue could not take, kept in memory until a send
+    /// can queue them: a sign-in token whose grant the store holds is the sign-in and is let go of,
+    /// and any other is ended at the service.
+    unsettled: Mutex<Vec<(String, RefreshToken)>>,
     status: tokio::sync::watch::Sender<AccountStatus>,
 }
 
@@ -1912,6 +1942,7 @@ impl SignedInAccount {
             item_scope: None,
             clock_ms: system_milliseconds,
             ended: AtomicBool::new(false),
+            unsettled: Mutex::new(Vec::new()),
             status,
         }
     }
@@ -2153,15 +2184,33 @@ impl SignedInAccount {
         let now = (self.clock_ms)();
         let mut entries = self.read_pending()?;
         entries.retain(|entry| now.saturating_sub(entry.queued_at_ms) < PENDING_LIFETIME_MS);
-        entries.push(PendingRevocation {
-            grant_id: grant_id.to_owned(),
-            refresh_token,
-            queued_at_ms: now,
-        });
+        // A token already waiting is not sent twice because it was queued twice.
+        if !entries
+            .iter()
+            .any(|entry| entry.grant_id == grant_id && entry.refresh_token == refresh_token)
+        {
+            entries.push(PendingRevocation {
+                grant_id: grant_id.to_owned(),
+                refresh_token,
+                queued_at_ms: now,
+            });
+        }
         while entries.len() > PENDING_LIMIT {
             entries.remove(0);
         }
         self.write_pending(&entries)
+    }
+
+    /// Keeps a token in memory until a send can queue it or the service acknowledges it: the one
+    /// way in, so a token is held once however often it is added.
+    fn keep_in_memory(&self, grant_id: &str, refresh_token: RefreshToken) {
+        let mut waiting = self
+            .unsettled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !waiting.iter().any(|(_, held)| *held == refresh_token) {
+            waiting.push((grant_id.to_owned(), refresh_token));
+        }
     }
 
     /// Ends a refresh token this account was issued and will not keep, such as one that came for a
@@ -2171,7 +2220,8 @@ impl SignedInAccount {
     ///
     /// The token is sent to the service at least once. When the queue cannot be written or the lock
     /// cannot be taken, it is sent on its own; when sending the queue fails, it is sent on its own
-    /// once more. The failure is returned.
+    /// once more. A token that the queue refused and the service did not take is kept in memory for
+    /// the next send, and is lost if the process stops before one runs. The failure is returned.
     ///
     /// # Errors
     ///
@@ -2184,30 +2234,36 @@ impl SignedInAccount {
             Ok(_held) => self.queue("unkept", refresh_token.clone()),
             Err(error) => Err(error),
         };
+        let refused = queued.is_err();
         let sent = match queued {
             Ok(()) => self.send_pending().await,
             Err(error) => Err(error),
         };
-        if sent.is_err() {
-            let _ = self.service.revoke(&refresh_token).await;
+        if sent.is_err() && self.service.revoke(&refresh_token).await.is_err() && refused {
+            // Neither the queue nor the service took it: memory keeps it for the next send. A token
+            // the queue took is the queue's, and the send that failed leaves it there.
+            self.keep_in_memory("unkept", refresh_token);
         }
         sent
     }
 
     /// Keeps a sign-in's tokens, replacing any grant this device held, whose revocation is queued.
     ///
+    /// An error means the new grant is known not to be held: the token it came with is the
+    /// caller's to end ([`Self::revoke_unkept`]). A token is never ended while the store may hold
+    /// it, so the case in which the store cannot say is its own outcome, [`Commit::Unsettled`],
+    /// which [`Self::keep`] settles.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot keep the grant. The queue of revocations is then put
-    /// back as it was found, but only where the store is known to hold the grant it replaced: a
-    /// write can fail after the new grant is in place, and when the store cannot then be read to
-    /// say which grant it holds, the queue is left as it stands, with the replaced grant's
-    /// revocation in it, because that is the one state in which no token is lost. A send never
-    /// sends the entry of the grant the store holds, and the next recovery removes a held grant
-    /// whose own revocation is queued, so the grant that was replaced is not ended while it is
-    /// still held. A write that fails after the grant is in place and is then seen to be there
-    /// counts as kept.
-    pub async fn commit(&self, issued: IssuedGrant, nonce: &str) -> Result<()> {
+    /// Returns an error when the store cannot keep the grant and is known to hold the grant it
+    /// replaced, or none. The queue of revocations is then put back as it was found, but only
+    /// where the store is known to hold the grant it replaced; where it holds none, the queue is
+    /// as the failed write left it, which holds nothing of this grant. A send never sends the entry
+    /// of the grant the store holds, and the next recovery removes a held grant whose own
+    /// revocation is queued, so the grant that was replaced is not ended while it is still held. A
+    /// write that fails after the grant is in place and is then seen to be there counts as kept.
+    pub async fn commit(&self, issued: IssuedGrant, nonce: &str) -> Result<Commit> {
         let replaced = {
             let _held = self.hold().await?;
             let grant = StoredGrant::new(issued, self.client, nonce, (self.clock_ms)())?;
@@ -2245,18 +2301,90 @@ impl SignedInAccount {
                         put_back(&kept);
                         return Err(error);
                     }
-                    // The store cannot say what it holds: the queue stays as it stands.
-                    Err(_) => return Err(error),
+                    // The store cannot say what it holds, so the new grant may be the one held and
+                    // its token must not be ended behind the store's back; it may also not be, and
+                    // then nothing else would end it. Its revocation is queued under its own
+                    // grant: a send leaves it alone while the store holds the grant, and the next
+                    // settlement removes the grant and sends it. When the queue cannot take it
+                    // either, the token is kept in memory and settled by the next send that can
+                    // read the store. The queue keeps the replaced grant's entry as it stands.
+                    Err(_) => {
+                        if self
+                            .queue(&grant.grant_id, grant.refresh_token.clone())
+                            .is_err()
+                        {
+                            self.keep_in_memory(&grant.grant_id, grant.refresh_token.clone());
+                        }
+                        return Ok(Commit::Unsettled);
+                    }
                 }
             }
             self.ended.store(false, Ordering::SeqCst);
             self.publish();
             replaced.is_some()
         };
-        if replaced {
+        let waiting = !self
+            .unsettled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        if replaced || waiting {
             let _ = self.send_pending().await;
         }
-        Ok(())
+        Ok(Commit::Kept)
+    }
+
+    /// Keeps a sign-in's tokens as [`Self::commit`] does, and ends them at the service when they
+    /// cannot be kept, so a caller has one thing to do with the issued tokens and none of it can
+    /// end a token the store holds.
+    ///
+    /// A token the store is known not to hold is sent to the service ([`Self::revoke_unkept`]). When
+    /// the store could not say ([`Commit::Unsettled`]) nothing is sent for the new grant until the
+    /// store can say: the account is settled at once ([`Self::recover`]), which removes whichever
+    /// grant the store holds that has its own revocation queued, sends every queued token, and ends
+    /// a token held in memory unless the store holds its grant. The outcome is [`Commit::Kept`]
+    /// only when that settlement left the store holding the new grant with no revocation queued for
+    /// it: then it is the sign-in, and the next recovery will not remove it. Every other outcome is
+    /// [`Commit::Unsettled`]: the settlement left the device signed out with every token ended or
+    /// queued, or the store still cannot be read or changed and the settlement waits for the next send, which
+    /// settles a token in memory, or the next recovery, sign-out or replacing sign-in, which
+    /// removes a held grant whose revocation is queued; until then a grant the store returns is
+    /// presented as it was found.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the commit.
+    pub async fn keep(&self, issued: IssuedGrant, nonce: &str) -> Result<Commit> {
+        let refresh = issued.refresh_token.clone();
+        match self.commit(issued, nonce).await {
+            Ok(Commit::Kept) => Ok(Commit::Kept),
+            Ok(Commit::Unsettled) => {
+                let _ = self.recover().await;
+                // What the store and the queue hold now, read together: a grant the queue still
+                // names is one the next recovery removes, so it is not kept.
+                let settled = match self.hold().await {
+                    Ok(_held) => match (self.read_grant(), self.read_pending()) {
+                        (Ok(Some(held)), Ok(queued)) => {
+                            held.refresh_token == refresh
+                                && !queued.iter().any(|entry| entry.grant_id == held.grant_id)
+                        }
+                        _ => false,
+                    },
+                    Err(_) => false,
+                };
+                if settled {
+                    self.ended.store(false, Ordering::SeqCst);
+                    self.publish();
+                    Ok(Commit::Kept)
+                } else {
+                    Ok(Commit::Unsettled)
+                }
+            }
+            Err(error) => {
+                let _ = self.revoke_unkept(refresh).await;
+                Err(error)
+            }
+        }
     }
 
     /// Reads the signed-in account's address and name from the service and keeps them.
@@ -2372,17 +2500,65 @@ impl SignedInAccount {
     /// Sends every queued revocation and removes each one the service acknowledges, except any that
     /// name the grant this device still holds. Returns how many are still waiting.
     ///
+    /// A token kept in memory because neither the store nor the queue could take it is settled
+    /// here, under the same lock that reads the store and the queue, so no commit can add one
+    /// between the reads and the decision: one whose grant the store holds is the sign-in and is
+    /// let go of; any other moves into the queue, which is where every token that waits to be ended
+    /// is kept, and is sent with it. Only a token the queue still refuses stays in memory, and is
+    /// sent on its own, before the queue is worked through, so that a store that fails while the
+    /// queue is cleaned up cannot keep a token that nothing durable names from the service; it is
+    /// counted as waiting until the service acknowledges it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the store cannot be read or changed.
     pub async fn send_pending(&self) -> Result<usize> {
-        let (entries, kept) = {
+        let (entries, kept, in_memory) = {
             let _held = self.hold().await?;
-            (
-                self.read_pending()?,
-                self.read_grant()?.map(|grant| grant.grant_id),
-            )
+            let kept = self.read_grant()?.map(|grant| grant.grant_id);
+            // The memory list is held from the moment it is taken to the moment what the queue
+            // refused is put back, with no wait in between, so a token added meanwhile (by
+            // `revoke_unkept`, which does not hold the store's lock) is added to the list that is
+            // put back and not lost to it.
+            let mut memory = self
+                .unsettled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let waiting = std::mem::take(&mut *memory);
+            let mut refused = Vec::new();
+            for (grant_id, refresh_token) in waiting {
+                if kept.as_deref() == Some(grant_id.as_str()) {
+                    continue;
+                }
+                if self.queue(&grant_id, refresh_token.clone()).is_err() {
+                    refused.push((grant_id, refresh_token));
+                }
+            }
+            // A queue write can install its entry and then report a failure: what the queue holds
+            // decides, so a token is never sent from memory and from the queue.
+            let entries = match self.read_pending() {
+                Ok(entries) => entries,
+                Err(error) => {
+                    memory.extend(refused);
+                    return Err(error);
+                }
+            };
+            refused.retain(|(grant_id, refresh_token)| {
+                !entries.iter().any(|entry| {
+                    entry.grant_id == *grant_id && entry.refresh_token == *refresh_token
+                })
+            });
+            memory.extend(refused.iter().cloned());
+            (entries, kept, refused)
         };
+        for (grant_id, refresh_token) in in_memory {
+            if self.service.revoke(&refresh_token).await.is_ok() {
+                self.unsettled
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|(held, token)| !(*held == grant_id && *token == refresh_token));
+            }
+        }
         for entry in entries {
             // A grant this device still holds is not ended by a send. An entry for it is there
             // because a sign-out stopped before it removed the grant, or because a commit could not
@@ -2401,7 +2577,13 @@ impl SignedInAccount {
             }
         }
         let _held = self.hold().await?;
-        Ok(self.read_pending()?.len())
+        let queued = self.read_pending()?.len();
+        let in_memory = self
+            .unsettled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        Ok(queued + in_memory)
     }
 
     /// What the account has used, or none when this sign-in was not granted usage.
