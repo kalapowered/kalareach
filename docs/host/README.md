@@ -285,7 +285,8 @@ host knows. A call is open from the moment its start asks the broker, through th
 until its close has been told to the broker, and the daemon counts all three. (A start whose
 outcome the broker could not tell is not known as a call, because the host has no identifier to
 close, and a change of account loses no close for it.) A sign-in or a sign-out is refused while a
-call is open, and a sign-in that is waiting when a call opens ends without spending its code.
+call is open, and a sign-in that is waiting when the browser comes back with a call open ends without
+spending its code.
 
 A change raises a gate before it reads the calls, and a request for a token waits while the gate is
 up. A start registers itself before it asks for a token, so it is either counted by the check, which
@@ -294,8 +295,11 @@ the account the change leaves, or refused when none is left. A call the check co
 as long as the check. The exchange of a sign-in is a request that waits on the service, and a call
 can open while it does: the new grant is then queued for revocation, and told to the service now and
 again at the next start if it cannot be, and the attempt ends as `call_open`; nothing the call holds
-changes. The gate is raised for the commit of a sign-in, the read of the account's identity that
-follows it, and the removal of a sign-out with the revocation that follows it. A call record stays
+changes. The gate is raised for the commit of a sign-in, with the revocation of the grant it
+replaces, the read of the account's identity that follows it, and the removal of a sign-out with
+the revocations that follow it. Each request the account service is sent has a deadline of its own,
+and up to sixteen revocations can wait to be sent, so a start that meets the gate waits at most the
+sum of those deadlines. A call record stays
 until its device stops the call; a phone that is lost during a call keeps `kr account sign-in` and
 `sign-out` refused until the daemon restarts.
 

@@ -21,7 +21,9 @@
 //! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_start_is_waiting_on_the_broker` |
 //! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_close_is_not_finished` |
 //! | KR-REQ-17.23 | `a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it_was` |
-//! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_is_made_under_the_account_it_leaves` |
+//! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_waits_and_is_refused_when_the_change_leaves_none` |
+//! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_waits_and_is_made_under_the_account_it_leaves` |
+//! | KR-REQ-17.23 | `a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service` |
 //! | KR-REQ-17.23 | `a_host_moved_off_the_managed_broker_can_still_end_the_sign_in_it_keeps` |
 //! | KR-REQ-17.23 | `an_account_the_store_could_not_settle_is_not_presented_until_it_is_settled` |
 //! | KR-REQ-17.23 | `each_refresh_presents_the_token_the_last_one_issued` |
@@ -1671,6 +1673,14 @@ async fn a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it
         broker.revoked().is_empty(),
         "the service refused the revocation of the grant that came for the turned-away sign-in"
     );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/auth/oauth2/revoke"
+                && request.body["token"] == broker.refresh(2).as_str()),
+        "the turned-away grant was sent to the service at once, and refused"
+    );
 
     let _ = mutate(
         &session,
@@ -1718,7 +1728,8 @@ async fn a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it
 /// began under the grant it was about to remove would have lost its account: the start waits, and
 /// when the grant is gone it is refused and creates nothing at the broker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_start_that_meets_an_account_being_changed_is_made_under_the_account_it_leaves() {
+async fn a_start_that_meets_an_account_being_changed_waits_and_is_refused_when_the_change_leaves_none()
+ {
     let broker = Broker::start().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
@@ -1775,6 +1786,112 @@ async fn a_start_that_meets_an_account_being_changed_is_made_under_the_account_i
             .iter()
             .all(|request| !request.path.starts_with("/api/voice/sessions")),
         "nothing was created at the broker"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a start that meets an account being changed waits for the change to end
+/// and is made under the account the change leaves. A sign-in whose identity agrees keeps the new
+/// account: the start is held at the gate until the identity read ends, nothing reaches the broker
+/// meanwhile, and the call is then created under the new account's token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_meets_an_account_being_changed_waits_and_is_made_under_the_account_it_leaves()
+{
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, session, session_id, prepared) = ready(&host, &owner).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let identity = broker.hold("/auth/oauth2/userinfo");
+
+    let (_page, started) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        identity.reached().await;
+        let params = start_params(session_id, &prepared);
+        let start = try_mutate(&session, host.environment_id, Method::VoiceStart, &params);
+        let release = async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while host.controller().host_account().token_requests_waiting() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the start's request for a token waits for the change to end");
+            assert!(
+                broker
+                    .seen()
+                    .iter()
+                    .all(|request| !request.path.starts_with("/api/voice/sessions")),
+                "nothing reached the broker while the account was being changed"
+            );
+            identity.release();
+        };
+        let (started, ()) = tokio::join!(start, release);
+        started
+    });
+    let report = settled(&host).await;
+    assert!(
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the sign-in is kept: {report:?}"
+    );
+    let result: VoiceStartResult = started
+        .expect("the start is answered")
+        .to_typed()
+        .expect("a start result");
+    assert!(matches!(result.outcome, VoiceStartOutcome::Started { .. }));
+    let creation = broker
+        .seen()
+        .into_iter()
+        .find(|request| request.path == "/api/voice/sessions")
+        .expect("the call was created at the broker");
+    assert_eq!(
+        creation.authorization.as_deref(),
+        Some(format!("Bearer {}", broker.access(2)).as_str()),
+        "the call was made under the account the change left"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a turned-away grant whose queue cannot be written is still sent to the service,
+/// once: a token the host cannot remember is not dropped unsent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    // The queue cannot be read: a directory stands where its file would be.
+    let session = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let queue = session.with_file_name("revoke");
+    std::fs::create_dir(&queue).expect("a directory in the queue's place");
+    let exchange = broker.hold("/auth/oauth2/token");
+
+    let (_page, _call) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        exchange.reached().await;
+        let started = start_a_call(&host, &owner).await;
+        exchange.release();
+        started
+    });
+    let report = settled(&host).await;
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::CallOpen)
+    );
+    assert!(
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the account is as it was: {report:?}"
+    );
+    assert_eq!(
+        broker.revoked(),
+        [broker.refresh(2)],
+        "the grant that could not be queued was sent to the service once"
     );
     host.stop().await;
 }
@@ -1894,8 +2011,8 @@ async fn an_account_the_store_could_not_settle_is_not_presented_until_it_is_sett
     host.stop().await;
 }
 
-/// The file the host's account keeps `item` in, found under the stopped daemon's secret store.
-fn account_item(stopped: &net_support::Stopped, item: &str) -> std::path::PathBuf {
+/// The file the host's account keeps `item` in, found under a daemon's secret store.
+fn account_item_in(secrets: &std::path::Path, item: &str) -> std::path::PathBuf {
     fn find(directory: &std::path::Path, item: &str, found: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -1912,13 +2029,14 @@ fn account_item(stopped: &net_support::Stopped, item: &str) -> std::path::PathBu
         }
     }
     let mut found = Vec::new();
-    find(
-        &stopped.tree().environment().secrets_dir(),
-        item,
-        &mut found,
-    );
+    find(secrets, item, &mut found);
     assert_eq!(found.len(), 1, "one {item} item of the account: {found:?}");
     found.remove(0)
+}
+
+/// The file the host's account keeps `item` in, found under the stopped daemon's secret store.
+fn account_item(stopped: &net_support::Stopped, item: &str) -> std::path::PathBuf {
+    account_item_in(&stopped.tree().environment().secrets_dir(), item)
 }
 
 /// KR-REQ-17.23: the token the service rotates is the one the next request presents: each refresh
