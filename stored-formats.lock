@@ -232,7 +232,7 @@
         "version": 2,
         "migrates_from": 1
       },
-      "digest": "fd20d2e0f80ff3f381b9c8d5c33355b3d534466748658c12948b02261e954f46",
+      "digest": "24a123807a5adb9584e8b4bfe12198ceed995766ca96c72126ac35900b97245a",
       "kept": [
         "Record, Transaction, Abandoned, TransactionState, Restart, Start (crates/kr-cli/src/update/mod.rs)",
         "PathVariable"
