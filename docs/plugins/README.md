@@ -333,11 +333,14 @@ and a package supplies no quoting of its own.
 An implementation that cannot produce the class its action declares is a finding, as is one that
 names a component the package does not ship or a method its connector table does not route.
 
-This host carries two of the forms today. A `decision_destination` action is admitted as the answer
-it is and written on the connection its request arrived on. A `presentation` action is admitted on
-`session.view` and answered with its receipt, and nothing more: no token is issued, no plan is
-asked for and nothing leaves the host, so its result names the action and carries no upstream
-result. Every other action is refused as `UNSUPPORTED_CAPABILITY` before anything is marked.
+This host carries three of the forms today. A `decision_destination` action is admitted as the
+answer it is and written on the connection its request arrived on. A `presentation` action is
+admitted on `session.view` and answered with its receipt, and nothing more: no token is issued, no
+plan is asked for and nothing leaves the host, so its result names the action and carries no
+upstream result. A `component` action is prepared by the package's component and carried out as the
+plan the host validated, in two passes
+([An action a component prepares](runtime.md#an-action-a-component-prepares)). Every other action is
+refused as `UNSUPPORTED_CAPABILITY` before anything is marked.
 
 How a package with no component answers an approval, from the connector table to the call, is in
 [Answering approvals from a declarative package](sdk.md).
@@ -499,11 +502,15 @@ implements the `adapter` interface and targets the `plugin` world.
 | `checkpoint` | Returns resumable component state | 100 ms |
 | `restore` | Restores state from a checkpoint | 100 ms |
 
-`prepare-action` returns an effect plan whose operation is one the broker already performs:
-present, send a routed upstream method with its fields filled in, cancel the current turn,
-contribute a completed attachment handle, or write terminal text. A component chooses between them
-and supplies the values. It cannot describe an operation the broker has no way to perform, and it
-cannot name a destination outside the binding the host made.
+`prepare-action` returns an effect plan whose operation is one the broker already performs: send
+the action's routed upstream method, cancel the current turn or contribute a completed attachment
+handle. The host builds the effect it validates from the invocation and the
+action's declaration, never from the plan, so the plan can only choose the one operation its action
+declared and confirm the arguments it was given: a plan for another action, of another class, with
+other arguments, naming fields of a routed method or a method other than the action's own, or that
+only redraws the document, is refused by name. A component is therefore a veto, and cannot describe
+an operation the broker has no way to perform or name a destination outside the binding the host
+made.
 
 `prepare-action` receives the invocation's token: the actor, the grant, the binding and thread
 revisions, the declared action and the hash of exactly the parameters a person saw. `encode-response`

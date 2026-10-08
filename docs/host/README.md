@@ -4875,11 +4875,14 @@ in force, and the capability the action needs is still usable at the revision th
 at.
 
 The hand-over to a component belongs to the plugin host, which owns the runtime that invokes
-`prepare_action`. The broker issues and spends the token around the operation it dispatches itself,
-and a `plugin.action.invoke` that would cross into that runtime is refused before the dispatch
-marker rather than carried. An action that answers through its connector's decision destination
-does not cross into it: no component prepares the answer, so no token is issued, and the broker
-writes the answer from the connector's table under the approval's own claim.
+`prepare_action`. The worker asks it for an action's plan after the action's intent is committed
+and before the boundary that writes its dispatch marker, with the receipt still `accepted`, and the
+broker issues and spends the token when the action comes back with the plan in hand
+(`docs/plugins/runtime.md`, "An action a component prepares"). A plan the broker refuses rejects
+the receipt, because nothing was dispatched. An action that answers through its connector's
+decision destination does not cross into the runtime: no component prepares the answer, so no token
+is issued, and the broker writes the answer from the connector's table under the approval's own
+claim.
 
 ### Capability evidence
 
