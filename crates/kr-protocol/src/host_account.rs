@@ -5,9 +5,10 @@
 //! local socket: the daemon listens on the loopback address the desktop client is registered with
 //! and keeps the grant that comes of the person's browser sign-in in the host's secret store.
 //! `account.status` reads where that stands, and says the address the person opens.
+//! `account.sign_out` removes the grant and asks the service to end it.
 //!
-//! Both methods are served on the local socket alone. A grant on a host decides whose balance a
-//! phone's call spends, so no paired device starts or reads it.
+//! The methods are served on the local socket alone. A grant on a host decides whose balance a
+//! phone's call spends, so no paired device starts, ends or reads it.
 
 use core::fmt;
 
@@ -34,6 +35,23 @@ pub struct AccountSignInStarted {
     pub expires_at_ms: TimestampMs,
 }
 
+/// Parameters of `account.sign_out`. The environment is the one the connection reaches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountSignOutParams {}
+
+/// What `account.sign_out` answers: whether there was an account to sign out, and whether the
+/// service has been told to end it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountSignedOut {
+    /// Whether an account was signed in. A host with none answers `false` and changes nothing.
+    pub was_signed_in: bool,
+    /// Whether the service has acknowledged ending the grant. When it has not, the grant is gone
+    /// from this host and the daemon sends the revocation again when it next starts.
+    pub service_told: bool,
+}
+
 /// Parameters of `account.status`. The environment is the one the connection reaches.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +70,7 @@ pub struct AccountReport {
     /// The account this host is signed in as, or what stands in its way.
     pub state: AccountState,
     /// How the most recent attempt that has ended ended. It stays while a newer attempt waits, and
-    /// is null before any attempt has ended since the daemon started.
+    /// is null before any attempt has ended since the daemon started or the host was signed out.
     pub last_attempt: Nullable<AccountAttempt>,
 }
 
