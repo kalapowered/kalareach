@@ -1438,13 +1438,13 @@ fn hexadecimal_units(text: &str, digits: usize) -> Option<Vec<u32>> {
 /// How long a startup write waits for another one to finish before it gives up.
 const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A lock beside one startup file, or beside the saved terminal preference, held for a whole
-/// read-rebuild-write.
+/// A lock held for a whole read-rebuild-write, of one startup file (kept in the installation's own
+/// lock directory), of the record of the startup files `kr` changed (beside it), or of the saved
+/// terminal preference (beside it).
 ///
 /// This is what closes the window between the check before the rename and the rename itself, for
 /// the writer that window was about: another `kr` process installing or removing the same entry.
-/// The lock file sits beside the startup file, so the two processes need no agreement beyond the
-/// directory they are both writing in.
+/// The two processes need no agreement beyond the lock's name, which both make the same way.
 ///
 /// The lock is the operating system's on both platforms, so a holder that dies releases it and no
 /// staleness rule is needed: on Unix it is `flock` on the open file, and on Windows it is the file
@@ -1462,7 +1462,7 @@ pub(crate) struct FileLock {
 }
 
 impl FileLock {
-    /// Returns where one startup file's lock lives.
+    /// Returns where the lock beside `path` lives.
     fn beside(path: &Path) -> std::io::Result<PathBuf> {
         let target = resolved(path)?;
         let directory = target
