@@ -124,6 +124,7 @@ const RECORD_LIMIT: u64 = 8 * 1024 * 1024;
 /// What a run that stopped part way tells a person to run: either command starts, before anything
 /// else, the daemons the one that stopped had stopped, and a rollback goes back from a release whose
 /// daemon does not start.
+#[cfg(unix)]
 const RUN_AGAIN: &str = "kr host update or kr host rollback";
 
 /// The store's record, `install.json`: what an update needs that the store's directories do not
@@ -201,6 +202,7 @@ kr_client::debug_as_name!(Abandoned);
 
 /// `newer` and then each of `older` for an environment `newer` has none for: a daemon recorded
 /// more recently is the one to start.
+#[cfg(unix)]
 fn merged(newer: Vec<Restart>, older: Vec<Restart>) -> Vec<Restart> {
     let mut restarts = newer;
     for restart in older {
@@ -215,6 +217,7 @@ fn merged(newer: Vec<Restart>, older: Vec<Restart>) -> Vec<Restart> {
 }
 
 /// Whichever of two roots is of the higher version, the first when they are of one.
+#[cfg(unix)]
 fn newer_root(
     first: Option<tough::schema::Signed<tough::schema::Root>>,
     second: Option<tough::schema::Signed<tough::schema::Root>>,
@@ -231,6 +234,7 @@ fn newer_root(
     }
 }
 
+#[cfg(unix)]
 impl Transaction {
     /// This update, failed, as what it owes: its daemons and its root together with those of the
     /// failed update it went on past, if it did.
@@ -251,6 +255,7 @@ impl Transaction {
     }
 }
 
+#[cfg(unix)]
 impl Abandoned {
     /// The update again, in the state of one whose switch happened, owing its daemons and those in
     /// `newer`, which are the more recent record of any environment they share.
@@ -266,6 +271,7 @@ impl Abandoned {
     }
 }
 
+#[cfg(unix)]
 impl Transaction {
     /// The directories the daemons it recorded, and those of a failed update it went on past, read
     /// their configuration documents in, by environment, where they said.
