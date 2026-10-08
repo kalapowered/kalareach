@@ -392,6 +392,10 @@ impl Controller {
         // moment.
         let barrier = self.barrier(own).await?;
         let barrier = self.barrier_for(audience, named, barrier)?;
+        // A revoked owner is no longer a key the feed may be told can remove this host.
+        if let Some(runtime) = self.feed_runtime() {
+            runtime.wake();
+        }
         // Cut to what one control frame carries: a revocation takes effect whatever it withdrew,
         // and the caller is owed an answer it can decode. Every total is counted before the cut.
         let answer = kr_protocol::sharing::RevocationResult::bounded(
