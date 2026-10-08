@@ -214,7 +214,8 @@ fn directories(
 
 /// Where an environment's configuration document can be: with the rest of its state, where this
 /// process's own environment says, and where an account with a home puts it by default. The
-/// daemon that reads it may have been started with an environment of its own, so each is looked at.
+/// daemon that reads it may have been started with an environment of its own, so each is looked at;
+/// one started with variables of its own that put the document somewhere else is not covered.
 fn configuration_directories(environment: &Environment) -> Vec<PathBuf> {
     let mut found = vec![environment.paths.state_dir().to_path_buf()];
     let documented = kr_protocol::hostinfo::configuration::document_path(

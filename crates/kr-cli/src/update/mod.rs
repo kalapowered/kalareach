@@ -1813,10 +1813,9 @@ fn settle(store: &Store, record: &mut Record) -> Result<()> {
                 .as_ref()
                 .is_none_or(|known| root.signed.version >= known.signed.version)
         };
-        // A transaction an earlier build began holds no root: the roots of the two releases are
-        // read as they were before the root was recorded with it, each on its own, and one that
-        // cannot be read adds none. Remove this once no supported updater begins a transaction
-        // without the root.
+        // A transaction an earlier build began holds no root: the roots of its two releases are
+        // read here, each on its own, and one that cannot be read adds none. Remove this, and its
+        // test, once no supported updater begins a transaction without the root.
         let trusted = update.trusted_root.or_else(|| {
             [&update.source, &update.target]
                 .into_iter()
