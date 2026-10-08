@@ -17,9 +17,17 @@ use crate::error::{ControllerError, Result};
 /// the environment over, not how soon the holder lets go.
 pub const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 
-/// The processes whose stop a test has had the kernel refuse.
-static REFUSED_STOPS: std::sync::Mutex<Vec<kr_protocol::identity::ProcessStartIdentity>> =
-    std::sync::Mutex::new(Vec::new());
+/// What a test runs once, right after the kernel's refusal of a stop it supplied.
+type AfterRefusal = Box<dyn FnOnce() + Send>;
+
+/// The processes whose stop a test has had the kernel refuse, each with what runs after the first
+/// refusal.
+static REFUSED_STOPS: std::sync::Mutex<
+    Vec<(
+        kr_protocol::identity::ProcessStartIdentity,
+        Option<AfterRefusal>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
 
 /// Makes the stop of one recorded process answer "operation not permitted", as the kernel does for
 /// a process that belongs to another account. Every other stop is the platform's own.
@@ -28,18 +36,37 @@ static REFUSED_STOPS: std::sync::Mutex<Vec<kr_protocol::identity::ProcessStartId
 /// have, and what the cleanup does with a process it cannot stop is the thing under test: the
 /// survivor stays a real running process, and the refusal is the only part supplied.
 pub fn refuse_stopping(identity: kr_protocol::identity::ProcessStartIdentity) {
+    refuse_stopping_then(identity, || {});
+}
+
+/// [`refuse_stopping`], and `then` runs once right after the first refusal: a process that is
+/// refused a stop and ends on its own afterwards, as one does that the platform will not let this
+/// host signal.
+pub fn refuse_stopping_then(
+    identity: kr_protocol::identity::ProcessStartIdentity,
+    then: impl FnOnce() + Send + 'static,
+) {
     REFUSED_STOPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(identity);
+        .push((identity, Some(Box::new(then))));
 }
 
 /// Whether a test has had the stop of this process refused.
 pub(crate) fn stop_is_refused(identity: &kr_protocol::identity::ProcessStartIdentity) -> bool {
-    REFUSED_STOPS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(identity)
+    let (refused, then) = {
+        let mut stops = REFUSED_STOPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match stops.iter_mut().find(|(refused, _)| refused == identity) {
+            Some((_, then)) => (true, then.take()),
+            None => (false, None),
+        }
+    };
+    if let Some(then) = then {
+        then();
+    }
+    refused
 }
 
 /// How long a start waits before it tries again.
