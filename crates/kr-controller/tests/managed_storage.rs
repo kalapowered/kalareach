@@ -17,12 +17,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kr_client::services::account::AccountToken;
-use kr_client::services::voice::{StoredAccountToken, account_token_path};
-use kr_client::services::{
-    BackupManifestService, HttpService, ManagedBackupManifestService, ServiceHttp, ServiceSigner,
-    managed_response_limits,
+use kr_client::services::account::{
+    AccountIdentity, AccountService, AccountToken, AccountUsage, AuthorisationGrant, Exchanged,
+    IssuedGrant, RefreshToken, Refreshed, StoredGrant,
 };
+use kr_client::services::{
+    BackupManifestService, HttpService, ManagedBackupManifestService, ServiceFuture, ServiceHttp,
+    ServiceSigner, managed_response_limits,
+};
+use kr_controller::account::{HostAccount, Service};
 use kr_controller::backup::quiet::{LONGEST_DELAY, Timer};
 use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK};
 use kr_controller::backup::store::{AttemptStatus, Production, Remote};
@@ -211,19 +214,20 @@ fn object_id(seed: u8) -> BackupObjectId {
     BackupObjectId::new(Uuid::from_bytes([seed; 16]))
 }
 
-/// What the account token on the host's disk is.
+/// What the sign-in the host holds is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Token {
-    /// None is imported.
+    /// No account is signed in.
     None,
-    /// The token the service issued, with the scope backup storage needs.
+    /// An account signed in at the service with the scope backup storage needs.
     Usable,
-    /// A token issued for another service.
+    /// An account signed in at another service.
     ForAnotherService,
-    /// A token the service issued without the scope.
+    /// An account signed in at the service without the scope, as one made before storage was
+    /// selected is.
     WithoutTheScope,
-    /// A token whose file says it has stopped being accepted.
-    Expired,
+    /// An account signed in at the service whose sign-in the service has since ended.
+    Ended,
 }
 
 /// What the test arranges before the daemon starts.
@@ -301,7 +305,7 @@ impl Rig {
         if arrangement.selects_the_service {
             write_document(&host, Some(served.origin()));
         }
-        write_token(&host, arrangement.token, served.origin());
+        sign_in(&host, arrangement.token, served.origin()).await;
         let (controller, client_endpoint, serving) = start_daemon(&host, Arc::clone(&timer)).await;
         let writer = daemon_writer(&host);
         let rig = Self {
@@ -496,44 +500,115 @@ fn write_document(host: &kr_ipc::testing::TempHost, origin: Option<&str>) {
     .expect("the document");
 }
 
-/// Writes the account token the operator would import.
-fn write_token(host: &kr_ipc::testing::TempHost, token: Token, origin: &str) {
-    let (origin, scopes, expires_at_ms): (&str, Vec<String>, Option<u64>) = match token {
-        Token::None => return,
-        Token::Usable => (origin, vec!["backup.write".to_owned()], None),
-        Token::ForAnotherService => (
-            "https://elsewhere.example",
-            vec!["backup.write".to_owned()],
-            None,
-        ),
-        Token::WithoutTheScope => (origin, vec!["voice".to_owned()], None),
-        Token::Expired => (origin, vec!["backup.write".to_owned()], Some(1)),
-    };
-    write_token_file(host, origin, TOKEN, scopes, expires_at_ms);
+/// Signs the host in as `token` says, before its daemon starts.
+async fn sign_in(host: &kr_ipc::testing::TempHost, token: Token, origin: &str) {
+    match token {
+        Token::None => {}
+        Token::Usable => {
+            keep_sign_in(
+                host,
+                origin,
+                TOKEN,
+                &["openid", "voice", "backup.write"],
+                3600,
+            )
+            .await;
+        }
+        Token::ForAnotherService => {
+            keep_sign_in(
+                host,
+                "https://elsewhere.example",
+                TOKEN,
+                &["openid", "voice", "backup.write"],
+                3600,
+            )
+            .await;
+        }
+        Token::WithoutTheScope => {
+            keep_sign_in(host, origin, TOKEN, &["openid", "voice"], 3600).await;
+        }
+        Token::Ended => {
+            // The access token is at its end, so the first token asked of the sign-in is a
+            // renewal, which the service refuses as it does a sign-in it has ended.
+            let account =
+                keep_sign_in(host, origin, TOKEN, &["openid", "voice", "backup.write"], 0).await;
+            account
+                .tokens()
+                .token("backup.write")
+                .await
+                .expect_err("the service ended the sign-in");
+        }
+    }
 }
 
-/// Writes an account token document into the host's runtime root.
-fn write_token_file(
+/// Keeps a sign-in in the secret store the daemon will open, as a finished browser sign-in leaves
+/// one: the grant the service issued, and the service it was signed in at.
+async fn keep_sign_in(
     host: &kr_ipc::testing::TempHost,
     origin: &str,
-    secret: &str,
-    scopes: Vec<String>,
-    expires_at_ms: Option<u64>,
-) {
+    access: &str,
+    scopes: &[&str],
+    expires_in_seconds: u64,
+) -> HostAccount {
     let environment = host.environment();
-    let stored = StoredAccountToken {
-        origin: origin.to_owned(),
-        access_token: AccountToken::new(secret).expect("a token"),
-        scopes,
-        expires_at_ms,
-    };
-    let root: PathBuf = environment.runtime_root().to_path_buf();
-    std::fs::create_dir_all(&root).expect("the runtime root");
-    kr_ipc::paths::write_owner_only_file(
-        &account_token_path(&root),
-        &stored.write().expect("a token document"),
-    )
-    .expect("the token file");
+    let store = open_store_in(&environment.secrets_dir()).expect("the daemon's secret store");
+    let account = HostAccount::new(
+        Arc::from(store.store),
+        host.environment_id(),
+        environment.runtime_root(),
+        Some(Service {
+            origin: origin.to_owned(),
+            account: Arc::new(RenewalRefused),
+        }),
+    );
+    account
+        .keep_for_test(IssuedGrant {
+            access_token: AccountToken::new(access).expect("a token"),
+            expires_in_seconds,
+            refresh_token: RefreshToken::new("a-refresh-token-the-service-ended").expect("a token"),
+            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            subject: "account-1".to_owned(),
+        })
+        .await;
+    account
+}
+
+/// An account service that issues nothing and refuses every renewal, as the service does for a
+/// sign-in it has ended.
+#[derive(Debug)]
+struct RenewalRefused;
+
+impl AccountService for RenewalRefused {
+    fn exchange<'a>(&'a self, _grant: &'a AuthorisationGrant) -> ServiceFuture<'a, Exchanged> {
+        Box::pin(async { Ok(Exchanged::Refused { leftover: None }) })
+    }
+
+    fn refresh<'a>(&'a self, _stored: &'a StoredGrant) -> ServiceFuture<'a, Refreshed> {
+        Box::pin(async { Ok(Refreshed::Ended) })
+    }
+
+    fn revoke<'a>(&'a self, _refresh: &'a RefreshToken) -> ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn identity<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountIdentity> {
+        Box::pin(async {
+            Ok(AccountIdentity {
+                subject: "account-1".to_owned(),
+                email: None,
+                name: None,
+            })
+        })
+    }
+
+    fn usage<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountUsage> {
+        Box::pin(async {
+            Err(kr_client::ClientError::refusal(
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                kr_client::shown::Shown::said("this stand-in reads no usage"),
+            ))
+        })
+    }
 }
 
 /// Starts a daemon on `host`, whose carrier waits by `timer`, and serves its local socket.
@@ -1223,14 +1298,15 @@ async fn a_writer_nobody_enrolled_is_asked_for_again_only_as_a_person_can_act() 
 }
 
 /// No request carrying an account leaves the host with a token that is not usable, and one that is
-/// usable does.
+/// usable does. The doctor says which sign-in the host holds and that signing in again is the
+/// remedy, as it must for a host that selected storage after it signed in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_that_is_not_usable_never_leaves_the_host() {
-    for token in [
-        Token::None,
-        Token::ForAnotherService,
-        Token::WithoutTheScope,
-        Token::Expired,
+    for (token, said) in [
+        (Token::None, "no account is signed in"),
+        (Token::ForAnotherService, "belongs to another service"),
+        (Token::WithoutTheScope, "lacks the backup.write scope"),
+        (Token::Ended, "ended the sign-in"),
     ] {
         let timer = HeldTimer::held();
         let rig = Rig::start(
@@ -1259,8 +1335,11 @@ async fn a_token_that_is_not_usable_never_leaves_the_host() {
             sent.is_empty(),
             "{token:?}: a token left the host: {sent:?}"
         );
-        let (status, _) = rig.storage_check().await;
+        let (status, detail) = rig.storage_check().await;
         assert_eq!(status, DoctorStatus::Warning, "{token:?}");
+        assert!(detail.contains(said), "{token:?}: {detail}");
+        let remedy = rig.storage_remedy().await;
+        assert!(remedy.contains("kr account sign-in"), "{token:?}: {remedy}");
     }
 
     // The control: with a usable token the same work goes, and every request that carries an
@@ -1319,7 +1398,7 @@ async fn a_service_that_never_answers_holds_one_task_and_not_the_daemon() {
     let served = serve().await;
     served.web().set_backup(true);
     write_document(&host, Some(served.origin()));
-    write_token(&host, Token::Usable, served.origin());
+    sign_in(&host, Token::Usable, served.origin()).await;
     served.web().fail(STATUS, 1, Moment::Hold);
     let (controller, endpoint, serving) = start_daemon(&host, HeldTimer::held()).await;
     within(
@@ -1576,7 +1655,7 @@ async fn a_delay_named_to_the_doctor_in_the_middle_of_an_upload_holds_what_comes
 /// question carries no token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_daemon_finds_the_publication_the_service_holds_whatever_its_token_is() {
-    for token in [Token::Usable, Token::Expired] {
+    for token in [Token::Usable, Token::Ended] {
         let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
         let web = Arc::clone(rig.served.web());
         // The publication reaches the service and its answer is lost. The question the daemon asks
@@ -1593,7 +1672,7 @@ async fn a_restarted_daemon_finds_the_publication_the_service_holds_whatever_its
         assert_eq!(web.generations(&archive_id().to_string()), vec![1]);
         let (host, served, _) = rig.stop().await;
         served.web().release_held();
-        write_token(&host, token, served.origin());
+        sign_in(&host, token, served.origin()).await;
         let before = served.web().arrived().len();
 
         let (controller, _, _serving) = start_daemon(&host, HeldTimer::held()).await;
@@ -1649,20 +1728,23 @@ async fn the_cleanup_privacy_mode_owes_ends_the_work_in_hand_whatever_the_token_
     let (waited, _) = within("the part is turned back", timer.next_wait()).await;
     assert!(waited >= Duration::from_secs(600), "{waited:?}");
 
-    // The token the host holds stops being usable, a new one with a secret of its own, and then
-    // privacy mode is turned on.
-    write_token_file(
-        &rig.host,
-        rig.served.origin(),
-        "a-token-that-has-expired",
-        vec!["backup.write".to_owned()],
-        Some(1),
-    );
+    // The host is signed in again with a grant that lacks the scope, with a token of its own, so
+    // the token it held stops being usable, and then privacy mode is turned on.
+    rig.controller
+        .host_account()
+        .keep_for_test(IssuedGrant {
+            access_token: AccountToken::new("a-token-without-the-scope").expect("a token"),
+            expires_in_seconds: 3600,
+            refresh_token: RefreshToken::new("a-refresh-token").expect("a token"),
+            scopes: vec!["openid".to_owned(), "voice".to_owned()],
+            subject: "account-1".to_owned(),
+        })
+        .await;
     rig.fence().await;
     assert!(
         web.arrived()
             .iter()
-            .all(|request| request.token.as_deref() != Some("a-token-that-has-expired")),
+            .all(|request| request.token.as_deref() != Some("a-token-without-the-scope")),
         "nothing left the host with a token it could not use"
     );
 
@@ -1711,7 +1793,7 @@ impl Drop for Daemon {
 }
 
 /// The daemon a person runs, started from a copy of the program on the internal disk with a storage
-/// service in its configuration document and an account token on its disk, asks that service about
+/// service in its configuration document and a sign-in the service issued, asks that service about
 /// backup storage as it starts and says so in `kr doctor`.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1722,7 +1804,7 @@ async fn the_daemon_a_person_runs_reaches_the_storage_service_it_selects() {
     let served = serve().await;
     served.web().set_backup(true);
     write_document(&host, Some(served.origin()));
-    write_token(&host, Token::Usable, served.origin());
+    sign_in(&host, Token::Usable, served.origin()).await;
     let program = host.root().join("kr-controller");
     kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-controller")), &program);
     let log_path = host.root().join("daemon.log");
@@ -1814,7 +1896,7 @@ async fn the_daemon_a_person_runs_reaches_the_storage_service_it_selects() {
             .arrived()
             .iter()
             .all(|request| request.token.as_deref().is_none_or(|token| token == TOKEN)),
-        "only the token the operator imported left the host"
+        "only the token of the host's sign-in left the host"
     );
 }
 
@@ -1865,13 +1947,7 @@ async fn a_daemon_publishes_to_a_local_worker() {
 
     let host = kr_ipc::testing::TempHost::create();
     write_document(&host, Some(&origin));
-    write_token_file(
-        &host,
-        &origin,
-        &secret,
-        vec!["backup.write".to_owned()],
-        None,
-    );
+    keep_sign_in(&host, &origin, &secret, &["openid", "backup.write"], 3600).await;
     let (controller, _endpoint, _serving) = start_daemon(&host, HeldTimer::automatic()).await;
     let writer = daemon_writer(&host);
     let archive = ArchiveId::new(kr_ipc::new_uuid());

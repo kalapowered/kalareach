@@ -596,6 +596,15 @@ impl Controller {
             net::pairing::HostPairingClock::new(&setup.boot_identity),
             net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
         ));
+        // The host's own sign-in to the managed account service lives in the same store, in a
+        // scope of its own. Everything this host presents an account token for, the voice broker
+        // and the storage service, goes through it.
+        let account = Arc::new(Self::build_host_account(
+            &started,
+            Arc::clone(&secret_store),
+            setup.environment_id,
+            setup.paths.runtime_root(),
+        ));
         // The managed storage service this host uploads its backups to, when its configuration
         // document selects one. Its clients are built here, from that document and from nothing a
         // process inherited, and they sign as a writer key only this host holds, made the first
@@ -616,22 +625,18 @@ impl Controller {
                     &net::device_key_scope(setup.environment_id),
                 )
                 .map_err(ControllerError::registry)?;
-                let tokens = Arc::new(
-                    kr_client::services::voice::AccountTokenFile::under(setup.paths.runtime_root())
-                        .for_origin(origin.as_str()),
-                );
                 let clients = crate::backup::runtime::managed_clients(
                     &origin,
                     Self::proxy_of(&started)?.as_ref(),
                     &writer,
-                    &tokens,
+                    &account.tokens(),
                 )?;
                 Some(crate::backup::runtime::BackupRuntime::new(
                     Arc::clone(&backup),
                     &clients,
                     writer,
                     &origin,
-                    tokens,
+                    Arc::clone(&account),
                     timer,
                 )?)
             }
@@ -728,6 +733,7 @@ impl Controller {
                 }),
             )),
             started,
+            account,
             rights_ceiling,
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
             debt_pass: Arc::new(tokio::sync::Notify::new()),
@@ -1068,7 +1074,7 @@ impl Controller {
     }
 
     /// The proxy `started` selects, read as the network endpoint reads it.
-    fn proxy_of(
+    pub(super) fn proxy_of(
         started: &crate::config::Started,
     ) -> Result<Option<kr_transport::config::ProxyUrl>> {
         started

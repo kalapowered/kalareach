@@ -9,7 +9,7 @@
 //! | --- | --- |
 //! | [`answer`] | The host's answers printed whole with `--json`, leaf by leaf |
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
-//! | [`account`] | The managed-service account token this host presents, and where it is kept |
+//! | [`account`] | `kr account`: signing this host in to the managed account service, and where that stands |
 //! | [`bind`] | Which session, if any, this process is inside, as the sessions' workers answer |
 //! | [`pair`] | `kr pair`: invitations, approving the device that answers one, and the first owner |
 //! | [`daemon`] | Reaching an environment's control daemon for the commands below |

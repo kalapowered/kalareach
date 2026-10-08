@@ -1846,6 +1846,7 @@ pub struct SignedInAccount {
     /// shipped build.
     #[cfg(feature = "testing")]
     lock_wait_notice: Option<Arc<dyn Fn() + Send + Sync>>,
+    item_scope: Option<String>,
     clock_ms: fn() -> u64,
     ended: AtomicBool,
     status: tokio::sync::watch::Sender<AccountStatus>,
@@ -1908,10 +1909,22 @@ impl SignedInAccount {
             shared_lock: None,
             #[cfg(feature = "testing")]
             lock_wait_notice: None,
+            item_scope: None,
             clock_ms: system_milliseconds,
             ended: AtomicBool::new(false),
             status,
         }
+    }
+
+    /// Keeps the grant under items named inside `scope`, for a store that more than one holder of
+    /// an account shares: the host keeps one account for each environment in the one store the
+    /// whole machine's daemons use.
+    ///
+    /// A scope is a secret-store name segment: lower-case ASCII, digits, `.`, `-` and `_`.
+    #[must_use]
+    pub fn in_scope(mut self, scope: impl Into<String>) -> Self {
+        self.item_scope = Some(scope.into());
+        self
     }
 
     /// Also takes an advisory lock on `path` around every change, for another process on this
@@ -2027,20 +2040,21 @@ impl SignedInAccount {
         })
     }
 
-    fn name(item: &str) -> Result<SecretName> {
-        SecretName::new(item).map_err(|error| storage(Shown::crypto(&error)))
+    fn name(&self, item: &str) -> Result<SecretName> {
+        let name = match &self.item_scope {
+            Some(scope) => format!("{scope}/{item}"),
+            None => item.to_owned(),
+        };
+        SecretName::new(name).map_err(|error| storage(Shown::crypto(&error)))
     }
 
     fn read_grant(&self) -> Result<Option<StoredGrant>> {
-        let bytes = self
-            .store
-            .get(&Self::name(SESSION_ITEM)?)
-            .map_err(|error| {
-                storage(crate::shown!(
-                    "the sign-in could not be read: {}",
-                    Shown::crypto(&error)
-                ))
-            })?;
+        let bytes = self.store.get(&self.name(SESSION_ITEM)?).map_err(|error| {
+            storage(crate::shown!(
+                "the sign-in could not be read: {}",
+                Shown::crypto(&error)
+            ))
+        })?;
         bytes
             .map(|bytes| StoredGrant::read(bytes.expose()))
             .transpose()
@@ -2048,7 +2062,7 @@ impl SignedInAccount {
 
     fn write_grant(&self, grant: &StoredGrant) -> Result<()> {
         self.store
-            .set(&Self::name(SESSION_ITEM)?, &grant.write()?)
+            .set(&self.name(SESSION_ITEM)?, &grant.write()?)
             .map_err(|error| {
                 storage(crate::shown!(
                     "the sign-in could not be kept: {}",
@@ -2059,7 +2073,7 @@ impl SignedInAccount {
 
     fn delete_grant(&self) -> Result<()> {
         self.store
-            .delete(&Self::name(SESSION_ITEM)?)
+            .delete(&self.name(SESSION_ITEM)?)
             .map_err(|error| {
                 storage(crate::shown!(
                     "the sign-in could not be removed: {}",
@@ -2069,15 +2083,12 @@ impl SignedInAccount {
     }
 
     fn read_pending(&self) -> Result<Vec<PendingRevocation>> {
-        let Some(bytes) = self
-            .store
-            .get(&Self::name(PENDING_ITEM)?)
-            .map_err(|error| {
-                storage(crate::shown!(
-                    "the pending revocations could not be read: {}",
-                    Shown::crypto(&error)
-                ))
-            })?
+        let Some(bytes) = self.store.get(&self.name(PENDING_ITEM)?).map_err(|error| {
+            storage(crate::shown!(
+                "the pending revocations could not be read: {}",
+                Shown::crypto(&error)
+            ))
+        })?
         else {
             return Ok(Vec::new());
         };
@@ -2102,7 +2113,7 @@ impl SignedInAccount {
     }
 
     fn write_pending(&self, entries: &[PendingRevocation]) -> Result<()> {
-        let name = Self::name(PENDING_ITEM)?;
+        let name = self.name(PENDING_ITEM)?;
         if entries.is_empty() {
             return self.store.delete(&name).map_err(|error| {
                 storage(crate::shown!(

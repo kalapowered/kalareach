@@ -1202,7 +1202,6 @@ const HOST_TREE_NAMES: &[&str] = &[
     "controller.lock",
     "c.sock",
     "r.sock",
-    "account-token.json",
     // The host's configuration document.
     "config.json",
 ];
