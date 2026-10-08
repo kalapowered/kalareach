@@ -446,10 +446,24 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
         tokio::task::spawn_blocking(move || reaching.recv_timeout(Duration::from_secs(30)).is_ok())
             .await
             .expect("the waiting thread finishes");
-    assert!(
-        reached,
-        "the announcement never took the worker's dispatch boundary"
-    );
+    if !reached {
+        // What the announcement met says why it never took the boundary: an answer means the worker
+        // read it and refused it for a boundary another task held, and no answer means the worker
+        // never read it.
+        let met = if announcing.is_finished() {
+            format!(
+                "answered {:?}",
+                announcing.await.map(|(_client, answer)| answer)
+            )
+        } else {
+            "not answered".to_owned()
+        };
+        panic!(
+            "the announcement never took the worker's dispatch boundary ({met}; the worker refused \
+             {} announcements for the boundary)",
+            worker.service.refusals_for_the_boundary()
+        );
+    }
     assert!(
         !announcing.is_finished(),
         "the isolated worker cannot acknowledge the revision"
