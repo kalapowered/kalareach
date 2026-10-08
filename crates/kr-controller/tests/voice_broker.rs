@@ -32,6 +32,8 @@
 //! | KR-REQ-17.23 | `an_account_signed_in_at_one_service_is_reached_only_through_that_service` |
 //! | KR-REQ-17.23 | `a_revocation_the_service_did_not_acknowledge_is_sent_again_when_the_daemon_starts` |
 //! | KR-REQ-17.23 | `a_host_whose_broker_is_not_the_account_service_signs_in_nowhere` |
+//! | KR-REQ-17.23 | `a_call_the_service_ended_no_longer_holds_sign_out_refused_when_its_phone_went_silent` |
+//! | KR-REQ-17.23 | `a_call_past_its_deadline_no_longer_holds_sign_out_refused_when_its_phone_went_silent` |
 //! | KR-REQ-15.17 | `a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_grant` |
 //! | KR-REQ-26.14 | `a_host_reaches_the_broker_through_the_proxy_its_document_selects` |
 
@@ -167,11 +169,23 @@ impl Held {
     }
 }
 
+/// What the stand-in voice service says of the call its account has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Call {
+    /// The call is open.
+    Open,
+    /// The service ended it: the account has no call.
+    Ended,
+    /// The service cannot answer.
+    Unreachable,
+}
+
 /// Everything the stand-in services share.
 struct Shared {
     seen: Mutex<Vec<Seen>>,
     account: Mutex<Account>,
     holds: Mutex<Vec<Hold>>,
+    call: Mutex<Call>,
 }
 
 /// A managed voice service and its account service on the loopback interface, as far as their
@@ -192,6 +206,7 @@ impl Broker {
         let shared = Arc::new(Shared {
             seen: Mutex::default(),
             holds: Mutex::default(),
+            call: Mutex::new(Call::Open),
             account: Mutex::new(Account {
                 nonce: String::new(),
                 challenge: String::new(),
@@ -262,6 +277,17 @@ impl Broker {
                 .to_vec(),
             subject: "account-1".to_owned(),
         }
+    }
+
+    /// Has the service end the account's call, as it does when no client has been on the call for
+    /// a while: the account then has no call.
+    fn end_the_call(&self) {
+        *self.shared.call.lock().expect("the call") = Call::Ended;
+    }
+
+    /// Has the service fail to answer what the account's call is doing.
+    fn fail_to_say_what_the_call_is_doing(&self) {
+        *self.shared.call.lock().expect("the call") = Call::Unreachable;
     }
 
     /// The service no longer honours the sign-in: its next refresh is refused.
@@ -443,6 +469,7 @@ async fn answer(mut stream: TcpStream, shared: &Shared) {
         let _ = stream.write_all(&response(401, refusal)).await;
         return;
     }
+    let call = *shared.call.lock().expect("the call");
     let data = match path.as_str() {
         "/api/voice/metadata" => serde_json::json!({
             "enabled": true,
@@ -490,6 +517,29 @@ async fn answer(mut stream: TcpStream, shared: &Shared) {
             "replayed": false,
             "disclosure": ["The managed service can read the conversation."]
         }),
+        "/api/voice/sessions/current" => match call {
+            Call::Open => serde_json::json!({
+                "callId": "call-1",
+                "state": "live",
+                "closesAt": "2099-01-01T00:10:00Z",
+                "controlPath": "/api/voice/sessions/call-1/control",
+                "heartbeatSeconds": 20,
+                "usageSeconds": 30,
+                "usageProvisional": true,
+                "delegations": [],
+                "disclosure": ["The managed service can read the conversation."]
+            }),
+            Call::Ended => {
+                let refusal = br#"{"ok":false,"error":{"code":"NOT_FOUND","message":"This account has no managed call."}}"#;
+                let _ = stream.write_all(&response(404, refusal)).await;
+                return;
+            }
+            Call::Unreachable => {
+                let refusal = br#"{"ok":false,"error":{"code":"INTERNAL","message":"Try again."}}"#;
+                let _ = stream.write_all(&response(503, refusal)).await;
+                return;
+            }
+        },
         "/api/voice/sessions/call-1/close" => serde_json::json!({
             "callId": "call-1",
             "state": "finalised",
@@ -2237,6 +2287,132 @@ async fn a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_gran
         "the close never reached the service"
     );
     assert_eq!(account_report(&host).await.state, AccountState::Ended);
+    host.stop().await;
+}
+
+/// A call a paired device started and then went silent on: the device never stops it.
+///
+/// Returns the device's session, so a test can show that a late stop from it finds nothing.
+async fn a_call_whose_phone_went_silent(
+    host: &net_support::Host,
+    owner: &DeviceKeys,
+) -> (
+    net_support::Device,
+    kr_client::session::Session,
+    Box<kr_protocol::voice::VoiceSessionDescriptor>,
+) {
+    start_a_call(host, owner).await
+}
+
+/// KR-REQ-17.23 and 15.17: a phone that is lost mid-call never stops its call, and the host does
+/// not keep sign-in and sign-out refused for it. While the service holds the call open the refusal
+/// stands, as it does for a call whose device is there. Once the service says it ended the call,
+/// the host ends the call's record as a stop would, revoking its grant and telling the service
+/// under the account the call was made under, and the sign-out is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_the_service_ended_no_longer_holds_sign_out_refused_when_its_phone_went_silent() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, session, call) = a_call_whose_phone_went_silent(&host, &owner).await;
+
+    // The service holds the call open: the host asks, and the refusal stands.
+    let refused = sign_out_as(&host, ActionId::new(kr_ipc::new_uuid()))
+        .await
+        .expect_err("the service still holds the call open");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refused:?}"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/api/voice/sessions/current"),
+        "the host asked the service whether it still holds the call"
+    );
+    assert!(matches!(
+        account_report(&host).await.state,
+        AccountState::SignedIn { .. }
+    ));
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 1);
+
+    // The service ends the call, and the device says nothing.
+    broker.end_the_call();
+    let signed_out = sign_out(&host).await;
+    assert!(signed_out.was_signed_in);
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+
+    // The call's record left as a stop's would: nothing of it is left on the host, and the
+    // service was told under the account the call was made under, before that account went.
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 0);
+    let closes: Vec<_> = broker
+        .seen()
+        .into_iter()
+        .filter(|request| request.path == "/api/voice/sessions/call-1/close")
+        .collect();
+    assert_eq!(closes.len(), 1, "the service was told once");
+    assert_eq!(
+        closes[0].authorization.as_deref(),
+        Some(format!("Bearer {}", broker.access(1)).as_str())
+    );
+    let late = try_mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await
+    .expect_err("the call's record is gone, so a late stop finds nothing");
+    assert!(!late.to_string().is_empty());
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a call whose own deadline has passed is over whatever its device did
+/// and whatever the service can be asked. Before the deadline a service that cannot be asked
+/// leaves the call open, and the sign-out is refused; at the deadline the sign-out is made, and
+/// the call's record is ended as a stop would end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_past_its_deadline_no_longer_holds_sign_out_refused_when_its_phone_went_silent() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = net_support::MovedWall::new();
+    let host = net_support::Host::start_with_document_clocks(
+        &owner,
+        &document_naming(&broker.origin),
+        wall.clocks(),
+    )
+    .await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, _session, _call) = a_call_whose_phone_went_silent(&host, &owner).await;
+    broker.fail_to_say_what_the_call_is_doing();
+
+    let refused = sign_out_as(&host, ActionId::new(kr_ipc::new_uuid()))
+        .await
+        .expect_err("a call that cannot be asked about is held open until its deadline");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refused:?}"
+    );
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 1);
+
+    // The call was asked for 600 seconds, and the clock passes them.
+    wall.advance(std::time::Duration::from_secs(601));
+    assert!(sign_out(&host).await.was_signed_in);
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 0);
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/api/voice/sessions/call-1/close"),
+        "the service was told the call is over"
+    );
     host.stop().await;
 }
 

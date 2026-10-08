@@ -23,7 +23,7 @@ use kr_client::transport::NetworkTransport;
 use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
@@ -146,6 +146,40 @@ pub struct Host {
     account_at: AccountAt,
     /// Where the host keeps its network keys, which a restart keeps: the same endpoint comes back.
     secrets: Arc<MemoryStore>,
+    /// The clocks the daemon measures time on, which a restart keeps.
+    clocks: Clocks,
+}
+
+/// A wall clock a suite moves by hand: the machine's own, and the time added to it.
+#[derive(Clone, Debug, Default)]
+pub struct MovedWall(Arc<std::sync::atomic::AtomicU64>);
+
+impl MovedWall {
+    /// A clock that reads the machine's own until it is moved.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Moves the clock `by` forward.
+    pub fn advance(&self, by: Duration) {
+        self.0.fetch_add(
+            u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// The daemon's clocks with this wall clock.
+    #[must_use]
+    pub fn clocks(&self) -> Clocks {
+        let moved = Arc::clone(&self.0);
+        Clocks {
+            wall: WallClock::from_fn(move || {
+                kr_ipc::now_ms().get() + moved.load(std::sync::atomic::Ordering::SeqCst)
+            }),
+            ..Clocks::system()
+        }
+    }
 }
 
 impl Host {
@@ -177,6 +211,25 @@ impl Host {
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
         account_at: AccountAt,
     ) -> Self {
+        Self::start_with_document_on(owner, document, account_at, Clocks::system()).await
+    }
+
+    /// Starts a daemon whose configuration document is `document`, on the clocks `clocks`, with
+    /// the managed account service at the broker.
+    pub async fn start_with_document_clocks(
+        owner: &DeviceKeys,
+        document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+        clocks: Clocks,
+    ) -> Self {
+        Self::start_with_document_on(owner, document, AccountAt::Broker, clocks).await
+    }
+
+    async fn start_with_document_on(
+        owner: &DeviceKeys,
+        document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+        account_at: AccountAt,
+        clocks: Clocks,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         write_document(&temp, document);
         let mut host = Self::start_on(
@@ -188,6 +241,7 @@ impl Host {
             },
             account_at,
             Arc::new(MemoryStore::new()),
+            clocks,
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -214,6 +268,7 @@ impl Host {
             },
             AccountAt::Managed,
             Arc::new(MemoryStore::new()),
+            Clocks::system(),
         )
         .await
     }
@@ -239,6 +294,7 @@ impl Host {
             settings,
             AccountAt::Managed,
             Arc::new(MemoryStore::new()),
+            Clocks::system(),
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -272,6 +328,7 @@ impl Host {
             settings,
             account_at,
             secrets,
+            clocks,
             ..
         } = self;
         clients.abort();
@@ -296,6 +353,7 @@ impl Host {
             settings,
             account_at,
             secrets,
+            clocks,
         }
     }
 
@@ -307,6 +365,7 @@ impl Host {
         settings: NetworkSettings,
         account_at: AccountAt,
         secrets: Arc<MemoryStore>,
+        clocks: Clocks,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -319,26 +378,31 @@ impl Host {
             let secrets = environment.secrets_dir();
             kr_controller::testing::with_account_origin(
                 account_origin.clone(),
-                Controller::start(ControllerSetup {
-                    paths: environment.clone(),
-                    environment_id,
-                    identity: Box::new(move || {
-                        let store = open_store_in(&secrets)
-                            .expect("a secret store for the test environment");
-                        Ok(
-                            ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                                .expect("an identity"),
-                        )
-                    }),
-                    secret_store: StoreSelection::File,
-                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                    supervisor: Box::new(RefusingSupervisor),
-                    worker_program: PathBuf::from("/nonexistent/kr-worker"),
-                    build_id: build(),
-                    release: "0".to_owned(),
-                    shell_packages: None,
-                    terminal: Box::new(kr_controller::supervision::NoTerminal),
-                }),
+                Controller::start_on_clocks(
+                    ControllerSetup {
+                        paths: environment.clone(),
+                        environment_id,
+                        identity: Box::new(move || {
+                            let store = open_store_in(&secrets)
+                                .expect("a secret store for the test environment");
+                            Ok(ControllerIdentity::open(
+                                store.store.as_ref(),
+                                environment_id,
+                                false,
+                            )
+                            .expect("an identity"))
+                        }),
+                        secret_store: StoreSelection::File,
+                        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                        supervisor: Box::new(RefusingSupervisor),
+                        worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                        build_id: build(),
+                        release: "0".to_owned(),
+                        shell_packages: None,
+                        terminal: Box::new(kr_controller::supervision::NoTerminal),
+                    },
+                    clocks.clone(),
+                ),
             )
         })
         .await
@@ -372,6 +436,7 @@ impl Host {
             settings,
             account_at,
             secrets,
+            clocks,
         }
     }
 
@@ -473,6 +538,7 @@ pub struct Stopped {
     settings: NetworkSettings,
     account_at: AccountAt,
     secrets: Arc<MemoryStore>,
+    clocks: Clocks,
 }
 
 impl Stopped {
@@ -503,9 +569,10 @@ impl Stopped {
             owner,
             account_at,
             secrets,
+            clocks,
             ..
         } = self;
-        let mut host = Host::start_on(temp, room, settings, account_at, secrets).await;
+        let mut host = Host::start_on(temp, room, settings, account_at, secrets, clocks).await;
         host.owner = owner;
         host
     }
