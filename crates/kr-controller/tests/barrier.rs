@@ -134,7 +134,7 @@ struct Worker {
 }
 
 impl Worker {
-    /// The worker's runtime of its own, which a case that stops its tasks has to name.
+    /// The worker's runtimes of its own, which a case that stops its tasks has to name.
     fn apart(&self) -> &ApartWorker {
         self._apart
             .as_ref()
@@ -152,7 +152,7 @@ async fn worker_apart() -> Worker {
     worker_serving(true).await
 }
 
-/// The worker as [`worker`] makes it, served on this test's runtime, or on one of its own when
+/// The worker as [`worker`] makes it, served on this test's runtime, or on runtimes of its own when
 /// `apart`.
 async fn worker_serving(apart: bool) -> Worker {
     let temp = kr_ipc::testing::TempHost::create();
@@ -448,9 +448,9 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
             .await
             .expect("the waiting thread finishes");
     if !reached {
-        // What the announcement met says why it never took the boundary: an answer means the worker
-        // read it and refused it for a boundary another task held, and no answer means the worker
-        // never read it.
+        // What the announcement met, for the failure message: an answer (which may be a refusal or
+        // a transport failure) or none, and how many announcements the worker refused for the
+        // boundary. None, and none refused, is a worker that never took the frame up.
         let met = if announcing.is_finished() {
             format!(
                 "answered {:?}",
@@ -1868,7 +1868,7 @@ impl Hosted {
         &self.service
     }
 
-    /// The worker's runtime of its own, which a case that stops its tasks has to name.
+    /// The worker's runtimes of its own, which a case that stops its tasks has to name.
     fn apart(&self) -> &ApartWorker {
         self._apart
             .as_ref()
@@ -1944,7 +1944,7 @@ async fn hosted_worker() -> Hosted {
     add_worker(&hosted_daemon().await, false).await
 }
 
-/// As [`hosted_worker`], with the worker's session runtime and connections on a runtime of their
+/// As [`hosted_worker`], with the worker's session runtime and connections on runtimes of their
 /// own.
 ///
 /// In production the worker is its own process. A test that holds its session for as long as the
@@ -2102,8 +2102,9 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
         build_id: build(),
     };
     let (runtime, service, apart_worker) = if apart {
-        // The session's own tasks run there too: its monitor locks the session each time it wakes,
-        // and on this test's runtime a held session would stop the thread that runs it.
+        // The session's own tasks run on a runtime of their own, apart from the connections: its
+        // monitor locks the session each time it wakes, and on this test's runtime, or on the
+        // connections', a held session would stop the thread that runs it.
         let (runtime, service, worker) =
             ApartWorker::start(session, Arc::clone(&identity), endpoint.clone(), binding).await;
         (runtime, service, Some(worker))
@@ -2176,8 +2177,12 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
 /// runnable on a thread and then left behind by a task that blocks it waits in that thread's run
 /// slot, where no other thread of the runtime takes it from, until the block ends: on one runtime a
 /// connection's task could wait there for as long as the hold lasted, and the announcement it was
-/// to read would go unread. Only the connections' runtime serves a connection, and nothing on it
-/// waits for the session but the announcement the case is about.
+/// to read would go unread. Only the connections' runtime serves a connection. The tasks that
+/// wait for the session or the boundary on it are the announcement's handler where a case holds the
+/// session, the worker's maintenance pass (at its start and every minute), a generation presented
+/// while the boundary is held, and a mutation a case has paused inside it. None of them is woken by
+/// the signal for a finished child process, which every test of this binary shares and which woke
+/// the session's monitor from outside.
 struct ApartWorker {
     /// The thread that keeps the connections' runtime polling, ended before that runtime is told to
     /// stop.
@@ -2194,7 +2199,8 @@ struct Apart {
 
 impl Apart {
     /// Starts a runtime of `threads` threads named `name` on a thread of its own, and runs `serve`
-    /// on it with that runtime's handle. `serve` ends when the runtime is stopped.
+    /// on it with that runtime's handle and the end that says it is stopped. `serve` returns when
+    /// that end resolves, and the runtime ends after it.
     fn start<F, Fut>(name: &'static str, threads: usize, serve: F) -> Self
     where
         F: FnOnce(tokio::runtime::Handle, tokio::sync::oneshot::Receiver<()>) -> Fut
@@ -2300,8 +2306,8 @@ impl ApartWorker {
 /// release it has not yet given. A task handed to the runtime from outside wakes a sleeping thread,
 /// which polls the sockets and timers when it goes to sleep again. A task comes every few
 /// milliseconds, which is far inside the daemon's exchange bound; a thread of the runtime has to be
-/// free to take it, and on this runtime only the announcement a case is about waits for the session
-/// or the boundary.
+/// free to take it. The tasks that can wait on that runtime are few (see [`ApartWorker`]), and it
+/// has four threads.
 struct Awake {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -2337,8 +2343,10 @@ impl Drop for Awake {
 impl Drop for ApartWorker {
     fn drop(&mut self) {
         drop(self.awake.take());
-        // The connections first: they hold the session's runtime, and a connection that was
-        // waiting for the session is let go of when this is dropped, not before.
+        // The connections first, so that nothing calls into the session after its own tasks have
+        // stopped. Neither side waits for the other, so each end has a bound of its own; a runtime
+        // that has not ended by then is left to end on its own, and a thread of it that is waiting
+        // for a lock is left waiting until the lock is let go.
         if let Some(connections) = self.connections.as_mut() {
             connections.end();
         }
