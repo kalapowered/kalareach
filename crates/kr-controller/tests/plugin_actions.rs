@@ -438,6 +438,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
                     kr_ipc::clock::boot_elapsed_ms() + 30_000,
                 ),
                 history: None,
+                screen_basis: None,
             },
         )))
         .await

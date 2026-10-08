@@ -1696,6 +1696,10 @@ async fn a_worker_states_that_it_holds_a_question_read_to_its_scope() {
         kr_protocol::local::holds_question_reads_to_scopes(stated),
         "stated: {stated:?}"
     );
+    assert!(
+        kr_protocol::local::narrows_to_previewed_screens(stated),
+        "stated: {stated:?}"
+    );
     drop(daemon);
     wired.close();
 }
