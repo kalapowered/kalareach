@@ -131,7 +131,8 @@ stops, so a limit that a part has is written in that part's own document.
 - **Voice.** A coordinator on the host decides what a call may read and send, under a voice grant
   that a device holds apart from its ordinary grant, with an unlocked-screen confirmation for the
   actions that need one: [voice](voice/README.md) and [client voice](client/voice.md). The daemon
-  this repository builds attaches no voice provider, so no call starts on it.
+  attaches the managed voice broker when its configuration document names one, and starts no call
+  otherwise.
 - **Encrypted push.** The host composes each notification, and a preview travels sealed to the
   receiving device's own preview key, so a service that carries it cannot read it:
   [delivery](delivery/README.md). Neither phone build opens a preview, so a phone shows the generic
