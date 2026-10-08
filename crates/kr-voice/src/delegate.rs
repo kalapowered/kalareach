@@ -238,6 +238,24 @@ struct State {
     /// and that wait is the window two starts can cross in. A device is in this set for the whole
     /// of its own start, so the second one is answered rather than run beside the first.
     starting: BTreeSet<DeviceId>,
+    /// How many calls this host is ending at the broker: counted under the lock that removed their
+    /// records, so a call is never between being recorded and being ended without being counted.
+    closing: usize,
+}
+
+/// A call's close at the broker, held for as long as it runs, and counted from the moment the call's
+/// record was removed.
+struct Closing<'a> {
+    state: &'a Mutex<State>,
+    count: usize,
+}
+
+impl Drop for Closing<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closing = state.closing.saturating_sub(self.count);
+        }
+    }
 }
 
 /// One device's start, held for as long as it runs.
@@ -366,6 +384,23 @@ impl Coordinator {
             .len()
     }
 
+    /// Whether any call can still need the account it was made under: one that is live, one whose
+    /// start is waiting on the broker, one that is being ended at the broker, and a replayed one
+    /// this host has yet to close.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked, which would mean the
+    /// coordinator's own state is no longer known.
+    #[must_use]
+    pub fn calls_open(&self) -> bool {
+        let state = self.state.lock().expect("the coordinator's state");
+        !state.sessions.is_empty()
+            || !state.starting.is_empty()
+            || state.closing > 0
+            || !state.deferred.is_empty()
+    }
+
     /* ---------------------------------------------------------------- */
     /* voice.grant                                                       */
     /* ---------------------------------------------------------------- */
@@ -456,7 +491,12 @@ impl Coordinator {
                     }
                 }
             }
+            state.closing += ending.len();
             (written, ending)
+        };
+        let _closing = Closing {
+            state: &self.state,
+            count: ending.len(),
         };
         // Outside the lock, and after the authority is already gone: a call whose grant this
         // change withdrew is finalised rather than left metering until its own deadline. Each is
@@ -1004,7 +1044,7 @@ impl Coordinator {
                 // and everything else is closed here, each through the provider that created it.
                 // A call is the pair of its identifier and that provider, because two providers
                 // can name a call the same thing.
-                std::mem::take(&mut state.deferred)
+                let closing: Vec<Ending> = std::mem::take(&mut state.deferred)
                     .into_iter()
                     .filter(|ending| {
                         !held.iter().any(|(call_id, provider)| {
@@ -1015,8 +1055,14 @@ impl Coordinator {
                                 }
                         })
                     })
-                    .collect()
+                    .collect();
+                state.closing += closing.len();
+                closing
             }
+        };
+        let _closing = Closing {
+            state: &self.state,
+            count: closing.len(),
         };
         for ending in &closing {
             if let Some(provider) = ending.provider.as_ref() {
@@ -1098,11 +1144,20 @@ impl Coordinator {
         params: &VoiceStopParams,
         now_ms: u64,
     ) -> Result<VoiceStopResult> {
-        let record = {
+        let (record, _closing) = {
             let mut state = self.state.lock().expect("the coordinator's state");
             let record = state.sessions.stop(params.voice_session_id, device_id)?;
             state.ledger.forget_session(params.voice_session_id);
-            record
+            // Counted in the same step that removes the record: the call is ended at the broker
+            // after this, and has to be seen as open until it is.
+            state.closing += 1;
+            (
+                record,
+                Closing {
+                    state: &self.state,
+                    count: 1,
+                },
+            )
         };
         let revoked_at_ms =
             match self

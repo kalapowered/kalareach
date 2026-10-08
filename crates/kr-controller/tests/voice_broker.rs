@@ -18,6 +18,10 @@
 //! | KR-REQ-17.23 | `a_sign_out_never_changes_the_account_a_call_closes_under` |
 //! | KR-REQ-17.23 | `a_sign_out_request_sent_again_is_answered_from_the_first` |
 //! | KR-REQ-17.23 | `a_sign_out_ends_the_sign_in_that_is_waiting` |
+//! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_start_is_waiting_on_the_broker` |
+//! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_close_is_not_finished` |
+//! | KR-REQ-17.23 | `a_host_moved_off_the_managed_broker_can_still_end_the_sign_in_it_keeps` |
+//! | KR-REQ-17.23 | `an_account_the_store_could_not_settle_is_not_presented_until_it_is_settled` |
 //! | KR-REQ-17.23 | `each_refresh_presents_the_token_the_last_one_issued` |
 //! | KR-REQ-17.23 | `an_account_signed_in_at_one_service_is_reached_only_through_that_service` |
 //! | KR-REQ-17.23 | `a_revocation_the_service_did_not_acknowledge_is_sent_again_when_the_daemon_starts` |
@@ -130,10 +134,36 @@ impl Account {
     }
 }
 
+/// A request the stand-in holds until the suite lets it go.
+struct Hold {
+    path: String,
+    reached: Arc<tokio::sync::Notify>,
+    released: tokio::sync::watch::Receiver<bool>,
+}
+
+/// The suite's end of a held request: when it has arrived, and the way to let it go.
+struct Held {
+    reached: Arc<tokio::sync::Notify>,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+impl Held {
+    /// Waits until the request is at the stand-in, not yet answered.
+    async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the request be answered.
+    fn release(self) {
+        let _ = self.release.send(true);
+    }
+}
+
 /// Everything the stand-in services share.
 struct Shared {
     seen: Mutex<Vec<Seen>>,
     account: Mutex<Account>,
+    holds: Mutex<Vec<Hold>>,
 }
 
 /// A managed voice service and its account service on the loopback interface, as far as their
@@ -153,6 +183,7 @@ impl Broker {
         let origin = format!("http://{}", listener.local_addr().expect("an address"));
         let shared = Arc::new(Shared {
             seen: Mutex::default(),
+            holds: Mutex::default(),
             account: Mutex::new(Account {
                 nonce: String::new(),
                 challenge: String::new(),
@@ -190,6 +221,19 @@ impl Broker {
 
     fn seen(&self) -> Vec<Seen> {
         self.shared.seen.lock().expect("what was seen").clone()
+    }
+
+    /// Holds the next request for `path` unanswered, after it has been checked, until the returned
+    /// handle lets it go.
+    fn hold(&self, path: &str) -> Held {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let (release, released) = tokio::sync::watch::channel(false);
+        self.shared.holds.lock().expect("the holds").push(Hold {
+            path: path.to_owned(),
+            reached: Arc::clone(&reached),
+            released,
+        });
+        Held { reached, release }
     }
 
     /// A sign-in the service has issued, as a finished browser sign-in leaves one, whose tokens
@@ -368,6 +412,17 @@ async fn answer(mut stream: TcpStream, shared: &Shared) {
         let refusal = br#"{"ok":false,"error":{"code":"UNAUTHENTICATED","message":"No."}}"#;
         let _ = stream.write_all(&response(401, refusal)).await;
         return;
+    }
+    let held = shared
+        .holds
+        .lock()
+        .expect("the holds")
+        .iter()
+        .find(|hold| hold.path == path)
+        .map(|hold| (Arc::clone(&hold.reached), hold.released.clone()));
+    if let Some((reached, mut released)) = held {
+        reached.notify_one();
+        let _ = released.wait_for(|released| *released).await;
     }
     let data = match path.as_str() {
         "/api/voice/metadata" => serde_json::json!({
@@ -696,6 +751,22 @@ async fn sign_out(host: &net_support::Host) -> AccountSignedOut {
         .expect("the daemon signs the host out")
 }
 
+/// What a device asks to start a call with, from what it was shown.
+fn start_params(session_id: SessionId, prepared: &VoicePrepareResult) -> VoiceStartParams {
+    let terms = prepared
+        .managed
+        .as_ref()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+    VoiceStartParams {
+        session_ids: [session_id].into_iter().collect(),
+        offer_sdp: "v=0\r\n".to_owned(),
+        duration_seconds: 600,
+        reasoning_budget_minor: Nullable::null(),
+        prepared: prepared.prepared,
+        expected_rate_version: Nullable::some(terms.rate.version.clone()),
+    }
+}
+
 /// A call a paired device starts, brokered under the account the host is signed in as.
 async fn start_a_call(
     host: &net_support::Host,
@@ -706,22 +777,11 @@ async fn start_a_call(
     Box<kr_protocol::voice::VoiceSessionDescriptor>,
 ) {
     let (device, session, session_id, prepared) = ready(host, owner).await;
-    let terms = prepared
-        .managed
-        .as_ref()
-        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
     let started: VoiceStartResult = mutate(
         &session,
         host.environment_id,
         Method::VoiceStart,
-        &VoiceStartParams {
-            session_ids: [session_id].into_iter().collect(),
-            offer_sdp: "v=0\r\n".to_owned(),
-            duration_seconds: 600,
-            reasoning_budget_minor: Nullable::null(),
-            prepared: prepared.prepared,
-            expected_rate_version: Nullable::some(terms.rate.version.clone()),
-        },
+        &start_params(session_id, &prepared),
     )
     .await
     .to_typed()
@@ -1417,6 +1477,294 @@ async fn a_sign_out_ends_the_sign_in_that_is_waiting() {
     host.stop().await;
 }
 
+/// KR-REQ-17.23 and 15.17: a call closes under the account it started under, and a start waits on the
+/// broker for seconds before it is recorded. While it waits, signing out is refused and a browser
+/// answer ends its sign-in unspent, so the account the start asked under is the one that closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_never_changes_under_a_call_whose_start_is_waiting_on_the_broker() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, session, session_id, prepared) = ready(&host, &owner).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let held = broker.hold("/api/voice/sessions");
+
+    let (started, ()) = tokio::join!(
+        async {
+            let started: VoiceStartResult = mutate(
+                &session,
+                host.environment_id,
+                Method::VoiceStart,
+                &start_params(session_id, &prepared),
+            )
+            .await
+            .to_typed()
+            .expect("a start result");
+            started
+        },
+        async {
+            held.reached().await;
+            // The call is not recorded yet: the broker has not answered. A sign-out is refused.
+            let refused = sign_out_as(&host, ActionId::new(kr_ipc::new_uuid()))
+                .await
+                .expect_err("a call is starting");
+            assert_eq!(
+                refused.code,
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                "{refused:?}"
+            );
+            // And the browser coming back ends the waiting sign-in before its code is spent.
+            let _ = browser_answers(&address, &url, "the-code").await;
+            let report = settled(&host).await;
+            assert_eq!(
+                report.last_attempt.as_ref(),
+                Some(&AccountAttempt::CallOpen)
+            );
+            assert!(
+                matches!(report.state, AccountState::SignedIn { .. }),
+                "the account is as it was: {report:?}"
+            );
+            assert!(
+                broker
+                    .seen()
+                    .iter()
+                    .all(|request| request.path != "/auth/oauth2/token"),
+                "the code was not spent"
+            );
+            held.release();
+        }
+    );
+    let VoiceStartOutcome::Started { session: call } = started.outcome else {
+        panic!("the broker created the call: {:?}", started.outcome);
+    };
+    let _ = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await;
+    let closes: Vec<_> = broker
+        .seen()
+        .into_iter()
+        .filter(|request| request.path.starts_with("/api/voice/sessions"))
+        .collect();
+    assert_eq!(closes.len(), 2, "the start and the close: {closes:?}");
+    for request in closes {
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(format!("Bearer {}", broker.access(1)).as_str()),
+            "{} carried the account the call started under",
+            request.path
+        );
+    }
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a stop removes the call's record before it tells the broker, and the
+/// close asks for a token of its own. Until the broker has been told, signing out is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_never_changes_under_a_call_whose_close_is_not_finished() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, session, call) = start_a_call(&host, &owner).await;
+    let held = broker.hold("/api/voice/sessions/call-1/close");
+
+    let (_stopped, ()) = tokio::join!(
+        async {
+            mutate(
+                &session,
+                host.environment_id,
+                Method::VoiceStop,
+                &VoiceStopParams {
+                    voice_session_id: call.voice_session_id,
+                },
+            )
+            .await
+        },
+        async {
+            held.reached().await;
+            // The record is gone and the broker has not been told: the call is still open.
+            let refused = sign_out_as(&host, ActionId::new(kr_ipc::new_uuid()))
+                .await
+                .expect_err("a close is not finished");
+            assert_eq!(
+                refused.code,
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                "{refused:?}"
+            );
+            assert!(matches!(
+                account_report(&host).await.state,
+                AccountState::SignedIn { .. }
+            ));
+            held.release();
+        }
+    );
+    let close = broker
+        .seen()
+        .into_iter()
+        .find(|request| request.path == "/api/voice/sessions/call-1/close")
+        .expect("the broker was told");
+    assert_eq!(
+        close.authorization.as_deref(),
+        Some(format!("Bearer {}", broker.access(1)).as_str()),
+        "the close carried the account the call started under"
+    );
+    assert!(sign_out(&host).await.was_signed_in);
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a host whose broker moved off the managed service still reaches the account
+/// service for what it keeps. It shows the grant, presents none, and signs out: the grant is revoked
+/// at the service that issued it and nothing of it reaches the new broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_moved_off_the_managed_broker_can_still_end_the_sign_in_it_keeps() {
+    let account = Broker::start().await;
+    let other = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&account.origin)).await;
+    sign_in_with(&host, account.issue_grant(600)).await;
+
+    let mut stopped = host.shut_down().await;
+    net_support::write_document(stopped.tree(), &document_naming(&other.origin));
+    stopped.account_service_stays_at(&account.origin);
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+
+    let report = account_report(&host).await;
+    assert_eq!(report.service.as_ref(), Some(&account.origin));
+    assert_eq!(
+        report.unavailable.as_ref(),
+        Some(&SignInUnavailable::BrokerIsAnotherService)
+    );
+    assert!(
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the grant it keeps is shown: {report:?}"
+    );
+    let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
+    assert!(
+        prepared.managed.as_ref().is_none(),
+        "no account is presented to the other broker"
+    );
+    let refused = host
+        .client()
+        .await
+        .mutate(
+            Method::AccountSignIn,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AccountSignInParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("this broker is not the account service");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::HostNotConfigured,
+        "{refused:?}"
+    );
+
+    assert!(sign_out(&host).await.was_signed_in);
+    assert_eq!(account.revoked(), [account.refresh(1)]);
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    assert!(other.seen().is_empty(), "the other broker was sent nothing");
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: when the store cannot be read to settle what an earlier run left, no token is
+/// presented, and the next request tries again: a grant whose revocation was queued is never used
+/// because settling it failed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_the_store_could_not_settle_is_not_presented_until_it_is_settled() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    // The second sign-in replaces the first, whose revocation the service refuses: it is queued.
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    broker.refuse_revocations(true);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let stopped = host.shut_down().await;
+    broker.refuse_revocations(false);
+    let queue = account_item(&stopped, "revoke");
+    let moved = queue.with_extension("moved");
+    // The item cannot be read: a directory stands where the file was.
+    std::fs::rename(&queue, &moved).expect("the queue is set aside");
+    std::fs::create_dir(&queue).expect("a directory in its place");
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+
+    let (_device, session, session_id, prepared) = ready(&host, &owner).await;
+    assert!(
+        prepared.managed.as_ref().is_none(),
+        "no account is presented while the store cannot be settled"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .all(|request| request.authorization.is_none()),
+        "the broker was shown no account"
+    );
+
+    std::fs::remove_dir(&queue).expect("the directory goes");
+    std::fs::rename(&moved, &queue).expect("the queue is back");
+    let prepared: VoicePrepareResult = session
+        .read(
+            Method::VoicePrepare,
+            &VoicePrepareParams {
+                session_ids: [session_id].into_iter().collect(),
+                selected: CanonicalSet::from_iter([]),
+            },
+        )
+        .await
+        .expect("the host answers what a call would be");
+    assert!(
+        prepared.managed.as_ref().is_some(),
+        "the account is presented once it is settled: {:?}",
+        prepared.managed_unavailable
+    );
+    assert_eq!(broker.revoked(), [broker.refresh(1)]);
+    host.stop().await;
+}
+
+/// The file the host's account keeps `item` in, found under the stopped daemon's secret store.
+fn account_item(stopped: &net_support::Stopped, item: &str) -> std::path::PathBuf {
+    fn find(directory: &std::path::Path, item: &str, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                find(&path, item, found);
+            } else if path.file_name().is_some_and(|name| name == item)
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with("account"))
+                && path.to_string_lossy().contains("host-account")
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    find(
+        &stopped.tree().environment().secrets_dir(),
+        item,
+        &mut found,
+    );
+    assert_eq!(found.len(), 1, "one {item} item of the account: {found:?}");
+    found.remove(0)
+}
+
 /// KR-REQ-17.23: the token the service rotates is the one the next request presents: each refresh
 /// presents the refresh token the last one issued, once, so the service never sees a spent token
 /// and ends the family.
@@ -1629,7 +1977,6 @@ async fn a_host_whose_broker_is_not_the_account_service_signs_in_nowhere() {
     )
     .await;
     let report = account_report(&host).await;
-    assert_eq!(report.service.as_ref(), None);
     assert_eq!(
         report.unavailable.as_ref(),
         Some(&SignInUnavailable::BrokerIsAnotherService)
@@ -1651,14 +1998,8 @@ async fn a_host_whose_broker_is_not_the_account_service_signs_in_nowhere() {
         kr_protocol::error::ErrorCode::HostNotConfigured,
         "{refused:?}"
     );
-    let refused = sign_out_as(&host, ActionId::new(kr_ipc::new_uuid()))
-        .await
-        .expect_err("there is no account service to sign out of");
-    assert_eq!(
-        refused.code,
-        kr_protocol::error::ErrorCode::HostNotConfigured,
-        "{refused:?}"
-    );
+    // Signing out needs no broker: with no account kept there is nothing to end, and it says so.
+    assert!(!sign_out(&host).await.was_signed_in);
     let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
     assert!(prepared.managed.as_ref().is_none(), "no terms were read");
     assert!(broker.seen().is_empty(), "the broker was sent nothing");
