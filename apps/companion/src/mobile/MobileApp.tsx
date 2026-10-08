@@ -270,6 +270,7 @@ export function MobileApp({
             surface={resolved}
             onOpen={openSession}
             onOpenVoice={connection?.connected === true ? openVoice : undefined}
+            connected={connection?.connected ?? null}
           />
         ) : null}
         {inVoice ? <VoiceRoute surface={resolved} embedded /> : null}
