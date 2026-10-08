@@ -620,8 +620,12 @@ impl RemoteConnection {
                 request.now_ms,
                 request.continuous_now,
             )
-            .map_err(|refusal| {
-                ProtocolError::new(ErrorCode::PermissionDenied, refusal.to_string())
+            .map_err(|refusal| match refusal {
+                // A floor this host could not write down says nothing about the grant.
+                kr_automation::AutomationError::AuthorityUnavailable(detail) => {
+                    ProtocolError::new(ErrorCode::StorageUnavailable, detail)
+                }
+                other => ProtocolError::new(ErrorCode::PermissionDenied, other.to_string()),
             })?;
         let record = self.share_record(acting.grant_id)?;
         let decided = self
