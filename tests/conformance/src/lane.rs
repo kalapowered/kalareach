@@ -5,8 +5,9 @@
 //! tool wrote: the JUnit files Gradle writes, one for each test class, or the test tree
 //! `xcresulttool` prints for the result bundle of an Xcode run. This module reads those into one
 //! list of cases and holds them to the rules a result has to keep before the report believes it:
-//! the files agree with their own counts, a failed suite has a failed case, and the tool's exit
-//! status agrees with the cases. A source file belongs to the cases of the classes it declares.
+//! the files agree with their own counts, a failed suite has a failed case, no case is reported
+//! twice, and the tool's exit status agrees with the cases. A source file belongs to the cases of
+//! the classes it declares.
 
 use std::path::Path;
 
@@ -38,8 +39,8 @@ pub struct Case {
 ///
 /// # Errors
 ///
-/// Returns why the files cannot be believed: there are none, one is not JUnit XML, or one disagrees
-/// with the counts it states about itself.
+/// Returns why the files cannot be believed: there are none, one is not JUnit XML, one disagrees
+/// with the counts it states about itself, or a case is reported twice.
 pub fn read_junit(directory: &Path) -> Result<Vec<Case>, String> {
     let mut files: Vec<_> = std::fs::read_dir(directory)
         .map_err(|error| format!("{} could not be read: {error}", directory.display()))?
@@ -202,7 +203,8 @@ pub fn parse_junit(text: &str) -> Result<Vec<Case>, String> {
 /// # Errors
 ///
 /// Returns why the file cannot be believed: it is not that tool's JSON, a case has a result this
-/// module does not know, no case ran, or a suite failed with no failed case under it.
+/// module does not know, no case ran, a case is reported twice, or a suite failed with no failed
+/// case under it.
 pub fn read_xcode(file: &Path) -> Result<Vec<Case>, String> {
     let text = std::fs::read_to_string(file)
         .map_err(|error| format!("{} could not be read: {error}", file.display()))?;
@@ -321,8 +323,12 @@ pub fn agree_with_exit(exit: Option<i32>, cases: &[Case]) -> Result<(), String> 
 /// `Foo::class` are none. A class nested in another is not listed: a JVM names it `Outer$Inner`,
 /// which [`declares`] gives to the file of `Outer`, and a nested Swift class is a helper of the
 /// test around it.
-#[must_use]
-pub fn declared_classes(file: &str, source: &str) -> Vec<String> {
+///
+/// # Errors
+///
+/// Returns that the braces of the file do not balance once comments and strings are blanked: the
+/// reading of the file cannot be trusted, and a class after the place it went wrong could be missed.
+pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String> {
     const MODIFIERS: &[&str] = &[
         "public",
         "private",
@@ -343,7 +349,7 @@ pub fn declared_classes(file: &str, source: &str) -> Vec<String> {
     ];
     const NOT_CLASSES: &[&str] = &["func", "var", "let", "init", "subscript", "deinit"];
     let swift = file.ends_with(".swift");
-    let masked = mask(source);
+    let masked = mask(source, swift);
     let mut package = String::new();
     let mut found = Vec::new();
     let mut depth = 0_i64;
@@ -351,6 +357,9 @@ pub fn declared_classes(file: &str, source: &str) -> Vec<String> {
         let at_top = depth == 0;
         depth += i64::try_from(line.matches('{').count()).unwrap_or(0)
             - i64::try_from(line.matches('}').count()).unwrap_or(0);
+        if depth < 0 {
+            return Err("a brace closes what was never opened".to_owned());
+        }
         let line = line.trim();
         if !at_top || line.is_empty() {
             continue;
@@ -391,92 +400,179 @@ pub fn declared_classes(file: &str, source: &str) -> Vec<String> {
             });
         }
     }
-    found
+    if depth != 0 {
+        return Err(format!("{depth} braces are still open at the end"));
+    }
+    Ok(found)
 }
 
 /// The source with every comment, string and character literal blanked out, each newline kept: what
-/// is left is code, so a brace or a keyword in it is one. Block comments nest and a triple-quoted
-/// string spans lines, as in both languages.
-fn mask(source: &str) -> String {
-    let chars: Vec<char> = source.chars().collect();
-    let mut out = String::with_capacity(source.len());
-    let starts = |at: usize, text: &str| {
+/// is left is code, so a brace or a keyword in it is one. Block comments nest (Java's do not, and no
+/// lane holds a Java file), a triple-quoted
+/// string spans lines, a Swift raw string (`#"..."#`) ends at its own number of `#`, and an
+/// expression interpolated into a string (`\(...)` in Swift, `${...}` in Kotlin) is blanked with the
+/// strings and comments inside it.
+fn mask(source: &str, swift: bool) -> String {
+    let mut masker = Masker {
+        chars: source.chars().collect(),
+        at: 0,
+        out: String::with_capacity(source.len()),
+        swift,
+    };
+    while masker.at < masker.chars.len() {
+        masker.code();
+    }
+    masker.out
+}
+
+struct Masker {
+    chars: Vec<char>,
+    at: usize,
+    out: String,
+    swift: bool,
+}
+
+impl Masker {
+    fn starts(&self, text: &str) -> bool {
         text.chars()
             .enumerate()
-            .all(|(i, c)| chars.get(at + i) == Some(&c))
-    };
-    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
-    let mut at = 0;
-    while at < chars.len() {
-        let c = chars[at];
-        if starts(at, "//") {
-            while at < chars.len() && chars[at] != '\n' {
-                out.push(' ');
-                at += 1;
+            .all(|(i, c)| self.chars.get(self.at + i) == Some(&c))
+    }
+
+    /// Blanks `count` characters, keeping newlines.
+    fn blank(&mut self, count: usize) {
+        for _ in 0..count {
+            if let Some(&c) = self.chars.get(self.at) {
+                self.out.push(if c == '\n' { '\n' } else { ' ' });
+                self.at += 1;
             }
-        } else if starts(at, "/*") {
+        }
+    }
+
+    /// One piece of code: a character it keeps, or a comment, string or literal it blanks.
+    fn code(&mut self) {
+        if !self.blanked() {
+            self.out.push(self.chars[self.at]);
+            self.at += 1;
+        }
+    }
+
+    /// Blanks a comment, string or literal that starts here, and says whether there was one.
+    fn blanked(&mut self) -> bool {
+        let c = self.chars[self.at];
+        if self.swift && c == '#' && self.raw_string() {
+            return true;
+        }
+        if self.starts("//") {
+            while self.at < self.chars.len() && self.chars[self.at] != '\n' {
+                self.blank(1);
+            }
+        } else if self.starts("/*") {
             let mut depth = 0_usize;
-            while at < chars.len() {
-                if starts(at, "/*") {
+            while self.at < self.chars.len() {
+                if self.starts("/*") {
                     depth += 1;
-                    out.push_str("  ");
-                    at += 2;
-                } else if starts(at, "*/") {
+                    self.blank(2);
+                } else if self.starts("*/") {
                     depth -= 1;
-                    out.push_str("  ");
-                    at += 2;
+                    self.blank(2);
                     if depth == 0 {
                         break;
                     }
                 } else {
-                    out.push(blank(chars[at]));
-                    at += 1;
+                    self.blank(1);
                 }
             }
-        } else if starts(at, "\"\"\"") {
-            out.push_str("   ");
-            at += 3;
-            while at < chars.len() && !starts(at, "\"\"\"") {
-                out.push(blank(chars[at]));
-                at += 1;
-            }
-            if at < chars.len() {
-                out.push_str("   ");
-                at += 3;
-            }
+        } else if self.starts("\"\"\"") {
+            self.blank(3);
+            self.string(true, 0);
         } else if c == '"' {
-            out.push(' ');
-            at += 1;
-            while at < chars.len() && chars[at] != '"' && chars[at] != '\n' {
-                let step = if chars[at] == '\\' { 2 } else { 1 };
-                for _ in 0..step.min(chars.len() - at) {
-                    out.push(' ');
-                }
-                at += step;
-            }
-            if at < chars.len() && chars[at] == '"' {
-                out.push(' ');
-                at += 1;
-            }
+            self.blank(1);
+            self.string(false, 0);
         } else if c == '\''
-            && (chars.get(at + 2) == Some(&'\'')
-                || (chars.get(at + 1) == Some(&'\\') && chars.get(at + 3) == Some(&'\'')))
+            && (self.chars.get(self.at + 2) == Some(&'\'')
+                || (self.chars.get(self.at + 1) == Some(&'\\')
+                    && self.chars.get(self.at + 3) == Some(&'\'')))
         {
-            let length = if chars.get(at + 1) == Some(&'\\') {
+            self.blank(if self.chars.get(self.at + 1) == Some(&'\\') {
                 4
             } else {
                 3
-            };
-            for _ in 0..length {
-                out.push(' ');
-            }
-            at += length;
+            });
         } else {
-            out.push(c);
-            at += 1;
+            return false;
+        }
+        true
+    }
+
+    /// A Swift raw string: the hashes, the quotes, and the text up to the quotes and as many
+    /// hashes. Returns whether one starts here.
+    fn raw_string(&mut self) -> bool {
+        let hashes = self.chars[self.at..]
+            .iter()
+            .take_while(|&&c| c == '#')
+            .count();
+        if self.chars.get(self.at + hashes) != Some(&'"') {
+            return false;
+        }
+        let triple = self.chars.get(self.at + hashes + 1) == Some(&'"')
+            && self.chars.get(self.at + hashes + 2) == Some(&'"');
+        self.blank(hashes + if triple { 3 } else { 1 });
+        self.string(triple, hashes);
+        true
+    }
+
+    /// The body of a string, after its opening quotes, up to and including the closing ones. A
+    /// raw string (`hashes` above 0) takes escapes and interpolations only after that many hashes.
+    fn string(&mut self, triple: bool, hashes: usize) {
+        let close: String = format!(
+            "{}{}",
+            if triple { "\"\"\"" } else { "\"" },
+            "#".repeat(hashes)
+        );
+        let escape: String = format!("\\{}", "#".repeat(hashes));
+        while self.at < self.chars.len() {
+            if self.starts(&close) {
+                self.blank(close.chars().count());
+                return;
+            }
+            if !triple && self.chars[self.at] == '\n' {
+                return;
+            }
+            if self.starts(&escape) {
+                self.blank(escape.chars().count());
+                if self.swift && self.chars.get(self.at) == Some(&'(') {
+                    self.blank(1);
+                    self.interpolation('(', ')');
+                } else {
+                    self.blank(1);
+                }
+            } else if !self.swift && self.starts("${") {
+                self.blank(2);
+                self.interpolation('{', '}');
+            } else {
+                self.blank(1);
+            }
         }
     }
-    out
+
+    /// An expression interpolated into a string, after its opening bracket, up to and including the
+    /// bracket that closes it. Strings and comments inside it are blanked like any other.
+    fn interpolation(&mut self, open: char, close: char) {
+        let mut depth = 1_usize;
+        while self.at < self.chars.len() && depth > 0 {
+            if self.blanked() {
+                continue;
+            }
+            let c = self.chars[self.at];
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+            }
+            self.blank(1);
+        }
+    }
 }
 
 /// Whether the class a tool reported is one the source file declares: the class itself, or a class
@@ -497,16 +593,41 @@ mod tests {
 
     #[test]
     fn the_classes_of_a_file_are_the_top_level_ones_in_code() {
-        let kotlin = "package to.kala.reach.companion.mobile\n\nimport org.junit.Test\n\n/*\n * class InAComment\n */\n// class AlsoAComment\nclass VoiceCaptureGateTest {\n    private class Switches : VoiceMediaSwitches {\n        val kind = Switches::class\n    }\n    val text = \"\"\"\nclass InAString\n\"\"\"\n    @Test fun a() {}\n}\n\nclass SoftwareSealer : Sealer\n";
+        let kotlin = "package to.kala.reach.companion.mobile\n\nimport org.junit.Test\n\n/*\n * class InAComment\n */\n// class AlsoAComment\nval raw = \"\"\"\nclass InAString {\n\"\"\"\nclass VoiceCaptureGateTest {\n    private class Switches : VoiceMediaSwitches {\n        val kind = Switches::class\n    }\n    val open = \"{\"\n    val alsoOpen = '{'\n    @Test fun a() {}\n}\n\nclass SoftwareSealer : Sealer\n";
         assert_eq!(
-            declared_classes("A.kt", kotlin),
+            declared_classes("A.kt", kotlin).expect("balanced"),
             [
                 "to.kala.reach.companion.mobile.VoiceCaptureGateTest",
                 "to.kala.reach.companion.mobile.SoftwareSealer",
             ]
         );
         let swift = "import XCTest\n\n@MainActor\nfinal class A: XCTestCase {\n    override class func setUp() {}\n    class var shared: Int { 0 }\n    private final class Helper {}\n}\n@available(iOS 17, *) final class B: XCTestCase {}\n";
-        assert_eq!(declared_classes("A.swift", swift), ["A", "B"]);
+        assert_eq!(
+            declared_classes("A.swift", swift).expect("balanced"),
+            ["A", "B"]
+        );
+    }
+
+    #[test]
+    fn an_expression_inside_a_string_is_blanked_with_the_strings_in_it() {
+        // A brace in a string inside an interpolated expression is no brace, and the classes after
+        // it are still found.
+        let kotlin = "class A {\n    val s = \"${a[\"{\"]}\" + \"x\"\n}\nclass B\n";
+        assert_eq!(
+            declared_classes("A.kt", kotlin).expect("balanced"),
+            ["A", "B"]
+        );
+        let swift = "final class A: XCTestCase {\n    let s = \"\\(f(\"{\")) // \\(g(\"/*\"))\"\n    let r = #\"a \"{\" b\"#\n}\nfinal class B: XCTestCase {}\n";
+        assert_eq!(
+            declared_classes("A.swift", swift).expect("balanced"),
+            ["A", "B"]
+        );
+    }
+
+    #[test]
+    fn a_file_whose_braces_do_not_balance_is_not_read() {
+        assert!(declared_classes("A.kt", "class A {\n").is_err());
+        assert!(declared_classes("A.kt", "}\nclass A\n").is_err());
     }
 
     #[test]

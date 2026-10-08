@@ -499,6 +499,19 @@ fn results_that_disagree_with_themselves_are_refused() {
             .expect_err("a failure nothing accounts for")
             .contains("no case under it failed")
     );
+    // A case reported twice.
+    let mut repeated = value.clone();
+    let suite = repeated
+        .pointer_mut("/testNodes/0/children/0/children/0/children")
+        .and_then(|children| children.as_array_mut())
+        .expect("the cases of a suite");
+    let first = suite[0].clone();
+    suite.push(first);
+    assert!(
+        lane::parse_xcode(&repeated)
+            .expect_err("a case that is reported twice")
+            .contains("reported twice")
+    );
     // A result this report does not read is not guessed at, and an expected failure is not a pass.
     set_result(
         &mut value,
@@ -554,7 +567,8 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
     step.command = vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        "echo 'kr-tool: gradle: 8.14.3'; cp -R \"$0\" \"${1#--results=}\"".to_owned(),
+        // The first value of a name stands, and a name with no value is unknown.
+        "echo 'kr-tool: gradle: 8.14.3'; echo 'kr-tool: java: '; echo 'kr-tool: gradle: 9.9'; cp -R \"$0\" \"${1#--results=}\"".to_owned(),
         fixtures()
             .join("lane-results")
             .join("junit")
@@ -573,6 +587,7 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
         (Verdict::Passed, 10, 0, 1)
     );
     assert_eq!(document.run.toolchain.phones["gradle"], "8.14.3");
+    assert_eq!(document.run.toolchain.phones["java"], "unknown");
 }
 
 #[test]

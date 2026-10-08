@@ -1455,10 +1455,18 @@ fn lane_files(map: &mut Map, root: &Path, lanes: &[Lane]) {
                 }
             }
             if lane.is_some_and(|lane| lane.reads.is_some()) {
-                let classes = crate::lane::declared_classes(&file, &text);
+                let classes = match crate::lane::declared_classes(&file, &text) {
+                    Ok(classes) => classes,
+                    Err(error) => {
+                        map.problems
+                            .push(format!("{file} cannot be read for its classes: {error}"));
+                        Vec::new()
+                    }
+                };
                 // A file that names rows and declares no class holds no case the lane's results
                 // could name, so its rows could never read anything from them.
-                if keyed && classes.is_empty() {
+                if keyed && classes.is_empty() && !map.problems.iter().any(|p| p.starts_with(&file))
+                {
                     map.problems.push(format!(
                         "{file} names rows and declares no class, so no test of the lane's results belongs to it"
                     ));
