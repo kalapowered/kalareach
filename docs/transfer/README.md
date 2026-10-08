@@ -691,19 +691,19 @@ draft is not among the drafts of the actor or if the draft's session is not the 
 session, the daemon answers that the draft is unknown. If the draft targets no session or if the
 draft has been sent to a session by a prompt, the daemon reports a conflict.
 
-The worker then claims a binding for an attempt, stating the maximum number of attachments for the
-operation and the action's deadline on the boot clock. In a single transaction the transfer service
-checks that the draft is open, its session is the session being acted on, it has not been sent by a
-prompt, the binding's state is `recorded` and its attempt is the same as that specified by the
-worker, the binding's insertion method is a typed submission, the number of attachments to the draft
-does not exceed the maximum for the operation, and the deadline is not past. Additionally the
-transfer service checks that the draft will fit into a reply containing the longest possible report
-for each offer in flight. If the checks pass, the transfer service sets the binding's state to
-`inserting` for the owner, which is the actor and the action together, issues a read grant over the
-one file, and increments the draft's revision. The same claim by the same owner at the same attempt
-returns the same claim and grant, so a reply that was lost leaves nothing behind. The transfer
-service does not accept a claim as long as there are sessions in the journal that were created by an
-earlier build.
+The second question is the claim. The worker names the binding, the attempt it read, the most
+attachments the operation accepts, and the deadline of its action on the boot clock. In one
+transaction the transfer service checks that the draft is open, targets this session and has not
+been sent by a prompt. It checks that the binding is `recorded` at that attempt and is a typed
+submission, and that the attachment is published, so there is a file to offer. It checks that the
+draft holds no more attachments than the operation accepts, and that the deadline has not passed.
+The deadline is read once the transfer service holds the store, so a claim that waited past its
+deadline is refused. It also checks that the draft would still fit its reply with the longest report
+that each offer in flight can still receive. If all of that holds, the transfer service sets the
+binding's state to `inserting` for its owner, which is the actor and the action together, issues a
+read grant over the one file, and increments the draft's revision. The same claim by the same owner
+at the same attempt returns the same claim and grant, so a reply that was lost leaves nothing
+behind. No claim is made while the journal still holds sessions of an earlier build.
 
 Last, the worker reports that the attachment was `accepted_by_agent`, providing provenance and
 evidence, or that it `failed`, providing a reason, or that the attachment was `unknown`, providing a
