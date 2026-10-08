@@ -1,4 +1,5 @@
-//! A launched worker's rendezvous: its launch identity and its ready report.
+//! A launched worker's rendezvous: its launch identity and its ready report, and a running
+//! worker's request that the plugin runtime be running.
 
 use std::sync::Arc;
 
@@ -68,7 +69,8 @@ impl Controller {
         };
         if hello.client != LocalClientKind::Worker {
             return Err(ControllerError::rendezvous(
-                "only a worker's startup claim is accepted here",
+                "only a worker's startup claim or its request for the plugin runtime is accepted \
+                 here",
             ));
         }
         let outcome = self
@@ -96,10 +98,22 @@ impl Controller {
             .await?;
 
         let claim: ControlFrame = reader.read_message().await?;
-        let ControlFrame::Rendezvous(claim) = claim else {
-            return Err(ControllerError::rendezvous(
-                "the worker did not present a startup claim",
-            ));
+        let claim = match claim {
+            ControlFrame::Rendezvous(claim) => claim,
+            // A worker that is already running asking for the plugin runtime: one request and
+            // one answer, from the process this daemon recorded for the session.
+            ControlFrame::PluginRuntimeWanted(wanted) => {
+                let answer = self.plugin_runtime_wanted(wanted, peer).await;
+                writer
+                    .write_message(&ControlFrame::PluginRuntimeState(answer))
+                    .await?;
+                return Ok(());
+            }
+            _ => {
+                return Err(ControllerError::rendezvous(
+                    "the worker did not present a startup claim",
+                ));
+            }
         };
         let (specification, admissions) = self.admit_rendezvous(&claim, peer).await?;
         writer

@@ -46,6 +46,9 @@ kr-pairing.workspace = true
 # daemon links no Wasm engine.
 kr-plugin-catalogue.workspace = true
 kr-plugin-sdk.workspace = true
+# The runtime's launcher and client, which link no engine: this daemon starts the plugin runtime and
+# looks for one a previous daemon started, and never runs a component.
+kr-plugin-service.workspace = true
 kr-protocol.workspace = true
 kr-project.workspace = true
 kr-shell-integration.workspace = true

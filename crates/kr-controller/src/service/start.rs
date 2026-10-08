@@ -384,6 +384,25 @@ impl Controller {
         // that instead of beneath the directory this daemon was started in. It is resolved before
         // the daemon is built, because what builds it cannot fail.
         let worker_program = kr_ipc::paths::resolve_here(setup.worker_program)?;
+        // The plugin runtime is found beside the worker, as the description process is, and reads
+        // its components from the catalogue's own store. Nothing here starts it: it is started
+        // when a worker first asks.
+        let supervisor: Arc<dyn WorkerSupervisor> = Arc::from(setup.supervisor);
+        let plugin_runtime = Arc::new(super::plugin_runtime::PluginRuntime::new(
+            setup.paths.clone(),
+            Arc::clone(&supervisor),
+            worker_program.parent().map_or_else(
+                || PathBuf::from(format!("kr-plugin-host{}", std::env::consts::EXE_SUFFIX)),
+                |directory| {
+                    directory.join(format!("kr-plugin-host{}", std::env::consts::EXE_SUFFIX))
+                },
+            ),
+            setup
+                .paths
+                .state_dir()
+                .join("catalogue")
+                .join(kr_plugin_catalogue::PACKAGES_ROOT),
+        ));
         // The grants and the invitations live in the daemon's own registry database, beside the
         // devices that hold them, so an authority object and the device it was issued to are in
         // one file and one backup.
@@ -677,7 +696,8 @@ impl Controller {
             clock,
             wall,
             network: std::sync::OnceLock::new(),
-            supervisor: setup.supervisor,
+            supervisor,
+            plugin_runtime,
             backup,
             transfer,
             project,
