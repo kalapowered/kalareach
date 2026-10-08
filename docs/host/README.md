@@ -51,7 +51,8 @@ much of that; it is not unique, so each directory also carries an `environment` 
 complete identifier. A second environment whose identifier shares the prefix is refused, never
 silently given another environment's registry.
 
-Endpoints are `c.sock` (clients), `r.sock` (the owner-only rendezvous), `t.sock` (attachment
+Endpoints are `c.sock` (clients), `r.sock` (the owner-only rendezvous, which a worker's startup
+claim and a running worker's request for the plugin runtime arrive on), `t.sock` (attachment
 chunks) and `w<display>.sock` (one worker). On Windows they are named pipes scoped by user and
 environment, carrying an owner-only access-control list, because the pipe namespace has no directory
 permissions to inherit. That namespace is shared by every account on the machine, so the list is not
@@ -806,14 +807,41 @@ file is the only place its diagnosis can go.
 
 A worker is not the only thing whose lifetime belongs to the platform. Components run in
 `kr-plugin-host`, one process per environment, started through the same supervisor as its own job
-outside the daemon's kill tree, and started only when a binding first needs one: an environment
-whose shells never use a component has no plugin process at all.
+outside the daemon's kill tree, and started only when a worker first needs one: a binding whose
+package ships a component. An environment whose shells never run such a program has no plugin
+process at all, and the daemon does not start one when it starts.
 
-It reports itself on a rendezvous endpoint of its own, signed with a keypair it generated at startup
-and keeps in memory, and the daemon publishes an owner-only descriptor at `plugin-host.json` beside
-the worker descriptors. Workers read it, challenge the process behind the endpoint, register their
-bindings and keep their own ledgers. Nothing durable lives in that process, so its death invalidates
-rich bindings, kills no worker and loses no request; a worker notices, re-registers, and carries on.
+A worker that has bound such a package connects to the daemon's rendezvous endpoint, which a
+running worker may use for this one request and nothing else, and asks for the runtime. The daemon
+answers only the process it recorded for that session, as the kernel names that process. It starts
+the runtime, or finds the one a previous daemon started, and answers that it is running or why it
+cannot be reached and how long to leave before asking again. The runtime reports itself on a
+rendezvous endpoint of its own, signed with a keypair it generated at startup and keeps in memory,
+and the daemon publishes an owner-only descriptor at `plugin-host.json` beside the worker
+descriptors. The worker reads it, challenges the process behind the endpoint, and registers its
+bindings with it directly; the daemon is not in that path again.
+
+The daemon starts at most five runtimes in ten minutes. A runtime that ends is started again by the
+next request, which a worker makes at once for the first loss of a run and after a wait that
+doubles from half a second to thirty for the ones after, and past the bound the answer
+is that the runtime is not started again yet, with the time the window next admits one. When the
+daemon looks for a runtime a previous daemon left, it keeps one that answers a challenge, whichever
+release started it, and answers that one which is running and does not answer cannot be reached,
+because a new runtime could not bind the endpoint the old one holds; nothing in the daemon ends
+that process. A runtime the daemon holds as running is answered running whenever its process is
+running, and a worker that cannot reach it says so itself. A descriptor whose content this release
+refuses is taken away, and a runtime still behind it holds its endpoint, so the new one fails to
+report itself; one that cannot be read at all is left, and the answer is that the runtime cannot be
+reached. A fix to the runtime in a new release reaches a running runtime only when that runtime ends.
+
+A worker registers one instance for each binding whose package ships a component, from the
+location and digest the daemon admitted when the binding was made, and unbinds it when the
+binding ends, so a session that has finished with its program holds no instance. A binding the
+runtime refuses is offered again after a wait that grows from half a minute to ten. Nothing durable
+lives in the runtime: its death invalidates rich bindings, kills no worker and loses no request;
+each worker reports its bindings' components unavailable with the reason, asks again, and
+registers them again. A component the runtime disabled after its faults stays disabled for the
+binding's life.
 
 `docs/plugins/runtime.md` has the execution model, the per-instance limits, the compiled-code cache
 and the protocol.
