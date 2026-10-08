@@ -134,8 +134,50 @@ struct Gateway {
     lifetime_ms: std::sync::atomic::AtomicU64,
     /// Answers a revocation with a refusal that may pass: a gateway having a bad hour.
     refuses_revocations: AtomicBool,
-    /// Has no status route: a deployment that answers 404 with nothing else.
-    no_status_route: AtomicBool,
+    /// What a route answers with whatever it is asked, for a deployment, a proxy or a fault that
+    /// does not answer as the Worker does.
+    replies: Mutex<BTreeMap<&'static str, ServiceHttpAnswer>>,
+    /// An answer held back until the test lets it go.
+    gate: Mutex<Option<Gate>>,
+}
+
+/// An answer the gateway has decided and not yet given: the exchange it belongs to has changed the
+/// gateway's records, and the caller waits for the answer.
+#[derive(Debug)]
+struct Gate {
+    route: &'static str,
+    /// How many requests to the route are answered before the one that is held.
+    skip: usize,
+    held: Arc<Held>,
+}
+
+/// The two ends of a held answer.
+#[derive(Debug, Default)]
+struct Held {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// The test's end of a held answer. A test that fails while an answer is held lets it go, or the
+/// caller waiting for it would keep the test from ending.
+struct Hold(Arc<Held>);
+
+impl Hold {
+    /// Waits until the gateway holds the answer.
+    async fn reached(&self) {
+        self.0.reached.notified().await;
+    }
+
+    /// Gives the caller the answer it waits for.
+    fn release(&self) {
+        self.0.release.notify_one();
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl Gateway {
@@ -194,8 +236,35 @@ impl Gateway {
         self.refuses_revocations.store(refuse, Ordering::SeqCst);
     }
 
-    fn lose_the_status_route(&self, lost: bool) {
-        self.no_status_route.store(lost, Ordering::SeqCst);
+    /// Makes the route answer `status` and `body` to everything, or as the Worker does again.
+    fn answer_route_with(&self, route: &'static str, answer: Option<(u16, &str)>) {
+        let mut replies = self.replies.lock().expect("the gateway is not poisoned");
+        match answer {
+            Some((status, body)) => {
+                replies.insert(
+                    route,
+                    ServiceHttpAnswer {
+                        status,
+                        body: body.as_bytes().to_vec(),
+                    },
+                );
+            }
+            None => {
+                replies.remove(route);
+            }
+        }
+    }
+
+    /// Holds back the answer to the request to `route` after `skip` others, once the gateway has
+    /// acted on it. The request is not answered until [`Held::release`].
+    fn hold(&self, route: &'static str, skip: usize) -> Hold {
+        let held = Arc::new(Held::default());
+        *self.gate.lock().expect("the gateway is not poisoned") = Some(Gate {
+            route,
+            skip,
+            held: Arc::clone(&held),
+        });
+        Hold(held)
     }
 
     /// Makes the credentials it issues from now on last `lifetime_ms`.
@@ -518,19 +587,21 @@ impl ServiceHttp for Gateway {
         body: &'a [u8],
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        let replied = self
+            .replies
+            .lock()
+            .expect("the gateway is not poisoned")
+            .iter()
+            .find(|(route, _)| url.ends_with(**route))
+            .map(|(_, answer)| answer.clone());
         let answer = if self.down.load(Ordering::SeqCst) {
             Err(kr_client::ClientError::ConnectionEnded)
+        } else if let Some(replied) = replied {
+            Ok(replied)
         } else if url.ends_with("/api/push/deliver") {
             Ok(self.deliver(body, headers))
         } else if url.ends_with("/api/push/deliver/status") {
-            if self.no_status_route.load(Ordering::SeqCst) {
-                Ok(ServiceHttpAnswer {
-                    status: 404,
-                    body: b"not found".to_vec(),
-                })
-            } else {
-                Ok(self.status(headers))
-            }
+            Ok(self.status(headers))
         } else if url.ends_with("/api/push/sender/renew")
             || url.ends_with("/api/push/sender/revoke")
         {
@@ -541,7 +612,24 @@ impl ServiceHttp for Gateway {
         if let Ok(answered) = &answer {
             self.state().asked.push((url.to_owned(), answered.status));
         }
-        Box::pin(async move { answer })
+        let held = {
+            let mut gate = self.gate.lock().expect("the gateway is not poisoned");
+            match gate.as_mut() {
+                Some(open) if url.ends_with(open.route) && open.skip > 0 => {
+                    open.skip -= 1;
+                    None
+                }
+                Some(open) if url.ends_with(open.route) => gate.take().map(|open| open.held),
+                _ => None,
+            }
+        };
+        Box::pin(async move {
+            if let Some(held) = held {
+                held.reached.notify_one();
+                held.release.notified().await;
+            }
+            answer
+        })
     }
 }
 
@@ -881,8 +969,7 @@ impl Environment {
         }
     }
 
-    /// Pairs a device that holds `keys`, and connects it. The same keys paired again are the same
-    /// installation under a device identifier of its own.
+    /// Pairs a device that holds `keys`, and connects it.
     async fn phone_with(&self, keys: DeviceKeys) -> Phone {
         let device = Device::with_keys(keys).await;
         let mut grant = proposal(&[ActionRight::SessionView]);
@@ -977,13 +1064,14 @@ fn owed(environment: &Environment) -> Vec<kr_delivery::journal::OwedRevocation> 
         .expect("a read")
 }
 
-/// Waits until the attention store holds `questions` pending questions and the delivery journal
-/// has taken everything it announced: the daemon has decided what to tell, and whom.
+/// Waits until the attention store holds `questions` pending questions and the daemon has decided
+/// what to tell, and whom: the delivery journal has taken everything the store announced and has
+/// produced from every event it took.
 async fn until_the_questions_are_settled(environment: &Environment, questions: usize) {
     until(
         "the store settling its questions with the delivery journal",
         || {
-            environment
+            let taken = environment
                 .controller()
                 .attention()
                 .take_for_delivery(|store, _| {
@@ -1000,7 +1088,18 @@ async fn until_the_questions_are_settled(environment: &Environment, questions: u
                         .unwrap_or(0);
                     raised >= questions && store.awaiting_delivery().ok() == Some(0)
                 })
-                .unwrap_or(false)
+                .unwrap_or(false);
+            taken
+                && environment
+                    .controller()
+                    .delivery()
+                    .with(|producer| {
+                        Ok(producer
+                            .journal()
+                            .pending_events(0, 1)
+                            .is_ok_and(|p| p.is_empty()))
+                    })
+                    .unwrap_or(false)
         },
     )
     .await;
@@ -1393,7 +1492,9 @@ async fn a_registration_is_kept_only_when_the_gateway_confirms_it_to_the_hosts_o
         "a failure asking again may mend"
     );
     environment.gateway.set_down(false);
-    environment.gateway.lose_the_status_route(true);
+    environment
+        .gateway
+        .answer_route_with("/api/push/deliver/status", Some((404, "not found")));
     let refused = other_phone
         .register(&environment, &unasked)
         .await
@@ -1402,7 +1503,9 @@ async fn a_registration_is_kept_only_when_the_gateway_confirms_it_to_the_hosts_o
         refused.code,
         kr_protocol::error::ErrorCode::UpstreamUnavailable
     );
-    environment.gateway.lose_the_status_route(false);
+    environment
+        .gateway
+        .answer_route_with("/api/push/deliver/status", None);
     assert!(environment.destination(other_phone.device_id()).is_none());
     assert!(credentials.held(unasked.sender_record_id).is_none());
     assert_eq!(
@@ -1495,12 +1598,17 @@ async fn unpairing_a_device_ends_its_destination_and_the_gateway_revokes_the_aut
     })
     .await;
 
-    // Nothing more is delivered to it.
-    let delivered = environment.gateway.delivered().len();
+    // Nothing more is delivered to it: the daemon decided the next question reaches nobody, which
+    // is its journal writing no notification, not the gateway merely not having been asked yet.
+    let (written, delivered) = (
+        environment.deliveries(),
+        environment.gateway.delivered().len(),
+    );
     environment
         ._worker
         .ask("deploy-2", "Deploy the release again?");
     until_the_questions_are_settled(&environment, 2).await;
+    assert_eq!(environment.deliveries(), written);
     assert_eq!(environment.gateway.delivered().len(), delivered);
 }
 
@@ -2089,7 +2197,8 @@ async fn a_device_that_registers_over_and_over_is_not_confirmed_with_the_gateway
         .expect_err("the fourth in a row is not put to the gateway");
     assert_eq!(
         refused.code,
-        kr_protocol::error::ErrorCode::UpstreamUnavailable
+        kr_protocol::error::ErrorCode::RateLimited,
+        "a refusal that says to wait"
     );
     assert_eq!(probes(), 3, "and the gateway was not asked");
     assert!(environment.destination(phone.device_id()).is_none());
@@ -2104,4 +2213,388 @@ async fn a_device_that_registers_over_and_over_is_not_confirmed_with_the_gateway
         .register(&environment, &theirs)
         .await
         .expect("another device is confirmed");
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the gateway's answers have to be to count
+// ---------------------------------------------------------------------------------------------
+
+const STATUS_ROUTE: &str = "/api/push/deliver/status";
+const RENEW_ROUTE: &str = "/api/push/sender/renew";
+const REVOKE_ROUTE: &str = "/api/push/sender/revoke";
+
+/// KR-REQ-16.08: only the gateway's own success confirms a bearer. A success with no `data`, one
+/// whose `data` is not an acknowledgement, a success that also carries an error, a refusal under a
+/// success status, and a refusal with no envelope, from something in front of the gateway, confirm
+/// nothing and keep nothing. None of them is taken for the gateway refusing the bearer, because
+/// asking again may mend them, and none reaches the question that costs the host's allowance for
+/// renewing. The gateway's own refusal of the bearer is the control, and so is its success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn only_the_gateways_own_success_confirms_a_bearer() {
+    use kr_protocol::error::ErrorCode::{InvalidArgument, UpstreamUnavailable};
+
+    let environment = Environment::start().await;
+    let host_key = environment.host_signing_key();
+    let phones = [
+        environment.phone().await,
+        environment.phone().await,
+        environment.phone().await,
+    ];
+    let unauthenticated = r#"{"ok":false,"error":{"code":"UNAUTHENTICATED","message":"no"}}"#;
+    let cases: [(u16, &str, kr_protocol::error::ErrorCode); 8] = [
+        (200, r#"{"ok":true}"#, UpstreamUnavailable),
+        (200, r#"{"ok":true,"data":{}}"#, UpstreamUnavailable),
+        (
+            200,
+            r#"{"ok":true,"data":null,"error":{"code":"UNAUTHENTICATED","message":"no"}}"#,
+            UpstreamUnavailable,
+        ),
+        (200, unauthenticated, UpstreamUnavailable),
+        (401, "unauthorised", UpstreamUnavailable),
+        (403, "<html>blocked</html>", UpstreamUnavailable),
+        (
+            401,
+            r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"no"}}"#,
+            UpstreamUnavailable,
+        ),
+        // The control: the gateway refusing the bearer is its answer about this credential.
+        (401, unauthenticated, InvalidArgument),
+    ];
+    for (index, (status, body, code)) in cases.iter().enumerate() {
+        let phone = &phones[index / 3];
+        let credential = environment.gateway.issue(
+            PushSenderRecordId::new(uuid(0x70 + u8::try_from(index).expect("a few cases"))),
+            phone.installation(),
+            host_key,
+        );
+        environment
+            .gateway
+            .answer_route_with(STATUS_ROUTE, Some((*status, body)));
+        let refused = phone
+            .register(&environment, &credential)
+            .await
+            .expect_err("an answer that is not the gateway's success confirms nothing");
+        assert_eq!(refused.code, *code, "{status} {body}");
+        assert!(environment.destination(phone.device_id()).is_none());
+        assert!(
+            environment
+                .controller()
+                .delivery_runtime()
+                .credentials()
+                .held(credential.sender_record_id)
+                .is_none()
+        );
+        assert!(!secret_store_holds(&environment, bytes_of(&credential)));
+    }
+    assert!(
+        environment.gateway.answers_on(RENEW_ROUTE).is_empty(),
+        "none of them reached the question that spends the host's allowance for renewing"
+    );
+
+    // The control: the gateway's success, with the nothing it says of a notification that does not
+    // exist, confirms the bearer.
+    environment.gateway.answer_route_with(STATUS_ROUTE, None);
+    let credential = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(0x7f)),
+        phones[2].installation(),
+        host_key,
+    );
+    phones[2]
+        .register(&environment, &credential)
+        .await
+        .expect("the gateway's success confirms the bearer");
+    assert_eq!(environment.gateway.answers_on(RENEW_ROUTE), vec![200]);
+}
+
+/// KR-REQ-16.08: the nonce a registration asks for is the gateway's to give or to refuse, and only
+/// its own refusal says the authorisation is not this host's. A 403 or a 401 with no envelope comes
+/// from something in front of the gateway: it confirms nothing, is not blamed on the credential,
+/// and may be asked again. The gateway's own `FORBIDDEN` is the control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_refusal_of_the_nonce_that_is_not_the_gateways_blames_nobody() {
+    use kr_protocol::error::ErrorCode::{InvalidArgument, UpstreamUnavailable};
+
+    let environment = Environment::start().await;
+    let host_key = environment.host_signing_key();
+    let phone = environment.phone().await;
+    let other_phone = environment.phone().await;
+    let cases: [(u16, &str, kr_protocol::error::ErrorCode); 3] = [
+        (403, "forbidden", UpstreamUnavailable),
+        (401, "<html>sign in</html>", UpstreamUnavailable),
+        (
+            403,
+            r#"{"ok":false,"error":{"code":"FORBIDDEN","message":"no"}}"#,
+            InvalidArgument,
+        ),
+    ];
+    for (index, (status, body, code)) in cases.iter().enumerate() {
+        let credential = environment.gateway.issue(
+            PushSenderRecordId::new(uuid(0x80 + u8::try_from(index).expect("a few cases"))),
+            phone.installation(),
+            host_key,
+        );
+        environment
+            .gateway
+            .answer_route_with(RENEW_ROUTE, Some((*status, body)));
+        let refused = phone
+            .register(&environment, &credential)
+            .await
+            .expect_err("a nonce nobody gave confirms nothing");
+        assert_eq!(refused.code, *code, "{status} {body}");
+        assert!(environment.destination(phone.device_id()).is_none());
+    }
+    environment.gateway.answer_route_with(RENEW_ROUTE, None);
+    let credential = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(0x8f)),
+        other_phone.installation(),
+        host_key,
+    );
+    other_phone
+        .register(&environment, &credential)
+        .await
+        .expect("the gateway's nonce confirms the authorisation");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The gateway's allowance for the host
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-16.09: the gateway counts the host's renewals and revocations together, and a
+/// registration that asks for a nonce spends from the same allowance. So the host allows itself a
+/// few registrations an hour whichever devices make them, and says to wait: a seventh device with
+/// a bearer the gateway takes is not put to the question that spends the allowance, while a bearer
+/// that fails the first question costs it nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn devices_registering_cannot_spend_the_gateways_allowance_for_renewing_and_revoking() {
+    let environment = Environment::start().await;
+    let host_key = environment.host_signing_key();
+    let phones = [
+        environment.phone().await,
+        environment.phone().await,
+        environment.phone().await,
+    ];
+    let mut next = 0xa0_u8;
+    // Two devices register three times each: each is within its own allowance.
+    for phone in &phones[..2] {
+        for _ in 0..3 {
+            next += 1;
+            let credential = environment.gateway.issue(
+                PushSenderRecordId::new(uuid(next)),
+                phone.installation(),
+                host_key,
+            );
+            phone
+                .register(&environment, &credential)
+                .await
+                .expect("a device within its own allowance is confirmed");
+        }
+    }
+    assert_eq!(environment.gateway.answers_on(RENEW_ROUTE).len(), 6);
+
+    // The third device has an allowance of its own and a bearer the gateway takes.
+    next += 1;
+    let credential = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(next)),
+        phones[2].installation(),
+        host_key,
+    );
+    let refused = phones[2]
+        .register(&environment, &credential)
+        .await
+        .expect_err("the host has asked the gateway for as many nonces as it allows itself");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::RateLimited);
+    assert_eq!(
+        environment.gateway.answers_on(RENEW_ROUTE).len(),
+        6,
+        "the gateway was not asked for another nonce"
+    );
+    assert_eq!(
+        environment.gateway.answers_on(STATUS_ROUTE).len(),
+        7,
+        "its bearer was put to the first question, which spends a larger allowance"
+    );
+    assert!(environment.destination(phones[2].device_id()).is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Which bearer the host keeps when two things change it at once
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-16.09: a registration whose bearer the gateway has confirmed does not put that bearer
+/// back over the one a renewal stored while the gateway was answering. The renewal retired it, so
+/// the host would hold a bearer the gateway no longer takes, and nothing but the gateway's recovery
+/// hour would mend it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registration_leaves_the_bearer_a_renewal_stored_while_the_gateway_was_answering() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x67));
+    // Two days left: inside the last week, where the gateway renews.
+    environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
+    let first =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &first)
+        .await
+        .expect("the first credential is registered");
+    let credentials = Arc::clone(environment.controller().delivery_runtime().credentials());
+
+    // The device is issued another bearer for the authorisation and hands it over. The gateway
+    // takes it, and its answer is held while the host renews.
+    let second =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    let held = environment.gateway.hold(STATUS_ROUTE, 0);
+    let renewing = async {
+        held.reached().await;
+        let current = credentials.held(sender).expect("held");
+        let credentials = Arc::clone(&credentials);
+        let renewed = tokio::task::spawn_blocking(move || {
+            kr_delivery::push::SenderCredentials::renew(credentials.as_ref(), &current)
+        })
+        .await
+        .expect("a thread")
+        .expect("the host renews");
+        held.release();
+        renewed
+    };
+    let (registered, renewed) = tokio::join!(phone.register(&environment, &second), renewing);
+    registered.expect("the registration is accepted");
+
+    assert_ne!(
+        renewed.secret, second.secret,
+        "the renewal retired the bearer"
+    );
+    assert_eq!(
+        credentials.held(sender).expect("held").secret,
+        renewed.secret,
+        "the host holds the bearer the gateway issued last"
+    );
+    assert_eq!(
+        stored_credential(&environment, sender).map(|stored| stored.secret),
+        Some(renewed.secret),
+        "and so does the secret store"
+    );
+    assert!(
+        environment.destination(phone.device_id()).is_some(),
+        "the destination was written all the same"
+    );
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("a question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+/// KR-REQ-16.09: a renewal whose answer comes late does not put its bearer over the one the device
+/// was issued and registered while it waited. The gateway issued the device's bearer later, so the
+/// renewed one is the retired one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_renewal_leaves_the_bearer_a_device_registered_while_the_gateway_was_answering() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x68));
+    environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
+    let first =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &first)
+        .await
+        .expect("the first credential is registered");
+    let credentials = Arc::clone(environment.controller().delivery_runtime().credentials());
+
+    // The renewal's nonce is answered, and the gateway renews; the answer to the renewal is held.
+    let current = credentials.held(sender).expect("held");
+    let held = environment.gateway.hold(RENEW_ROUTE, 1);
+    let renewing = tokio::task::spawn_blocking({
+        let credentials = Arc::clone(&credentials);
+        move || kr_delivery::push::SenderCredentials::renew(credentials.as_ref(), &current)
+    });
+    held.reached().await;
+
+    // The device is issued a bearer after that renewal, which retires the renewed one, and
+    // registers it.
+    let second =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &second)
+        .await
+        .expect("the second credential is registered");
+    held.release();
+    let answered = renewing
+        .await
+        .expect("a thread")
+        .expect("the renewal is answered");
+
+    assert_eq!(
+        credentials.held(sender).expect("held").secret,
+        second.secret,
+        "the host holds the bearer the device registered, not the renewal that came after it"
+    );
+    assert_eq!(
+        answered.secret, second.secret,
+        "and the caller that renewed is given it"
+    );
+    assert_eq!(
+        stored_credential(&environment, sender).map(|stored| stored.secret),
+        Some(second.secret)
+    );
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("a question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// One sweep of owed revocations at a time
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-16.10: a sweep that finds another still asking leaves the debt to it. Two sweeps that
+/// asked about one debt would each ask the gateway for a nonce and for the revocation, and the
+/// gateway counts all four against the host's allowance for renewing and revoking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_second_sweep_does_not_ask_about_a_debt_the_first_is_asking_about() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x69));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+
+    // The unpairing starts a sweep, whose first question is held at the gateway.
+    let held = environment.gateway.hold(REVOKE_ROUTE, 0);
+    unpair(&environment, phone.device_id()).await;
+    held.reached().await;
+    let runtime = Arc::clone(environment.controller().delivery_runtime());
+    tokio::task::spawn_blocking(move || runtime.sweep_revocations())
+        .await
+        .expect("a sweep");
+    assert_eq!(
+        environment.gateway.answers_on(REVOKE_ROUTE),
+        vec![200],
+        "the second sweep asked nothing while the first was asking"
+    );
+
+    held.release();
+    until("the debt being paid", || owed(&environment).is_empty()).await;
+    assert_eq!(
+        environment.gateway.answers_on(REVOKE_ROUTE),
+        vec![200, 200],
+        "a nonce, and the revocation, once"
+    );
 }
