@@ -6144,7 +6144,18 @@ async fn a_rescue_the_older_release_cannot_read_the_stores_for_is_refused_and_th
  {
     let mut host = Host::bare();
     let log = host.tree.root().join("starts.log");
-    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    // The older release reads transfer journals from version 2.
+    let stores = release_stores()
+        .into_iter()
+        .map(|store| match store.store.as_str() {
+            "transfers" => ReleaseStore {
+                migrates_from: 2,
+                ..store
+            },
+            _ => store,
+        })
+        .collect();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(stores);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
@@ -6487,6 +6498,13 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
     host.install(&one);
     host.put(&two);
     host.record_a_switched_update(&one, &two);
+    // The environment a daemon of the store served, as its start records it.
+    host.store
+        .record_roots(
+            host.tree.paths().runtime_root(),
+            host.tree.paths().state_root(),
+        )
+        .expect("records the roots");
     // A daemon of the release that failed that holds the environment and listens to nothing: this
     // process stands in for it.
     let holding = kr_controller::singleton::SingletonLock::acquire(

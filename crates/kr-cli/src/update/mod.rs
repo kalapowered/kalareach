@@ -267,11 +267,16 @@ impl Abandoned {
 }
 
 impl Transaction {
-    /// The directories the daemons it recorded read their configuration documents in, by
-    /// environment, where they said.
+    /// The directories the daemons it recorded, and those of a failed update it went on past, read
+    /// their configuration documents in, by environment, where they said.
     fn published_directories(&self) -> Vec<(EnvironmentId, PathBuf)> {
         self.restarts
             .iter()
+            .chain(
+                self.abandoned
+                    .iter()
+                    .flat_map(|failed| failed.restarts.iter()),
+            )
             .filter_map(|restart| {
                 restart
                     .configuration_directory
