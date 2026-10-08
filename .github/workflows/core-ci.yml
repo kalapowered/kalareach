@@ -539,7 +539,7 @@ jobs:
       # The forwarder is built with them: the worker's transport suite launches the forwarder as a
       # launched agent's relay and as its bridge, and finds it beside the test executable.
       - name: Build the control daemon, the worker and the forwarder the suites run
-        run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook
+        run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host
 
       # kr-cli's suites include the first-owner pairing tests in `crates/kr-cli/tests/pair_windows.rs`,
       # which start the daemon on loopback (its network listener comes up on this platform), confirm
@@ -870,6 +870,24 @@ jobs:
       - name: Start through the environment's scheduled task
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test task_supervisor
+
+      # The plugin host, started by the daemon through that task when a worker asks for it, killed
+      # and replaced, and found again by a daemon that starts after it: the daemon's half of the
+      # plugin runtime on this platform, with a real component run in the host. The components are
+      # compiled to wasm32-wasip2 and not committed, and KR_REQUIRE_PLUGIN_FIXTURES makes a missing
+      # one a failure and not a skip. The host itself is built with the daemon and the worker.
+      - name: Install the component target
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: rustup target add wasm32-wasip2
+
+      - name: Build the test components
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        shell: bash
+        run: bash scripts/build-plugin-fixtures.sh
+
+      - name: Start the plugin host through the environment's scheduled task
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-controller --test plugin_runtime_service
 
       # kr new through the environment's scheduled task, as the standalone start runs it here: three
       # first commands at once meet one daemon that serves every caller, the daemon is in none of
