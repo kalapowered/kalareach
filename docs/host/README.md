@@ -306,12 +306,22 @@ sum of those deadlines.
 
 A phone that is lost during a call never stops it, and its call does not keep `kr account sign-in`
 and `sign-out` refused for good. A call is over when its own deadline passes, and when the managed
-service says it no longer holds the call open (`GET /api/voice/sessions/current` names no call for the
-account, another call, or this one closing). Before it refuses a sign-in or a sign-out for a call,
+service says it no longer holds the call open: `GET /api/voice/sessions/current` answers, in the
+service's own words for it, that the account has no call, or names another call, or names this one
+closing. Before it refuses a sign-in or a sign-out for a call, and before a sign-in's code is spent,
 the daemon ends the calls that are over as a stop from the device would: the call's record leaves,
 its voice grant is revoked, and the service is told, under the account the call was made under, so
-it can finalise the call. A service that cannot be asked within ten seconds leaves the call open,
-and the call's deadline ends it.
+it can finalise the call. A call counts as open until its record has been ended, even past its
+deadline, so the account never changes while a close is still owed under it; a request that looks
+in the moment a deadline passes is turned away once, and the next one ends the record first.
+
+The host asks the service about each call in turn and waits up to ten seconds for each answer,
+after a token request that has the account transport's own limit (twenty seconds when it
+refreshes). The close of a call that is over has the voice transport's own limit (fifty seconds). A
+service that cannot be asked, answers something this host cannot read, or answers with a status and
+a body that disagree leaves the call open, and the call's deadline ends it. A person who signs in
+or out with a lost call and a service that does not answer can therefore wait about a minute for
+the host's answer.
 
 `kr account sign-out` (`account.sign_out`, served on the local socket alone, asking for host
 management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret

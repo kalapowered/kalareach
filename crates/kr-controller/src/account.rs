@@ -613,14 +613,15 @@ impl Inner {
     /// Whether a call is open once the calls that are over have been ended.
     ///
     /// Asked at the places a person's request is turned away for a call, so that a call whose
-    /// device is gone never turns one away for good. The check inside the change stays the plain
-    /// one: by then these have been ended, and a call that opened since is a real one.
+    /// device is gone never turns one away for good. A call that is over only after this has
+    /// looked, because its deadline passed while the service was being asked, still counts as open
+    /// here and in the check inside the change: the request is turned away once, and the next one
+    /// ends the record before it looks. The check inside the change is the plain one, because by
+    /// then the account is about to change and every record must have been ended or counted.
     async fn a_call_is_open_after_settling(&self) -> bool {
         let Some(calls) = self.calls.get() else {
             return false;
         };
-        // Also when nothing counts as open: a call past its deadline no longer counts, and its
-        // record is still to be ended.
         calls.end_those_that_are_over().await;
         calls.open()
     }
