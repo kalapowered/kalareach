@@ -4366,6 +4366,44 @@ impl kr_worker::action::time::WallClock for WallThatMovesAfterItsNextReading {
     }
 }
 
+/// A continuous clock that, once armed, runs a closure right after its nth reading from then on:
+/// how a test moves the world after a worker has read the wall clock and stamped the reading with
+/// the continuous clock, and before it does anything else.
+struct ContinuousThatMovesAfterItsNthReading {
+    inner: kr_ipc::clock::ManualSharedClock,
+    after: std::sync::Mutex<Option<(u32, Box<dyn FnOnce() + Send>)>>,
+}
+
+impl std::fmt::Debug for ContinuousThatMovesAfterItsNthReading {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ContinuousThatMovesAfterItsNthReading")
+    }
+}
+
+impl kr_ipc::clock::SharedClock for ContinuousThatMovesAfterItsNthReading {
+    fn boot_elapsed_ms(&self) -> u64 {
+        let reading = self.inner.boot_elapsed_ms();
+        let due = {
+            let mut armed = self
+                .after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match armed.take() {
+                Some((1, what)) => Some(what),
+                Some((remaining, what)) => {
+                    *armed = Some((remaining - 1, what));
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(what) = due {
+            what();
+        }
+        reading
+    }
+}
+
 /// KR-REQ-09.19: a worker whose clock reading predates the owner's establishment does not spend
 /// the establishment on it. The worker reads its clock at the start of an observation; while it
 /// waits, the owner corrects the wall clock and establishes it; the worker then finds the
@@ -4378,13 +4416,13 @@ fn a_worker_judges_an_establishment_against_a_reading_taken_after_it() {
     let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
     let machine = DriftingMachine::fast_by(0);
     let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
-    let wall = Arc::new(WallThatMovesAfterItsNextReading {
-        inner: machine.wall.clone(),
+    let continuous = Arc::new(ContinuousThatMovesAfterItsNthReading {
+        inner: machine.continuous.clone(),
         after: std::sync::Mutex::new(None),
     });
     let mut session = Session::open(SessionConfig {
         time: kr_worker::action::time::TimeSources {
-            wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+            continuous: Arc::clone(&continuous) as Arc<dyn kr_ipc::clock::SharedClock>,
             ..machine.sources_on(&floor)
         },
         ..session_config(&environment, session_id)
@@ -4395,17 +4433,21 @@ fn a_worker_judges_an_establishment_against_a_reading_taken_after_it() {
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
 
-    let right = machine.wall.clone();
-    let continuous = machine.continuous.clone();
+    // The worker reads the continuous clock, then the wall clock and the continuous clock again to
+    // stamp the reading: the owner acts right after that second reading of the continuous clock.
+    let (right, inner) = (machine.wall.clone(), machine.continuous.clone());
     let published = Arc::clone(&floor);
-    *wall
+    *continuous
         .after
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
-        right.advance(std::time::Duration::from_secs(60));
-        continuous.advance(std::time::Duration::from_secs(1));
-        published.establish(right.now_ms().get(), continuous.boot_elapsed_ms());
-    }));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+        2,
+        Box::new(move || {
+            right.advance(std::time::Duration::from_secs(60));
+            inner.advance(std::time::Duration::from_secs(1));
+            published.establish(right.now_ms().get(), inner.boot_elapsed_ms());
+        }),
+    ));
     session.observe_time();
     assert_eq!(
         session.time().trust(),
@@ -5050,19 +5092,19 @@ fn a_later_look_does_not_forget_the_rollback_an_earlier_look_found() {
     );
 }
 
-/// KR-REQ-09.18, KR-REQ-09.19: a confirmation the worker met and refused leaves the next one to
-/// answer to the same readings. The owner confirms the clock (A), and then confirms it again (B),
-/// but the daemon stops before it publishes B; the worker looks, loads A, and its second reading
-/// finds the clock a minute behind both, so it refuses A. The clock is right again and the daemon
-/// completes the publication of B. B is older than the minute the clock lost, so it does not end
-/// the distrust, although the clock agrees with it by then. The control is a second action of the
-/// owner made after the clock was right again.
+/// KR-REQ-09.18, KR-REQ-09.19: a reading the worker kept when it refused one confirmation is held
+/// against the next. The owner confirms the clock (A); the worker looks, and its second reading of
+/// the look finds the clock a minute low, so it refuses A. The owner had made a second confirmation
+/// (B) between the worker's two readings, which the daemon publishes after the look, when the clock
+/// is right again: B follows the reading the worker proved its mark at, so only the low reading
+/// the worker kept refuses it. The control is a confirmation the owner makes after the clock is
+/// right again.
 #[test]
 fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readings() {
     use kr_ipc::clock::SharedClock as _;
     use kr_worker::action::time::WallClock as _;
 
-    let looked = |b_is_older_than_the_lost_minute: bool| {
+    let looked = |b_was_made_before_the_clock_fell: bool| {
         let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
         let machine = DriftingMachine::fast_by(0);
         let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
@@ -5081,28 +5123,31 @@ fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readi
         machine.runs(AN_HOUR);
         machine.owner_establishes(&floor);
         machine.runs(std::time::Duration::from_secs(1));
-        let b = (
+        // The worker's first reading is the one its mark is proved at; B is made a second after
+        // it, and the clock falls a minute two seconds after it, before the second reading.
+        let (proved_wall, proved_at) = (
             machine.wall.now_ms().get(),
             machine.continuous.boot_elapsed_ms(),
         );
-        machine.runs(std::time::Duration::from_secs(1));
-        let lost = machine.wall.clone();
+        let (inner, continuous) = (machine.wall.clone(), machine.continuous.clone());
         *wall
             .after
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
-            lost.set(lost.now_ms().get() - 60_000);
+            continuous.advance(std::time::Duration::from_secs(2));
+            inner.advance(std::time::Duration::from_secs(2));
+            inner.set(inner.now_ms().get() - 60_000);
         }));
         session.observe_time();
         assert_eq!(
             session.time().trust(),
             WallClockTrust::Unresolved,
-            "the clock a minute behind A at the second reading refuses A"
+            "the clock a minute low at the second reading refuses A"
         );
         machine.wall.advance(std::time::Duration::from_secs(60));
         machine.runs(std::time::Duration::from_secs(1));
-        if b_is_older_than_the_lost_minute {
-            floor.establish(b.0, b.1);
+        if b_was_made_before_the_clock_fell {
+            floor.establish(proved_wall + 1_000, proved_at + 1_000);
         } else {
             machine.owner_establishes(&floor);
         }
@@ -5112,7 +5157,7 @@ fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readi
     assert_eq!(
         looked(true),
         WallClockTrust::Unresolved,
-        "B was made before the clock lost its minute"
+        "B was made before the clock fell, and the worker kept the reading after it"
     );
     assert_eq!(
         looked(false),
@@ -5125,9 +5170,9 @@ fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readi
 /// the furthest it has proved. The owner confirms the clock and the worker follows it; the wall
 /// clock then steps forward an hour, which the confirmation does not mind, and the worker proves
 /// that reading; and the clock goes back three seconds at each of the next three looks, every one
-/// of them inside the tolerance. Nine seconds behind its mark is a rollback, as it is for a worker
-/// that never met a confirmation. A worker that took the same confirmation again at every look
-/// would set its mark to the lower reading each time, and never find it.
+/// of them inside the tolerance. Six seconds behind its mark, at the second of them, is a rollback,
+/// as it is for a worker that never met a confirmation. A worker that took the same confirmation
+/// again at every look would set its mark to the lower reading each time, and never find it.
 #[test]
 fn a_worker_follows_a_confirmation_once_so_a_clock_that_slips_after_it_is_found() {
     let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
@@ -5148,7 +5193,7 @@ fn a_worker_follows_a_confirmation_once_so_a_clock_that_slips_after_it_is_found(
     assert_eq!(
         session.time().trust(),
         WallClockTrust::Unresolved,
-        "nine seconds behind its mark, at three looks, is a rollback"
+        "a clock six seconds behind its mark is a rollback, as it is for any worker"
     );
 }
 
