@@ -2065,6 +2065,8 @@ export interface KalaReachProtocol {
   device_list_result?: DeviceListResult
   device_preview_key_update_params?: DevicePreviewKeyUpdateParams
   device_preview_key_update_result?: DevicePreviewKeyUpdateResult
+  device_push_register_params?: DevicePushRegisterParams
+  device_push_register_result?: DevicePushRegisterResult
   device_revoke_params?: DeviceRevokeParams
   device_summary?: DeviceSummary
   diff_apply_params?: DiffApplyParams
@@ -2360,7 +2362,7 @@ export interface KalaReachProtocol {
   proposed_grant?: ProposedGrant5
   protocol_error?: ProtocolError
   push_delivery_ack?: PushDeliveryAck
-  push_delivery_credential?: PushDeliveryCredential
+  push_delivery_credential?: PushDeliveryCredential1
   push_delivery_request?: PushDeliveryRequest
   push_installation_binding?: PushInstallationBinding
   push_registration_answer?: PushRegistrationAnswer
@@ -11611,6 +11613,77 @@ export interface DevicePreviewKeyUpdateResult {
   revision?: string
 }
 /**
+ * Parameters of `device.push.register`.
+ *
+ * A paired device hands its host the delivery credential its installation was issued for this
+ * host (`push.sender.issue`), over its paired channel, so the host can deliver to it. The device
+ * is the one the connection authenticated as; the parameters name no device.
+ */
+export interface DevicePushRegisterParams {
+  credential: PushDeliveryCredential
+  /**
+   * Whether the device wants notification previews. Without them it is sent the generic alert
+   * alone. A registration that says nothing wants previews.
+   */
+  previews_enabled?: boolean
+}
+/**
+ * The credential this installation was issued for this host. The host keeps this credential
+ * once the gateway has taken its bearer and confirmed the authorisation for the host's own
+ * key; it must name the installation the device's own authorisation key names.
+ */
+export interface PushDeliveryCredential {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The gateway that issued it.
+   */
+  gateway_origin: string
+  /**
+   * The destination installation.
+   */
+  installation_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The revision of the record it was issued against.
+   */
+  revision: string
+  /**
+   * The bearer itself. It reaches a log or a debug rendering as a redaction.
+   */
+  secret: string
+  /**
+   * The authorisation it delivers under.
+   */
+  sender_record_id: string
+}
+/**
+ * The result of `device.push.register`. It never carries the credential.
+ */
+export interface DevicePushRegisterResult {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  credential_expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * The installation the gateway knows it by.
+   */
+  installation_id: string
+  /**
+   * The authorisation this host delivers under.
+   */
+  sender_record_id: string
+}
+/**
  * Parameters of `device.revoke`.
  */
 export interface DeviceRevokeParams {
@@ -15864,6 +15937,7 @@ export interface MethodEntry {
     | 'device.list'
     | 'device.revoke'
     | 'device.preview_key.update'
+    | 'device.push.register'
     | 'device.keys.complete'
     | 'catalogue.list'
     | 'catalogue.add'
@@ -21359,7 +21433,7 @@ export interface PushSuppression {
  * The gateway stores [`PushDeliveryCredential::secret_digest`], never the secret. A copy of the
  * database is therefore not a set of working credentials.
  */
-export interface PushDeliveryCredential {
+export interface PushDeliveryCredential1 {
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -24423,6 +24497,7 @@ export interface ServiceRequestPayload {
     | 'device.list'
     | 'device.revoke'
     | 'device.preview_key.update'
+    | 'device.push.register'
     | 'device.keys.complete'
     | 'catalogue.list'
     | 'catalogue.add'

@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 161,
+  "method_count": 162,
   "methods": [
     {
       "capability": "none",
@@ -764,6 +764,31 @@
         "device"
       ],
       "summary": "Rotate this device's own notification-preview key through its paired proof.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "devices",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "device.push.register",
+      "name": "device.push.register",
+      "required_rights": [
+        {
+          "authority": "resource_owner",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "device"
+      ],
+      "summary": "Hand this host the delivery credential this device's installation was issued for it, so the host can notify this device. The host asks the gateway whether it takes the credential's bearer and holds the authorisation for the host's own key before it keeps anything.",
       "version": 1
     },
     {

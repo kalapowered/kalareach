@@ -1152,6 +1152,48 @@ impl RemoteConnection {
                     Err(error) => failure(mutation.request_id, error.to_protocol_error()),
                 }
             }
+            // A device handing the host the credential its installation was issued: the daemon's
+            // own effect, on the destination of the device this connection authenticated as. It is
+            // retained and answered like a key registration, because the gateway is asked before
+            // anything is kept and the answer can be lost on the way back.
+            Method::DevicePushRegister => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let actor_id = self.device.principal();
+                if let Some(answer) = self
+                    .controller
+                    .retained_authority_change(&actor_id, mutation)
+                {
+                    return answer;
+                }
+                if self.controller.clock.now() >= accepted.deadline {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "the deadline this action was admitted under passed before it could \
+                             run",
+                        ),
+                    );
+                }
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                match self
+                    .controller
+                    .push_register_action(&actor_id, mutation, carried)
+                    .await
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
+                }
+            }
             // A device completing its own record: the daemon's own effect, on this device's own
             // row and nothing else. The parameters name no device; the one written is the one this
             // connection authenticated as. The admission travels with the declaration, so the

@@ -53,6 +53,7 @@ links to its document.
 | `device.list` | read | `local_ipc`, `paired_device` | Paired devices, their key purposes and each host's last authority acknowledgement. |  |
 | `device.revoke` | write | `local_ipc`, `paired_device` | Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer. |  |
 | `device.preview_key.update` | write | `paired_device` | Rotate this device's own notification-preview key through its paired proof. | [Delivery: What travels, and what does not](../delivery/README.md) |
+| `device.push.register` | write | `paired_device` | Hand this host the delivery credential this device's installation was issued for it, so the host can notify this device. The host asks the gateway whether it takes the credential's bearer and holds the authorisation for the host's own key before it keeps anything. | [Delivery: A paired device becomes a destination](../delivery/README.md) |
 | `device.keys.complete` | write | `paired_device` | Declare this device's own four public keys once, signed by the authorisation key its pairing recorded, so the host keeps every key it binds. |  |
 
 ## Plugin catalogues

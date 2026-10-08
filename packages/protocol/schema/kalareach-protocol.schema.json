@@ -11003,6 +11003,54 @@
       ],
       "type": "object"
     },
+    "DevicePushRegisterParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `device.push.register`.\n\nA paired device hands its host the delivery credential its installation was issued for this\nhost (`push.sender.issue`), over its paired channel, so the host can deliver to it. The device\nis the one the connection authenticated as; the parameters name no device.",
+      "properties": {
+        "credential": {
+          "$ref": "#/$defs/PushDeliveryCredential",
+          "description": "The credential this installation was issued for this host. The host keeps this credential\nonce the gateway has taken its bearer and confirmed the authorisation for the host's own\nkey; it must name the installation the device's own authorisation key names."
+        },
+        "previews_enabled": {
+          "default": true,
+          "description": "Whether the device wants notification previews. Without them it is sent the generic alert\nalone. A registration that says nothing wants previews.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "credential"
+      ],
+      "type": "object"
+    },
+    "DevicePushRegisterResult": {
+      "additionalProperties": false,
+      "description": "The result of `device.push.register`. It never carries the credential.",
+      "properties": {
+        "credential_expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the credential the host keeps stops working, unless it renews it first."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device whose destination is configured."
+        },
+        "installation_id": {
+          "$ref": "#/$defs/InstallationId",
+          "description": "The installation the gateway knows it by."
+        },
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "The authorisation this host delivers under."
+        }
+      },
+      "required": [
+        "device_id",
+        "installation_id",
+        "sender_record_id",
+        "credential_expires_at_ms"
+      ],
+      "type": "object"
+    },
     "DeviceRevokeParams": {
       "additionalProperties": false,
       "description": "Parameters of `device.revoke`.",
@@ -18772,6 +18820,11 @@
         {
           "const": "device.preview_key.update",
           "description": "Rotate this device's own notification-preview key through its paired proof.",
+          "type": "string"
+        },
+        {
+          "const": "device.push.register",
+          "description": "Hand this host the delivery credential this device's installation was issued for it, so the host can notify this device. The host asks the gateway whether it takes the credential's bearer and holds the authorisation for the host's own key before it keeps anything.",
           "type": "string"
         },
         {
@@ -38176,6 +38229,12 @@
     },
     "device_preview_key_update_result": {
       "$ref": "#/$defs/DevicePreviewKeyUpdateResult"
+    },
+    "device_push_register_params": {
+      "$ref": "#/$defs/DevicePushRegisterParams"
+    },
+    "device_push_register_result": {
+      "$ref": "#/$defs/DevicePushRegisterResult"
     },
     "device_revoke_params": {
       "$ref": "#/$defs/DeviceRevokeParams"
