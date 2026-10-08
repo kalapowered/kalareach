@@ -202,7 +202,10 @@ fn read_credential(file: &Path) -> Result<SecretVec> {
     let unreadable =
         |error: &std::io::Error| CliError::Usage(shown!("{}: {}", named(file), Shown::io(error)));
     // Read through a bound, not from a length the file reports: a pipe or a device reports none.
-    let mut bytes = Vec::new();
+    // The buffer has room for the whole bound at once, so a read never grows it by copying what
+    // it holds into a larger one, and no copy is left uncleared.
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(CREDENTIAL_FILE_LIMIT + 1).unwrap_or(usize::MAX));
     std::fs::File::open(file)
         .and_then(|opened| {
             opened
@@ -541,6 +544,17 @@ mod tests {
             };
             assert!(refusal.contains("does not hold"), "{refusal}");
             assert!(!refusal.contains(planted), "{refusal}");
+        }
+
+        // A file that reports no length and never ends is read to the bound and refused.
+        #[cfg(unix)]
+        {
+            let refusal =
+                match credential(ExternalDestinationKind::Slack, Some(Path::new("/dev/zero"))) {
+                    Err(error) => error.to_string(),
+                    Ok(_) => panic!("an endless file was accepted"),
+                };
+            assert!(refusal.contains("is larger than a credential"), "{refusal}");
         }
 
         // The controls: a Slack address with its line ending is the address, and a mail account is

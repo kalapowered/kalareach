@@ -704,7 +704,12 @@ impl Controller {
                             .to_owned(),
                     ));
                 }
-                validate_configuration(&configure_params(&mutation.params)?)?;
+                let params = configure_params(&mutation.params)?;
+                validate_configuration(&params)?;
+                if let Some(secret) = params.secret.as_ref() {
+                    crate::push::external::check_secret(secret)
+                        .map_err(ControllerError::InvalidArgument)?;
+                }
             }
             Method::DeliveryDestinationRemove => {
                 if mutation.target.session_id.as_ref().is_some()
