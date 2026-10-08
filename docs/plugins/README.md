@@ -499,11 +499,15 @@ implements the `adapter` interface and targets the `plugin` world.
 | `checkpoint` | Returns resumable component state | 100 ms |
 | `restore` | Restores state from a checkpoint | 100 ms |
 
-`prepare-action` returns an effect plan whose operation is one the broker already performs:
-present, send a routed upstream method with its fields filled in, cancel the current turn,
-contribute a completed attachment handle, or write terminal text. A component chooses between them
-and supplies the values. It cannot describe an operation the broker has no way to perform, and it
-cannot name a destination outside the binding the host made.
+`prepare-action` returns an effect plan whose operation is one the broker already performs: send
+the action's routed upstream method, cancel the current turn, contribute a completed attachment
+handle, or write terminal text. The host builds the effect it validates from the invocation and the
+action's declaration, never from the plan, so the plan can only choose the one operation its action
+declared and confirm the arguments it was given: a plan for another action, of another class, with
+other arguments, naming fields of a routed method or a method other than the action's own, or that
+only redraws the document, is refused by name. A component is therefore a veto, and cannot describe
+an operation the broker has no way to perform or name a destination outside the binding the host
+made.
 
 `prepare-action` receives the invocation's token: the actor, the grant, the binding and thread
 revisions, the declared action and the hash of exactly the parameters a person saw. `encode-response`
