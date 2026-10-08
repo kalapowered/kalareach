@@ -273,7 +273,7 @@ fn reply(holding: &Mutex<Holding>, session_id: SessionId, frame: ControlFrame) -
 
 /// Serves the played worker on its endpoint: the handshake a daemon makes, stating `stated`
 /// about itself, and then [`reply`] for every frame.
-fn serving(
+pub(super) fn serving(
     holding: Arc<Mutex<Holding>>,
     stated: CanonicalSet<CapabilityId>,
 ) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {

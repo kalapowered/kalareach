@@ -566,17 +566,6 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        // A host that cannot show the issuer the screen does not share the screen. Section 25
-        // requires the preview to show what is being shared, and this daemon holds no screen
-        // content of its own: the worker does. An invitation that included it here would be one
-        // whose issuer was shown nothing.
-        if params.selection.include_live_screen {
-            return Err(ControllerError::InvalidArgument(
-                "this host cannot preview the screen this invitation would share, so it does not \
-                 share it"
-                    .to_owned(),
-            ));
-        }
         let named = self
             .named_previews(params.session_id, &params.selection)
             .await?;
@@ -592,7 +581,7 @@ impl Controller {
             selection: params.selection.clone(),
             lifetime_ms: params.lifetime_ms.as_ref().map(|lifetime| lifetime.get()),
             accepted_notices: params.accepted_notices.clone(),
-            live_screen: None,
+            live_screen: named.live_screen,
             named_questions: named.questions,
             named_approvals: named.approvals,
             authority_revision: self.policy().authority_revision(),
@@ -655,7 +644,7 @@ impl Controller {
         selection: &RoleSelection,
     ) -> Result<NamedPreviews> {
         let named = selection.named_questions.len() + selection.named_approvals.len();
-        if named == 0 {
+        if named == 0 && !selection.include_live_screen {
             return Ok(NamedPreviews::default());
         }
         if named > MAX_NAMED_RESOURCES {
@@ -1087,6 +1076,8 @@ fn unfinished_and_unknown() -> ControllerError {
 struct NamedPreviews {
     questions: Vec<NamedQuestionPreview>,
     approvals: Vec<NamedApprovalPreview>,
+    /// The visible lines of the screen, when the share includes the screen.
+    live_screen: Option<kr_protocol::sharing::LiveScreenPreview>,
 }
 
 /// Why the session's worker could not say what a share names.
@@ -1149,6 +1140,60 @@ fn answered_as<T: kr_protocol::wire::WireMessage>(
         .map_err(|error| PreviewFailure::Refused(unreachable_worker(error)))
 }
 
+/// The visible lines of the session's screen, as the share's recipient would first see them.
+///
+/// The worker cuts them to the scope the share would carry, and a screen it had to cut is not
+/// shared: the issuer is shown what the recipient will read, and a preview that says less than the
+/// recipient will see is the thing the preview is there to prevent. A worker of an earlier build
+/// does not know the read, and the screen is not shared through it.
+async fn read_screen(
+    client: &mut LocalClient,
+    session_id: SessionId,
+    selection: &RoleSelection,
+) -> std::result::Result<kr_protocol::sharing::LiveScreenPreview, PreviewFailure> {
+    let answered = client
+        .request(
+            Method::SessionScreenPreview,
+            &kr_protocol::sharing::SessionScreenPreviewParams {
+                session_id,
+                history: selection.history(),
+            },
+        )
+        .await
+        .map_err(PreviewFailure::Link)?;
+    let result: kr_protocol::sharing::SessionScreenPreviewResult = match answered {
+        Ok(value) => answered_as(&value)?,
+        Err(error)
+            if matches!(
+                error.code,
+                ErrorCode::PermissionDenied
+                    | ErrorCode::InvalidArgument
+                    | ErrorCode::UnsupportedCapability
+            ) =>
+        {
+            return Err(PreviewFailure::Refused(ControllerError::Refused {
+                code: ErrorCode::UnsupportedCapability,
+                detail: "this session's worker is of a build that cannot show its screen to the                          issuer of a share, so the screen is not shared"
+                    .to_owned(),
+            }));
+        }
+        Err(error) => return Err(as_the_worker_gave_it(error)),
+    };
+    let Some(screen) = result.screen.0 else {
+        return Err(PreviewFailure::Refused(ControllerError::InvalidArgument(
+            "the session's worker showed no screen for a share that includes it".to_owned(),
+        )));
+    };
+    if screen.truncated {
+        return Err(PreviewFailure::Refused(ControllerError::InvalidArgument(
+            "this session's screen is larger than a preview can show, so its issuer cannot be \
+             shown all of what the share would give"
+                .to_owned(),
+        )));
+    }
+    Ok(screen)
+}
+
 /// Reads, on one link to the session's worker, what it holds of each question and approval
 /// `selection` names, and builds what the issuer is shown of each.
 ///
@@ -1162,6 +1207,9 @@ async fn read_previews(
     selection: &RoleSelection,
 ) -> std::result::Result<NamedPreviews, PreviewFailure> {
     let mut previews = NamedPreviews::default();
+    if selection.include_live_screen {
+        previews.live_screen = Some(read_screen(client, session_id, selection).await?);
+    }
     for question_id in &selection.named_questions {
         let answered = client
             .request(
