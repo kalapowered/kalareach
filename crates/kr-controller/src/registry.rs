@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -941,6 +941,7 @@ impl Registry {
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
+                self.migrate_7_to_8()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -948,23 +949,31 @@ impl Registry {
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
+                self.migrate_7_to_8()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
+                self.migrate_7_to_8()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
+                self.migrate_7_to_8()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
+                self.migrate_7_to_8()?;
             }
-            Some(6) => self.migrate_6_to_7()?,
+            Some(6) => {
+                self.migrate_6_to_7()?;
+                self.migrate_7_to_8()?;
+            }
+            Some(7) => self.migrate_7_to_8()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1221,6 +1230,23 @@ impl Registry {
         }
         self.connection
             .execute("UPDATE schema_version SET version = 7", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 7 to 8: the device store's record of this host's wall clock holds more.
+    ///
+    /// The record gained the anchor the mark is projected from, the moment the owner established
+    /// the clock, the two holds that wait for the owner, and whether an earlier build's attention
+    /// record of the clock has been taken in. The device store adds those columns to a table that
+    /// exists when it opens the file, and the other writers are opened before a version moves, so
+    /// a file that records 8 has them. Nothing in a row changes.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_7_to_8(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 8", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -4162,6 +4188,67 @@ mod tests {
             vec!["registry.sqlite3".to_owned()],
             "a closed registry is still one file"
         );
+    }
+
+    /// The release before this one left the device store's record of the host's wall clock with
+    /// three columns. A registry at that release's version comes forward with the columns the
+    /// record has since gained and keeps the row it held.
+    #[test]
+    fn a_registry_of_the_release_before_is_brought_forward_with_the_clock_record_it_gained() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(Registry::open(&path, environment()).expect("a registry"));
+        Connection::open(&path)
+            .expect("opens")
+            .execute_batch(
+                "DROP TABLE network_clock;
+                 CREATE TABLE network_clock (
+                     id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
+                     observed_ms INTEGER NOT NULL,
+                     untrusted_at_ms INTEGER
+                 );
+                 INSERT INTO network_clock (id, observed_ms) VALUES (0, 1234);
+                 UPDATE schema_version SET version = 7;",
+            )
+            .expect("sets the file back to the release before");
+        let columns = |path: &std::path::Path| -> Vec<String> {
+            let connection = Connection::open(path).expect("opens");
+            let mut statement = connection
+                .prepare("SELECT name FROM pragma_table_info('network_clock') ORDER BY name")
+                .expect("prepares");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("reads")
+                .collect::<rusqlite::Result<_>>()
+                .expect("columns")
+        };
+        let other = tempfile::tempdir().expect("a directory");
+        let new = other.path().join("registry.sqlite3");
+        drop(Registry::open(&new, environment()).expect("a new registry"));
+        assert_ne!(
+            columns(&path),
+            columns(&new),
+            "the record is a shape behind"
+        );
+
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(
+            carried,
+            Some(Carried {
+                from: 7,
+                to: SCHEMA_VERSION
+            })
+        );
+        assert_eq!(columns(&path), columns(&new));
+        let kept: i64 = Connection::open(&path)
+            .expect("opens")
+            .query_row(
+                "SELECT observed_ms FROM network_clock WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the row stays");
+        assert_eq!(kept, 1234);
     }
 
     /// A registry that is at this build's schema is not migrated, and one with no log to take in is
