@@ -3019,6 +3019,95 @@ mod tests {
         assert_eq!(registry.floors_of_boot(other).expect("readable").len(), 1);
     }
 
+    /// The writer a registry's own write meets ahead of it, held until the registry has to wait.
+    static WRITER_AHEAD: std::sync::Mutex<Option<Connection>> = std::sync::Mutex::new(None);
+
+    /// Lets the writer ahead finish the moment the registry waits for it.
+    fn finish_the_writer_ahead(_waits: i32) -> bool {
+        let writer = WRITER_AHEAD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(writer) = writer else {
+            return false;
+        };
+        writer
+            .execute_batch("COMMIT")
+            .expect("the writer ahead commits");
+        true
+    }
+
+    /// Has another connection to the registry's file hold its write lock, as the device directory
+    /// does while it records the host's clock, until `registry` waits for it.
+    fn put_a_writer_ahead(path: &std::path::Path, registry: &Registry) {
+        let writer = Connection::open(path).expect("opens");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("takes the write lock");
+        *WRITER_AHEAD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer);
+        registry
+            .connection
+            .busy_handler(Some(finish_the_writer_ahead))
+            .expect("installs the handler");
+    }
+
+    fn the_registry_waited() -> bool {
+        WRITER_AHEAD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// A write that reads before it writes waits for the writer ahead of it, as one that only
+    /// writes does. Another connection of this daemon writes the same file, and a transaction that
+    /// asks for the write lock only at its first write is refused at once while it holds a read:
+    /// the wait that would let the writer ahead finish never begins.
+    #[test]
+    fn a_write_that_reads_first_waits_for_the_writer_ahead_of_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let mut registry = opened(&path, kernel);
+        let actor = ActorId::new("local:test").expect("a principal");
+        let digest = Digest256::from_bytes([1; 32]);
+        let reserved = |registry: &mut Registry| {
+            registry
+                .reserve(
+                    &actor,
+                    kr_ipc::new_uuid(),
+                    digest,
+                    b"intent",
+                    TimestampMs::new(1),
+                )
+                .expect("reserves")
+                .reservation
+        };
+        let waiting = reserved(&mut registry);
+        registry
+            .set_phase(waiting.reservation_id, LaunchPhase::Spawned)
+            .expect("spawned");
+
+        put_a_writer_ahead(&path, &registry);
+        registry
+            .claim_rendezvous(
+                waiting.reservation_id,
+                AuthorisationKey::from_bytes([2; 32]),
+            )
+            .expect("a claim waits for the writer ahead");
+        assert!(the_registry_waited(), "the claim waited for it");
+
+        put_a_writer_ahead(&path, &registry);
+        reserved(&mut registry);
+        assert!(the_registry_waited(), "the reservation waited for it");
+
+        put_a_writer_ahead(&path, &registry);
+        registry
+            .forget_workers_of_closed_sessions()
+            .expect("the forgetting waits for the writer ahead");
+        assert!(the_registry_waited(), "the forgetting waited for it");
+    }
+
     #[test]
     fn records_the_previous_build_made_in_whole_seconds_are_settled_where_the_kernel_can_say() {
         let directory = tempfile::tempdir().expect("a directory");
