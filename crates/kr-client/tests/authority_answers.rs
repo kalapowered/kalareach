@@ -260,75 +260,75 @@ async fn run_the_script(service: &Arc<dyn ServiceHttp>, origin: &GatewayOrigin, 
 
     journal.step("the host reads a feed nobody has written to, for its summary");
     let answer = as_host.read(feed, None, true).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host reads its records");
     let answer = as_host.read(feed, None, false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("a remote owner reads the host's feed");
     let answer = as_owner.read(feed, None, false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 
     // Publishing.
     let first = revocation(&owner, 0xb1, host_device, 0xa1, devices(0xc1));
     journal.step("the owner publishes a revocation request");
     let answer = as_owner.publish(feed, &first, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the owner publishes it again");
     let answer = as_owner.publish(feed, &first, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     let different = revocation(&owner, 0xb1, host_device, 0xa1, devices(0xc2));
     journal.step("the owner publishes another request under the same identity");
     let answer = as_owner.publish(feed, &different, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     let second_request = revocation(&second, 0xb2, host_device, 0xa2, grants(0xd1));
     journal.step("a stranger publishes a request of its own");
     let answer = as_stranger.publish(feed, &second_request, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     // A request signed by one key and carried by another is not the carrier's.
     let borrowed = revocation(&second, 0xb2, host_device, 0xa3, devices(0xc3));
     journal.step("the owner carries a request another key signed");
     let answer = as_owner.publish(feed, &borrowed, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     let mut altered = revocation(&owner, 0xb1, host_device, 0xa4, devices(0xc4));
     altered.target = devices(0xc5);
     journal.step("the owner publishes a request altered after it was signed");
     let answer = as_owner.publish(feed, &altered, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 
     // Reading.
     journal.step("the host reads what was published");
     let answer = as_host.read(feed, None, false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the owner reads only what it published");
     let answer = as_owner.read(feed, None, false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the stranger reads only what it published");
     let answer = as_stranger.read(feed, None, false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host reads from a cursor");
     let answer = as_host.read(feed, Some(1), false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 
     // Revisions.
     journal.step("the host issues its first revision");
     let one = revision(&host, host_device, 1, 0, &[0xa1]);
     let answer = as_host.revise(&one, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host sends it again");
     let answer = as_host.revise(&one, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host sends another record under the same number");
     let rewritten = revision(&host, host_device, 1, 0, &[0xa1, 0xa2]);
     let answer = as_host.revise(&rewritten, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host sends a revision that does not follow the one the feed holds");
     let gap = revision(&host, host_device, 6, 5, &[0xa2]);
     let answer = as_host.revise(&gap, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host sends a revision that is not above the one it follows");
     let backwards = revision(&host, host_device, 1, 1, &[0xa2]);
     let answer = as_host.revise(&backwards, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 
     // Acknowledgements.
     journal.step("the host reports progress on the request");
@@ -342,10 +342,10 @@ async fn run_the_script(service: &Arc<dyn ServiceHttp>, origin: &GatewayOrigin, 
         1_000,
     );
     let answer = as_host.acknowledge(&pending, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host reads the record, which is still outstanding");
     let answer = as_host.read(feed, None, false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host reports an older acknowledgement");
     let older = acknowledgement(
         host_device,
@@ -357,11 +357,11 @@ async fn run_the_script(service: &Arc<dyn ServiceHttp>, origin: &GatewayOrigin, 
         500,
     );
     let answer = as_host.acknowledge(&older, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host acknowledges the request as complete");
     let complete = acknowledgement(host_device, 0xa1, 1, RevocationCompletion::Complete, 2_000);
     let answer = as_host.acknowledge(&complete, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host reports progress after completion");
     let after = acknowledgement(
         host_device,
@@ -373,74 +373,74 @@ async fn run_the_script(service: &Arc<dyn ServiceHttp>, origin: &GatewayOrigin, 
         3_000,
     );
     let answer = as_host.acknowledge(&after, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host acknowledges under a revision it never issued");
     let invented = acknowledgement(host_device, 0xa1, 9, RevocationCompletion::Complete, 4_000);
     let answer = as_host.acknowledge(&invented, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host acknowledges a request the revision did not apply");
     let misapplied = acknowledgement(host_device, 0xa2, 1, RevocationCompletion::Complete, 4_000);
     let answer = as_host.acknowledge(&misapplied, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host acknowledges a request nobody published");
     let unknown = acknowledgement(host_device, 0xee, 1, RevocationCompletion::Complete, 4_000);
     let answer = as_host.acknowledge(&unknown, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 
     // Refusals.
     journal.step("the host refuses the stranger's request");
     let answer = as_host
         .reject(request_id(0xa2), RejectionReason::NoOwnerAuthority)
         .await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host refuses it again");
     let answer = as_host
         .reject(request_id(0xa2), RejectionReason::NoOwnerAuthority)
         .await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host refuses a request nobody published");
     let answer = as_host
         .reject(request_id(0xee), RejectionReason::UnknownTarget)
         .await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host issues a revision that applies the request it refused");
     let two = revision(&host, host_device, 2, 1, &[0xa2]);
     let answer = as_host.revise(&two, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host acknowledges the request it refused");
     let contradicting =
         acknowledgement(host_device, 0xa2, 2, RevocationCompletion::Complete, 5_000);
     let answer = as_host.acknowledge(&contradicting, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 
     // Naming the keys that may remove the host.
     journal.step("the host names the owner's key as one that may remove it");
     let answer = as_host.delegate(&[owner.key.key_id()]).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host names no key");
     let answer = as_host.delegate(&[]).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host names the owner's key again");
     let answer = as_host.delegate(&[owner.key.key_id()]).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 
     // Removal.
     journal.step("a stranger removes the host");
     let answer = as_stranger.remove(feed).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the owner the host named removes it");
     let answer = as_owner.remove(feed).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host reads its feed after its removal");
     let answer = as_host.read(feed, None, false).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the owner publishes to a host that was removed");
     let late = revocation(&owner, 0xb1, host_device, 0xa5, devices(0xc6));
     let answer = as_owner.publish(feed, &late, None).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
     journal.step("the host reads the summary of its removal");
     let answer = as_host.read(feed, None, true).await;
-    journal.decoded(decoded(&answer, &show));
+    journal.decoded(decoded(&answer, show));
 }
 
 /// A transport the script is run through when it is not run against a Worker.

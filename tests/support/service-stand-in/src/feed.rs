@@ -285,11 +285,10 @@ fn build(
             proven(
                 caller,
                 signature,
-                &serde_json::to_value(request.issuer_key_id)
+                serde_json::to_value(request.issuer_key_id)
                     .expect("a key id")
                     .as_str()
-                    .expect("text")
-                    .to_owned(),
+                    .expect("text"),
                 REVOCATION_DOMAIN,
                 request.signing_input(),
                 &request.signature,
@@ -318,11 +317,10 @@ fn build(
             proven(
                 caller,
                 signature,
-                &serde_json::to_value(revision.host_key_id)
+                serde_json::to_value(revision.host_key_id)
                     .expect("a key id")
                     .as_str()
-                    .expect("text")
-                    .to_owned(),
+                    .expect("text"),
                 AUTHORITY_REVISION_DOMAIN,
                 revision.signing_input(),
                 &revision.signature,
@@ -502,6 +500,12 @@ impl Feed {
                 Ok(self.state(caller))
             }
         }
+    }
+
+    /// A week passes: the records the host finished with are dropped, as retention drops them.
+    pub(crate) fn forget_what_was_finished(&mut self) {
+        self.records
+            .retain(|_, record| record.settled_at_ms.is_none());
     }
 
     fn host(&self) -> &Host {
