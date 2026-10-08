@@ -314,8 +314,9 @@ that no file of the lane declares, or that two declare, is a problem of the resu
 every file of its lane: a result that cannot be given to one file cannot be given to any row. That
 holds whichever way the reading of the sources went wrong, with one limit. A class that the reading
 misses in its own file and lists in exactly one other is given to the other file, so its cases count
-for that file's rows; a failure of it still fails the run, as a failure of those rows or as one
-listed outside any row.
+for that file's rows, and the rows of the file that holds the class read only that file's other
+classes; a failure of it still fails the run, as a failure of those rows or as one listed outside
+any row.
 
 The two scripts run the tests unchanged and leave what the tool wrote at the path `--results` names:
 Gradle's JUnit files in a directory, and, for Xcode, the tree `xcrun xcresulttool get test-results
