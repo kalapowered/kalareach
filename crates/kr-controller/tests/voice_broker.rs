@@ -11,7 +11,14 @@
 //! | KR-REQ-15.01 | `a_host_whose_document_names_a_broker_brokers_a_call_through_it` |
 //! | KR-REQ-15.19 | `a_host_whose_document_names_a_broker_brokers_a_call_through_it` |
 //! | KR-REQ-17.23 | `an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed_in` |
-//! | KR-REQ-17.23 | `a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_grant` |
+//! | KR-REQ-17.23 | `a_sign_in_that_does_not_complete_leaves_the_host_signed_out_and_says_why` |
+//! | KR-REQ-17.23 | `a_sign_in_request_sent_again_is_answered_from_the_first` |
+//! | KR-REQ-17.23 | `a_sign_in_never_changes_the_account_a_call_closes_under` |
+//! | KR-REQ-17.23 | `each_refresh_presents_the_token_the_last_one_issued` |
+//! | KR-REQ-17.23 | `an_account_signed_in_at_one_service_is_reached_only_through_that_service` |
+//! | KR-REQ-17.23 | `a_revocation_the_service_did_not_acknowledge_is_sent_again_when_the_daemon_starts` |
+//! | KR-REQ-17.23 | `a_host_whose_broker_is_not_the_account_service_signs_in_nowhere` |
+//! | KR-REQ-15.17 | `a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_grant` |
 //! | KR-REQ-26.14 | `a_host_reaches_the_broker_through_the_proxy_its_document_selects` |
 
 mod net_support;
@@ -28,7 +35,8 @@ use kr_client::services::account::{
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::host_account::{
-    AccountReport, AccountSignInParams, AccountState, AccountStatusParams,
+    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountState,
+    AccountStatusParams, SignInUnavailable,
 };
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::{ActionId, EnvironmentId, SessionId};
@@ -67,13 +75,23 @@ struct Account {
     ended: bool,
     /// Every refresh token presented to it, in order.
     refreshes: Vec<String>,
+    /// Names this service's tokens, so two services' tokens are never alike.
+    label: String,
+    /// The account the service says is signed in.
+    subject: String,
+    /// The account the identity read names, when it is not the one the code was issued for.
+    userinfo_subject: Option<String>,
+    /// Whether a revocation is refused, as a service that cannot be reached refuses it.
+    revoke_fails: bool,
+    /// Every refresh token revoked at it, in order.
+    revoked: Vec<String>,
 }
 
 impl Account {
     fn issue(&mut self, with_identity: bool) -> serde_json::Value {
         self.issued += 1;
-        self.access = format!("access-{}", self.issued);
-        self.refresh = format!("refresh-{}", self.issued);
+        self.access = format!("access-{}-{}", self.label, self.issued);
+        self.refresh = format!("refresh-{}-{}", self.label, self.issued);
         let mut answer = serde_json::json!({
             "access_token": self.access,
             "token_type": "Bearer",
@@ -91,7 +109,7 @@ impl Account {
             let now = kr_ipc::now_ms().get() / 1000;
             let claims = serde_json::json!({
                 "iss": ISSUER,
-                "sub": "account-1",
+                "sub": self.subject,
                 "aud": Client::Desktop.id(),
                 "nonce": self.nonce,
                 "iat": now - 5,
@@ -126,6 +144,7 @@ impl Broker {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port");
+        let listener_port = listener.local_addr().expect("an address").port();
         let origin = format!("http://{}", listener.local_addr().expect("an address"));
         let shared = Arc::new(Shared {
             seen: Mutex::default(),
@@ -138,6 +157,11 @@ impl Broker {
                 refresh: String::new(),
                 ended: false,
                 refreshes: Vec::new(),
+                label: listener_port.to_string(),
+                subject: "account-1".to_owned(),
+                userinfo_subject: None,
+                revoke_fails: false,
+                revoked: Vec::new(),
             }),
         });
         let record = Arc::clone(&shared);
@@ -185,6 +209,50 @@ impl Broker {
     /// The service no longer honours the sign-in: its next refresh is refused.
     fn end_the_sign_in(&self) {
         self.shared.account.lock().expect("the account").ended = true;
+    }
+
+    /// The access token this service issues as its `n`th.
+    fn access(&self, n: u32) -> String {
+        format!(
+            "access-{}-{n}",
+            self.shared.account.lock().expect("the account").label
+        )
+    }
+
+    /// The refresh token this service issues as its `n`th.
+    fn refresh(&self, n: u32) -> String {
+        format!(
+            "refresh-{}-{n}",
+            self.shared.account.lock().expect("the account").label
+        )
+    }
+
+    /// Has the service refuse revocations, as one that cannot be reached would.
+    fn refuse_revocations(&self, refuse: bool) {
+        self.shared
+            .account
+            .lock()
+            .expect("the account")
+            .revoke_fails = refuse;
+    }
+
+    /// The refresh tokens revoked at the service, in order.
+    fn revoked(&self) -> Vec<String> {
+        self.shared
+            .account
+            .lock()
+            .expect("the account")
+            .revoked
+            .clone()
+    }
+
+    /// Has the identity read name another account than the one the code was issued for.
+    fn name_another_account(&self) {
+        self.shared
+            .account
+            .lock()
+            .expect("the account")
+            .userinfo_subject = Some("account-2".to_owned());
     }
 
     /// The refresh tokens presented to the service, in order.
@@ -401,10 +469,20 @@ fn account_answer(
             }
             (
                 200,
-                serde_json::json!({"sub": "account-1", "email": "someone@example.test"}),
+                serde_json::json!({
+                    "sub": account.userinfo_subject.as_ref().unwrap_or(&account.subject),
+                    "email": "someone@example.test"
+                }),
             )
         }
-        "/auth/oauth2/revoke" => (200, serde_json::json!({})),
+        "/auth/oauth2/revoke" => {
+            if account.revoke_fails {
+                return (503, serde_json::json!({"error": "temporarily_unavailable"}));
+            }
+            let revoked = form["token"].as_str().unwrap_or("").to_owned();
+            account.revoked.push(revoked);
+            (200, serde_json::json!({}))
+        }
         _ => (404, serde_json::json!({"error": "not_found"})),
     }
 }
@@ -430,10 +508,7 @@ fn document_naming(origin: &str) -> ConfigurationDocument {
 
 /// Signs the host in as a finished browser sign-in would, with the tokens the service issued.
 async fn sign_in_with(host: &net_support::Host, grant: IssuedGrant) {
-    host.controller()
-        .host_account()
-        .keep_for_test(grant, true)
-        .await;
+    host.controller().host_account().keep_for_test(grant).await;
 }
 
 /// A sign-in at a service the test has no stand-in for.
@@ -483,6 +558,40 @@ async fn account_report(host: &net_support::Host) -> AccountReport {
         .expect("the daemon reports")
         .to_typed()
         .expect("a report")
+}
+
+/// A loopback port nothing holds now.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a loopback port")
+        .local_addr()
+        .expect("an address")
+        .port()
+}
+
+/// Has the daemon listen for sign-ins on `port` instead of the registered address.
+fn listen_for_sign_ins_on(host: &net_support::Host, port: u16) {
+    host.controller()
+        .host_account()
+        .listen_on(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+}
+
+/// Waits until no sign-in is waiting or finishing, and returns where the host stands.
+async fn settled(host: &net_support::Host) -> AccountReport {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let report = account_report(host).await;
+            if !matches!(
+                report.state,
+                AccountState::WaitingForBrowser { .. } | AccountState::Finishing
+            ) {
+                return report;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the sign-in settles")
 }
 
 /// The browser coming back to the daemon with `code`, as the service sends it on to the address
@@ -674,7 +783,7 @@ async fn a_host_whose_document_names_a_broker_brokers_a_call_through_it() {
     for request in &seen {
         assert_eq!(
             request.authorization.as_deref(),
-            Some("Bearer access-1"),
+            Some(format!("Bearer {}", broker.access(1)).as_str()),
             "{} carried the signed-in account's token",
             request.path
         );
@@ -760,26 +869,47 @@ async fn a_host_reaches_the_broker_through_the_proxy_its_document_selects() {
 }
 
 /// KR-REQ-17.23: an operator signs the host in through a browser, the daemon keeps the account and
-/// shows none of it, and a call presents the token of the account it signed in. A browser answer
-/// that is not for the attempt the host is waiting on is set aside, and a second sign-in ends the
-/// first.
+/// shows none of it, and a call presents the token of the account it signed in. The address the
+/// browser opens asks for the voice scope. A browser answer that is not for the attempt the host is
+/// waiting on is set aside, and a second sign-in ends the first and takes its address over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed_in() {
     let broker = Broker::start().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    host.controller()
-        .host_account()
-        .listen_on("127.0.0.1:0".parse().expect("an address"));
+    // One address for both attempts, as the registered one is: the second can bind it only if the
+    // first has let it go.
+    listen_for_sign_ins_on(&host, free_port());
     let before = account_report(&host).await;
     assert_eq!(before.state, AccountState::SignedOut);
     assert_eq!(before.service.as_ref(), Some(&broker.origin));
 
     let (first_url, first_address) = start_sign_in(&host).await;
     let (second_url, second_address) = start_sign_in(&host).await;
+    assert_eq!(
+        first_address, second_address,
+        "the second attempt took the address over"
+    );
     assert_ne!(first_url, second_url, "a second sign-in is a new attempt");
+    assert_eq!(
+        account_report(&host).await.last_attempt.as_ref(),
+        Some(&AccountAttempt::Superseded),
+        "the first attempt ended because the second began"
+    );
     broker.expect_sign_in(&second_url);
+    let asked: std::collections::BTreeMap<String, String> = url::Url::parse(&second_url)
+        .expect("an address")
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    assert!(
+        asked["scope"].split(' ').any(|scope| scope == "voice"),
+        "the sign-in asks for the voice scope: {}",
+        asked["scope"]
+    );
+    assert_eq!(asked["code_challenge_method"], "S256");
+    assert_eq!(asked["redirect_uri"], Redirect::Loopback.uri());
 
     // The first attempt's state is not the second's, so the browser that carries it is told so and
     // the host goes on waiting.
@@ -799,13 +929,15 @@ async fn an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed
             .all(|request| !request.path.starts_with("/auth/")),
         "nothing was exchanged for it"
     );
-    let _ = first_address;
 
     let page = browser_answers(&second_address, &second_url, "the-code").await;
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
-    assert!(page.contains("signed in"), "{page}");
 
-    let report = account_report(&host).await;
+    let report = settled(&host).await;
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::SignedIn)
+    );
     let AccountState::SignedIn {
         origin,
         email,
@@ -821,9 +953,9 @@ async fn an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed
     );
     assert!(scopes.iter().any(|scope| scope == "voice"), "{scopes:?}");
     let said = serde_json::to_string(&report).expect("a report");
-    for held in ["access-1", "refresh-1"] {
-        assert!(!said.contains(held), "the report says no token: {said}");
-        assert!(!format!("{report:?}").contains(held));
+    for held in [broker.access(1), broker.refresh(1)] {
+        assert!(!said.contains(&held), "the report says no token: {said}");
+        assert!(!format!("{report:?}").contains(&held));
     }
 
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
@@ -852,12 +984,205 @@ async fn an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed
         if request.path.starts_with("/api/voice/") {
             assert_eq!(
                 request.authorization.as_deref(),
-                Some("Bearer access-1"),
+                Some(format!("Bearer {}", broker.access(1)).as_str()),
                 "{} carried the account the host signed in",
                 request.path
             );
         }
     }
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a sign-in that does not complete leaves the host signed out and says why: the
+/// service refusing the code, the identity read naming another account than the one the code was
+/// issued for, and another program holding the address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_does_not_complete_leaves_the_host_signed_out_and_says_why() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+
+    // The service does not redeem a code it did not issue.
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let _ = browser_answers(&address, &url, "a-code-the-service-never-issued").await;
+    let report = settled(&host).await;
+    assert_eq!(report.state, AccountState::SignedOut);
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::ServiceRefused)
+    );
+
+    // The identity read disagrees with the code's account: the sign-in is undone, not kept.
+    broker.name_another_account();
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let _ = browser_answers(&address, &url, "the-code").await;
+    let report = settled(&host).await;
+    assert_eq!(report.state, AccountState::SignedOut, "{report:?}");
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::NotForThisAttempt)
+    );
+
+    // Another program holds the address.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    listen_for_sign_ins_on(&host, held.local_addr().expect("an address").port());
+    let refused = host
+        .client()
+        .await
+        .mutate(
+            Method::AccountSignIn,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AccountSignInParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("the address is held");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refused:?}"
+    );
+    assert_eq!(
+        account_report(&host).await.last_attempt.as_ref(),
+        Some(&AccountAttempt::PortBusy)
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a request to start a sign-in that is sent again, as one whose answer was lost is,
+/// is answered from the first and does not end the attempt that is waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_request_sent_again_is_answered_from_the_first() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let mut asked = Vec::new();
+    // On one connection, as a retry of a request whose answer was lost is: the digest the host
+    // keeps covers the window the request was sent under.
+    let mut client = host.client().await;
+    for _ in 0..2 {
+        asked.push(
+            client
+                .mutate(
+                    Method::AccountSignIn,
+                    action,
+                    ActionTarget::environment(host.environment_id),
+                    &AccountSignInParams {},
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("the daemon starts the sign-in")
+                .to_typed::<AccountSignInStarted>()
+                .expect("a started sign-in"),
+        );
+    }
+    assert_eq!(asked[0], asked[1], "the repeat is the first one's answer");
+    let AccountState::WaitingForBrowser {
+        authorise_url,
+        redirect_address,
+        ..
+    } = account_report(&host).await.state
+    else {
+        panic!("one sign-in is waiting");
+    };
+    broker.expect_sign_in(&authorise_url);
+    let page = browser_answers(&redirect_address, &authorise_url, "the-code").await;
+    assert!(
+        page.starts_with("HTTP/1.1 200"),
+        "the attempt the repeat left alone still completes: {page}"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a call closes under the account it started under, so a sign-in is refused
+/// while a call is open, and one that is waiting when a call opens ends without spending its code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_never_changes_the_account_a_call_closes_under() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+
+    // A sign-in begins, and then a call opens while the person is in the browser.
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let (_device, session, session_id, prepared) = ready(&host, &owner).await;
+    let terms = prepared
+        .managed
+        .as_ref()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+    let started: VoiceStartResult = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStart,
+        &VoiceStartParams {
+            session_ids: [session_id].into_iter().collect(),
+            offer_sdp: "v=0\r\n".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: Nullable::null(),
+            prepared: prepared.prepared,
+            expected_rate_version: Nullable::some(terms.rate.version.clone()),
+        },
+    )
+    .await
+    .to_typed()
+    .expect("a start result");
+    let VoiceStartOutcome::Started { session: call } = started.outcome else {
+        panic!("the broker created the call: {:?}", started.outcome);
+    };
+    let _ = browser_answers(&address, &url, "the-code").await;
+    let report = settled(&host).await;
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::CallOpen)
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .all(|request| request.path != "/auth/oauth2/token"),
+        "the code was not spent"
+    );
+
+    // And a new sign-in is refused outright while the call is open.
+    let refused = host
+        .client()
+        .await
+        .mutate(
+            Method::AccountSignIn,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AccountSignInParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a call is open");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refused:?}"
+    );
+
+    let _ = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await;
+    start_sign_in(&host).await;
     host.stop().await;
 }
 
@@ -899,7 +1224,7 @@ async fn each_refresh_presents_the_token_the_last_one_issued() {
     for (index, presented) in refreshes.iter().enumerate() {
         assert_eq!(
             presented,
-            &format!("refresh-{}", index + 1),
+            &broker.refresh(u32::try_from(index).expect("a small count") + 1),
             "each refresh presents the token the last one issued: {refreshes:?}"
         );
     }
@@ -975,11 +1300,12 @@ async fn a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_gran
     host.stop().await;
 }
 
-/// KR-REQ-17.23: an account signed in at one service is never presented to another. The host that
-/// signed in at one broker, restarted with a document that names a second, sends the second
-/// nothing, and the first nothing either.
+/// KR-REQ-17.23: what the host keeps of a sign-in is reached only through the service that issued
+/// it. A host restarted for another service finds no account, presents nothing to it and sends it
+/// nothing of the first service's; the first service's account is still there when the host is
+/// configured for it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_account_signed_in_at_one_service_is_not_presented_to_another() {
+async fn an_account_signed_in_at_one_service_is_reached_only_through_that_service() {
     let first = Broker::start().await;
     let second = Broker::start().await;
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -990,46 +1316,113 @@ async fn an_account_signed_in_at_one_service_is_not_presented_to_another() {
     let stopped = host.shut_down().await;
     net_support::write_document(stopped.tree(), &document_naming(&second.origin));
     let settings = stopped.settings().clone();
-    let host = stopped.start(settings).await;
+    let host = stopped.start(settings.clone()).await;
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
     let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
-
     assert!(
         prepared.managed.as_ref().is_none(),
         "no terms were read with an account that belongs to another service"
     );
     assert!(
         second.seen().is_empty(),
-        "the second service was sent nothing: {:?}",
-        second.seen()
+        "the second service was sent nothing"
     );
+
+    // A sign-in at the second service replaces nothing of the first's, and tells the second
+    // nothing of it.
+    sign_in_with(&host, second.issue_grant(600)).await;
+    for request in second.seen() {
+        let text = request.body.to_string();
+        assert!(
+            !text.contains(&first.refresh(1)) && !text.contains(&first.access(1)),
+            "the second service was sent the first's credentials: {text}"
+        );
+    }
+    assert!(first.seen().is_empty() && first.revoked().is_empty());
+
+    let stopped = host.shut_down().await;
+    net_support::write_document(stopped.tree(), &document_naming(&first.origin));
+    let host = stopped.start(settings).await;
     assert!(
-        first.seen().is_empty(),
-        "the first service was sent nothing"
+        matches!(
+            account_report(&host).await.state,
+            AccountState::SignedIn { .. }
+        ),
+        "the first service's account is where it was left"
     );
     host.stop().await;
 }
 
-/// KR-REQ-17.23: a sign-in that no record names a service for is not presented anywhere: the
-/// daemon stopped between keeping the account and recording where it was signed in, and a bearer
-/// token with no known service is a token it cannot tell the destination of.
+/// KR-REQ-17.23: a revocation the service did not acknowledge is sent again when the daemon next
+/// starts, before it hands out a token: the replaced grant's refresh token is not left live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_account_with_no_recorded_service_is_not_presented() {
+async fn a_revocation_the_service_did_not_acknowledge_is_sent_again_when_the_daemon_starts() {
     let broker = Broker::start().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    host.controller()
-        .host_account()
-        .keep_for_test(broker.issue_grant(600), false)
-        .await;
-    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
-    let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
-
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    broker.refuse_revocations(true);
+    sign_in_with(&host, broker.issue_grant(600)).await;
     assert!(
-        prepared.managed.as_ref().is_none(),
-        "no terms were read with an account no service is recorded for"
+        broker.revoked().is_empty(),
+        "the service refused the revocation of the replaced grant"
     );
-    assert!(broker.seen().is_empty(), "the service was sent nothing");
+
+    let stopped = host.shut_down().await;
+    broker.refuse_revocations(false);
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while broker.revoked().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the daemon sends the revocation again");
+    assert_eq!(broker.revoked(), [broker.refresh(1)]);
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a host whose voice broker is not the account service has nothing to sign in to. It
+/// says so, refuses to start a sign-in, and presents no account to the broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_whose_broker_is_not_the_account_service_signs_in_nowhere() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    // The account service stays at its own origin, which the stand-in is not at.
+    let host = net_support::Host::start_with_document_at(
+        &owner,
+        &document_naming(&broker.origin),
+        net_support::AccountAt::Managed,
+    )
+    .await;
+    let report = account_report(&host).await;
+    assert_eq!(report.service.as_ref(), None);
+    assert_eq!(
+        report.unavailable.as_ref(),
+        Some(&SignInUnavailable::BrokerIsAnotherService)
+    );
+    let refused = host
+        .client()
+        .await
+        .mutate(
+            Method::AccountSignIn,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AccountSignInParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("there is no account service to sign in at");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::HostNotConfigured,
+        "{refused:?}"
+    );
+    let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
+    assert!(prepared.managed.as_ref().is_none(), "no terms were read");
+    assert!(broker.seen().is_empty(), "the broker was sent nothing");
     host.stop().await;
 }
 
@@ -1056,7 +1449,12 @@ async fn a_host_that_names_no_service_refuses_to_sign_in() {
         kr_protocol::error::ErrorCode::HostNotConfigured,
         "{refused:?}"
     );
-    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    let report = account_report(&host).await;
+    assert_eq!(report.state, AccountState::SignedOut);
+    assert_eq!(
+        report.unavailable.as_ref(),
+        Some(&SignInUnavailable::NoBroker)
+    );
     host.stop().await;
 }
 
