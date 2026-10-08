@@ -681,7 +681,7 @@ impl TransferModule {
                     &actor_id,
                     session_id,
                     &begin,
-                    kr_ipc::clock::boot_elapsed_ms(),
+                    &kr_ipc::clock::boot_elapsed_ms,
                 )?)),
                 DraftStep::Report(report) => DraftAnswer::Reported(
                     service.record_insertion_outcome(&actor_id, session_id, &report)?,

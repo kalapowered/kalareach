@@ -259,7 +259,7 @@ impl Harness {
             &self.actor,
             session,
             &self.begin_of(session, draft_id, transfer_id, action),
-            BOOT_NOW_MS,
+            &|| BOOT_NOW_MS,
         )
     }
 
