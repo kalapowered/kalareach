@@ -351,7 +351,8 @@ pub const fn alert_for(rule: AttentionRule) -> PushAlert {
         AttentionRule::CommandFailed
         | AttentionRule::AdapterFailed
         | AttentionRule::ApplicationNotice
-        | AttentionRule::AutomationPaused => PushAlert::SessionNeedsAttention,
+        | AttentionRule::AutomationPaused
+        | AttentionRule::AuthorityFeedRemoved => PushAlert::SessionNeedsAttention,
     }
 }
 
@@ -655,6 +656,7 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
             format!("A program{place} asked the terminal for a notification.")
         }
         AttentionRule::AutomationPaused => "Automation was paused by a limit.".to_owned(),
+        AttentionRule::AuthorityFeedRemoved => "This host's authority feed was removed.".to_owned(),
     };
     let line = |text: String| ContentLine {
         session_id: notice.session_id,
