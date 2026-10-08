@@ -1564,9 +1564,10 @@ mod tests {
 
     /// KR-REQ-09.18: the readings a worker keeps against the owner's confirmation never accept
     /// what the whole history of its readings refutes, whatever the merging and the capacity do to
-    /// them. A clock that wanders, steps back and recovers fills the staircase past its capacity;
-    /// a confirmation made at any point of the run is refuted by the kept readings whenever it is
-    /// by every reading taken.
+    /// them. Half of the histories are of a clock that wanders, steps back and recovers; the other
+    /// half of one that steps forward by seconds again and again, which fills the staircase past
+    /// its capacity. A confirmation made at any point of the run is refuted by the kept readings
+    /// whenever it is refuted by a reading taken.
     #[test]
     fn the_kept_readings_refute_whatever_the_whole_history_refutes() {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -1576,27 +1577,60 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             (state >> 33) % bound
         };
-        for _ in 0..200 {
+        let mut fullest = 0;
+        for run in 0..200 {
             let mut kept = Readings::default();
             let mut history = Vec::new();
             let (mut continuous_ms, mut wall_ms) = (10_000_u64, WALL);
             for _ in 0..(20 + next(60)) {
                 let passed = 1 + next(30_000);
                 continuous_ms += passed;
-                wall_ms = match next(4) {
-                    0 => wall_ms + passed + next(120_000),
-                    1 => (wall_ms + passed).saturating_sub(next(90_000)),
+                wall_ms = match (run % 2, next(4)) {
+                    (0, 0) => wall_ms + passed + next(120_000),
+                    (0, 1) => (wall_ms + passed).saturating_sub(next(90_000)),
+                    (1, 0 | 1) => wall_ms + passed + 1_000 + next(4_000),
+                    (1, 2) if next(8) == 0 => (wall_ms + passed).saturating_sub(next(90_000)),
                     _ => wall_ms + passed,
                 };
-                kept.keep(continuous_ms, wall_ms);
-                history.push((continuous_ms, wall_ms));
+                // Now and then a reading arrives after a later one, and counts as taken at the
+                // later one's time. It was taken earlier, and the clock may have been lower then.
+                let (taken_at, wall_taken) = if run % 4 == 3 && next(3) == 0 {
+                    let taken_at = continuous_ms
+                        .saturating_sub(passed + next(30_000))
+                        .max(10_000);
+                    let wall_taken = wall_ms
+                        .saturating_sub(continuous_ms - taken_at)
+                        .saturating_sub(next(40_000));
+                    (taken_at, wall_taken)
+                } else {
+                    (continuous_ms, wall_ms)
+                };
+                kept.keep(taken_at, wall_taken);
+                fullest = fullest.max(kept.0.len());
+                history.push((taken_at, wall_taken));
             }
-            for _ in 0..50 {
-                let boot_ms = 10_000 + next(continuous_ms - 10_000);
+            for trial in 0..50 {
+                // Half of the confirmations are made to sit within a second of the tolerance of
+                // one reading taken after them, chosen from the whole history: where a merge that
+                // raised a level, or one that dropped a reading, would show.
+                let aimed = history[usize::try_from(next(history.len() as u64)).expect("fits")];
+                let (boot_ms, wall_ms) = if trial % 2 == 1 {
+                    let boot_ms = 10_000 + next(aimed.0 - 10_000 + 1);
+                    // The reading is refuted exactly when the owner's word, less the credited
+                    // time between, is more than the tolerance below it.
+                    let wall_ms = (aimed.1 + MAX_WALL_CLOCK_ROLLBACK_MS
+                        - kr_ipc::clock::credited(aimed.0 - boot_ms)
+                        + next(2_000))
+                    .saturating_sub(1_000);
+                    (boot_ms, wall_ms)
+                } else {
+                    let boot_ms = 10_000 + next(continuous_ms - 10_000);
+                    (boot_ms, WALL + (boot_ms - 10_000) + next(60_000))
+                };
                 let established = Establishment {
                     count: 1,
                     restated: false,
-                    wall_ms: WALL + (boot_ms - 10_000) + next(60_000),
+                    wall_ms,
                     boot_ms,
                 };
                 let refuted_by_history = history.iter().any(|&(at, wall)| {
@@ -1608,6 +1642,11 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            fullest,
+            Readings::CAPACITY,
+            "some history filled the staircase"
+        );
     }
 
     fn boot(byte: u8) -> BootIdentity {
