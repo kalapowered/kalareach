@@ -617,6 +617,53 @@ impl Fate {
     }
 }
 
+/// The lines an external message carries for one announcement, in the host's own words.
+///
+/// What a message names is what the host itself knows of the condition: which rule raised it, the
+/// session it belongs to and when it was first seen, and the host's own summary when it has one.
+/// A session's own words never enter: the attention store keeps none of them, and a message built
+/// here could not carry them if it tried. The lines are committed with the notice, so a recovery
+/// that produces from the event again composes the same message.
+///
+/// Each line is dated by when the condition was first seen and names its session, which is what
+/// lets the message be checked against the grant of the rule that sends it, resource by resource
+/// and by the history it reaches.
+fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
+    let place = notice
+        .session_id
+        .map(|session| format!(" in session {session}"))
+        .unwrap_or_default();
+    let sentence = match rule {
+        AttentionRule::PendingApproval => format!("An approval is waiting{place}."),
+        AttentionRule::PendingInput => format!("A question is waiting{place}."),
+        AttentionRule::InputIdleReminder => {
+            format!("A question{place} has been waiting for an answer for some time.")
+        }
+        AttentionRule::CommandFailed => format!("A command failed{place}."),
+        AttentionRule::ReviewReady => {
+            format!("An agent turn finished{place} and is ready to review.")
+        }
+        AttentionRule::AdapterFailed => format!("An adapter failed{place}."),
+        AttentionRule::HostContactLost => "Contact with the host was lost.".to_owned(),
+        AttentionRule::ApplicationNotice => {
+            format!("A program{place} asked the terminal for a notification.")
+        }
+        AttentionRule::AutomationPaused => {
+            "A workflow was paused by one of its own limits.".to_owned()
+        }
+    };
+    let line = |text: String| ContentLine {
+        session_id: notice.session_id,
+        produced_at_ms: Some(notice.audience.at_ms()),
+        text,
+    };
+    let mut lines = vec![line(sentence)];
+    if !notice.summary.is_empty() {
+        lines.push(line(notice.summary.clone()));
+    }
+    lines
+}
+
 /// An announcement taken as an event nothing is produced from.
 fn observed_announcement(announcement: &Announcement, now_ms: u64) -> TakenEvent {
     observed(
@@ -824,7 +871,10 @@ impl Producer {
                 cursor = cursor.max(announcement.number);
                 let across_privacy = matches!(fate, Fate::Drop(why) if why.across_privacy());
                 match fate {
-                    Fate::Produce(notice) => events.push(notice.taken(announcement.number)?),
+                    Fate::Produce(notice) => {
+                        let lines = host_lines(announcement.rule, &notice);
+                        events.push(notice.taken_with(announcement.number, lines)?);
+                    }
                     Fate::Drop(_) | Fate::Alert(_) => {
                         taken.dropped += 1;
                         taken.across_privacy += usize::from(across_privacy);
