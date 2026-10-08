@@ -297,11 +297,12 @@ can open while it does: the new grant is then queued for revocation, and told to
 again at the next start if it cannot be, and the attempt ends as `call_open`; nothing the call holds
 changes. The gate is raised for the commit of a sign-in, with the revocation of the grant it
 replaces, the read of the account's identity that follows it, and the removal of a sign-out with
-the revocations that follow it. Each request the account service is sent has a deadline of its own,
-and up to sixteen revocations can wait to be sent, so a start that meets the gate waits at most the
-sum of those deadlines. A call record stays
-until its device stops the call; a phone that is lost during a call keeps `kr account sign-in` and
-`sign-out` refused until the daemon restarts.
+the revocations that follow it. Each request the account service is sent has a deadline of its own.
+A sign-in that replaces a grant and then undoes itself sends up to two rounds of revocations (up to
+sixteen each), the read of the account's identity and, when its access token is near its end, a
+refresh, all behind the one gate, so a start that meets the gate waits at most the sum of those
+deadlines. A call record stays until its device stops the call; a phone that is lost during a call
+keeps `kr account sign-in` and `sign-out` refused until the daemon restarts.
 
 `kr account sign-out` (`account.sign_out`, served on the local socket alone, asking for host
 management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret

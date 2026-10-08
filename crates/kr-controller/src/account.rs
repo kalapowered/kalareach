@@ -33,8 +33,8 @@
 //! the broker and a close that is not finished (the coordinator counts both). The commit of a
 //! sign-in and the removal of a sign-out then raise a gate that makes every token request wait while
 //! they run: a start that begins after the check waits for the change to end and takes the token of
-//! the account the change leaves, and one that began before it was counted by the check. No call can
-//! hold a token of the old account across the change.
+//! the account the change leaves, or is refused when none is left, and one that began before it was
+//! counted by the check. No call can hold a token of the old account across the change.
 //!
 //! Signing out removes the grant and asks the service to end it, under the same scope rule as
 //! signing in.
@@ -669,7 +669,10 @@ impl Inner {
                     // Queued before it is sent, so a service that cannot be reached is told again
                     // when the daemon next starts.
                     if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
-                        eprintln!("kr-controller: a refused sign-in could not be revoked: {error}");
+                        eprintln!(
+                            "kr-controller: a refused sign-in's token was sent to the service but \
+                             could not be kept for a second try: {error}"
+                        );
                     }
                     return AccountAttempt::CallOpen;
                 };
@@ -711,19 +714,10 @@ async fn ended(cancel: &mut watch::Receiver<bool>) {
     }
 }
 
-/// A request for a token that is waiting for a change of the account to end, counted for a test.
+/// A request for a token that is waiting for a change of the account to end, counted for a test:
+/// it is counted from the first poll of the gate that finds it still up, and not before.
 #[cfg(feature = "testing")]
 struct Waiting<'a>(&'a Inner);
-
-#[cfg(feature = "testing")]
-impl<'a> Waiting<'a> {
-    fn of(inner: &'a Inner) -> Self {
-        inner
-            .waiting
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(inner)
-    }
-}
 
 #[cfg(feature = "testing")]
 impl Drop for Waiting<'_> {
@@ -732,6 +726,27 @@ impl Drop for Waiting<'_> {
             .waiting
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Waits until `changing` is down, and counts the wait for a test only while the gate is up.
+async fn until_down(inner: &Inner, changing: &mut tokio::sync::watch::Receiver<bool>) {
+    #[cfg(feature = "testing")]
+    let mut counted = None;
+    let mut wait = std::pin::pin!(changing.wait_for(|changing| !*changing));
+    std::future::poll_fn(|context| {
+        let polled = wait.as_mut().poll(context);
+        #[cfg(feature = "testing")]
+        if polled.is_pending() && counted.is_none() {
+            inner
+                .waiting
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            counted = Some(Waiting(inner));
+        }
+        #[cfg(not(feature = "testing"))]
+        let _ = inner;
+        polled.map(|_| ())
+    })
+    .await;
 }
 
 /// The token source a managed call presents.
@@ -762,9 +777,7 @@ impl AccountTokenSource for HostTokens {
             // that is about to go.
             let mut changing = self.inner.changing.subscribe();
             if *changing.borrow() {
-                #[cfg(feature = "testing")]
-                let _waiting = Waiting::of(&self.inner);
-                let _ = changing.wait_for(|changing| !*changing).await;
+                until_down(&self.inner, &mut changing).await;
             }
             if self.inner.recover().await.is_err() {
                 return Err(kr_client::ClientError::refusal(
