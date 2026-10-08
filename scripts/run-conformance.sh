@@ -5,8 +5,8 @@
 #
 #   scripts/run-conformance.sh                    every group this platform runs
 #   scripts/run-conformance.sh --group <name>     one group; repeat it for several. The groups are
-#                                                 rust, end-to-end, performance, typescript and
-#                                                 applications
+#                                                 rust, end-to-end, performance, typescript,
+#                                                 applications and phones
 #   scripts/run-conformance.sh --all-terminals    every group, and then section 27's terminal
 #                                                 matrix, which fails naming each terminal until
 #                                                 its runs exist
