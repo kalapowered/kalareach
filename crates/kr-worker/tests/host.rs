@@ -2051,7 +2051,7 @@ case $(uname) in
     ( trap '' HUP TERM; exec sleep 601 ) &
     n stubborn $!
     ( ( trap '' HUP TERM; exec sleep 602 ) & n orphan $! )
-    powershell.exe -NoProfile -Command '$p = Start-Process -FilePath "$env:SystemRoot\System32\PING.EXE" -ArgumentList "-n","605","127.0.0.1" -WindowStyle Hidden -PassThru; Set-Content -Path jobonly.pid -Value $p.Id'
+    "${SYSTEMROOT:-/c/Windows}/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -Command '$p = Start-Process -FilePath "$env:SystemRoot\System32\PING.EXE" -ArgumentList "-n","605","127.0.0.1" -WindowStyle Hidden -PassThru; Set-Content -Path jobonly.pid -Value $p.Id'
     ;;
   *)
     sh -c 'trap "" HUP TERM; echo $$ > stubborn.pid; exec sleep 601' &
@@ -2518,8 +2518,11 @@ async fn a_survivor_of_a_crashed_session_tries_to_act_as_it() {
         "terminal_write=written".to_owned()
     });
 
-    std::fs::write(directory.join("survivor.out"), said.join("\n"))
+    // Written whole and then named, so a reader never meets it half written.
+    std::fs::write(directory.join("survivor.out.part"), said.join("\n"))
         .expect("writes what came of it");
+    std::fs::rename(directory.join("survivor.out.part"), directory.join("survivor.out"))
+        .expect("names what came of it");
     // And stays, as a survivor does, until the test ends it.
     tokio::time::sleep(std::time::Duration::from_secs(600)).await;
 }
