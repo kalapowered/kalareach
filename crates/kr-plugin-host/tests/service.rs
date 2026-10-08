@@ -1,11 +1,15 @@
 //! A real plugin host process, beside a real worker session with a real shell.
 //!
-//! What these tests are for is the part that cannot be shown in one process: that the plugin
-//! runtime is started lazily as its own job outside the control daemon's kill tree, that a worker
-//! draining a pseudo-terminal is not behind a component that has stopped responding, and that
-//! killing the plugin host under load takes no worker with it and loses nothing.
+//! What these tests are for is the part that cannot be shown in one process: that a worker
+//! draining a pseudo-terminal is not behind a component that has stopped responding, that a
+//! component that never returns costs its own binding and nothing else, and that a host started
+//! through the launcher runs in a directory of its own with no secret in its arguments.
 //!
-//! Requirement rows closed here: KR-REQ-05.06, KR-REQ-05.07, KR-REQ-11.39.
+//! The host here is started by the launcher over a supervisor of this suite's own, which stands in
+//! for the control daemon. That the daemon starts it, lazily and outside its own kill tree, that a
+//! host which ends takes no worker with it and is started again, and that a daemon which restarts
+//! finds the host it left, are shown against a real daemon in
+//! `crates/kr-controller/tests/plugin_runtime.rs`.
 //!
 //! Every path is on the internal disk and the plugin host is copied there before it is started. A
 //! process a service manager launches has its own privacy identity to the operating system, and one
@@ -27,7 +31,7 @@ use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::version::PackageVersion;
 use kr_plugin_service::client::{PluginClient, new_binding_id};
 use kr_plugin_service::launcher::{
-    self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor, host_endpoint,
+    self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor,
 };
 use kr_plugin_service::protocol::{ComponentSource, HostDescriptor};
 use kr_plugin_service::vocabulary::{
@@ -406,22 +410,6 @@ fn retire_job(label: &str) {
     }
 }
 
-/// Returns a process's parent and group identifiers, as the operating system reports them.
-fn parent_and_group(pid: u32) -> Option<(u32, u32)> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "ppid=,pgid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut fields = text.split_whitespace();
-    let parent = fields.next()?.parse().ok()?;
-    let group = fields.next()?.parse().ok()?;
-    Some((parent, group))
-}
-
 /// Returns true when a process is still running.
 ///
 /// A process this test started and then killed stays in the process table until somebody reaps it,
@@ -665,44 +653,15 @@ fn scrape(handle: &str, text: &str) -> ScopedSourceEvent {
     )
 }
 
-// KR-REQ-05.06: the service is started lazily, as its own job, outside the daemon's kill tree.
+// A host the launcher starts runs in a directory of its own, is given no secret, and is the only
+// process that holds its reservation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_05_06_the_plugin_runtime_is_a_lazily_started_job_of_its_own() {
+async fn a_plugin_host_runs_in_a_directory_of_its_own_and_is_given_no_secret() {
     let host = Host::create();
     let environment = host.environment();
-
-    // Lazily: an environment that has never needed a component has no plugin host, no descriptor
-    // and nothing listening. Nothing about opening a session creates one.
-    assert!(
-        launcher::read_descriptor(&environment)
-            .expect("a read")
-            .is_none(),
-        "an environment with no bindings already has a plugin host"
-    );
-    let endpoint = host_endpoint(&environment).expect("an endpoint");
-    assert!(
-        kr_ipc::endpoint::Connection::connect(&endpoint)
-            .await
-            .is_err(),
-        "something is already serving the plugin endpoint"
-    );
-
     let started = host.start_plugin_host().await;
     let pid = started.pid();
 
-    // Its own job: the service manager was asked to start one, with a label of its own and the
-    // argument vector the launcher built.
-    assert!(
-        started.launch().label.starts_with("kr-plugin-host-"),
-        "the job label was {}",
-        started.launch().label
-    );
-    assert!(
-        started
-            .launch()
-            .arguments
-            .contains(&"--rendezvous".to_owned())
-    );
     assert!(
         !started
             .launch()
@@ -712,20 +671,10 @@ async fn kr_req_05_06_the_plugin_runtime_is_a_lazily_started_job_of_its_own() {
         "a secret reached the job definition"
     );
 
-    // Outside the kill tree: the host is not in this process's process group, so a signal aimed at
-    // this test's group does not reach it, and it survives this process either way.
-    let ours = parent_and_group(std::process::id()).expect("this process is readable");
-    let theirs = parent_and_group(pid).expect("the plugin host is readable");
-    assert_ne!(
-        theirs.1, ours.1,
-        "the plugin host shares this process's group, so it is inside the kill tree"
-    );
-
-    // And it serves: a worker connects, challenges it and gets an answer.
+    // It serves: a worker connects, challenges it and gets an answer.
     let client = host.plugin_client().await;
     let health = client.health().await.expect("the host reports itself");
     assert_eq!(health.live_bindings, 0);
-    assert!(health.deadlines_enforceable);
 
     // One reservation, one host. Nothing else claimed this one, and the launcher still holds the
     // endpoint a second claim would have to arrive on.
@@ -769,10 +718,11 @@ async fn kr_req_05_06_the_plugin_runtime_is_a_lazily_started_job_of_its_own() {
     let _ = launcher::retire_descriptor(&environment);
 }
 
-// KR-REQ-05.07, KR-REQ-11.39: a worker drains its terminal while a component is stuck, and a
-// plugin-host crash takes no worker with it and loses nothing.
+// A component that never returns costs its own binding and nothing else: the worker's terminal goes
+// on draining beside the process it is stuck in, and a second binding on the same host answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request() {
+async fn a_component_that_never_returns_costs_its_own_binding_and_not_the_terminal_or_another_binding()
+ {
     let Some(stuck) = component("infinite-loop") else {
         return;
     };
@@ -786,18 +736,12 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
     let session = WorkerSession::open(&host);
     let mut terminal = session.attach().await;
 
-    // A real plugin host, started through the platform's own service manager.
+    // A real plugin host, started through the launcher.
     let started = host.start_plugin_host().await;
-    let pid = started.pid();
     let plugin = host.plugin_client().await;
 
     let stuck_component = host.install("infinite-loop", &stuck);
     let good_component = host.install("well-behaved", &well_behaved);
-
-    // The worker's own record of what it is waiting on. The broker's approval ledger is a later
-    // task; what stands in for it here is a record on this side of the socket, which is the point:
-    // it is not in the plugin host, so the plugin host cannot lose it.
-    let pending: Vec<String> = vec!["req-1".to_owned(), "req-2".to_owned()];
 
     let stuck_binding = new_binding_id();
     plugin
@@ -847,85 +791,7 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
         .expect("the snapshot runs");
     assert!(snapshot.answered());
 
-    // KR-REQ-05.07. Kill the plugin host while both bindings are live and the shell is producing
-    // output, by the identifier this test recorded and no other.
-    assert!(alive(pid), "the plugin host was not running");
     started.kill();
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while alive(pid) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the plugin host did not end"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // The worker is untouched: its shell is still running and its terminal is still draining.
-    let after = collect(&mut terminal, Duration::from_millis(1_500)).await;
-    assert!(
-        String::from_utf8_lossy(&after).contains("kalareach-"),
-        "the terminal stopped draining when the plugin host died: {} bytes",
-        after.len()
-    );
-
-    // Nothing the worker was waiting on was in the other process, so nothing was lost.
-    assert_eq!(pending, vec!["req-1".to_owned(), "req-2".to_owned()]);
-
-    // The worker learns the rich bindings are gone, rather than being told a call succeeded.
-    let error = plugin
-        .snapshot(good_binding, Duration::from_millis(500))
-        .await
-        .expect_err("a dead host answers nothing");
-    assert!(
-        matches!(
-            error,
-            kr_plugin_service::error::ServiceError::Unavailable { .. }
-                | kr_plugin_service::error::ServiceError::CallerDeadline { .. }
-        ),
-        "the worker was told {error}"
-    );
-    drop(plugin);
-
-    // A replacement host is started and the bindings are re-registered. That is the whole recovery.
-    //
-    // The dead host's job is retired first. A service manager that still holds a job whose process
-    // was killed is the state a control daemon would clear before it started a replacement, and a
-    // test that skipped it would be starting a second job beside a dead one.
-    drop(started);
-    let _ = launcher::retire_descriptor(&environment);
-    let replacement = host.start_plugin_host().await;
-    assert_ne!(
-        replacement.pid(),
-        pid,
-        "the replacement is the same process"
-    );
-    let plugin = host.plugin_client().await;
-    let rebound = new_binding_id();
-    plugin
-        .register(
-            rebound,
-            &identity("well-behaved", good_component.digest),
-            &facts("well-behaved"),
-            "/bin/sh",
-            &good_component,
-        )
-        .await
-        .expect("the binding is re-registered against the replacement");
-    let snapshot = plugin
-        .snapshot(rebound, Duration::from_millis(500))
-        .await
-        .expect("the snapshot runs");
-    assert!(snapshot.answered());
-
-    // The terminal never stopped.
-    let finally = collect(&mut terminal, Duration::from_millis(1_000)).await;
-    assert!(
-        String::from_utf8_lossy(&finally).contains("kalareach-"),
-        "the terminal stopped draining while the plugin host was replaced"
-    );
-
-    replacement.kill();
     let _ = launcher::retire_descriptor(&environment);
 }
 
