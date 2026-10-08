@@ -516,14 +516,32 @@ fn resolved(
         report.executable = Nullable::some(executable.display().to_string());
         // What the shell finds first is what an invocation runs, and a launcher cannot start a
         // shim: an invocation that finds one runs as typed, which a person who turned the
-        // integration on is told here, beside the executable.
-        if !kr_worker::broker::commands::starts_directly(&executable) && report.reason.0.is_none() {
+        // integration on is told here, beside the executable. A script is one wherever the
+        // platform starts it: the program it runs is its interpreter, so the worker reads no
+        // identity for it, and a package installed from npm puts one first on the search path.
+        if (!kr_worker::broker::commands::starts_directly(&executable) || is_script(&executable))
+            && report.reason.0.is_none()
+        {
             report.reason = Nullable::some(format!(
                 "first hit is {}, a script or shim that no launcher starts, so an invocation that \
                  finds it runs as typed",
                 executable.display()
             ));
         }
+    }
+    // An integration that starts a backend is not served until this worker runs one, so every
+    // invocation runs as typed, and the owner who turned it on is told, beside the state.
+    if report.state == CommandIntegrationState::On
+        && report.reason.0.is_none()
+        && connector
+            .and_then(|connector| connector.manifest().command_integration.as_ref())
+            .is_some_and(|declared| declared.backend.is_some())
+    {
+        report.reason = Nullable::some(
+            "its integration starts a backend, which this worker does not run yet, so an \
+             invocation runs as typed"
+                .to_owned(),
+        );
     }
     // What an integrated launch records as its mode: only an integration a new session can use.
     if report.state == CommandIntegrationState::On
@@ -533,6 +551,17 @@ fn resolved(
         report.mode = IntegrationMode::NativeBridge;
     }
     report
+}
+
+/// Whether `path` names a script: a file that opens with `#!`, which no launcher starts as the
+/// program it is.
+fn is_script(path: &Path) -> bool {
+    use std::io::Read as _;
+
+    let mut start = [0_u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut start))
+        .is_ok_and(|()| &start == b"#!")
 }
 
 /// The bytes `report` takes in an answer, in the larger of its two forms: the owner's, and the

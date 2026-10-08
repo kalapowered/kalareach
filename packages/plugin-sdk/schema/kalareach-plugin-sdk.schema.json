@@ -912,6 +912,17 @@
       "additionalProperties": false,
       "description": "What a package declares about the command it integrates.",
       "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IntegrationBackend"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The backend the worker starts for the integrated invocation, where the application's\nterminal speaks to a server.\n\nA package that declares none leaves the member out, so a manifest written before the\nmember existed reads and hashes exactly as it did."
+        },
         "command": {
           "description": "The command name a person types, with no directory.",
           "type": "string"
@@ -973,6 +984,17 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "messages": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageMembers"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The members a message is read by beyond its identifier and method, for a table the\nworker's gateway reads.\n\nA table that declares a backend in its package's command integration states them. A table\nthat does not leaves the member out, so a connector written before the member existed\nreads and hashes exactly as it did."
         },
         "method_path": {
           "$ref": "#/$defs/FieldPath",
@@ -2152,6 +2174,31 @@
       ],
       "type": "object"
     },
+    "IntegrationBackend": {
+      "additionalProperties": false,
+      "description": "The backend a command integration starts.",
+      "properties": {
+        "arguments": {
+          "description": "The arguments the application's own executable is started with to make the backend, in\norder, each one argument element. The executable is the one the shell resolved for the\ncommand; a package cannot name another.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "launching_words": {
+          "description": "The words that may follow the command name for a launch the backend is started for.\n\nA launch whose first word is absent, or one of these, and that types no option, is a plain\nlaunch of the terminal. Any other launch (a subcommand that is not a terminal, an option,\na prompt) runs as typed, because the closed list is what the package qualified.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "arguments",
+        "launching_words"
+      ],
+      "type": "object"
+    },
     "IntegrationVariable": {
       "additionalProperties": false,
       "description": "One environment variable a command integration sets.",
@@ -2280,6 +2327,30 @@
         "executable",
         "distribution",
         "confidence"
+      ],
+      "type": "object"
+    },
+    "MessageMembers": {
+      "additionalProperties": false,
+      "description": "The top-level members a message is read by, beyond its identifier and its method.\n\nA table that the worker's gateway reads for a native terminal and the backend behind it names\nthem here: the member a request carries its parameters in, the member a successful response\ncarries its result in, and the member a failed response carries its error in. The gateway\ntreats a frame that names the method member as a request, a frame that names exactly one of the\nresult and error members as a response, and anything else as neither, so the three names and\nthe identifier and method members all differ.",
+      "properties": {
+        "error": {
+          "description": "The member a failed response carries its error in.",
+          "type": "string"
+        },
+        "params": {
+          "description": "The member a request carries its parameters in.",
+          "type": "string"
+        },
+        "result": {
+          "description": "The member a successful response carries its result in.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "params",
+        "result",
+        "error"
       ],
       "type": "object"
     },

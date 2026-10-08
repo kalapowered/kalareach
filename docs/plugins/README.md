@@ -139,6 +139,49 @@ written before the member existed reads and hashes as it did.
 - The declaration adds at least one flag or sets at least one variable, and the package requests
   `command_integration.launch`.
 
+#### A backend
+
+An application whose terminal speaks to a server (Codex's `--remote` terminal and its App Server)
+adds a `backend` member. The worker starts the server as the session's backend, from the
+executable the shell resolved for the command and the arguments declared here, and runs the
+terminal against a gateway the worker owns.
+
+```json
+"command_integration": {
+  "command": "codex",
+  "flags": ["--remote", "{gateway}"],
+  "variables": [],
+  "grant_statement": "Starts the Codex app server as the session's backend and points the terminal at it.",
+  "backend": {
+    "arguments": ["app-server", "--listen", "stdio://"],
+    "launching_words": ["resume", "fork"]
+  }
+}
+```
+
+- `arguments` are what the server is started with: one to eight, each 1 to 256 bytes and one
+  visible line, written as they stand. A package cannot name the executable: it is the one the shell
+  resolved, and it has to be a program the worker can read and hash, not a script.
+- `{gateway}` is the one flag element, exactly, that the worker replaces, once the launch is
+  committed, with the address of the gateway the terminal connects to. A backend declares it
+  exactly once; a flag that holds it and does not stand alone, or one declared with no backend, is a
+  finding.
+- `launching_words` are the bare words (letters, digits, `_` and `-`, at most 32 bytes, at most
+  eight) that may follow the command for a launch the backend is started for. The launch has to
+  type no option, and its first word has to be absent or listed; any other launch runs as typed,
+  with the reason named. The list is closed because it is what the package qualified: an option
+  would not reach the server, and a word that is another subcommand's name (`login`, `exec`) is not
+  a terminal at all.
+- The package ships a connector table the gateway can read, and the validator checks it: `stdio`,
+  line-delimited JSON, a matching identifier, the request identifier, the method and the response
+  identifier each one top-level member, at most 256 classified methods, and a `messages` member
+  (see the connector table below) whose names differ from one another and from those members.
+- A package that declares a backend states `"sdk_range": ">=0.1.5, <0.2.0"`, because an earlier
+  host would refuse a manifest member it never learned.
+
+The three members are optional and left out when unset, so a manifest written before them reads
+and hashes exactly as it did.
+
 ### The forwarder's placeholder
 
 A package that has an application start the forwarder writes `{kr_hook}` where it runs it, and the
@@ -465,6 +508,11 @@ component fault disables rich meaning without stalling or discarding valid nativ
   component interprets them. A table that answers none gives its package no such trust, so a
   protocol whose answer is a response to the request itself, rather than a request of its own, is
   answered by the native client alone.
+- **Messages:** for a table a backend is read with, the top-level members a message is read by
+  beyond its identifier and method: `params`, `result` and `error`. A request names the method
+  member, a response names exactly one of the result and error members, and the five names differ
+  (a request and a response may share their identifier member, as JSON-RPC's do). A table that
+  declares no backend leaves the member out.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 

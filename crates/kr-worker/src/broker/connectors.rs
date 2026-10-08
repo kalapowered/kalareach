@@ -57,6 +57,8 @@ pub struct ConnectorCommand {
     pub flags: Vec<String>,
     /// The variables the integration sets for the invocation, in order.
     pub variables: Vec<EnvironmentVariable>,
+    /// The backend the integration starts for the invocation, where it declares one.
+    pub backend: Option<kr_plugin_sdk::integration::IntegrationBackend>,
 }
 
 /// The native bridge an installation put in place for a connector's application.
@@ -284,6 +286,7 @@ impl InstalledConnector {
                         value: variable.value.clone(),
                     })
                     .collect(),
+                backend: declared.backend.clone(),
             });
         // As the integration: declared by the verified manifest, and run only while the
         // installation holds the capability the owner confirmed it under.
@@ -874,6 +877,9 @@ pub mod fixture {
         pub native_bridge: bool,
         /// Whether the package ships a component.
         pub component: bool,
+        /// Whether the package ships a table the worker's gateway reads over a backend's
+        /// standard streams, in place of the Channels table, and declares no action.
+        pub gateway: bool,
     }
 
     impl Shape {
@@ -890,6 +896,7 @@ pub mod fixture {
                 launch_probe: None,
                 native_bridge: true,
                 component: false,
+                gateway: false,
             }
         }
 
@@ -909,6 +916,34 @@ pub mod fixture {
                 launch_probe: None,
                 native_bridge: false,
                 component: false,
+                gateway: false,
+            }
+        }
+
+        /// A Codex-shaped package: the terminal is pointed at the worker's gateway by `--remote
+        /// {gateway}`, the application's server is the backend the worker starts, and the table is
+        /// the one the gateway reads over that server's standard streams. It declares no action.
+        #[must_use]
+        pub fn codex_backend() -> Self {
+            Self {
+                plugin_name: "codex",
+                display_name: "Codex CLI",
+                executable: "codex",
+                directory: &[],
+                integration: Some(serde_json::json!({
+                    "command": "codex",
+                    "flags": ["--remote", "{gateway}"],
+                    "variables": [],
+                    "grant_statement": "Starts the Codex app server as the session's backend and points the terminal at it.",
+                    "backend": {
+                        "arguments": ["app-server", "--listen", "stdio://"],
+                        "launching_words": ["resume", "fork"]
+                    }
+                })),
+                launch_probe: None,
+                native_bridge: false,
+                component: false,
+                gateway: true,
             }
         }
 
@@ -925,6 +960,7 @@ pub mod fixture {
                 launch_probe: None,
                 native_bridge: false,
                 component: false,
+                gateway: false,
             }
         }
     }
@@ -943,6 +979,7 @@ pub mod fixture {
             launch_probe: Some(probe),
             native_bridge: false,
             component: false,
+            gateway: false,
         }
     }
 
@@ -1042,6 +1079,52 @@ pub mod fixture {
         serde_json::to_string_pretty(&table).expect("a literal table encodes")
     }
 
+    /// The upstream version the gateway fixture's table is qualified for.
+    pub const GATEWAY_QUALIFIED_VERSION: &str = "0.155.1";
+
+    /// A table the worker's gateway reads: one JSON document per line over the backend's standard
+    /// streams, the members it reads a message by at the top level, and a few of the methods a
+    /// Codex-shaped application sends, one of each class.
+    fn gateway_connector_json_for(plugin_id: &str) -> String {
+        let path =
+            |name: &str| serde_json::json!({ "segments": [{ "type": "member", "name": name }] });
+        let table = serde_json::json!({
+            "manifest_version": 1,
+            "plugin_id": plugin_id,
+            "protocol": {
+                "name": "codex-app-server",
+                "qualified_range": format!("={GATEWAY_QUALIFIED_VERSION}"),
+                "tested_version": GATEWAY_QUALIFIED_VERSION
+            },
+            "transport": "stdio",
+            "framing": { "type": "line_delimited_json", "max_message_bytes": "8388608" },
+            "request_id_path": path("id"),
+            "method_path": path("method"),
+            "response_correlation": { "type": "matching_id", "id_path": path("id") },
+            "messages": { "params": "params", "result": "result", "error": "error" },
+            "routes": [
+                { "method": "account.login.start", "wire_name": "account/login/start", "direction": "host_to_upstream" },
+                { "method": "initialize", "wire_name": "initialize", "direction": "host_to_upstream" },
+                { "method": "item.command-execution.request-approval", "wire_name": "item/commandExecution/requestApproval", "direction": "upstream_to_host" },
+                { "method": "thread.list", "wire_name": "thread/list", "direction": "host_to_upstream" },
+                { "method": "thread.shell-command", "wire_name": "thread/shellCommand", "direction": "host_to_upstream" },
+                { "method": "turn.interrupt", "wire_name": "turn/interrupt", "direction": "host_to_upstream" }
+            ],
+            "methods": [
+                { "method": "account.login.start", "class": "credential", "evidence": "Starts a sign-in and can carry a key" },
+                { "method": "initialize", "class": "mutation", "evidence": "Negotiates what the connection may call" },
+                { "method": "item.command-execution.request-approval", "class": "mutation", "evidence": "Asks whether a command may run" },
+                { "method": "thread.list", "class": "observation", "evidence": "Reads the threads and changes none" },
+                { "method": "thread.shell-command", "class": "unsupported", "evidence": "Runs outside the application's sandbox" },
+                { "method": "turn.interrupt", "class": "mutation", "evidence": "Cancels the turn in flight" }
+            ],
+            "decision_destination": null,
+            "volatile_forwarding": false,
+            "qualification_note": "A test fixture shaped like the Codex connector."
+        });
+        serde_json::to_string_pretty(&table).expect("a literal table encodes")
+    }
+
     /// The package's presentation: a document that names no action.
     #[must_use]
     pub fn presentation_json() -> String {
@@ -1096,48 +1179,27 @@ pub mod fixture {
             serde_json::json!({ "capability": "metadata.match", "reason": format!("Recognise {}", shape.display_name) }),
             serde_json::json!({ "capability": "presentation.declarative", "reason": "Show the session" }),
             serde_json::json!({ "capability": "broker.semantic_events", "reason": "Read the hooks' observations" }),
-            serde_json::json!({ "capability": "upstream.action", "reason": "Deliver a message into the session" }),
         ];
+        if !shape.gateway {
+            capabilities.push(serde_json::json!({ "capability": "upstream.action", "reason": "Deliver a message into the session" }));
+        }
         if shape.native_bridge {
             capabilities.push(serde_json::json!({ "capability": "native_bridge.install", "reason": "Register the forwarder Claude Code starts" }));
         }
-        capabilities.push(serde_json::json!({ "capability": "approval.decode", "reason": "Recognise a relayed tool approval" }));
-        capabilities.push(serde_json::json!({ "capability": "approval.respond", "reason": "Answer a relayed tool approval" }));
+        if !shape.gateway {
+            capabilities.push(serde_json::json!({ "capability": "approval.decode", "reason": "Recognise a relayed tool approval" }));
+            capabilities.push(serde_json::json!({ "capability": "approval.respond", "reason": "Answer a relayed tool approval" }));
+        }
         if shape.integration.is_some() {
             capabilities.push(serde_json::json!({ "capability": "command_integration.launch", "reason": "Start the agent with the flags its bridge needs" }));
         }
         if shape.launch_probe.is_some() {
             capabilities.push(serde_json::json!({ "capability": "launch.probe", "reason": "Read which sandbox the application will use before a launch" }));
         }
-        let mut manifest = serde_json::json!({
-            "manifest_version": 1,
-            "publisher_id": "kalareach",
-            "plugin_name": shape.plugin_name,
-            "version": "0.3.0",
-            "display_name": shape.display_name,
-            "description": format!("Recognises {}, observes it through hooks and answers its relayed tool approvals.", shape.display_name),
-            "sdk_range": ">=0.1.2, <0.2.0",
-            "wit_range": ">=0.1.0, <0.2.0",
-            "source": {
-                "repository": "https://github.com/kalapowered/kalareach-plugins",
-                "revision": format!("refs/tags/{}-0.3.0", shape.plugin_name)
-            },
-            "match_rules": [{
-                "id": format!("{}-executable", shape.plugin_name),
-                "executable": { "file_stem": shape.executable, "path_suffix": shape.directory, "version_range": null },
-                "distribution": null,
-                "confidence": "inferred"
-            }],
-            "platforms": [
-                { "os": "linux", "architectures": ["x86_64", "aarch64"] },
-                { "os": "mac_os", "architectures": ["aarch64"] }
-            ],
-            "payloads": files
-                .iter()
-                .map(|(role, path, bytes)| payload(role, path, bytes))
-                .collect::<Vec<_>>(),
-            "capabilities": capabilities,
-            "actions": [
+        let actions = if shape.gateway {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([
                 {
                     "id": "prompt.send",
                     "label": "Send",
@@ -1176,7 +1238,37 @@ pub mod fixture {
                     "description": format!("Answer the tool approval {} is waiting on", shape.display_name),
                     "confirmation_required": false
                 }
+            ])
+        };
+        let mut manifest = serde_json::json!({
+            "manifest_version": 1,
+            "publisher_id": "kalareach",
+            "plugin_name": shape.plugin_name,
+            "version": "0.3.0",
+            "display_name": shape.display_name,
+            "description": format!("Recognises {}, observes it through hooks and answers its relayed tool approvals.", shape.display_name),
+            "sdk_range": ">=0.1.2, <0.2.0",
+            "wit_range": ">=0.1.0, <0.2.0",
+            "source": {
+                "repository": "https://github.com/kalapowered/kalareach-plugins",
+                "revision": format!("refs/tags/{}-0.3.0", shape.plugin_name)
+            },
+            "match_rules": [{
+                "id": format!("{}-executable", shape.plugin_name),
+                "executable": { "file_stem": shape.executable, "path_suffix": shape.directory, "version_range": null },
+                "distribution": null,
+                "confidence": "inferred"
+            }],
+            "platforms": [
+                { "os": "linux", "architectures": ["x86_64", "aarch64"] },
+                { "os": "mac_os", "architectures": ["aarch64"] }
             ],
+            "payloads": files
+                .iter()
+                .map(|(role, path, bytes)| payload(role, path, bytes))
+                .collect::<Vec<_>>(),
+            "capabilities": capabilities,
+            "actions": actions,
             "attachments": null,
             "native_bridge": null
         });
@@ -1205,6 +1297,9 @@ pub mod fixture {
         if let Some(probe) = &shape.launch_probe {
             manifest["sdk_range"] = serde_json::json!(">=0.1.4, <0.2.0");
             manifest["launch_probe"] = probe.clone();
+        }
+        if shape.gateway {
+            manifest["sdk_range"] = serde_json::json!(">=0.1.5, <0.2.0");
         }
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
@@ -1270,7 +1365,12 @@ pub mod fixture {
             (
                 "connector",
                 "connector.json",
-                connector_json_for(&plugin_id).into_bytes(),
+                if shape.gateway {
+                    gateway_connector_json_for(&plugin_id)
+                } else {
+                    connector_json_for(&plugin_id)
+                }
+                .into_bytes(),
             ),
             (
                 "presentation",
@@ -1315,6 +1415,15 @@ pub mod fixture {
         ]
         .into_iter()
         .collect();
+        if shape.gateway {
+            for capability in [
+                PluginCapability::UpstreamAction,
+                PluginCapability::ApprovalDecode,
+                PluginCapability::ApprovalRespond,
+            ] {
+                granted.remove(&capability);
+            }
+        }
         if shape.native_bridge {
             granted.insert(PluginCapability::NativeBridgeInstall);
         }

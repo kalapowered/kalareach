@@ -502,6 +502,7 @@ pub fn example_connector_table() -> crate::connector::ConnectorManifest {
         response_correlation: ResponseCorrelation::MatchingId {
             id_path: path("id"),
         },
+        messages: None,
         routes: vec![
             Route {
                 method: MethodName::new("turn.start").expect("a literal method name"),

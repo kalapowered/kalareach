@@ -11,6 +11,15 @@
 //! hash, which covers the declaration, and not [`CommandIntegration::statement`], which lists the
 //! command, every flag and every variable exactly, so no confirmation shows it.
 //!
+//! A declaration may also name a **backend**: an application whose terminal speaks to a server
+//! rather than to its own program (Codex's `--remote` terminal and its App Server). The worker
+//! starts that server as the session's backend, from the executable the shell resolved for the
+//! command and the arguments declared here, and the flag element [`GATEWAY_PLACEHOLDER`] is
+//! replaced, once the launch is committed, with the address of the worker-owned gateway the
+//! terminal is to connect to. The backend is started only for a plain launch of the terminal: a
+//! launch that types an option, or whose first word is not one the declaration lists, runs as
+//! typed, because the server would not receive what was typed.
+//!
 //! What a declaration may say is closed:
 //!
 //! * The command is a bare name, the executable name of one of the package's own match rules.
@@ -38,6 +47,22 @@ pub const MAX_FLAGS: usize = 16;
 
 /// The longest one flag may be, in bytes.
 pub const MAX_FLAG_BYTES: usize = 4096;
+
+/// The most arguments a backend is started with.
+pub const MAX_BACKEND_ARGUMENTS: usize = 8;
+
+/// The longest one backend argument may be, in bytes.
+pub const MAX_BACKEND_ARGUMENT_BYTES: usize = 256;
+
+/// The most words a declaration lists as launching the terminal.
+pub const MAX_LAUNCHING_WORDS: usize = 8;
+
+/// The longest one such word may be, in bytes.
+pub const MAX_LAUNCHING_WORD_BYTES: usize = 32;
+
+/// The text a flag holds, as a whole element, where the host writes the address of the gateway the
+/// terminal connects to.
+pub const GATEWAY_PLACEHOLDER: &str = "{gateway}";
 
 /// The flag that ends a command line's options.
 ///
@@ -83,6 +108,68 @@ pub struct CommandIntegration {
     pub variables: Vec<IntegrationVariable>,
     /// What the package says its integration does, in its own words.
     pub grant_statement: Summary,
+    /// The backend the worker starts for the integrated invocation, where the application's
+    /// terminal speaks to a server.
+    ///
+    /// A package that declares none leaves the member out, so a manifest written before the
+    /// member existed reads and hashes exactly as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<IntegrationBackend>,
+}
+
+/// The backend a command integration starts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct IntegrationBackend {
+    /// The arguments the application's own executable is started with to make the backend, in
+    /// order, each one argument element. The executable is the one the shell resolved for the
+    /// command; a package cannot name another.
+    pub arguments: Vec<String>,
+    /// The words that may follow the command name for a launch the backend is started for.
+    ///
+    /// A launch whose first word is absent, or one of these, and that types no option, is a plain
+    /// launch of the terminal. Any other launch (a subcommand that is not a terminal, an option,
+    /// a prompt) runs as typed, because the closed list is what the package qualified.
+    pub launching_words: Vec<String>,
+}
+
+impl IntegrationBackend {
+    /// Returns why a launch typed as `typed`, the command name first, is not one the backend is
+    /// started for, where it is not.
+    ///
+    /// The reason names the element and what the declaration allows, and a caller ends it with
+    /// what follows from it: the invocation runs as typed.
+    #[must_use]
+    pub fn refuses(&self, typed: &[String]) -> Option<String> {
+        let mut rest = typed.iter().skip(1);
+        if let Some(option) = typed.iter().skip(1).find(|word| word.starts_with('-')) {
+            return Some(format!(
+                "{} is an option, and the gateway serves a launch that types none, because the \
+                 backend this session starts does not receive it",
+                quoted(option)
+            ));
+        }
+        let first = rest.next()?;
+        if self.launching_words.iter().any(|word| word == first) {
+            return None;
+        }
+        Some(format!(
+            "{} is not a launch the gateway serves; it serves {}",
+            quoted(first),
+            if self.launching_words.is_empty() {
+                "only the command typed alone".to_owned()
+            } else {
+                format!(
+                    "the command typed alone, or followed by {}",
+                    self.launching_words
+                        .iter()
+                        .map(|word| quoted(word))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                )
+            }
+        ))
+    }
 }
 
 /// One environment variable a command integration sets.
@@ -130,6 +217,37 @@ impl CommandIntegration {
                 .collect();
             statement.push_str(&variables.join(", "));
             statement.push('.');
+        }
+        if let Some(backend) = &self.backend {
+            statement.push_str(&format!(
+                " It also starts the program {} names, with these arguments, as the session's \
+                 backend, in this order: {}.",
+                quoted(&self.command),
+                backend
+                    .arguments
+                    .iter()
+                    .map(|argument| quoted(argument))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            statement.push_str(&format!(
+                " {GATEWAY_PLACEHOLDER} is replaced by the address of the gateway this host \
+                 runs for that backend, which the terminal connects to."
+            ));
+            statement.push_str(&if backend.launching_words.is_empty() {
+                " The backend is started only when the command is typed alone.".to_owned()
+            } else {
+                format!(
+                    " The backend is started only when the command is typed alone or followed by {} \
+                     and no option.",
+                    backend
+                        .launching_words
+                        .iter()
+                        .map(|word| quoted(word))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                )
+            });
         }
         statement
     }
@@ -191,8 +309,120 @@ impl CommandIntegration {
                     .to_owned(),
             );
         }
+        self.backend_problems(&mut problems);
         problems
     }
+
+    /// Adds every way the backend and the flag that names its gateway break the contract.
+    fn backend_problems(&self, problems: &mut Vec<String>) {
+        let naming: Vec<usize> = self
+            .flags
+            .iter()
+            .enumerate()
+            .filter(|(_, flag)| flag.contains(GATEWAY_PLACEHOLDER))
+            .map(|(index, _)| index)
+            .collect();
+        for index in &naming {
+            if self.flags[*index] != GATEWAY_PLACEHOLDER {
+                problems.push(format!(
+                    "flag {index}: {GATEWAY_PLACEHOLDER} stands alone as a whole flag element, \
+                     and this one holds more"
+                ));
+            }
+        }
+        let Some(backend) = &self.backend else {
+            if !naming.is_empty() {
+                problems.push(format!(
+                    "a flag names {GATEWAY_PLACEHOLDER} and the integration declares no backend, \
+                     so there is no gateway to name"
+                ));
+            }
+            return;
+        };
+        if naming.len() != 1 {
+            problems.push(format!(
+                "the integration declares a backend and names {GATEWAY_PLACEHOLDER} in {} flags; \
+                 the terminal is told where the gateway is by exactly one",
+                naming.len()
+            ));
+        }
+        let arguments = backend.arguments.len();
+        if arguments == 0 || arguments > MAX_BACKEND_ARGUMENTS {
+            problems.push(format!(
+                "the backend is started with {arguments} arguments; the range is 1 to \
+                 {MAX_BACKEND_ARGUMENTS}"
+            ));
+        }
+        for (index, argument) in backend.arguments.iter().enumerate() {
+            if let Some(problem) = backend_argument_problem(argument) {
+                problems.push(format!("backend argument {index}: {problem}"));
+            }
+        }
+        if backend.launching_words.len() > MAX_LAUNCHING_WORDS {
+            problems.push(format!(
+                "the integration lists {} launching words, over the {MAX_LAUNCHING_WORDS} it may",
+                backend.launching_words.len()
+            ));
+        }
+        let mut listed = std::collections::BTreeSet::new();
+        for word in &backend.launching_words {
+            if let Some(problem) = launching_word_problem(word) {
+                problems.push(format!("launching word {}: {problem}", quoted(word)));
+            }
+            if !listed.insert(word.as_str()) {
+                problems.push(format!(
+                    "the launching word {} is listed more than once",
+                    quoted(word)
+                ));
+            }
+        }
+    }
+}
+
+/// Returns why one backend argument is not one a package may declare, where it is not.
+fn backend_argument_problem(argument: &str) -> Option<String> {
+    if argument.is_empty() {
+        return Some("an empty argument".to_owned());
+    }
+    if argument.len() > MAX_BACKEND_ARGUMENT_BYTES {
+        return Some(format!(
+            "{} bytes, over the {MAX_BACKEND_ARGUMENT_BYTES} one backend argument may be",
+            argument.len()
+        ));
+    }
+    if let Some(character) = argument.chars().find(|c| is_forbidden_text_char(*c)) {
+        return Some(format!(
+            "it carries U+{:04X}, which a person reading the declaration could not see",
+            u32::from(character)
+        ));
+    }
+    if forwarder::mentions(argument) || argument.contains(GATEWAY_PLACEHOLDER) {
+        return Some(
+            "a backend argument is written as it stands; neither placeholder is replaced in one"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// Returns why one launching word is not a bare subcommand name, where it is not.
+fn launching_word_problem(word: &str) -> Option<String> {
+    if word.is_empty() || word.len() > MAX_LAUNCHING_WORD_BYTES {
+        return Some(format!(
+            "a launching word is 1 to {MAX_LAUNCHING_WORD_BYTES} bytes, and this is {}",
+            word.len()
+        ));
+    }
+    if word.starts_with('-') {
+        return Some("it starts with '-', which makes it an option, not a word".to_owned());
+    }
+    if !word
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Some("letters, digits, '_' and '-' only".to_owned());
+    }
+    None
 }
 
 /// Returns the permitted entry a declared variable is, where it is one.
@@ -308,7 +538,27 @@ mod tests {
                 .collect(),
             grant_statement: Summary::new("Adds the flags the package's bridge needs")
                 .expect("a literal summary"),
+            backend: None,
         }
+    }
+
+    fn with_backend(
+        mut declared: CommandIntegration,
+        backend: &[&str],
+        words: &[&str],
+    ) -> CommandIntegration {
+        declared.backend = Some(IntegrationBackend {
+            arguments: backend
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            launching_words: words.iter().map(|word| (*word).to_owned()).collect(),
+        });
+        declared
+    }
+
+    fn typed(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
     }
 
     #[test]
@@ -494,6 +744,186 @@ mod tests {
         assert!(
             !integration("gemini", &[], &[]).problems(&rules).is_empty(),
             "an integration that changes nothing"
+        );
+    }
+
+    /// A backend declaration the contract accepts: the terminal is pointed at the gateway by one
+    /// flag element, the server is started by the arguments declared, and a launch is a plain one.
+    fn codex_like() -> CommandIntegration {
+        with_backend(
+            integration("codex", &["--remote", GATEWAY_PLACEHOLDER], &[]),
+            &["app-server", "--listen", "stdio://"],
+            &["resume", "fork"],
+        )
+    }
+
+    #[test]
+    fn kr_req_12_07_a_backend_is_declared_by_arguments_one_gateway_flag_and_closed_words() {
+        let rules = [rule("codex", &[])];
+        assert!(codex_like().problems(&rules).is_empty());
+        // Every way the declaration can break the contract is a finding that says which.
+        let broken = |declared: CommandIntegration| declared.problems(&rules);
+        let one_of = |problems: Vec<String>, text: &str| {
+            assert!(
+                problems.iter().any(|problem| problem.contains(text)),
+                "{text:?} is not among {problems:?}"
+            );
+        };
+        // No gateway flag, or two, leaves the terminal unable to find the gateway.
+        one_of(
+            broken(with_backend(
+                integration("codex", &["--remote", "unix:///x"], &[]),
+                &["app-server"],
+                &[],
+            )),
+            "in 0 flags",
+        );
+        one_of(
+            broken(with_backend(
+                integration(
+                    "codex",
+                    &["--remote", GATEWAY_PLACEHOLDER, GATEWAY_PLACEHOLDER],
+                    &[],
+                ),
+                &["app-server"],
+                &[],
+            )),
+            "in 2 flags",
+        );
+        // The placeholder is a whole element and needs a backend to name.
+        one_of(
+            broken(with_backend(
+                integration("codex", &["--remote=unix://{gateway}"], &[]),
+                &["app-server"],
+                &[],
+            )),
+            "stands alone",
+        );
+        one_of(
+            broken(integration(
+                "codex",
+                &["--remote", GATEWAY_PLACEHOLDER],
+                &[],
+            )),
+            "declares no backend",
+        );
+        // The arguments are bounded and written as they stand.
+        one_of(
+            broken(with_backend(
+                integration("codex", &[GATEWAY_PLACEHOLDER], &[]),
+                &[],
+                &[],
+            )),
+            "0 arguments",
+        );
+        let nine = ["a"; MAX_BACKEND_ARGUMENTS + 1];
+        one_of(
+            broken(with_backend(
+                integration("codex", &[GATEWAY_PLACEHOLDER], &[]),
+                &nine,
+                &[],
+            )),
+            "arguments; the range is 1 to",
+        );
+        let long = "x".repeat(MAX_BACKEND_ARGUMENT_BYTES + 1);
+        one_of(
+            broken(with_backend(
+                integration("codex", &[GATEWAY_PLACEHOLDER], &[]),
+                &[&long],
+                &[],
+            )),
+            "over the 256",
+        );
+        for argument in ["", "a\nb", "a\u{200B}b", "{gateway}", "{kr_hook}"] {
+            assert!(
+                !broken(with_backend(
+                    integration("codex", &[GATEWAY_PLACEHOLDER], &[]),
+                    &[argument],
+                    &[]
+                ))
+                .is_empty(),
+                "{argument:?} is refused"
+            );
+        }
+        // The launching words are bare, bounded and listed once.
+        for word in [
+            "",
+            "-x",
+            "--last",
+            "a b",
+            "a/b",
+            &"w".repeat(MAX_LAUNCHING_WORD_BYTES + 1),
+        ] {
+            assert!(
+                !broken(with_backend(
+                    integration("codex", &["--remote", GATEWAY_PLACEHOLDER], &[]),
+                    &["app-server"],
+                    &[word]
+                ))
+                .is_empty(),
+                "{word:?} is refused"
+            );
+        }
+        one_of(
+            broken(with_backend(
+                integration("codex", &["--remote", GATEWAY_PLACEHOLDER], &[]),
+                &["app-server"],
+                &["resume", "resume"],
+            )),
+            "more than once",
+        );
+    }
+
+    #[test]
+    fn kr_req_12_07_a_launch_is_plain_when_it_types_no_option_and_its_first_word_is_listed() {
+        let declared = codex_like();
+        let backend = declared.backend.as_ref().expect("a backend");
+        for plain in [
+            typed(&["codex"]),
+            typed(&["codex", "resume"]),
+            typed(&["codex", "fork"]),
+            typed(&["codex", "resume", "0198-session"]),
+        ] {
+            assert_eq!(backend.refuses(&plain), None, "{plain:?}");
+        }
+        // Each refusal names the element or the word, so the owner is told why it ran as typed.
+        let reason = |words: &[&str]| backend.refuses(&typed(words)).expect("a refusal");
+        assert!(reason(&["codex", "-c", "x=y"]).contains("\"-c\" is an option"));
+        assert!(reason(&["codex", "resume", "--last"]).contains("\"--last\" is an option"));
+        assert!(reason(&["codex", "exec", "task"]).contains("\"exec\" is not a launch"));
+        assert!(reason(&["codex", "fix the bug"]).contains("followed by \"resume\" or \"fork\""));
+        // A declaration that lists no word serves the command typed alone and nothing else.
+        let alone = IntegrationBackend {
+            arguments: typed(&["serve"]),
+            launching_words: Vec::new(),
+        };
+        assert_eq!(alone.refuses(&typed(&["agent"])), None);
+        assert!(
+            alone
+                .refuses(&typed(&["agent", "login"]))
+                .expect("a refusal")
+                .contains("only the command typed alone")
+        );
+    }
+
+    #[test]
+    fn kr_req_12_07_the_statement_shows_the_backend_whole_and_what_replaces_the_gateway_flag() {
+        let statement = codex_like().statement();
+        assert!(
+            statement.contains("\"--remote\" \"{gateway}\""),
+            "the flag list shows the placeholder as written: {statement}"
+        );
+        assert!(
+            statement.contains("\"app-server\" \"--listen\" \"stdio://\""),
+            "every backend argument is in the statement, in order: {statement}"
+        );
+        assert!(statement.contains("{gateway} is replaced by the address of the gateway"));
+        assert!(statement.contains("followed by \"resume\" or \"fork\" and no option"));
+        // A declaration with no backend says nothing about one.
+        assert!(
+            !integration("agent", &["--flag"], &[])
+                .statement()
+                .contains("backend")
         );
     }
 }

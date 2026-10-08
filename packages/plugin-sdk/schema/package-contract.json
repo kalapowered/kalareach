@@ -107,9 +107,15 @@
     }
   ],
   "command_integration": {
+    "gateway_placeholder": "{gateway}",
+    "max_backend_argument_bytes": 256,
+    "max_backend_arguments": 8,
+    "max_backend_methods": 256,
     "max_command_bytes": 64,
     "max_flag_bytes": 4096,
     "max_flags": 16,
+    "max_launching_word_bytes": 32,
+    "max_launching_words": 8,
     "permitted_variables": [
       {
         "application": "Gemini CLI",
@@ -292,7 +298,7 @@
     "retained_generations": "2",
     "retained_metadata_bytes": "134217728"
   },
-  "sdk_version": "0.1.4",
+  "sdk_version": "0.1.5",
   "wit_package": {
     "export_interface": "adapter",
     "exports": [
