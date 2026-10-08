@@ -94,6 +94,8 @@ pub struct Host {
     pub room: room::TestRoom,
     /// The network settings the host was started with, which a restart keeps.
     settings: NetworkSettings,
+    /// The clocks the daemon was started on, when a suite moves them by hand; a restart keeps them.
+    clocks: Option<kr_controller::service::Clocks>,
 }
 
 impl Host {
@@ -118,8 +120,30 @@ impl Host {
                 endpoint: loopback(),
                 ..NetworkSettings::default()
             },
+            None,
         )
         .await
+    }
+
+    /// Starts a daemon on the clocks a suite moves by hand, with `owner` as its first owner.
+    pub async fn start_on_clocks(
+        owner: &DeviceKeys,
+        clocks: kr_controller::service::Clocks,
+    ) -> Self {
+        let mut host = Self::start_on(
+            kr_ipc::testing::TempHost::create(),
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            Some(clocks),
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
     }
 
     /// Starts a daemon whose network selects the services `endpoint` names, with `owner` as its
@@ -141,6 +165,7 @@ impl Host {
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
             settings,
+            None,
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -172,6 +197,7 @@ impl Host {
             owner,
             room,
             settings,
+            clocks,
             ..
         } = self;
         clients.abort();
@@ -194,6 +220,7 @@ impl Host {
             room,
             owner,
             settings,
+            clocks,
         }
     }
 
@@ -203,12 +230,13 @@ impl Host {
         temp: kr_ipc::testing::TempHost,
         room: room::TestRoom,
         settings: NetworkSettings,
+        clocks: Option<kr_controller::service::Clocks>,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
-            Controller::start(ControllerSetup {
+            let setup = ControllerSetup {
                 paths: environment.clone(),
                 environment_id,
                 identity: Box::new(move || {
@@ -227,7 +255,14 @@ impl Host {
                 release: "0".to_owned(),
                 shell_packages: None,
                 terminal: Box::new(kr_controller::supervision::NoTerminal),
-            })
+            };
+            let clocks = clocks.clone();
+            async move {
+                match clocks {
+                    Some(clocks) => Controller::start_on_clocks(setup, clocks).await,
+                    None => Controller::start(setup).await,
+                }
+            }
         })
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
@@ -258,6 +293,7 @@ impl Host {
             owner_device: None,
             room,
             settings,
+            clocks,
         }
     }
 
@@ -357,6 +393,7 @@ pub struct Stopped {
     room: room::TestRoom,
     owner: Option<DeviceRecord>,
     settings: NetworkSettings,
+    clocks: Option<kr_controller::service::Clocks>,
 }
 
 impl Stopped {
@@ -376,9 +413,13 @@ impl Stopped {
     /// `settings` and the stopped one's owner.
     pub async fn start(self, settings: NetworkSettings) -> Host {
         let Self {
-            temp, room, owner, ..
+            temp,
+            room,
+            owner,
+            clocks,
+            ..
         } = self;
-        let mut host = Host::start_on(temp, room, settings).await;
+        let mut host = Host::start_on(temp, room, settings, clocks).await;
         host.owner = owner;
         host
     }
