@@ -52,7 +52,8 @@ complete identifier. A second environment whose identifier shares the prefix is 
 silently given another environment's registry.
 
 Endpoints are `c.sock` (clients), `r.sock` (the owner-only rendezvous, which a worker's startup
-claim and a running worker's request for the plugin runtime arrive on), `t.sock` (attachment
+claim and a running worker's requests for the plugin runtime and for the drafts its agent is
+offered attachments from arrive on), `t.sock` (attachment
 chunks) and `w<display>.sock` (one worker). On Windows they are named pipes scoped by user and
 environment, carrying an owner-only access-control list, because the pipe namespace has no directory
 permissions to inherit. That namespace is shared by every account on the machine, so the list is not
@@ -812,7 +813,7 @@ package ships a component. An environment whose shells never run such a program 
 process at all, and the daemon does not start one when it starts.
 
 A worker that has bound such a package connects to the daemon's rendezvous endpoint, which a
-running worker may use for this one request and nothing else, and asks for the runtime. The daemon
+running worker may use for two kinds of request and nothing else, and asks for the runtime. The daemon
 answers only the process it recorded for that session, as the kernel names that process. It starts
 the runtime, or finds the one a previous daemon started, and answers that it is running or why it
 cannot be reached and how long to leave before asking again. The runtime reports itself on a
@@ -845,6 +846,24 @@ binding's life.
 
 `docs/plugins/runtime.md` has the execution model, the per-instance limits, the compiled-code cache
 and the protocol.
+
+### Drafts a worker offers to its agent
+
+A worker whose package offers an attachment from a draft to its agent asks the daemon about that
+draft on the same rendezvous endpoint. There are three questions: what the draft holds, a claim of
+one binding for the offer, and the report of what the agent answered. Each is a single question and
+answer exchange on a connection of its own. The daemon answers only the process it recorded for the
+session, as the kernel names it. A process that isn't the session's worker is refused without
+revealing anything about any draft. If the daemon hasn't recorded a process for that session yet, it
+tells the worker to ask again later.
+
+The worker names the actor its action is for. The transfer service looks for the draft among that
+actor's drafts and decides everything about the draft itself. The daemon doesn't keep any state or
+connections related to these questions, so if the daemon goes away and comes back the worker can
+just ask again. The report is the one question that has to arrive. The worker keeps the reports it
+has not delivered, at most 256, and asks again until the daemon either records or refuses each of
+them for good. A worker that ends before it reports is a closed session, and the closure fails the
+offer. `docs/transfer/README.md` has the rules of the claim and the report.
 
 ### The plugin catalogue
 

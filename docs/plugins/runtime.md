@@ -437,6 +437,8 @@ because a host ends the connection, and every binding on it, over a request it d
 daemon takes away a descriptor that names another protocol, and a host of another protocol that is
 still running holds its endpoint, so no runtime can be started until it ends. A host ends with the
 login session or a restart of the machine; a host of the current protocol is adopted as it is.
+The worker and the host ship together, so the protocol keeps no reader for an earlier version: a
+change to it takes a new name, and a host of the old name is refused and not served.
 
 A component's bytes travel as a location rather than as a payload: a control frame is bounded at
 1 MiB and a component may be sixteen times that. The worker sends the payload's path and the digest
@@ -559,6 +561,46 @@ Dropping the *last* handle signals the thread rather than waiting for it, which 
 handle safe to drop anywhere. Dropping one a caller holds stops nothing on its own: the runtime
 holds a handle of its own until the binding is unbound or its owner goes, and only the last one to
 go signals the thread.
+
+### An action that offers an attachment
+
+An action that offers an attachment from a draft is a component action that also names a draft. The
+action's package must declare that it offers attachments by uploading them to the upstream. That's
+the only way a worker can offer an attachment. The action must declare exactly one parameter of kind
+`attachment_handle`, which will be the identifier of the transfer. Since the worker needs to read
+the draft from the control daemon, there are two more possible refusals before it asks the component
+to handle the action. The worker must have a daemon to ask, and a place must be free for the report
+of the offer, because it keeps at most 256 reports waiting for the daemon.
+
+The preparation runs in a fixed order: read, ask, compare, claim.
+
+1. The worker reads what the draft holds and checks it against the package's declaration. The draft
+   is open and is for this application instance. The attachment is bound to it as a `recorded` typed
+   submission, at the attempt the worker read. The number of attachments, the size, the media type
+   (exact, or by a `type/*` family) and the destination are what the package declares.
+2. The component is asked for its plan.
+3. The plan is compared with the invocation: it must offer the attachment that the invocation names,
+   and no other.
+4. The worker reads the action's receipt again. An action that was cancelled or fenced in the
+   meantime claims nothing.
+5. The worker claims the binding. This is the last thing it does, so that it doesn't claim the
+   binding until it has done everything else that might refuse the action.
+
+One bound covers all of it, from the read of the draft to the claim: five seconds, or the action's
+accepted deadline if that is sooner.
+
+From the point that it claims the binding, the worker is responsible for reporting the result of the
+action to the daemon, regardless of how the action ends. If the upstream acknowledges the request,
+the worker reports `accepted_by_agent`, with the upstream request and turn as evidence. If the
+upstream refuses the request, or the action is rejected after the claim, it reports `failed`. If the
+action reaches the dispatch marker without ever being answered, it reports `unknown`, and a later
+offer of the same attachment names the earlier action it supersedes, as any action on a subject with
+an uncertain outcome does. A claim that the daemon was asked for and did not answer is settled by a
+report that the offer failed, made once the claim's deadline has passed, because until then the
+daemon may still commit it. The worker keeps these reports in memory until it can deliver them, and
+uses a task to keep asking the daemon until it either records the report or refuses it. A worker
+that ends first is a closed session, and the closure fails every offer in flight, so nothing needs
+to survive the worker.
 
 ## The generation that ships with the host
 
