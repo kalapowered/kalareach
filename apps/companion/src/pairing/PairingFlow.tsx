@@ -90,9 +90,16 @@ function until(ms: number | null): string {
  * choice.
  */
 export function PairingFlow({
-  chooseHost
+  chooseHost,
+  focusTheField = true
 }: {
   readonly chooseHost?: (reference: string) => Promise<void>
+  /**
+   * Whether the code field takes focus when the column is at its start. The desktop's pairing view
+   * is a screen of its own and starts typing. On a phone the column is one place among four, and
+   * focusing a field there would raise the keyboard over a screen the person only opened.
+   */
+  readonly focusTheField?: boolean
 } = {}): ReactNode {
   const { port, say } = useApp()
   const [view, setView] = useState<PairingView | null>(null)
@@ -148,6 +155,7 @@ export function PairingFlow({
   useEffect(() => {
     if (screen === null) return
     if (screen === 'entry') {
+      if (!focusTheField) return
       field.current?.focus()
       if (selectOnEntry.current) {
         field.current?.select()
@@ -156,7 +164,7 @@ export function PairingFlow({
       return
     }
     heading.current?.focus()
-  }, [screen])
+  }, [screen, focusTheField])
 
   // The countdown ticks while the person decides, and says "One minute left" once.
   const expiresAt =
