@@ -1526,6 +1526,34 @@ not track stays as an earlier application left it. WezTerm's bidirectional mode 
 protection of xterm and Ghostty are two. The soft reset of xterm and WezTerm would clear them, and
 would clear the person's own state with them.
 
+The sequence that sets left and right margins, `CSI Pl;Pr s`, is also a cursor save on four of the
+eight terminals. Alacritty, foot, tmux and GNU screen have no margin mode, and each reads every
+`CSI s` as `ESC 7` whatever its parameters, so the cursor goes into the slot that `ESC 7` writes.
+kitty ignores a `CSI s` that has parameters. WezTerm, xterm and Ghostty read one as margins once
+`?69h` is set and do nothing with it otherwise. The restoration therefore writes `?69h` and the
+margins directly after the `ESC 7` that saves the session's cursor, while the state that cursor
+holds is still in force. A terminal that reads the margins as a save saves the same cursor again.
+Where the restoration installs no saved cursor for the buffer that shows, it writes the plain state,
+saves it, and then sets the margins. Written where it was before, after the scroll region had sent
+the cursor home, the sequence replaced the saved cursor with the home position and the session's
+current rendition, and an `ESC 8` brought that back.
+
+tmux 3.7c and 3.6, GNU screen 5.0.2 and 4.09.01 and the terminal library of Alacritty 0.17.0 were
+each sent both orders for four screens (a cursor saved in the primary buffer, one saved in the
+alternate buffer, one saved inside a scroll region in origin mode, and a screen with no saved cursor
+and a rendition in force), followed by `ESC 8` and a character, and the cursor was read back. After
+the old order a terminal that reads the margins as a save put the cursor at the wrong place on three
+screens, in every one of six runs of each. On the fourth, tmux and Alacritty, the two read back for
+the rendition, gave the character the rendition in force when the sequence was written. After the
+new order each put the cursor where the session had saved it, and tmux and Alacritty gave the
+character the plain rendition, as they do on the same screen without margins. xterm 412 held the
+same state after both orders in all 162 runs, which is what a terminal with the mode should do. The
+sources are `vte/src/ansi.rs` 1737, `csi.c` 1263-1265, `input.c` 345 and 1804-1806 and `src/ansi.c`
+959-961 for the four terminals that save, and `kitty/vt-parser.c` 1324-1336,
+`termwiz/src/escape/csi.rs` 2059-2085, `term/src/terminalstate/mod.rs` 2313-2316,
+`src/terminal/stream.zig` 1694-1705, `src/terminal/Terminal.zig` 1627-1631 and `charproc.c`
+4884-4902 for the others.
+
 Two terminals do not keep the other buffer as xterm does. GNU screen switches buffers only when its
 `altscreen` setting is on, and the default is off. tmux throws away what is drawn in the alternate
 screen when it leaves it. Neither matters to the stream, because every switch of buffer the

@@ -54,6 +54,12 @@
 //! handed can have left a link open, and one the writer did not open would otherwise attach to the
 //! first cells it draws.
 //!
+//! The sequence that sets left and right margins, `CSI Pl;Pr s`, is a cursor save on Alacritty,
+//! foot, tmux and GNU screen, which have no margin mode, so it is written while the state a saved
+//! cursor holds is still in force: directly after the `ESC 7` that saves the session's cursor, or
+//! after the plain state is saved again where the restoration installs no saved cursor for the
+//! buffer that shows.
+//!
 //! When the primary buffer is the one that is showing, the other buffer is painted right after
 //! those saves, and the plain state is saved again: entering the other buffer saved a cursor, which
 //! a session that never saved one has no counterpart of. When the alternate buffer is showing, the
@@ -296,15 +302,19 @@ struct Writer {
     charsets: Option<Charsets>,
     /// The rows of the buffer that is not showing, held back until the switch can be made.
     inactive: Vec<GridRow>,
-    /// The scroll region, held back until the rows have been painted.
+    /// Whether this terminal's keyboard protocols may be changed at all.
+    keyboard: Keyboard,
+    /// The scroll region and the left and right margins, held back until the rows have been
+    /// painted.
     ///
     /// Every row is addressed absolutely, and an absolute address means something different once
     /// margins and origin mode are in force. The screen is therefore painted with neither, and both
-    /// are installed afterwards together with the cursor, which is the only thing whose position
-    /// they then apply to.
-    /// Whether this terminal's keyboard protocols may be changed at all.
-    keyboard: Keyboard,
+    /// are installed afterwards. The scroll region goes in with the cursor, which is the only thing
+    /// whose position it then applies to. The left and right margins go in with the saved cursor,
+    /// for the reason `install_left_right_margins` gives.
     margins: Option<Margins>,
+    /// Whether the session's left and right margins have been written to this terminal.
+    left_right_margins_written: bool,
     /// Whether the snapshot had origin mode set, held back for the same reason.
     origin_mode: bool,
     /// Whether the session has autowrap on, which the plain state writes before every save.
@@ -328,6 +338,7 @@ impl Writer {
             charsets: None,
             inactive: Vec::new(),
             margins: None,
+            left_right_margins_written: false,
             origin_mode: false,
             autowrap: true,
             reverse_video: false,
@@ -880,6 +891,8 @@ impl Writer {
         self.move_to(line, column);
         self.out.push(ESC);
         self.out.push(b'7');
+        // With the saved state still in force, for the reason `install_left_right_margins` gives.
+        self.install_left_right_margins();
         // Everything the save disturbed is put back, so the operations that follow describe the
         // screen rather than the pen this one happened to leave behind.
         self.rendition(restore_pen);
@@ -897,12 +910,17 @@ impl Writer {
         // Everything the rows had to be painted without goes in here: the character sets the text
         // would have been drawn through, and the scroll region and origin mode that would have
         // moved every absolute address.
+        //
+        // Where the restoration installed no saved cursor for the buffer that is showing, the left
+        // and right margins are written here, over the plain cursor the buffer holds, and before
+        // the character sets so that the plain state does not undo them.
+        self.install_left_right_margins_over_the_plain_cursor();
         if let Some(charsets) = self.charsets.take() {
             self.charsets(&charsets);
         }
         let margins = self.margins.take();
         if let Some(margins) = margins {
-            self.install_margins(margins);
+            self.install_scroll_region(margins);
         }
         if self.origin_mode {
             // Enabling origin mode homes the cursor, so it happens before the cursor is placed and
@@ -1012,22 +1030,67 @@ impl Writer {
         self.active = active;
     }
 
-    fn install_margins(&mut self, margins: Margins) {
+    /// Sets the scroll region the session has.
+    fn install_scroll_region(&mut self, margins: Margins) {
         let mut vertical = (margins.top.saturating_add(1)).to_string().into_bytes();
         vertical.push(b';');
         vertical.extend_from_slice((margins.bottom.saturating_add(1)).to_string().as_bytes());
         vertical.push(b'r');
         self.csi(&vertical);
-        // Left and right margins need the mode that enables them. A session that never set them
-        // has them at the full width, and enabling the mode for that would change nothing while
-        // leaving a mode set that the snapshot did not have set.
-        if margins.left > 0 || margins.right.saturating_add(1) < self.viewport.cols {
-            self.csi(b"?69h");
-            let mut horizontal = (margins.left.saturating_add(1)).to_string().into_bytes();
-            horizontal.push(b';');
-            horizontal.extend_from_slice((margins.right.saturating_add(1)).to_string().as_bytes());
-            horizontal.push(b's');
-            self.csi(&horizontal);
+    }
+
+    /// The left and right margins the session has, when they are not the whole width and have not
+    /// been written yet.
+    ///
+    /// A session that never set them has them at the full width, and enabling the mode for that
+    /// would change nothing while leaving a mode set that the snapshot did not have set.
+    fn left_right_margins_to_write(&self) -> Option<Margins> {
+        self.margins.filter(|margins| {
+            !self.left_right_margins_written
+                && (margins.left > 0 || margins.right.saturating_add(1) < self.viewport.cols)
+        })
+    }
+
+    /// Writes the session's left and right margins, with the mode that enables them.
+    ///
+    /// The sequence that sets them, `CSI Pl;Pr s`, saves the cursor on Alacritty, foot, tmux and
+    /// GNU screen, which have no margin mode: they read it as they read `ESC 7` and put the cursor
+    /// into the slot that writes. kitty, which has none either, ignores it with parameters, and
+    /// xterm, WezTerm and Ghostty take it as margins once the mode is set. So it is written while
+    /// the state the saved cursor holds is still in force, and on a terminal that reads it as a
+    /// save it saves that same cursor again. Written anywhere else it would replace the cursor the
+    /// session saved with wherever the cursor happened to be.
+    fn install_left_right_margins(&mut self) {
+        let Some(margins) = self.left_right_margins_to_write() else {
+            return;
+        };
+        self.csi(b"?69h");
+        let mut horizontal = (margins.left.saturating_add(1)).to_string().into_bytes();
+        horizontal.push(b';');
+        horizontal.extend_from_slice((margins.right.saturating_add(1)).to_string().as_bytes());
+        horizontal.push(b's');
+        self.csi(&horizontal);
+        self.left_right_margins_written = true;
+    }
+
+    /// Writes the left and right margins that no saved cursor of the buffer that is showing
+    /// carried, over the plain cursor that buffer holds.
+    ///
+    /// The plain state is written and saved again first, so that a terminal that reads the
+    /// sequence as a save of the cursor saves the plain cursor and not wherever the cursor stands
+    /// after the rows.
+    /// What that disturbs is put back: the rendition and the link the session has open.
+    fn install_left_right_margins_over_the_plain_cursor(&mut self) {
+        if self.left_right_margins_to_write().is_none() {
+            return;
+        }
+        let restore_pen = self.pen.unwrap_or_default();
+        let restore_link = self.link.clone();
+        self.save_plain_state();
+        self.install_left_right_margins();
+        self.rendition(restore_pen);
+        if let Some(link) = restore_link {
+            self.open_link(&link);
         }
     }
 

@@ -550,3 +550,140 @@ fn every_cursor_a_restoration_saves_holds_the_sessions_autowrap_and_reverse_vide
         }
     }
 }
+
+/// What a saved-cursor slot holds, as far as the bytes written say: where the cursor stood and the
+/// rendition it was drawn in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    row: u32,
+    column: u32,
+    rendition: String,
+}
+
+/// What the two saved-cursor slots of a terminal hold after the bytes, primary buffer first.
+///
+/// Four terminals (Alacritty, foot, tmux and GNU screen) have no left and right margin mode and
+/// read the margins sequence `CSI Pl;Pr s` as `CSI s`, a save of the cursor into the slot `ESC 7`
+/// writes; `margins_save` says the terminal is one of them. A terminal that has the mode takes it
+/// as margins and saves nothing. Only what these cases need is followed: the cursor's address, its
+/// column moving with each character, and the rendition.
+fn held_after(items: &[Item], starts_on_alternate: bool, margins_save: bool) -> [Option<Held>; 2] {
+    let mut slots: [Option<Held>; 2] = [None, None];
+    let mut on_alternate = usize::from(starts_on_alternate);
+    let (mut row, mut column) = (0_u32, 0_u32);
+    let mut rendition = String::from("0m");
+    for item in items {
+        let held = |row, column, rendition: &str| Held {
+            row,
+            column,
+            rendition: rendition.to_owned(),
+        };
+        match item {
+            Item::Text(_) => column += 1,
+            Item::Control(b'\r') => column = 0,
+            Item::Esc(sequence) if sequence == "7" => {
+                slots[on_alternate] = Some(held(row, column, &rendition));
+            }
+            Item::Csi(sequence) => {
+                let last = sequence.chars().last().expect("a final byte");
+                let parameters = &sequence[..sequence.len() - 1];
+                match last {
+                    'H' | 'f' => {
+                        let mut numbers = parameters
+                            .split(';')
+                            .map(|number| number.parse::<u32>().unwrap_or(1).max(1));
+                        row = numbers.next().unwrap_or(1) - 1;
+                        column = numbers.next().unwrap_or(1) - 1;
+                    }
+                    'm' => rendition.clone_from(sequence),
+                    // A scroll region and a change of origin mode home the cursor.
+                    'r' => (row, column) = (0, 0),
+                    's' if parameters.contains(';') && margins_save => {
+                        slots[on_alternate] = Some(held(row, column, &rendition));
+                    }
+                    'h' | 'l' if parameters == "?6" => (row, column) = (0, 0),
+                    'h' | 'l' if parameters == "?1049" => {
+                        if last == 'h' {
+                            slots[on_alternate] = Some(held(row, column, &rendition));
+                            on_alternate = 1;
+                        } else {
+                            on_alternate = 0;
+                            if let Some(back) = &slots[0] {
+                                (row, column) = (back.row, back.column);
+                                rendition.clone_from(&back.rendition);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    slots
+}
+
+/// Installing a session's left and right margins leaves the saved cursor where the session has it.
+///
+/// Alacritty, foot, tmux and GNU screen have no margin mode and read the sequence that sets them as
+/// a save of the cursor, so whatever the cursor and the rendition are when it is written is what
+/// `ESC 8` brings back afterwards. The same screen without margins is the control: each terminal, whether it reads
+/// the sequence as margins or as a save, holds the saved cursor it holds there. That is the
+/// cursor the session saved, or the plain one at home where it saved none.
+#[test]
+fn installing_left_and_right_margins_keeps_the_saved_cursor_the_session_holds() {
+    let margins: &[u8] = b"\x1b[?69h\x1b[5;15s";
+    let screens: [(&str, &[u8]); 4] = [
+        (
+            "a cursor saved in the primary buffer",
+            b"abc\x1b[1;31m\x1b[2;8H\x1b7\x1b[0m\x1b[4;1Hxyz",
+        ),
+        (
+            "no cursor saved, and a rendition in force",
+            b"abc\x1b[4;1Hxyz\x1b[1;34m",
+        ),
+        (
+            "a cursor saved in the alternate buffer",
+            b"abc\x1b[?1047h\x1b[1;32m\x1b[3;9H\x1b7\x1b[0m\x1b[5;1Hxyz",
+        ),
+        (
+            "a cursor saved in the buffer that is not showing",
+            b"abc\x1b[2;8H\x1b7\x1b[?1047h\x1b[Hxyz",
+        ),
+    ];
+    let mut differing = Vec::new();
+    for (name, stream) in screens {
+        for scope in SCOPES {
+            let with_margins = [stream, margins].concat();
+            let written = items(&restoration_after(&with_margins, scope));
+            assert!(
+                written.contains(&Item::Csi("5;15s".to_owned())),
+                "{name} in {scope:?}: the margins are installed: {written:?}"
+            );
+            let control = items(&restoration_after(stream, scope));
+            for starts_on_alternate in [false, true] {
+                for margins_save in [false, true] {
+                    if held_after(&written, starts_on_alternate, margins_save)
+                        != held_after(&control, starts_on_alternate, margins_save)
+                    {
+                        differing.push(format!(
+                            "{name} in {scope:?}, a terminal that began on the {} buffer and \
+                             reads the margins as {}",
+                            if starts_on_alternate {
+                                "alternate"
+                            } else {
+                                "primary"
+                            },
+                            if margins_save { "a save" } else { "margins" }
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        differing.is_empty(),
+        "the saved cursors differ from the ones the same screen leaves without margins:\n{}",
+        differing.join("\n")
+    );
+}
