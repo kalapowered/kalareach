@@ -234,9 +234,10 @@ token. The browser signs in at the managed account service, and its code is rede
 so a token is presented only to a voice broker that is that service; a host whose configuration
 names another broker presents none. A token issued without the `voice` scope is refused before any
 request carries it. A call closes under the account it started under, so a sign-in is refused while
-a call is open; a call whose phone is lost stops counting when its deadline passes or the service
-says it holds no such call, and the host ends its record then. When the service ends the sign-in, the host shows it as ended, and a call that needs
-a token is refused with a message that says to sign in again.
+a call is open. A call whose phone is lost never stops it: when a sign-in or a sign-out next asks,
+the host ends the record of a call that is past its deadline or that the service says it no longer
+holds, as a stop would. When the service ends the sign-in, the host shows it as ended, and a call
+that needs a token is refused with a message that says to sign in again.
 
 A host with no account signed in and a host with no provider attached are both complete hosts.
 They start no managed call, and nothing else on them depends on one: sessions, agents and their questions work as

@@ -24,28 +24,26 @@ struct VoiceCalls {
     daemon: std::sync::Weak<Controller>,
 }
 
-impl VoiceCalls {
-    /// The coordinator and the time on the clock every voice deadline is decided on.
-    fn coordinator(&self) -> Option<(Arc<crate::voice::VoiceModule>, u64)> {
-        let module = self.module.upgrade()?;
-        let daemon = self.daemon.upgrade()?;
-        Some((module, daemon.settled_now_ms()))
-    }
-}
-
 impl crate::account::Calls for VoiceCalls {
     fn open(&self) -> bool {
-        self.coordinator()
-            .is_some_and(|(module, now_ms)| module.coordinator().calls_open(now_ms))
+        self.module
+            .upgrade()
+            .is_some_and(|module| module.coordinator().calls_open())
     }
 
     fn end_those_that_are_over(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            if let Some((module, now_ms)) = self.coordinator() {
-                module.coordinator().end_calls_that_are_over(now_ms).await;
-            }
+            let (Some(module), Some(daemon)) = (self.module.upgrade(), self.daemon.upgrade())
+            else {
+                return;
+            };
+            // The time every voice deadline is decided on.
+            module
+                .coordinator()
+                .end_calls_that_are_over(daemon.settled_now_ms())
+                .await;
         })
     }
 }
