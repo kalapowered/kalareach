@@ -100,6 +100,82 @@ describe('the Hosts screen of a phone', () => {
   })
 })
 
+describe('forgetting a host on a phone', () => {
+  // KR-REQ-13.08: a host this phone cannot reach any more, one that revoked it among them, stays
+  // listed until the person forgets it. Forgetting asks first, because this phone must pair with
+  // the host again to reach it; the safe answer has the focus, and keeping the host puts it back
+  // where it was.
+  it('asks before it forgets a host, and forgets it once the person says so', async () => {
+    const { controls } = start()
+    await openTab('Hosts')
+    act(() => {
+      controls.setPairing({ hosts: [STUDIO] })
+    })
+    await userEvent.click(await screen.findByTestId('forget-host'))
+    const question = await screen.findByTestId('forget-host-ask')
+    expect(question).toHaveTextContent('Forget studio?')
+    expect(screen.getByTestId('keep-host')).toHaveFocus()
+    expect(controls.forgottenHosts).toEqual([])
+
+    await userEvent.click(screen.getByTestId('keep-host'))
+    expect(screen.queryByTestId('forget-host-ask')).toBeNull()
+    expect(screen.getByTestId('forget-host')).toHaveFocus()
+    expect(controls.forgottenHosts).toEqual([])
+
+    await userEvent.click(screen.getByTestId('forget-host'))
+    await userEvent.click(await screen.findByTestId('forget-host-confirm'))
+    await waitFor(() => {
+      expect(controls.forgottenHosts).toEqual(['studio-reference'])
+    })
+    await waitFor(() => {
+      expect(screen.queryByTestId('paired-hosts')).toBeNull()
+    })
+    expect(screen.getByRole('heading', { name: 'Pair with a host' })).toHaveFocus()
+    expect(await screen.findByText(/studio is forgotten/)).toBeInTheDocument()
+  })
+
+  // KR-REQ-13.08: the host in use that is forgotten is the host the commands stop going to.
+  it('leaves the commands going nowhere when the host in use is forgotten', async () => {
+    const { controls } = start()
+    await openTab('Hosts')
+    act(() => {
+      controls.setPairing({ hosts: [{ ...STUDIO, in_use: true }] })
+    })
+    await userEvent.click(await screen.findByTestId('forget-host'))
+    await userEvent.click(await screen.findByTestId('forget-host-confirm'))
+    await waitFor(() => {
+      expect(controls.forgottenHosts).toEqual(['studio-reference'])
+    })
+    await openTab('Sessions')
+    expect(await screen.findByText('No host is being reached.')).toBeInTheDocument()
+  })
+
+  it('says why a host could not be forgotten, and leaves it listed', async () => {
+    const { port, controls } = fakeHost()
+    const refused = {
+      code: 'RESOURCE_UNAVAILABLE',
+      message: 'This computer could not change its records of hosts.',
+      user_action: 'nothing'
+    }
+    render(
+      <AppProvider port={{ ...port, hostsForget: () => Promise.reject(refused) }}>
+        <MobileApp surface="ios" />
+      </AppProvider>
+    )
+    await openTab('Hosts')
+    act(() => {
+      controls.setPairing({ hosts: [STUDIO] })
+    })
+    await userEvent.click(await screen.findByTestId('forget-host'))
+    await userEvent.click(await screen.findByTestId('forget-host-confirm'))
+    expect((await screen.findByTestId('forget-host-failure')).textContent).toContain(
+      'could not change its records'
+    )
+    expect(screen.getByTestId('forget-host-confirm')).toBeEnabled()
+    expect(within(screen.getByTestId('paired-hosts')).getByText('studio')).toBeInTheDocument()
+  })
+})
+
 describe('the lists of a phone', () => {
   // KR-REQ-13.08: what one host listed is not left on the screen once that host is not the one being
   // reached, and the lists are read again from the host that is.

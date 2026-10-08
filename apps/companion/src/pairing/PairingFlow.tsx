@@ -87,13 +87,16 @@ function until(ms: number | null): string {
  *
  * `chooseHost` is given where the application's commands may go to a paired host: a phone, which has
  * none of its own. It is called with the host's reference, and the host's row then offers the
- * choice.
+ * choice. `forgetHost` is given with it: forgetting is this computer's own action, and a host that
+ * revoked it is still listed here until it is forgotten.
  */
 export function PairingFlow({
   chooseHost,
+  forgetHost,
   focusTheField = true
 }: {
   readonly chooseHost?: (reference: string) => Promise<void>
+  readonly forgetHost?: (reference: string) => Promise<void>
   /**
    * Whether the code field takes focus when the column is at its start. The desktop's pairing view
    * is a screen of its own and starts typing. On a phone the column is one place among four, and
@@ -506,7 +509,20 @@ export function PairingFlow({
       ) : null}
 
       {screen === 'entry' && view.hosts.length > 0 ? (
-        <PairedHosts hosts={view.hosts} chooseHost={chooseHost} />
+        <PairedHosts
+          hosts={view.hosts}
+          chooseHost={chooseHost}
+          forgetHost={
+            forgetHost === undefined
+              ? undefined
+              : async (host) => {
+                  await forgetHost(host.reference)
+                  say(`${host.name} is forgotten. This phone no longer lists it.`)
+                  // The row the person was on is gone: the screen's own heading is where they are.
+                  heading.current?.focus()
+                }
+          }
+        />
       ) : null}
     </div>
   )
@@ -619,13 +635,37 @@ function Pasted({
 /** The hosts this computer is paired with, newest first. */
 function PairedHosts({
   hosts,
-  chooseHost
+  chooseHost,
+  forgetHost
 }: {
   readonly hosts: readonly HostRow[]
   readonly chooseHost: ((reference: string) => Promise<void>) | undefined
+  readonly forgetHost: ((host: HostRow) => Promise<void>) | undefined
 }): ReactNode {
   const [using, setUsing] = useState<string | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
+  // The host being asked about, and the one being forgotten. Forgetting is asked twice: this
+  // computer cannot pair with the host again from here, so the first press only asks.
+  const [asking, setAsking] = useState<string | null>(null)
+  const [forgetting, setForgetting] = useState<string | null>(null)
+  const [forgetFailure, setForgetFailure] = useState<string | null>(null)
+  const keep = useRef<HTMLButtonElement>(null)
+  const forgetButtons = useRef(new Map<string, HTMLButtonElement>())
+  const restore = useRef<string | null>(null)
+
+  // Focus follows the question: to the safe answer when it opens, and back to the host's own
+  // control when it closes without an answer.
+  useEffect(() => {
+    if (asking !== null) {
+      keep.current?.focus()
+      return
+    }
+    if (restore.current !== null) {
+      forgetButtons.current.get(restore.current)?.focus()
+      restore.current = null
+    }
+  }, [asking])
+
   return (
     <section aria-labelledby="paired-hosts" className="pairing-section">
       <h2 id="paired-hosts">Paired hosts</h2>
@@ -646,28 +686,94 @@ function PairedHosts({
                 {host.in_contact ? 'In contact' : 'Not in contact'}
               </span>
             )}
-            {chooseHost === undefined ? null : host.in_use ? (
-              <span className="small muted" data-testid="host-in-use">
-                In use
-              </span>
-            ) : (
-              <Button
-                disabled={using !== null}
-                data-testid="use-host"
-                onClick={() => {
-                  setUsing(host.reference)
-                  setFailure(null)
-                  chooseHost(host.reference)
-                    .catch((error: unknown) => {
-                      setFailure(failureMessage(error))
-                    })
-                    .finally(() => {
-                      setUsing(null)
-                    })
-                }}
+            {asking === host.reference && forgetHost !== undefined ? (
+              <div
+                className="paired-host-ask"
+                role="group"
+                aria-label={`Forget ${host.name}`}
+                data-testid="forget-host-ask"
               >
-                {using === host.reference ? 'Reaching the host' : 'Use this host'}
-              </Button>
+                <p className="small">
+                  Forget {host.name}? This phone stops listing it and must pair with it again.
+                </p>
+                <div className="row wrap">
+                  <Button
+                    ref={keep}
+                    data-testid="keep-host"
+                    onClick={() => {
+                      restore.current = host.reference
+                      setAsking(null)
+                    }}
+                  >
+                    Keep it
+                  </Button>
+                  <Button
+                    tone="danger"
+                    data-testid="forget-host-confirm"
+                    disabled={forgetting !== null}
+                    onClick={() => {
+                      setForgetting(host.reference)
+                      setForgetFailure(null)
+                      forgetHost(host)
+                        .then(() => {
+                          setAsking(null)
+                        })
+                        .catch((error: unknown) => {
+                          setForgetFailure(failureMessage(error))
+                        })
+                        .finally(() => {
+                          setForgetting(null)
+                        })
+                    }}
+                  >
+                    {forgetting === host.reference ? 'Forgetting' : 'Forget'}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
+                {chooseHost === undefined ? null : host.in_use ? (
+                  <span className="small muted" data-testid="host-in-use">
+                    In use
+                  </span>
+                ) : (
+                  <Button
+                    disabled={using !== null}
+                    data-testid="use-host"
+                    onClick={() => {
+                      setUsing(host.reference)
+                      setFailure(null)
+                      chooseHost(host.reference)
+                        .catch((error: unknown) => {
+                          setFailure(failureMessage(error))
+                        })
+                        .finally(() => {
+                          setUsing(null)
+                        })
+                    }}
+                  >
+                    {using === host.reference ? 'Reaching the host' : 'Use this host'}
+                  </Button>
+                )}
+                {forgetHost === undefined ? null : (
+                  <Button
+                    ref={(button) => {
+                      if (button === null) forgetButtons.current.delete(host.reference)
+                      else forgetButtons.current.set(host.reference, button)
+                    }}
+                    tone="quiet"
+                    aria-label={`Forget ${host.name}`}
+                    data-testid="forget-host"
+                    disabled={using !== null}
+                    onClick={() => {
+                      setForgetFailure(null)
+                      setAsking(host.reference)
+                    }}
+                  >
+                    Forget
+                  </Button>
+                )}
+              </>
             )}
           </li>
         ))}
@@ -675,6 +781,11 @@ function PairedHosts({
       {failure === null ? null : (
         <p role="alert" className="small" data-testid="use-host-failure">
           {failure}
+        </p>
+      )}
+      {forgetFailure === null ? null : (
+        <p role="alert" className="small danger-text" data-testid="forget-host-failure">
+          {forgetFailure}
         </p>
       )}
     </section>

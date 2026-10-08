@@ -358,6 +358,8 @@ export interface FakeHostControls {
   setPairing(change: Partial<PairingView>): void
   /** The references the page asked to use as the host its commands go to, in order. */
   readonly usedHosts: string[]
+  /** The references the person forgot, in order. */
+  readonly forgottenHosts: string[]
   /**
    * Has the host refuse the voice preparation until the person has allowed voice, as a host that
    * holds no voice grant for this device does; allowing it lifts the refusal. `reason` is the
@@ -628,6 +630,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const voiceStarts: VoiceStartRequest[] = []
   const voiceAllows: VoiceAllowRequest[] = []
   const usedHosts: string[] = []
+  const forgottenHosts: string[] = []
   /** The words the host refuses a preparation with while no voice grant stands, or none. */
   let voiceGrantMissing: string | null = null
   let voiceAllowFailure: string | null = null
@@ -1267,6 +1270,19 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       for (const listener of connectionListeners) listener(connectionNow())
       return Promise.resolve(connectionNow())
     },
+    hostsForget: (reference) => {
+      const forgotten = pairing.hosts.find((host) => host.reference === reference)
+      if (forgotten === undefined) {
+        refuse('INVALID_ARGUMENT', 'This computer is not paired with that host.')
+      }
+      forgottenHosts.push(reference)
+      publishPairing({ hosts: pairing.hosts.filter((host) => host.reference !== reference) })
+      if (forgotten.in_use) {
+        connected = false
+        for (const listener of connectionListeners) listener(connectionNow())
+      }
+      return Promise.resolve(connectionNow())
+    },
     onPairing: (listener) => register(pairingListeners, listener),
     ownerConfirmations: () => Promise.resolve(owner),
     ownerConfirmationReview: (reference) => {
@@ -1654,6 +1670,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       qualifiedShell = false
     },
     usedHosts,
+    forgottenHosts,
     voiceAllows,
     requireVoiceGrant(reason = 'PERMISSION_DENIED: no voice grant covers this device') {
       voiceGrantMissing = reason

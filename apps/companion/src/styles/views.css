@@ -1253,6 +1253,28 @@
   list-style: none;
 }
 
+/*
+ * A host's row is its name and what it may do, then what a person can do with it. At a larger text
+ * size the controls wrap beneath the name instead of running past the screen's edge, and the
+ * question about forgetting a host takes the row's whole width.
+ */
+.paired-hosts .divided-row {
+  flex-wrap: wrap;
+}
+
+.paired-hosts .divided-row > .spacer {
+  flex: 1 1 10rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.paired-host-ask {
+  display: flex;
+  flex: 1 1 100%;
+  flex-direction: column;
+  gap: var(--gap-2);
+}
+
 /* ---- The owner's confirmations -------------------------------------------------------------- */
 
 .confirmations {
