@@ -28,6 +28,7 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
 
+use kr_ipc::floor::Establishment;
 use kr_protocol::action::{
     ExpirationTombstone, ExpiryReason, HostTimeState, MAX_WALL_CLOCK_ROLLBACK_MS, ProvenWallClock,
     RetrustEvidence, TimeAdapterReading, TimeCheckpoint, WallClockTrust,
@@ -377,8 +378,17 @@ struct TimeState {
     /// confirmation, and at a rollback its own detector finds: a restatement adds nothing to what
     /// the worker found, so it clears neither. A look that finds nothing, or half of a
     /// publication, leaves it in force. A contract that restored a record never has it, and takes
-    /// only an action of the owner made after.
+    /// only an action of the owner made after it restored.
     adopting: bool,
+    /// The rollback this contract found and has not had answered, if it did.
+    ///
+    /// A contract that distrusts its clock because of a rollback keeps what it knows of when it
+    /// found it, so that an older confirmation cannot clear it afterwards, whether that
+    /// confirmation is met in the look that found the rollback, in a later one, or after a
+    /// restart. A contract that restored a distrusted record holds one from the moment it
+    /// restored, since it cannot tell what the distrust rests on. It is dropped when the clock is
+    /// trusted again.
+    rollback: Option<Rollback>,
     trust: WallClockTrust,
     checkpoint: Option<TimeCheckpoint>,
     revalidation_owed: bool,
@@ -418,6 +428,65 @@ impl HighWater {
             continuous_now.saturating_sub(self.continuous_ms),
         ))
     }
+}
+
+/// What a rollback is measured against, and when it was proved.
+#[derive(Clone, Copy, Debug)]
+struct Reference {
+    /// The earliest the wall clock can honestly read at the continuous reading it was asked for.
+    wall_ms: u64,
+    /// The continuous reading of this boot at which the clock was proved to read it, or nought
+    /// when that was in an earlier boot.
+    proved_at: u64,
+}
+
+/// A rollback this contract found, and what the owner's confirmation has to be to answer it.
+///
+/// The rollback happened after the clock was last proved and before the look that found it, so a
+/// confirmation made before the clock was last proved cannot have seen it. One made between the
+/// two is an answer only if the clock that look read agrees with it: a clock that is a minute
+/// behind what the owner said, after the owner said it, is a rollback the owner did not see.
+#[derive(Clone, Copy, Debug)]
+struct Rollback {
+    /// The continuous reading of this boot at which the clock was last proved before the rollback.
+    proved_at: u64,
+    /// The continuous reading of the look that found the rollback.
+    found_at: u64,
+    /// The wall reading that look took, when it took one. A contract that restored a distrusted
+    /// record knows no such reading, and answers only to a confirmation made after it restored.
+    found_wall_ms: Option<u64>,
+}
+
+impl Rollback {
+    /// Returns the rollback a look at `continuous_ms` found at `wall_ms` against a reading proved
+    /// at `proved_at`, joined to one already found: the later the clock was proved, the fewer the
+    /// confirmations that can have seen the rollback.
+    fn found(earlier: Option<Self>, proved_at: u64, continuous_ms: u64, wall_ms: u64) -> Self {
+        Self {
+            proved_at: earlier.map_or(proved_at, |earlier| earlier.proved_at.max(proved_at)),
+            found_at: continuous_ms,
+            found_wall_ms: Some(wall_ms),
+        }
+    }
+
+    /// Whether `established` answers this rollback.
+    fn is_answered_by(&self, established: &Establishment) -> bool {
+        established.boot_ms > self.proved_at
+            && (established.boot_ms > self.found_at
+                || self.found_wall_ms.is_some_and(|wall_ms| {
+                    !behind_the_confirmation(established, self.found_at, wall_ms)
+                }))
+    }
+}
+
+/// Whether a wall reading taken at `continuous_ms` is behind the owner's confirmation, carried
+/// forward by the continuous clock, by more than the rollback tolerance and the rate allowance.
+fn behind_the_confirmation(established: &Establishment, continuous_ms: u64, wall_ms: u64) -> bool {
+    let elapsed = continuous_ms.saturating_sub(established.boot_ms);
+    let expected = established.wall_ms.saturating_add(elapsed);
+    let slack = MAX_WALL_CLOCK_ROLLBACK_MS
+        .saturating_add(elapsed.saturating_sub(kr_ipc::clock::credited(elapsed)));
+    wall_ms.saturating_add(slack) < expected
 }
 
 /// The three clocks and the time service a contract reads, and the host's clock floor it
@@ -602,6 +671,16 @@ impl TimeContract {
         let owner_confirmed_at_restore =
             recorded.as_ref().is_some_and(|state| state.owner_confirmed);
         let adopting = recorded.is_none();
+        // A distrusted record may rest on a rollback, and nothing recorded says when it was found:
+        // only a confirmation made after this contract restored can be an answer to it.
+        let rollback = recorded
+            .as_ref()
+            .filter(|state| state.trust == WallClockTrust::Unresolved)
+            .map(|_| Rollback {
+                proved_at: now_continuous,
+                found_at: now_continuous,
+                found_wall_ms: None,
+            });
         let followed = if recorded.is_some() {
             floor
                 .as_ref()
@@ -637,6 +716,7 @@ impl TimeContract {
                 restored: high_water,
                 followed,
                 adopting,
+                rollback,
                 owner_confirmed: owner_confirmed_at_restore,
                 saved: high_water,
                 trust,
@@ -791,17 +871,23 @@ impl TimeContract {
         } else {
             MAX_WALL_CLOCK_ROLLBACK_MS
         };
-        if let Some(mark) = state.high_water {
-            let projected = mark.projected(continuous_ms);
-            found.rolled_back = projected.saturating_sub(wall_ms) > tolerance;
-        } else if let Some(checkpoint) = state.checkpoint.as_ref() {
-            // A checkpoint from before a reboot. The continuous clock restarted, so the only
-            // comparison left is against the mark itself: a wall clock reading before it has gone
-            // backwards.
-            found.rolled_back = checkpoint.wall_clock_ms.get().saturating_sub(wall_ms) > tolerance;
+        let reference = self.reference(&state, continuous_ms);
+        if let Some(reference) = reference {
+            found.rolled_back = reference.wall_ms.saturating_sub(wall_ms) > tolerance;
         }
 
         state.last = Some(now);
+        if let Some(reference) = reference.filter(|_| found.rolled_back) {
+            // What the worker found ends what it can take from a restatement, and is not
+            // answered by a confirmation older than the rollback.
+            state.adopting = false;
+            state.rollback = Some(Rollback::found(
+                state.rollback,
+                reference.proved_at,
+                continuous_ms,
+                wall_ms,
+            ));
+        }
         if found.rolled_back && state.trust != WallClockTrust::Unresolved {
             state.trust = WallClockTrust::Unresolved;
             // Whatever restored the trust, a clock that went backwards is not the clock that was
@@ -878,7 +964,7 @@ impl TimeContract {
             state.trust = WallClockTrust::Unresolved;
             state.critical = state.critical.saturating_add(1);
         }
-        self.follow_the_owner(&mut state, &reading, found.rolled_back);
+        self.follow_the_owner(&mut state, &reading);
         let trust = state.trust;
         drop(state);
 
@@ -889,6 +975,32 @@ impl TimeContract {
             self.checkpoint_at(reading);
         }
         found
+    }
+
+    /// Returns what a rollback is measured against, if this contract has anything.
+    ///
+    /// It is the mark carried forward by the continuous clock. A contract that never trusted its
+    /// clock has no mark, and then it is the checkpoint it began with, as it stands: after a
+    /// reboot the continuous clock restarted, so the only comparison left is the reading itself,
+    /// and a wall clock reading before it has gone backwards. The look that finds a rollback and
+    /// the check that spends a confirmation compare against this one reading.
+    fn reference(&self, state: &TimeState, continuous_ms: u64) -> Option<Reference> {
+        state
+            .high_water
+            .map(|mark| Reference {
+                wall_ms: mark.projected(continuous_ms),
+                proved_at: mark.continuous_ms,
+            })
+            .or_else(|| {
+                state.checkpoint.as_ref().map(|checkpoint| Reference {
+                    wall_ms: checkpoint.wall_clock_ms.get(),
+                    proved_at: if checkpoint.boot_identity == self.boot_identity {
+                        checkpoint.continuous_ms.get()
+                    } else {
+                        0
+                    },
+                })
+            })
     }
 
     /// Returns the earliest the wall clock can honestly read now.
@@ -1218,6 +1330,7 @@ impl TimeContract {
         state.critical = state.critical.saturating_add(1);
         state.trust = WallClockTrust::Trusted;
         state.owner_confirmed = owner;
+        state.rollback = None;
         state.checkpoint = Some(checkpoint.clone());
         state.high_water = Some(HighWater {
             wall_ms,
@@ -1237,11 +1350,17 @@ impl TimeContract {
     /// its own record distrusts the clock. What the owner said is what the time was then, so the
     /// worker's own wall clock has to read that carried forward by the continuous time since, or
     /// later: it may be behind it by no more than the rollback tolerance and the rate allowance.
-    /// A reading the worker took after the confirmation outranks it in the same way: a wall clock
-    /// that has fallen behind the worker's own mark, when that mark was raised after the owner
-    /// spoke, is a rollback the owner did not see, and an older confirmation does not clear what
-    /// the worker found after it. A restatement answers to the mark whatever its age, since it
-    /// adds nothing to what the worker knows.
+    ///
+    /// A rollback the worker found is answered only by a confirmation that can have seen it
+    /// ([`Rollback::is_answered_by`]): one made after the clock was last proved, and after the
+    /// look that found the rollback or agreeing with the clock that look read. An older
+    /// confirmation does not clear it, whether it is met in that look, in a later one, or after a
+    /// restart, and the clock reading right again by the second reading of the look does not
+    /// change that. The worker's mark, or its checkpoint when it has no mark, outranks a
+    /// confirmation made before that reading was proved in the same way: a wall clock behind it at
+    /// the second reading is a rollback the owner did not see. A restatement answers to that
+    /// reading whatever its age, since it adds nothing to what the worker knows, and never lowers
+    /// it.
     ///
     /// A wall clock behind either is a rollback since, and the confirmation is spent all the same,
     /// because one a worker met and could not follow is not one it follows when the clock next
@@ -1264,16 +1383,8 @@ impl TimeContract {
     /// found no rollback and is making its first look at a confirmation takes it. One that has
     /// looked at a confirmation, that found a rollback, or that restored a record, spends it
     /// without following it: a restatement over a withdrawal whose distrust the daemon lost clears
-    /// nothing a worker found. One that takes it answers to its own mark, as above.
-    fn follow_the_owner(
-        &self,
-        state: &mut TimeState,
-        reading: &TimeAdapterReading,
-        rolled_back: bool,
-    ) {
-        if rolled_back {
-            state.adopting = false;
-        }
+    /// nothing a worker found.
+    fn follow_the_owner(&self, state: &mut TimeState, reading: &TimeAdapterReading) {
         let Some(established) = self.floor.as_ref().and_then(|floor| floor.established()) else {
             return;
         };
@@ -1287,20 +1398,19 @@ impl TimeContract {
         }
         let continuous_ms = self.continuous.boot_elapsed_ms();
         let wall_ms = self.wall.now_ms().get();
-        let elapsed = continuous_ms.saturating_sub(established.boot_ms);
-        let expected = established.wall_ms.saturating_add(elapsed);
-        let slack = MAX_WALL_CLOCK_ROLLBACK_MS
-            .saturating_add(elapsed.saturating_sub(kr_ipc::clock::credited(elapsed)));
-        let behind_the_confirmation = wall_ms.saturating_add(slack) < expected;
-        // A restatement adds nothing to what the worker knows of its clock, so it answers to the
-        // worker's mark whatever the mark's age. An action of the owner answers only to a mark
-        // raised after the owner spoke.
-        let behind_a_later_mark = state.high_water.is_some_and(|mark| {
-            (established.restated || mark.continuous_ms >= established.boot_ms)
-                && mark.projected(continuous_ms).saturating_sub(wall_ms)
-                    > MAX_WALL_CLOCK_ROLLBACK_MS
+        let reference = self.reference(state, continuous_ms);
+        // A restatement answers to the worker's reading whatever its age. An action of the owner
+        // answers only to one proved after the owner spoke: the owner may be correcting a clock
+        // that ran ahead of the truth.
+        let behind_its_own_reading = reference.is_some_and(|reference| {
+            (established.restated || reference.proved_at >= established.boot_ms)
+                && reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS
         });
-        if behind_the_confirmation || behind_a_later_mark {
+        let behind_the_owner = behind_the_confirmation(&established, continuous_ms, wall_ms);
+        let not_answered = state
+            .rollback
+            .is_some_and(|rollback| !rollback.is_answered_by(&established));
+        if behind_the_owner || behind_its_own_reading || not_answered {
             if state.trust == WallClockTrust::Trusted {
                 state.trust = WallClockTrust::Unresolved;
                 state.owner_confirmed = false;
