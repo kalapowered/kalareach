@@ -9,6 +9,9 @@
 //! | --- | --- |
 //! | KR-REQ-13.08 | `a_paired_host_answers_the_commands_the_page_calls` |
 //! | KR-REQ-13.08 | `a_host_that_comes_back_is_reached_again` |
+//! | KR-REQ-13.08 | `a_host_chosen_before_is_reached_again_when_the_application_starts` |
+//! | KR-REQ-13.08 | `choosing_between_two_paired_hosts_goes_to_the_one_chosen_last` |
+//! | KR-REQ-13.08 | `a_choice_of_host_that_cannot_be_kept_is_not_made` |
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
@@ -43,13 +46,40 @@ impl Ceremony for NoOwner {
     }
 }
 
-/// This computer paired with `host` as a device holding `rights`, by a direct invitation the
-/// person pastes, and the data directory its records live in.
-async fn paired_with(
-    host: &Host,
-    owner: &DeviceKeys,
-    rights: &[ActionRight],
-) -> (Companion, tempfile::TempDir) {
+/// This computer as a phone: its backend, the pasteboard the person copies an invitation to, the
+/// secret store its keys live in and the directory its records live in.
+struct Phone {
+    companion: Companion,
+    paste: Arc<StubPaste>,
+    secrets: Arc<dyn SecretStore>,
+    room: Arc<dyn CandidateRoom>,
+    data: tempfile::TempDir,
+}
+
+/// A phone that has paired with nothing.
+fn unpaired_phone(host: &Host) -> Phone {
+    let data = tempfile::tempdir().expect("a directory");
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
+    let paste = StubPaste::holding("", false);
+    let companion = Companion::start(
+        data.path(),
+        support::parts(Arc::clone(&secrets), Arc::clone(&room)),
+        Arc::new(NoOwner),
+        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::PastePlatform>,
+    );
+    Phone {
+        companion,
+        paste,
+        secrets,
+        room,
+        data,
+    }
+}
+
+/// `phone` paired with `host` as a device holding `rights`, by a direct invitation the person
+/// pastes and the host's owner approves.
+async fn pair(phone: &Phone, host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) {
     let mut client = host.client().await;
     let signer = Signer::OwnerDevice(owner);
     let invited = calls::invite_direct(
@@ -64,15 +94,8 @@ async fn paired_with(
     let InviteEntry::Direct { qr_text } = &invited.entry else {
         panic!("a direct invitation");
     };
-    let data = tempfile::tempdir().expect("a directory");
-    let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
-    let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
-    let companion = Companion::start(
-        data.path(),
-        support::parts(secrets, room),
-        Arc::new(NoOwner),
-        StubPaste::holding(qr_text.as_str(), false),
-    );
+    phone.paste.copy(qr_text.as_str(), false);
+    let companion = &phone.companion;
     companion
         .call("pairing_paste", json!({}))
         .expect("the invitation is read");
@@ -91,7 +114,24 @@ async fn paired_with(
     .await
     .expect("the owner approves");
     companion.reached(|state| state["state"] == "paired").await;
-    (companion, data)
+}
+
+/// A phone paired with `host` as a device holding `rights`.
+async fn phone_paired_with(host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) -> Phone {
+    let phone = unpaired_phone(host);
+    pair(&phone, host, owner, rights).await;
+    phone
+}
+
+/// This computer paired with `host` as a device holding `rights`, and the data directory its
+/// records live in.
+async fn paired_with(
+    host: &Host,
+    owner: &DeviceKeys,
+    rights: &[ActionRight],
+) -> (Companion, tempfile::TempDir) {
+    let phone = phone_paired_with(host, owner, rights).await;
+    (phone.companion, phone.data)
 }
 
 /// The reference the pairing screen gives the one host this computer is paired with.
@@ -327,6 +367,17 @@ async fn a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do() {
         )
         .expect("the person allows the default scope");
     let value = &allowed["value"];
+    let device_id = companion
+        .device()
+        .host_in_use()
+        .expect("the host in use")
+        .device_id
+        .to_string();
+    assert!(
+        !allowed.to_string().contains(&device_id),
+        "the page is not told the identity the host gave this device: {allowed}"
+    );
+    assert!(value.get("device_id").is_none(), "{allowed}");
     let mut stated: Vec<&str> = value["statement"]["actions"]
         .as_array()
         .map_or_else(Vec::new, |each| {
@@ -343,4 +394,188 @@ async fn a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do() {
 
     prepare().expect("the preparation is answered once the grant stands");
     host.stop().await;
+}
+
+/// KR-REQ-13.08: the host a phone's commands went to is the one it reaches when the application
+/// starts again, without the person choosing it again, and the rights are the grant's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_chosen_before_is_reached_again_when_the_application_starts() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    connection(&phone.companion, true).await;
+
+    // The application starts again over the same records and the same secrets.
+    let restarted = Companion::start(
+        phone.data.path(),
+        support::parts(Arc::clone(&phone.secrets), Arc::clone(&phone.room)),
+        Arc::new(NoOwner),
+        StubPaste::holding("", false),
+    );
+    assert_eq!(
+        restarted
+            .call("connection_state", json!({}))
+            .expect("the connection's state")["connected"],
+        false,
+        "nothing is reached until the application takes the host up"
+    );
+    companion_tauri::hosts::resume(restarted.app.handle());
+    let back = connection(&restarted, true).await;
+    assert_eq!(back["rights"], json!(["session.view"]));
+    restarted
+        .call("session_list", every_session())
+        .expect("the host it chose before answers");
+    host.stop().await;
+}
+
+/// KR-REQ-13.08: with two hosts paired, the commands go to the host chosen last, and the host the
+/// screen says is in use is the host the connection is to, however the choices were made, even two
+/// at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn choosing_between_two_paired_hosts_goes_to_the_one_chosen_last() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = phone_paired_with(&first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    // Pairing with a second host does not take the commands from the first.
+    let state = connection(companion, true).await;
+    assert_eq!(state["environment_id"], first.environment_id.to_string());
+
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let references: Vec<String> = view["hosts"]
+        .as_array()
+        .expect("hosts")
+        .iter()
+        .map(|row| row["reference"].as_str().expect("a reference").to_owned())
+        .collect();
+    assert_eq!(references.len(), 2, "both hosts are listed");
+    // The rows carry no environment, so a host is found by choosing it and asking where the
+    // connection went.
+    let mut by_environment = std::collections::BTreeMap::new();
+    for reference in &references {
+        let used = companion
+            .call("hosts_use", json!({ "reference": reference }))
+            .expect("the host is chosen");
+        assert_eq!(used["connected"], true, "{used}");
+        by_environment.insert(
+            used["environment_id"]
+                .as_str()
+                .expect("environment")
+                .to_owned(),
+            reference.clone(),
+        );
+    }
+    assert_eq!(
+        by_environment.len(),
+        2,
+        "each choice went to a host of its own: {by_environment:?}"
+    );
+
+    // Choices made together are made one after another: when they are done, the host the screen
+    // says is in use is the host the connection is to.
+    let device = companion.device();
+    let host_of = |reference: &String| device.host_by_reference(reference).expect("a paired host");
+    let (a, b) = (host_of(&references[0]), host_of(&references[1]));
+    let handle = companion.app.handle().clone();
+    for round in 0..8 {
+        let (x, y) = if round % 2 == 0 {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        };
+        let (h1, h2) = (handle.clone(), handle.clone());
+        let (one, two) = tokio::join!(
+            tokio::spawn(async move { companion_tauri::hosts::use_host(&h1, x).await }),
+            tokio::spawn(async move { companion_tauri::hosts::use_host(&h2, y).await }),
+        );
+        one.expect("the first choice ran")
+            .expect("a choice is answered");
+        two.expect("the second choice ran")
+            .expect("a choice is answered");
+        let state = connection(companion, true).await;
+        let view = companion
+            .call("pairing_view", json!({}))
+            .expect("the pairing screen");
+        let in_use: Vec<&str> = view["hosts"]
+            .as_array()
+            .expect("hosts")
+            .iter()
+            .filter(|row| row["in_use"] == true)
+            .map(|row| row["reference"].as_str().expect("a reference"))
+            .collect();
+        assert_eq!(in_use.len(), 1, "one host is in use: {view}");
+        let environment = state["environment_id"].as_str().expect("an environment");
+        assert_eq!(
+            by_environment.get(environment).map(String::as_str),
+            Some(in_use[0]),
+            "round {round}: the connection is to the host the screen says is in use"
+        );
+    }
+    first.stop().await;
+    second.stop().await;
+}
+
+/// KR-REQ-13.08: a choice of host that could not be kept for the next run is not made: the answer
+/// is a failure, the host in use is the one before, and the commands still go there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_of_host_that_cannot_be_kept_is_not_made() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = phone_paired_with(&first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let other = view["hosts"]
+        .as_array()
+        .expect("hosts")
+        .iter()
+        .find(|row| row["in_use"] == false)
+        .and_then(|row| row["reference"].as_str())
+        .expect("the host not in use")
+        .to_owned();
+
+    // A directory stands where the choice is written before it replaces the old one.
+    let blocked = phone.data.path().join("command-host.new");
+    std::fs::create_dir(&blocked).expect("the file's place is taken");
+    let refused = companion
+        .call("hosts_use", json!({ "reference": other }))
+        .expect_err("the choice cannot be kept");
+    assert_eq!(refused["code"], "RESOURCE_UNAVAILABLE", "{refused}");
+    let after = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    assert_eq!(
+        after["hosts"]
+            .as_array()
+            .expect("hosts")
+            .iter()
+            .find(|row| row["reference"] == other.as_str())
+            .map(|row| row["in_use"].clone()),
+        Some(json!(false)),
+        "the host that was not chosen is still not in use"
+    );
+    assert_eq!(
+        companion
+            .call("connection_state", json!({}))
+            .expect("the connection's state")["environment_id"],
+        first.environment_id.to_string(),
+        "the commands still go to the host before"
+    );
+
+    std::fs::remove_dir(&blocked).expect("the place is free");
+    let used = companion
+        .call("hosts_use", json!({ "reference": other }))
+        .expect("the choice is kept now");
+    assert_eq!(used["environment_id"], second.environment_id.to_string());
+    first.stop().await;
+    second.stop().await;
 }

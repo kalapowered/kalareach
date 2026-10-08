@@ -293,6 +293,34 @@ native code does the rest with `kr-client`'s pairing module:
   `pairing`, each written whole and renamed into place. They hold no secret.
 - The service it pairs through is `https://reach.kala.to` until the person picks another, and the
   choice is kept in `pairing-origin`.
+- The host its commands go to is kept in `command-host`, written whole and renamed into place, and a
+  choice that could not be kept is not made.
+
+## Where a phone's commands go
+
+A phone has no host of its own. It pairs with one, and from then on the commands the page calls are
+asked of a host it is paired with, over the connection this device is authorised for, with the
+rights its grant carries and no more (`src-tauri/src/hosts.rs`). The first host a phone pairs with
+becomes the one in use, and the Hosts screen lists every host it is paired with, each with "Use this
+host"; a computer that reaches a host of its own keeps that one until a host is chosen. The choice
+is remembered across runs and taken up again when the application starts.
+
+The application says what is true at each moment, as `connection_state` and the `kr://connection`
+event: connected, with the rights, or not connected, with why. A connection that ends is taken up
+again after a pause that grows while the host does not answer, a host that accepts a connection and
+then closes it is waited for as one that does not answer, and a command made while there is no
+connection is refused as such. Each choice of host has a number, and a task that keeps the
+connection of an earlier choice can neither install its connection nor record its loss once a
+later one is made. The Sessions and Hosts screens read their lists again each time the connection
+comes or goes, and show nothing of a host that is not the one reached.
+
+Voice on a phone starts with a question: a host that holds no voice grant for the device refuses a
+preparation, and the voice screen shows the host's words, every action the default grant permits
+in the sentence the protocol states it in, and the sessions to choose. Allowing sends the sessions
+and the default actions to the host as this device's own grant, which native code names, so the
+page never holds the identity the host gave the device. The answer states what the grant permits
+and any action the device's own access does not include, which the person reads before the call
+is shown. The allowance stays until the person changes it.
 
 An invitation on the pasteboard is read by native code, not by the page. A code invitation that
 names a service other than this computer's raises the system's own alert, modal to the companion's
@@ -300,6 +328,11 @@ window, before anything connects there. The alert names both services, and decli
 nowhere. Each change reaches the page as a view on the `kr://pairing` event. The page reads each
 view, and the connection's state for the indicator in its top bar, only once its listener is
 registered, and keeps a change it heard over a read that answers later.
+
+`src-tauri/tests/paired_host.rs` pairs a phone with kr-controller's in-process host and then reads
+through the paired connection: the host chosen first, the commands the grant allows and refuses,
+a host lost and reached again, a host remembered across a restart, two hosts chosen between, one at
+a time and two at once, and a choice that could not be kept.
 
 `src-tauri/tests/pairing.rs` pairs this computer both ways against kr-controller's in-process host,
 confirms one request as its owner and declines another. It calls the pairing commands the way the
