@@ -21,6 +21,7 @@ use serde::Serialize;
 use crate::evidence::{self, Figure, KnownDifference};
 use crate::id::{Family, Identifier};
 use crate::identity::{self, Commit, PackageVersion, System, TerminalProfile, Toolchain};
+use crate::lane;
 use crate::libtest::Outcome as LibtestOutcome;
 use crate::map::{self, Binding, Declarations, Map, Place, Reference};
 use crate::plan::{self, ApplicationsPlan, Group, Platform};
@@ -523,8 +524,9 @@ pub fn assemble(
     let Gathered {
         mut figures,
         known,
-        problems,
+        mut problems,
     } = gathered;
+    problems.extend(unowned_lane_cases(options, map, executed));
     let resolver = Resolver::new(options, groups, map, executed, &known);
     // The identifiers of each test that recorded a known difference.
     let mut recorded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -634,6 +636,12 @@ pub fn assemble(
         .map(|(index, _)| index + 1)
         .collect();
     let typescript = groups.contains(&Group::TypeScript) && options.platform != Platform::Windows;
+    let mut toolchain = identity::toolchain(&options.root, typescript);
+    for step in executed {
+        if matches!(step.step.reading, plan::Reading::Lane(_)) {
+            toolchain.phones.extend(step.tools.iter().cloned());
+        }
+    }
     let mut packages: Vec<PackageVersion> = map
         .packages
         .iter()
@@ -656,7 +664,7 @@ pub fn assemble(
             platform: options.platform.name().to_owned(),
             system: identity::system(&options.root),
             commit: identity::commit(&options.root),
-            toolchain: identity::toolchain(&options.root, typescript),
+            toolchain,
             terminal_profile: identity::terminal_profile(&options.root),
             packages,
             applications: options.applications.clone(),
@@ -701,6 +709,48 @@ pub fn assemble(
         warnings: map.warnings.clone(),
         summary,
     }
+}
+
+/// What is wrong with the cases a lane's tool reported: each belongs to exactly one file of the
+/// lane, the file that declares its class. A case that no file declares, or that two declare,
+/// cannot be keyed to a row, so the result is not complete.
+fn unowned_lane_cases(options: &Options, map: &Map, executed: &[Executed]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, step) in executed.iter().enumerate() {
+        let (Some(cases), plan::Reading::Lane(tests)) = (&step.lane, &step.step.reading) else {
+            continue;
+        };
+        let files: Vec<&Vec<String>> = map
+            .lane_classes
+            .iter()
+            .filter(|(file, _)| {
+                options
+                    .lanes
+                    .iter()
+                    .any(|lane| lane.reads == Some(*tests) && plan::matches(lane.files, file))
+            })
+            .map(|(_, classes)| classes)
+            .collect();
+        let classes: BTreeSet<&str> = cases.iter().map(|case| case.class.as_str()).collect();
+        for class in classes {
+            match files
+                .iter()
+                .filter(|declared| lane::declares(declared, class))
+                .count()
+            {
+                1 => {}
+                0 => problems.push(format!(
+                    "step {}: the lane reported {class}, which no file of the lane declares",
+                    index + 1
+                )),
+                _ => problems.push(format!(
+                    "step {}: the lane reported {class}, which more than one file of the lane declares",
+                    index + 1
+                )),
+            }
+        }
+    }
+    problems
 }
 
 /// Resolves keyed places to outcomes against what ran.
@@ -759,9 +809,8 @@ impl<'a> Resolver<'a> {
             Place::Rust { target, .. } | Place::RustModule { target, .. } => {
                 self.ran.contains_key(target) || self.built.contains(target)
             }
-            Place::TypeScript { .. } | Place::Lane { .. } => {
-                self.groups.contains(&Group::TypeScript)
-            }
+            Place::TypeScript { .. } => self.groups.contains(&Group::TypeScript),
+            Place::Lane { .. } => self.groups.contains(&Group::Phones),
         }
     }
 
@@ -779,18 +828,140 @@ impl<'a> Resolver<'a> {
                 line,
                 title,
             } => self.typescript(package, file, *line, title, key),
-            Place::Lane { file, reason } => vec![TestRecord {
-                test: file.clone(),
-                source: key.source.clone(),
-                keyed_by: key.binding,
-                outcome: Outcome::NotBuilt,
-                reason: Some(reason.clone()),
-                runs: Vec::new(),
-                command: None,
-                needs: Vec::new(),
-                known_differences: Vec::new(),
-            }],
+            Place::Lane { file, reason } => self.lane(file, reason, key),
         }
+    }
+
+    /// The records of one keyed file of a phone lane: one for each case the lane's tool reported
+    /// for a class the file declares; or one, when this run's platform does not run the lane, when
+    /// the lane's tool reported nothing, or when it reported nothing of this file.
+    fn lane(&self, file: &str, reason: &str, key: &map::Key) -> Vec<TestRecord> {
+        let record = |test: String,
+                      outcome: Outcome,
+                      reason: Option<String>,
+                      runs: Vec<RunRecord>,
+                      command: Option<String>| TestRecord {
+            test,
+            source: key.source.clone(),
+            keyed_by: key.binding,
+            outcome,
+            reason,
+            runs,
+            command,
+            needs: Vec::new(),
+            known_differences: Vec::new(),
+        };
+        let reads = self
+            .options
+            .lanes
+            .iter()
+            .find(|lane| plan::matches(lane.files, file))
+            .and_then(|lane| lane.reads);
+        let step = reads.and_then(|reads| {
+            self.executed.iter().enumerate().find(
+                |(_, step)| matches!(step.step.reading, plan::Reading::Lane(tests) if tests == reads),
+            )
+        });
+        let Some((index, step)) = step else {
+            return vec![record(
+                file.to_owned(),
+                Outcome::NotRun,
+                Some(reason.to_owned()),
+                Vec::new(),
+                None,
+            )];
+        };
+        let failed = |why: String| {
+            let run = RunRecord {
+                step: index + 1,
+                outcome: Outcome::Failed,
+                reason: Some(why.clone()),
+            };
+            vec![record(
+                file.to_owned(),
+                Outcome::Failed,
+                Some(why),
+                vec![run],
+                None,
+            )]
+        };
+        let Some(cases) = &step.lane else {
+            return failed(format!(
+                "the lane's tests did not report: {}",
+                step.error.clone().unwrap_or_default()
+            ));
+        };
+        let declared = self
+            .map
+            .lane_classes
+            .get(file)
+            .map_or(&[][..], Vec::as_slice);
+        let own: Vec<&lane::Case> = cases
+            .iter()
+            .filter(|case| lane::declares(declared, &case.class))
+            .collect();
+        if own.is_empty() {
+            return failed(
+                "the lane ran, and its results hold no test of this file's classes".to_owned(),
+            );
+        }
+        own.into_iter()
+            .map(|case| {
+                let run = match &case.outcome {
+                    LibtestOutcome::Passed => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::Passed,
+                        reason: None,
+                    },
+                    LibtestOutcome::Failed => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::Failed,
+                        reason: None,
+                    },
+                    LibtestOutcome::Ignored(reason) => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::Ignored,
+                        reason: reason.clone(),
+                    },
+                    LibtestOutcome::Skipped(line) => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::NotRun,
+                        reason: Some(format!("it returned early and said why: {line}")),
+                    },
+                };
+                // The step's own command, less the place it leaves its results, narrowed to the one
+                // case: each script passes what follows `--` on to its tool.
+                let mut words: Vec<String> = step
+                    .step
+                    .command
+                    .iter()
+                    .filter(|word| !word.starts_with("--results="))
+                    .cloned()
+                    .collect();
+                words.push("--".to_owned());
+                match reads {
+                    Some(plan::Tests::Xcode) => {
+                        words.push(format!("-only-testing:{}", case.selector))
+                    }
+                    _ => {
+                        words.push("--tests".to_owned());
+                        words.push(case.selector.clone());
+                    }
+                }
+                let command = words
+                    .iter()
+                    .map(|word| plan::quote(word))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                record(
+                    format!("{file} {}.{}", case.class, case.name),
+                    run.outcome.clone(),
+                    run.reason.clone(),
+                    vec![run],
+                    Some(command),
+                )
+            })
+            .collect()
     }
 
     /// Every test in a module of a target: what its sources declare and what its binaries listed.
@@ -986,9 +1157,11 @@ impl<'a> Resolver<'a> {
                 failed.error.clone().unwrap_or_default()
             );
         }
+        // Only the groups that run Rust targets say why a Rust target was not run.
         let absent = self
             .groups
             .iter()
+            .filter(|group| matches!(group, Group::EndToEnd | Group::Performance))
             .find_map(|group| plan::group_absent_reason(*group, self.options.platform));
         match (target.kind, absent) {
             (TargetKind::Bench, _) => format!(
@@ -1232,6 +1405,15 @@ impl<'a> Resolver<'a> {
                             .map_or_else(|| binary.executable.clone(), ToString::to_string);
                         failed.insert(format!("step {}: {where_} {name}", index + 1));
                     }
+                }
+            }
+            for case in step.lane.iter().flatten() {
+                let keyed_class = map.keys.values().flat_map(|places| places.keys()).any(|place| {
+                    matches!(place, Place::Lane { file, .. }
+                        if map.lane_classes.get(file).is_some_and(|classes| lane::declares(classes, &case.class)))
+                });
+                if case.outcome == LibtestOutcome::Failed && !keyed_class {
+                    failed.insert(format!("step {}: {} {}", index + 1, case.class, case.name));
                 }
             }
             if let Some(results) = &step.vitest {

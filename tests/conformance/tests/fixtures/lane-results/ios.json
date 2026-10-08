@@ -1,0 +1,525 @@
+{
+  "devices": [
+    {
+      "architecture": "arm64",
+      "deviceId": "00000000-0000-0000-0000-000000000000",
+      "deviceName": "iPhone 17",
+      "modelName": "iPhone 17",
+      "osBuildNumber": "23F77",
+      "osVersion": "26.5",
+      "platform": "iOS Simulator"
+    }
+  ],
+  "testNodes": [
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "duration": "0.0046s",
+                  "durationInSeconds": 0.00460207462310791,
+                  "name": "testABuildWithoutConfigurationLeavesFirebaseAlone()",
+                  "nodeIdentifier": "LaunchPlanTests/testABuildWithoutConfigurationLeavesFirebaseAlone()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testABuildWithoutConfigurationLeavesFirebaseAlone",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00097s",
+                  "durationInSeconds": 0.0009739398956298828,
+                  "name": "testAConfigurationFirebaseCannotStartFromLeavesFirebaseAloneAndSaysWhy()",
+                  "nodeIdentifier": "LaunchPlanTests/testAConfigurationFirebaseCannotStartFromLeavesFirebaseAloneAndSaysWhy()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testAConfigurationFirebaseCannotStartFromLeavesFirebaseAloneAndSaysWhy",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00037s",
+                  "durationInSeconds": 0.0003739595413208008,
+                  "name": "testALaunchWithConfigurationStartsPushWithoutAskingForAnything()",
+                  "nodeIdentifier": "LaunchPlanTests/testALaunchWithConfigurationStartsPushWithoutAskingForAnything()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testALaunchWithConfigurationStartsPushWithoutAskingForAnything",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00034s",
+                  "durationInSeconds": 0.00034308433532714844,
+                  "name": "testAnotherModeRunsAfterPushHasStarted()",
+                  "nodeIdentifier": "LaunchPlanTests/testAnotherModeRunsAfterPushHasStarted()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testAnotherModeRunsAfterPushHasStarted",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00034s",
+                  "durationInSeconds": 0.0003399848937988281,
+                  "name": "testASettingThisCodeDoesNotKnowWaitsRatherThanAgrees()",
+                  "nodeIdentifier": "LaunchPlanTests/testASettingThisCodeDoesNotKnowWaitsRatherThanAgrees()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testASettingThisCodeDoesNotKnowWaitsRatherThanAgrees",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.001s",
+                  "durationInSeconds": 0.0010440349578857422,
+                  "name": "testAutoInitFollowsTheCurrentPermissionEveryLaunch()",
+                  "nodeIdentifier": "LaunchPlanTests/testAutoInitFollowsTheCurrentPermissionEveryLaunch()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testAutoInitFollowsTheCurrentPermissionEveryLaunch",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0024s",
+                  "durationInSeconds": 0.002400994300842285,
+                  "name": "testNoPlanEverAsksForAPermission()",
+                  "nodeIdentifier": "LaunchPlanTests/testNoPlanEverAsksForAPermission()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testNoPlanEverAsksForAPermission",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0018s",
+                  "durationInSeconds": 0.0017969608306884766,
+                  "name": "testRegistrationForRemoteNotificationsNeedsNoPermission()",
+                  "nodeIdentifier": "LaunchPlanTests/testRegistrationForRemoteNotificationsNeedsNoPermission()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testRegistrationForRemoteNotificationsNeedsNoPermission",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0011s",
+                  "durationInSeconds": 0.00109100341796875,
+                  "name": "testTheCountAndSweepModesRunBeforeAnythingCanWriteAndNothingElseRuns()",
+                  "nodeIdentifier": "LaunchPlanTests/testTheCountAndSweepModesRunBeforeAnythingCanWriteAndNothingElseRuns()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testTheCountAndSweepModesRunBeforeAnythingCanWriteAndNothingElseRuns",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0023s",
+                  "durationInSeconds": 0.0023469924926757812,
+                  "name": "testTheSystemsSettingIsReadWithoutAskingAndOnlyAYesAgrees()",
+                  "nodeIdentifier": "LaunchPlanTests/testTheSystemsSettingIsReadWithoutAskingAndOnlyAYesAgrees()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests/testTheSystemsSettingIsReadWithoutAskingAndOnlyAYesAgrees",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ],
+              "name": "LaunchPlanTests",
+              "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/LaunchPlanTests",
+              "nodeType": "Test Suite",
+              "result": "Passed"
+            },
+            {
+              "children": [
+                {
+                  "duration": "0.0028s",
+                  "durationInSeconds": 0.002848029136657715,
+                  "name": "testAChangeAfterTheDeadlineEndsTheCallWhenTheTimerIsLate()",
+                  "nodeIdentifier": "VoiceCallControlTests/testAChangeAfterTheDeadlineEndsTheCallWhenTheTimerIsLate()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testAChangeAfterTheDeadlineEndsTheCallWhenTheTimerIsLate",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0024s",
+                  "durationInSeconds": 0.002429962158203125,
+                  "name": "testActivationThatCrossesTheDeadlineRecordsNothing()",
+                  "nodeIdentifier": "VoiceCallControlTests/testActivationThatCrossesTheDeadlineRecordsNothing()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testActivationThatCrossesTheDeadlineRecordsNothing",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00037s",
+                  "durationInSeconds": 0.0003719329833984375,
+                  "name": "testAnEndedCallStaysEnded()",
+                  "nodeIdentifier": "VoiceCallControlTests/testAnEndedCallStaysEnded()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testAnEndedCallStaysEnded",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.019s",
+                  "durationInSeconds": 0.018640995025634766,
+                  "name": "testAnInterruptionEndsOnTheSystemsWordAndKeepsThePersonsMute()",
+                  "nodeIdentifier": "VoiceCallControlTests/testAnInterruptionEndsOnTheSystemsWordAndKeepsThePersonsMute()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testAnInterruptionEndsOnTheSystemsWordAndKeepsThePersonsMute",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0015s",
+                  "durationInSeconds": 0.001528024673461914,
+                  "name": "testARefusedSessionEndsTheCall()",
+                  "nodeIdentifier": "VoiceCallControlTests/testARefusedSessionEndsTheCall()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testARefusedSessionEndsTheCall",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00098s",
+                  "durationInSeconds": 0.0009829998016357422,
+                  "name": "testAReservationEndsWithItsCallAndAHoldKeepsIt()",
+                  "nodeIdentifier": "VoiceCallControlTests/testAReservationEndsWithItsCallAndAHoldKeepsIt()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testAReservationEndsWithItsCallAndAHoldKeepsIt",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00034s",
+                  "durationInSeconds": 0.0003370046615600586,
+                  "name": "testASecondCallIsRefusedWithoutTouchingTheAudioOfTheFirst()",
+                  "nodeIdentifier": "VoiceCallControlTests/testASecondCallIsRefusedWithoutTouchingTheAudioOfTheFirst()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testASecondCallIsRefusedWithoutTouchingTheAudioOfTheFirst",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00043s",
+                  "durationInSeconds": 0.0004260540008544922,
+                  "name": "testEveryWayIntoTheCallEndsItAfterTheDeadlineWhenTheTimerIsLate()",
+                  "nodeIdentifier": "VoiceCallControlTests/testEveryWayIntoTheCallEndsItAfterTheDeadlineWhenTheTimerIsLate()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testEveryWayIntoTheCallEndsItAfterTheDeadlineWhenTheTimerIsLate",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00032s",
+                  "durationInSeconds": 0.00032198429107666016,
+                  "name": "testNothingRecordsBeforeTheHostPermitsTheCall()",
+                  "nodeIdentifier": "VoiceCallControlTests/testNothingRecordsBeforeTheHostPermitsTheCall()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testNothingRecordsBeforeTheHostPermitsTheCall",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.029s",
+                  "durationInSeconds": 0.029018044471740723,
+                  "name": "testTheApplicationsCallsHaveTheAudioOneAtATime()",
+                  "nodeIdentifier": "VoiceCallControlTests/testTheApplicationsCallsHaveTheAudioOneAtATime()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testTheApplicationsCallsHaveTheAudioOneAtATime",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00049s",
+                  "durationInSeconds": 0.00048601627349853516,
+                  "name": "testTheCallEndsAtItsDeadline()",
+                  "nodeIdentifier": "VoiceCallControlTests/testTheCallEndsAtItsDeadline()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testTheCallEndsAtItsDeadline",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0021s",
+                  "durationInSeconds": 0.002133011817932129,
+                  "name": "testTheSwitchesFollowTheGateInEveryCombination()",
+                  "nodeIdentifier": "VoiceCallControlTests/testTheSwitchesFollowTheGateInEveryCombination()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests/testTheSwitchesFollowTheGateInEveryCombination",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ],
+              "name": "VoiceCallControlTests",
+              "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCallControlTests",
+              "nodeType": "Test Suite",
+              "result": "Passed"
+            },
+            {
+              "children": [
+                {
+                  "duration": "0.0052s",
+                  "durationInSeconds": 0.0051850080490112305,
+                  "name": "testAFutureInstantIsNeverVouchedFor()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testAFutureInstantIsNeverVouchedFor()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testAFutureInstantIsNeverVouchedFor",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.002s",
+                  "durationInSeconds": 0.0020220279693603516,
+                  "name": "testAPermitIsRefusedWhenStaleRepeatedOrAfterAStop()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testAPermitIsRefusedWhenStaleRepeatedOrAfterAStop()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testAPermitIsRefusedWhenStaleRepeatedOrAfterAStop",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00091s",
+                  "durationInSeconds": 0.0009130239486694336,
+                  "name": "testARouteChangeAndAMissingInputKeepCaptureOff()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testARouteChangeAndAMissingInputKeepCaptureOff()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testARouteChangeAndAMissingInputKeepCaptureOff",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00096s",
+                  "durationInSeconds": 0.0009620189666748047,
+                  "name": "testCaptureEndsAtTheDeadlineByItself()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testCaptureEndsAtTheDeadlineByItself()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testCaptureEndsAtTheDeadlineByItself",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0013s",
+                  "durationInSeconds": 0.0012639760971069336,
+                  "name": "testCaptureWaitsForTheRecorderAndEndsWithIt()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testCaptureWaitsForTheRecorderAndEndsWithIt()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testCaptureWaitsForTheRecorderAndEndsWithIt",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0014s",
+                  "durationInSeconds": 0.0014100074768066406,
+                  "name": "testNothingIsCapturedWithoutAPermit()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testNothingIsCapturedWithoutAPermit()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testNothingIsCapturedWithoutAPermit",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0015s",
+                  "durationInSeconds": 0.0015480518341064453,
+                  "name": "testOnlyTheCurrentGenerationCanBeRevoked()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testOnlyTheCurrentGenerationCanBeRevoked()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testOnlyTheCurrentGenerationCanBeRevoked",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0011s",
+                  "durationInSeconds": 0.0010859966278076172,
+                  "name": "testSpeechIsVouchedForOnlyInsideTheKeptIntervals()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testSpeechIsVouchedForOnlyInsideTheKeptIntervals()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testSpeechIsVouchedForOnlyInsideTheKeptIntervals",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0017s",
+                  "durationInSeconds": 0.0017379522323608398,
+                  "name": "testTheDisplayAndTheMicrophoneAgreeInEveryCombination()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testTheDisplayAndTheMicrophoneAgreeInEveryCombination()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testTheDisplayAndTheMicrophoneAgreeInEveryCombination",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0041s",
+                  "durationInSeconds": 0.004106044769287109,
+                  "name": "testThePersonsMuteAndTheSystemAreSeparate()",
+                  "nodeIdentifier": "VoiceCaptureGateTests/testThePersonsMuteAndTheSystemAreSeparate()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests/testThePersonsMuteAndTheSystemAreSeparate",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ],
+              "name": "VoiceCaptureGateTests",
+              "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureGateTests",
+              "nodeType": "Test Suite",
+              "result": "Passed"
+            },
+            {
+              "children": [
+                {
+                  "duration": "0.00045s",
+                  "durationInSeconds": 0.00045299530029296875,
+                  "name": "testAnUnlockedScreenActionNeedsItsConfirmation()",
+                  "nodeIdentifier": "VoiceCaptureStateTests/testAnUnlockedScreenActionNeedsItsConfirmation()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureStateTests/testAnUnlockedScreenActionNeedsItsConfirmation",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00032s",
+                  "durationInSeconds": 0.0003210306167602539,
+                  "name": "testARefusalExplainsItself()",
+                  "nodeIdentifier": "VoiceCaptureStateTests/testARefusalExplainsItself()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureStateTests/testARefusalExplainsItself",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00036s",
+                  "durationInSeconds": 0.0003600120544433594,
+                  "name": "testEveryStateSaysSomethingAPersonCanRead()",
+                  "nodeIdentifier": "VoiceCaptureStateTests/testEveryStateSaysSomethingAPersonCanRead()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureStateTests/testEveryStateSaysSomethingAPersonCanRead",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00029s",
+                  "durationInSeconds": 0.00028693675994873047,
+                  "name": "testOnlyCapturingCouldHaveHeardSpeech()",
+                  "nodeIdentifier": "VoiceCaptureStateTests/testOnlyCapturingCouldHaveHeardSpeech()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureStateTests/testOnlyCapturingCouldHaveHeardSpeech",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00029s",
+                  "durationInSeconds": 0.00028502941131591797,
+                  "name": "testUnreceivedSpeechAuthorisesNothing()",
+                  "nodeIdentifier": "VoiceCaptureStateTests/testUnreceivedSpeechAuthorisesNothing()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureStateTests/testUnreceivedSpeechAuthorisesNothing",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ],
+              "name": "VoiceCaptureStateTests",
+              "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceCaptureStateTests",
+              "nodeType": "Test Suite",
+              "result": "Passed"
+            },
+            {
+              "children": [
+                {
+                  "duration": "0.00061s",
+                  "durationInSeconds": 0.0006070137023925781,
+                  "name": "testAReadingThatShowsNothingNewAfterTheDeadlineEndsTheCall()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testAReadingThatShowsNothingNewAfterTheDeadlineEndsTheCall()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testAReadingThatShowsNothingNewAfterTheDeadlineEndsTheCall",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.006s",
+                  "durationInSeconds": 0.005987048149108887,
+                  "name": "testASilentStopVouchesForNothingAfterTheLastAudio()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testASilentStopVouchesForNothingAfterTheLastAudio()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testASilentStopVouchesForNothingAfterTheLastAudio",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0015s",
+                  "durationInSeconds": 0.0014660358428955078,
+                  "name": "testAStaleReadingAfterTheDeadlineEndsTheCall()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testAStaleReadingAfterTheDeadlineEndsTheCall()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testAStaleReadingAfterTheDeadlineEndsTheCall",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00032s",
+                  "durationInSeconds": 0.0003210306167602539,
+                  "name": "testAudioArrivingAfterTheDeadlineEndsTheCallWhenTheTimerIsLate()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testAudioArrivingAfterTheDeadlineEndsTheCallWhenTheTimerIsLate()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testAudioArrivingAfterTheDeadlineEndsTheCallWhenTheTimerIsLate",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0003s",
+                  "durationInSeconds": 0.0002999305725097656,
+                  "name": "testAudioResumingAfterAStopOpensTheMicrophoneAgain()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testAudioResumingAfterAStopOpensTheMicrophoneAgain()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testAudioResumingAfterAStopOpensTheMicrophoneAgain",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00039s",
+                  "durationInSeconds": 0.00039196014404296875,
+                  "name": "testEveryCloseBeforeTheStopIsNoticedEndsAtTheLastAudio()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testEveryCloseBeforeTheStopIsNoticedEndsAtTheLastAudio()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testEveryCloseBeforeTheStopIsNoticedEndsAtTheLastAudio",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0015s",
+                  "durationInSeconds": 0.0014780759811401367,
+                  "name": "testReadingsOutsideTheDevicesTimeAreDropped()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testReadingsOutsideTheDevicesTimeAreDropped()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testReadingsOutsideTheDevicesTimeAreDropped",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0018s",
+                  "durationInSeconds": 0.0018259286880493164,
+                  "name": "testTheDeadlineBeforeTheStopIsNoticedEndsAtTheLastAudio()",
+                  "nodeIdentifier": "VoiceRecorderReaderTests/testTheDeadlineBeforeTheStopIsNoticedEndsAtTheLastAudio()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests/testTheDeadlineBeforeTheStopIsNoticedEndsAtTheLastAudio",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ],
+              "name": "VoiceRecorderReaderTests",
+              "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderReaderTests",
+              "nodeType": "Test Suite",
+              "result": "Passed"
+            },
+            {
+              "children": [
+                {
+                  "duration": "0.0017s",
+                  "durationInSeconds": 0.0017020702362060547,
+                  "name": "testAnInputThatNeverDeliversIsNotARecorder()",
+                  "nodeIdentifier": "VoiceRecorderWatchTests/testAnInputThatNeverDeliversIsNotARecorder()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderWatchTests/testAnInputThatNeverDeliversIsNotARecorder",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.00094s",
+                  "durationInSeconds": 0.0009399652481079102,
+                  "name": "testAResetStartsCountingAfresh()",
+                  "nodeIdentifier": "VoiceRecorderWatchTests/testAResetStartsCountingAfresh()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderWatchTests/testAResetStartsCountingAfresh",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0036s",
+                  "durationInSeconds": 0.0036050081253051758,
+                  "name": "testAudioArrivingStartsItAndNothingArrivingStopsIt()",
+                  "nodeIdentifier": "VoiceRecorderWatchTests/testAudioArrivingStartsItAndNothingArrivingStopsIt()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderWatchTests/testAudioArrivingStartsItAndNothingArrivingStopsIt",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "duration": "0.0013s",
+                  "durationInSeconds": 0.0013020038604736328,
+                  "name": "testPlaybackAloneIsNotARecorder()",
+                  "nodeIdentifier": "VoiceRecorderWatchTests/testPlaybackAloneIsNotARecorder()",
+                  "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderWatchTests/testPlaybackAloneIsNotARecorder",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ],
+              "name": "VoiceRecorderWatchTests",
+              "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests/VoiceRecorderWatchTests",
+              "nodeType": "Test Suite",
+              "result": "Passed"
+            }
+          ],
+          "name": "KalaReachNativeTests",
+          "nodeIdentifierURL": "test://com.apple.xcode/companion-tauri/KalaReachNativeTests",
+          "nodeType": "Unit test bundle",
+          "result": "Passed"
+        }
+      ],
+      "name": "KalaReachNativeTests",
+      "nodeType": "Test Plan",
+      "result": "Passed"
+    }
+  ],
+  "testPlanConfigurations": [
+    {
+      "configurationId": "1",
+      "configurationName": "Test Scheme Action"
+    }
+  ]
+}

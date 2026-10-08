@@ -1,0 +1,10 @@
+# A tree the conformance report's own tests read: the Kotlin and Swift test files of the phone
+# applications as they were committed, with the results their tools wrote for them in
+# ../lane-results. It is a workspace of its own, so the repository's workspace never builds it.
+[package]
+name = "lanes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]

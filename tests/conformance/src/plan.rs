@@ -1,6 +1,6 @@
 //! What the report runs, on each platform, and what it reads besides the tests' own comments.
 //!
-//! The report runs five groups. Each is a list of steps, and each step is a command the report
+//! The report runs six groups. Each is a list of steps, and each step is a command the report
 //! runs as it is written here and records verbatim in the result:
 //!
 //! * `rust`: the workspace's tests, as the landing workflow runs them on this platform. On Linux
@@ -12,6 +12,8 @@
 //!   throughput and scheduling suites, with the flags the landing workflow runs them with.
 //! * `typescript`: each package's own `test` script, reporting in JSON.
 //! * `applications`: the application matrix, over the programs the fetch step installed.
+//! * `phones`: the phone applications' unit tests, the Kotlin tests on Linux and the Swift tests on
+//!   macOS, each run by a script of its own and read from the files the tool leaves.
 //!
 //! A test that none of the selected groups runs on this platform is reported as not run, with the
 //! reason this plan gives, and never as passed.
@@ -31,16 +33,19 @@ pub enum Group {
     TypeScript,
     /// The application matrix.
     Applications,
+    /// The phone applications' unit tests.
+    Phones,
 }
 
 impl Group {
     /// Every group, in the order a full run runs them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Rust,
         Self::EndToEnd,
         Self::Performance,
         Self::TypeScript,
         Self::Applications,
+        Self::Phones,
     ];
 
     /// The name a selection gives it.
@@ -52,6 +57,7 @@ impl Group {
             Self::Performance => "performance",
             Self::TypeScript => "typescript",
             Self::Applications => "applications",
+            Self::Phones => "phones",
         }
     }
 
@@ -110,6 +116,18 @@ pub enum Reading {
         /// The package's directory, relative to the repository.
         directory: String,
     },
+    /// A phone application's unit tests, which the step's script runs and leaves the results of at
+    /// the path its `--results=` argument names.
+    Lane(Tests),
+}
+
+/// How a lane's tool reports the tests it ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tests {
+    /// Gradle's JUnit files, one for each test class, in a directory.
+    Junit,
+    /// The test tree `xcresulttool` prints for an Xcode run's result bundle, in one file.
+    Xcode,
 }
 
 /// One command of a group.
@@ -568,10 +586,45 @@ pub fn steps(
                     steps.push(step);
                 }
             }
+            Group::Phones => steps.extend(phones(platform, evidence)),
             _ => {}
         }
     }
     steps
+}
+
+/// The phone applications' unit tests that run on `platform`: the Kotlin tests on Linux, where
+/// Gradle needs a JDK and nothing of the Android SDK, and the Swift tests on macOS, where Xcode
+/// runs them in a simulator. Each script leaves what its tool wrote at the path it is given.
+fn phones(platform: Platform, evidence: &str) -> Option<Step> {
+    let (what, script, results, reading) = match platform {
+        Platform::Linux => (
+            "the Android application's unit tests",
+            "scripts/android-unit-tests.sh",
+            "android",
+            Tests::Junit,
+        ),
+        Platform::MacOs => (
+            "the iOS application's unit tests",
+            "scripts/ios-unit-tests.sh",
+            "ios.json",
+            Tests::Xcode,
+        ),
+        Platform::Windows => return None,
+    };
+    Some(Step {
+        group: Group::Phones,
+        what: what.to_owned(),
+        command: vec![
+            "bash".to_owned(),
+            script.to_owned(),
+            format!("--results={evidence}/conformance/{results}"),
+        ],
+        needs: Vec::new(),
+        reading: Reading::Lane(reading),
+        filter: None,
+        skips: Vec::new(),
+    })
 }
 
 /// The variable that lets the one case that writes this machine's credential store run.
@@ -1422,6 +1475,9 @@ pub const fn group_absent_reason(group: Group, platform: Platform) -> Option<&'s
         (Group::Applications, Platform::Windows) => Some(
             "a console application on Windows is driven through the pseudo-console, which the Windows test machine qualifies",
         ),
+        (Group::Phones, Platform::Windows) => Some(
+            "the phone applications' unit tests run on Linux (Kotlin, with Gradle) and on macOS (Swift, with Xcode)",
+        ),
         _ => None,
     }
 }
@@ -1456,30 +1512,36 @@ pub const CASE_TABLES: &[CaseTable] = &[
     },
 ];
 
-/// A set of files whose tests another toolchain builds, which the report reads the keys of and
-/// does not run.
+/// A set of files whose tests another toolchain builds. The report reads their keys. It runs and
+/// reads the tests of a lane that names how its tool reports them; the others it shows as not
+/// built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lane {
     /// The files, relative to the repository: `*` stands for one path component and `**` for any
     /// number of them.
     pub files: &'static str,
-    /// Why the report does not build them.
+    /// Why this run does not show their results: where they run instead.
     pub reason: &'static str,
+    /// How the lane's tool reports the tests it ran, for a lane the `phones` group runs.
+    pub reads: Option<Tests>,
 }
 
 /// The lanes.
 pub const LANES: &[Lane] = &[
     Lane {
         files: "apps/companion/native/android/src/test/**",
-        reason: "Android unit tests: the Android build runs them",
+        reason: "the Android application's unit tests run in the Linux report, with Gradle",
+        reads: Some(Tests::Junit),
     },
     Lane {
         files: "apps/companion/native/ios/Tests/**",
-        reason: "iOS unit tests: Xcode runs them",
+        reason: "the iOS application's unit tests run in the macOS report, with Xcode",
+        reads: Some(Tests::Xcode),
     },
     Lane {
         files: "apps/companion/e2e/**",
         reason: "Playwright over the built interface: `pnpm --dir apps/companion run e2e` runs it, in the landing workflow's companion job",
+        reads: None,
     },
 ];
 

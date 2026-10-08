@@ -4,6 +4,7 @@
 //! the thing itself at run time, and one that cannot be read is recorded as unknown rather than
 //! guessed.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -30,6 +31,10 @@ pub struct Toolchain {
     pub node: Option<String>,
     /// `pnpm --version`, where the TypeScript group ran.
     pub pnpm: Option<String>,
+    /// What the phone applications' unit tests ran with, as their scripts report it: the JDK and
+    /// Gradle, or Xcode and the simulator. Empty where that group did not run.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub phones: BTreeMap<String, String>,
 }
 
 /// The machine.
@@ -103,6 +108,7 @@ pub fn toolchain(root: &Path, typescript: bool) -> Toolchain {
         pnpm: typescript
             .then(|| output("pnpm", &["--version"], root))
             .flatten(),
+        phones: BTreeMap::new(),
     }
 }
 

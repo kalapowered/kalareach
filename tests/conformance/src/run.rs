@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use crate::lane;
 use crate::libtest::{self, Binary};
-use crate::plan::{Reading, Step};
+use crate::plan::{Reading, Step, Tests};
 use crate::vitest;
 use crate::workspace::{Package, TargetId};
 
@@ -47,6 +48,10 @@ pub struct Executed {
     pub listed: BTreeMap<TargetId, BTreeSet<String>>,
     /// A vitest step's results.
     pub vitest: Option<vitest::Results>,
+    /// A phone lane's cases, as its tool reported them and the exit status agreed with them.
+    pub lane: Option<Vec<lane::Case>>,
+    /// What the step's script said it ran with, in the `kr-tool: <name>: <value>` lines it prints.
+    pub tools: Vec<(String, String)>,
     /// Why it could not be run or read, when it could not.
     pub error: Option<String>,
 }
@@ -109,6 +114,8 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         built: Vec::new(),
         listed: BTreeMap::new(),
         vitest: None,
+        lane: None,
+        tools: Vec::new(),
         error: None,
     };
     if let Err(error) = std::fs::create_dir_all(&logs) {
@@ -153,7 +160,16 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         }
     }
     let output = match std::fs::read(&log_path) {
-        Ok(bytes) => libtest::plain(&String::from_utf8_lossy(&bytes)),
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            executed.tools = text
+                .lines()
+                .filter_map(|line| line.strip_prefix(TOOL_LINE))
+                .filter_map(|line| line.split_once(": "))
+                .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+                .collect();
+            libtest::plain(&text)
+        }
         Err(error) => {
             executed.error = Some(format!("the step's log could not be read: {error}"));
             return executed;
@@ -182,9 +198,31 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
                 None => executed.error = Some("the step names no JSON report".to_owned()),
             }
         }
+        Reading::Lane(tests) => {
+            let results = step
+                .command
+                .iter()
+                .find_map(|word| word.strip_prefix("--results="))
+                .map(PathBuf::from);
+            let read = match (results, tests) {
+                (Some(path), Tests::Junit) => lane::read_junit(&path),
+                (Some(path), Tests::Xcode) => lane::read_xcode(&path),
+                (None, _) => Err("the step names no place for its results".to_owned()),
+            };
+            match read.and_then(|cases| {
+                lane::agree_with_exit(executed.exit, &cases)?;
+                Ok(cases)
+            }) {
+                Ok(cases) => executed.lane = Some(cases),
+                Err(error) => executed.error = Some(error),
+            }
+        }
     }
     executed
 }
+
+/// The beginning of a line in which a lane's script says what it ran with.
+pub const TOOL_LINE: &str = "kr-tool: ";
 
 /// Holds what a step's log ran against what its build made: every test binary built is run once,
 /// and nothing else is. Returns the step's error when they differ.

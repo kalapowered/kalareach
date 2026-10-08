@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="to.kala.reach.companion.mobile.VoiceCaptureGateTest" tests="10" skipped="0" failures="0" errors="0" timestamp="2026-10-08T09:48:04.680Z" hostname="runner" time="0.004">
+  <properties/>
+  <testcase name="the_display_and_the_microphone_agree_in_every_combination" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.003"/>
+  <testcase name="nothing_is_captured_without_a_permit" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="speech_is_vouched_for_only_inside_the_kept_intervals" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="capture_waits_for_the_recorder_and_ends_with_it" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="a_permit_is_refused_when_stale_repeated_or_after_a_stop" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="only_the_current_generation_can_be_revoked" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="a_route_change_and_a_missing_input_keep_capture_off" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="a_future_instant_is_never_vouched_for" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="the_persons_mute_and_the_system_are_separate" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <testcase name="capture_ends_at_the_deadline_by_itself" classname="to.kala.reach.companion.mobile.VoiceCaptureGateTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

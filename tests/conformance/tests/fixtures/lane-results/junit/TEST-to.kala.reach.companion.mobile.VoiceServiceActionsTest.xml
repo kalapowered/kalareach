@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="to.kala.reach.companion.mobile.VoiceServiceActionsTest" tests="4" skipped="0" failures="0" errors="0" timestamp="2026-10-08T09:48:04.712Z" hostname="runner" time="0.001">
+  <properties/>
+  <testcase name="an_action_for_the_running_call_acts" classname="to.kala.reach.companion.mobile.VoiceServiceActionsTest" time="0.0"/>
+  <testcase name="an_action_for_an_earlier_call_changes_nothing" classname="to.kala.reach.companion.mobile.VoiceServiceActionsTest" time="0.0"/>
+  <testcase name="a_service_with_no_call_ends_itself" classname="to.kala.reach.companion.mobile.VoiceServiceActionsTest" time="0.0"/>
+  <testcase name="each_call_gives_its_actions_their_own_address" classname="to.kala.reach.companion.mobile.VoiceServiceActionsTest" time="0.001"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

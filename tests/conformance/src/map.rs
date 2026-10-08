@@ -24,7 +24,8 @@
 //!
 //! In data files, a case table's `covers` field keys the tests `plan::CASE_TABLES` says run its
 //! cases. In TypeScript, `crate::typescript` states the rules. A Kotlin or Swift test file in one
-//! of `plan::LANES` keys itself as a whole, because another toolchain builds it.
+//! of `plan::LANES` keys itself as a whole, because another toolchain builds it, and owns the cases
+//! the lane's tool reports for the classes it declares.
 //!
 //! Every other mention (a comment on product code, a script) is a reference: it is listed with the
 //! identifier, and it is never a test. Every mention of any kind is checked against the grammar,
@@ -164,6 +165,9 @@ pub struct Map {
     pub packages: Vec<Package>,
     /// The TypeScript files read, with their tests.
     pub typescript: Vec<FileFacts>,
+    /// The classes each file of a lane declares, whether or not it names a row: the cases a lane's
+    /// tool reports belong to the file that declares their class.
+    pub lane_classes: BTreeMap<String, Vec<String>>,
 }
 
 impl Map {
@@ -1428,23 +1432,38 @@ fn lane_files(map: &mut Map, root: &Path, lanes: &[Lane]) {
                 continue;
             };
             let lane = lanes.iter().find(|lane| matches(lane.files, &file));
+            let mut keyed = false;
             for comment in crate::clike::comments(&text) {
                 for (identifier, source) in map.mentions(&comment.text, &file, comment.line) {
                     match lane {
-                        Some(lane) => map.key(
-                            identifier,
-                            Place::Lane {
-                                file: file.clone(),
-                                reason: lane.reason.to_owned(),
-                            },
-                            Binding::FileComment,
-                            source,
-                        ),
+                        Some(lane) => {
+                            keyed = true;
+                            map.key(
+                                identifier,
+                                Place::Lane {
+                                    file: file.clone(),
+                                    reason: lane.reason.to_owned(),
+                                },
+                                Binding::FileComment,
+                                source,
+                            );
+                        }
                         None => {
                             map.reference(identifier, source, "a comment that is not on a test")
                         }
                     }
                 }
+            }
+            if lane.is_some_and(|lane| lane.reads.is_some()) {
+                let classes = crate::lane::declared_classes(&file, &text);
+                // A file that names rows and declares no class holds no case the lane's results
+                // could name, so its rows could never read anything from them.
+                if keyed && classes.is_empty() {
+                    map.problems.push(format!(
+                        "{file} names rows and declares no class, so no test of the lane's results belongs to it"
+                    ));
+                }
+                map.lane_classes.insert(file, classes);
             }
         }
     }

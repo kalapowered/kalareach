@@ -616,6 +616,8 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         built: vec![target.clone()],
         listed: [(target.clone(), [name.to_owned()].into())].into(),
         vitest: None,
+        lane: None,
+        tools: Vec::new(),
         error: None,
     };
     let options = Options {
