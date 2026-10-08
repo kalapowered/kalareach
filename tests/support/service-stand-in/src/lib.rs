@@ -26,7 +26,7 @@
 //! | A second creation of an upload that is open is `403 FORBIDDEN` | recorded | `storage/upload.ts` | same; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | A part sent again, a completion sent again | recorded, answered as a duplicate | `storage/upload.ts` | same |
 //! | A completion or a part for an upload nobody created is `NOT_FOUND`, which the client reads as the upload being gone | recorded | `storage/upload.ts` | same |
-//! | A part sent to an upload that was abandoned is `403 FORBIDDEN`; an abandonment is answered again with what it released, which is the most the creation declared and not the size it sent (the script declares 3000 and sends 1000) | recorded | `storage/upload.ts:856` | same |
+//! | A part sent to an upload that was abandoned is `403 FORBIDDEN`; an abandonment is answered again with what it released, which is the most the creation declared and not the size of the object (the script declares 3000 for an object of 1000 bytes and abandons the upload before it sends a part) | recorded | `storage/upload.ts:856` | same |
 //! | A read past the end of an object is `INVALID_REQUEST`; a deletion answered again says it was already done; one of an object never held is `NOT_FOUND` | recorded | `storage/index.ts` | same |
 //! | A publication before any writer is enrolled is `403 FORBIDDEN`; one of other content under a generation held is `403`; one below the checkpoint is `403` | recorded | `backup/collection.ts` | same |
 //! | A publication sent again is a duplicate and needs no account proof | recorded | `backup/index.ts:116` | same |
