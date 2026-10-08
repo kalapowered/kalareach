@@ -454,6 +454,19 @@ impl Controller {
         Ok(self.plugin_bridge.live_packages(revision).pending)
     }
 
+    /// Where each worker's last accepted report says a binding's component stands. For this
+    /// host's own tests, after [`Self::refresh_admissions`] has asked every worker again.
+    #[cfg(feature = "testing")]
+    pub fn reported_components(
+        &self,
+    ) -> Vec<(
+        SessionId,
+        kr_protocol::ids::BrokerBindingId,
+        kr_protocol::admission::ComponentReport,
+    )> {
+        self.plugin_bridge.components()
+    }
+
     /// Refreshes every recorded member's report as `plugin.list` does, and says whether the counts
     /// are known. For this host's own tests, which stop waiting for it part way as a caller that
     /// goes away does.
