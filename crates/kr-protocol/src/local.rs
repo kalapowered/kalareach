@@ -247,6 +247,12 @@ pub fn reads_history_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
 /// its meaning: a worker that states only that is still sent its scope with every other read.
 pub const FORWARDED_QUESTION_SCOPE: &str = "forwarded.question-scope/1";
 
+/// What a worker answers a method it does not list, whoever asks.
+///
+/// A worker of a build that predates a local read answers it this way, which is how the daemon
+/// tells an earlier build from a worker that refused for another reason.
+pub const METHOD_NOT_REACHABLE: &str = "the method is not reachable from a local caller";
+
 /// Returns true when a worker's statement says it holds a forwarded question read to the read's
 /// history scope ([`FORWARDED_QUESTION_SCOPE`]).
 #[must_use]
