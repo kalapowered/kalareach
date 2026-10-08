@@ -210,6 +210,24 @@ impl SharingService {
                 "this invitation includes the live screen and the issuer was shown none".to_owned(),
             ));
         }
+        if !request.selection.include_live_screen && request.live_screen.is_some() {
+            return Err(ControllerError::InvalidArgument(
+                "this invitation previews a screen it does not include".to_owned(),
+            ));
+        }
+        // A preview that was cut shows the issuer less than the recipient will read, which is the
+        // thing the preview is there to prevent.
+        if request
+            .live_screen
+            .as_ref()
+            .is_some_and(|screen| screen.truncated)
+        {
+            return Err(ControllerError::InvalidArgument(
+                "the screen this invitation includes is larger than a preview shows, so its issuer \
+                 would not be shown all of it"
+                    .to_owned(),
+            ));
+        }
         let proposed = roles::compile(
             &request.selection,
             request.session_id,
