@@ -1896,7 +1896,7 @@ pub mod configuration {
         /// Read when the daemon starts, so a change applies at the next start. No environment
         /// variable reaches any of it.
         pub network: NetworkSelection,
-        /// The managed voice broker this host names to its paired devices.
+        /// The managed voice broker this host starts its paired devices' calls at.
         ///
         /// Read when the daemon starts, so a change applies at the next start. No environment
         /// variable reaches it.
@@ -2345,8 +2345,8 @@ pub mod configuration {
         pub mainline_dht: Nullable<bool>,
         /// The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
-        /// and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.
-        /// Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
+        /// and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker, and
+        /// plugin repositories. Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
         /// submission do not use it. It is this machine's own choice: no invitation or host bundle
         /// carries it. It names no user and no password, because a proxy that needs credentials is
         /// not supported.
@@ -2421,7 +2421,7 @@ pub mod configuration {
         }
     }
 
-    /// The managed voice broker this host names to its paired devices.
+    /// The managed voice broker this host starts its paired devices' calls at.
     ///
     /// A provider origin, so it is this document's to choose and no inherited variable's. The
     /// daemon reads it when it starts its voice service, so a change applies at the next start.
@@ -4063,13 +4063,14 @@ pub mod configuration {
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
         about: "the HTTP proxy this host's outbound HTTPS goes through: the network endpoint's \
-                relays and Pkarr servers, the rendezvous, delivery and plugin repositories",
+                relays and Pkarr servers, the rendezvous, delivery, the managed voice broker and \
+                plugin repositories",
     };
 
-    /// The managed voice broker this host names to its devices.
+    /// The managed voice broker this host starts its devices' calls at.
     pub const VOICE_BROKER_ORIGIN: Selection = Selection {
         key: "voice.broker_origin",
-        about: "the managed voice broker this host names to its paired devices",
+        about: "the managed voice broker this host starts its paired devices' calls at",
     };
 
     /// The managed storage service this host uploads its backups to.
@@ -8411,8 +8412,12 @@ mod tests {
                 panic!("{origin} is a loopback origin: {problems:?}");
             });
         }
-        let too_long = format!("https://{}.example", "a".repeat(120));
-        assert!(too_long.len() > crate::service::MAX_GATEWAY_ORIGIN_LEN);
+        let longest = host(crate::service::MAX_GATEWAY_ORIGIN_LEN);
+        assert_eq!(longest.len(), crate::service::MAX_GATEWAY_ORIGIN_LEN);
+        let mut document = ConfigurationDocument::empty();
+        document.voice.broker_origin = Nullable::some(longest);
+        configuration::validate(&document).expect("an origin at the gateway rule's bound");
+        let too_long = host(crate::service::MAX_GATEWAY_ORIGIN_LEN + 1);
         let mut document = ConfigurationDocument::empty();
         document.voice.broker_origin = Nullable::some(too_long);
         configuration::validate(&document).expect_err("an origin past the gateway rule's bound");
