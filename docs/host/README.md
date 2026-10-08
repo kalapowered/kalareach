@@ -3207,9 +3207,11 @@ The carrier waits between passes as the service and the cause allow:
 | A privacy fence was raised | At once, whatever else it waits for and whatever token the host holds, because the cleanup a fence owes ends work in flight |
 | Nothing is owed | When something changes |
 
-A delay the service names binds every question to it. The daemon's first question at start, the
-status read `kr doctor` makes and each pass all wait it out, and a fence that arrives meanwhile does
-its cleanup and leaves the rest of the delay owed. A refusal that names a delay and one that needs a
+A delay the service names binds every question to it, and the daemon never waits longer than an
+hour for one, whatever the service writes. The question the daemon asks about an earlier
+publication, its first question about backup storage, the status read `kr doctor` makes and each
+pass all wait it out, and a pass stops between two requests when a delay arrives while it runs. A
+fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A refusal that names a delay and one that needs a
 person can come in the same pass, for example when a publication is refused because the writer is
 not enrolled and the question that follows is turned back with a delay. The pass ends at the delay
 and the daemon keeps the person's refusal for `kr doctor`. A refusal that names no delay may be about
@@ -3218,8 +3220,8 @@ one attempt alone, an object the service already holds for example, and the pass
 A part is 8 MiB and its answer begins only after the whole part has been sent, so storage exchanges
 get 60 seconds to start answering and 90 in all. That is the time the slowest supported uplink needs
 to send one: about 1.1 Mbit/s. The carrier is a task of its own, so a service that never answers
-holds that task and not the daemon, and stopping the daemon ends the exchange in flight. The
-uploader reaches the backup store through one handle that gives the reactor thread's other tasks to
+holds that task and not the daemon, and stopping the daemon ends the exchange in flight; a step in
+the middle of a store write finishes first. The uploader reaches the backup store through one handle that gives the reactor thread's other tasks to
 another thread while a store call blocks.
 
 The carrier produces no generation. Sealing one from the host's state, the schedule it is made on,

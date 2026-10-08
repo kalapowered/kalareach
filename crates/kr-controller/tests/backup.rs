@@ -17,6 +17,7 @@ use kr_client::services::{
     StorageLimits, StoragePrincipal, StorageService, StorageStatus, StorageUsage, StoredObject,
     UploadAborted, UploadCompleted, UploadCreated, UploadId, UploadPart, WriterSummary,
 };
+use kr_controller::backup::quiet::{Quiet, RealTimer};
 use kr_controller::backup::store::{
     AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, LocalState,
     ObligationKind, Production, Publication, Remote, SCHEMA_VERSION, Step, UploadRecord,
@@ -7059,6 +7060,7 @@ impl Host {
             storage,
             manifest,
             self.producer.writer.clone(),
+            Arc::new(Quiet::new(Arc::new(RealTimer))),
             TimestampMs::new(now),
         )
     }
