@@ -759,3 +759,131 @@ async fn kr_req_25_10_a_share_ends_on_the_continuous_clock_whatever_the_wall_clo
     assert!(refused.message.contains("expired"), "{refused:?}");
     world.serving.abort();
 }
+
+/// Whether a connection's wait for a grant of its to end has finished, without waiting for it to.
+async fn has_ended(ended: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>) -> bool {
+    tokio::select! {
+        biased;
+        () = ended.as_mut() => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
+/// KR-REQ-25.10: a connection is ended when a grant it stands on ends, on the clock that ends it
+/// and nothing else, and not before. The share's two deadlines each end it alone, and so does the
+/// end of the pairing grant that lets the device in; the controls move each clock to just before
+/// the end and find the connection standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_connection_is_ended_by_the_clock_that_ends_a_grant_it_stands_on() {
+    use std::sync::atomic::Ordering;
+
+    /// Which grant ends, and on which clock.
+    #[derive(Clone, Copy, Debug)]
+    enum Ends {
+        ShareOnTheContinuousClock,
+        ShareInUtc,
+        PairingGrantOnTheContinuousClock,
+        PairingGrantInUtc,
+    }
+
+    for ends in [
+        Ends::ShareOnTheContinuousClock,
+        Ends::ShareInUtc,
+        Ends::PairingGrantOnTheContinuousClock,
+        Ends::PairingGrantInUtc,
+    ] {
+        let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+        let holding = std::sync::Arc::new(std::sync::Mutex::new(Holding::default()));
+        let world = fake::fake_world_on(
+            Some(clocks),
+            serving(std::sync::Arc::clone(&holding), holds_question_reads()),
+        )
+        .await;
+        fake::acknowledged(&world.controller, world.session_id);
+        let now = wall.load(Ordering::SeqCst);
+        let minute = |minutes: u64| GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(now + minutes * 60_000),
+        };
+        let (mut pairing, _) = crate::service::net::tests::granted(
+            if matches!(
+                ends,
+                Ends::PairingGrantOnTheContinuousClock | Ends::PairingGrantInUtc
+            ) {
+                minute(1)
+            } else {
+                minute(60)
+            },
+            world.controller.policy().authority_revision(),
+        );
+        pairing.session_selector = SessionSelector::None;
+        let device = holding_grant(&world.controller, 30, pairing);
+        let held_share = share(
+            &world,
+            &device,
+            &[ActionRight::SessionView],
+            &[],
+            true,
+            if matches!(ends, Ends::ShareOnTheContinuousClock | Ends::ShareInUtc) {
+                minute(1)
+            } else {
+                minute(60)
+            },
+        );
+        let connection = super::RemoteConnection::for_test(&world.controller, device);
+        let acting = connection
+            .acting_for(Some(world.session_id), Some(held_share.grant_id))
+            .expect("the share is held");
+        connection
+            .fix(world.session_id, &acting)
+            .expect("the connection acts under the share");
+
+        let ended = connection.grant_ended();
+        tokio::pin!(ended);
+        assert!(
+            !has_ended(&mut ended).await,
+            "{ends:?}: nothing has ended yet"
+        );
+
+        // The control: a clock to just before the end, on the clock that ends it.
+        match ends {
+            Ends::ShareOnTheContinuousClock | Ends::PairingGrantOnTheContinuousClock => {
+                continuous.advance(std::time::Duration::from_secs(59));
+            }
+            Ends::ShareInUtc | Ends::PairingGrantInUtc => {
+                wall.store(now + 59_000, Ordering::SeqCst);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !has_ended(&mut ended).await,
+            "{ends:?}: a grant a second short of its end has not ended"
+        );
+
+        // Then past it, on that clock alone.
+        match ends {
+            Ends::ShareOnTheContinuousClock | Ends::PairingGrantOnTheContinuousClock => {
+                continuous.advance(std::time::Duration::from_secs(2));
+            }
+            Ends::ShareInUtc | Ends::PairingGrantInUtc => {
+                wall.store(now + 61_000, Ordering::SeqCst);
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), &mut ended)
+            .await
+            .unwrap_or_else(|_| panic!("{ends:?}: the connection is ended when the grant is"));
+        if matches!(ends, Ends::ShareOnTheContinuousClock) {
+            // A share that ran out on the clock that cannot be wound back stays run out: its end
+            // is owed to the grant store, and once written no boot finds it in force again.
+            let grants = world.controller.sharing().grants();
+            world.controller.lifetimes().settle_stored(grants);
+            assert!(
+                grants
+                    .grant_expired_at(held_share.grant_id)
+                    .expect("readable")
+                    .is_some(),
+                "the share's end is on record"
+            );
+        }
+        world.serving.abort();
+    }
+}

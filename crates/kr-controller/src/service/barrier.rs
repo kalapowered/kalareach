@@ -818,9 +818,7 @@ impl Controller {
                     // refused inside its own transaction as before.
                     admitted.retain(|_, connection| {
                         !revoked.contains(&connection.actor_id)
-                            && !connection
-                                .acting
-                                .is_some_and(|grant| revoked_grants.contains(&grant))
+                            && connection.acting.is_disjoint(&revoked_grants)
                     });
                     for connection in admitted.values_mut() {
                         connection.admitted_revision = revision;

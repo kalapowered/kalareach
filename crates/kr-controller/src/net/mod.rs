@@ -587,12 +587,28 @@ impl NetworkHost {
             remote: Arc::clone(&remote),
             connection_id,
             relay: None,
+            watch: None,
         };
         // The relay is its own task, because a subscription delivers whenever the session produces
         // output and the request loop below is usually waiting for the device rather than for the
         // worker. It checks the registration and the grant before each batch it writes, which is
         // what stops a fenced connection from being served a subscription it had already started.
         let mut relay = tokio::spawn(relay_loop(relayed, Arc::clone(&remote)));
+        // A grant this connection stands on ends whether or not the device says anything, and
+        // whatever the connection is doing when it does: a request waiting for a worker is not a
+        // reason to keep serving it. Nothing more is written to it, and the connection, its link
+        // to the worker and what it held there go with it.
+        guard.watch = Some(
+            tokio::spawn({
+                let remote = Arc::clone(&remote);
+                async move {
+                    remote.grant_ended().await;
+                    remote.output().withdraw();
+                    remote.release().await;
+                }
+            })
+            .abort_handle(),
+        );
         // The guard owns the relay's abort handle, so a handler the transport drops still stops it.
         // A detached relay would hold this connection and its controller for as long as it waited.
         guard.relay = Some(relay.abort_handle());
@@ -614,12 +630,6 @@ impl NetworkHost {
                 // device reconnect and restore its state from the cursor it holds rather than go
                 // on against a stream that has stopped without saying so.
                 _ = &mut relay => break,
-                // A grant this connection stands on has ended, whether or not the device says
-                // anything. Nothing more is written to it, and its link to the worker goes with it.
-                () = remote.grant_ended() => {
-                    remote.output().withdraw();
-                    break;
-                }
             }
         }
         relay.abort();
@@ -1237,12 +1247,17 @@ struct ConnectionGuard {
     remote: Arc<RemoteConnection>,
     connection_id: ConnectionId,
     relay: Option<tokio::task::AbortHandle>,
+    /// Ends the connection when a grant it stands on ends ([`RemoteConnection::grant_ended`]).
+    watch: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         if let Some(relay) = self.relay.take() {
             relay.abort();
+        }
+        if let Some(watch) = self.watch.take() {
+            watch.abort();
         }
         self.host
             .live

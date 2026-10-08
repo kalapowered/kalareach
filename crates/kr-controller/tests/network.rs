@@ -5166,7 +5166,7 @@ async fn kr_req_25_10_a_shares_withdrawal_fences_what_acted_under_it_and_nothing
         .expect("the device that did not act under the share is served");
     assert_eq!(still_served.session.session_id, session_id);
     // The owner's connection is the one that withdrew the share, and it is served on the same
-    // connection afterwards: the read above was made on it.
+    // connection afterwards: the polls for the attachments above were made on it.
 
     typing.close();
     watching.session.close();

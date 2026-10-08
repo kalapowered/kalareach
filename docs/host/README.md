@@ -4488,19 +4488,22 @@ attachment holds, and deciding a later request under another grant would leave t
 the grant it was made under. The worker is told which grant a request was decided under, and holds
 its answer to that grant's rights and history scope.
 
-A share's own end is a time bound beside the others a decision holds. A share that has run out
-refuses what it would decide and ends a subscription it was carrying at the next batch, and it
-writes nothing on the device's record: the device was paired under a grant of its own, and is served under it afterwards.
+A share's own end is a time bound beside the others a decision holds, and it writes nothing on the
+device's record: the device was paired under a grant of its own, and is served under it afterwards.
 
-**A connection does not outlive the grant it acts under.** When a share ends, by revocation, by
-withdrawal of the invitation or by running out, the host stops every stream to the connections that
-act under it at once, without waiting for the device to send anything, lets go of their links to
-the session's worker, and refuses what they send next. A connection that sends nothing is ended when
-its share ends, and so is one whose pairing grant ends. The revocation of a share reaches the
-connections acting under it and under the grants withdrawn with it, and no others: the device's
-other connections, other devices and the owner's own connections stay as they were. Revoking a
-device, or any grant that is not a share a connection acts under, still reaches every connection it
-withdrew authority from.
+**A connection does not outlive the grant it acts under.** When a share is revoked, with the grant
+it was issued under or alone, or runs out, the host stops every stream to the connections that
+decided a request under it at once, without waiting for the device to send anything, lets go of
+their links to the session's worker, and refuses what they send next. A connection that sends
+nothing is ended when a share it acts under ends, and so is one whose pairing grant ends. The
+device opens another connection to be served again, under its own grant. The revocation of a share
+reaches the connections that decided a request under it, or under a grant withdrawn with it, and
+those connections only: a read the daemon answers itself counts, and a connection that opened no
+link to the worker counts. The device's other connections, other devices and the owner's own
+connections keep their registration and their links. The revocation still advances the host's
+authority revision, which takes every paired device's input lease and refuses the actions each
+worker admitted and did not dispatch, so a device that was typing takes the lease again. Revoking a
+device still reaches every connection.
 
 `grants::decide` takes the intersection in this order:
 
@@ -4678,8 +4681,8 @@ caller whose window has closed, or whose daemon has restarted since, is still to
   device's own record stands revoked, its last write, and so does every grant the device holds.
   The answer names what the action withdrew, and nothing when another revocation had taken it
   first. Any fence still owed runs before the answer goes back, so its revision and barrier hold.
-  That fence withdraws the registration of the connection that asked, as it does every other, so
-  that connection is told to open a new one and the retry on it is answered. A claim an earlier
+  That fence withdraws the registrations the revocation reaches, and a connection it withdraws is
+  told to open a new one and the retry on it is answered. A claim an earlier
   build left open kept no record of what it withdrew. Nothing else this host keeps names the
   action that changed it: a device's record can hold a preview key because another action
   registered the same one. So a revocation short of that or with no such record, a preview-key
@@ -4709,9 +4712,12 @@ answer is not replayed from the record. The read is performed again using the cu
 history bound. In particular, if the call has ended or a grant has gone, the answer to the action is
 a refusal.
 
-The fence this daemon takes is host-wide: every registration is withdrawn and the connections that
-kept their authority are re-admitted at the revision now in force. Withdrawing one device's
-registration on its own belongs to the network half, which owns those registrations.
+The fence this daemon takes withdraws the registrations the change reaches, and the connections that
+kept their authority are re-admitted at the revision now in force. A change to this host's policy
+or a revocation of authority that is not one device's or one share's reaches every registration;
+the revocation of a share reaches the registrations of the connections that decided a request under
+it or under a grant withdrawn with it; and withdrawing one device's registration on its own belongs
+to the network half, which owns those registrations.
 
 ### The remote authority feed
 
