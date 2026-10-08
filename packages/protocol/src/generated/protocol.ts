@@ -5844,10 +5844,12 @@ export interface AttentionQuestionSlice1 {
 /**
  * A request for one session's attention source records past where the store has read.
  *
- * The worker answers with an [`AttentionSourcePage`]. While no source has a record past its
- * cursor and the session's privacy state has not moved, it may hold the request for up to
- * `wait_ms`, answering as soon as a question transition, a host event, the transition of a
- * pending approval or a privacy transition is committed.
+ * The worker answers with an [`AttentionSourcePage`]. While no question transition, host event or
+ * transition of an approval is past its cursor and the session's privacy state has not moved, it
+ * may hold the request for up to `wait_ms`. A broker transition that is no approval's does not end
+ * the wait, and goes with the next page. The worker answers as soon as a question transition, a
+ * host event, the transition of an approval or a privacy transition is committed, and at once
+ * when its page of the broker's records ends before the newest one.
  */
 export interface AttentionSourcesRequest {
   /**
@@ -11270,9 +11272,11 @@ export interface DeliveryDestinationConfigureParams {
   rule_name: string
   /**
    * The credential the destination sends with, for every service but a webhook, or null to
-   * leave the one already kept under the identifier. When it is given, it is kept and the
-   * destination is configured together: a configuration the host refuses leaves the credential
-   * kept before it as it was. It has to be the credential of the destination's service.
+   * leave the one already kept under the identifier. When it is given, the destination is
+   * configured first and the credential is kept after it: a configuration the host refuses
+   * leaves the credential kept before it as it was, and a credential the store refuses leaves
+   * a destination that may send nothing. It has to be the credential of the destination's
+   * service.
    */
   secret: DestinationSecret | null
 }

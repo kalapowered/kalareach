@@ -93,9 +93,9 @@ pub fn serves(privacy: Option<&PrivacyRecord>, source: AttentionSource, sequence
 /// The reads are made in order, each a statement of its own: the question ledger's head and its
 /// records after the cursor, then the broker's approvals', then the host events' head and theirs,
 /// then the privacy record, which decides which records carry text. `built_at_boot_ms` is the
-/// caller's reading of the continuous clock, taken before the first of them. A page carries at most `request.max_records`
-/// records from each source and, encoded, at most `max_bytes`; what it leaves out is read by the
-/// next request. A page with records to carry always carries one, so the reading moves on; a
+/// caller's reading of the continuous clock, taken before the first of them. A page carries at
+/// most `request.max_records` records from each source and, encoded, at most `max_bytes`; what it
+/// leaves out is read by the next request. A page with records to carry always carries one, so the reading moves on; a
 /// caller whose frame cannot hold even that is told so by measuring the page.
 ///
 /// # Errors

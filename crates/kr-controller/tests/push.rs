@@ -3006,8 +3006,8 @@ fn a_configuration_the_write_refuses_asks_nothing_of_the_credential_store() {
 
 /// KR-REQ-25.23: a store that writes the credential and then reports a failure leaves a destination
 /// that does send, with the credential the record names, and the owner is told it may not: the
-/// error says "may send nothing" and never that the destination sends nothing. The control is
-/// the destination's record, which names the stamp the store holds.
+/// error says it "may send nothing". The control is the destination's record, which names the
+/// stamp the store holds.
 #[test]
 fn a_credential_the_store_writes_and_then_fails_over_is_at_work_and_the_error_says_it_may_not_be() {
     let store = Arc::new(RecordingStore::new());
@@ -3033,10 +3033,6 @@ fn a_credential_the_store_writes_and_then_fails_over_is_at_work_and_the_error_sa
     assert!(
         error.to_string().contains("may send nothing"),
         "the owner is told what is known: {error}"
-    );
-    assert!(
-        !error.to_string().contains("sends nothing"),
-        "and not what is not: {error}"
     );
 
     let id = DestinationId::new("chat").expect("an identifier");

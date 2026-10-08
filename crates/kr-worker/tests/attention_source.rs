@@ -769,10 +769,10 @@ async fn a_held_page_answers_when_an_approval_waits_behind_a_full_page() {
     bound.close().await;
 }
 
-/// KR-REQ-25.01: a broker transition serves no text, in a live worker or from its closed journal,
-/// with privacy mode off, on, or off again: what an approval asks is the application's to show. The
-/// control is a host event committed beside it, whose words are served in the same request while
-/// privacy mode is off.
+/// KR-REQ-25.01: a broker transition serves no text, from a live worker and from a read of the
+/// journal the same way a closed session's is read, with privacy mode off and then on: what an
+/// approval asks is the application's to show. The control is a host event committed beside it,
+/// whose words are served in the same request while privacy mode is off.
 #[tokio::test]
 async fn a_broker_transition_serves_no_text_whatever_privacy_mode_says() {
     use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};

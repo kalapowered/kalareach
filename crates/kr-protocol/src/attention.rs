@@ -919,10 +919,12 @@ pub const ATTENTION_TEXT_LEASE_MS: u64 = 5_000;
 
 /// A request for one session's attention source records past where the store has read.
 ///
-/// The worker answers with an [`AttentionSourcePage`]. While no source has a record past its
-/// cursor and the session's privacy state has not moved, it may hold the request for up to
-/// `wait_ms`, answering as soon as a question transition, a host event, the transition of a
-/// pending approval or a privacy transition is committed.
+/// The worker answers with an [`AttentionSourcePage`]. While no question transition, host event or
+/// transition of an approval is past its cursor and the session's privacy state has not moved, it
+/// may hold the request for up to `wait_ms`. A broker transition that is no approval's does not end
+/// the wait, and goes with the next page. The worker answers as soon as a question transition, a
+/// host event, the transition of an approval or a privacy transition is committed, and at once
+/// when its page of the broker's records ends before the newest one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttentionSourcesRequest {
