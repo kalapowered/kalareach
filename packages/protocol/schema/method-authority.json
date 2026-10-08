@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 162,
+  "method_count": 163,
   "methods": [
     {
       "capability": "none",
@@ -1740,6 +1740,35 @@
         "session"
       ],
       "summary": "Set a session's pinned label.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "sessions",
+      "history_filter": "live_view_only",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "session.screen.preview",
+      "name": "session.screen.preview",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "The text of the visible lines of the screen showing now, as a viewer holding a history scope would first see it, for the issuer of a share to be shown before it exists. It reaches neither the buffer that is not showing nor scrollback, and the host's own owner is the only caller.",
       "version": 1
     },
     {

@@ -777,6 +777,16 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Set a session's pinned label.";
 
+    SessionScreenPreview = "session.screen.preview", Sessions,
+    effect: Read, ingress: [LocalIpc], rights: [req(SessionView)],
+    selectors: [Session],
+    history: LiveViewOnly, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "The text of the visible lines of the screen showing now, as a viewer holding a history \
+          scope would first see it, for the issuer of a share to be shown before it exists. It \
+          reaches neither the buffer that is not showing nor scrollback, and the host's own \
+          owner is the only caller.";
+
     // ----- Attachments ----------------------------------------------------------------------
     SessionAttach = "session.attach", Attachments,
     effect: Write, ingress: [LocalIpc, PairedDevice],
