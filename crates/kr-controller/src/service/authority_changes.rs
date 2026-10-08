@@ -692,13 +692,12 @@ impl Controller {
         ))
     }
 
-    /// Lists the paired devices, with each one's last authority acknowledgement.
+    /// Lists the paired devices, with when each pairing ends and how the authority feed stands.
     ///
-    /// Section 10 puts the acknowledgement in the list because an offline host cannot apply a
-    /// revocation it has not received, and a person deciding whether a revocation has taken effect
-    /// needs to see which hosts have answered. The feed's staleness is beside it for the same
-    /// reason: a list that looked current because nothing had contradicted it would be worse than
-    /// no list.
+    /// Section 10 shows the feed's staleness beside the list because an offline host cannot apply
+    /// a revocation it has not received, and a person deciding whether a revocation has taken
+    /// effect needs to know whether the host has read the feed lately: a list that looked current
+    /// because nothing had contradicted it would be worse than no list.
     pub(super) async fn device_list(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DeviceListParams = parse(params)?;
         let records = self.devices.devices()?;
@@ -715,15 +714,12 @@ impl Controller {
             if record.revoked_at_ms.is_some() && !params.include_revoked {
                 continue;
             }
-            let acknowledged = self.authority_feed().last_acknowledgement(record.device_id);
             let pairing = self.pairing_facts(&record)?;
             devices.push(kr_protocol::sharing::DeviceSummary {
                 device_id: record.device_id,
                 display_name: record.device_name.as_str().to_owned(),
                 grant_id: record.grant.grant_id,
                 paired_at_ms: record.paired_at_ms,
-                acknowledged_revision: kr_protocol::scalars::Nullable(acknowledged),
-                acknowledged_at_ms: kr_protocol::scalars::Nullable::null(),
                 revoked: record.revoked_at_ms.is_some(),
                 keys: kr_protocol::scalars::Nullable(record.public_keys()),
                 manages_host: record
@@ -746,6 +742,7 @@ impl Controller {
             authority_revision,
             feed_synchronised_at_ms: status.last_synchronised_at_ms,
             feed_stale: status.stale,
+            feed_removed: status.removed_at_ms.0.is_some(),
         })
     }
 
