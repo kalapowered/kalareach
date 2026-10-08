@@ -332,7 +332,7 @@ impl Controller {
         })
     }
 
-    /// Lists the notification destinations in service, a paired device's and the owner's.
+    /// Lists the notification destinations that have a rule, a paired device's and the owner's.
     ///
     /// A destination that was removed stays in the journal as the name of what was sent to it,
     /// with no rule, and is not listed. What is listed is what the owner configured and what a
@@ -1622,7 +1622,7 @@ pub(super) fn secret_params(
 /// The one refusal of parameters that do not read as `delivery.destination.configure`'s.
 const CONFIGURE_PARAMS_REFUSAL: &str = "delivery.destination.configure takes a destination_id, a \
      kind (webhook, slack, discord, telegram or email), an endpoint, an idempotency_header or \
-     null, a rule_name and a grant_id";
+     null, a rule_name and a grant_id, and a secret where the service sends with one";
 
 /// Reads the parameters of `delivery.destination.configure`.
 ///
@@ -1646,7 +1646,7 @@ fn destination_summary(
     let rule = record.rule.as_ref()?;
     let (endpoint, idempotency_header) = match record.as_external() {
         Some(external) => (
-            Some(external.endpoint.clone()),
+            listed_endpoint(external),
             match &external.idempotency {
                 Idempotency::Supported { field } => Some(field.clone()),
                 Idempotency::Unsupported => None,
@@ -1671,6 +1671,21 @@ fn destination_summary(
         in_force: record.enabled,
         configured_at_ms: record.configured_at_ms,
     })
+}
+
+/// Where an external destination sends, as the list says it.
+///
+/// A webhook's address can carry a token in its query or fragment, so the list gives the address
+/// without them; the other kinds' endpoints are a channel, a chat or a mailbox, and are given as
+/// configured. An address that cannot be read again is not given at all.
+fn listed_endpoint(external: &kr_delivery::destination::ExternalDestination) -> Option<String> {
+    if external.kind != kr_delivery::destination::DestinationKind::Webhook {
+        return Some(external.endpoint.clone());
+    }
+    let mut address = url::Url::parse(&external.endpoint).ok()?;
+    address.set_query(None);
+    address.set_fragment(None);
+    Some(address.into())
 }
 
 /// Reads the parameters of `delivery.destination.remove`.

@@ -38,8 +38,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kr_delivery::destination::{
-    DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord, PreviewKeys,
-    PushDestination,
+    CredentialStamp, DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord,
+    PreviewKeys, PushDestination,
 };
 use kr_delivery::external::ExternalSender;
 use kr_delivery::journal::{
@@ -695,19 +695,23 @@ impl DeliveryModule {
     }
 
     /// Records a destination of a credentialed kind as [`Self::configure_if`] does, with the
-    /// credential it sends with, in one operation: the credential is kept and the record names it
-    /// together, or neither changes.
+    /// credential it sends with, in one operation: the record names the credential's stamp, and the
+    /// credential is kept under that stamp once the record is written.
     ///
-    /// The credential goes to the secret store just before the record is written, because the
-    /// record names the stamp it is kept under. A write the admission or the journal then refuses
-    /// puts back what the store held under the identifier before, stamp included, so a
-    /// destination that was being replaced goes on sending with the credential it had, to where
-    /// it was configured to send, and a refused first configuration leaves no credential kept.
+    /// The record goes first, so a write the admission or the journal refuses has touched nothing:
+    /// a destination being replaced goes on sending with the credential it had, to where it was
+    /// configured to send, and a refused first configuration leaves no credential kept. A host
+    /// that stops between the record and the credential, or a store that then refuses the
+    /// credential, leaves a destination whose record names a stamp the store does not hold. A
+    /// pass refuses to send with a credential whose stamp is not the record's, so such a
+    /// destination sends nothing until its credential is handed over again, and the refusal says
+    /// so.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the credential is not one this
-    /// destination's kind sends with, and what [`Self::configure_if`] returns.
+    /// destination's kind sends with, what [`Self::configure_if`] returns, and
+    /// [`ControllerError::Storage`] when the record was written and the credential could not be.
     pub fn configure_with_secret_if(
         &self,
         record: &DestinationRecord,
@@ -737,9 +741,9 @@ impl DeliveryModule {
             // the admission then refuses leaves the old destination with the credential it sends
             // with, and one that stops between the two leaves a credential nothing reads.
             let mut forget_old_secret = false;
-            // What the store held under the identifier before a credential replaced it, to put
-            // back if the record is not written.
-            let mut replaced: Option<Option<secrets::HeldSecret>> = None;
+            // The credential this configuration brings, kept under the stamp the record names
+            // once the record is written, and not before.
+            let mut bringing: Option<(&DestinationSecret, CredentialStamp)> = None;
             match &mut record.destination {
                 Destination::External(external) => match external.kind.credential() {
                     Some(kind) => {
@@ -749,8 +753,9 @@ impl DeliveryModule {
                                     "a {kind} destination sends with a {kind} credential"
                                 )));
                             }
-                            replaced = Some(self.secrets.get(&record.id)?);
-                            external.credential = Some(self.secrets.put(&record.id, secret)?);
+                            let stamp = CredentialStamp::fresh();
+                            external.credential = Some(stamp.clone());
+                            bringing = Some((secret, stamp));
                         } else {
                             let held = self.secrets.get(&record.id)?.ok_or_else(|| {
                                 ControllerError::InvalidArgument(format!(
@@ -803,32 +808,33 @@ impl DeliveryModule {
                     owing,
                 )
                 .map_err(unavailable);
-            // A write that did not happen leaves the store as it was found.
             let wrote = match wrote {
                 Ok(true) => true,
                 other => {
-                    if let Some(before) = &replaced
-                        && let Err(error) = self.secrets.restore(&record.id, before.as_ref())
-                    {
-                        eprintln!(
-                            "kr-controller: the credential a refused configuration replaced \
-                             could not be put back: {error}"
-                        );
-                    }
                     if let Some(refusal) = refused {
                         return Err(refusal);
                     }
                     other?
                 }
             };
-            if wrote
-                && forget_old_secret
-                && let Err(error) = self.secrets.remove(&record.id)
-            {
-                eprintln!(
-                    "kr-controller: a credential kept for a destination it replaced could not be \
-                     removed: {error}"
-                );
+            if wrote {
+                if let Some((secret, stamp)) = &bringing
+                    && let Err(error) = self.secrets.put_stamped(&record.id, secret, stamp)
+                {
+                    return Err(ControllerError::Storage {
+                        operation: "keep a destination's credential",
+                        detail: format!(
+                            "the destination was configured and sends nothing until its \
+                             credential is kept: hand it over again ({error})"
+                        ),
+                    });
+                }
+                if forget_old_secret && let Err(error) = self.secrets.remove(&record.id) {
+                    eprintln!(
+                        "kr-controller: a credential kept for a destination it replaced could \
+                         not be removed: {error}"
+                    );
+                }
             }
             Ok(wrote)
         })
