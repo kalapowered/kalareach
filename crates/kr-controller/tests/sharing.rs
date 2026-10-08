@@ -2954,18 +2954,28 @@ async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanch
         .await
         .expect("the redemption answers while the other writer holds the store")
         .expect("the redemption ends");
-    match outcome {
-        Err(kr_controller::error::ControllerError::PermissionDenied { detail }) => {
-            assert_eq!(detail, "this invitation is not open to this device");
-        }
-        other => panic!(
+    let Err(kr_controller::error::ControllerError::PermissionDenied { detail }) = outcome else {
+        panic!(
             "an invitation this host did not hold when the redemption began is refused as \
-             missing, not {other:?}"
-        ),
-    }
+             missing, not {outcome:?}"
+        );
+    };
     registry
         .execute_batch("COMMIT;")
         .expect("the rows are committed");
+    // Refused as an invitation nobody issued is: the same refusal, whatever it says.
+    let Err(kr_controller::error::ControllerError::PermissionDenied { detail: unknown }) =
+        controller.sharing().redeem(
+            invitation_id(0x7f),
+            device_id(0xf1),
+            now + 1,
+            || Ok(()),
+            None,
+        )
+    else {
+        panic!("an invitation nobody issued is refused");
+    };
+    assert_eq!(detail, unknown);
 
     let proposal = controller
         .sharing()
