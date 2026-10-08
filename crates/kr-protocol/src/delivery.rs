@@ -1,11 +1,12 @@
-//! External notification destinations: creating and removing one, and the credential one of them
-//! sends with.
+//! External notification destinations: creating, listing and removing one, and the credential one
+//! of them sends with.
 //!
 //! The owner creates a destination with `delivery.destination.configure`: which service, where it
-//! sends, whether it deduplicates by an identifier, and the grant whose authority the content is
-//! intersected with. `delivery.destination.remove` takes one away, and `delivery.destination.list`
-//! says which are in service. A paired device is a destination too, but it is made by the device's
-//! own registration, never by these two.
+//! sends, whether it deduplicates by an identifier, the grant whose authority the content is
+//! intersected with, and the credential it sends with. `delivery.destination.remove` takes one
+//! away, and `delivery.destination.list` lists the ones that have a rule. A paired device is a
+//! destination too, but it is made by the device's own registration, never by configuring or
+//! removing.
 //!
 //! Section 25 documents Slack, Discord, Telegram and email delivery beside webhooks, and each of
 //! those four sends through a credential. A Slack or Discord incoming-webhook address is itself a
@@ -331,6 +332,11 @@ pub struct DeliveryDestinationConfigureParams {
     /// is told about, from when, and with which rights. It has to stand now, and a destination
     /// under a grant that stops standing is told nothing.
     pub grant_id: GrantId,
+    /// The credential the destination sends with, for every service but a webhook, or null to
+    /// leave the one already kept under the identifier. When it is given, it is kept and the
+    /// destination is configured together: a configuration the host refuses leaves the credential
+    /// kept before it as it was. It has to be the credential of the destination's service.
+    pub secret: Nullable<DestinationSecret>,
 }
 
 /// The result of `delivery.destination.configure`.
@@ -372,8 +378,9 @@ pub struct DeliveryDestinationRemoveResult {
     /// How many queued notifications an earlier attempt had sent now have an outcome nobody can
     /// settle.
     pub unresolved: U64,
-    /// How many attempts were on the wire when the destination was removed. Each finishes and
-    /// reports its answer, and the destination may still receive that message.
+    /// How many attempts were under way when the destination was removed. Each finishes and
+    /// reports its answer, and the destination may still receive the message of one that had
+    /// reached it.
     pub fenced: U64,
 }
 
@@ -404,7 +411,7 @@ pub enum DeliveryDestinationKind {
 }
 
 /// One destination this host delivers to, as `delivery.destination.list` says it. It never carries
-/// a credential, and says only whether one is kept.
+/// a credential.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryDestinationSummary {
@@ -423,15 +430,15 @@ pub struct DeliveryDestinationSummary {
     pub rule_name: String,
     /// The grant whose authority the content is intersected with.
     pub grant_id: Nullable<GrantId>,
-    /// Whether the destination is in service. A destination the gateway rejected the token of is
+    /// Whether the destination is in force. A destination the gateway rejected the token of is
     /// not, and stays listed until it is removed or its device registers again.
     pub in_force: bool,
     /// When it was configured, in UTC milliseconds.
     pub configured_at_ms: TimestampMs,
 }
 
-/// The result of `delivery.destination.list`: the destinations that have a rule, by identifier.
-/// One that was removed is not listed.
+/// The result of `delivery.destination.list`: the destinations that have a rule, by identifier,
+/// in force or not. One that was removed is not listed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryDestinationListResult {
