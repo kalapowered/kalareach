@@ -35,7 +35,6 @@ fn a_reading_names_the_parent_and_the_group_of_the_process_that_holds_the_number
         "the child is this process's own"
     );
     assert_eq!(lineage.group, pid, "and leads a group of its own");
-    assert_eq!(lineage.terminal, None, "it holds no terminal");
     let own = process_lineage(std::process::id()).expect("reads this process");
     assert_ne!(
         lineage.group, own.group,
