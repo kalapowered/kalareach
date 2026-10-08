@@ -425,7 +425,7 @@
         "version": 7,
         "migrates_from": 6
       },
-      "digest": "1f7fd3db726ef731c40bbb97e2cf51af3c1510d2c8ea334ceee1ed58fc903b8d",
+      "digest": "410eddba0a132430789e4039cf890db8e6ced4d073ba6bbb1eef6906d4fae94d",
       "kept": [
         "WorkflowDefinition",
         "NodeOutput",
@@ -433,6 +433,7 @@
         "WorkflowEnableResult",
         "WorkflowPauseResult",
         "WorkflowRunResult",
+        "NodeStatus",
         "ShellCommandParams",
         "RunTestsParams",
         "RequestReviewParams",

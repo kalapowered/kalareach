@@ -142,8 +142,9 @@ pub fn table() -> Vec<Store> {
                 Kept::Words(
                     "launch phases",
                     LaunchPhase::ALL
+                        .iter()
                         .map(|phase| phase.as_str().to_owned())
-                        .to_vec(),
+                        .collect(),
                 ),
             ],
         },
@@ -241,6 +242,7 @@ pub fn table() -> Vec<Store> {
                 protocol::<automation::WorkflowEnableResult>("WorkflowEnableResult"),
                 protocol::<automation::WorkflowPauseResult>("WorkflowPauseResult"),
                 protocol::<automation::WorkflowRunResult>("WorkflowRunResult"),
+                protocol::<automation::NodeStatus>("NodeStatus"),
                 protocol::<automation::ShellCommandParams>("ShellCommandParams"),
                 protocol::<automation::RunTestsParams>("RunTestsParams"),
                 protocol::<automation::RequestReviewParams>("RequestReviewParams"),

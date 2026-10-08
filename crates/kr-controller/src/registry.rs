@@ -72,64 +72,57 @@ pub const SCHEMA_VERSION: i64 = 7;
 /// shape raises this past the last version that wrote it.
 pub const OLDEST_SCHEMA_VERSION: i64 = 1;
 
-/// How far a reservation has progressed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LaunchPhase {
-    /// Recorded, nothing spawned.
-    Reserved,
-    /// The service manager was asked to start a worker. Execution may have begun.
-    Spawned,
-    /// A worker claimed this reservation. The claim is consumed; no second one is admitted.
-    Claimed,
-    /// The worker reported its root shell and the session is live.
-    Live,
-    /// The reservation was fenced and must never be resumed. Its execution is unresolved, so it
-    /// still occupies a slot: something may be running that this host did not admit.
-    Fenced,
-    /// The launch is confirmed not to have produced a running worker. It occupies nothing.
-    Failed,
-    /// The session closed.
-    Closed,
+/// Makes a stored vocabulary of one list: the enum, every variant, the word stored for each, and
+/// the reading of a word back. A word added here is in the list that the format check reads, so it
+/// cannot be missed there.
+macro_rules! stored_words {
+    ($(#[doc = $doc:literal])* $name:ident { $($(#[doc = $variant_doc:literal])+ $variant:ident => $word:literal,)+ }) => {
+        $(#[doc = $doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum $name {
+            $($(#[doc = $variant_doc])+ $variant,)+
+        }
+
+        impl $name {
+            /// Every variant, in the order they are declared.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
+
+            /// Returns the stable stored string.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $word,)+
+                }
+            }
+
+            fn parse(text: &str) -> Option<Self> {
+                match text {
+                    $($word => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
 }
 
-impl LaunchPhase {
-    /// Every phase, for what reads the words the registry stores for them. A phase added to the
-    /// type is added here too, beside `as_str` and `parse`, whose matches the compiler checks.
-    pub const ALL: [Self; 7] = [
-        Self::Reserved,
-        Self::Spawned,
-        Self::Claimed,
-        Self::Live,
-        Self::Fenced,
-        Self::Failed,
-        Self::Closed,
-    ];
-
-    /// Returns the stable stored string.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Reserved => "reserved",
-            Self::Spawned => "spawned",
-            Self::Claimed => "claimed",
-            Self::Live => "live",
-            Self::Fenced => "fenced",
-            Self::Failed => "failed",
-            Self::Closed => "closed",
-        }
-    }
-
-    fn parse(text: &str) -> Option<Self> {
-        match text {
-            "reserved" => Some(Self::Reserved),
-            "spawned" => Some(Self::Spawned),
-            "claimed" => Some(Self::Claimed),
-            "live" => Some(Self::Live),
-            "fenced" => Some(Self::Fenced),
-            "failed" => Some(Self::Failed),
-            "closed" => Some(Self::Closed),
-            _ => None,
-        }
+stored_words! {
+    /// How far a reservation has progressed.
+    LaunchPhase {
+        /// Recorded, nothing spawned.
+        Reserved => "reserved",
+        /// The service manager was asked to start a worker. Execution may have begun.
+        Spawned => "spawned",
+        /// A worker claimed this reservation. The claim is consumed; no second one is admitted.
+        Claimed => "claimed",
+        /// The worker reported its root shell and the session is live.
+        Live => "live",
+        /// The reservation was fenced and must never be resumed. Its execution is unresolved, so it
+        /// still occupies a slot: something may be running that this host did not admit.
+        Fenced => "fenced",
+        /// The launch is confirmed not to have produced a running worker. It occupies nothing.
+        Failed => "failed",
+        /// The session closed.
+        Closed => "closed",
     }
 }
 
@@ -4095,8 +4088,8 @@ mod tests {
     }
 
     /// The registry file has four writers, and the version it records stands for all of them: the
-    /// carry opens the others after its own steps, so a table of theirs that was a shape behind is
-    /// brought to the shape of a new file at this version, and the pairing tables exist.
+    /// carry opens the others before it writes the version, so a table of theirs that was a shape
+    /// behind is brought to the shape of a new file at this version, and the pairing tables exist.
     #[test]
     fn the_carry_brings_every_writer_of_the_file_forward_and_not_only_the_registry_s_own_tables() {
         let directory = tempfile::tempdir().expect("a directory");
