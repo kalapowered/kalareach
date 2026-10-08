@@ -514,6 +514,53 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 25 makes invitations single use and has a recipient act on one, and section 23's
+    // sharing row names no method that does. A recipient redeems the invitation it was given, from
+    // a paired connection only: the invitation names the device that may, which no right in a grant
+    // stands for, so the basis is resolved by the host from the invitation itself. It asks no
+    // owner confirmation, because redeeming adds nothing the issuer did not already approve, and
+    // its answer is the grant and no text of the session, so no history filter applies to it.
+    let redemptions = [("grant.redeem", EffectClass::Write)];
+    for (name, effect) in redemptions {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::Sharing,
+            "{name} is a sharing method"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::PairedDevice],
+            "{name} is the recipient's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::basis(RequiredAuthority::InvitedDevice)],
+            "{name} is answered only to the device the invitation names"
+        );
+        assert_eq!(
+            entry.history_filter,
+            HistoryFilter::NotApplicable,
+            "{name} answers a grant and no session text"
+        );
+        assert_eq!(
+            entry.confirmation,
+            ConfirmationRequirement::None,
+            "{name} adds nothing the issuer did not approve"
+        );
+        assert_eq!(
+            entry.freshness,
+            FreshnessRequirement::ActionWindow,
+            "{name} is a first admission under an action window"
+        );
+        assert_eq!(
+            entry.idempotency,
+            IdempotencyBehaviour::ActionDeduplicated,
+            "{name} is de-duplicated by actor and action"
+        );
+    }
+
     // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
     // starts, and section 23's voice row names no read that can answer that: `voice.context` names
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
@@ -674,6 +721,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + updates.len()
             + descriptions.len()
             + machines.len()
+            + redemptions.len()
             + policy.len()
             + voice.len()
             + owner.len()

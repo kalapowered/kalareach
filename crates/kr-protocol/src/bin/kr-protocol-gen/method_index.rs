@@ -245,7 +245,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::HistoryPage
         | Method::ActionRead => None,
 
-        Method::GrantCreate => at(PAIRING, "Grants"),
+        Method::GrantCreate | Method::GrantRedeem => at(PAIRING, "Grants"),
         Method::GrantRevoke | Method::GrantList => None,
 
         Method::PushInstallationRegister

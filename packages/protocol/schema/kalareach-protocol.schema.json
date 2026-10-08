@@ -15204,6 +15204,39 @@
       ],
       "type": "object"
     },
+    "GrantRedeemParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `grant.redeem`.",
+      "properties": {
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation to redeem. Its issuer hands it to the recipient; the host answers only the\ndevice it names."
+        }
+      },
+      "required": [
+        "invitation_id"
+      ],
+      "type": "object"
+    },
+    "GrantRedeemResult": {
+      "additionalProperties": false,
+      "description": "The result of `grant.redeem`.",
+      "properties": {
+        "grant": {
+          "$ref": "#/$defs/Grant",
+          "description": "The grant it carried, now active. It names the session it covers and what it reaches; the\ntext the issuer was shown stays with the issuer."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation that was redeemed."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "grant"
+      ],
+      "type": "object"
+    },
     "GrantRevokeParams": {
       "additionalProperties": false,
       "description": "Parameters of `grant.revoke`.",
@@ -19297,6 +19330,11 @@
         {
           "const": "grant.list",
           "description": "List grants this issuer may see, with their revisions and expiry.",
+          "type": "string"
+        },
+        {
+          "const": "grant.redeem",
+          "description": "Redeem a session invitation, once, and activate the grant it carries. Only the device the invitation names redeems it, and a withdrawn, expired or already redeemed invitation activates nothing. The answer is the grant and carries no session text.",
           "type": "string"
         },
         {
@@ -29479,6 +29517,11 @@
           "type": "string"
         },
         {
+          "const": "invited_device",
+          "description": "The device a session invitation names. Redeeming an invitation is the recipient's act and\nnobody else's, so the host resolves it from the invitation when it activates the grant it\ncarries; no right in a grant stands for it.",
+          "type": "string"
+        },
+        {
           "const": "present_view_authority",
           "description": "Current read authority over the subject the host resolves from the named resource, rather\nthan over a resource the request states. For a session subject that is `session.view` at\nthe session's current scope; for a host or environment subject it is the actor's current\nread scope over that environment. It is a read requirement: permission to have performed\nthe original effect is not required, and is not sufficient either. Holding a stale\nidentifier is never enough.",
           "type": "string"
@@ -29549,6 +29592,11 @@
         {
           "const": "invitation",
           "description": "One pairing invitation and candidate attempt.",
+          "type": "string"
+        },
+        {
+          "const": "session_invitation",
+          "description": "One session invitation: the single-use offer of a shared session that carries a grant.",
           "type": "string"
         },
         {
@@ -38347,6 +38395,12 @@
     },
     "grant_list_result": {
       "$ref": "#/$defs/GrantListResult"
+    },
+    "grant_redeem_params": {
+      "$ref": "#/$defs/GrantRedeemParams"
+    },
+    "grant_redeem_result": {
+      "$ref": "#/$defs/GrantRedeemResult"
     },
     "grant_revoke_params": {
       "$ref": "#/$defs/GrantRevokeParams"

@@ -1080,6 +1080,7 @@ export type ResourceSelectorKind =
   | 'device'
   | 'grant'
   | 'invitation'
+  | 'session_invitation'
   | 'catalogue'
   | 'plugin'
   | 'question'
@@ -2122,6 +2123,8 @@ export interface KalaReachProtocol {
   grant_create_result?: GrantCreateResult
   grant_list_params?: GrantListParams
   grant_list_result?: GrantListResult
+  grant_redeem_params?: GrantRedeemParams
+  grant_redeem_result?: GrantRedeemResult
   grant_revoke_params?: GrantRevokeParams
   grant_summary?: GrantSummary
   hello_reply?: HelloReply
@@ -14478,6 +14481,101 @@ export interface Grant2 {
     | 'none'
 }
 /**
+ * Parameters of `grant.redeem`.
+ */
+export interface GrantRedeemParams {
+  /**
+   * The invitation to redeem. Its issuer hands it to the recipient; the host answers only the
+   * device it names.
+   */
+  invitation_id: string
+}
+/**
+ * The result of `grant.redeem`.
+ */
+export interface GrantRedeemResult {
+  grant: Grant3
+  /**
+   * The invitation that was redeemed.
+   */
+  invitation_id: string
+}
+/**
+ * The grant it carried, now active. It names the session it covers and what it reaches; the
+ * text the issuer was shown stays with the issuer.
+ */
+export interface Grant3 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  history: HistoryScope1
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one was delegated from. Revoking a parent revokes its descendants.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * One paired device.
+   */
+  recipient_device_id: string
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
  * Parameters of `grant.revoke`.
  */
 export interface GrantRevokeParams {
@@ -15969,6 +16067,7 @@ export interface MethodEntry {
     | 'grant.create'
     | 'grant.revoke'
     | 'grant.list'
+    | 'grant.redeem'
     | 'push.installation.register'
     | 'push.sender.issue'
     | 'push.sender.renew'
@@ -16069,6 +16168,7 @@ export interface RequiredRight {
     | 'plugin_effect_rights'
     | 'local_caller_token'
     | 'issuer_delegation'
+    | 'invited_device'
     | 'present_view_authority'
   /**
    * When it must be presented.
@@ -24528,6 +24628,7 @@ export interface ServiceRequestPayload {
     | 'grant.create'
     | 'grant.revoke'
     | 'grant.list'
+    | 'grant.redeem'
     | 'push.installation.register'
     | 'push.sender.issue'
     | 'push.sender.renew'
