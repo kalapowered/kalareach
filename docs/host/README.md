@@ -4617,6 +4617,16 @@ A share's own end is a time bound beside the others a decision holds. A share th
 refuses what it would decide and ends a subscription it was carrying at the next batch, and it
 writes nothing on the device's record: the device was paired under a grant of its own, and is served under it afterwards.
 
+**A connection does not outlive the grant it acts under.** When a share ends, by revocation, by
+withdrawal of the invitation or by running out, the host stops every stream to the connections that
+act under it at once, without waiting for the device to send anything, lets go of their links to
+the session's worker, and refuses what they send next. A connection that sends nothing is ended when
+its share ends, and so is one whose pairing grant ends. The revocation of a share reaches the
+connections acting under it and under the grants withdrawn with it, and no others: the device's
+other connections, other devices and the owner's own connections stay as they were. Revoking a
+device, or any grant that is not a share a connection acts under, still reaches every connection it
+withdrew authority from.
+
 `grants::decide` takes the intersection in this order:
 
 1. The method has to be in the registry and reachable from the caller's ingress class. An unlisted

@@ -91,6 +91,11 @@ pub struct RemoteConnection {
     /// The session this connection serves and the grant it acts under for it, fixed when the link
     /// to the session's worker opened ([`Self::fix`]).
     fixed: std::sync::Mutex<Option<(kr_protocol::ids::SessionId, kr_protocol::ids::GrantId)>>,
+    /// The end of the share the connection acts under, once it is fixed to one
+    /// ([`Self::grant_ended`] waits for it).
+    fixed_bound: std::sync::Mutex<Option<crate::grants::policy::HeldBound>>,
+    /// Notified when a grant is fixed, so that the wait for a grant's end looks at it.
+    acting_changed: tokio::sync::Notify,
     /// Where a notification the proxy read is written.
     notifications: tokio::sync::mpsc::Sender<Relayed>,
     /// What this connection has queued for the device and not yet had written.
@@ -146,6 +151,8 @@ impl RemoteConnection {
             authority,
             proxy: tokio::sync::Mutex::new(None),
             fixed: std::sync::Mutex::new(None),
+            fixed_bound: std::sync::Mutex::new(None),
+            acting_changed: tokio::sync::Notify::new(),
             notifications,
             // What this connection said it could receive, never more than the protocol's own
             // bound: a peer that offered a smaller send queue is held to what it offered.
@@ -227,6 +234,8 @@ impl RemoteConnection {
             authority,
             proxy: tokio::sync::Mutex::new(None),
             fixed: std::sync::Mutex::new(None),
+            fixed_bound: std::sync::Mutex::new(None),
+            acting_changed: tokio::sync::Notify::new(),
             notifications,
             budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
             lost: Arc::new(tokio::sync::Notify::new()),
@@ -283,6 +292,15 @@ impl RemoteConnection {
         if let Some(proxy) = self.proxy.lock().await.take() {
             proxy.close();
         }
+        // With no link there is no session this connection acts for, under any grant.
+        *self
+            .fixed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .fixed_bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Returns the envelope every request on this connection is attributed to.
