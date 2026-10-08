@@ -132,7 +132,7 @@ impl RemoteConnection {
         let mut fixed = self.fixed.lock().unwrap_or_else(PoisonError::into_inner);
         match *fixed {
             Some((fixed_session, fixed_grant))
-                if fixed_session == session_id && fixed_grant != acting.grant.grant_id =>
+                if fixed_session != session_id || fixed_grant != acting.grant.grant_id =>
             {
                 Err(ProtocolError::new(
                     ErrorCode::PermissionDenied,
@@ -174,20 +174,22 @@ impl RemoteConnection {
         if self.admits(pairing, session_id) {
             return Ok(Acting::pairing(pairing));
         }
-        let now_ms = self.controller.wall_now_ms();
-        let mut shares: Vec<Grant> = self
-            .controller
-            .sharing()
-            .grants()
+        let lifetimes = self.controller.lifetimes();
+        let grants = self.controller.sharing().grants();
+        let mut shares: Vec<Grant> = grants
             .records_for_device(self.device.device_id)
             .map_err(|error| error.to_protocol_error())?
             .into_iter()
             .filter(|record| {
                 record.is_active()
                     && record.revoked_at_ms.is_none()
-                    && record.grant.expiry.is_valid_at(now_ms)
                     && !record.grant.permits(ActionRight::VoiceUse)
                     && self.admits(&record.grant, session_id)
+                    // A share that has ended on either clock is not one to choose among.
+                    && matches!(
+                        lifetimes.stored_standing(grants, record),
+                        Ok(GrantStanding::InForce)
+                    )
             })
             .map(|record| record.grant)
             .collect();

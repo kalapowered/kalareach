@@ -877,6 +877,46 @@ fn kr_req_25_10_a_committed_redemption_is_answered_to_a_repeat_of_its_action() {
     assert_eq!(answered.invitation_id, issued.preview.invitation_id);
 }
 
+/// KR-REQ-25.10: the admission that lets a device redeem is asked inside the commit that activates
+/// the grant. One that lapsed while the redemption waited for the store activates nothing and
+/// writes nothing, and the invitation stays open for the device to redeem under an admission that
+/// holds.
+#[test]
+fn a_redemption_whose_admission_lapsed_activates_nothing() {
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    let issued = service
+        .share(&share(SessionRole::Viewer, 1), || Ok(()))
+        .expect("issued");
+    let invitation = issued.preview.invitation_id;
+
+    service
+        .redeem(
+            invitation,
+            device_id(0xf1),
+            NOW + 1_000,
+            || {
+                Err(kr_controller::error::ControllerError::WindowExpired {
+                    detail: "the window ran out while the store was busy".to_owned(),
+                })
+            },
+            None,
+        )
+        .expect_err("the admission lapsed before the commit");
+    assert!(
+        !service
+            .grants()
+            .record(issued.grant.grant_id)
+            .expect("readable")
+            .expect("present")
+            .is_active(),
+        "nothing was activated"
+    );
+
+    service
+        .redeem(invitation, device_id(0xf1), NOW + 1_100, || Ok(()), None)
+        .expect("the invitation is still open under an admission that holds");
+}
+
 #[test]
 fn an_invitation_is_single_use_and_expires() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");

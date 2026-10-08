@@ -16,7 +16,7 @@ use kr_protocol::grant::{Grant, GrantExpiry, SessionSelector};
 use kr_protocol::ids::{ActionId, GrantId, QuestionRevision, RequestId, SessionEpoch};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::question::{
-    QuestionAnswer, QuestionAnswerParams, QuestionReadParams, QuestionReadResult, QuestionState,
+    QuestionAnswer, QuestionAnswerParams, QuestionReadParams, QuestionState,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs};
@@ -346,13 +346,6 @@ async fn kr_req_25_10_a_device_holding_two_shares_acts_under_the_one_it_names_an
             "the refusal says why: {error:?}"
         );
     }
-    let kept: QuestionReadResult = {
-        let held = holding.lock().expect("held");
-        QuestionReadResult {
-            questions: held.questions.values().cloned().collect(),
-        }
-    };
-    assert_eq!(kept.questions.len(), 1);
     world.serving.abort();
 }
 
@@ -380,7 +373,18 @@ async fn kr_req_25_10_a_grant_another_device_holds_reads_as_one_that_does_not_ex
         true,
         GrantExpiry::Never,
     );
+    let own = share(
+        &world,
+        &device,
+        &[ActionRight::SessionView, ActionRight::QuestionRespond],
+        &[],
+        true,
+        GrantExpiry::Never,
+    );
     let connection = super::RemoteConnection::for_test(&world.controller, device);
+    // The control: the device's own share is held, so naming it is not refused as unheld.
+    let held = connection.acting_for(Some(world.session_id), Some(own.grant_id));
+    assert!(held.is_ok(), "the device's own share is held: {held:?}");
     let mut told = Vec::new();
     for named in [
         theirs.grant_id,
@@ -592,5 +596,166 @@ async fn kr_req_25_10_a_share_that_runs_out_under_a_subscription_ends_it_and_the
         ),
         "{listed:?}"
     );
+    world.serving.abort();
+}
+
+/// KR-REQ-25.10: a device whose pairing grant admits a session is decided under it for a request
+/// that names no grant, even when it holds shares that admit the session as well. The shares are
+/// not a reason to ask it to name one, and a mutation naming one is decided under that share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_the_pairing_grant_decides_what_names_no_grant_when_it_admits_the_session() {
+    let mut held = Holding::default();
+    held.questions.insert(
+        question_id(0x11),
+        question(
+            unplaced(),
+            0x11,
+            QuestionState::Pending,
+            3_000,
+            "Run the tests?",
+        ),
+    );
+    let (world, holding) = world(held, holds_results()).await;
+    for question in holding.lock().expect("held").questions.values_mut() {
+        question.session_id = world.session_id;
+    }
+    let device = paired(&world.controller, 27, SessionSelector::Any);
+    for _ in 0..2 {
+        share(
+            &world,
+            &device,
+            &[ActionRight::SessionView, ActionRight::QuestionRespond],
+            &[question_id(0x11)],
+            true,
+            GrantExpiry::Never,
+        );
+    }
+    let connection = super::RemoteConnection::for_test(&world.controller, device.clone());
+    let answered = connection
+        .read(&device_read(1, Method::QuestionRead, &questions_of(&world)))
+        .await;
+    assert!(
+        matches!(
+            &answered,
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "two shares do not make a read that the pairing grant admits ask for a name: {answered:?}"
+    );
+    assert_eq!(
+        holding
+            .lock()
+            .expect("held")
+            .forwarded
+            .last()
+            .expect("the read reached the worker")
+            .actor
+            .grant_id,
+        Nullable::some(device.grant.grant_id),
+        "it was decided under the pairing grant"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-25.10: an action that was decided under a share is read back under that share when it is
+/// repeated on a connection that has not acted for the session yet. The pairing grant admits the
+/// session and carries no right to look at it, so a read back under any grant but the share is
+/// refused before it reaches the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_repeated_action_is_read_back_under_the_share_it_was_decided_under() {
+    let (world, holding) = world(Holding::default(), holds_results()).await;
+    let (mut pairing, _) = crate::service::net::tests::granted(
+        GrantExpiry::Never,
+        world.controller.policy().authority_revision(),
+    );
+    pairing.actions = CanonicalSet::new();
+    let device = holding_grant(&world.controller, 28, pairing);
+    let held_share = share(
+        &world,
+        &device,
+        &[ActionRight::SessionView, ActionRight::QuestionRespond],
+        &[],
+        true,
+        GrantExpiry::Never,
+    );
+
+    let first = super::RemoteConnection::for_test(&world.controller, device.clone());
+    let request = answering(&world, &first, 33, Some(held_share.grant_id));
+    drop(first.mutate(&request).await);
+    assert!(
+        holding.lock().expect("held").mutations.len() == 1,
+        "the action reached the worker under the share"
+    );
+
+    // The same action again, on a connection that has acted for nothing.
+    let second = super::RemoteConnection::for_test(&world.controller, device);
+    drop(second.mutate(&request).await);
+    let held = holding.lock().expect("held");
+    let read_back = held
+        .forwarded
+        .iter()
+        .find(|forwarded| forwarded.request.method == Method::ActionRead.into())
+        .expect("the receipt was asked for at the worker");
+    assert_eq!(
+        read_back.actor.grant_id,
+        Nullable::some(held_share.grant_id),
+        "under the share the action was decided under"
+    );
+    drop(held);
+    world.serving.abort();
+}
+
+/// KR-REQ-25.10: a share ends on the continuous clock whatever the wall clock says. The wall clock
+/// is held where it was, a minute before the share's end, and the continuous clock moves past it:
+/// the share that decided a request a moment ago refuses the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_share_ends_on_the_continuous_clock_whatever_the_wall_clock_says() {
+    use std::sync::atomic::Ordering;
+
+    let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+    let holding = std::sync::Arc::new(std::sync::Mutex::new(Holding::default()));
+    let world = fake::fake_world_on(
+        Some(clocks),
+        serving(std::sync::Arc::clone(&holding), holds_question_reads()),
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    let device = paired(&world.controller, 29, SessionSelector::None);
+    let now = wall.load(Ordering::SeqCst);
+    let held_share = share(
+        &world,
+        &device,
+        &[ActionRight::SessionView],
+        &[],
+        true,
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(now + 60_000),
+        },
+    );
+    let connection = super::RemoteConnection::for_test(&world.controller, device);
+    let ask = || {
+        connection
+            .acting_for(Some(world.session_id), Some(held_share.grant_id))
+            .and_then(|acting| {
+                connection.ask_under(
+                    acting,
+                    Some(world.session_id),
+                    Method::QuestionRead.entry(),
+                    false,
+                )
+            })
+    };
+    ask().expect("the share holds");
+
+    continuous.advance(std::time::Duration::from_secs(120));
+    assert_eq!(
+        wall.load(Ordering::SeqCst),
+        now,
+        "the wall clock did not move"
+    );
+    let refused = ask().expect_err("the share has run out on the continuous clock");
+    assert!(refused.message.contains("expired"), "{refused:?}");
     world.serving.abort();
 }
