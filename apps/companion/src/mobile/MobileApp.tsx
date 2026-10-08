@@ -33,6 +33,7 @@ import { Inbox } from './views/Inbox'
 import { MobileHosts, MobileSessions } from './views/Places'
 import { MobileSession } from './views/MobileSession'
 import { MobileSettings } from './views/Settings'
+import { VoiceRoute } from '../voice/VoiceRoute'
 import type { Channel } from '../model/account'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { useRebind } from './useRebind'
@@ -50,6 +51,8 @@ interface Place {
   readonly tab: Tab
   readonly sessionId?: string
   readonly settings?: boolean
+  /** The voice screen, over the sessions list: opened from it, and left the way a session is. */
+  readonly voice?: boolean
 }
 
 const TABS: readonly Tab[] = ['attention', 'sessions', 'hosts', 'account']
@@ -175,19 +178,25 @@ export function MobileApp({
   }, [])
 
   const inSession = place.tab === 'sessions' && place.sessionId !== undefined
+  const inVoice = place.tab === 'sessions' && place.voice === true && !inSession
   const settingsOpen = inSession && place.settings === true
-  const title = inSession
-    ? 'Session'
-    : place.tab === 'attention'
-      ? 'Attention'
-      : place.tab === 'sessions'
-        ? 'Sessions'
-        : place.tab === 'hosts'
-          ? 'Hosts'
-          : 'Account'
+  const title = inVoice
+    ? 'Voice'
+    : inSession
+      ? 'Session'
+      : place.tab === 'attention'
+        ? 'Attention'
+        : place.tab === 'sessions'
+          ? 'Sessions'
+          : place.tab === 'hosts'
+            ? 'Hosts'
+            : 'Account'
 
   const setSettings = useCallback((open: boolean) => {
     setPlace((current) => ({ ...current, settings: open }))
+  }, [])
+  const openVoice = useCallback(() => {
+    setPlace({ tab: 'sessions', voice: true })
   }, [])
 
   // Android's system back leaves a session the same way the bar's control does, so the two are one
@@ -213,6 +222,19 @@ export function MobileApp({
     }
   }, [inSession, settingsOpen, setSettings])
 
+  // The voice screen is left the way a session is: by the bar's control and by the system's back.
+  useEffect(() => {
+    if (!inVoice) return
+    window.history.pushState({ kr: 'voice' }, '')
+    const onPop = () => {
+      setPlace({ tab: 'sessions' })
+    }
+    window.addEventListener('popstate', onPop)
+    return () => {
+      window.removeEventListener('popstate', onPop)
+    }
+  }, [inVoice])
+
   const shell = (
     <div className="m-shell" data-surface={resolved}>
       <TopBar
@@ -220,7 +242,7 @@ export function MobileApp({
         surface={resolved}
         connection={connection}
         onBack={
-          inSession
+          inSession || inVoice
             ? () => {
                 setPlace({ tab: 'sessions' })
               }
@@ -243,9 +265,14 @@ export function MobileApp({
         {place.tab === 'attention' ? (
           <Inbox surface={resolved} onOpenSession={openSession} onCounts={setActionable} />
         ) : null}
-        {place.tab === 'sessions' && !inSession ? (
-          <MobileSessions surface={resolved} onOpen={openSession} />
+        {place.tab === 'sessions' && !inSession && !inVoice ? (
+          <MobileSessions
+            surface={resolved}
+            onOpen={openSession}
+            onOpenVoice={connection?.connected === true ? openVoice : undefined}
+          />
         ) : null}
+        {inVoice ? <VoiceRoute surface={resolved} embedded /> : null}
         {inSession && place.sessionId ? (
           <MobileSession
             sessionId={place.sessionId}
@@ -254,7 +281,9 @@ export function MobileApp({
             connected={connection?.connected ?? null}
           />
         ) : null}
-        {place.tab === 'hosts' ? <MobileHosts surface={resolved} /> : null}
+        {place.tab === 'hosts' ? (
+          <MobileHosts surface={resolved} connected={connection?.connected ?? null} />
+        ) : null}
         {place.tab === 'account' ? <Account surface={resolved} channel={build.channel} /> : null}
       </main>
 

@@ -232,3 +232,18 @@
     transform: none;
   }
 }
+
+/* A session the person can choose: the whole row is the target, at the platform's minimum. */
+.kr-voice__choice {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  min-height: var(--target, 2.75rem);
+  cursor: pointer;
+}
+
+.kr-voice__choice input {
+  inline-size: 1.25rem;
+  block-size: 1.25rem;
+  flex: none;
+}

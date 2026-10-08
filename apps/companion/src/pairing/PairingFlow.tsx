@@ -82,8 +82,18 @@ function until(ms: number | null): string {
   return ms === null ? '' : ` until ${clockTime(ms)}`
 }
 
-/** The pairing screen's column. */
-export function PairingFlow(): ReactNode {
+/**
+ * The pairing screen's column.
+ *
+ * `chooseHost` is given where the application's commands may go to a paired host: a phone, which has
+ * none of its own. It is called with the host's reference, and the host's row then offers the
+ * choice.
+ */
+export function PairingFlow({
+  chooseHost
+}: {
+  readonly chooseHost?: (reference: string) => Promise<void>
+} = {}): ReactNode {
   const { port, say } = useApp()
   const [view, setView] = useState<PairingView | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
@@ -487,7 +497,9 @@ export function PairingFlow(): ReactNode {
         />
       ) : null}
 
-      {screen === 'entry' && view.hosts.length > 0 ? <PairedHosts hosts={view.hosts} /> : null}
+      {screen === 'entry' && view.hosts.length > 0 ? (
+        <PairedHosts hosts={view.hosts} chooseHost={chooseHost} />
+      ) : null}
     </div>
   )
 }
@@ -597,14 +609,21 @@ function Pasted({
 }
 
 /** The hosts this computer is paired with, newest first. */
-function PairedHosts({ hosts }: { readonly hosts: readonly HostRow[] }): ReactNode {
+function PairedHosts({
+  hosts,
+  chooseHost
+}: {
+  readonly hosts: readonly HostRow[]
+  readonly chooseHost: ((reference: string) => Promise<void>) | undefined
+}): ReactNode {
+  const [using, setUsing] = useState<string | null>(null)
+  const [failure, setFailure] = useState<string | null>(null)
   return (
     <section aria-labelledby="paired-hosts" className="pairing-section">
       <h2 id="paired-hosts">Paired hosts</h2>
       <ul className="paired-hosts" data-testid="paired-hosts">
-        {hosts.map((host, index) => (
-          // A host has no identifier the page may hold, and the list is shown in the order kept.
-          <li key={index} className="divided-row">
+        {hosts.map((host) => (
+          <li key={host.reference} className="divided-row">
             <div className="spacer">
               <strong>{host.name}</strong>
               <p className="small muted">
@@ -619,9 +638,37 @@ function PairedHosts({ hosts }: { readonly hosts: readonly HostRow[] }): ReactNo
                 {host.in_contact ? 'In contact' : 'Not in contact'}
               </span>
             )}
+            {chooseHost === undefined ? null : host.in_use ? (
+              <span className="small muted" data-testid="host-in-use">
+                In use
+              </span>
+            ) : (
+              <Button
+                disabled={using !== null}
+                data-testid="use-host"
+                onClick={() => {
+                  setUsing(host.reference)
+                  setFailure(null)
+                  chooseHost(host.reference)
+                    .catch((error: unknown) => {
+                      setFailure(failureMessage(error))
+                    })
+                    .finally(() => {
+                      setUsing(null)
+                    })
+                }}
+              >
+                {using === host.reference ? 'Reaching the host' : 'Use this host'}
+              </Button>
+            )}
           </li>
         ))}
       </ul>
+      {failure === null ? null : (
+        <p role="alert" className="small" data-testid="use-host-failure">
+          {failure}
+        </p>
+      )}
     </section>
   )
 }
