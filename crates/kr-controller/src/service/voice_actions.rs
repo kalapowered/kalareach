@@ -6,8 +6,10 @@ use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::service::GatewayOrigin;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use kr_protocol::voice::{VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationOutcome};
+use kr_voice::broker::ManagedVoiceService;
 
 use crate::error::{ControllerError, Result};
 
@@ -21,10 +23,10 @@ impl Controller {
     /// to it: a service built inside `Arc::new_cyclic` could not read a session or propose an
     /// effect, which is most of what those seams are for.
     ///
-    /// The managed broker is configured only when the configuration document names its origin,
-    /// in the voice section this daemon read when it started. A host without one is a complete
-    /// host: a person's own provider credential and the agent already running in the session both
-    /// still work, and `voice.start` says so rather than failing obscurely.
+    /// The managed broker is attached when the configuration document names its origin, in the
+    /// voice section this daemon read when it started. A host without one is a complete host: a
+    /// person's own provider credential and the agent already running in the session both still
+    /// work, and `voice.start` says so rather than failing obscurely.
     pub(super) fn start_voice(self: &Arc<Self>) {
         let authority = Arc::new(crate::voice::GrantAuthority::new(
             Arc::clone(&self.sharing),
@@ -32,11 +34,7 @@ impl Controller {
             self.sharing.host_device_id(),
             self.me.clone(),
         ));
-        // Reaching a managed service needs an HTTP exchange, which the client library leaves to
-        // the embedder: a desktop build, a mobile build and a test each reach the network
-        // differently. An embedder attaches its own with `VoiceModule::with_provider`, and a host
-        // with none brokers no managed call.
-        let provider = None;
+        let provider = self.managed_voice_provider();
         let module = crate::voice::VoiceModule::new(
             Arc::new(crate::voice::ControllerFacts::new(self.me.clone())),
             authority,
@@ -51,6 +49,35 @@ impl Controller {
                 .to_owned(),
         );
         let _ = self.voice.set(Arc::new(module));
+    }
+
+    /// The managed broker the configuration document names, reached over a transport of its own
+    /// through the proxy that document selects, or none where it names none.
+    ///
+    /// A host that cannot reach the broker it names still starts: the transport is built on its
+    /// first use and says why when it cannot be, and a broker the document names wrongly is a
+    /// document the daemon refused before it got here. What is reported here is what leaves a
+    /// device with no broker where the document names one.
+    fn managed_voice_provider(&self) -> Option<Arc<dyn ManagedVoiceService>> {
+        let origin = self.started.voice.broker_origin()?;
+        let unavailable = |reason: &dyn std::fmt::Display| {
+            eprintln!(
+                "kr-controller: managed voice is not attached: voice.broker_origin in this host's \
+                 configuration document is not usable: {reason}"
+            );
+        };
+        let gateway = GatewayOrigin::new(origin)
+            .inspect_err(|error| unavailable(error))
+            .ok()?;
+        // A proxy the document selects and this host cannot read is never gone around.
+        let proxy = self
+            .started_proxy()
+            .inspect_err(|error| unavailable(error))
+            .ok()?;
+        let transport = Arc::new(crate::voice::VoiceTransport::new(gateway, proxy));
+        crate::voice::VoiceModule::managed_provider(origin, transport, self.paths.runtime_root())
+            .inspect_err(|error| unavailable(error))
+            .ok()
     }
 
     /// The environment's voice service.
