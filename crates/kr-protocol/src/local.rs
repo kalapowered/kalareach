@@ -282,14 +282,33 @@ pub fn holds_results_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> boo
         .any(|capability| capability.as_str() == FORWARDED_RESULT_SCOPE)
 }
 
-/// The capability a worker states when it narrows an attachment to the screen a share's issuer
-/// previewed, which a forwarded `session.attach` asks for
-/// ([`ForwardedMutation::previewed_screen`]).
+/// The capability a worker states when it reads the grant a forwarded `session.attach` was decided
+/// under ([`ForwardedMutation::screen_basis`]) and draws the attachment the screen that grant
+/// allows.
 ///
 /// A worker of an earlier build ends the link a frame with a member it does not know arrived on,
-/// and would draw such an attachment more than the preview showed, so a daemon refuses a share's
-/// attach to a worker that does not state this.
+/// and would draw a share's attachment more than the preview showed, so a daemon refuses a share's
+/// attach to a worker that does not state this, and sends a pairing grant's attach without the
+/// member.
 pub const FORWARDED_PREVIEWED_SCREEN: &str = "forwarded.previewed-screen/1";
+
+/// The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
+/// session's screen the attachment is drawn.
+///
+/// The worker holds no grants, so the daemon says. An attach that says nothing is drawn the least:
+/// the daemon that wrote it did not say it was decided under a pairing grant, and a share is the
+/// grant whose issuer was shown the screen as text and nothing behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenBasis {
+    /// The device's pairing grant: no issuer was shown a preview of what it is sent, and its
+    /// attachment is drawn the live screen, with the titles and the link targets the application
+    /// set.
+    Pairing,
+    /// A share, whose issuer was shown the screen as text before it existed: its attachment is
+    /// drawn that and no more, with no title and no link target.
+    Share,
+}
 
 /// Returns true when a worker's statement says it narrows an attachment to a share's previewed
 /// screen ([`FORWARDED_PREVIEWED_SCREEN`]).
@@ -426,19 +445,19 @@ pub struct ForwardedMutation {
     /// [`FORWARDED_RESULT_SCOPE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::grant::HistoryScope>,
-    /// Whether the host decided this mutation under a share, whose issuer was shown the session's
-    /// screen as text before the share existed.
+    /// The kind of grant the host decided this mutation under, for a `session.attach` only.
     ///
-    /// A `session.attach` that sets it is drawn that screen and no more: the text and how it is
-    /// drawn, and no window title, no title stack and no link target, which the preview did not
-    /// show. A mutation decided under a device's pairing grant sets nothing, and its attachment is
-    /// drawn the live screen as before.
+    /// An attachment decided under a share is drawn the screen the share's issuer was shown: the
+    /// text and how it is drawn, and no window title, no title stack and no link target, which the
+    /// preview did not show. One decided under a device's pairing grant is drawn the live screen.
+    /// A frame that says nothing is drawn as a share's is, because the worker cannot tell which it
+    /// is and the narrower reading discloses nothing the other does not.
     ///
-    /// It is absent from the wire when it is false, so a frame without one is byte for byte what a
+    /// It is absent from the wire when it is absent, so a frame without one is byte for byte what a
     /// worker built before it read, and a daemon sends it only to a worker that states
     /// [`FORWARDED_PREVIEWED_SCREEN`].
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub previewed_screen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_basis: Option<ScreenBasis>,
 }
 
 /// The rights beside a forwarded mutation, as they are encoded and decoded: a set that holds
@@ -699,7 +718,7 @@ mod tests {
                 grant_rights: rights.iter().copied().collect(),
                 accepted_deadline_boot_ms: U64::new(5),
                 history: None,
-                previewed_screen: false,
+                screen_basis: None,
             }))
         };
 
@@ -867,7 +886,7 @@ mod tests {
             grant_rights: CanonicalSet::new(),
             accepted_deadline_boot_ms: U64::new(5),
             history,
-            previewed_screen: false,
+            screen_basis: None,
         };
         let limits = kr_cbor::Limits::DEFAULT;
 
@@ -887,18 +906,20 @@ mod tests {
             "an earlier daemon's frame reads as unscoped"
         );
 
-        let previewed = super::ForwardedMutation {
-            previewed_screen: true,
-            ..mutation(None)
-        };
-        let bytes = kr_cbor::to_canonical_vec(&previewed).expect("encodes");
-        let decoded: super::ForwardedMutation =
-            kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
-        assert_eq!(decoded, previewed);
-        assert!(
-            kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
-            "an earlier worker cannot read a frame that asks for a share's previewed screen"
-        );
+        for basis in [super::ScreenBasis::Pairing, super::ScreenBasis::Share] {
+            let based = super::ForwardedMutation {
+                screen_basis: Some(basis),
+                ..mutation(None)
+            };
+            let bytes = kr_cbor::to_canonical_vec(&based).expect("encodes");
+            let decoded: super::ForwardedMutation =
+                kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
+            assert_eq!(decoded, based);
+            assert!(
+                kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
+                "an earlier worker cannot read a frame that says which grant an attach is under"
+            );
+        }
 
         let scoped = mutation(Some(HistoryScope {
             lower_bound_ms: Nullable::some(TimestampMs::new(2_000)),

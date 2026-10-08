@@ -543,6 +543,15 @@ export type ActionRight =
  */
 export type QuestionId = string
 /**
+ * The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
+ * session's screen the attachment is drawn.
+ *
+ * The worker holds no grants, so the daemon says. An attach that says nothing is drawn the least:
+ * the daemon that wrote it did not say it was decided under a pairing grant, and a share is the
+ * grant whose issuer was shown the screen as text and nothing behind it.
+ */
+export type ScreenBasis = 'pairing' | 'share'
+/**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
@@ -8035,19 +8044,19 @@ export interface ForwardedMutation {
   history?: HistoryScope | null
   mutation: MutationRequest1
   /**
-   * Whether the host decided this mutation under a share, whose issuer was shown the session's
-   * screen as text before the share existed.
+   * The kind of grant the host decided this mutation under, for a `session.attach` only.
    *
-   * A `session.attach` that sets it is drawn that screen and no more: the text and how it is
-   * drawn, and no window title, no title stack and no link target, which the preview did not
-   * show. A mutation decided under a device's pairing grant sets nothing, and its attachment is
-   * drawn the live screen as before.
+   * An attachment decided under a share is drawn the screen the share's issuer was shown: the
+   * text and how it is drawn, and no window title, no title stack and no link target, which the
+   * preview did not show. One decided under a device's pairing grant is drawn the live screen.
+   * A frame that says nothing is drawn as a share's is, because the worker cannot tell which it
+   * is and the narrower reading discloses nothing the other does not.
    *
-   * It is absent from the wire when it is false, so a frame without one is byte for byte what a
+   * It is absent from the wire when it is absent, so a frame without one is byte for byte what a
    * worker built before it read, and a daemon sends it only to a worker that states
    * [`FORWARDED_PREVIEWED_SCREEN`].
    */
-  previewed_screen?: boolean
+  screen_basis?: ScreenBasis | null
 }
 /**
  * The actor the host verified, with the ingress it arrived on.

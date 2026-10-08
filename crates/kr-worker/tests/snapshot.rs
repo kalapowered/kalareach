@@ -2958,18 +2958,39 @@ async fn forwarded_for_device<T: serde::Serialize>(
     method: Method,
     params: &T,
 ) -> kr_protocol::envelope::ParamsValue {
-    forwarded_for_device_under(host, client, method, params, false).await
+    forwarded_for_device_under(
+        host,
+        client,
+        method,
+        params,
+        Some(kr_protocol::local::ScreenBasis::Pairing),
+    )
+    .await
 }
 
-/// As [`forwarded_for_device`], for a mutation the daemon decided under a share when
-/// `under_a_share` says so.
+/// As [`forwarded_for_device`], for a mutation the daemon says was decided under `basis`, or says
+/// nothing of when it is `None`, as a daemon of an earlier build does.
 async fn forwarded_for_device_under<T: serde::Serialize>(
     host: &Host,
     client: &mut LocalClient,
     method: Method,
     params: &T,
-    under_a_share: bool,
+    basis: Option<kr_protocol::local::ScreenBasis>,
 ) -> kr_protocol::envelope::ParamsValue {
+    match forwarded_outcome_for_device(host, client, method, params, basis).await {
+        Ok(value) => value,
+        Err(error) => panic!("{} is admitted: {error:?}", method.as_str()),
+    }
+}
+
+/// As [`forwarded_for_device_under`], and the refusal a worker gave where it gave one.
+async fn forwarded_outcome_for_device<T: serde::Serialize>(
+    host: &Host,
+    client: &mut LocalClient,
+    method: Method,
+    params: &T,
+    basis: Option<kr_protocol::local::ScreenBasis>,
+) -> std::result::Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
     use kr_protocol::envelope::{MutationRequest, Outcome};
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2_000_000);
     let request_id =
@@ -3011,7 +3032,7 @@ async fn forwarded_for_device_under<T: serde::Serialize>(
             kr_ipc::clock::boot_elapsed_ms() + 30_000,
         ),
         history: None,
-        previewed_screen: under_a_share,
+        screen_basis: basis,
     }));
     client
         .writer()
@@ -3022,10 +3043,8 @@ async fn forwarded_for_device_under<T: serde::Serialize>(
         match client.recv().await.expect("the worker answers") {
             ControlFrame::Response(response) if response.request_id == request_id => {
                 return match response.outcome {
-                    Outcome::Ok(value) => value,
-                    Outcome::Error(error) => {
-                        panic!("{} is admitted: {error:?}", method.as_str())
-                    }
+                    Outcome::Ok(value) => Ok(value),
+                    Outcome::Error(error) => Err(error),
                 };
             }
             _ => {}
@@ -3104,10 +3123,14 @@ async fn a_device_shown_the_live_screen_alone_is_kept_off_the_stream_from_its_at
 
 /// KR-REQ-10.50: an attachment decided under a share is drawn the screen its issuer was shown,
 /// which is the text, and one decided under the device's pairing grant is drawn the live screen
-/// with the titles and the link targets the application set. The screen is the same; what differs
-/// is the grant the daemon says the attach was decided under.
+/// with the titles and the link targets the application set. An attach whose daemon says nothing
+/// of the grant is drawn as a share's is. The screen is the same; what differs is the grant the
+/// daemon says the attach was decided under. Whichever it is, the attachment is shown the visible
+/// screen alone and is kept off the raw stream, and cannot put its window in the retained rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_attachment_decided_under_a_share_is_drawn_the_screen_its_issuer_was_shown() {
+async fn an_attachment_is_drawn_the_screen_its_grant_allows() {
+    use kr_protocol::local::ScreenBasis;
+
     let session = Dimensions::new(CANONICAL.0, CANONICAL.1);
     let host = host_with(
         "stty -echo -echonl || exit 1; \
@@ -3120,8 +3143,8 @@ async fn an_attachment_decided_under_a_share_is_drawn_the_screen_its_issuer_was_
     .await;
     produced(&host.runtime, b"and plain text").await;
 
-    let mut restored = Vec::new();
-    for under_a_share in [false, true] {
+    let mut drawn = Vec::new();
+    for basis in [Some(ScreenBasis::Pairing), Some(ScreenBasis::Share), None] {
         let mut device = device_connection(&host).await;
         let mut requested = CanonicalSet::new();
         requested.insert(AttachmentCapability::ObserveTerminal);
@@ -3137,35 +3160,67 @@ async fn an_attachment_decided_under_a_share_is_drawn_the_screen_its_issuer_was_
                 terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
                 requested,
             },
-            under_a_share,
+            basis,
         )
         .await
         .to_typed()
         .expect("an attachment");
+        assert_eq!(
+            (
+                attached.attachment.presentation.as_ref().copied(),
+                attached.attachment.presentation_reason
+            ),
+            (
+                Some(TerminalPresentationMode::Viewport),
+                Some(PresentationReason::RestorationIncomplete)
+            ),
+            "{basis:?}: the attachment is kept off the stream, as the live screen alone is"
+        );
+        let attachment_id = attached.attachment.attachment_id;
         let (_, bytes) = host
             .runtime
             .session()
-            .restoration(attached.attachment.attachment_id)
+            .restoration(attachment_id)
             .expect("the screen it is drawn");
-        restored.push(String::from_utf8_lossy(&bytes).into_owned());
-    }
-    let [pairing_grant, share] = restored.as_slice() else {
-        panic!("two restorations");
-    };
-    for named in ["a-window-title", "https://example.invalid/a-target"] {
-        assert!(
-            pairing_grant.contains(named),
-            "a device under its pairing grant is drawn {named}: {pairing_grant:?}"
+        drawn.push((basis, String::from_utf8_lossy(&bytes).into_owned()));
+
+        // And its window cannot be placed in the retained rows, whichever it is.
+        let refused = forwarded_outcome_for_device(
+            &host,
+            &mut device,
+            Method::AttachmentViewport,
+            &kr_protocol::attachment::AttachmentViewportParams {
+                attachment_id,
+                dimensions: session,
+                position: Nullable(Some(kr_protocol::attachment::ViewportPosition::Above(
+                    kr_protocol::scalars::U64::new(3),
+                ))),
+                column: kr_protocol::scalars::U64::ZERO,
+            },
+            basis,
+        )
+        .await
+        .expect_err("a window above the live screen is refused");
+        assert_eq!(
+            refused.code,
+            kr_protocol::error::ErrorCode::UnsupportedCapability,
+            "{basis:?}: {refused:?}"
         );
+    }
+    for (basis, bytes) in &drawn {
+        let told = *basis == Some(ScreenBasis::Pairing);
+        for named in ["a-window-title", "https://example.invalid/a-target"] {
+            assert_eq!(
+                bytes.contains(named),
+                told,
+                "{basis:?}: is it drawn {named}? {bytes:?}"
+            );
+        }
         assert!(
-            !share.contains(named),
-            "the recipient of a share is not drawn {named}: {share:?}"
+            bytes.contains("a linked word") && bytes.contains("and plain text"),
+            "{basis:?}: and it is drawn the text: {bytes:?}"
         );
     }
-    assert!(
-        share.contains("a linked word") && share.contains("and plain text"),
-        "but it is drawn the text: {share:?}"
-    );
 }
 
 /// KR-REQ-08.18 and KR-REQ-08.82: a soft reset from the alternate buffer is a redraw like any

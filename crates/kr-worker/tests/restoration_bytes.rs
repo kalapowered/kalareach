@@ -108,8 +108,14 @@ fn restoration_with(stream: &[u8], keyboard: Keyboard, scope: Scope) -> Vec<u8> 
     restoration.bytes
 }
 
-/// Both scopes a restoration is drawn in: the whole screen, and the live screen alone.
-const SCOPES: [Scope; 2] = [Scope::WholeScreen, Scope::LiveScreen];
+/// Every scope a restoration is drawn in: the whole screen, the live screen alone, and the live
+/// screen as a share's issuer was shown it, which differs from the second in the titles and the
+/// link targets and in nothing a check here reads.
+const SCOPES: [Scope; 3] = [
+    Scope::WholeScreen,
+    Scope::LiveScreen,
+    Scope::PreviewedScreen,
+];
 
 /// The screens the tests draw: each buffer showing, and the other one holding something. The
 /// alternate buffer is entered through mode 1047, which saves no cursor, so the session holds no

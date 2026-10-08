@@ -102,8 +102,8 @@ fn unplaced() -> kr_protocol::ids::SessionId {
     kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16]))
 }
 
-/// What a worker of this build states: it reads a scope, holds a question read and the result of a
-/// mutation to it.
+/// What a worker states that holds results to a scope but does not read the grant an attach was
+/// decided under: it reads a scope, holds a question read and the result of a mutation to it.
 fn holds_results() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
     [
         kr_protocol::local::FORWARDED_HISTORY_SCOPE,
@@ -1026,10 +1026,10 @@ async fn kr_req_25_10_a_connection_is_ended_with_a_share_it_only_read_under() {
     }
 }
 
-/// KR-REQ-10.50: an attach decided under a share asks the worker to draw the screen the share's
-/// issuer was shown, and an attach decided under the device's pairing grant does not. A worker that
-/// does not state it narrows an attachment so is not asked to attach a share, since it would draw
-/// more than was shown, and is still asked to attach the device under its pairing grant.
+/// KR-REQ-10.50: an attach says which grant it was decided under, and a share's asks the worker to
+/// draw the screen the share's issuer was shown. A worker that does not state it reads that is not
+/// asked to attach a share, since it would draw more than was shown, and is still asked to attach
+/// the device under its pairing grant, with no member it would end the link on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_50_an_attach_under_a_share_asks_for_the_previewed_screen_and_one_under_a_pairing_grant_does_not()
  {
@@ -1078,11 +1078,11 @@ async fn kr_req_10_50_an_attach_under_a_share_asks_for_the_previewed_screen_and_
             .await;
 
         let held = holding.lock().expect("held");
-        let attached: Vec<(Nullable<GrantId>, bool)> = held
+        let attached: Vec<(Nullable<GrantId>, Option<kr_protocol::local::ScreenBasis>)> = held
             .mutations
             .iter()
             .filter(|forwarded| forwarded.mutation.method == Method::SessionAttach.into())
-            .map(|forwarded| (forwarded.actor.grant_id, forwarded.previewed_screen))
+            .map(|forwarded| (forwarded.actor.grant_id, forwarded.screen_basis))
             .collect();
         if worker_narrows {
             assert_eq!(
@@ -1090,14 +1090,19 @@ async fn kr_req_10_50_an_attach_under_a_share_asks_for_the_previewed_screen_and_
                 2,
                 "both attaches reached the worker: {attached:?}"
             );
-            assert!(
-                !attached[0].1,
-                "a device under its pairing grant is drawn the live screen"
+            assert_eq!(
+                attached[0].1,
+                Some(kr_protocol::local::ScreenBasis::Pairing),
+                "a device under its pairing grant says it is one, and is drawn the live screen"
             );
             assert_eq!(
-                (attached[1].0, attached[1].1),
-                (Nullable::some(viewing.grant_id), true),
-                "and the recipient of a share the screen its issuer was shown"
+                attached[1],
+                (
+                    Nullable::some(viewing.grant_id),
+                    Some(kr_protocol::local::ScreenBasis::Share)
+                ),
+                "and the recipient of a share says it is one, to be drawn the screen its issuer \
+                 was shown"
             );
         } else {
             assert_eq!(
@@ -1105,7 +1110,10 @@ async fn kr_req_10_50_an_attach_under_a_share_asks_for_the_previewed_screen_and_
                 1,
                 "only the attach under the pairing grant reached an earlier worker: {attached:?}"
             );
-            assert!(!attached[0].1);
+            assert_eq!(
+                attached[0].1, None,
+                "and it carries no member the earlier worker would end the link on"
+            );
             let refused = refusal_of(&answer);
             assert_eq!(
                 refused.code,

@@ -2262,8 +2262,9 @@ impl WorkerService {
     /// a worker that says so, that it holds a question read to that scope, without which a daemon
     /// sends it no question read with one, and that it holds what it retains to the scope a
     /// forwarded mutation carries, without which a daemon shows a paired device none of a retained
-    /// answer it gives, and that it draws an attachment only the screen a share's issuer was
-    /// shown when the attach asks it to, without which a daemon attaches no share to it.
+    /// answer it gives, and that it reads which grant a forwarded `session.attach` was decided
+    /// under and draws a share's attachment only the screen its issuer was shown, without which a
+    /// daemon attaches no share to it.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         self.time
             .floor_identity()
@@ -3904,7 +3905,7 @@ impl WorkerService {
             // shows of the answer, now and when the action is read again, is held to it.
             &Caller::forwarded(&forwarded.actor, &forwarded.grant_rights)
                 .within(forwarded.history.clone())
-                .shown_the_previewed_screen(forwarded.previewed_screen),
+                .with_screen_basis(forwarded.screen_basis),
             Freshness::Vouched(deadline),
             proxied,
         )
@@ -6370,11 +6371,14 @@ impl WorkerService {
                         crate::history_filter::ViewerScope::forwarded(kr_ipc::now_ms().get()),
                     );
                     // A share's issuer was shown the screen as text, so an attachment decided under
-                    // one is drawn that and no title and no link target behind it.
-                    let scope = if caller.previewed_screen {
-                        crate::render::Scope::PreviewedScreen
-                    } else {
-                        filter.screen_scope()
+                    // one is drawn that and no title and no link target behind it. Only a daemon
+                    // that says the attach was decided under a pairing grant gets the live screen:
+                    // an attach that says nothing is drawn as a share's is.
+                    let scope = match caller.screen_basis {
+                        Some(kr_protocol::local::ScreenBasis::Pairing) => filter.screen_scope(),
+                        Some(kr_protocol::local::ScreenBasis::Share) | None => {
+                            crate::render::Scope::PreviewedScreen
+                        }
                     };
                     session.narrow_content(attachment_id, scope);
                     // The attach answered before the scope was known, and the scope decides how
@@ -6811,9 +6815,12 @@ pub struct Caller {
     /// Only a forwarded read carries one ([`Self::within`]); [`Self::history_filter`] is where it
     /// is used.
     pub history: Option<kr_protocol::grant::HistoryScope>,
-    /// Whether the daemon decided this caller's mutation under a share, whose issuer was shown the
-    /// session's screen as text: an attachment it makes is drawn that screen and no more.
-    pub previewed_screen: bool,
+    /// The kind of grant the daemon decided this caller's attach under, when it said.
+    ///
+    /// An attachment decided under a share is drawn the screen the share's issuer was shown, and
+    /// one a daemon did not say was decided under a pairing grant is drawn as a share's is: this
+    /// worker holds no grants, and the narrower screen discloses nothing the other does not.
+    pub screen_basis: Option<kr_protocol::local::ScreenBasis>,
 }
 
 impl Caller {
@@ -6829,7 +6836,7 @@ impl Caller {
             authority_deadline_boot_ms: None,
             grant_rights: CanonicalSet::new(),
             history: None,
-            previewed_screen: false,
+            screen_basis: None,
         }
     }
 
@@ -6848,7 +6855,7 @@ impl Caller {
             authority_deadline_boot_ms: None,
             grant_rights: grant_rights.clone(),
             history: None,
-            previewed_screen: false,
+            screen_basis: None,
         }
     }
 
@@ -6859,11 +6866,13 @@ impl Caller {
         self
     }
 
-    /// Returns the same caller, with whether the daemon decided its mutation under a share whose
-    /// issuer was shown the session's screen as text.
+    /// Returns the same caller, with the kind of grant the daemon decided its attach under.
     #[must_use]
-    pub const fn shown_the_previewed_screen(mut self, previewed: bool) -> Self {
-        self.previewed_screen = previewed;
+    pub const fn with_screen_basis(
+        mut self,
+        basis: Option<kr_protocol::local::ScreenBasis>,
+    ) -> Self {
+        self.screen_basis = basis;
         self
     }
 

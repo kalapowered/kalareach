@@ -716,7 +716,9 @@ impl HistoryFilter {
     /// How much of the screen a snapshot installation may carry for this viewer.
     ///
     /// Snapshot installation goes through the filtered projection, never the worker's unrestricted
-    /// internal state, so this is the only thing that decides it.
+    /// internal state, so this and the grant a daemon says an attach was decided under are what
+    /// decide it: the second narrows a share's recipient further, to the screen its issuer was
+    /// shown.
     #[must_use]
     pub const fn screen_scope(&self) -> crate::render::Scope {
         self.scope.screen_scope()
