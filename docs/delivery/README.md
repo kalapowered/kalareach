@@ -437,12 +437,13 @@ stamp the credential will be kept under; the credential is kept only after the r
 configuration that is refused therefore asks nothing of the secret store: a destination being
 replaced goes on sending to where it was configured to send, under the credential and the grant it
 had, and a first configuration that is refused leaves no credential kept. If the host stops
-between the two writes, or the secret store refuses the credential, the destination is configured
-and sends nothing, because a pass sends only with the credential its record names; a store that
-refuses is told in the answer ("may send nothing", since a store can fail at its last step after
-it has written), and handing the credential over again repairs either. Configuring under an
-identifier that is in use replaces that destination. A webhook, which sends with none, takes away any credential kept for
-what it replaced, once the new destination is written.
+between the two writes, the destination is configured and sends nothing, because a pass sends only
+with the credential its record names. If the secret store refuses the credential, the answer says
+the destination may send nothing: usually the store holds no credential for it, but a store can
+fail at its last step after it has written one, and then the destination sends. Handing the
+credential over again repairs either case. Configuring under an identifier that is in use replaces
+that destination. A webhook, which sends with none, takes away any credential kept for what it
+replaced, once the new destination is written.
 
 The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
 told, and every pass asks the grant again, so a destination under a grant that stops standing is
@@ -485,7 +486,8 @@ journal, a log or an error, and a refusal of a malformed request says what shape
 without repeating anything the request carried.
 
 A destination of one of those kinds is configured with its credential, or after one is kept, and
-without a delivery identifier: none of the four services recognises a repeat by one. The journal records a
+without a delivery identifier: none of the four services recognises a repeat by one. The journal
+records a
 random stamp in place of the credential, and the stamp is part of what binds a notification to its
 destination. Storing a new credential under a configured destination changes that binding, so a
 notification admitted while the old credential was in force is taken back at its claim rather than
@@ -586,6 +588,18 @@ transport write at a time and only while the text's lease and the privacy state 
 meets that contract: each hands its bytes to a transport that sends them later on its own. So none
 carries session text, and each carries instead the generic alert, the host's own words, or the
 sentence that names a message's readers.
+
+An external message does name what happened and where, in the host's own words. When the daemon
+takes an announcement for delivery it writes, with the notice and before the source's cursor
+moves, the lines the message will carry: one sentence per rule ("A question is waiting in session
+...", "An approval is waiting in session ...", "A command failed in session ...") that names the
+session by its identifier, dated by when the condition was first seen, and the host's own summary
+when the notice has one. Nothing a session said is in them, and a worker's words cannot be: the
+attention store keeps none. The lines are checked when the message is composed, against the grant of
+the rule that sends it: a line naming a session the grant does not reach, or dated before the
+history the grant reaches, is left out and counted in the message, and a notice about a session the
+grant does not reach produces no message for that destination at all. A recovery that produces
+from the same event again composes the same message, because the lines were written with it.
 
 A request already handed to a transport can still leave after a lease lapses or privacy mode turns
 on, within that sender's own deadline. What it carries then is only the generic alert, the host's
