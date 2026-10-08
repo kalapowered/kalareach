@@ -16,7 +16,7 @@ use kr_client::error::{ClientError, Result};
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AUTHORIZE_PATH, AccountHttp, AccountIdentity, AccountService, AccountStatus,
     AccountToken, AccountTokenSource, AccountUsage, Answer, AnswerFault, AuthorisationGrant,
-    AuthorisationRequest, Carrier, Client, Exchanged, ISSUER, IdentityRead, IssuedGrant,
+    AuthorisationRequest, Carrier, Client, Commit, Exchanged, ISSUER, IdentityRead, IssuedGrant,
     LEASE_SCOPE, ManagedAccountService, PendingAuthorisation, RELYING_PARTY_ID, REQUESTED_SCOPES,
     Redirect, RefreshToken, Refreshed, SignedInAccount, StoredGrant, TOKEN_PATH, USAGE_PATH,
     USAGE_SCOPE, UsageLine, UsageResource, code_challenge,
@@ -1751,11 +1751,12 @@ async fn a_queue_write_that_lands_and_then_fails_is_given_back_whole() {
 }
 
 /// When the new grant's write fails and the store then cannot be read to say which grant it holds,
-/// the queue stays as it stands, with the replaced grant's revocation in it: that is the one state in
-/// which no token is lost. If the new grant did land, the replaced one is ended at the next send; if
-/// it did not, the replaced one is held, and a send does not end it.
+/// the commit says so rather than failing: neither grant can be said to be held. Both grants'
+/// revocations are queued, each under its own grant, so no token is lost whichever the store holds,
+/// and a send ends the one that is not held and leaves the one that is: it is ended when the next
+/// settlement removes it.
 #[tokio::test]
-async fn a_commit_whose_result_cannot_be_read_keeps_the_replaced_grants_revocation() {
+async fn a_commit_whose_result_cannot_be_read_queues_both_grants_and_ends_neither_while_held() {
     let _clock = CLOCK.lock().await;
     rewind();
     let stub = Arc::new(Stub::new());
@@ -1769,22 +1770,548 @@ async fn a_commit_whose_result_cannot_be_read_keeps_the_replaced_grants_revocati
     // commit's first read, before the write, is the one that works).
     store.session_next(SessionWrite::LandsThenFails);
     store.session_reads(&[false, true]);
-    signed_in
-        .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
-        .await
-        .expect_err("the result cannot be read");
-    let kept = queue_text(&store).expect("the queue was left as it stood");
+    assert_eq!(
+        signed_in
+            .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the commit says it cannot tell, and does not fail"),
+        Commit::Unsettled
+    );
+    let queued = queue_text(&store).expect("the queue holds the entries");
     assert!(
-        kept.contains("grant-a"),
-        "A's revocation is still owed: {kept}"
+        queued.contains("grant-a") && queued.contains("grant-b"),
+        "{queued}"
     );
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-b"));
-    // B is what the store holds, so the next send ends A: no token is lost.
+
+    // B is what the store holds, so a send ends A and leaves B.
+    signed_in.send_pending().await.expect("a send");
+    assert_eq!(stub.revoked(), ["grant-a"]);
+    assert!(matches!(
+        signed_in.status().expect("a status"),
+        AccountStatus::SignedIn { .. }
+    ));
+
+    // The next settlement removes the grant whose own revocation is queued, and sends it.
+    let restarted = account_on(&stub, &store);
+    assert_eq!(restarted.recover().await.expect("a recovery"), 0);
+    assert_eq!(stub.revoked(), ["grant-a", "grant-b"]);
+    assert_eq!(
+        restarted.status().expect("a status"),
+        AccountStatus::SignedOut
+    );
+}
+
+/// What a sign-in the store cannot say it kept comes to, whichever grant the store holds: the
+/// device is signed out, and the service was told to end the token it had, the token the sign-in
+/// brought and nothing twice. The caller does what the host's sign-in does with the tokens it was
+/// issued: it hands them to [`SignedInAccount::keep`] and does nothing else with them.
+async fn an_unsettled_sign_in_ends_every_token(write: SessionWrite) {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
     signed_in
-        .revoke_unkept(RefreshToken::new("grant-c").expect("a token"))
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
         .await
-        .expect("the token is sent");
-    assert_eq!(stub.revoked(), ["grant-a", "grant-c"]);
+        .expect("A");
+    store.session_next(write);
+    store.session_reads(&[false, true]);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say, which is not a failure"),
+        Commit::Unsettled
+    );
+    let mut revoked = stub.revoked();
+    revoked.sort();
+    assert_eq!(
+        revoked,
+        ["grant-a", "grant-b"],
+        "each token was sent once, and the token the store may hold was sent only once it was settled"
+    );
+    assert_eq!(
+        signed_in.status().expect("a status"),
+        AccountStatus::SignedOut,
+        "no grant is reported as signed in that the service has ended"
+    );
+    assert_eq!(stored_refresh(&store.inner), None);
+    assert_eq!(queue_text(&store), None, "nothing is left waiting");
+}
+
+#[tokio::test]
+async fn a_sign_in_the_store_cannot_say_it_kept_ends_every_token_when_the_new_grant_landed() {
+    an_unsettled_sign_in_ends_every_token(SessionWrite::LandsThenFails).await;
+}
+
+#[tokio::test]
+async fn a_sign_in_the_store_cannot_say_it_kept_ends_every_token_when_the_new_grant_did_not_land() {
+    an_unsettled_sign_in_ends_every_token(SessionWrite::Refused).await;
+}
+
+/// What a sign-in comes to when the store cannot say which grant it holds and the queue cannot take
+/// the new grant's revocation either: the token is held in memory and ended only if the store does
+/// not hold its grant. A store that holds it keeps the sign-in, and the token the service was told
+/// to end is the replaced grant's alone; a store that does not hold it ends it, once.
+async fn an_unsettled_sign_in_the_queue_cannot_take(
+    write: SessionWrite,
+) -> (Arc<Stub>, Arc<FaultyStore>, Arc<SignedInAccount>, Commit) {
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    store.session_next(write);
+    store.session_reads(&[false, true]);
+    // The entry for A is written; the entry for B is refused.
+    store.queue_writes(&[false, true]);
+    let kept = signed_in
+        .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+        .await
+        .expect("the store could not say, which is not a failure");
+    (stub, store, signed_in, kept)
+}
+
+#[tokio::test]
+async fn a_token_the_store_holds_is_not_ended_when_the_queue_could_not_take_it() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let (stub, store, signed_in, kept) =
+        an_unsettled_sign_in_the_queue_cannot_take(SessionWrite::LandsThenFails).await;
+    assert_eq!(
+        kept,
+        Commit::Kept,
+        "the settlement found the store holding the new grant, which is the sign-in"
+    );
+    assert_eq!(
+        stub.revoked(),
+        ["grant-a"],
+        "only the replaced grant was ended"
+    );
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-b"));
+    assert!(
+        matches!(
+            signed_in.status().expect("a status"),
+            AccountStatus::SignedIn { .. }
+        ),
+        "the grant the store holds is the sign-in"
+    );
+    // Nothing is left to send, and nothing is sent again.
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked(), ["grant-a"]);
+}
+
+#[tokio::test]
+async fn a_token_the_store_does_not_hold_is_ended_once_when_the_queue_could_not_take_it() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let (stub, store, signed_in, kept) =
+        an_unsettled_sign_in_the_queue_cannot_take(SessionWrite::Refused).await;
+    assert_eq!(kept, Commit::Unsettled);
+    let mut revoked = stub.revoked();
+    revoked.sort();
+    assert_eq!(revoked, ["grant-a", "grant-b"], "each token was ended");
+    assert_eq!(stored_refresh(&store.inner), None);
+    assert_eq!(
+        signed_in.status().expect("a status"),
+        AccountStatus::SignedOut
+    );
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked().len(), 2, "nothing is sent twice");
+}
+
+/// A token that is only in memory moves into the durable queue at the first send that can read the
+/// store and write the queue, so a process that stops afterwards loses nothing: here the store
+/// cannot be read when the sign-in is settled, the service cannot be reached when it is later
+/// sent, and a second run on the same store ends both tokens.
+#[tokio::test]
+async fn a_token_kept_in_memory_is_queued_by_the_first_send_that_can_and_survives_a_restart() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    store.session_next(SessionWrite::Refused);
+    // The commit's read before the write works; its read-back fails, and so does the read of the
+    // settlement that follows: the store cannot be read.
+    store.session_reads(&[false, true, true]);
+    store.queue_writes(&[false, true]);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled
+    );
+    assert!(
+        stub.revoked().is_empty(),
+        "nothing was ended while the store could not say"
+    );
+    let queued = queue_text(&store).expect("A's entry is queued");
+    assert!(!queued.contains("grant-b"), "B is only in memory: {queued}");
+
+    // The store can be read now, and the service cannot be reached: B moves into the queue.
+    stub.revoke_works.store(false, Ordering::SeqCst);
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 2);
+    let queued = queue_text(&store).expect("the queue");
+    assert!(
+        queued.contains("grant-a") && queued.contains("grant-b"),
+        "B is durable now: {queued}"
+    );
+
+    // The process stops. The next run settles from what the store holds.
+    stub.revoke_works.store(true, Ordering::SeqCst);
+    let restarted = account_on(&stub, &store);
+    assert_eq!(restarted.recover().await.expect("a recovery"), 0);
+    let mut revoked = stub.revoked();
+    revoked.sort();
+    assert_eq!(revoked, ["grant-a", "grant-b"]);
+    assert_eq!(queue_text(&store), None);
+    assert_eq!(
+        restarted.status().expect("a status"),
+        AccountStatus::SignedOut
+    );
+}
+
+/// A queue write that installs its entry and then reports a failure leaves the token both in the
+/// queue and in memory; one send ends it once.
+#[tokio::test]
+async fn a_token_in_the_queue_and_in_memory_is_ended_once() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    // A first sign-in: nothing is replaced, so the first queue write is the new grant's.
+    store.session_next(SessionWrite::Refused);
+    store.session_reads(&[false, true]);
+    store.queue_write_lands_then_fails();
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled
+    );
+    assert_eq!(stub.revoked(), ["grant-b"], "ended once");
+    assert_eq!(queue_text(&store), None);
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked(), ["grant-b"], "and not again");
+}
+
+/// A later sign-in that is kept sends what is waiting in memory, so a token that no send has been
+/// able to queue yet is not left until the next start.
+#[tokio::test]
+async fn a_sign_in_that_is_kept_later_ends_a_token_that_was_only_in_memory() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    // A first sign-in: the store cannot say, cannot be read when it is settled, and the queue
+    // refuses the token, so only memory holds it.
+    store.session_next(SessionWrite::Refused);
+    store.session_reads(&[false, true, true]);
+    store.queue_writes(&[true]);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled
+    );
+    assert!(stub.revoked().is_empty());
+
+    // The next sign-in replaces nothing, and is kept.
+    signed_in
+        .commit(issued_for("account-1", "grant-c", &["openid"]), "a-nonce")
+        .await
+        .expect("a sign-in");
+    assert_eq!(stub.revoked(), ["grant-b"]);
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-c"));
+    assert!(matches!(
+        signed_in.status().expect("a status"),
+        AccountStatus::SignedIn { .. }
+    ));
+}
+
+/// A token that waits to be ended is queued once however often it is queued, so a service that
+/// takes it later is sent it once.
+#[tokio::test]
+async fn a_token_waiting_to_be_ended_is_queued_once() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    stub.revoke_works.store(false, Ordering::SeqCst);
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    for _ in 0..2 {
+        assert_eq!(
+            signed_in
+                .revoke_unkept(RefreshToken::new("grant-x").expect("a token"))
+                .await
+                .expect("the token is queued"),
+            1
+        );
+    }
+    let queued = queue_text(&store).expect("a queue");
+    assert_eq!(queued.matches("grantId").count(), 1, "{queued}");
+    stub.revoke_works.store(true, Ordering::SeqCst);
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked(), ["grant-x"], "the service is sent it once");
+}
+
+/// A token that only memory holds, which the service has not acknowledged, is counted as waiting:
+/// a sign-out does not say the service was told when it was not.
+#[tokio::test]
+async fn a_token_only_memory_holds_is_counted_as_waiting() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    // A first sign-in: the store cannot say, and the queue refuses the token in the commit, in the
+    // settlement and in each send that follows, so only memory holds it; the service cannot be
+    // reached when it is sent.
+    store.session_next(SessionWrite::Refused);
+    store.session_reads(&[false, true]);
+    store.queue_writes(&[true, true, true, true]);
+    stub.revoke_works.store(false, Ordering::SeqCst);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled
+    );
+    assert_eq!(
+        queue_text(&store),
+        None,
+        "the queue holds nothing of the token"
+    );
+    let signed_out = signed_in.sign_out().await.expect("a sign-out");
+    assert!(
+        !signed_out.service_told,
+        "a sign-out does not say the service was told when a token is still waiting"
+    );
+    assert_eq!(
+        queue_text(&store),
+        None,
+        "the token is still only in memory"
+    );
+    stub.revoke_works.store(true, Ordering::SeqCst);
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked(), ["grant-b"]);
+}
+
+/// A token that only memory holds and the service acknowledges is let go of: a later send neither
+/// sends it again nor counts it.
+#[tokio::test]
+async fn a_memory_token_the_service_acknowledged_is_let_go_of() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    // A first sign-in: the store cannot say, and the queue refuses the token in the commit and in
+    // the send that settles it, so only memory holds it and the service is sent it from there.
+    store.session_next(SessionWrite::Refused);
+    store.session_reads(&[false, true]);
+    store.queue_writes(&[true, true]);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled
+    );
+    assert_eq!(stub.revoked(), ["grant-b"]);
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked(), ["grant-b"], "and not sent again");
+}
+
+/// A write of the queue that installs the entry and then reports a failure, in the send that moves
+/// a token out of memory: what the queue holds decides, so the token is sent once.
+#[tokio::test]
+async fn a_token_the_queue_took_while_reporting_a_failure_is_sent_once() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    // A first sign-in: the store cannot say, and the queue refuses the token in `commit`, so only
+    // memory holds it. The next write of the queue, in the send, lands and reports a failure.
+    store.session_next(SessionWrite::Refused);
+    store.session_reads(&[false, true, true]);
+    store.queue_writes(&[true]);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled
+    );
+    store.queue_write_lands_then_fails();
+    signed_in.send_pending().await.expect("a send");
+    assert_eq!(stub.revoked(), ["grant-b"], "the token was sent once");
+    assert_eq!(queue_text(&store), None);
+}
+
+/// A store that refuses the clean-up of the queue does not keep a token that only memory holds from
+/// the service: it is sent before the queue is worked through.
+#[tokio::test]
+async fn a_failing_queue_clean_up_does_not_keep_a_memory_token_from_the_service() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    // B is refused by the store, which cannot be read afterwards; A's entry is queued; B's entry is
+    // refused and so is every later write of the queue, which the settlement's clean-up needs.
+    store.session_next(SessionWrite::Refused);
+    store.session_reads(&[false, true]);
+    store.queue_writes(&[false, true, true, true]);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled
+    );
+    let mut revoked = stub.revoked();
+    revoked.sort();
+    assert_eq!(
+        revoked,
+        ["grant-a", "grant-b"],
+        "B reached the service although the queue could not be cleaned up"
+    );
+}
+
+/// A token that the queue refuses and the service cannot be told stays in memory, and the next send
+/// ends it.
+#[tokio::test]
+async fn a_token_neither_the_queue_nor_the_service_took_is_kept_for_the_next_send() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    stub.revoke_works.store(false, Ordering::SeqCst);
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    store.queue_writes(&[true]);
+    let _ = signed_in
+        .revoke_unkept(RefreshToken::new("grant-x").expect("a token"))
+        .await;
+    assert!(stub.revoked().is_empty());
+    stub.revoke_works.store(true, Ordering::SeqCst);
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked(), ["grant-x"]);
+}
+
+/// A token that neither the queue nor the service takes is held in memory once however often it is
+/// refused, so a service that answers later is sent it once, and a service that does not is not
+/// counted as owed it twice.
+#[tokio::test]
+async fn a_token_refused_twice_is_held_in_memory_once() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    stub.revoke_works.store(false, Ordering::SeqCst);
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    store.queue_writes(&[true, true, true, true]);
+    for _ in 0..2 {
+        let _ = signed_in
+            .revoke_unkept(RefreshToken::new("grant-x").expect("a token"))
+            .await;
+    }
+    assert_eq!(
+        signed_in.send_pending().await.expect("a send"),
+        1,
+        "one token is owed, not two"
+    );
+    stub.revoke_works.store(true, Ordering::SeqCst);
+    assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+    assert_eq!(stub.revoked(), ["grant-x"], "sent once");
+}
+
+/// A sign-in the settlement does not leave kept is not reported as kept: the store holds the new
+/// grant and the queue still names it, because the settlement could not run, so the next recovery
+/// would remove it. The outcome is unsettled, and a second run ends both tokens.
+#[tokio::test]
+async fn a_sign_in_the_next_recovery_would_remove_is_not_reported_as_kept() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    // B's write lands and reports a failure; the read-back fails and so does the settlement's
+    // first read; the queue takes both entries.
+    store.session_next(SessionWrite::LandsThenFails);
+    store.session_reads(&[false, true, true]);
+    assert_eq!(
+        signed_in
+            .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+            .await
+            .expect("the store could not say"),
+        Commit::Unsettled,
+        "the store holds B and the queue names it: not a sign-in that is kept"
+    );
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-b"));
+    let restarted = account_on(&stub, &store);
+    assert_eq!(restarted.recover().await.expect("a recovery"), 0);
+    let mut revoked = stub.revoked();
+    revoked.sort();
+    assert_eq!(revoked, ["grant-a", "grant-b"]);
+    assert_eq!(
+        restarted.status().expect("a status"),
+        AccountStatus::SignedOut
+    );
+}
+
+/// A sign-in the store is known not to have kept is ended at the service, once, and the grant the
+/// device holds is left alone.
+#[tokio::test]
+async fn a_sign_in_the_store_is_known_not_to_have_kept_ends_its_token_and_leaves_the_old_grant() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    store.session_next(SessionWrite::Refused);
+    signed_in
+        .keep(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+        .await
+        .expect_err("the store refused the new grant");
+    assert_eq!(
+        stub.revoked(),
+        ["grant-b"],
+        "only the token that was not kept"
+    );
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    assert!(matches!(
+        signed_in.status().expect("a status"),
+        AccountStatus::SignedIn { .. }
+    ));
 }
 
 /// A write that fails at its last step, after the new grant is in place, is the commit: the queue
