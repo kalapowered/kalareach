@@ -150,18 +150,32 @@ impl PluginHost {
                     detail: format!("the component runtime could not be built: {error}"),
                 }
             })?;
-        // Created if it is not there yet, owner-only. A host is started the first time a binding
-        // needs a component, and an environment that has never installed one has no such directory;
-        // that is a first state rather than a misconfiguration. Opening it once here is what lets
-        // every payload afterwards be opened relative to this handle.
-        kr_ipc::paths::create_private_directory(&config.packages_root).map_err(|error| {
-            LaunchError::Refused {
-                detail: format!(
-                    "the packages directory {} cannot be made: {error}",
-                    config.packages_root.display()
-                ),
+        // The directory belongs to whoever filed the components in it, which is the catalogue: it
+        // holds every repository's store, made with the catalogue's own permissions. This host
+        // opens it and nothing more. It does not create it, because a host started where no
+        // package was ever installed has no component to read, and it does not judge its mode,
+        // because the owner-only directory above it is what keeps other accounts out. A name that
+        // is a link or not a directory is refused, and opening it once here is what lets every
+        // payload afterwards be opened relative to this handle.
+        match std::fs::symlink_metadata(&config.packages_root) {
+            Ok(found) if found.is_dir() => {}
+            Ok(_) => {
+                return Err(LaunchError::Refused {
+                    detail: format!(
+                        "the packages directory {} is a link or not a directory",
+                        config.packages_root.display()
+                    ),
+                });
             }
-        })?;
+            Err(error) => {
+                return Err(LaunchError::Refused {
+                    detail: format!(
+                        "the packages directory {} cannot be read: {error}",
+                        config.packages_root.display()
+                    ),
+                });
+            }
+        }
         let packages =
             cap_std::fs::Dir::open_ambient_dir(&config.packages_root, cap_std::ambient_authority())
                 .map_err(|error| LaunchError::Refused {
@@ -1399,6 +1413,48 @@ mod tests {
         let opened = cap_std::fs::Dir::open_ambient_dir(&packages, cap_std::ambient_authority())
             .expect("the packages directory opens");
         (directory, opened, packages)
+    }
+
+    #[cfg(unix)]
+    fn config_over(packages: &Path, scratch: &Path) -> HostConfig {
+        HostConfig {
+            endpoint: kr_ipc::paths::Endpoint::from_path(scratch.join("p.sock"))
+                .expect("an endpoint"),
+            packages_root: packages.to_path_buf(),
+            cache_root: scratch.join("cache"),
+        }
+    }
+
+    /// The catalogue makes the directory the host reads components from, with its own permissions.
+    /// A host that demanded owner-only on it would refuse to start in every real environment.
+    #[cfg(unix)]
+    #[test]
+    fn a_packages_directory_the_catalogue_made_is_opened_as_it_is_and_never_made() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = tempfile::tempdir().expect("a temporary directory");
+        let packages = scratch.path().join("repositories");
+        let identity = || {
+            HostIdentity::generate(kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()))
+                .expect("an identity")
+        };
+
+        let absent = PluginHost::new(identity(), config_over(&packages, scratch.path()))
+            .expect_err("a host does not make the catalogue's directory");
+        assert!(absent.to_string().contains("cannot be read"), "{absent}");
+        assert!(!packages.exists());
+
+        std::fs::create_dir(&packages).expect("the catalogue's directory");
+        std::fs::set_permissions(&packages, std::fs::Permissions::from_mode(0o755))
+            .expect("the permissions a default umask gives");
+        PluginHost::new(identity(), config_over(&packages, scratch.path()))
+            .expect("a directory readable by others is the catalogue's own");
+
+        let link = scratch.path().join("linked");
+        std::os::unix::fs::symlink(&packages, &link).expect("a link");
+        let linked = PluginHost::new(identity(), config_over(&link, scratch.path()))
+            .expect_err("a link is not the catalogue's directory");
+        assert!(linked.to_string().contains("not a directory"), "{linked}");
     }
 
     #[test]
