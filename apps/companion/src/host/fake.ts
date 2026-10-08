@@ -230,9 +230,13 @@ export interface FakeHostControls {
   /**
    * Has the connection go to another host, as choosing one does: the environment the connection
    * belongs to changes and is told, the host lists no sessions of the earlier one, and reads of its
-   * sessions are refused when `refuseSessionList` is set.
+   * sessions or of its environments are refused when `refuseSessionList` or `refuseEnvironmentList`
+   * is set.
    */
-  switchHost(environmentId: string, options?: { readonly refuseSessionList?: boolean }): void
+  switchHost(
+    environmentId: string,
+    options?: { readonly refuseSessionList?: boolean; readonly refuseEnvironmentList?: boolean }
+  ): void
   /** Sets what the connection may do, and says so as native code does. */
   setRights(rights: readonly ActionRight[]): void
   /**
@@ -663,6 +667,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let hostEnvironment: string = ENVIRONMENT
   let anotherHost = false
   let sessionListRefused = false
+  let environmentListRefused = false
   const connectionNow = (): ConnectionState =>
     receivedConnection({
       connected,
@@ -792,6 +797,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     environmentList: () =>
       reading('environmentList', () => {
         requireConnection()
+        if (environmentListRefused) {
+          refuse('PERMISSION_DENIED', 'This device may not list the environments of this host.')
+        }
         return environments(hostEnvironment, anotherHost ? 'another host · Linux' : null)
       }),
 
@@ -1639,6 +1647,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       hostEnvironment = environmentId
       anotherHost = true
       sessionListRefused = options?.refuseSessionList === true
+      environmentListRefused = options?.refuseEnvironmentList === true
       for (const listener of connectionListeners) listener(connectionNow())
     },
     withoutQualifiedShell() {
