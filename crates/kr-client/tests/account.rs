@@ -1442,6 +1442,78 @@ async fn a_grant_whose_own_revocation_is_pending_is_removed_at_start() {
     );
 }
 
+/// A store that refuses the next write of the session item, as a full disk or a locked keychain does.
+struct RefusesOneSessionWrite {
+    inner: MemoryStore,
+    refuse: std::sync::atomic::AtomicBool,
+}
+
+impl SecretStore for RefusesOneSessionWrite {
+    fn set(&self, name: &SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
+        if name.as_str().ends_with("account/session") && self.refuse.swap(false, Ordering::SeqCst) {
+            return Err(kr_crypto::CryptoError::SecretStore {
+                message: "the store refused the write".to_owned(),
+            });
+        }
+        self.inner.set(name, secret)
+    }
+
+    fn get(&self, name: &SecretName) -> kr_crypto::Result<Option<kr_crypto::secret::SecretVec>> {
+        self.inner.get(name)
+    }
+
+    fn delete(&self, name: &SecretName) -> kr_crypto::Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+/// A commit that cannot write the new grant leaves the old one whole, and owes it no revocation: the
+/// queue is not left holding the revocation of a grant this device goes on holding, so sending the
+/// queue (as ending an unkept token does) never ends it at the service.
+#[tokio::test]
+async fn a_commit_that_cannot_write_the_new_grant_leaves_the_old_one_whole() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(RefusesOneSessionWrite {
+        inner: MemoryStore::new(),
+        refuse: std::sync::atomic::AtomicBool::new(false),
+    });
+    let signed_in = Arc::new(
+        SignedInAccount::new(
+            Arc::clone(&stub) as Arc<dyn AccountService>,
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            Client::Desktop,
+        )
+        .with_clock(clock_ms),
+    );
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    store.refuse.store(true, Ordering::SeqCst);
+    signed_in
+        .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+        .await
+        .expect_err("the new grant cannot be written");
+
+    // Ending a token that was never kept sends the queue too. The queue holds nothing of A.
+    signed_in
+        .revoke_unkept(RefreshToken::new("grant-b").expect("a token"))
+        .await
+        .expect("the token is sent");
+    assert_eq!(stub.revoked(), ["grant-b"], "A's token was not sent");
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    assert!(matches!(
+        signed_in.status().expect("a status"),
+        AccountStatus::SignedIn { .. }
+    ));
+}
+
 /// A grant the service no longer honours ends; an unknown outcome keeps it for the next ask.
 #[tokio::test]
 async fn invalid_grant_ends_the_sign_in_and_an_unknown_outcome_keeps_it() {
