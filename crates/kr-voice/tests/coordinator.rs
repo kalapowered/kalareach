@@ -2018,7 +2018,9 @@ async fn stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told() 
 
 /// KR-REQ-15.02 and 15.17: a call whose device went silent is over at its own deadline, whatever
 /// the service can be asked. Until then it is open, and the host ends its record as a stop would:
-/// the grant is revoked, and the service is told so it can finalise the call.
+/// the grant is revoked, and the service is told so it can finalise the call. The record counts as
+/// open until it has been ended, past the deadline too, so the account cannot change while there is
+/// still a record whose close is owed under it.
 #[tokio::test]
 async fn a_call_is_over_at_its_deadline_without_its_device() {
     let fixture = fixture();
@@ -2026,7 +2028,7 @@ async fn a_call_is_over_at_its_deadline_without_its_device() {
     // Started at 10 000 for 600 seconds.
     let deadline = 610_000;
 
-    assert!(fixture.coordinator.calls_open(deadline - 1));
+    assert!(fixture.coordinator.calls_open());
     fixture.broker.answers_holds(ServiceHolds::Unreachable);
     assert_eq!(
         fixture
@@ -2036,12 +2038,12 @@ async fn a_call_is_over_at_its_deadline_without_its_device() {
         0,
         "a service that cannot be asked leaves the call open"
     );
-    assert!(fixture.coordinator.calls_open(deadline - 1));
+    assert!(fixture.coordinator.calls_open());
     assert_eq!(fixture.coordinator.live_sessions(), 1);
 
     assert!(
-        !fixture.coordinator.calls_open(deadline),
-        "a call at its deadline is not open"
+        fixture.coordinator.calls_open(),
+        "a call past its deadline is open until its record has been ended"
     );
     assert_eq!(
         fixture.coordinator.end_calls_that_are_over(deadline).await,
@@ -2049,10 +2051,7 @@ async fn a_call_is_over_at_its_deadline_without_its_device() {
     );
     assert_eq!(fixture.coordinator.live_sessions(), 0);
     assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
-    assert!(
-        !fixture.coordinator.calls_open(deadline),
-        "its close has been told"
-    );
+    assert!(!fixture.coordinator.calls_open(), "its close has been told");
 
     // The device's own stop, arriving late, finds nothing left to stop.
     let error = fixture
@@ -2083,12 +2082,12 @@ async fn a_call_the_service_ended_is_over_before_its_deadline() {
 
     assert_eq!(fixture.coordinator.end_calls_that_are_over(20_000).await, 0);
     assert_eq!(fixture.broker.asked(), vec!["call-managed".to_owned()]);
-    assert!(fixture.coordinator.calls_open(20_000));
+    assert!(fixture.coordinator.calls_open());
     assert_eq!(fixture.authority.revocations(), revoked_before);
 
     fixture.broker.answers_holds(ServiceHolds::Over);
     assert_eq!(fixture.coordinator.end_calls_that_are_over(21_000).await, 1);
-    assert!(!fixture.coordinator.calls_open(21_000));
+    assert!(!fixture.coordinator.calls_open());
     assert_eq!(fixture.coordinator.live_sessions(), 0);
     assert_eq!(
         fixture.authority.revocations(),

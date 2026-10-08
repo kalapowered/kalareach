@@ -34,6 +34,8 @@
 //! | KR-REQ-17.23 | `a_host_whose_broker_is_not_the_account_service_signs_in_nowhere` |
 //! | KR-REQ-17.23 | `a_call_the_service_ended_no_longer_holds_sign_out_refused_when_its_phone_went_silent` |
 //! | KR-REQ-17.23 | `a_call_past_its_deadline_no_longer_holds_sign_out_refused_when_its_phone_went_silent` |
+//! | KR-REQ-17.23 | `a_call_whose_deadline_passes_while_the_service_is_asked_keeps_the_account_as_it_is` |
+//! | KR-REQ-17.23 | `a_call_whose_deadline_passes_while_a_sign_in_is_exchanged_keeps_the_account_as_it_is` |
 //! | KR-REQ-15.17 | `a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_grant` |
 //! | KR-REQ-26.14 | `a_host_reaches_the_broker_through_the_proxy_its_document_selects` |
 
@@ -2413,6 +2415,114 @@ async fn a_call_past_its_deadline_no_longer_holds_sign_out_refused_when_its_phon
             .any(|request| request.path == "/api/voice/sessions/call-1/close"),
         "the service was told the call is over"
     );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a call whose deadline passes while the service is being asked about it
+/// is still open to the request that was asking. The account does not change while the call's
+/// record is there to be closed under it: the request is refused, nothing is revoked, and the next
+/// request ends the record, tells the service under the account the call was made under, and is
+/// made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_whose_deadline_passes_while_the_service_is_asked_keeps_the_account_as_it_is() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = net_support::MovedWall::new();
+    let host = net_support::Host::start_with_document_clocks(
+        &owner,
+        &document_naming(&broker.origin),
+        wall.clocks(),
+    )
+    .await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, _session, _call) = a_call_whose_phone_went_silent(&host, &owner).await;
+
+    // The service is asked about the call, and the call's deadline passes before it answers that
+    // the call is still open.
+    let asked = broker.hold("/api/voice/sessions/current");
+    let (answer, ()) = tokio::join!(
+        sign_out_as(&host, ActionId::new(kr_ipc::new_uuid())),
+        async {
+            asked.reached().await;
+            wall.advance(std::time::Duration::from_secs(601));
+            asked.release();
+        }
+    );
+    let refused = answer.expect_err("the call's record was still there when the request looked");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refused:?}"
+    );
+    assert!(matches!(
+        account_report(&host).await.state,
+        AccountState::SignedIn { .. }
+    ));
+    assert!(broker.revoked().is_empty(), "nothing was revoked");
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 1);
+
+    assert!(sign_out(&host).await.was_signed_in);
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 0);
+    let closes: Vec<_> = broker
+        .seen()
+        .into_iter()
+        .filter(|request| request.path == "/api/voice/sessions/call-1/close")
+        .collect();
+    assert_eq!(closes.len(), 1, "the service was told once");
+    assert_eq!(
+        closes[0].authorization.as_deref(),
+        Some(format!("Bearer {}", broker.access(1)).as_str()),
+        "the close carried the account the call was made under"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a call that opens while a sign-in's code is being exchanged, and whose
+/// deadline passes before the exchange answers, still leaves the account as it was: the record is
+/// there to be closed under the account it was made under, so the new grant is revoked and the
+/// attempt ends as `call_open`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_whose_deadline_passes_while_a_sign_in_is_exchanged_keeps_the_account_as_it_is() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = net_support::MovedWall::new();
+    let host = net_support::Host::start_with_document_clocks(
+        &owner,
+        &document_naming(&broker.origin),
+        wall.clocks(),
+    )
+    .await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let exchange = broker.hold("/auth/oauth2/token");
+
+    let (page, _call) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        exchange.reached().await;
+        // The code is out at the service. A call opens now, under the account signed in, and its
+        // deadline passes before the service answers.
+        let started = start_a_call(&host, &owner).await;
+        wall.advance(std::time::Duration::from_secs(601));
+        exchange.release();
+        started
+    });
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    let report = settled(&host).await;
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::CallOpen)
+    );
+    assert!(
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the account is as it was: {report:?}"
+    );
+    assert_eq!(
+        broker.revoked(),
+        [broker.refresh(2)],
+        "the grant the exchange brought was ended"
+    );
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 1);
     host.stop().await;
 }
 
