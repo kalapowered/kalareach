@@ -312,18 +312,20 @@ pub fn start_pairing<R: tauri::Runtime>(
                 kr_client::pairing::candidate::AttemptState::Paired { .. }
             );
             let _ = emitter.emit(pairing::PAIRING_EVENT, view);
-            // A computer that reaches no host takes the first one it pairs with as the one its
-            // commands go to, so a phone that has just paired is talking to the host it paired with
-            // without a second step. Once a host is in use, this does nothing.
-            if paired
-                && device.host_in_use().is_none()
-                && !emitter.state::<AppState>().connection_state().connected
-                && let Some(host) = device.newest_host()
-            {
-                let app = emitter.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = hosts::use_host(&app, host).await;
-                });
+            if paired {
+                // A computer that reaches no host takes the first one it pairs with as the one its
+                // commands go to, so a phone that has just paired is talking to the host it paired
+                // with without a second step. Once a host is in use, or while one is reached
+                // (a computer's own host, say), this does nothing.
+                if device.host_in_use().is_none()
+                    && !emitter.state::<AppState>().connection_state().connected
+                    && let Some(host) = device.newest_host()
+                {
+                    let app = emitter.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = hosts::use_host(&app, host).await;
+                    });
+                }
             }
         }
     })?;

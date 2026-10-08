@@ -10,7 +10,7 @@
 //! with why. A command made while it is not connected is refused as such, and none is sent down a
 //! connection that is gone.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_client::pairing::paired::PairedHost;
 use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
@@ -28,6 +28,10 @@ const LONGEST_RETRY: Duration = Duration::from_secs(30);
 /// How long [`use_host`] waits for the first attempt before it answers with where things stand.
 const FIRST_ATTEMPT_WITHIN: Duration = Duration::from_secs(60);
 
+/// How long a connection must last before the next loss is treated as a first one, and not as a
+/// host that accepts and then closes.
+const LASTED: Duration = Duration::from_secs(10);
+
 /// The pause after `failures` attempts in a row that ended without a connection that lasted.
 fn pause(failures: u32) -> Duration {
     FIRST_RETRY
@@ -38,22 +42,34 @@ fn pause(failures: u32) -> Duration {
 /// Makes `host` the one this application's commands go to, and says where that stands once the
 /// first attempt to reach it has ended.
 ///
-/// The choice is remembered. The connection is kept: when it ends it is taken up again, and the
-/// application says it is not connected for as long as it is not.
+/// The choice is kept for the next run before it is made, so one that could not be kept is not made
+/// and the host in use stays as it was. The connection is kept: when it ends it is taken up again,
+/// and the application says it is not connected for as long as it is not.
 ///
 /// # Errors
 ///
-/// Returns a local failure when this computer's pairing records could not be opened.
+/// Returns a local failure when this computer's pairing records could not be opened or the choice
+/// could not be kept.
 pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Result<ConnectionState> {
     let state = app.state::<AppState>();
     let device = state.device()?;
-    // What is held for the host before this one is let go before anything else is asked of it.
-    state.end_supervision();
-    state.disconnected("this application is reaching the host you chose");
-    device.use_host(host.host_device_id);
     let (first, reached) = tokio::sync::oneshot::channel();
-    let handle = tauri::async_runtime::spawn(keep(app.clone(), host, Some(first)));
-    state.supervise(handle);
+    // One step: the host chosen before is let go, this choice is kept, and the task that keeps its
+    // connection starts, so no task of an earlier choice can put its connection back.
+    state.choose_host(
+        "this application is reaching the host you chose",
+        |choice| {
+            device.use_host(host.host_device_id)?;
+            Ok(tauri::async_runtime::spawn(keep(
+                app.clone(),
+                host,
+                choice,
+                Some(first),
+            )))
+        },
+    )?;
+    // The page is told at once that the host it was talking to is no longer the one in use.
+    let _ = app.emit(CONNECTION_EVENT, state.connection_state());
     let _ = tokio::time::timeout(FIRST_ATTEMPT_WITHIN, reached).await;
     Ok(state.connection_state())
 }
@@ -66,16 +82,29 @@ pub fn resume<R: Runtime>(app: &AppHandle<R>) {
         return;
     };
     if let Some(host) = device.host_in_use() {
-        let handle = tauri::async_runtime::spawn(keep(app.clone(), host, None));
-        state.supervise(handle);
+        let _ = state.choose_host(
+            "this application is reaching the host you chose",
+            |choice| {
+                Ok(tauri::async_runtime::spawn(keep(
+                    app.clone(),
+                    host,
+                    choice,
+                    None,
+                )))
+            },
+        );
     }
 }
 
-/// Keeps a connection to `host`: reaches it, forwards what it publishes, and when it ends reaches
-/// it again. `first` is told once the first attempt has ended either way.
+/// Keeps a connection to `host` for `choice`: reaches it, forwards what it publishes, and when it
+/// ends reaches it again. `first` is told once the first attempt has ended either way.
+///
+/// A task ends as soon as another host is chosen: it installs a connection, or records that it has
+/// none, only while its own choice is the one in force.
 async fn keep<R: Runtime>(
     app: AppHandle<R>,
     host: PairedHost,
+    choice: u64,
     mut first: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
     let mut failures: u32 = 0;
@@ -87,18 +116,29 @@ async fn keep<R: Runtime>(
         let outcome = Connection::paired(&device, &host).await;
         match outcome {
             Ok(connection) => {
-                failures = 0;
                 let session = connection.session();
-                state.connected(connection);
+                if !state.connected_for(choice, connection) {
+                    return;
+                }
                 let _ = app.emit(CONNECTION_EVENT, state.connection_state());
                 if let Some(first) = first.take() {
                     let _ = first.send(());
                 }
+                let began = Instant::now();
                 connection::forward_events(app.clone(), session).await;
+                // A connection that did not last is not a recovery: a host that accepts and then
+                // closes is waited for as one that does not answer.
+                failures = if began.elapsed() >= LASTED {
+                    0
+                } else {
+                    failures.saturating_add(1)
+                };
             }
             Err(error) => {
                 failures = failures.saturating_add(1);
-                state.disconnected(error.message);
+                if !state.disconnected_for(choice, error.message) {
+                    return;
+                }
                 let _ = app.emit(CONNECTION_EVENT, state.connection_state());
                 if let Some(first) = first.take() {
                     let _ = first.send(());
