@@ -76,6 +76,9 @@ pub enum Request {
     Descriptions,
     /// The address a sign-in is opened at and the account it signed in: `kr account`.
     Account,
+    /// The destinations notifications are sent to, as the owner named them: their identifiers,
+    /// where they send and what the rule that sends to them is called: `kr destination`.
+    Destinations,
 }
 
 /// Content the person asked to read.
