@@ -4546,6 +4546,196 @@ fn asked_ids(
         .collect()
 }
 
+/// KR-REQ-25.10 and KR-REQ-18.03 over the real network path, for a share that includes the screen.
+/// A line is on the session's screen before anything is shared. The owner is shown it in the
+/// preview, as the text itself. The device it is shared with, whose own pairing grant reaches no
+/// session, attaches and subscribes only once it has redeemed the invitation, is sent what the
+/// session prints from then on, and is cut off when the owner withdraws the share.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until_the_share_is_withdrawn()
+ {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let on_session = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let on_the_host = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::null(),
+        session_epoch: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+
+    // A device that types puts a line on the screen before anything is shared.
+    let typist = Device::create(&loopback()).await;
+    let typist_record = pair(&daemon, &typist, &owner).await;
+    let typing = connect(&daemon, &typist, &typist_record).await;
+    let attached = attach(&typing, host.environment_id, session_id).await;
+    let printed = type_and_observe(
+        &typing,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        MARKER_COMMAND,
+    )
+    .await;
+    assert!(printed.contains(MARKER));
+
+    // The device the owner shares with is paired under a grant that reaches no session.
+    let viewer = Device::create(&loopback()).await;
+    let viewer_record = pair_with(
+        &daemon,
+        &viewer,
+        &owner,
+        proposing(&[ActionRight::SessionView], SessionSelector::None),
+    )
+    .await;
+    let selection = kr_protocol::sharing::RoleSelection {
+        include_live_screen: true,
+        ..kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer)
+    };
+    let issued: kr_protocol::sharing::GrantCreateResult = local
+        .mutate(
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_session.clone(),
+            &kr_protocol::sharing::GrantCreateParams {
+                session_id,
+                recipient_device_id: viewer_record.device_id,
+                parent_grant_id: Nullable::null(),
+                accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(
+                    &selection.actions(),
+                ),
+                selection,
+                lifetime_ms: Nullable::null(),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is written")
+        .to_typed()
+        .expect("decodes");
+    let shown = issued
+        .preview
+        .live_screen
+        .0
+        .expect("the owner is shown the screen being shared");
+    assert!(!shown.truncated);
+    assert!(
+        shown.lines.iter().any(|line| line.contains(MARKER)),
+        "the preview is the text on the screen, printed before the share: {shown:?}"
+    );
+
+    // Until it is redeemed the share reaches nothing.
+    let session = connect(&daemon, &viewer, &viewer_record).await;
+    let before = session
+        .mutate(
+            Method::SessionAttach,
+            on_session.clone(),
+            None,
+            &ParamsValue::empty(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Semantic,
+                claim_geometry: false,
+                dimensions: Nullable::null(),
+                terminal_profile_id: Nullable::null(),
+                requested: [AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("a share nobody redeemed attaches nothing");
+    assert_eq!(before.code(), ErrorCode::PermissionDenied);
+    let _: kr_protocol::sharing::GrantRedeemResult = session
+        .mutate(
+            Method::GrantRedeem,
+            on_the_host.clone(),
+            None,
+            &ParamsValue::empty(),
+            &kr_protocol::sharing::GrantRedeemParams {
+                invitation_id: issued.preview.invitation_id,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the invitation is redeemed")
+        .to_typed()
+        .expect("decodes");
+
+    // Redeemed, it attaches and follows the screen.
+    let watching = attach_one(
+        &session,
+        host.environment_id,
+        session_id,
+        &[AttachmentCapability::ObserveTerminal],
+    )
+    .await;
+    let mut events = session.events();
+    let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
+    let params = restoration
+        .subscribe_params(session_id, watching, &[EventStream::Output])
+        .expect("the stream is waiting to subscribe");
+    session
+        .subscribe_events(&params)
+        .await
+        .expect("the share includes the live screen, so the device subscribes");
+    restoration.subscribed().expect("the order is kept");
+    typing
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the second command is accepted");
+    let seen = observe(&session, &mut events, SECOND_MARKER).await;
+    assert!(seen.contains(SECOND_MARKER));
+
+    // The owner withdraws the share: the device is served nothing more.
+    local
+        .mutate(
+            Method::GrantRevoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host,
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: issued.grant.grant_id,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is revoked");
+    let after = session
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await;
+    assert!(
+        after.is_err(),
+        "a device whose share was withdrawn is not served: {after:?}"
+    );
+
+    typing.close();
+    session.close();
+    // A revocation fences every connection admitted before it, the owner's own included.
+    let mut local = host.client().await;
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
 /// KR-REQ-10.51, KR-REQ-25.10 and KR-REQ-18.03 over the real network path: the local owner shares
 /// a session with a paired device, naming a question an application inside the session asked
 /// before the history bound the share sets. The owner is shown the question as the session's own

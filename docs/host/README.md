@@ -4606,8 +4606,8 @@ the grant it was made under. The worker is told which grant a request was decide
 its answer to that grant's rights and history scope.
 
 A share's own end is a time bound beside the others a decision holds. A share that has run out
-refuses what it would decide and ends a subscription it was carrying, and it writes nothing on the
-device's record: the device was paired under a grant of its own, and is served under it afterwards.
+refuses what it would decide and ends a subscription it was carrying at the next batch, and it
+writes nothing on the device's record: the device was paired under a grant of its own, and is served under it afterwards.
 
 `grants::decide` takes the intersection in this order:
 
@@ -4673,7 +4673,12 @@ grant, and an invitation that names a question, an approval or the live screen i
 text for that thing arrives with it and the two name the same things. `grant.create` reads that text
 from the session's worker before anything is written: a named question's text, its revision and the
 moment it was asked, while it is open, and what a named approval asks and when its request arrived,
-while it can still be decided, pending or claimed. What an approval asks is its decoder's summary,
+while it can still be decided, pending or claimed. For the live screen it asks the worker for the
+visible lines of the buffer that is showing (`session.screen.preview`, a read only the owner at
+this machine makes), cut to the scope the share would carry: the buffer that is not showing and
+what has scrolled off are not in it. A screen too large for a preview is not shared, because the
+issuer would be shown less than the recipient will read, and a session whose worker is of a build
+that cannot show it is not shared either. What an approval asks is its decoder's summary,
 or where the decoder gave none, as the Claude Code channel's table gives none, the request as its
 upstream wrote it, when that is text of at most 4,096 bytes; an approval with neither cannot be
 named, because a preview cut short would show its issuer less than the recipient will read. An
