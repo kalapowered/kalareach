@@ -660,7 +660,7 @@ fn windows() -> Vec<Step> {
             reading: Reading::Build,
             ..Step::cargo(
                 Group::Rust,
-                "the control daemon, the worker and the forwarder the suites start",
+                "the control daemon, the worker, the forwarder and the plugin host the suites start",
                 &[
                     "build",
                     "--locked",
@@ -670,6 +670,8 @@ fn windows() -> Vec<Step> {
                     "kr-worker",
                     "-p",
                     "kr-hook",
+                    "-p",
+                    "kr-plugin-host",
                 ],
             )
         },
@@ -1052,6 +1054,18 @@ fn windows() -> Vec<Step> {
                 "kr-controller",
                 "--test",
                 "task_supervisor",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the plugin host started through the environment's scheduled task",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "plugin_runtime_service",
             ],
         ),
         // kr new through the environment's scheduled task. The daemon the task starts keeps its
