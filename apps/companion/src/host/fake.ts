@@ -227,6 +227,12 @@ export interface FakeHostControls {
    * contacted right now.
    */
   setConnected(connected: boolean, reason?: string): void
+  /**
+   * Has the connection go to another host, as choosing one does: the environment the connection
+   * belongs to changes and is told, the host lists no sessions of the earlier one, and reads of its
+   * sessions are refused when `refuseSessionList` is set.
+   */
+  switchHost(environmentId: string, options?: { readonly refuseSessionList?: boolean }): void
   /** Sets what the connection may do, and says so as native code does. */
   setRights(rights: readonly ActionRight[]): void
   /**
@@ -653,10 +659,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   // What native code says, taken in the way the desktop port takes it in: a blank reason is none.
   // What the connection may do: the host's owner holds every right, unless a test says otherwise.
   let rights: readonly ActionRight[] = EVERY_RIGHT
+  let hostEnvironment: string = ENVIRONMENT
+  let anotherHost = false
+  let sessionListRefused = false
   const connectionNow = (): ConnectionState =>
     receivedConnection({
       connected,
-      environment_id: connected ? ENVIRONMENT : null,
+      environment_id: connected ? hostEnvironment : null,
       reason: connected ? null : lostBecause,
       rights: connected ? rights : null
     })
@@ -788,7 +797,10 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     sessionList: () =>
       reading('sessionList', () => {
         requireConnection()
-        return { sessions: listed() }
+        if (sessionListRefused) {
+          refuse('PERMISSION_DENIED', 'This device may not list the sessions of this host.')
+        }
+        return { sessions: anotherHost ? [] : listed() }
       }),
     sessionRead: (params) =>
       reading('sessionRead', () => {
@@ -1620,6 +1632,12 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setConnected(next, reason = UNREACHABLE) {
       connected = next
       lostBecause = reason
+      for (const listener of connectionListeners) listener(connectionNow())
+    },
+    switchHost(environmentId, options) {
+      hostEnvironment = environmentId
+      anotherHost = true
+      sessionListRefused = options?.refuseSessionList === true
       for (const listener of connectionListeners) listener(connectionNow())
     },
     withoutQualifiedShell() {

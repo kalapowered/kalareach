@@ -37,15 +37,23 @@ interface Row {
   readonly tone: 'muted' | 'success' | 'warning'
 }
 
+/**
+ * The connection a list was read under, as one value: whether a host is reached, and which one.
+ * Two hosts are two values, so what one listed is never taken for the other's.
+ */
+function connectionKey(connected: boolean | null | undefined, environmentId: string | null | undefined): string {
+  return connected === true ? `host:${environmentId ?? ''}` : String(connected)
+}
+
 /** What a list read, and the connection it was read under. */
 interface Held {
-  readonly at: boolean | null | undefined
+  readonly at: string
   readonly rows: readonly Row[]
 }
 
 /** Why a list could not be read, and the connection it was read under. */
 interface Problem {
-  readonly at: boolean | null | undefined
+  readonly at: string
   readonly message: string
 }
 
@@ -54,7 +62,8 @@ export function MobileSessions({
   surface,
   onOpen,
   onOpenVoice,
-  connected
+  connected,
+  environmentId
 }: {
   readonly surface: Surface
   readonly onOpen: (sessionId: string) => void
@@ -62,14 +71,17 @@ export function MobileSessions({
   readonly onOpenVoice?: () => void
   /** Whether a host is being reached now, or null before anything has said. */
   readonly connected?: boolean | null
+  /** The environment the connection belongs to, which says which host is reached. */
+  readonly environmentId?: string | null
 }): ReactNode {
   const { port } = useApp()
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)
-  const rows = held !== null && held.at === connected ? held.rows : null
+  const key = connectionKey(connected, environmentId)
+  const rows = held !== null && held.at === key ? held.rows : null
   const [problem, setProblem] = useState<Problem | null>(null)
-  const error = problem !== null && problem.at === connected ? problem.message : null
+  const error = problem !== null && problem.at === key ? problem.message : null
   const target = minimumTarget(surface)
   // The host is asked about the rows a person can see, and the few either side of them.
   const { onScreen, track } = useOnScreen()
@@ -93,7 +105,7 @@ export function MobileSessions({
           if (!current()) return
           const sessions = (answer satisfies SessionListResult).sessions ?? []
           setHeld({
-            at: connected,
+            at: key,
             rows: sessions.map((session) => ({
               id: session.session_id,
               title: `Session ${session.display_number}`,
@@ -112,11 +124,11 @@ export function MobileSessions({
         })
         .catch((failure: unknown) => {
           if (!current()) return
-          setProblem({ at: connected, message: failureMessage(failure) })
+          setProblem({ at: key, message: failureMessage(failure) })
         })
     })
     return reads.stop
-  }, [port, connected])
+  }, [port, connected, key])
 
   return (
     <>
@@ -205,19 +217,23 @@ export function MobileSessions({
  */
 export function MobileHosts({
   surface,
-  connected
+  connected,
+  environmentId
 }: {
   readonly surface: Surface
   /** Whether a host is being reached now, or null before anything has said. */
   readonly connected?: boolean | null
+  /** The environment the connection belongs to, which says which host is reached. */
+  readonly environmentId?: string | null
 }): ReactNode {
   const { port } = useApp()
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)
-  const rows = held !== null && held.at === connected ? held.rows : null
+  const key = connectionKey(connected, environmentId)
+  const rows = held !== null && held.at === key ? held.rows : null
   const [problem, setProblem] = useState<Problem | null>(null)
-  const error = problem !== null && problem.at === connected ? problem.message : null
+  const error = problem !== null && problem.at === key ? problem.message : null
   const target = minimumTarget(surface)
 
   // Read as the session list is: only the newest read shows, and nothing once the list has gone.
@@ -230,7 +246,7 @@ export function MobileHosts({
         .then((answer: EnvironmentListResult) => {
           if (!current()) return
           setHeld({
-            at: connected,
+            at: key,
             rows: answer.environments.map((environment) => ({
               id: environment.environment_id,
               title: environment.label,
@@ -245,11 +261,11 @@ export function MobileHosts({
         })
         .catch((failure: unknown) => {
           if (!current()) return
-          setProblem({ at: connected, message: failureMessage(failure) })
+          setProblem({ at: key, message: failureMessage(failure) })
         })
     })
     return reads.stop
-  }, [port, connected])
+  }, [port, connected, key])
 
   return (
     <>

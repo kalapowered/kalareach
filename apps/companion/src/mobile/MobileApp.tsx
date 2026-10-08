@@ -109,6 +109,7 @@ export function MobileApp({
   // then, so neither the bar nor a session claims contact or its loss before anything has answered.
   const [connection, setConnection] = useState<{
     readonly connected: boolean
+    readonly environmentId: string | null
     readonly reason: string | null
     readonly rights: readonly ActionRight[] | null
   } | null>(null)
@@ -152,12 +153,18 @@ export function MobileApp({
         (state) => {
           setConnection({
             connected: state.connected,
+            environmentId: state.environment_id,
             reason: state.reason,
             rights: state.connected ? state.rights : null
           })
         },
         (failure) => {
-          setConnection({ connected: false, reason: failureMessage(failure), rights: null })
+          setConnection({
+            connected: false,
+            environmentId: null,
+            reason: failureMessage(failure),
+            rights: null
+          })
         }
       ),
     [port]
@@ -271,6 +278,7 @@ export function MobileApp({
             onOpen={openSession}
             onOpenVoice={connection?.connected === true ? openVoice : undefined}
             connected={connection?.connected ?? null}
+            environmentId={connection?.environmentId ?? null}
           />
         ) : null}
         {inVoice ? <VoiceRoute surface={resolved} embedded /> : null}
@@ -283,7 +291,11 @@ export function MobileApp({
           />
         ) : null}
         {place.tab === 'hosts' ? (
-          <MobileHosts surface={resolved} connected={connection?.connected ?? null} />
+          <MobileHosts
+            surface={resolved}
+            connected={connection?.connected ?? null}
+            environmentId={connection?.environmentId ?? null}
+          />
         ) : null}
         {place.tab === 'account' ? <Account surface={resolved} channel={build.channel} /> : null}
       </main>
