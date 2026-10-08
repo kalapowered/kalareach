@@ -828,10 +828,11 @@ destination measures differently from moving anything:
    gave it. A disagreement means the text cannot be placed at canonical positions, so the span is
    filled with spaces and counted.
 4. **The coordinate system is established, not assumed.** A frame clears origin mode, the left and
-   right margins and insert mode, and makes the whole screen the scroll region, before its first
-   cell. A destination that was being forwarded the stream a moment ago can be in any of those, and
-   each one changes where an absolute address lands or what drawing a cell does to its neighbours.
-   The session's own are installed after the last row, so a projection that becomes a direct
+   right margins and insert mode, makes the whole screen the scroll region, and closes any hyperlink
+   it did not open, before its first cell. A destination that was being forwarded the stream a
+   moment ago can be in any of those, and each one changes where an absolute address lands, what
+   drawing a cell does to its neighbours, or which cells belong to a link. The session's own
+   coordinate system is installed after the last row, so a projection that becomes a direct
    presentation leaves the application the terminal it is writing for; a window showing part of the
    grid cannot carry a margin, which is a row of the grid, and reports that instead.
 
