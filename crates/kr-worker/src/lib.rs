@@ -43,6 +43,7 @@ pub mod attention_fence;
 pub mod attention_source;
 pub mod broker;
 pub mod config;
+pub mod daemon_link;
 pub mod description_facts;
 pub mod desktop;
 pub mod environment;
