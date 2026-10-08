@@ -119,18 +119,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use kr_client::error::ClientError;
+use kr_client::retry::UserAction;
 use kr_client::services::{
     ArchiveAnswer, BackupManifestService, BackupState, Dispatched, NewUpload, PartTable,
-    StorageService, UploadId, UploadProgress, upload_parts,
+    ServiceFuture, StorageService, StorageStatus, UploadId, UploadProgress, upload_parts,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::SigningTranscript;
 use kr_protocol::archive::{
     ArchiveDescriptor, BACKUP_PUBLICATION_DOMAIN, BackupGenerationPublication,
-    BackupGenerationPublicationPayload,
+    BackupGenerationPublicationPayload, BackupWriterRecord,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
@@ -410,6 +412,59 @@ pub enum Idle {
     },
 }
 
+/// Why the service is holding work back, as it said, so that whatever runs the uploader can wait
+/// as long as the service asked and for as long as the cause lasts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hold {
+    /// The code the refusal or the failure carried.
+    pub code: ErrorCode,
+    /// What a person does about it.
+    pub action: UserAction,
+    /// How long the service asked to be left alone, when it said.
+    pub retry_after: Option<Duration>,
+}
+
+impl Hold {
+    /// What the service's refusal or a failure to reach it says.
+    #[must_use]
+    pub fn of(error: &ClientError) -> Self {
+        let retry_after = match error {
+            ClientError::Refused {
+                retry_after_seconds,
+                ..
+            } => retry_after_seconds.map(Duration::from_secs),
+            _ => None,
+        };
+        Self {
+            code: error.code(),
+            action: error.user_action(),
+            retry_after,
+        }
+    }
+
+    /// The hold that asks more of whoever waits: one a person must clear over one that passes, and
+    /// of two that pass the longer delay.
+    #[must_use]
+    pub fn stronger(self, other: Self) -> Self {
+        if (other.needs_a_person(), other.retry_after) > (self.needs_a_person(), self.retry_after) {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// Whether only a person can clear the cause: an account that is not signed in, an allowance
+    /// that is spent, a writer nobody enrolled or a service that is not configured. Waiting does
+    /// not clear any of them, so asking again soon only repeats the refusal.
+    #[must_use]
+    pub const fn needs_a_person(&self) -> bool {
+        matches!(
+            self.code,
+            ErrorCode::QuotaExceeded | ErrorCode::PermissionDenied | ErrorCode::HostNotConfigured
+        )
+    }
+}
+
 /// What one pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PassReport {
@@ -417,6 +472,10 @@ pub struct PassReport {
     pub idle: Option<Idle>,
     /// Every step the pass took, in order.
     pub steps: Vec<Stepped>,
+    /// The service's hold that ended the pass, when one did.
+    pub hold: Option<Hold>,
+    /// What the storage service said about backup storage, when the pass asked.
+    pub status: Option<StorageStatus>,
 }
 
 impl PassReport {
@@ -452,11 +511,169 @@ struct Turn {
     unreclaimed: BTreeSet<(ArchiveId, BackupGeneration)>,
 }
 
+/// What the services answered in the step being taken, so a step that waited can say why.
+#[derive(Debug, Default)]
+struct Noted {
+    holds: Mutex<Vec<Hold>>,
+}
+
+impl Noted {
+    fn note(&self, error: &ClientError) {
+        self.holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Hold::of(error));
+    }
+
+    /// The hold the step met, and clears what was noted. A cause a person must clear outranks one
+    /// that passes, and of two that pass the longer delay stands.
+    fn take(&self) -> Option<Hold> {
+        let mut noted = self.holds.lock().unwrap_or_else(PoisonError::into_inner);
+        let strongest = noted.iter().copied().reduce(Hold::stronger);
+        noted.clear();
+        strongest
+    }
+}
+
+/// A storage client that notes what the service refuses.
+#[derive(Debug)]
+struct NotingStorage {
+    inner: Arc<dyn StorageService>,
+    noted: Arc<Noted>,
+}
+
+impl NotingStorage {
+    async fn noted<T>(&self, answer: ServiceFuture<'_, T>) -> kr_client::Result<T> {
+        let answered = answer.await;
+        if let Err(error) = &answered {
+            self.noted.note(error);
+        }
+        answered
+    }
+}
+
+impl StorageService for NotingStorage {
+    fn status(&self) -> ServiceFuture<'_, StorageStatus> {
+        Box::pin(self.noted(self.inner.status()))
+    }
+
+    fn set_retention<'a>(
+        &'a self,
+        change: &'a kr_client::services::RetentionChange,
+    ) -> ServiceFuture<'a, kr_client::services::RetentionAnswer> {
+        Box::pin(self.noted(self.inner.set_retention(change)))
+    }
+
+    fn create_upload<'a>(
+        &'a self,
+        upload: &'a NewUpload,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadCreated>> {
+        Box::pin(self.noted(self.inner.create_upload(upload)))
+    }
+
+    fn upload_part<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        part: kr_client::services::UploadPart<'a>,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::PartStored>> {
+        Box::pin(self.noted(self.inner.upload_part(upload_id, part)))
+    }
+
+    fn complete_upload<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        table: &'a PartTable,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadCompleted>> {
+        Box::pin(self.noted(self.inner.complete_upload(upload_id, table)))
+    }
+
+    fn abort_upload<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadAborted>> {
+        Box::pin(self.noted(self.inner.abort_upload(upload_id)))
+    }
+
+    fn read_object(
+        &self,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
+        offset: u64,
+        length: u64,
+    ) -> ServiceFuture<'_, kr_client::services::ObjectRange> {
+        Box::pin(
+            self.noted(
+                self.inner
+                    .read_object(archive_id, object_id, offset, length),
+            ),
+        )
+    }
+
+    fn delete_object(
+        &self,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
+    ) -> ServiceFuture<'_, kr_client::services::ObjectDeleted> {
+        Box::pin(self.noted(self.inner.delete_object(archive_id, object_id)))
+    }
+}
+
+/// A backup manifest client that notes what the service refuses.
+#[derive(Debug)]
+struct NotingManifest {
+    inner: Arc<dyn BackupManifestService>,
+    noted: Arc<Noted>,
+}
+
+impl NotingManifest {
+    async fn noted<T>(&self, answer: ServiceFuture<'_, T>) -> kr_client::Result<T> {
+        let answered = answer.await;
+        if let Err(error) = &answered {
+            self.noted.note(error);
+        }
+        answered
+    }
+}
+
+impl BackupManifestService for NotingManifest {
+    fn enrol<'a>(
+        &'a self,
+        record: &'a BackupWriterRecord,
+    ) -> ServiceFuture<'a, kr_client::services::Enrolled> {
+        Box::pin(self.noted(self.inner.enrol(record)))
+    }
+
+    fn publish<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::Published>> {
+        Box::pin(self.noted(self.inner.publish(publication)))
+    }
+
+    fn publish_dispatched<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, Dispatched<ArchiveAnswer<kr_client::services::Published>>> {
+        Box::pin(self.noted(self.inner.publish_dispatched(publication)))
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        archive_id: ArchiveId,
+        generation: Option<BackupGeneration>,
+        checkpoint: Option<&'a kr_protocol::pairing::GenerationCheckpoint>,
+    ) -> ServiceFuture<'a, Option<kr_client::services::FetchedGeneration>> {
+        Box::pin(self.noted(self.inner.fetch(archive_id, generation, checkpoint)))
+    }
+}
+
 /// The executor that carries the backup outbox.
 pub struct Uploader {
     backup: Arc<BackupService>,
     storage: Arc<dyn StorageService>,
     manifest: Arc<dyn BackupManifestService>,
+    /// What the services refused in the step being taken.
+    noted: Arc<Noted>,
     /// The writer's key, which signs every publication and whose generations this uploader
     /// publishes.
     writer: AuthorisationKeyPair,
@@ -496,10 +713,18 @@ impl Uploader {
         writer: AuthorisationKeyPair,
         now: TimestampMs,
     ) -> Self {
+        let noted = Arc::new(Noted::default());
         Self {
             backup,
-            storage,
-            manifest,
+            storage: Arc::new(NotingStorage {
+                inner: storage,
+                noted: Arc::clone(&noted),
+            }),
+            manifest: Arc::new(NotingManifest {
+                inner: manifest,
+                noted: Arc::clone(&noted),
+            }),
+            noted,
             writer,
             started_at_ms: now.get(),
             dispatched_here: BTreeSet::new(),
@@ -578,10 +803,12 @@ impl Uploader {
         {
             return Ok(report);
         }
-        if privacy.inhibited_at().is_none() {
+        let fenced = privacy.inhibited_at().is_some();
+        if !fenced {
             match self.storage.status().await {
-                Ok(status) if status.backup == BackupState::On => {}
-                Ok(_) => {
+                Ok(status) if status.backup == BackupState::On => report.status = Some(status),
+                Ok(status) => {
+                    report.status = Some(status);
                     report.idle = Some(Idle::BackupOff);
                     return Ok(report);
                 }
@@ -589,15 +816,40 @@ impl Uploader {
                     report.idle = Some(Idle::Unavailable {
                         reason: error.to_string(),
                     });
+                    report.hold = Some(Hold::of(&error));
                     return Ok(report);
                 }
             }
         }
         let mut turn = Turn::default();
+        self.noted.take();
         while let Some(stepped) = self.next(now, &mut turn).await? {
+            let held = self.noted.take();
+            let waiting = matches!(stepped, Stepped::Waiting { .. });
             report.steps.push(stepped);
+            let Some(hold) = held.filter(|_| waiting) else {
+                continue;
+            };
+            report.hold = Some(report.hold.map_or(hold, |earlier| earlier.stronger(hold)));
+            // A service that asked to be left alone is not asked about the next attempt either:
+            // the answer would be the same. A refusal that names no delay may be about this
+            // attempt alone, an object the service already holds for example, so the pass goes on.
+            // Under a privacy fence it goes on in every case, because what a fence owes is ending
+            // work, and an attempt that needs no answer from the service ends anyway.
+            if !fenced && hold.retry_after.is_some() {
+                break;
+            }
         }
         Ok(report)
+    }
+
+    /// Asks the storage service what it says about backup storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the transport or the service answered when it did not say.
+    pub async fn status(&self) -> kr_client::Result<StorageStatus> {
+        self.storage.status().await
     }
 
     /// Takes the next step, or answers none when nothing can be done now.
@@ -844,14 +1096,18 @@ impl Uploader {
                 // leaves only while the store still holds this attempt for this uploader.
                 let mut keep = |progress: &UploadProgress| -> kr_client::Result<()> {
                     // Its own statement, so the store is let go before `may_send` reads it again.
-                    let recorded = backup.store().note_parts_acknowledged(
-                        object.archive_id,
-                        object.backup_generation,
-                        object.object_id,
-                        &record.upload_id,
-                        u64::from(progress.parts_acknowledged),
-                    );
-                    match recorded.and_then(|()| may_send(backup, attempt)) {
+                    // The store is a database on the disk, written between two parts of an upload
+                    // that takes minutes, so the write does not hold a reactor thread.
+                    let recorded = blocking(|| {
+                        backup.store().note_parts_acknowledged(
+                            object.archive_id,
+                            object.backup_generation,
+                            object.object_id,
+                            &record.upload_id,
+                            u64::from(progress.parts_acknowledged),
+                        )
+                    });
+                    match recorded.and_then(|()| blocking(|| may_send(backup, attempt))) {
                         Ok(true) => Ok(()),
                         Ok(false) => {
                             withdrawn = true;
@@ -1863,11 +2119,28 @@ enum Unstaged {
     NotAdmitted(String),
 }
 
+/// Runs `work`, which blocks on the disk, without holding a thread the reactor runs other tasks on.
+///
+/// The daemon's runtime has worker threads to give up, and `block_in_place` hands this one's tasks
+/// to another while it blocks. A runtime of one thread has none, and there the work runs where it
+/// is, which is all a runtime of one thread can do.
+fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// Reads one object's staged ciphertext whole and holds it to what this host admitted.
 ///
 /// The object is bounded by the part table's own limit first, and the file's length is read before
-/// its bytes, so a file of another size is refused without being read.
+/// its bytes, so a file of another size is refused without being read. An object is as large as a
+/// gibibyte, so the read does not hold a reactor thread.
 fn staged(object: &ObjectRecord) -> std::result::Result<Vec<u8>, Unstaged> {
+    blocking(|| read_staged(object))
+}
+
+fn read_staged(object: &ObjectRecord) -> std::result::Result<Vec<u8>, Unstaged> {
     let not_admitted = || {
         Unstaged::NotAdmitted(format!(
             "the staged ciphertext of object {} is not what this host admitted",
