@@ -2913,24 +2913,29 @@ that wrote its own closure before it went has stopped what it owned, and its rec
 **What the cleanup stops, and by what.** The worker writes down the processes its session owns in
 its journal (the `owned_processes` table), each by identifier and start value, and rewrites that
 record as the set changes. Each process is recorded from one reading that gives its start and the
-fact that puts it in the session's tree (its parent, its terminal, its group, or the session's job),
-so an identifier the kernel gave to a stranger after the process it listed ended is not recorded.
+fact that puts it in the session's tree (its parent, its session, its terminal, its group, or the
+session's job), so an identifier the kernel gave to a stranger after the process it listed ended is
+not recorded. A process stays in the record until the kernel says it has ended, so one that left
+the tree after it was seen is still stopped.
 The record belongs to one boot: one from another boot, one from an earlier build that names no boot,
 and a missing one are not acted on, and the closure says why. A recorded process is stopped only
 through the platform's hold on it: a process descriptor on Linux, the kernel's own version of the
 process on macOS (which the kernel checks again as it signals), an open handle on Windows. A
 platform that offers none of these does not signal the process by its number. On Unix the cleanup
 asks (terminate, hang up, continue), waits the five-second period section 7 gives a closing
-session, ends what is left, and waits two seconds more. On Windows the worker's job object held the
+session for the recorded processes and for whatever the unit's control group still holds, ends
+what is left, and waits two seconds more. On Windows the worker's job object held the
 whole tree and closed with the worker; the cleanup waits for that, and ends by handle only what is
 left. A worker that ran as a systemd service also ran in that service's control group, named from
 the reservation and unable to name anything else. The cleanup reads the group from the kernel, asks
 the manager to kill what it still holds, and reaches a process the worker never saw.
 
-**What it cannot reach, and what a survivor means.** A process that left the terminal's session, a
-process the worker started outside it, a process that began after the worker's last record and, on
-Linux, one that moved itself to another service or scope are not found. macOS has no control group,
-so there the record and the terminal are all there is. A process that outlasts the attempt, such as
+**What it cannot reach, and what a survivor means.** On macOS and on a Linux host with no service
+manager, a process that left the terminal's session, a process the worker started outside it and a
+process that began after the worker's last record are not found: there the record and the terminal
+are all there is, and a recorded process that left the session is still stopped. Where a service's
+control group is read, those three are reached by the group, and a process that moved itself to
+another service or scope is the one that is not found. A process that outlasts the attempt, such as
 one the platform will not let this host signal, is fenced rather than stopped: the worker that
 served it is dead, and its endpoint, descriptor and terminal are gone, so it cannot act as the
 session. The closure names it by identifier, start value and where it ran, with incomplete
@@ -2938,6 +2943,13 @@ coverage, so that nobody reads it as gone. The next session's control group is n
 reservation, and the number of its endpoint only grows, so no later session shares an identity with
 a survivor. Coverage is complete only where the cleanup confirmed a boundary: a control group the
 worker ran in and the kernel read empty, or a job that needed no help.
+
+**Who waits for it.** The closure is recorded after the cleanup, so a read, a list, the barrier
+and a daemon that starts beside a crashed session wait for it: about five seconds when a recorded
+process ignores the request, two more after force, and longer when the service manager does not
+answer (the command is given the two seconds, and is then ended and given five to be collected).
+A start runs every crashed session's cleanup before waiting for any of them. A list or a barrier
+that meets several crashed sessions one after another waits for each in turn.
 
 **A closed session can be collected.** A session with no worker has no maintenance tick, so the
 archive has a collection of its own (`ArchiveService::collect`) that applies the bounds belonging

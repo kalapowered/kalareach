@@ -1389,13 +1389,33 @@ mod platform {
             super::Stop::Terminate => &[libc::SIGTERM, libc::SIGHUP, libc::SIGCONT],
             super::Stop::Kill => &[libc::SIGKILL],
         };
+        let mut instance = instance;
         for (index, signal) in signals.iter().enumerate() {
-            match signal_instance(&instance, *signal) {
-                Signalled::Delivered => {}
-                Signalled::NoSuchProcess if index == 0 => return super::Stopped::Gone,
-                Signalled::NoSuchProcess => break,
-                Signalled::Refused(detail) => return super::Stopped::Refused(detail),
-                Signalled::Unavailable(detail) => return super::Stopped::Unsafe(detail),
+            // A process that runs a new program between the reading and the signal has the same
+            // identifier and start and a new version, and the kernel answers that no process has
+            // the old one. So an answer of "none" is checked: the same process again, under its
+            // new version, is signalled under that; anything else has ended.
+            let mut attempts = 0;
+            loop {
+                match signal_instance(&instance, *signal) {
+                    Signalled::Delivered => break,
+                    Signalled::NoSuchProcess => {
+                        attempts += 1;
+                        match read_instance(instance.pid()) {
+                            Ok(Some(now))
+                                if now.start_value == identity.start_value.get()
+                                    && attempts < 4 =>
+                            {
+                                instance = now;
+                            }
+                            Ok(Some(_) | None) if index == 0 => return super::Stopped::Gone,
+                            Ok(Some(_) | None) => return super::Stopped::Signalled,
+                            Err(detail) => return super::Stopped::Unsafe(detail),
+                        }
+                    }
+                    Signalled::Refused(detail) => return super::Stopped::Refused(detail),
+                    Signalled::Unavailable(detail) => return super::Stopped::Unsafe(detail),
+                }
             }
         }
         super::Stopped::Signalled
@@ -1589,6 +1609,13 @@ mod macos_signal {
         gid: u32,
         real_uid: u32,
         real_gid: u32,
+    }
+
+    impl Instance {
+        /// The identifier it was read under.
+        pub(super) const fn pid(&self) -> u32 {
+            self.pid
+        }
     }
 
     /// What signalling an instance came to.

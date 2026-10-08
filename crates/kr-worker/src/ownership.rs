@@ -472,10 +472,7 @@ impl OwnedProcesses {
                 }
                 members.push(identity.clone());
                 let children = kr_ipc::identity::children_of(pid).ok()?;
-                // The children are this process's only if it is the same process still.
-                if kr_ipc::identity::process_start_identity(pid).ok().as_ref() != Some(&identity) {
-                    continue;
-                }
+                let mut batch = Vec::new();
                 for child in children {
                     if walked.contains(&child) {
                         continue;
@@ -483,8 +480,15 @@ impl OwnedProcesses {
                     if let Ok(lineage) = kr_ipc::identity::process_lineage(child)
                         && lineage.parent == pid
                     {
-                        pending.push((child, lineage.identity));
+                        batch.push((child, lineage.identity));
                     }
+                }
+                // The children are this process's only if it is the same process after they were
+                // read as before: a parent that ended and whose identifier passed to another
+                // process, and a child that did the same, would otherwise agree with each other
+                // by number alone.
+                if kr_ipc::identity::process_start_identity(pid).ok().as_ref() == Some(&identity) {
+                    pending.extend(batch);
                 }
             }
             let adopted = kr_ipc::identity::children_of(worker).ok()?;
@@ -523,22 +527,19 @@ impl OwnedProcesses {
         self.note_reduced_agents(&job);
         let mut found = Vec::new();
         let mut unreadable = 0_usize;
-        let mut read = |reading: crate::windows::job::MemberReading, this: &Self| match reading {
+        let mut read = |reading: crate::windows::job::MemberReading| match reading {
             crate::windows::job::MemberReading::Held(identity) => found.push(identity),
             // A number the job listed that a process outside the job holds now is a stranger.
             crate::windows::job::MemberReading::NotHeld => {}
             // An identifier the operating system will not describe is not an identity, so it is
             // not recorded - and not silently forgotten either, because the session owned
             // whatever it names.
-            crate::windows::job::MemberReading::Unreadable(why) => {
-                unreadable += 1;
-                this.note_unestablished(format!("a process of the session's job: {why}"));
-            }
+            crate::windows::job::MemberReading::Unreadable(_) => unreadable += 1,
         };
         match job.process_ids() {
             Ok(members) => {
                 for pid in members {
-                    read(job.member(pid), self);
+                    read(job.member(pid));
                 }
             }
             Err(error) => self.note_unestablished(format!(
@@ -549,7 +550,7 @@ impl OwnedProcesses {
             match agent.process_ids() {
                 Ok(held) => {
                     for pid in held {
-                        read(agent.member(pid), self);
+                        read(agent.member(pid));
                     }
                 }
                 Err(error) => self.note_unestablished(format!(

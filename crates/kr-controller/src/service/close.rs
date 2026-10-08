@@ -418,6 +418,22 @@ impl Controller {
         }))
     }
 
+    /// Starts [`Self::crash_flight`] on a task this daemon owns, for the same reasons
+    /// [`Self::reconcile_soon`] does. `None` once this daemon is being let go.
+    pub(super) fn crash_flight_soon(
+        &self,
+        session_id: SessionId,
+        display_number: kr_protocol::session::DisplayNumber,
+        identity: kr_protocol::identity::ProcessStartIdentity,
+        reason: ClosureReason,
+    ) -> Option<tokio::task::JoinHandle<Result<Option<ClosureRecord>>>> {
+        let me = self.me.upgrade()?;
+        Some(tokio::spawn(async move {
+            me.crash_flight(session_id, display_number, &identity, reason)
+                .await
+        }))
+    }
+
     /// The body of [`Self::reconcile`].
     async fn reconcile_session(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
         let record = {

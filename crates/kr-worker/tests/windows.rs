@@ -392,6 +392,47 @@ fn the_job_holds_the_shell_and_every_process_it_starts(/* KR-ACC-010, KR-REQ-07.
     );
 }
 
+/// KR-REQ-07.66: a process is recorded as the session's only through the job, asked about the
+/// process on one open handle that also gives its creation time. A process outside the job is a
+/// stranger however it came to be listed, and is not recorded.
+#[test]
+fn the_job_names_its_members_by_the_handle_it_asked_and_refuses_a_stranger(/* KR-REQ-07.66 */) {
+    use kr_worker::windows::job::MemberReading;
+
+    let (_pty, _reader, mut shell) = powershell_in_a_console("Start-Sleep -Seconds 120");
+    let root = u32::try_from(shell.identity().pid.get()).expect("an identifier");
+    let job = kr_worker::windows::job::holding(root).expect("the session's job");
+
+    // The control: the root shell is in the job, and the identity read through the handle is the
+    // identity the shell was started under.
+    assert_eq!(
+        job.member(root),
+        MemberReading::Held(shell.identity().clone()),
+        "the job holds the root shell, under its own identity"
+    );
+
+    // A process this test starts outside the job: it holds an identifier, and the job does not
+    // hold it.
+    let mut outside = std::process::Command::new(system_program("PING.EXE"))
+        .args(["-n", "120", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("starts a process outside the job");
+    let stranger = outside.id();
+    assert_eq!(
+        job.member(stranger),
+        MemberReading::NotHeld,
+        "a process outside the job is not recorded as the session's"
+    );
+    // And an identifier no process holds is not a member either.
+    outside.kill().expect("ends the stranger");
+    outside.wait().expect("collects the stranger");
+    assert_eq!(job.member(stranger), MemberReading::NotHeld);
+
+    shell.force_stop().expect("the shell is ended");
+    shell.wait().expect("the shell ends");
+}
+
 #[test]
 fn closing_the_last_handle_ends_what_the_job_holds(/* KR-REQ-07.62 */) {
     // Kill-on-close is the promise that a worker which crashes, is killed, or exits without
