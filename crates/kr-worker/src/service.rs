@@ -2275,7 +2275,7 @@ impl WorkerService {
                     kr_protocol::local::FORWARDED_HISTORY_SCOPE,
                     kr_protocol::local::FORWARDED_QUESTION_SCOPE,
                     kr_protocol::local::FORWARDED_RESULT_SCOPE,
-                    kr_protocol::local::FORWARDED_PREVIEWED_SCREEN,
+                    kr_protocol::local::FORWARDED_SCREEN_BASIS,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
@@ -6364,9 +6364,10 @@ impl WorkerService {
                 // build serves a grant no retained content beyond it.
                 let mut result = session.attach(&params, granted, attachment_id)?;
                 if !owner {
-                    // The one filter decides how much of the screen a caller is drawn. A grant's
-                    // scope here is section 10's live-screen exception, and asking the filter
-                    // rather than naming the scope here is what keeps that decision in one place.
+                    // The one filter decides how much of the screen a pairing grant's caller is
+                    // drawn: section 10's live-screen exception, and asking the filter rather than
+                    // naming the scope here keeps that decision in one place. Which grant the
+                    // attach was decided under is the daemon's to say, below.
                     let filter = crate::history_filter::HistoryFilter::new(
                         crate::history_filter::ViewerScope::forwarded(kr_ipc::now_ms().get()),
                     );
