@@ -389,9 +389,10 @@ impl Pause {
 /// on runtimes of their own, apart from each other, so isolating it blocks the session's tasks that
 /// want the session on the threads of the runtime they run on, and stops neither the threads that
 /// serve this test nor the ones that serve the connection. With them on one runtime, a task of the
-/// session that woke while the session was held (its monitor wakes on every child process this
-/// test binary's other cases end) could block the thread a connection's task had been made
-/// runnable on, and the announcement that task was to read would go unread until the hold ended.
+/// session that woke while the session was held (its monitor wakes at times no case chooses: on
+/// Unix on every child process this test binary's other cases end) could block the thread a
+/// connection's task had been made runnable on, and the announcement that task was to read would
+/// go unread until the hold ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_resumes() {
     let worker = worker_apart().await;
