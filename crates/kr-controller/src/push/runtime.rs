@@ -89,6 +89,26 @@ pub const CONFIRMATIONS_PER_DEVICE: StatusAllowance = StatusAllowance {
     per_hour: 6,
 };
 
+/// How many nonces for a renewal this host asks the gateway for, to confirm credentials, whichever
+/// devices hand them over: a burst of six, then six an hour.
+///
+/// The gateway counts this host's renewals and revocations together, sixty requests an hour, and
+/// every renewal and every revocation takes two. A registration's nonce comes out of the same
+/// count, so what registrations may spend is a share of it that leaves most to the work the host
+/// owes: at most twelve in any hour, and eighteen when the daemon starts again inside the hour.
+pub const CONFIRMATIONS_PER_HOST: StatusAllowance = StatusAllowance {
+    burst: 6,
+    per_hour: 6,
+};
+
+/// How many renewal and revocation requests the gateway takes from one host key in an hour.
+const GATEWAY_RENEWAL_LIMIT: u64 = 60;
+
+const _: () = assert!(
+    CONFIRMATIONS_PER_HOST.most_in_an_hour() + CONFIRMATIONS_PER_HOST.burst
+        <= GATEWAY_RENEWAL_LIMIT / 2
+);
+
 /// The most unknown outcomes one sweep considers.
 ///
 /// A record the sweep may no longer ask about takes no question, so a sweep considers more records
@@ -124,6 +144,11 @@ pub struct DeliveryRuntime {
     recovered: AtomicBool,
     /// What each paired device may still ask the gateway about a credential it hands over.
     confirmations: Mutex<std::collections::BTreeMap<kr_protocol::ids::DeviceId, StatusBudget>>,
+    /// What all devices together may still spend of the gateway's allowance for renewing and
+    /// revoking, on nonces that confirm a credential.
+    nonces: StatusBudget,
+    /// One sweep of owed revocations at a time: a debt two sweeps ask about costs four requests.
+    sweeping: Mutex<()>,
     cadence: Cadence,
     runtime: tokio::runtime::Handle,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -153,6 +178,8 @@ impl DeliveryRuntime {
             attention: OnceLock::new(),
             recovered: AtomicBool::new(false),
             confirmations: Mutex::new(std::collections::BTreeMap::new()),
+            nonces: StatusBudget::new(CONFIRMATIONS_PER_HOST),
+            sweeping: Mutex::new(()),
             cadence,
             runtime,
             tasks: Mutex::new(Vec::new()),
@@ -371,6 +398,12 @@ impl DeliveryRuntime {
         let Some(adapters) = self.adapters.get() else {
             return;
         };
+        // A sweep that finds another asking leaves its debts to it: they are not settled until it
+        // has asked, so a second sweep would ask about the same ones, and the gateway counts every
+        // request against this host's allowance for renewing and revoking.
+        let Ok(_one_sweep) = self.sweeping.try_lock() else {
+            return;
+        };
         let credentials = Arc::clone(&self.credentials);
         let forget = move |sender_record_id| match credentials.forget(sender_record_id) {
             Ok(()) => true,
@@ -409,21 +442,23 @@ impl DeliveryRuntime {
     /// the device's word. A bearer for another authorisation is found at the first delivery, which
     /// the gateway refuses as aimed at another authorisation.
     ///
-    /// A device may ask a few times an hour, whatever it hands over: the questions come out of the
-    /// gateway's allowances for this host, and a device that registers over and over would spend
-    /// the renewals and revocations of every other.
+    /// A device may ask a few times an hour, whatever it hands over, and all devices together a few
+    /// more: the questions come out of the gateway's allowances for this host, and a device that
+    /// registers over and over would spend the renewals and revocations of every other. The
+    /// nonce is the dearer question, so it is asked only for a bearer the first question took, and
+    /// the host-wide allowance for it ([`CONFIRMATIONS_PER_HOST`]) is spent only then.
     ///
     /// # Errors
     ///
-    /// Returns [`Confirmation::Refused`] for the gateway's own refusal and
-    /// [`Confirmation::NotAsked`] when it was not asked, was not answered as the gateway answers,
-    /// or this device has asked too often.
+    /// Returns [`Confirmation::Refused`] for the gateway's own refusal,
+    /// [`Confirmation::Limited`] when this device or this host has asked too often, and
+    /// [`Confirmation::NotAsked`] when it was not asked or was not answered as the gateway answers.
     pub fn confirm(
         &self,
         device_id: kr_protocol::ids::DeviceId,
         credential: &kr_protocol::push::PushDeliveryCredential,
     ) -> Result<(), super::Confirmation> {
-        use super::Confirmation::NotAsked;
+        use super::Confirmation::{Limited, NotAsked};
 
         let Some(adapters) = self.adapters.get() else {
             return Err(NotAsked(
@@ -438,14 +473,14 @@ impl DeliveryRuntime {
             .or_insert_with(|| StatusBudget::new(CONFIRMATIONS_PER_DEVICE))
             .take(SystemClock.steady_ms());
         if !allowed {
-            return Err(NotAsked(
+            return Err(Limited(
                 "this device has registered too often; try again later".to_owned(),
             ));
         }
         // From the sweep's share, so a device that registers over and over cannot spend the
         // pass's, which notifications a person is waiting on depend on.
         if !adapters.unknown.reserve(SystemClock.steady_ms()) {
-            return Err(NotAsked(
+            return Err(Limited(
                 "this host has asked the gateway too often; try again later".to_owned(),
             ));
         }
@@ -454,6 +489,14 @@ impl DeliveryRuntime {
         adapters
             .unknown
             .probe(credential, kr_delivery::preview::fresh_notification_id())?;
+        // Then the nonce, from the host's share of the allowance it is counted in.
+        if !self.nonces.take(SystemClock.steady_ms()) {
+            return Err(Limited(
+                "this host has confirmed as many credentials as it allows itself for now; try \
+                 again later"
+                    .to_owned(),
+            ));
+        }
         adapters
             .senders
             .begin_renewal(&credential.gateway_origin, credential.sender_record_id)

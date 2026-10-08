@@ -79,8 +79,9 @@ pub mod transport;
 /// authorisation the host owes the gateway a revocation of, take nothing back, and the item
 /// either has in the store is removed: a host that stopped between ending a destination and
 /// deleting its item would otherwise renew a credential for a device that is no longer paired. A
-/// store that cannot be read stops the start, as one that cannot say whether privacy mode is on
-/// does.
+/// store that will not delete one is reported and the start goes on, because nothing loads that
+/// item; a store that cannot be read stops the start, as one that cannot say whether privacy mode
+/// is on does.
 ///
 /// # Errors
 ///
@@ -99,8 +100,11 @@ pub fn load_held_credentials(
             producer.journal().owed_revocations().map_err(unavailable)?,
         ))
     })?;
+    // The items of authorisations being revoked go first. A store that will not delete one is
+    // reported and the start goes on: nothing loads or renews it, and the sweep that pays the debt
+    // deletes it when the store will.
     for sender_record_id in &owed {
-        credentials.forget(*sender_record_id).map_err(storage)?;
+        forget_at_start(credentials, *sender_record_id);
     }
     let mut loaded = 0;
     for destination in destinations {
@@ -111,7 +115,7 @@ pub fn load_held_credentials(
             || destination.rule.is_none()
             || owed.contains(&push.sender_record_id)
         {
-            credentials.forget(push.sender_record_id).map_err(storage)?;
+            forget_at_start(credentials, push.sender_record_id);
             continue;
         }
         if credentials.load(push.sender_record_id).map_err(storage)? {
@@ -119,6 +123,20 @@ pub fn load_held_credentials(
         }
     }
     Ok(loaded)
+}
+
+/// Lets go of an authorisation's credential at a start, and reports a secret store that will not
+/// give its item up instead of stopping the start for it.
+fn forget_at_start(
+    credentials: &credentials::HeldCredentials,
+    sender_record_id: PushSenderRecordId,
+) {
+    if let Err(detail) = credentials.forget(sender_record_id) {
+        eprintln!(
+            "kr-controller: a delivery credential could not be removed from the secret store: \
+             {detail}"
+        );
+    }
 }
 
 /// The origin of the push gateway KalaReach runs, section 16's "Workers push gateway".
@@ -136,7 +154,8 @@ pub const OFFICIAL_GATEWAY_ORIGIN: &str = kr_client::services::account::ACCOUNT_
 /// The difference is the device's: a refusal is the gateway's own answer about this credential,
 /// and asking again with it is asking again for the same refusal; a question that was not asked,
 /// or not answered as the gateway answers, says nothing about the credential and may be asked
-/// again.
+/// again, and one this host held back to keep the gateway's allowances for what is owed is asked
+/// again later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirmation {
     /// The gateway refused: it holds no authorisation for this host's key under that identifier,
@@ -144,6 +163,9 @@ pub enum Confirmation {
     Refused(String),
     /// No answer that says either way: nobody answered, or the answer was not the gateway's.
     NotAsked(String),
+    /// The gateway was not asked because this host allows itself no more such questions for now,
+    /// from this device or from all of them. Asking again later is answered.
+    Limited(String),
 }
 
 /// How far ahead of this host's clock a credential's issue time may be: the clocks of a phone and
@@ -941,7 +963,9 @@ impl DeliveryModule {
     /// taken it or has said it never will, and until the host has let go of what it kept of the
     /// authorisation. One that does not complete is asked for again later, further apart each
     /// time, and given up when the credential it would have ended could no longer be in use:
-    /// thirty days, and some attempts.
+    /// thirty days, and some attempts. A debt is never given up while the host still keeps what it
+    /// kept of the authorisation: it is the only record that an item left in the secret store is
+    /// not to be kept.
     ///
     /// Returns how many were settled.
     ///
@@ -990,8 +1014,11 @@ impl DeliveryModule {
             };
             let now_ms = clock.now_ms();
             // Patience runs out after thirty days and some attempts: a host that was off for the
-            // whole time has not been refused by anyone, and is asked a few times first.
-            let given_up = matches!(answer, sender::RevocationAnswer::Later(_))
+            // whole time has not been refused by anyone, and is asked a few times first. It runs
+            // out only for a host that has let go of the authorisation: a debt given up with the
+            // item still in the secret store leaves an item nothing names and no start finds.
+            let given_up = forgotten
+                && matches!(answer, sender::RevocationAnswer::Later(_))
                 && owed.attempts >= REVOCATION_MIN_ATTEMPTS
                 && now_ms.saturating_sub(owed.queued_at_ms) >= REVOCATION_PATIENCE_MS;
             if given_up {
