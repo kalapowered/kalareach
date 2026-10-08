@@ -242,14 +242,16 @@ impl Transaction {
     /// failed update it went on past, if it did.
     fn abandon(self) -> Abandoned {
         // The release a chain of failed updates began from is the last whose daemon ran, which is
-        // what a rollback goes back to; the release the last of them made current is the target.
-        let (source, restarts, trusted_root) = match self.abandoned {
+        // what a rollback goes back to, unless the chain has come back to it: then it is the
+        // release the last of them began from. The release the last of them made current is the
+        // target.
+        let source = goes_back_to(&self);
+        let (restarts, trusted_root) = match self.abandoned {
             Some(earlier) => (
-                earlier.source,
                 merged(self.restarts, earlier.restarts),
                 newer_root(self.trusted_root, earlier.trusted_root),
             ),
-            None => (self.source, self.restarts, self.trusted_root),
+            None => (self.restarts, self.trusted_root),
         };
         Abandoned {
             source,
@@ -1796,7 +1798,7 @@ async fn hand_over(
     }
     .map_err(|failed| {
         // A rollback takes only a release older than the current one, so a release it would
-        // refuse is not named: a daemon that does not start from the older release a rollback went
+        // refuse is not named. A daemon that does not start from the older release a rollback went
         // back to is started by `kr host update --archive` of it, which is where a host goes from
         // there.
         let goes_back = match &went_back_to {
@@ -1881,13 +1883,27 @@ async fn undo(store: &Store, record: &mut Record, ended_by: CliError) -> CliErro
             forget_update(store, record);
             ended_by
         }
-        Err(failed) => CliError::Other(shown!(
-            "{}. A control daemon the update stopped did not start again: {}; the next {} settles \
-             that before anything else",
-            ended_by.said(),
-            failed.said(),
-            RUN_AGAIN
-        )),
+        Err(failed) => {
+            // An update that went on past no failed one is started again by the next run, before
+            // anything else; one that did is that failed update again, which only an archive of
+            // the release now current starts again.
+            let how = match record.update.as_ref() {
+                Some(update) if update.abandoned.is_some() => shown!(
+                    "kr host update --archive of {}, the release now current, starts it again",
+                    crate::shown::release(&update.source)
+                ),
+                _ => shown!(
+                    "the next {} starts it again before anything else",
+                    RUN_AGAIN
+                ),
+            };
+            CliError::Other(shown!(
+                "{}. A control daemon the update stopped did not start again: {}; {}",
+                ended_by.said(),
+                failed.said(),
+                how
+            ))
+        }
     }
 }
 
@@ -2248,8 +2264,8 @@ async fn recover(store: &Store, record: &mut Record) -> Result<Recovered> {
 }
 
 /// What a run says when an update an earlier run left is not settled: the daemon that does not start,
-/// what starts it, and, where the switch happened and the update went forward, what goes back to
-/// `back_to`.
+/// what starts it, and, where the switch happened, the release `back_to` that a rollback goes back
+/// to, when there is one that is older than the release now current.
 ///
 /// Where the switch did not happen, either command starts the daemon again from the release still
 /// current, before anything else. Where it did, only `kr host update --archive` of the release now
