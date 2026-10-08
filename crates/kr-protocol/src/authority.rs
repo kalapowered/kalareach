@@ -60,6 +60,10 @@ pub enum RequiredAuthority {
     /// grant it is delegating from, or issued the grant it is revoking. Holding a right that a
     /// grant happens to contain never implies authority over the grant itself.
     IssuerDelegation,
+    /// The device a session invitation names. Redeeming an invitation is the recipient's act and
+    /// nobody else's, so the host resolves it from the invitation when it activates the grant it
+    /// carries; no right in a grant stands for it.
+    InvitedDevice,
     /// Current read authority over the subject the host resolves from the named resource, rather
     /// than over a resource the request states. For a session subject that is `session.view` at
     /// the session's current scope; for a host or environment subject it is the actor's current
@@ -158,6 +162,8 @@ pub enum ResourceSelectorKind {
     Grant,
     /// One pairing invitation and candidate attempt.
     Invitation,
+    /// One session invitation: the single-use offer of a shared session that carries a grant.
+    SessionInvitation,
     /// One plugin catalogue.
     Catalogue,
     /// One plugin package.

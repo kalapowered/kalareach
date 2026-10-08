@@ -4244,6 +4244,32 @@
       "version": 1
     },
     {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "sharing",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "grant.redeem",
+      "name": "grant.redeem",
+      "required_rights": [
+        {
+          "authority": "invited_device",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session_invitation",
+        "grant"
+      ],
+      "summary": "Redeem a session invitation, once, and activate the grant it carries. Only the device the invitation names redeems it, and a withdrawn, expired or already redeemed invitation activates nothing. The answer is the grant and carries no session text.",
+      "version": 1
+    },
+    {
       "capability": {
         "required": {
           "capability_id": "push.installation",
