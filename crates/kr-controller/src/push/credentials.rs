@@ -46,8 +46,8 @@
 //!
 //! The revision on a credential a device hands over is the device's word. A device that lies about
 //! it can decide the outcome of that race for its own destination, which costs it a retired bearer
-//! and costs no other destination anything, and the next renewal the host asks for with nothing
-//! changed meanwhile replaces it.
+//! and one renewal to replace it, two of the host's sixty requests an hour, and the next renewal
+//! the host asks for with nothing changed meanwhile replaces it.
 //!
 //! # Asking again after a refusal
 //!
@@ -62,7 +62,8 @@
 //! A renewal not asked for because of the wait says so
 //! ([`kr_delivery::DeliveryError::RenewalWaits`]), as a refusal does not: nothing was sent, so a
 //! delivery that needed the renewal is looked at again shortly without using up an attempt, and
-//! goes out as soon as the wait ends or a new bearer ends it.
+//! goes out as soon as the wait ends, or a new bearer ends it and its renewal, which the gateway
+//! allows in the hour after an issue, succeeds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};

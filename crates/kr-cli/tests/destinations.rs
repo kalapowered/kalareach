@@ -349,6 +349,50 @@ async fn a_chat_destination_is_configured_from_a_credential_file_that_is_never_p
         assert!(!printed.contains("credential-marker-6b1f"), "{printed}");
     }
 
+    // A replacement the daemon refuses, under a grant that was never issued, changes nothing: not
+    // the destination, and not the credential it sends with.
+    let replacement = host.work.path().join("replacement-address");
+    std::fs::write(
+        &replacement,
+        "https://hooks.slack.com/services/T0PLANTED/B0PLANTED/replacement-marker-3d9a\n",
+    )
+    .expect("the replacement credential");
+    let nobody = "0badc0de-0000-4000-8000-000000000001";
+    let (status, refusal) = host.json(&[
+        "destination",
+        "configure",
+        "chat",
+        "--kind",
+        "slack",
+        "--endpoint",
+        "#elsewhere",
+        "--grant",
+        nobody,
+        "--credential-file",
+        &replacement.to_string_lossy(),
+    ]);
+    assert_ne!(status, Some(0), "{refusal}");
+    assert_eq!(host.destination("chat"), Some(record.clone()));
+    let secrets = host.temp.environment().secrets_dir();
+    // Whether the credential kept for the destination is the one that holds `text`.
+    let vault = |text: &str| {
+        let store = open_store_in(&secrets).expect("the secret store");
+        let name = DestinationId::new("chat").expect("an identifier");
+        let held = kr_controller::push::secrets::DestinationSecrets::new(
+            Arc::from(store.store),
+            host.temp.environment_id(),
+        )
+        .get(&name)
+        .expect("a read");
+        matches!(
+            held.map(|held| held.secret),
+            Some(kr_protocol::delivery::DestinationSecret::Slack { webhook_url })
+                if webhook_url.expose().contains(text)
+        )
+    };
+    assert!(vault("credential-marker-6b1f"), "the credential it had");
+    assert!(!vault("replacement-marker-3d9a"), "and not the refused one");
+
     // The credential is the daemon's: it sends with it, and it goes with the destination.
     let removed = host.done(&["destination", "remove", "chat"]);
     assert_eq!(removed["found"], Value::Bool(true));

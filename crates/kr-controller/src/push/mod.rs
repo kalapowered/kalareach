@@ -327,7 +327,7 @@ pub struct DeliveryModule {
     /// Where this host's own tests stop a key registration before it asks its admission, and
     /// again once the journal has taken it. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    key_write: [crate::attention::Pause; 2],
+    key_write: [crate::attention::Pause; 3],
 }
 
 /// What storing one destination's credential did.
@@ -403,6 +403,19 @@ impl DeliveryModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.key_write[1].arm()
+    }
+
+    /// Stops the next destination write after everything it reads has been read and before its
+    /// admission is asked inside the journal's write. Returns the end that says it has arrived
+    /// and the end that lets it go.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_destination_write(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.key_write[2].arm()
     }
 
     /// Returns the privacy state this module's exchanges are admitted under, for the environment's
@@ -678,6 +691,39 @@ impl DeliveryModule {
         admitted: &dyn Fn() -> Result<()>,
         owing: Option<(PushSenderRecordId, &str, u64)>,
     ) -> Result<bool> {
+        self.write_destination(record, None, admitted, owing)
+    }
+
+    /// Records a destination of a credentialed kind as [`Self::configure_if`] does, with the
+    /// credential it sends with, in one operation: the credential is kept and the record names it
+    /// together, or neither changes.
+    ///
+    /// The credential goes to the secret store just before the record is written, because the
+    /// record names the stamp it is kept under. A write the admission or the journal then refuses
+    /// puts back what the store held under the identifier before, stamp included, so a
+    /// destination that was being replaced goes on sending with the credential it had, to where
+    /// it was configured to send, and a refused first configuration leaves no credential kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the credential is not one this
+    /// destination's kind sends with, and what [`Self::configure_if`] returns.
+    pub fn configure_with_secret_if(
+        &self,
+        record: &DestinationRecord,
+        secret: &DestinationSecret,
+        admitted: &dyn Fn() -> Result<()>,
+    ) -> Result<bool> {
+        self.write_destination(record, Some(secret), admitted, None)
+    }
+
+    fn write_destination(
+        &self,
+        record: &DestinationRecord,
+        new_secret: Option<&DestinationSecret>,
+        admitted: &dyn Fn() -> Result<()>,
+        owing: Option<(PushSenderRecordId, &str, u64)>,
+    ) -> Result<bool> {
         let mut record = record.clone();
         if let Destination::External(external) = &mut record.destination {
             if external.kind.credential().is_none() {
@@ -691,28 +737,47 @@ impl DeliveryModule {
             // the admission then refuses leaves the old destination with the credential it sends
             // with, and one that stops between the two leaves a credential nothing reads.
             let mut forget_old_secret = false;
+            // What the store held under the identifier before a credential replaced it, to put
+            // back if the record is not written.
+            let mut replaced: Option<Option<secrets::HeldSecret>> = None;
             match &mut record.destination {
                 Destination::External(external) => match external.kind.credential() {
                     Some(kind) => {
-                        let held = self.secrets.get(&record.id)?.ok_or_else(|| {
-                            ControllerError::InvalidArgument(format!(
-                                "a {kind} destination sends with a credential this host keeps in \
-                                 its secret store, and none is kept under {}: hand it over with \
-                                 delivery.destination.secret.set first",
-                                record.id
-                            ))
-                        })?;
-                        if held.secret.kind() != kind {
-                            return Err(ControllerError::InvalidArgument(format!(
-                                "the credential kept under {} is for a {} destination, not a \
-                                 {kind} one",
-                                record.id,
-                                held.secret.kind()
-                            )));
+                        if let Some(secret) = new_secret {
+                            if secret.kind() != kind {
+                                return Err(ControllerError::InvalidArgument(format!(
+                                    "a {kind} destination sends with a {kind} credential"
+                                )));
+                            }
+                            replaced = Some(self.secrets.get(&record.id)?);
+                            external.credential = Some(self.secrets.put(&record.id, secret)?);
+                        } else {
+                            let held = self.secrets.get(&record.id)?.ok_or_else(|| {
+                                ControllerError::InvalidArgument(format!(
+                                    "a {kind} destination sends with a credential this host \
+                                     keeps in its secret store, and none is kept under {}: hand \
+                                     it over with the configuration, or with \
+                                     delivery.destination.secret.set first",
+                                    record.id
+                                ))
+                            })?;
+                            if held.secret.kind() != kind {
+                                return Err(ControllerError::InvalidArgument(format!(
+                                    "the credential kept under {} is for a {} destination, not a \
+                                     {kind} one",
+                                    record.id,
+                                    held.secret.kind()
+                                )));
+                            }
+                            external.credential = Some(held.stamp);
                         }
-                        external.credential = Some(held.stamp);
                     }
                     None => {
+                        if new_secret.is_some() {
+                            return Err(ControllerError::InvalidArgument(
+                                "a webhook sends with no credential".to_owned(),
+                            ));
+                        }
                         external.credential = None;
                         forget_old_secret = true;
                     }
@@ -722,6 +787,8 @@ impl DeliveryModule {
                 Destination::Push(_) => forget_old_secret = true,
             }
             let mut refused = None;
+            #[cfg(feature = "testing")]
+            self.key_write[2].wait();
             let wrote = producer
                 .journal_mut()
                 .configure_destination_owing(
@@ -735,10 +802,25 @@ impl DeliveryModule {
                     },
                     owing,
                 )
-                .map_err(unavailable)?;
-            if let Some(refusal) = refused {
-                return Err(refusal);
-            }
+                .map_err(unavailable);
+            // A write that did not happen leaves the store as it was found.
+            let wrote = match wrote {
+                Ok(true) => true,
+                other => {
+                    if let Some(before) = &replaced
+                        && let Err(error) = self.secrets.restore(&record.id, before.as_ref())
+                    {
+                        eprintln!(
+                            "kr-controller: the credential a refused configuration replaced \
+                             could not be put back: {error}"
+                        );
+                    }
+                    if let Some(refusal) = refused {
+                        return Err(refusal);
+                    }
+                    other?
+                }
+            };
             if wrote
                 && forget_old_secret
                 && let Err(error) = self.secrets.remove(&record.id)
@@ -1125,9 +1207,14 @@ impl DeliveryModule {
             // holds for passes. One the share cannot cover yet is left as it is, due, for a later
             // pass: nothing is claimed, so no attempt is spent. Sends have places of their own in
             // the selection, so a question left here holds no send back.
-            if selection.next == NextAction::Receipt && !status.reserve(clock.steady_ms()) {
+            let reserved = selection.next == NextAction::Receipt;
+            if reserved && !status.reserve(clock.steady_ms()) {
                 continue;
             }
+            // The reservation goes back unless the question is put: a delivery that ends without
+            // asking, or that waits for a renewal and is looked at again, has not used the
+            // gateway's allowance.
+            let status = &Reservation::new(status, reserved);
             let claim = self.with(|producer| {
                 producer
                     .journal_mut()
@@ -1253,8 +1340,9 @@ impl DeliveryModule {
         let (next_attempt_at_ms, spends_the_attempt) = match error {
             kr_delivery::DeliveryError::RenewalWaits { remaining_ms, .. } => {
                 // The wait can end sooner than it was said to: a device that hands over a new
-                // bearer ends it. So the next look is never further off than the most, and a
-                // wait that ends sooner than the least is looked at when it does. The last look
+                // bearer ends it, and the renewal of that bearer is asked at the next look. So the
+                // next look is never further off than the most, and a wait that ends sooner than
+                // the least is looked at when it does. The last look
                 // before the notification's own deadline is the one just before it.
                 let look = now_ms.saturating_add(
                     (*remaining_ms).clamp(RENEWAL_LOOK_AT_LEAST_MS, RENEWAL_LOOK_AT_MOST_MS),
@@ -1616,6 +1704,17 @@ impl DeliveryModule {
         let Some(_admission) = self.admitted(delivery) else {
             return self.taken_back(delivery, now_ms);
         };
+        // The notification's own deadline, read as late as it can be before the send: the secret
+        // store and the admission both wait, and section 16 stops at expiry.
+        let now_ms = clock.now_ms().max(now_ms);
+        if now_ms >= delivery.expires_at_ms.get() {
+            return self.settle(
+                delivery,
+                DeliveryState::Expired,
+                "the notification expired while its credential was being read",
+                now_ms,
+            );
+        }
         let outcome = external.send(
             destination,
             held.as_ref().map(|held| &held.secret),
@@ -1649,6 +1748,54 @@ impl DeliveryModule {
                 .map_err(unavailable)?;
             Ok(())
         })
+    }
+}
+
+/// A status question's place in the pass's share of the gateway's allowance, taken before the
+/// delivery it is for is claimed.
+///
+/// Dropped, it gives the place back unless a question was put through it.
+#[derive(Debug)]
+struct Reservation<'a> {
+    status: &'a dyn DeliveryStatus,
+    held: bool,
+    put: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> Reservation<'a> {
+    const fn new(status: &'a dyn DeliveryStatus, held: bool) -> Self {
+        Self {
+            status,
+            held,
+            put: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl DeliveryStatus for Reservation<'_> {
+    fn status(
+        &self,
+        credential: &PushDeliveryCredential,
+        notification_id: kr_protocol::ids::NotificationId,
+    ) -> StatusAnswer {
+        self.put.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.status.status(credential, notification_id)
+    }
+
+    fn reserve(&self, steady_ms: u64) -> bool {
+        self.status.reserve(steady_ms)
+    }
+
+    fn release(&self) {
+        self.status.release();
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.held && !self.put.load(std::sync::atomic::Ordering::SeqCst) {
+            self.status.release();
+        }
     }
 }
 
