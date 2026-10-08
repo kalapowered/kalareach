@@ -561,6 +561,37 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 25 requires the preview of a shared live screen to show the text itself. The daemon
+    // holds no screen, so it asks the session's worker, as the owner at this machine, for the lines
+    // a viewer holding the share's scope would first see. Nothing but the owner is served it: a
+    // paired device that wants the screen attaches and is held to its grant's scope, and a method
+    // that handed the text to a device would be a second way to see it.
+    let previews = [("session.screen.preview", EffectClass::Read)];
+    for (name, effect) in previews {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::Sessions,
+            "{name} is a session read"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is the owner's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::SessionView)],
+            "{name} asks for session.view and nothing else"
+        );
+        assert_eq!(
+            entry.history_filter,
+            HistoryFilter::LiveViewOnly,
+            "{name} shows the live screen and nothing behind it"
+        );
+    }
+
     // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
     // starts, and section 23's voice row names no read that can answer that: `voice.context` names
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
@@ -722,6 +753,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + descriptions.len()
             + machines.len()
             + redemptions.len()
+            + previews.len()
             + policy.len()
             + voice.len()
             + owner.len()

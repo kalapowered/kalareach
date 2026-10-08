@@ -18963,6 +18963,11 @@
           "type": "string"
         },
         {
+          "const": "session.screen.preview",
+          "description": "The text of the visible lines of the screen showing now, as a viewer holding a history scope would first see it, for the issuer of a share to be shown before it exists. It reaches neither the buffer that is not showing nor scrollback, and the host's own owner is the only caller.",
+          "type": "string"
+        },
+        {
           "const": "session.attach",
           "description": "Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well.",
           "type": "string"
@@ -32464,6 +32469,46 @@
         }
       ]
     },
+    "SessionScreenPreviewParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.screen.preview`.",
+      "properties": {
+        "history": {
+          "$ref": "#/$defs/HistoryScope",
+          "description": "The history scope the preview is cut to: the scope of the grant that would be written."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose screen is previewed."
+        }
+      },
+      "required": [
+        "session_id",
+        "history"
+      ],
+      "type": "object"
+    },
+    "SessionScreenPreviewResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.screen.preview`.",
+      "properties": {
+        "screen": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LiveScreenPreview"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The visible lines, or null when the scope does not include the live screen.\n\nCut to [`MAX_PREVIEW_LINES`] lines of [`MAX_PREVIEW_LINE_CHARS`] characters, and marked\nwhen it was: a caller that must show all of it refuses a cut one."
+        }
+      },
+      "required": [
+        "screen"
+      ],
+      "type": "object"
+    },
     "SessionSelector": {
       "description": "Which sessions a grant covers.",
       "oneOf": [
@@ -39388,6 +39433,12 @@
     },
     "session_rename_result": {
       "$ref": "#/$defs/SessionRenameResult"
+    },
+    "session_screen_preview_params": {
+      "$ref": "#/$defs/SessionScreenPreviewParams"
+    },
+    "session_screen_preview_result": {
+      "$ref": "#/$defs/SessionScreenPreviewResult"
     },
     "session_summary": {
       "$ref": "#/$defs/SessionSummary"

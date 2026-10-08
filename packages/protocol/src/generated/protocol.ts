@@ -2457,6 +2457,8 @@ export interface KalaReachProtocol {
   session_ref?: SessionRef
   session_rename_params?: SessionRenameParams
   session_rename_result?: SessionRenameResult
+  session_screen_preview_params?: SessionScreenPreviewParams
+  session_screen_preview_result?: SessionScreenPreviewResult
   session_summary?: SessionSummary2
   shell_command_params?: ShellCommandParams
   shell_launch_params?: ShellLaunchParams
@@ -15993,6 +15995,7 @@ export interface MethodEntry {
     | 'session.close'
     | 'session.describe'
     | 'session.rename'
+    | 'session.screen.preview'
     | 'session.attach'
     | 'session.detach'
     | 'attachment.configure'
@@ -24554,6 +24557,7 @@ export interface ServiceRequestPayload {
     | 'session.close'
     | 'session.describe'
     | 'session.rename'
+    | 'session.screen.preview'
     | 'session.attach'
     | 'session.detach'
     | 'attachment.configure'
@@ -25499,6 +25503,59 @@ export interface SessionRenameResult {
    * The title now shown.
    */
   title: string
+}
+/**
+ * Parameters of `session.screen.preview`.
+ */
+export interface SessionScreenPreviewParams {
+  history: HistoryScope4
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * How far back a grant may see, and which current resources it names explicitly.
+ *
+ * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
+ * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
+ * voice context. A later snapshot or a freshly generated summary never makes older underlying
+ * content newly authorised.
+ */
+export interface HistoryScope4 {
+  /**
+   * Whether the currently visible screen is included. This exception never grants inactive
+   * screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * The earliest content this grant may see. Null means no retained history at all.
+   */
+  lower_bound_ms: TimestampMs | null
+  /**
+   * Current approvals named explicitly, on the same terms, each by the identity of the one
+   * resource the broker arbitrates for it.
+   *
+   * An upstream's own request identifier does not pick out one request: two connections both
+   * call their first request `1`. A resource identity names exactly one.
+   */
+  named_approvals: PendingResourceId[]
+  /**
+   * Current questions named explicitly, even when they were created before the lower bound.
+   */
+  named_questions: QuestionId[]
+}
+/**
+ * The result of `session.screen.preview`.
+ */
+export interface SessionScreenPreviewResult {
+  /**
+   * The visible lines, or null when the scope does not include the live screen.
+   *
+   * Cut to [`MAX_PREVIEW_LINES`] lines of [`MAX_PREVIEW_LINE_CHARS`] characters, and marked
+   * when it was: a caller that must show all of it refuses a cut one.
+   */
+  screen: LiveScreenPreview | null
 }
 /**
  * Parameters of a `shell_command` node.
