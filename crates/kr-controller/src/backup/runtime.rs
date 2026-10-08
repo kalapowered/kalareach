@@ -254,10 +254,13 @@ pub fn managed_clients(
     Ok(ServiceClients {
         storage: Some(Arc::new(
             ManagedStorageService::new(origin.clone(), Arc::clone(&http), Arc::clone(&signer))
-                .presenting(Arc::clone(&source)),
+                .presenting(Arc::clone(&source))
+                .leaving_delays_to_the_caller(),
         )),
         backup_manifest: Some(Arc::new(
-            ManagedBackupManifestService::new(origin.clone(), http, signer).presenting(source),
+            ManagedBackupManifestService::new(origin.clone(), http, signer)
+                .presenting(source)
+                .leaving_delays_to_the_caller(),
         )),
         ..ServiceClients::none()
     })
