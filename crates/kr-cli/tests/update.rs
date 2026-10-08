@@ -5700,6 +5700,8 @@ async fn kr_host_terminal_clear_holds_the_preference_and_needs_no_directory_that
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     host.install(&one);
     let clear = |host: &Host| host.kr_json(&["host", "terminal", "--clear", "--json"]);
+    let state_dir = host.tree.environment().state_dir().to_path_buf();
+    std::fs::remove_dir_all(&state_dir).expect("an environment with no state directory yet");
     let (output, said) = clear(&host);
     assert!(
         output.status.success(),
@@ -5709,7 +5711,6 @@ async fn kr_host_terminal_clear_holds_the_preference_and_needs_no_directory_that
 
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
-    let state_dir = host.tree.environment().state_dir().to_path_buf();
     let file = state_dir.join(PREFERENCE_FILE);
     kr_ipc::paths::write_owner_only_file(&file, preference_document("iterm2").as_bytes())
         .expect("a preference");
