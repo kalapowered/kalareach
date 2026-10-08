@@ -12,12 +12,19 @@
 
 use std::sync::Arc;
 
-use kr_client::Session;
-use kr_protocol::ids::{BuildId, EnvironmentId};
+use kr_client::pairing::paired::PairedHost;
+use kr_client::{Said as _, Session};
+use kr_protocol::ids::{BuildId, DeviceId, EnvironmentId};
+use kr_protocol::rights::ActionRight;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter as _};
+use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
 
+use crate::device::Device;
 use crate::error::{CommandError, Result};
+use crate::state::AppState;
+
+/// How long a connection to a paired host, and the question that follows it, may take.
+const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The event the backend publishes each host notification on.
 pub const HOST_EVENT: &str = "kr://event";
@@ -38,11 +45,27 @@ pub fn build_id() -> Result<BuildId> {
         .map_err(|error| CommandError::local_failure(error.to_string()))
 }
 
-/// A live connection to the host on this machine.
+/// Who this application is on the host it reached, and what the host lets it do there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// The owner at this machine, over its own socket: every right.
+    Owner,
+    /// A device the host paired with: the rights its grant carries, as this device recorded them
+    /// when it paired, under the identity the host gave it.
+    Paired {
+        /// The device identity the host gave this application.
+        device_id: DeviceId,
+        /// What its grant carries. The host checks each action against its own record again.
+        rights: Vec<ActionRight>,
+    },
+}
+
+/// A live connection to a host: the one on this machine, or one this device is paired with.
 #[derive(Debug)]
 pub struct Connection {
     session: Arc<Session>,
     environment_id: EnvironmentId,
+    standing: Standing,
 }
 
 impl Connection {
@@ -58,7 +81,50 @@ impl Connection {
         Ok(Self {
             session: Arc::new(session),
             environment_id,
+            standing: Standing::Owner,
         })
+    }
+
+    /// A connection to a host this device is paired with, as the device the host made it.
+    ///
+    /// The environment is the one the host says it is, read over the connection: a paired
+    /// connection carries no environment on its handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure when the host cannot be reached or cannot say which environment it is.
+    pub async fn paired(device: &Device, host: &PairedHost) -> Result<Self> {
+        let pairing = device.pairing();
+        let identity = pairing.candidate.paired_identity(host.device_id);
+        let session =
+            tokio::time::timeout(CONNECT_WITHIN, pairing.link.connect_paired(host, &identity))
+                .await
+                .map_err(|_| CommandError::unavailable("the host did not answer in time"))?
+                .map_err(|error| CommandError::unavailable(error.said().into_string()))?;
+        let info: kr_protocol::hostinfo::HostInfoResult = tokio::time::timeout(
+            CONNECT_WITHIN,
+            session.read(
+                kr_protocol::method::Method::HostInfo,
+                &crate::commands::NoParams {},
+            ),
+        )
+        .await
+        .map_err(|_| CommandError::unavailable("the host did not say which environment it is"))?
+        .map_err(CommandError::from)?;
+        Ok(Self {
+            session: Arc::new(session),
+            environment_id: info.environment_id,
+            standing: Standing::Paired {
+                device_id: host.device_id,
+                rights: host.proposed_grant.actions.iter().copied().collect(),
+            },
+        })
+    }
+
+    /// Who this application is on the host, and what that lets it do.
+    #[must_use]
+    pub const fn standing(&self) -> &Standing {
+        &self.standing
     }
 
     /// The session every command goes through.
@@ -115,6 +181,20 @@ impl ConnectionState {
             environment_id: Some(environment_id.to_string()),
             reason: None,
             rights: Some(kr_protocol::rights::ActionRight::ALL.to_vec()),
+        }
+    }
+
+    /// The state of a live connection, with the rights its standing gives.
+    #[must_use]
+    pub fn of(connection: &Connection) -> Self {
+        match &connection.standing {
+            Standing::Owner => Self::owner(connection.environment_id),
+            Standing::Paired { rights, .. } => Self {
+                connected: true,
+                environment_id: Some(connection.environment_id.to_string()),
+                reason: None,
+                rights: Some(rights.clone()),
+            },
         }
     }
 }
@@ -186,56 +266,64 @@ fn read_payload(payload: &kr_protocol::envelope::ParamsValue) -> serde_json::Val
         .unwrap_or(serde_json::Value::Null)
 }
 
-/// Publishes the session's events to the window until the connection ends.
+/// Publishes the session's events to the window until the connection ends, and then says so.
 ///
 /// Every event carries the stream it came from, so a view that is showing one session can ignore
 /// another's. A client that published events without their stream would leave each view guessing
-/// whether an event was its own.
-pub fn publish_events(app: AppHandle, session: Arc<Session>) {
+/// whether an event was its own. When the connection ends the application is told it is not
+/// connected, and its state says so, so a command made afterwards is refused as unconnected rather
+/// than sent down a connection that is gone.
+pub async fn forward_events<R: Runtime>(app: AppHandle<R>, session: Arc<Session>) {
     let mut events = session.events();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(notification) => {
-                    let published = PublishedEvent {
-                        payload: read_payload(&notification.payload),
-                        stream_id: notification.stream_id.to_string(),
-                        sequence: notification.sequence.to_string(),
-                        event_type: notification.event_type.to_string(),
-                    };
-                    if app.emit(HOST_EVENT, published).is_err() {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // The interface fell behind the host. Section 8 makes that a resynchronisation
-                    // rather than a gap to paper over, so the view is told to take a snapshot
-                    // again instead of receiving a stream with a hole in it.
-                    if app
-                        .emit(
-                            HOST_EVENT,
-                            PublishedEvent {
-                                stream_id: String::new(),
-                                sequence: String::new(),
-                                event_type: "resync_required".to_owned(),
-                                payload: serde_json::Value::Null,
-                            },
-                        )
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = app.emit(
-                        CONNECTION_EVENT,
-                        ConnectionState::unreachable("the connection to this host ended"),
-                    );
-                    break;
+    loop {
+        let heard = tokio::select! {
+            heard = events.recv() => heard,
+            () = session.closed() => {
+                let state = app.state::<AppState>();
+                state.disconnected_from(&session, "the connection to this host ended");
+                let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                return;
+            }
+        };
+        match heard {
+            Ok(notification) => {
+                let published = PublishedEvent {
+                    payload: read_payload(&notification.payload),
+                    stream_id: notification.stream_id.to_string(),
+                    sequence: notification.sequence.to_string(),
+                    event_type: notification.event_type.to_string(),
+                };
+                if app.emit(HOST_EVENT, published).is_err() {
+                    return;
                 }
             }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // The interface fell behind the host. Section 8 makes that a resynchronisation
+                // rather than a gap to paper over, so the view is told to take a snapshot again
+                // instead of receiving a stream with a hole in it.
+                if app
+                    .emit(
+                        HOST_EVENT,
+                        PublishedEvent {
+                            stream_id: String::new(),
+                            sequence: String::new(),
+                            event_type: "resync_required".to_owned(),
+                            payload: serde_json::Value::Null,
+                        },
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
-    });
+    }
+}
+
+/// Publishes the session's events to the window in a task of their own.
+pub fn publish_events<R: Runtime>(app: AppHandle<R>, session: Arc<Session>) {
+    tauri::async_runtime::spawn(forward_events(app, session));
 }
 
 #[cfg(test)]

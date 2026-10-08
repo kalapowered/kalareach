@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use kr_client::Session;
 use kr_protocol::ids::EnvironmentId;
 
-use crate::connection::{Connection, ConnectionState};
+use crate::connection::{Connection, ConnectionState, Standing};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::owner::Owner;
@@ -27,6 +27,7 @@ pub struct AppState {
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
+    supervision: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -44,6 +45,32 @@ impl AppState {
             drafts: Mutex::new(None),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
+            supervision: Mutex::new(None),
+        }
+    }
+
+    /// Takes on the task that keeps a connection to the paired host the commands go to, ending the
+    /// one before it.
+    pub fn supervise(&self, task: tauri::async_runtime::JoinHandle<()>) {
+        let before = self
+            .supervision
+            .lock()
+            .expect("the supervision lock is not poisoned")
+            .replace(task);
+        if let Some(before) = before {
+            before.abort();
+        }
+    }
+
+    /// Ends the task that keeps a connection to a paired host, when there is one.
+    pub fn end_supervision(&self) {
+        if let Some(task) = self
+            .supervision
+            .lock()
+            .expect("the supervision lock is not poisoned")
+            .take()
+        {
+            task.abort();
         }
     }
 
@@ -80,6 +107,43 @@ impl AppState {
             .ok_or_else(CommandError::not_connected)
     }
 
+    /// Records that the connection `session` belongs to has ended, and why, unless a newer
+    /// connection has already taken its place.
+    pub fn disconnected_from(&self, session: &Arc<Session>, reason: impl Into<String>) {
+        let ours = self
+            .connection
+            .read()
+            .expect("the state lock is not poisoned")
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(&held.session(), session));
+        if ours {
+            self.disconnected(reason);
+        }
+    }
+
+    /// The identity the host gave this device, when the commands go to a host it is paired with.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HOST_NOT_CONFIGURED` when there is no connection, and a refusal when the
+    /// connection is to the host on this machine, where this application is the owner and not a
+    /// paired device.
+    pub fn paired_device_id(&self) -> Result<kr_protocol::ids::DeviceId> {
+        match self
+            .connection
+            .read()
+            .expect("the state lock is not poisoned")
+            .as_ref()
+            .map(Connection::standing)
+        {
+            Some(Standing::Paired { device_id, .. }) => Ok(*device_id),
+            Some(Standing::Owner) => Err(CommandError::refused(
+                "this application is the owner of the host it is connected to, not a paired device",
+            )),
+            None => Err(CommandError::not_connected()),
+        }
+    }
+
     /// The environment the connection belongs to, as the host stamped it on the handshake.
     ///
     /// # Errors
@@ -102,7 +166,7 @@ impl AppState {
             .read()
             .expect("the state lock is not poisoned");
         match held.as_ref() {
-            Some(connection) => ConnectionState::owner(connection.environment_id()),
+            Some(connection) => ConnectionState::of(connection),
             None => ConnectionState {
                 connected: false,
                 environment_id: None,
