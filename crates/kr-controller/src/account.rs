@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use kr_client::services::account::{
     AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault, AuthorisationGrant,
-    AuthorisationRequest, Client, Exchanged, IdentityRead, PendingAuthorisation, Redirect,
+    AuthorisationRequest, Client, Commit, Exchanged, IdentityRead, PendingAuthorisation, Redirect,
     SignedInAccount,
 };
 use kr_client::services::{AccountToken, ServiceFuture};
@@ -289,10 +289,12 @@ impl HostAccount {
     #[cfg(feature = "testing")]
     pub async fn keep_for_test(&self, issued: kr_client::services::account::IssuedGrant) {
         let held = self.inner.held.as_ref().expect("a service to sign in at");
-        held.signed_in
+        let committed = held
+            .signed_in
             .commit(issued, "a-nonce")
             .await
             .expect("the grant is kept");
+        assert_eq!(committed, Commit::Kept);
     }
 
     /// The token source a managed call presents: this host's sign-in at the account service.
@@ -707,12 +709,28 @@ impl Inner {
                     }
                     return AccountAttempt::CallOpen;
                 };
-                if let Err(error) = held.signed_in.commit(issued, grant.nonce()).await {
-                    eprintln!("kr-controller: a host sign-in could not be kept: {error}");
-                    // The grant is not kept, so its token is ended: queued where the store allows,
-                    // and sent once where it does not.
-                    let _ = held.signed_in.revoke_unkept(refresh).await;
-                    return AccountAttempt::NotKept;
+                match held.signed_in.keep(issued, grant.nonce()).await {
+                    Ok(Commit::Kept) => {}
+                    Ok(Commit::Unsettled) => {
+                        // The store reported a failure and then could not say which grant it
+                        // held. No token was ended while the store may hold it, and the account
+                        // was settled at once: the host is signed out with every token ended or
+                        // queued for the service, or the store still cannot be read or changed
+                        // and the next recovery, sign-out or replacing sign-in settles it, until
+                        // when a grant the store returns is presented as it was found.
+                        eprintln!(
+                            "kr-controller: the store could not say whether a host sign-in was \
+                             kept; the host is signed out, or the account is settled at its next \
+                             start, sign-out or sign-in"
+                        );
+                        return AccountAttempt::NotKept;
+                    }
+                    Err(error) => {
+                        // The grant is not kept, so its token was ended: queued where the store
+                        // allows, and sent once where it does not.
+                        eprintln!("kr-controller: a host sign-in could not be kept: {error}");
+                        return AccountAttempt::NotKept;
+                    }
                 }
                 if let Ok(IdentityRead::Disagreed) = held.signed_in.complete_identity().await {
                     return AccountAttempt::NotForThisAttempt;
