@@ -389,8 +389,8 @@ impl Pause {
 /// on runtimes of their own, apart from each other, so isolating it blocks the session's tasks that
 /// want the session on the threads of the runtime they run on, and stops neither the threads that
 /// serve this test nor the ones that serve the connection. With them on one runtime, a task of the
-/// session that woke while the session was held (its monitor wakes at times no case chooses: on
-/// Unix on every child process this test binary's other cases end) could block the thread a
+/// session that woke while the session was held (the monitor can, at times this case does not
+/// choose; on Unix one is the end of another case's child process) could block the thread a
 /// connection's task had been made runnable on, and the announcement that task was to read would
 /// go unread until the hold ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -2171,15 +2171,16 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
 /// do in its own process, and apart from each other. It ends, with its runtimes, when this is
 /// dropped.
 ///
-/// The session's own tasks (its monitor among them, which wakes at times no case chooses) run on a
-/// runtime of their own, and the service with its connections on another. A case holds the session
-/// for seconds, where a worker's process holds it for one operation, and a task that waits for it
-/// blocks the thread it runs on. A task made runnable on a thread and then left behind by a task
-/// that blocks it waits in that thread's run slot, where no other thread of the runtime takes it
-/// from, until the block ends: with the monitor on the connections' runtime, a connection's task
-/// could wait there for as long as a hold lasted, and the announcement it was to read would go
-/// unread. The service's own tasks that take the session or the boundary still run on the
-/// connections' runtime, and a case that holds either holds up the ones it meets.
+/// The tasks that `SessionRuntime::start` spawns (the monitor among them, which can wake at times
+/// the case that holds the session does not choose) run on a runtime of their own, and the service
+/// with its connections on another. A case holds the session for seconds, where a worker's process
+/// holds it for one operation, and a task that waits for it blocks the thread it runs on. A task
+/// made runnable on a thread and then left behind by a task that blocks it waits in that thread's
+/// run slot, where no other thread of the runtime takes it from, until the block ends: with the
+/// monitor on the connections' runtime, a connection's task could wait there for as long as a hold
+/// lasted, and the announcement it was to read would go unread. The service's tasks that wait for
+/// the session or the boundary still run on the connections' runtime, and a case that holds either
+/// holds up the ones that wait for it.
 struct ApartWorker {
     /// The thread that keeps the connections' runtime polling, ended before that runtime is told to
     /// stop.
@@ -2859,9 +2860,10 @@ fn seed_undispatched_intents(hosted: &Hosted, device: &ActorId, count: usize) {
 /// announcement meets while a mutation, a generation another link presents or a maintenance pass
 /// is inside it.
 ///
-/// The worker is served apart. A task of the worker that wants the boundary while it is held, a
+/// The worker is served apart. A task of the worker that waits for the boundary while it is held, a
 /// generation another link presents or the maintenance pass among them, waits for it on a thread,
-/// and on this test's runtime that thread could be one this test's own waits need.
+/// and on this test's runtime that thread could be one this test's own waits need. The
+/// announcement does not wait for it: it is refused.
 struct HeldBoundary {
     release: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
