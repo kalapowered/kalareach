@@ -1442,19 +1442,81 @@ async fn a_grant_whose_own_revocation_is_pending_is_removed_at_start() {
     );
 }
 
-/// A store that refuses the next write of the session item, as a full disk or a locked keychain does.
-struct RefusesOneSessionWrite {
-    inner: MemoryStore,
-    refuse: std::sync::atomic::AtomicBool,
+/// What a store does with the next write of the session item.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionWrite {
+    /// Writes it.
+    Works,
+    /// Refuses it, as a full disk or a locked keychain does.
+    Refused,
+    /// Writes it and then reports a failure, as a flush that fails after the rename does.
+    LandsThenFails,
 }
 
-impl SecretStore for RefusesOneSessionWrite {
-    fn set(&self, name: &SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
-        if name.as_str().ends_with("account/session") && self.refuse.swap(false, Ordering::SeqCst) {
-            return Err(kr_crypto::CryptoError::SecretStore {
-                message: "the store refused the write".to_owned(),
-            });
+/// A store whose writes of the session item and of the revocation queue can be made to fail.
+struct FaultyStore {
+    inner: MemoryStore,
+    session: Mutex<SessionWrite>,
+    /// For each next write of the revocation queue, whether it is refused; none left means writes work.
+    queue_plan: Mutex<VecDeque<bool>>,
+}
+
+impl FaultyStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            session: Mutex::new(SessionWrite::Works),
+            queue_plan: Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn session_next(&self, write: SessionWrite) {
+        *self.session.lock().expect("the plan") = write;
+    }
+
+    /// Refuses a write of the revocation queue when the plan says the next one is refused.
+    fn queue_write_allowed(&self, name: &SecretName) -> kr_crypto::Result<()> {
+        if name.as_str().ends_with("account/revoke")
+            && self
+                .queue_plan
+                .lock()
+                .expect("the plan")
+                .pop_front()
+                .unwrap_or(false)
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    fn queue_writes(&self, refused: &[bool]) {
+        *self.queue_plan.lock().expect("the plan") = refused.iter().copied().collect();
+    }
+}
+
+fn refused() -> kr_crypto::CryptoError {
+    kr_crypto::CryptoError::SecretStore {
+        message: "the store refused the write".to_owned(),
+    }
+}
+
+impl SecretStore for FaultyStore {
+    fn set(&self, name: &SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
+        if name.as_str().ends_with("account/session") {
+            let write = std::mem::replace(
+                &mut *self.session.lock().expect("the plan"),
+                SessionWrite::Works,
+            );
+            match write {
+                SessionWrite::Works => {}
+                SessionWrite::Refused => return Err(refused()),
+                SessionWrite::LandsThenFails => {
+                    self.inner.set(name, secret)?;
+                    return Err(refused());
+                }
+            }
+        }
+        self.queue_write_allowed(name)?;
         self.inner.set(name, secret)
     }
 
@@ -1463,12 +1525,34 @@ impl SecretStore for RefusesOneSessionWrite {
     }
 
     fn delete(&self, name: &SecretName) -> kr_crypto::Result<()> {
+        // An empty queue is written by removing it, which is a write of the queue all the same.
+        self.queue_write_allowed(name)?;
         self.inner.delete(name)
     }
 
     fn describe(&self) -> String {
         self.inner.describe()
     }
+}
+
+fn account_on(stub: &Arc<Stub>, store: &Arc<FaultyStore>) -> Arc<SignedInAccount> {
+    Arc::new(
+        SignedInAccount::new(
+            Arc::clone(stub) as Arc<dyn AccountService>,
+            Arc::clone(store) as Arc<dyn SecretStore>,
+            Client::Desktop,
+        )
+        .with_clock(clock_ms),
+    )
+}
+
+/// The revocation queue as the store holds it, as text.
+fn queue_text(store: &FaultyStore) -> Option<String> {
+    store
+        .inner
+        .get(&SecretName::new("account/revoke").expect("a name"))
+        .expect("a read")
+        .map(|bytes| String::from_utf8_lossy(bytes.expose()).into_owned())
 }
 
 /// A commit that cannot write the new grant leaves the old one whole, and owes it no revocation: the
@@ -1479,23 +1563,13 @@ async fn a_commit_that_cannot_write_the_new_grant_leaves_the_old_one_whole() {
     let _clock = CLOCK.lock().await;
     rewind();
     let stub = Arc::new(Stub::new());
-    let store = Arc::new(RefusesOneSessionWrite {
-        inner: MemoryStore::new(),
-        refuse: std::sync::atomic::AtomicBool::new(false),
-    });
-    let signed_in = Arc::new(
-        SignedInAccount::new(
-            Arc::clone(&stub) as Arc<dyn AccountService>,
-            Arc::clone(&store) as Arc<dyn SecretStore>,
-            Client::Desktop,
-        )
-        .with_clock(clock_ms),
-    );
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
     signed_in
         .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
         .await
         .expect("A");
-    store.refuse.store(true, Ordering::SeqCst);
+    store.session_next(SessionWrite::Refused);
     signed_in
         .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
         .await
@@ -1508,6 +1582,109 @@ async fn a_commit_that_cannot_write_the_new_grant_leaves_the_old_one_whole() {
         .expect("the token is sent");
     assert_eq!(stub.revoked(), ["grant-b"], "A's token was not sent");
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    assert!(matches!(
+        signed_in.status().expect("a status"),
+        AccountStatus::SignedIn { .. }
+    ));
+}
+
+/// The queue is put back as it was, whole, when the new grant cannot be written: a queue that is
+/// full drops its oldest entry to take the new one, and the failed commit gives that entry back.
+#[tokio::test]
+async fn a_failed_commit_gives_a_full_queue_back_as_it_was() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    stub.revoke_works.store(false, Ordering::SeqCst);
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    // Every replacement queues a revocation the service does not take: the queue fills to its limit.
+    for number in 0..20 {
+        signed_in
+            .commit(
+                issued_for("account-1", &format!("grant-{number}"), &["openid"]),
+                "a-nonce",
+            )
+            .await
+            .expect("a sign-in");
+    }
+    let before = queue_text(&store).expect("a queue");
+    assert_eq!(
+        before.matches("grantId").count(),
+        16,
+        "the queue is full: {before}"
+    );
+    store.session_next(SessionWrite::Refused);
+    signed_in
+        .commit(issued_for("account-1", "grant-new", &["openid"]), "a-nonce")
+        .await
+        .expect_err("the new grant cannot be written");
+    assert_eq!(
+        queue_text(&store).as_deref(),
+        Some(before.as_str()),
+        "the queue is as the failed commit found it"
+    );
+}
+
+/// When the write of the new grant and the putting back of the queue both fail, the old grant and
+/// its own queued revocation are both there. Sending the queue does not send that entry, so the
+/// grant this device holds is not ended behind its back; the next recovery removes the grant, as it
+/// does for a sign-out that stopped, and sends its token then.
+#[tokio::test]
+async fn a_grant_whose_queue_could_not_be_put_back_is_not_ended_while_it_is_held() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    store.session_next(SessionWrite::Refused);
+    // The entry for A is written, the new grant is refused, and putting the queue back is refused.
+    store.queue_writes(&[false, true]);
+    signed_in
+        .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+        .await
+        .expect_err("the new grant cannot be written");
+    signed_in
+        .revoke_unkept(RefreshToken::new("grant-b").expect("a token"))
+        .await
+        .expect("the token is sent");
+    assert_eq!(stub.revoked(), ["grant-b"], "A is held, so A is not sent");
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+
+    // The next run settles it: the grant with its own revocation queued is removed and sent.
+    let restarted = account_on(&stub, &store);
+    assert_eq!(restarted.recover().await.expect("a recovery"), 0);
+    assert_eq!(stub.revoked(), ["grant-b", "grant-a"]);
+    assert_eq!(
+        restarted.status().expect("a status"),
+        AccountStatus::SignedOut
+    );
+}
+
+/// A write that fails at its last step, after the new grant is in place, is the commit: the queue
+/// keeps the old grant's revocation and sends it, and the new grant is the one kept.
+#[tokio::test]
+async fn a_write_that_lands_and_then_fails_is_the_commit() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("A");
+    store.session_next(SessionWrite::LandsThenFails);
+    signed_in
+        .commit(issued_for("account-1", "grant-b", &["openid"]), "a-nonce")
+        .await
+        .expect("the grant is in place, so the commit stands");
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-b"));
+    assert_eq!(stub.revoked(), ["grant-a"], "the replaced grant is ended");
     assert!(matches!(
         signed_in.status().expect("a status"),
         AccountStatus::SignedIn { .. }
