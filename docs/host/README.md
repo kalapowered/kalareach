@@ -3877,7 +3877,7 @@ carried forward by the continuous clock, by no more than five seconds and the ra
 readings include the one the worker takes after it loads the confirmation and every other reading
 its time contract takes of its wall clock, whether a look, a checkpoint or the settling of a
 deadline takes it. A reading's level is its wall time less the time the continuous clock has counted
-since the boot, less the rate allowance of that time, and one reading is lower than another when its
+since the boot, plus the rate allowance of that time, and one reading is lower than another when its
 level is. The worker keeps the readings that are lower than every later one, so a confirmation that
 the daemon publishes late is judged against what the clock read in the meantime, and a clock that
 reads right again by the next look does not take a reading back. To keep few, it lets one reading
