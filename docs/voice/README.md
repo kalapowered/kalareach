@@ -7,7 +7,8 @@ document is that boundary written down.
 
 A host whose configuration document names a managed broker (`voice.broker_origin`) attaches it when
 the daemon starts. The daemon reaches the broker over a transport of its own, through the proxy the
-same document selects, and presents the account token an operator put on the host. A host whose
+same document selects, and presents the account token of the account an operator signed in on the
+host (`kr account sign-in`). A host whose
 document names no broker attaches no provider, so no call starts on it: `voice.start` answers that
 the host has no voice service configured. `voice.grant` acts as this document describes, and
 `voice.prepare` returns the scope a call would have, with no managed terms. With no call there is no
@@ -217,15 +218,25 @@ with the rate as it is now; no voice session and no grant are written for that s
 
 ## The account token
 
-Brokering a managed call spends an account's balance, so the host presents an account token. It is
-read from `account-token.json` under this host's runtime root, written by
-`kr account token import <path>`, and it is never printed: not by the command that imports it, not
-in a refusal, not in a log. The value lives in a type with no display, and the one place it is read
-is the authorisation header of the request it authorises. The token lasts as long as the service
-said when it issued it, ten minutes for the managed service, and the host does not refresh it; a
-token issued without the `voice` scope is refused before any request carries it.
+Brokering a managed call spends an account's balance, so the host presents the account token of an
+account an operator signed in on it. `kr account sign-in` asks the control daemon, which listens on
+the loopback address the desktop client is registered with, `127.0.0.1:8765`, while a browser signs
+in; the daemon exchanges the answer with the service and keeps the account in the host's secret
+store, and `kr account show` says where that stands. Only the daemon holds it, because its refresh
+token rotates on every use and a second holder would end the sign-in. The setup is in
+[Account sign-in](../host/README.md#account-sign-in).
 
-A host with no token and a host with no provider attached are both complete hosts. They start no
-managed call, and nothing else on them depends on one: sessions, agents and their questions work as
+The value is never printed: not by either command, not in a refusal, not in a log. It lives in a
+type with no display, and the one place it is read is the authorisation header of the request it
+authorises. The access token lasts ten minutes. The daemon refreshes it when a call needs one and
+the one it holds is about to end, never before, so a host that starts no call spends no refresh
+token. A token is presented only to the service the account was signed in at, which is the broker
+the host's configuration names: when that changes, nothing is presented until a person signs in
+again. A token issued without the `voice` scope is refused before any request carries it. When the
+service ends the sign-in, the host shows it as ended, and a call that needs a token is refused with
+a message that says to sign in again.
+
+A host with no account signed in and a host with no provider attached are both complete hosts.
+They start no managed call, and nothing else on them depends on one: sessions, agents and their questions work as
 they do without voice. The coordinator takes its provider through a seam, so a provider of a
 person's own can stand where the managed one does, and this daemon attaches only the managed one.

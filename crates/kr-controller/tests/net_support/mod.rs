@@ -46,6 +46,27 @@ use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::LocalIdentity;
 use kr_transport::scheduler::SendLimits;
 
+/// Writes the configuration document an environment's daemon reads when it starts.
+pub fn write_document(
+    temp: &kr_ipc::testing::TempHost,
+    document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+) {
+    let environment = temp.environment();
+    let path = kr_protocol::hostinfo::configuration::document_path(
+        environment.state_dir(),
+        environment.state_root(),
+        environment.environment_id(),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("the state directory");
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
+    )
+    .expect("the configuration document");
+}
+
 /// A supervisor that starts nothing. These suites create no sessions.
 #[derive(Debug)]
 pub struct RefusingSupervisor;
@@ -116,20 +137,7 @@ impl Host {
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
-        let environment = temp.environment();
-        let path = kr_protocol::hostinfo::configuration::document_path(
-            environment.state_dir(),
-            environment.state_root(),
-            environment.environment_id(),
-        );
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("the state directory");
-        }
-        kr_ipc::paths::write_owner_only_file(
-            &path,
-            kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
-        )
-        .expect("the configuration document");
+        write_document(&temp, document);
         let mut host = Self::start_on(
             temp,
             room::TestRoom::new(),

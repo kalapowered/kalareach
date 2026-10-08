@@ -41,6 +41,7 @@ kr-delivery.workspace = true
 kr-describe.workspace = true
 kr-flush.workspace = true
 kr-ipc.workspace = true
+kr-loopback.workspace = true
 kr-pairing.workspace = true
 # The catalogue client: verification, storage and network, and no component engine, so this
 # daemon links no Wasm engine.

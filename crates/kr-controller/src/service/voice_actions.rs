@@ -77,8 +77,12 @@ impl Controller {
             .started_proxy()
             .inspect_err(|error| unavailable(error))
             .ok()?;
-        let transport = Arc::new(crate::voice::VoiceTransport::new(gateway, proxy));
-        crate::voice::VoiceModule::managed_provider(origin, transport, self.paths.runtime_root())
+        let transport = Arc::new(crate::managed_transport::ManagedTransport::new(
+            gateway,
+            proxy,
+            crate::managed_transport::VOICE_DEADLINES,
+        ));
+        crate::voice::VoiceModule::managed_provider(origin, transport, self.account.tokens())
             .inspect_err(|error| origin_unusable(error))
             .ok()
     }

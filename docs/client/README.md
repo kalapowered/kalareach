@@ -147,8 +147,7 @@ error and the `--json` failure document. A usage mistake is said by its kind and
 command declares: the argument, the values it takes, a suggestion and the usage line, which names
 the command `kr` however it was invoked. What was typed is never repeated, because an argument in
 the wrong place can be a secret pasted into it.
-`kr account token show` and `kr account token import` say a stored origin as an address, and the
-stored scopes as the names this build knows, with the others counted. While an owner device
+`kr account show` says the service an account is signed in at as an address. While an owner device
 confirms a pairing, the command says the verification value the new device should show, grouped in
 fours as both devices show it and only when it is eight hexadecimal digits, and names the device by
 its platform: the name a device gave itself is not repeated. When `kr new` starts a daemon that does
