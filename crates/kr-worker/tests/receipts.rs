@@ -4371,8 +4371,11 @@ impl kr_worker::action::time::WallClock for WallThatMovesAfterItsNextReading {
 /// the continuous clock, and before it does anything else.
 struct ContinuousThatMovesAfterItsNthReading {
     inner: kr_ipc::clock::ManualSharedClock,
-    after: std::sync::Mutex<Option<(u32, Box<dyn FnOnce() + Send>)>>,
+    after: std::sync::Mutex<Option<Armed>>,
 }
+
+/// How many more readings to wait for, and what to run after the last of them.
+type Armed = (u32, Box<dyn FnOnce() + Send>);
 
 impl std::fmt::Debug for ContinuousThatMovesAfterItsNthReading {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
