@@ -24,7 +24,11 @@ use kr_flush::NameKind;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    ActorId, DraftId, DraftRevision, EnvironmentId, GrantId, SessionId, TransferId,
+    ActionId, ActorId, DraftId, DraftRevision, EnvironmentId, GrantId, SessionId, TransferId,
+};
+use kr_protocol::insertion::{
+    BindingFacts, DraftFacts, InsertionBegin, InsertionClaim, InsertionReport,
+    MAX_INSERTION_REPORT_BYTES, ReportedOutcome,
 };
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::transfer::{
@@ -152,21 +156,6 @@ pub struct Recovery {
     pub unremovable_payloads: usize,
     /// Payloads no row accounted for at all, removed by reconciliation.
     pub orphans_removed: usize,
-}
-
-/// What an adapter reports after it offers an attachment to an agent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InsertionOutcome {
-    /// The agent took it, and this is the upstream part or native binding that says so.
-    AcceptedByAgent {
-        /// The upstream evidence. Nothing else moves a binding to accepted.
-        upstream_evidence: String,
-    },
-    /// The insertion failed. The draft and the completed upload are both retained.
-    Failed {
-        /// What went wrong, for the user.
-        detail: String,
-    },
 }
 
 /// The action one mutation is performed under.
@@ -1951,7 +1940,9 @@ impl TransferService {
         let result = DraftCreateResult {
             draft: self.draft_record(&row, &[])?,
         };
-        check_result_size(&result, "this draft")?;
+        let mut worst = result.clone();
+        worst_case(&mut worst.draft);
+        check_result_size(&worst, "this draft")?;
         let retained = match action {
             Some(action) => Some(action.retained(
                 kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
@@ -2018,7 +2009,9 @@ impl TransferService {
         let result = DraftUpdateResult {
             draft: self.compose_draft(&updated, &bindings, &handles)?,
         };
-        check_result_size(&result, "this draft")?;
+        let mut worst = result.clone();
+        worst_case(&mut worst.draft);
+        check_result_size(&worst, "this draft")?;
         let retained = match action {
             Some(action) => Some(action.retained(
                 kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
@@ -2110,6 +2103,24 @@ impl TransferService {
         let handle = handle_of(&upload)?;
         check_contribution(&params.contribution, &handle)?;
         let existing = store.bindings(params.draft_id)?;
+        // An attachment that is being offered to the agent, or that the agent accepted, is not
+        // bound again: a second binding would write over the claim, or over the evidence.
+        if let Some(held) = existing
+            .iter()
+            .find(|binding| binding.transfer_id == params.transfer_id)
+            && matches!(
+                held.state,
+                InsertionState::Inserting | InsertionState::AcceptedByAgent
+            )
+        {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "{} is {} on this draft, so it cannot be bound again",
+                    params.transfer_id,
+                    held.state.as_str()
+                ),
+            });
+        }
         if existing.len() as u64 >= params.contribution.max_count.get()
             && !existing
                 .iter()
@@ -2168,6 +2179,8 @@ impl TransferService {
             external_destination: params.contribution.external_destination.0.clone(),
             bound_at_ms: now,
             ordinal,
+            claimed_by: None,
+            claim_grant: None,
         };
         let updated = DraftRow {
             revision: DraftRevision::new(params.expected_revision.get().saturating_add(1)),
@@ -2220,7 +2233,9 @@ impl TransferService {
             .cloned()
             .ok_or_else(|| TransferError::store("the binding that was written is not readable"))?;
         let result = AgentDraftAddAttachmentResult { draft, attachment };
-        check_result_size(&result, "this draft with the attachment bound to it")?;
+        let mut worst = result.clone();
+        worst_case(&mut worst.draft);
+        check_result_size(&worst, "this draft with the attachment bound to it")?;
         let retained = match action {
             Some(action) => Some(action.retained(
                 kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
@@ -2279,95 +2294,312 @@ impl TransferService {
         self.locked()?.end_sessions(sessions, now)
     }
 
-    /// Records what an adapter reported about one binding.
+    /// What a draft holds, without its text, for the worker of the session it targets.
     ///
-    /// A failure keeps the draft and the completed upload. Acceptance requires upstream evidence,
-    /// which is what this records; nothing infers it from a call that returned.
+    /// # Errors
+    ///
+    /// Returns [`TransferError::UnknownDraft`] for a draft that is not the actor's or targets
+    /// another session, and [`TransferError::DraftConflict`] for one that targets no session or
+    /// has already been sent to one by a prompt.
+    pub fn insertion_facts(
+        &self,
+        actor: &ActorId,
+        session_id: SessionId,
+        draft_id: DraftId,
+    ) -> Result<DraftFacts> {
+        let store = self.locked()?;
+        let row = draft_of(&store, draft_id, actor)?;
+        self.check_environment(row.environment_id)?;
+        check_targets(&store, &row, session_id)?;
+        let bindings = store.bindings(draft_id)?;
+        let handles = self.handles_of(&store, &bindings)?;
+        let facts = facts_of(&row, &bindings, &handles);
+        check_result_size(&facts, "this draft's facts")?;
+        Ok(facts)
+    }
+
+    /// Claims one binding for an offer to the agent, and issues the read grant over its file.
+    ///
+    /// One transaction: the draft is open, targets the worker's session and has not been sent by a
+    /// prompt; the binding is at the attempt the worker read and is `recorded`; the draft holds no
+    /// more attachments than the operation accepts; and the draft, as the claim leaves it and with
+    /// the longest report of every offer in flight added, still fits the reply that carries it.
+    /// The binding becomes `inserting` for the offer's owner, the grant is written, and the draft
+    /// takes one revision. A repeat by the owner of a claim that stands is answered with the same
+    /// claim and the same grant, so a reply that was lost leaves nothing behind.
+    ///
+    /// The claim is refused while the journal still holds sessions of earlier builds
+    /// ([`Noting`]): a build that cannot read an `inserting` binding could open such a journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::DraftConflict`] for any condition above that does not hold,
+    /// [`TransferError::SessionEnded`] for a session that has ended, [`TransferError::QuotaExceeded`]
+    /// when the room is not there, and [`TransferError::StoreUnavailable`] while the journal is
+    /// unsettled.
+    pub fn insertion_begin(
+        &self,
+        actor: &ActorId,
+        session_id: SessionId,
+        begin: &InsertionBegin,
+        boot_now_ms: u64,
+    ) -> Result<InsertionClaim> {
+        let now = self.clock.now_ms();
+        let mut store = self.locked()?;
+        let row = draft_of(&store, begin.draft_id, actor)?;
+        self.check_environment(row.environment_id)?;
+        check_targets(&store, &row, session_id)?;
+        let owner = owner_of(actor, begin.action_id);
+        let attempt = attempt_of(begin.attempt)?;
+        let bindings = store.bindings(begin.draft_id)?;
+        let existing = bindings
+            .iter()
+            .find(|binding| binding.transfer_id == begin.transfer_id)
+            .cloned()
+            .ok_or_else(|| {
+                TransferError::invalid(format!("{} is not bound to this draft", begin.transfer_id))
+            })?;
+        let handles = self.handles_of(&store, &bindings)?;
+        // A repeat by the owner: the claim stands, and so does its grant.
+        if existing.state == InsertionState::Inserting
+            && existing.claimed_by.as_deref() == Some(owner.as_str())
+            && existing.ordinal == attempt
+            && let Some(grant) = existing.claim_grant
+        {
+            let grant = self.read_grant_of(&store, grant)?;
+            return Ok(InsertionClaim {
+                facts: facts_of(&row, &bindings, &handles),
+                grant,
+            });
+        }
+        if store.noting()? != Noting::Done {
+            return Err(TransferError::store(
+                "the journal still holds sessions of an earlier build, so no attachment can be \
+                 offered to an agent until they have ended",
+            ));
+        }
+        if boot_now_ms >= begin.deadline_boot_ms.get() {
+            return Err(TransferError::DraftConflict {
+                detail: "the deadline of the action this claim is for has passed".to_owned(),
+            });
+        }
+        if row.state != DraftState::Open {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "this draft is {}, so nothing is offered from it",
+                    row.state.as_str()
+                ),
+            });
+        }
+        if existing.state != InsertionState::Recorded || existing.ordinal != attempt {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "{} is {} at attempt {} and the claim is for attempt {attempt}",
+                    begin.transfer_id,
+                    existing.state.as_str(),
+                    existing.ordinal
+                ),
+            });
+        }
+        if existing.insertion_method != InsertionMethod::TypedSubmission {
+            return Err(TransferError::invalid(format!(
+                "{} is inserted by {}, and only a typed submission is offered by a worker",
+                begin.transfer_id,
+                existing.insertion_method.as_str()
+            )));
+        }
+        if bindings.len() as u64 > begin.max_count.get() {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "this operation accepts {} attachments and the draft holds {}",
+                    begin.max_count.get(),
+                    bindings.len()
+                ),
+            });
+        }
+        let position = bindings
+            .iter()
+            .position(|binding| binding.transfer_id == begin.transfer_id)
+            .ok_or_else(|| TransferError::store("the binding that was read is not there"))?;
+        let upload = store
+            .upload(begin.transfer_id)?
+            .ok_or_else(|| unknown(begin.transfer_id))?;
+        let grant = self.read_grant_for(&handle_of(&upload)?, existing.insertion_method, now)?;
+        let claimed = BindingRow {
+            state: InsertionState::Inserting,
+            upstream_evidence: None,
+            failure_detail: None,
+            claimed_by: Some(owner),
+            claim_grant: Some(grant.grant_id),
+            bound_at_ms: now,
+            ..existing
+        };
+        let updated = DraftRow {
+            revision: DraftRevision::new(row.revision.get().saturating_add(1)),
+            updated_at_ms: now,
+            ..row.clone()
+        };
+        let mut after = bindings.clone();
+        after[position] = claimed.clone();
+        let draft = self.compose_draft(&updated, &after, &handles)?;
+        check_room(&draft, "this draft with the attachment being offered")?;
+        let facts = facts_of(&updated, &after, &handles);
+        let read_grant = AttachmentReadGrant {
+            grant_id: grant.grant_id,
+            environment_id: grant.environment_id,
+            transfer_id: grant.transfer_id,
+            insertion_method: grant.insertion_method,
+            host_path: grant.host_path.clone(),
+            expires_at_ms: grant.expires_at_ms,
+        };
+        store
+            .bind_attachment(&claimed, row.revision, Some(&grant), None, None, None)?
+            .ok_or_else(|| TransferError::DraftConflict {
+                detail: "this draft's revision moved while the claim was written".to_owned(),
+            })?;
+        Ok(InsertionClaim {
+            facts,
+            grant: read_grant,
+        })
+    }
+
+    /// Records what became of an offer, for the owner that claimed it, on the report of the worker
+    /// of `session_id`.
+    ///
+    /// Only the owner's own claim is settled, at the attempt it was made for. Acceptance needs
+    /// upstream evidence, and a write into the terminal is not evidence. An identical report
+    /// repeated is answered with the state it recorded; a report that differs from what was
+    /// recorded is refused. The text of the evidence or the detail is cut to the bound a draft's
+    /// reply keeps room for. The claim's read grant is revoked with the report.
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::UnknownDraft`] when nothing is named,
-    /// [`TransferError::SessionEnded`] when the draft's session has ended (a report that arrives
-    /// after the session's worker did cannot change what that end decided), or
-    /// [`TransferError::InvalidArgument`] when the attachment is not bound to that draft.
+    /// [`TransferError::DraftConflict`] when the binding was not claimed by this owner at this
+    /// attempt or was recorded otherwise, [`TransferError::SessionEnded`] when the session of the
+    /// draft has ended, and [`TransferError::InvalidArgument`] when the attachment is not bound to
+    /// that draft or acceptance carries no evidence.
     pub fn record_insertion_outcome(
         &self,
         actor: &ActorId,
-        draft_id: DraftId,
-        transfer_id: TransferId,
-        outcome: &InsertionOutcome,
-    ) -> Result<DraftAttachment> {
+        session_id: SessionId,
+        report: &InsertionReport,
+    ) -> Result<InsertionState> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
-        let row = draft_of(&store, draft_id, actor)?;
-        let existing = store
-            .bindings(draft_id)?
-            .into_iter()
-            .find(|binding| binding.transfer_id == transfer_id)
+        let row = draft_of(&store, report.draft_id, actor)?;
+        self.check_environment(row.environment_id)?;
+        let owner = owner_of(actor, report.action_id);
+        let attempt = attempt_of(report.attempt)?;
+        let bindings = store.bindings(report.draft_id)?;
+        let position = bindings
+            .iter()
+            .position(|binding| binding.transfer_id == report.transfer_id)
             .ok_or_else(|| {
-                TransferError::invalid(format!("{transfer_id} is not bound to this draft"))
+                TransferError::invalid(format!("{} is not bound to this draft", report.transfer_id))
             })?;
-        check_insertion_detail(outcome)?;
-        let binding = match outcome {
-            InsertionOutcome::AcceptedByAgent { upstream_evidence } => {
-                if upstream_evidence.trim().is_empty() {
+        let existing = bindings[position].clone();
+        let (state, evidence, detail) = match &report.outcome {
+            ReportedOutcome::AcceptedByAgent {
+                provenance,
+                evidence,
+            } => {
+                if *provenance == kr_protocol::broker::ActionProvenance::TerminalInput {
+                    return Err(TransferError::PermissionDenied {
+                        detail: "bytes written into the terminal are not evidence that an agent \
+                                 took an attachment"
+                            .to_owned(),
+                    });
+                }
+                let evidence = cut_to(evidence.trim(), MAX_INSERTION_REPORT_BYTES);
+                if evidence.is_empty() {
                     return Err(TransferError::invalid(
-                        "acceptance by an agent is recorded only with the upstream evidence for it",
+                        "acceptance by an agent is recorded only with the upstream evidence for \
+                         it",
                     ));
                 }
-                BindingRow {
-                    state: InsertionState::AcceptedByAgent,
-                    upstream_evidence: Some(upstream_evidence.clone()),
-                    failure_detail: None,
-                    bound_at_ms: now,
-                    ..existing
-                }
+                (InsertionState::AcceptedByAgent, Some(evidence), None)
             }
-            InsertionOutcome::Failed { detail } => BindingRow {
-                state: InsertionState::Failed,
-                upstream_evidence: None,
-                failure_detail: Some(detail.clone()),
-                bound_at_ms: now,
-                ..existing
-            },
+            ReportedOutcome::Failed { detail } => (
+                InsertionState::Failed,
+                None,
+                Some(cut_to(detail, MAX_INSERTION_REPORT_BYTES)),
+            ),
+            ReportedOutcome::Unknown { detail } => (
+                InsertionState::Unknown,
+                None,
+                Some(cut_to(detail, MAX_INSERTION_REPORT_BYTES)),
+            ),
         };
-        // The draft this outcome produces has to fit the frame that carries it, and an outcome
-        // adds text to it. So the whole draft is composed and measured before the outcome commits,
-        // the same way an update and a binding are.
+        let claimed =
+            existing.claimed_by.as_deref() == Some(owner.as_str()) && existing.ordinal == attempt;
+        // The report the binding was settled with, repeated, is answered as it stands: its
+        // acknowledgement was lost, and nothing it says is new.
+        if claimed
+            && existing.state != InsertionState::Inserting
+            && existing.state == state
+            && existing.upstream_evidence == evidence
+            && existing.failure_detail == detail
         {
-            let mut prospective = store.bindings(draft_id)?;
-            for held in &mut prospective {
-                if held.transfer_id == transfer_id {
-                    *held = binding.clone();
-                }
-            }
-            let handles = self.handles_of(&store, &prospective)?;
+            return Ok(existing.state);
+        }
+        // A report for a session that has ended cannot change what that end decided, whoever makes
+        // it.
+        if store.session_has_ended(report.draft_id, report.transfer_id)? {
+            return Err(TransferError::SessionEnded);
+        }
+        // Only the worker of the session the draft targets settles an offer from it.
+        if row.session_id != Some(session_id) {
+            return Err(TransferError::UnknownDraft {
+                draft: report.draft_id.to_string(),
+            });
+        }
+        if !claimed {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "{} was not claimed by this action at attempt {attempt}",
+                    report.transfer_id
+                ),
+            });
+        }
+        if existing.state != InsertionState::Inserting {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "{} was recorded as {} and this report says otherwise",
+                    report.transfer_id,
+                    existing.state.as_str()
+                ),
+            });
+        }
+        let settled = BindingRow {
+            state,
+            upstream_evidence: evidence,
+            failure_detail: detail,
+            bound_at_ms: now,
+            ..existing
+        };
+        // The draft this outcome produces has to fit the frame that carries it, with the room the
+        // other offers in flight keep for theirs.
+        {
+            let mut after = bindings.clone();
+            after[position] = settled.clone();
+            let handles = self.handles_of(&store, &after)?;
             let updated = DraftRow {
                 revision: DraftRevision::new(row.revision.get().saturating_add(1)),
                 updated_at_ms: now,
                 ..row.clone()
             };
-            let composed = self.compose_draft(&updated, &prospective, &handles)?;
-            check_result_size(&composed, "this draft with the outcome recorded on it")?;
+            let composed = self.compose_draft(&updated, &after, &handles)?;
+            check_room(&composed, "this draft with the outcome recorded on it")?;
         }
         store
-            // The insertion outcome changes the binding's state and nothing about which session
-            // owns the attachment.
-            .bind_attachment(&binding, row.revision, None, None, None, None)?
-            .ok_or_else(|| TransferError::store("the draft's revision moved during this record"))?;
-        let bindings = store.bindings(draft_id)?;
-        let handles = self.handles_of(&store, &bindings)?;
-        drop(store);
-        let updated = DraftRow {
-            revision: DraftRevision::new(row.revision.get().saturating_add(1)),
-            updated_at_ms: now,
-            ..row
-        };
-        self.compose_draft(&updated, &bindings, &handles)?
-            .attachments
-            .into_iter()
-            .find(|attachment| attachment.handle.transfer_id == transfer_id)
-            .ok_or_else(|| TransferError::store("the binding that was written is not readable"))
+            // The outcome changes the binding's state and nothing about which session owns the
+            // attachment.
+            .bind_attachment(&settled, row.revision, None, None, None, None)?
+            .ok_or_else(|| TransferError::DraftConflict {
+                detail: "this draft's revision moved while the outcome was written".to_owned(),
+            })?;
+        Ok(state)
     }
 
     /// Records that a draft is sent to a session, which is what moves its attachments onto the
@@ -3406,6 +3638,28 @@ impl TransferService {
         Ok(row)
     }
 
+    /// The read grant a claim issued, as the claim answers with it.
+    fn read_grant_of(
+        &self,
+        store: &std::sync::MutexGuard<'_, Store>,
+        grant_id: GrantId,
+    ) -> Result<AttachmentReadGrant> {
+        let row = store
+            .grant(grant_id)?
+            .filter(|row| !row.revoked)
+            .ok_or_else(|| TransferError::PermissionDenied {
+                detail: format!("read grant {grant_id} has been revoked"),
+            })?;
+        Ok(AttachmentReadGrant {
+            grant_id: row.grant_id,
+            environment_id: row.environment_id,
+            transfer_id: row.transfer_id,
+            insertion_method: row.insertion_method,
+            host_path: row.host_path,
+            expires_at_ms: row.expires_at_ms,
+        })
+    }
+
     fn handles_of(
         &self,
         store: &std::sync::MutexGuard<'_, Store>,
@@ -3617,23 +3871,107 @@ fn check_original_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a handle the declared contribution does not admit.
-/// Refuses an insertion outcome whose text a draft could not carry.
+/// The owner of an offer: the actor it is made for and the action it is made under.
+fn owner_of(actor: &ActorId, action: ActionId) -> String {
+    format!("{actor}/{action}")
+}
+
+/// The attempt a claim or a report names, as a binding's order.
+fn attempt_of(attempt: U64) -> Result<i64> {
+    i64::try_from(attempt.get()).map_err(|_| TransferError::invalid("an attempt is a small number"))
+}
+
+/// Cuts `text` at a character boundary to at most `max` bytes.
+fn cut_to(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Refuses a draft the worker asking is not the worker of.
 ///
-/// A draft's reply holds one of these per binding. Bounding each one is what keeps the reply
-/// bounded, and the bound is on the text rather than on how many bindings a draft may have.
-fn check_insertion_detail(outcome: &InsertionOutcome) -> Result<()> {
-    let text = match outcome {
-        InsertionOutcome::AcceptedByAgent { upstream_evidence } => upstream_evidence,
-        InsertionOutcome::Failed { detail } => detail,
-    };
-    if text.chars().count() > kr_protocol::transfer::MAX_INSERTION_DETAIL_LEN {
-        return Err(TransferError::invalid(format!(
-            "an insertion outcome carries at most {} characters",
-            kr_protocol::transfer::MAX_INSERTION_DETAIL_LEN
-        )));
+/// A draft of another session is as unknown as one that is not the actor's. One that targets no
+/// session, and one a prompt has already sent to a session, are not offered attachments by a
+/// worker, and say so.
+fn check_targets(store: &Store, row: &DraftRow, session_id: SessionId) -> Result<()> {
+    match row.session_id {
+        Some(target) if target == session_id => {}
+        Some(_) => {
+            return Err(TransferError::UnknownDraft {
+                draft: row.draft_id.to_string(),
+            });
+        }
+        None => {
+            return Err(TransferError::DraftConflict {
+                detail: "this draft targets no session, so no worker offers anything from it"
+                    .to_owned(),
+            });
+        }
+    }
+    if store.draft_sent_to(row.draft_id)?.is_some() {
+        return Err(TransferError::DraftConflict {
+            detail: "this draft was sent to its session by a prompt".to_owned(),
+        });
     }
     Ok(())
+}
+
+/// What a draft holds, as a worker is told it.
+fn facts_of(
+    row: &DraftRow,
+    bindings: &[BindingRow],
+    handles: &[(AttachmentHandle, Option<AttachmentReadGrant>)],
+) -> DraftFacts {
+    DraftFacts {
+        draft_id: row.draft_id,
+        revision: row.revision,
+        state: row.state,
+        session_id: Nullable(row.session_id),
+        application_instance_id: Nullable(row.application_instance_id),
+        bindings: bindings
+            .iter()
+            .zip(handles)
+            .map(|(binding, (handle, _))| BindingFacts {
+                transfer_id: binding.transfer_id,
+                attempt: U64::new(u64::try_from(binding.ordinal).unwrap_or(0)),
+                insertion_method: binding.insertion_method,
+                state: binding.state,
+                media_type: handle.declared_media_type.clone(),
+                byte_len: handle.byte_len,
+                content_digest: handle.content_digest,
+                external_destination: Nullable(binding.external_destination.clone()),
+            })
+            .collect(),
+    }
+}
+
+/// Makes `draft` the longest it can become before the next reply that carries it.
+///
+/// An attachment being offered will be reported, and the report adds text to the draft; a draft
+/// that ends with its session takes the longest state word. The reply is measured at that length,
+/// so a claim never leaves a report that cannot be recorded, and a draft that can be read can still
+/// be read when its session closes.
+fn worst_case(draft: &mut DraftRecord) {
+    draft.state = DraftState::Conflicted;
+    draft.revision = DraftRevision::new(1 << 40);
+    for attachment in &mut draft.attachments {
+        if attachment.state == InsertionState::Inserting {
+            attachment.state = InsertionState::AcceptedByAgent;
+            attachment.upstream_evidence = Nullable::some("x".repeat(MAX_INSERTION_REPORT_BYTES));
+        }
+    }
+}
+
+/// Refuses a draft whose reply, at its longest ([`worst_case`]), would not travel in a frame.
+fn check_room(draft: &DraftRecord, what: &str) -> Result<u64> {
+    let mut worst = draft.clone();
+    worst_case(&mut worst);
+    check_result_size(&worst, what)
 }
 
 /// Refuses a result too large to travel in the frame that carries it.
@@ -3656,6 +3994,7 @@ fn check_result_size<T: serde::Serialize>(result: &T, what: &str) -> Result<u64>
     Ok(len)
 }
 
+/// Refuses a handle the declared contribution does not admit.
 fn check_contribution(
     contribution: &kr_protocol::transfer::AttachmentContribution,
     handle: &AttachmentHandle,

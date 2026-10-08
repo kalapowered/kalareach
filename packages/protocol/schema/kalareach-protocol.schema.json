@@ -4468,6 +4468,62 @@
       ],
       "type": "object"
     },
+    "BindingFacts": {
+      "additionalProperties": false,
+      "description": "One binding of a draft, without the attachment's name.",
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/U64",
+          "description": "The binding's attempt."
+        },
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The upload's size in bytes."
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The upload's whole-file digest."
+        },
+        "external_destination": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the bytes leave this environment for, when the binding recorded one."
+        },
+        "insertion_method": {
+          "$ref": "#/$defs/InsertionMethod",
+          "description": "How it was offered to be inserted."
+        },
+        "media_type": {
+          "description": "The media type the upload was declared with.",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/InsertionState",
+          "description": "What became of the offer."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The attachment."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "attempt",
+        "insertion_method",
+        "state",
+        "media_type",
+        "byte_len",
+        "content_digest",
+        "external_destination"
+      ],
+      "type": "object"
+    },
     "BootEpoch": {
       "description": "The host boot epoch, which binds continuous-time deadlines to one boot.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -8994,6 +9050,32 @@
         },
         {
           "additionalProperties": false,
+          "description": "A worker's question about a draft, on the control daemon's rendezvous endpoint: what the\ndraft holds, a claim of one binding for an offer to the agent, or a report of the offer.",
+          "properties": {
+            "draft_wanted": {
+              "$ref": "#/$defs/DraftWanted"
+            }
+          },
+          "required": [
+            "draft_wanted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The control daemon's answer to that question.",
+          "properties": {
+            "draft_answer": {
+              "$ref": "#/$defs/DraftAnswer"
+            }
+          },
+          "required": [
+            "draft_answer"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A mutation the control daemon admitted, passed to the worker that owns its subject.",
           "properties": {
             "forwarded": {
@@ -12100,6 +12182,63 @@
       ],
       "type": "object"
     },
+    "DraftAnswer": {
+      "description": "The daemon's answer to a [`DraftWanted`].",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "What the draft holds.",
+          "properties": {
+            "facts": {
+              "$ref": "#/$defs/DraftFacts"
+            }
+          },
+          "required": [
+            "facts"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The claim.",
+          "properties": {
+            "claim": {
+              "$ref": "#/$defs/InsertionClaim"
+            }
+          },
+          "required": [
+            "claim"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The report is recorded, and the binding is in this state.",
+          "properties": {
+            "reported": {
+              "$ref": "#/$defs/InsertionState"
+            }
+          },
+          "required": [
+            "reported"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The daemon refused. The error's retry category says whether asking again can succeed.",
+          "properties": {
+            "refused": {
+              "$ref": "#/$defs/ProtocolError"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "DraftAttachment": {
       "additionalProperties": false,
       "description": "One attachment bound to a draft, and what became of it.",
@@ -12241,6 +12380,62 @@
       ],
       "type": "object"
     },
+    "DraftFacts": {
+      "additionalProperties": false,
+      "description": "What a draft holds, without its text.",
+      "properties": {
+        "application_instance_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplicationInstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The application instance it targets."
+        },
+        "bindings": {
+          "description": "Its bindings, in the order they were bound.",
+          "items": {
+            "$ref": "#/$defs/BindingFacts"
+          },
+          "type": "array"
+        },
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft."
+        },
+        "revision": {
+          "$ref": "#/$defs/DraftRevision",
+          "description": "Its revision."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session it targets."
+        },
+        "state": {
+          "$ref": "#/$defs/DraftState",
+          "description": "Its state."
+        }
+      },
+      "required": [
+        "draft_id",
+        "revision",
+        "state",
+        "session_id",
+        "application_instance_id",
+        "bindings"
+      ],
+      "type": "object"
+    },
     "DraftId": {
       "description": "One durable device-owned draft, independent of an attachment.",
       "format": "uuid",
@@ -12360,6 +12555,60 @@
         }
       ]
     },
+    "DraftStep": {
+      "description": "What a worker asks.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "What the draft holds, without its text.",
+          "properties": {
+            "facts": {
+              "additionalProperties": false,
+              "properties": {
+                "draft_id": {
+                  "$ref": "#/$defs/DraftId",
+                  "description": "The draft."
+                }
+              },
+              "required": [
+                "draft_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "facts"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Claim one binding to be offered to the agent.",
+          "properties": {
+            "begin": {
+              "$ref": "#/$defs/InsertionBegin"
+            }
+          },
+          "required": [
+            "begin"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Report what became of an offer.",
+          "properties": {
+            "report": {
+              "$ref": "#/$defs/InsertionReport"
+            }
+          },
+          "required": [
+            "report"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "DraftUpdateParams": {
       "additionalProperties": false,
       "description": "Parameters of `draft.update`.",
@@ -12395,6 +12644,30 @@
       },
       "required": [
         "draft"
+      ],
+      "type": "object"
+    },
+    "DraftWanted": {
+      "additionalProperties": false,
+      "description": "A worker's question about a draft, with the session and the actor it asks for.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor the action is for, as the daemon vouched for it to the worker."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose worker asks. The daemon answers only the process it recorded for it."
+        },
+        "step": {
+          "$ref": "#/$defs/DraftStep",
+          "description": "What is asked."
+        }
+      },
+      "required": [
+        "session_id",
+        "actor_id",
+        "step"
       ],
       "type": "object"
     },
@@ -16463,6 +16736,64 @@
       ],
       "type": "object"
     },
+    "InsertionBegin": {
+      "additionalProperties": false,
+      "description": "A claim of one binding for one offer.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action the offer is made for, which owns the claim."
+        },
+        "attempt": {
+          "$ref": "#/$defs/U64",
+          "description": "The attempt the worker read: the binding's order in its draft. A binding bound again is a\nnew attempt."
+        },
+        "deadline_boot_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "The latest moment the claim may be made, on the machine's boot clock in milliseconds. The\ndaemon makes no claim after it, so a claim the worker gave up on cannot commit later."
+        },
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft."
+        },
+        "max_count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many attachments the package's contribution lets a draft hold."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The attachment."
+        }
+      },
+      "required": [
+        "action_id",
+        "draft_id",
+        "transfer_id",
+        "attempt",
+        "max_count",
+        "deadline_boot_ms"
+      ],
+      "type": "object"
+    },
+    "InsertionClaim": {
+      "additionalProperties": false,
+      "description": "A claim the daemon made.",
+      "properties": {
+        "facts": {
+          "$ref": "#/$defs/DraftFacts",
+          "description": "The draft as the claim left it."
+        },
+        "grant": {
+          "$ref": "#/$defs/AttachmentReadGrant",
+          "description": "The narrow read grant over the one file. It is revoked when the offer is reported and when\nthe session ends."
+        }
+      },
+      "required": [
+        "facts",
+        "grant"
+      ],
+      "type": "object"
+    },
     "InsertionMethod": {
       "description": "How an integration puts an attachment in front of its agent.\n\nSection 12 allows exactly three, per operation, declared in advance. None of them is a guess at\na composer's quoting rules.",
       "oneOf": [
@@ -16483,6 +16814,40 @@
         }
       ]
     },
+    "InsertionReport": {
+      "additionalProperties": false,
+      "description": "What an offer came to.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action the offer was made for."
+        },
+        "attempt": {
+          "$ref": "#/$defs/U64",
+          "description": "The attempt that was claimed."
+        },
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft."
+        },
+        "outcome": {
+          "$ref": "#/$defs/ReportedOutcome",
+          "description": "What it came to."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The attachment."
+        }
+      },
+      "required": [
+        "action_id",
+        "draft_id",
+        "transfer_id",
+        "attempt",
+        "outcome"
+      ],
+      "type": "object"
+    },
     "InsertionState": {
       "description": "What became of one attachment binding on a draft.",
       "oneOf": [
@@ -16492,13 +16857,23 @@
           "type": "string"
         },
         {
+          "const": "inserting",
+          "description": "The worker has claimed the binding and is offering the attachment to the agent. Nothing\nelse offers it, and the binding cannot be bound again until the offer is reported.",
+          "type": "string"
+        },
+        {
           "const": "accepted_by_agent",
-          "description": "The adapter reported upstream evidence. Only this state means the agent took the file.",
+          "description": "The adapter reported upstream evidence. Only this state means the receiver of a typed\nrequest acknowledged it after the file was available to it.",
           "type": "string"
         },
         {
           "const": "failed",
-          "description": "The insertion failed. The draft and the completed upload are both retained for a retry.",
+          "description": "The insertion failed, or nothing was offered. The draft and the completed upload are both\nretained for a retry.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "The offer may have reached the agent and nothing says whether it was taken. The draft and\nthe completed upload are retained; offering the attachment again is a new attempt.",
           "type": "string"
         }
       ]
@@ -29444,6 +29819,73 @@
         "documented"
       ],
       "type": "object"
+    },
+    "ReportedOutcome": {
+      "description": "What an offer came to, as the worker knows it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The upstream took it, and this is how the worker knows.",
+          "properties": {
+            "evidence": {
+              "description": "The upstream's own evidence.",
+              "type": "string"
+            },
+            "outcome": {
+              "const": "accepted_by_agent",
+              "type": "string"
+            },
+            "provenance": {
+              "$ref": "#/$defs/ActionProvenance",
+              "description": "How the worker knows. A write into the terminal is never evidence."
+            }
+          },
+          "required": [
+            "outcome",
+            "provenance",
+            "evidence"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The offer was refused, or nothing was offered. The draft and the upload are retained.",
+          "properties": {
+            "detail": {
+              "description": "Why, for the person.",
+              "type": "string"
+            },
+            "outcome": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "detail"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The offer may have reached the upstream and nothing says whether it was taken.",
+          "properties": {
+            "detail": {
+              "description": "What is known.",
+              "type": "string"
+            },
+            "outcome": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "detail"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "RepositoryGeneration": {
       "description": "The catalogue generation a plugin package was resolved against.",

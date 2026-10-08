@@ -400,6 +400,12 @@ export type ControlFrame =
       plugin_runtime_state: PluginRuntimeState
     }
   | {
+      draft_wanted: DraftWanted
+    }
+  | {
+      draft_answer: DraftAnswer
+    }
+  | {
       forwarded: ForwardedMutation
     }
   | {
@@ -512,6 +518,26 @@ export type PluginRuntimeState =
   | {
       unavailable: PluginRuntimeUnavailable
     }
+/**
+ * The daemon's answer to a [`DraftWanted`].
+ */
+export type DraftAnswer =
+  | {
+      facts: DraftFacts
+    }
+  | {
+      claim: InsertionClaim
+    }
+  | {
+      reported: InsertionState
+    }
+  | {
+      refused: ProtocolError
+    }
+/**
+ * What became of one attachment binding on a draft.
+ */
+export type InsertionState = 'recorded' | 'inserting' | 'accepted_by_agent' | 'failed' | 'unknown'
 /**
  * One permitted action in a grant.
  */
@@ -3659,7 +3685,7 @@ export interface DraftAttachment {
   /**
    * What became of the offer.
    */
-  state: 'recorded' | 'accepted_by_agent' | 'failed'
+  state: 'recorded' | 'inserting' | 'accepted_by_agent' | 'failed' | 'unknown'
   /**
    * The upstream part or native draft binding the adapter reported. Present only for
    * [`InsertionState::AcceptedByAgent`], because nothing else establishes acceptance.
@@ -3867,7 +3893,7 @@ export interface DraftAttachment1 {
   /**
    * What became of the offer.
    */
-  state: 'recorded' | 'accepted_by_agent' | 'failed'
+  state: 'recorded' | 'inserting' | 'accepted_by_agent' | 'failed' | 'unknown'
   /**
    * The upstream part or native draft binding the adapter reported. Present only for
    * [`InsertionState::AcceptedByAgent`], because nothing else establishes acceptance.
@@ -7980,6 +8006,254 @@ export interface PluginRuntimeUnavailable {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   retry_after_ms: string
+}
+/**
+ * A worker's question about a draft, with the session and the actor it asks for.
+ */
+export interface DraftWanted {
+  /**
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
+   */
+  actor_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * What is asked.
+   */
+  step:
+    | {
+        facts: {
+          /**
+           * One durable device-owned draft, independent of an attachment.
+           */
+          draft_id: string
+        }
+      }
+    | {
+        begin: InsertionBegin
+      }
+    | {
+        report: InsertionReport
+      }
+}
+/**
+ * A claim of one binding for one offer.
+ */
+export interface InsertionBegin {
+  /**
+   * The action the offer is made for, which owns the claim.
+   */
+  action_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attempt: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  deadline_boot_ms: string
+  /**
+   * One durable device-owned draft, independent of an attachment.
+   */
+  draft_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_count: string
+  /**
+   * The attachment.
+   */
+  transfer_id: string
+}
+/**
+ * What an offer came to.
+ */
+export interface InsertionReport {
+  /**
+   * The action the offer was made for.
+   */
+  action_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attempt: string
+  /**
+   * One durable device-owned draft, independent of an attachment.
+   */
+  draft_id: string
+  /**
+   * What it came to.
+   */
+  outcome:
+    | {
+        /**
+         * The upstream's own evidence.
+         */
+        evidence: string
+        outcome: 'accepted_by_agent'
+        /**
+         * How the worker knows. A write into the terminal is never evidence.
+         */
+        provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
+      }
+    | {
+        /**
+         * Why, for the person.
+         */
+        detail: string
+        outcome: 'failed'
+      }
+    | {
+        /**
+         * What is known.
+         */
+        detail: string
+        outcome: 'unknown'
+      }
+  /**
+   * The attachment.
+   */
+  transfer_id: string
+}
+/**
+ * What a draft holds, without its text.
+ */
+export interface DraftFacts {
+  /**
+   * The application instance it targets.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * Its bindings, in the order they were bound.
+   */
+  bindings: BindingFacts[]
+  /**
+   * One durable device-owned draft, independent of an attachment.
+   */
+  draft_id: string
+  /**
+   * Its revision.
+   */
+  revision: string
+  /**
+   * The session it targets.
+   */
+  session_id: SessionId | null
+  /**
+   * Its state.
+   */
+  state: 'open' | 'conflicted' | 'orphaned'
+}
+/**
+ * One binding of a draft, without the attachment's name.
+ */
+export interface BindingFacts {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attempt: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * Where the bytes leave this environment for, when the binding recorded one.
+   */
+  external_destination: string | null
+  /**
+   * How it was offered to be inserted.
+   */
+  insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
+  /**
+   * The media type the upload was declared with.
+   */
+  media_type: string
+  /**
+   * What became of the offer.
+   */
+  state: 'recorded' | 'inserting' | 'accepted_by_agent' | 'failed' | 'unknown'
+  /**
+   * The attachment.
+   */
+  transfer_id: string
+}
+/**
+ * A claim the daemon made.
+ */
+export interface InsertionClaim {
+  facts: DraftFacts1
+  grant: AttachmentReadGrant1
+}
+/**
+ * What a draft holds, without its text.
+ */
+export interface DraftFacts1 {
+  /**
+   * The application instance it targets.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * Its bindings, in the order they were bound.
+   */
+  bindings: BindingFacts[]
+  /**
+   * One durable device-owned draft, independent of an attachment.
+   */
+  draft_id: string
+  /**
+   * Its revision.
+   */
+  revision: string
+  /**
+   * The session it targets.
+   */
+  session_id: SessionId | null
+  /**
+   * Its state.
+   */
+  state: 'open' | 'conflicted' | 'orphaned'
+}
+/**
+ * A narrow, expiring read grant over exactly one completed attachment.
+ *
+ * This is how an adapter reaches a staging file when its insertion method needs a readable path.
+ * It covers one file, read only, for one purpose, and it weakens nothing else: the agent's sandbox
+ * is unchanged, and no file is placed inside a repository.
+ */
+export interface AttachmentReadGrant1 {
+  /**
+   * The environment the grant is valid in, and only that one.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * The environment-local path the agent may read, valid only while this grant is.
+   *
+   * It is inside the environment's staging area and outside every repository, which is what
+   * keeps an upload from becoming a file in the user's working tree.
+   */
+  host_path: string
+  /**
+   * The insertion method it was issued for.
+   */
+  insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
+  /**
+   * The attachment it covers.
+   */
+  transfer_id: string
 }
 /**
  * A mutation the host admitted for a caller, passed to the component that owns its subject.

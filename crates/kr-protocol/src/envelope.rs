@@ -512,6 +512,11 @@ pub enum ControlFrame {
     PluginRuntimeWanted(crate::admission::PluginRuntimeWanted),
     /// The control daemon's answer to that request.
     PluginRuntimeState(crate::admission::PluginRuntimeState),
+    /// A worker's question about a draft, on the control daemon's rendezvous endpoint: what the
+    /// draft holds, a claim of one binding for an offer to the agent, or a report of the offer.
+    DraftWanted(Box<crate::insertion::DraftWanted>),
+    /// The control daemon's answer to that question.
+    DraftAnswer(Box<crate::insertion::DraftAnswer>),
     /// A mutation the control daemon admitted, passed to the worker that owns its subject.
     Forwarded(Box<crate::local::ForwardedMutation>),
     /// A read the control daemon admitted for a caller it authenticated elsewhere.

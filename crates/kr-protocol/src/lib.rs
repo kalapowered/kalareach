@@ -141,6 +141,7 @@ pub mod hostinfo;
 pub mod identity;
 pub mod ids;
 pub mod input;
+pub mod insertion;
 pub mod invitation;
 pub mod limits;
 pub mod local;
