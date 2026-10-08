@@ -129,3 +129,14 @@ describe('the voice entry of a phone', () => {
     expect(await screen.findByTestId('voice-entry')).toBeInTheDocument()
   })
 })
+
+describe('the pairing entry on a phone', () => {
+  // KR-REQ-13.04: opening the Hosts tab raises no keyboard. The code field is there to be tapped,
+  // and the screen is a place among four, not a form the person came to fill.
+  it('does not take focus when the Hosts tab opens', async () => {
+    start()
+    await openTab('Hosts')
+    const field = await screen.findByLabelText('Pairing code')
+    expect(document.activeElement).not.toBe(field)
+  })
+})
