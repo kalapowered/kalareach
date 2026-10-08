@@ -637,6 +637,12 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
         .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
         .await
         .expect("writes the request");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), next_answer(&mut link))
+            .await
+            .is_err(),
+        "nothing past the cursors, so the request is held before the approval is relayed"
+    );
 
     channel.relay("abcde").await;
     let Answer::Page(woken) = within(&mut link, Duration::from_secs(5)).await else {
