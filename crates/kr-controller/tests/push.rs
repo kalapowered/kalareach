@@ -7757,12 +7757,13 @@ fn an_owed_revocation_is_asked_for_until_the_gateway_takes_it_or_says_it_never_w
 
 /// KR-REQ-16.10: a debt is paid when the gateway has taken it and the host has let go of what it
 /// kept of the authorisation. While the secret store refuses to give the credential up, the debt
-/// stays owed, though the gateway has revoked the authorisation, so a stored item that nothing
-/// else names is not forgotten.
+/// stays owed, though the gateway has revoked the authorisation and whatever the debt has waited,
+/// so a stored item that nothing else names is not forgotten.
 #[test]
 fn a_debt_stays_owed_while_the_host_cannot_let_go_of_what_it_kept() {
-    use kr_controller::push::sender::RevocationAnswer::Revoked;
+    use kr_controller::push::sender::RevocationAnswer::{Later, Revoked};
 
+    const DAY: u64 = 24 * 60 * 60 * 1000;
     let directory = tempfile::tempdir().expect("a directory");
     let module = DeliveryModule::open_at(
         &directory.path().join("delivery.sqlite3"),
@@ -7772,11 +7773,12 @@ fn a_debt_stays_owed_while_the_host_cannot_let_go_of_what_it_kept() {
     )
     .expect("a delivery module");
     let id = PushSenderRecordId::new(uuid(1));
+    let t0 = 1_000;
     module
         .with(|producer| {
             producer
                 .journal_mut()
-                .owe_revocation(id, "https://reach.invalid", 1_000)
+                .owe_revocation(id, "https://reach.invalid", t0)
                 .expect("a debt");
             Ok(())
         })
@@ -7786,21 +7788,48 @@ fn a_debt_stays_owed_while_the_host_cannot_let_go_of_what_it_kept() {
             .with(|producer| Ok(producer.journal().owed_revocations().expect("a read").len()))
             .expect("a read")
     };
-    let sweep = |at: u64, can_let_go: bool| {
+    let sweep = |at: u64, can_let_go: bool, answer| {
         let revoking = Revoking::default();
-        *revoking.answers.lock().expect("not poisoned") = [Revoked].into();
+        *revoking.answers.lock().expect("not poisoned") = [answer].into();
         module
             .settle_revocations(&revoking, &|_| can_let_go, &move || at)
             .expect("a sweep")
     };
     assert_eq!(
-        sweep(1_000, false),
+        sweep(t0, false, Revoked),
         0,
         "the gateway revoked it, and the host kept its item"
     );
     assert_eq!(owed(), 1);
+
+    // Asked again for as many days as it takes, with the gateway taking it or not answering: the
+    // item is still there, so the debt is the only record that it is not to be kept.
+    for (ask, answer) in [
+        Later("no answer".to_owned()),
+        Revoked,
+        Later("no".to_owned()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = t0 + (1 + u64::try_from(ask).expect("a few")) * DAY;
+        assert_eq!(sweep(at, false, answer), 0);
+    }
+    for (ask, answer) in [Later("no answer".to_owned()), Revoked]
+        .into_iter()
+        .enumerate()
+    {
+        let at = t0 + 31 * DAY + u64::try_from(ask).expect("a few") * DAY;
+        assert_eq!(
+            sweep(at, false, answer),
+            0,
+            "not given up after thirty days and some asks while the item is kept"
+        );
+        assert_eq!(owed(), 1);
+    }
+
     assert_eq!(
-        sweep(1_000 + 24 * 60 * 60 * 1000, true),
+        sweep(t0 + 40 * DAY, true, Revoked),
         1,
         "and once the store lets go it is paid"
     );

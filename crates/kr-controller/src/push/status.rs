@@ -37,7 +37,9 @@
 //! whether it takes the bearer ([`GatewayStatus::probe`]). It spends the sweep's share, after a
 //! small allowance of the device's own, so a device that registers over and over spends neither
 //! the pass's share, which notifications a person is waiting on depend on, nor much of the
-//! sweep's.
+//! sweep's. The question after it, for a nonce, is counted by the gateway with this host's
+//! renewals and revocations, and has an allowance of the host's own across all devices
+//! ([`super::runtime::CONFIRMATIONS_PER_HOST`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -218,8 +220,11 @@ impl GatewayStatus {
     ///
     /// The gateway authenticates the bearer before it looks for the notification, so a success
     /// says the bearer belongs to an active authorisation that has not expired, and nothing is
-    /// delivered or changed by asking. Only the gateway's own success counts: a bare status, such
-    /// as a 404 from a deployment without the route, is no evidence of anything.
+    /// delivered or changed by asking. Only the gateway's own success counts: a 200 whose
+    /// envelope says it succeeded, carries a `data` member (nothing, or an acknowledgement) and
+    /// carries no error. A bare status, such as a 404 from a deployment without the route, a
+    /// success with no `data`, one whose `data` is not an acknowledgement, and one that also names
+    /// an error are no evidence of anything.
     ///
     /// # Errors
     ///
@@ -243,9 +248,14 @@ impl GatewayStatus {
             ));
         }
         match kr_client::services::json::read::<Probe>(&answer.body) {
-            Ok(Probe { ok: true, .. }) if answer.status == 200 => Ok(()),
+            Ok(Probe {
+                ok: true,
+                data: Some(_),
+                error: None,
+            }) if answer.status == 200 => Ok(()),
             Ok(Probe {
                 ok: false,
+                data: None | Some(None),
                 error: Some(refusal),
             }) if answer.status == 401 && refusal.code == "UNAUTHENTICATED" => Err(
                 Confirmation::Refused("the gateway does not take that bearer".to_owned()),
@@ -337,12 +347,28 @@ struct StatusRequest {
     notification_id: NotificationId,
 }
 
-/// The envelope of an answer read for what it says about the credential asked with, and not for
-/// the outcome it carries.
+/// The envelope of an answer read for what it says about the credential asked with.
+///
+/// `data` keeps a member that is not there apart from one that is null: the outer `Option` is
+/// whether the envelope names it, and the inner one is what it holds. The gateway's success names
+/// it, as nothing for a notification it holds no outcome of, and a body that does not is not the
+/// gateway's.
 #[derive(serde::Deserialize)]
 struct Probe {
     ok: bool,
+    #[serde(default, deserialize_with = "member")]
+    data: Option<Option<PushDeliveryAck>>,
+    #[serde(default)]
     error: Option<ProbeRefusal>,
+}
+
+/// Reads a member that is present, whether it holds a value or null.
+fn member<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// The code of the gateway's refusal, the only word of it this host reads.
