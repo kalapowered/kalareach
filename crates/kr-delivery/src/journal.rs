@@ -2172,6 +2172,34 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn record_attempt(&mut self, transition: &Transition) -> Result<bool> {
+        self.record(transition, true)
+    }
+
+    /// Records that a claimed attempt was not made, and gives the attempt back.
+    ///
+    /// A claim counts its attempt before anything is presented, and an attempt that never reached
+    /// the point of presenting anything has used nothing up: a credential whose renewal is not
+    /// asked for again until a wait is over cannot send, whatever the clock does meanwhile, and
+    /// the notification must stay as able to be sent as it was when the claim took it. The row
+    /// goes back to the state `transition` names, with the attempt count it had before the claim,
+    /// no attempt row for the claimed number, and the outbox row `transition` schedules.
+    ///
+    /// Only a transition that is still moving can give an attempt back. One that settles the
+    /// record, as privacy mode does when it has ended the generation this was queued under, keeps
+    /// the attempt it was claimed as, because nothing is left to be attempted. As with
+    /// [`Self::record_attempt`], `Ok(false)` says the record is no longer the one the caller
+    /// claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn record_unattempted(&mut self, transition: &Transition) -> Result<bool> {
+        self.record(transition, false)
+    }
+
+    /// Writes one transition for the attempt the caller claimed, spending that attempt or giving
+    /// it back.
+    fn record(&mut self, transition: &Transition, spends_the_attempt: bool) -> Result<bool> {
         let identifier = transition.notification_id.to_string();
         let transaction = self
             .connection
@@ -2273,23 +2301,37 @@ impl DeliveryJournal {
         } else {
             transition.clone()
         };
-        transaction.execute(
-            "INSERT INTO delivery_attempts
-                 (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (notification_id, attempt) DO UPDATE SET
-                 settled_at_ms = excluded.settled_at_ms,
-                 outcome = excluded.outcome,
-                 detail = excluded.detail",
-            params![
-                identifier,
-                as_i64(transition.attempt),
-                as_i64(transition.started_at_ms.get()),
-                transition.settled_at_ms.map(|at| as_i64(at.get())),
-                transition.settled_at_ms.map(|_| transition.state.as_str()),
-                transition.detail.as_deref(),
-            ],
-        )?;
+        // The conversions above can settle a transition whose caller thought it was still
+        // moving, and a settled record has no attempt left to give back.
+        let attempts_after = if spends_the_attempt || transition.state.is_settled() {
+            transition.attempt
+        } else {
+            transition.attempt.saturating_sub(1)
+        };
+        if attempts_after == transition.attempt {
+            transaction.execute(
+                "INSERT INTO delivery_attempts
+                     (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (notification_id, attempt) DO UPDATE SET
+                     settled_at_ms = excluded.settled_at_ms,
+                     outcome = excluded.outcome,
+                     detail = excluded.detail",
+                params![
+                    identifier,
+                    as_i64(transition.attempt),
+                    as_i64(transition.started_at_ms.get()),
+                    transition.settled_at_ms.map(|at| as_i64(at.get())),
+                    transition.settled_at_ms.map(|_| transition.state.as_str()),
+                    transition.detail.as_deref(),
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM delivery_attempts WHERE notification_id = ?1 AND attempt = ?2",
+                params![identifier, as_i64(transition.attempt)],
+            )?;
+        }
         // Decided from what is written, not from what was proposed: the conversions above can
         // settle a transition its caller thought was still moving.
         let holds_request = !transition.state.is_settled()
@@ -2299,7 +2341,7 @@ impl DeliveryJournal {
         transaction.execute(
             "UPDATE delivery_notifications
                 SET state = ?2,
-                    attempts = MAX(attempts, ?3),
+                    attempts = ?3,
                     detail = COALESCE(?4, detail),
                     content = CASE WHEN ?5 = 1 THEN content ELSE NULL END,
                     suppression_reason = COALESCE(?6, suppression_reason),
@@ -2311,7 +2353,7 @@ impl DeliveryJournal {
             params![
                 identifier,
                 transition.state.as_str(),
-                as_i64(transition.attempt),
+                as_i64(attempts_after),
                 transition.detail.as_deref(),
                 i64::from(holds_request),
                 reason,
@@ -2333,7 +2375,7 @@ impl DeliveryJournal {
                     params![
                         identifier,
                         as_i64(due.get()),
-                        as_i64(transition.attempt),
+                        as_i64(attempts_after),
                         transition.next.as_str()
                     ],
                 )?;
@@ -5242,6 +5284,50 @@ mod tests {
         );
         assert!(journal.due(2_999, 10).expect("a read").is_empty());
         assert_eq!(journal.due(3_000, 10).expect("a read").len(), 1);
+    }
+
+    /// An attempt given back is a notification put back to work, which privacy mode's boundary
+    /// forbids as it does for an answer: the notification is cancelled, keeps the attempt it was
+    /// claimed as, and leaves no outbox row.
+    #[test]
+    fn an_attempt_given_back_after_a_privacy_boundary_cancels_the_notification() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        let claimed = claim(&mut journal, 9, 2_000);
+        journal.fence(1).expect("a fence");
+        journal.cancel_undispatched(2_500).expect("a cancellation");
+        assert!(
+            journal
+                .record_unattempted(&Transition {
+                    notification_id: claimed.notification_id,
+                    attempt: claimed.attempt,
+                    state: DeliveryState::Retrying,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_600)),
+                    next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                    next: crate::push::NextAction::Send,
+                    detail: Some("the credential has to be renewed first".to_owned()),
+                    suppression: None,
+                    left_this_host: false,
+                    reported_by_destination: false,
+                })
+                .expect("a transition")
+        );
+        let record = journal
+            .delivery(NotificationId::new(uuid(9)))
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(record.state, DeliveryState::Cancelled);
+        assert_eq!(record.attempts, 1, "nothing is left to attempt");
+        assert!(
+            journal.due(10_000, 10).expect("a read").is_empty(),
+            "nothing is queued under a generation privacy mode has ended"
+        );
     }
 
     /// An answer that arrives after privacy mode has drawn its boundary is recorded, and it does
