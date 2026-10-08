@@ -854,6 +854,9 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         self.refuse_a_destination_held_by_another(&destination_id, &offered)?;
         let credentials = std::sync::Arc::clone(self.delivery_runtime().credentials());
+        // Where the host's changes to this authorisation's credential stand before the gateway is
+        // asked, so a renewal that lands while it answers is not written over by this credential.
+        let seen = credentials.mark(offered.sender_record_id);
         // The gateway is asked off the runtime's threads and outside every lock this host holds:
         // it can take as long as its deadlines allow, and nothing else waits for it.
         let runtime = std::sync::Arc::clone(self.delivery_runtime());
@@ -875,6 +878,10 @@ impl Controller {
                     detail: format!(
                         "the gateway could not be asked about the authorisation: {detail}"
                     ),
+                },
+                crate::push::Confirmation::Limited(detail) => ControllerError::Refused {
+                    code: ErrorCode::RateLimited,
+                    detail,
                 },
             })?;
         let registry = self.registry.lock().await;
@@ -933,7 +940,9 @@ impl Controller {
                 Ok(())
             } else {
                 Err(ControllerError::PermissionDenied {
-                    detail: "this device's grant has run out; pair again".to_owned(),
+                    detail: "this device's grant has run out, so it can register no destination; \
+                             pairing a new device gives notifications one that stands"
+                        .to_owned(),
                 })
             }
         };
@@ -958,7 +967,7 @@ impl Controller {
             });
         }
         credentials
-            .keep(offered.clone())
+            .keep(offered.clone(), seen)
             .map_err(|detail| ControllerError::Storage {
                 operation: "keep a delivery credential",
                 detail,
