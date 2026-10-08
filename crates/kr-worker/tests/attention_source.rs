@@ -267,6 +267,7 @@ fn sources(questions_after: u64, host_events_after: u64, wait_ms: u64) -> Attent
     AttentionSourcesRequest {
         request_id: RequestId::new(21),
         questions_after: U64::new(questions_after),
+        approvals_after: U64::ZERO,
         host_events_after: U64::new(host_events_after),
         max_records: U64::new(64),
         wait_ms: U64::new(wait_ms),
@@ -610,6 +611,80 @@ async fn a_held_page_answers_when_a_host_event_is_committed() {
         panic!("expected the held page");
     };
     assert_eq!(page.host_events.records.len(), 1);
+}
+
+/// KR-REQ-25.01: a relayed approval committed to the broker's ledger while a request is held
+/// answers it at once, with the transitions the broker recorded, and the transition that interpreted
+/// the approval is among what the next request reads. The request is held for twenty seconds and the
+/// answer is waited for five, so a commit that did not wake it fails here.
+#[tokio::test]
+async fn a_held_page_answers_when_an_approval_is_committed() {
+    use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
+    use kr_worker::broker::connectors::fixture;
+
+    let host = host().await;
+    let broker = host.service.broker();
+    register(broker, 2);
+    let package = Package::new();
+    package.bind(broker, 2);
+    let mut channel = Channel::open(
+        package.launch(broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    link.writer()
+        .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
+        .await
+        .expect("writes the request");
+
+    channel.relay("abcde").await;
+    let Answer::Page(woken) = within(&mut link, Duration::from_secs(5)).await else {
+        panic!("expected the held page");
+    };
+    assert!(
+        !woken.approvals.records.is_empty(),
+        "the commit that woke the request is in the page"
+    );
+    assert_eq!(woken.approvals.records[0].sequence, U64::new(1));
+
+    // The interpretation is the next transition: read from where the first page stopped, until the
+    // page carries it.
+    let mut after = woken
+        .approvals
+        .records
+        .last()
+        .map_or(0, |last| last.sequence.get());
+    let mut interpreted = woken
+        .approvals
+        .records
+        .iter()
+        .any(|record| record.interpreted);
+    while !interpreted {
+        let next = page(
+            &mut link,
+            AttentionSourcesRequest {
+                approvals_after: U64::new(after),
+                ..sources(0, 0, 5_000)
+            },
+        )
+        .await;
+        assert!(
+            !next.approvals.records.is_empty(),
+            "the interpretation is committed within the wait"
+        );
+        after = next
+            .approvals
+            .records
+            .last()
+            .map_or(after, |last| last.sequence.get());
+        interpreted = next
+            .approvals
+            .records
+            .iter()
+            .any(|record| record.interpreted);
+    }
+    channel.close().await;
 }
 
 /// KR-REQ-24.11: a privacy transition committed while a request is held answers it at once,

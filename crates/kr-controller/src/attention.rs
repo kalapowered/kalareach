@@ -69,8 +69,8 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::framed::CheckedWrite;
 use kr_protocol::attention::ChangeSummary;
 use kr_protocol::attention::{
-    AttentionAcknowledgeParams, AttentionAutomationSubject, AttentionBarrier,
-    AttentionBarrierAcknowledged, AttentionHostRecord, AttentionQuestionRecord,
+    AttentionAcknowledgeParams, AttentionApprovalRecord, AttentionAutomationSubject,
+    AttentionBarrier, AttentionBarrierAcknowledged, AttentionHostRecord, AttentionQuestionRecord,
     AttentionQuietHoursParams, AttentionQuietHoursResult, AttentionReadParams, AttentionRecordRef,
     AttentionSource, AttentionSourcePage, AttentionSourcesRequest, AttentionTextRequest,
     MAX_ATTENTION_SOURCE_RECORDS, MAX_ATTENTION_SOURCE_WAIT_MS, MAX_ATTENTION_TEXT_RECORDS,
@@ -81,7 +81,8 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, GrantId, RequestId, SessionId};
+use kr_protocol::gateway::PendingState;
+use kr_protocol::ids::{ActorId, ApprovalRequestId, GrantId, RequestId, SessionId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::question::QuestionEventKind;
 use kr_protocol::scalars::{Nullable, SecretBytes32, TimestampMs, U64};
@@ -2152,20 +2153,18 @@ impl AttentionModule {
         let mut behind = false;
         // The module is held for each step and let go of across the wait, so a module its owner
         // has let go of goes, with its store's claim, while a request is held.
-        while let Some((questions_after, host_events_after, wait)) =
-            module.upgrade().and_then(|held| {
-                if !held.origins().watched.contains(&session_id) {
-                    return None;
-                }
-                let (questions_after, host_events_after) = held.cursors(session_id).ok()?;
-                let wait = if behind {
-                    0
-                } else {
-                    held.page_wait(session_id)
-                };
-                Some((questions_after, host_events_after, wait))
-            })
-        {
+        while let Some((cursors, wait)) = module.upgrade().and_then(|held| {
+            if !held.origins().watched.contains(&session_id) {
+                return None;
+            }
+            let cursors = held.cursors(session_id).ok()?;
+            let wait = if behind {
+                0
+            } else {
+                held.page_wait(session_id)
+            };
+            Some((cursors, wait))
+        }) {
             let Some(held) = module.upgrade() else {
                 break;
             };
@@ -2174,8 +2173,9 @@ impl AttentionModule {
             let request_id = next_request();
             let request = AttentionSourcesRequest {
                 request_id,
-                questions_after: U64::new(questions_after),
-                host_events_after: U64::new(host_events_after),
+                questions_after: U64::new(cursors.questions),
+                approvals_after: U64::new(cursors.approvals),
+                host_events_after: U64::new(cursors.host_events),
                 max_records: U64::new(PAGE_RECORDS),
                 wait_ms: U64::new(wait),
                 fingerprint_key: SecretBytes32::from_bytes(fingerprint_key),
@@ -2194,10 +2194,7 @@ impl AttentionModule {
             let Some(held) = module.upgrade() else {
                 break;
             };
-            match held
-                .take_page(session_id, &link, questions_after, host_events_after, &page)
-                .await
-            {
+            match held.take_page(session_id, &link, cursors, &page).await {
                 Ok(Taken::Complete) => behind = false,
                 Ok(Taken::Partial) => behind = true,
                 Ok(Taken::Stale) | Err(_) => break,
@@ -2236,19 +2233,17 @@ impl AttentionModule {
         })
     }
 
-    /// Returns where the store has read one session's two sources.
-    fn cursors(&self, session_id: SessionId) -> Answer<(u64, u64)> {
+    /// Returns where the store has read one session's three sources.
+    fn cursors(&self, session_id: SessionId) -> Answer<Cursors> {
         let store = self.store()?;
         let engine = store.engine().map_err(refusal)?;
         let origin = Origin::Session(session_id);
-        Ok((
-            engine
-                .consumed(origin, AttentionSource::Questions)
-                .unwrap_or_default(),
-            engine
-                .consumed(origin, AttentionSource::HostEvents)
-                .unwrap_or_default(),
-        ))
+        let read = |source| engine.consumed(origin, source).unwrap_or_default();
+        Ok(Cursors {
+            questions: read(AttentionSource::Questions),
+            approvals: read(AttentionSource::Approvals),
+            host_events: read(AttentionSource::HostEvents),
+        })
     }
 
     /// Returns the key one session's fingerprints are made under, derived from the store's own
@@ -2272,26 +2267,11 @@ impl AttentionModule {
         self: &Arc<Self>,
         session_id: SessionId,
         link: &Arc<Link>,
-        questions_after: u64,
-        host_events_after: u64,
+        cursors: Cursors,
         page: &AttentionSourcePage,
     ) -> Answer<Taken> {
         let events = events_of(session_id, page);
-        let complete = complete(
-            questions_after,
-            page.questions.head.get(),
-            page.questions
-                .records
-                .last()
-                .map(|record| record.sequence.get()),
-        ) && complete(
-            host_events_after,
-            page.host_events.head.get(),
-            page.host_events
-                .records
-                .last()
-                .map(|record| record.sequence.get()),
-        );
+        let complete = cursors.reached_by(page);
         let built_at_boot_ms = page.built_at_boot_ms.get();
         let output_floor = page.output_floor.0.map(|floor| floor.get());
         let link = Arc::clone(link);
@@ -2448,7 +2428,7 @@ impl AttentionModule {
         }
     }
 
-    /// Reads a closed session's journal from the store's cursors to the head of both sources.
+    /// Reads a closed session's journal from the store's cursors to the head of every source.
     fn read_to_the_end(
         &self,
         session_id: SessionId,
@@ -2458,12 +2438,12 @@ impl AttentionModule {
             .fingerprint_key(session_id)
             .map_err(Unfinished::Store)?;
         loop {
-            let (questions_after, host_events_after) =
-                self.cursors(session_id).map_err(Unfinished::Store)?;
+            let cursors = self.cursors(session_id).map_err(Unfinished::Store)?;
             let request = AttentionSourcesRequest {
                 request_id: RequestId::new(0),
-                questions_after: U64::new(questions_after),
-                host_events_after: U64::new(host_events_after),
+                questions_after: U64::new(cursors.questions),
+                approvals_after: U64::new(cursors.approvals),
+                host_events_after: U64::new(cursors.host_events),
                 max_records: U64::new(PAGE_RECORDS),
                 wait_ms: U64::ZERO,
                 fingerprint_key: SecretBytes32::from_bytes(key),
@@ -2473,21 +2453,7 @@ impl AttentionModule {
             let page = kr_worker::attention_source::page(journal, &request, 0, usize::MAX)
                 .map_err(|_| Unfinished::Journal)?;
             let events = events_of(session_id, &page);
-            let done = complete(
-                questions_after,
-                page.questions.head.get(),
-                page.questions
-                    .records
-                    .last()
-                    .map(|record| record.sequence.get()),
-            ) && complete(
-                host_events_after,
-                page.host_events.head.get(),
-                page.host_events
-                    .records
-                    .last()
-                    .map(|record| record.sequence.get()),
-            );
+            let done = cursors.reached_by(&page);
             let reading = self.reading();
             self.store()
                 .map_err(Unfinished::Store)?
@@ -2498,9 +2464,7 @@ impl AttentionModule {
             }
             // A page that moved neither cursor would be read again for ever. What the store will
             // not take from the journal is as good as what the journal cannot give.
-            if self.cursors(session_id).map_err(Unfinished::Store)?
-                == (questions_after, host_events_after)
-            {
+            if self.cursors(session_id).map_err(Unfinished::Store)? == cursors {
                 return Err(Unfinished::Journal);
             }
         }
@@ -2508,7 +2472,7 @@ impl AttentionModule {
 
     /// Marks every source of a session as a gap with no known end.
     ///
-    /// Every source: the two a link reads, and any other the store holds records of for the
+    /// Every source: the three a link reads, and any other the store holds records of for the
     /// session, so each of the session's unresolved items is uncertain afterwards.
     fn gaps_without_end(&self, session_id: SessionId) -> Answer<()> {
         let origin = Origin::Session(session_id);
@@ -2517,6 +2481,7 @@ impl AttentionModule {
             let engine = store.engine().map_err(refusal)?;
             let mut sources: BTreeMap<AttentionSource, u64> = [
                 (AttentionSource::Questions, 0),
+                (AttentionSource::Approvals, 0),
                 (AttentionSource::HostEvents, 0),
             ]
             .into_iter()
@@ -3230,12 +3195,58 @@ pub fn events_of(session_id: SessionId, page: &AttentionSourcePage) -> Vec<Sourc
         .map(|record| question_event(session_id, record))
         .collect();
     events.extend(
+        page.approvals
+            .records
+            .iter()
+            .map(|record| approval_event(session_id, record)),
+    );
+    events.extend(
         page.host_events
             .records
             .iter()
             .map(|record| host_event(session_id, record)),
     );
     events
+}
+
+/// Turns one broker transition into the event the store reads.
+///
+/// The transition that interpreted an approval raises it, under the resource's identifier as its
+/// request, and an approval that reaches a terminal state is resolved. Everything else the broker
+/// records moves the cursor and nothing more: a request nothing has interpreted is a claim and
+/// not an approval, a claim given back or an answer on its way leaves the approval as it is, and
+/// raising it again would announce it again. The event carries no text: the store keeps none, and
+/// what an approval asks is the application's to show.
+#[must_use]
+pub fn approval_event(session_id: SessionId, record: &AttentionApprovalRecord) -> SourceEvent {
+    // A resource's identifier is a UUID, which an opaque identifier always takes; one it did not
+    // take would be a record nothing can raise, and it moves the cursor all the same.
+    let request_id = ApprovalRequestId::new(record.resource_id.to_string()).ok();
+    let kind = match request_id {
+        Some(request_id) if record.interpreted && record.state == PendingState::Pending => {
+            EventKind::ApprovalRequested {
+                request_id,
+                session_id,
+                summary: String::new(),
+            }
+        }
+        Some(request_id) if record.approval && record.state.is_terminal() => {
+            EventKind::ApprovalResolved {
+                request_id,
+                session_id,
+            }
+        }
+        _ => EventKind::Observed,
+    };
+    SourceEvent::new(
+        EventCursor::in_session(
+            session_id,
+            AttentionSource::Approvals,
+            record.sequence.get(),
+        ),
+        record.recorded_at_ms,
+        kind,
+    )
 }
 
 /// Turns one question transition into the event the store reads.
@@ -3382,6 +3393,42 @@ fn journal_error(error: kr_automation::AutomationError) -> ProtocolError {
         ErrorCode::StorageUnavailable,
         format!("the workflow journal: {error}"),
     )
+}
+
+/// Where the store has read one session's three sources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Cursors {
+    questions: u64,
+    approvals: u64,
+    host_events: u64,
+}
+
+impl Cursors {
+    /// Whether a page read from these cursors reached the head of every source.
+    fn reached_by(self, page: &AttentionSourcePage) -> bool {
+        complete(
+            self.questions,
+            page.questions.head.get(),
+            page.questions
+                .records
+                .last()
+                .map(|record| record.sequence.get()),
+        ) && complete(
+            self.approvals,
+            page.approvals.head.get(),
+            page.approvals
+                .records
+                .last()
+                .map(|record| record.sequence.get()),
+        ) && complete(
+            self.host_events,
+            page.host_events.head.get(),
+            page.host_events
+                .records
+                .last()
+                .map(|record| record.sequence.get()),
+        )
+    }
 }
 
 /// Whether one source's part of a page reached the source's head.
@@ -3638,11 +3685,11 @@ pub(crate) mod tests {
 
     use kr_ipc::framed::{FrameReader, FrameWriter};
     use kr_protocol::attention::{
-        AttentionHostSlice, AttentionQuestionSlice, AttentionReadResult, AttentionRecordText,
-        AttentionTextAnswer, VisitChangedResult,
+        AttentionApprovalSlice, AttentionHostSlice, AttentionQuestionSlice, AttentionReadResult,
+        AttentionRecordText, AttentionTextAnswer, VisitChangedResult,
     };
     use kr_protocol::frame::StreamKind;
-    use kr_protocol::ids::QuestionId;
+    use kr_protocol::ids::{PendingResourceId, QuestionId};
     use kr_protocol::method::MethodVersion;
     use kr_protocol::scalars::TimestampMs;
     use kr_protocol::session::DisplayNumber;
@@ -3985,6 +4032,10 @@ pub(crate) mod tests {
                     text: Nullable::null(),
                 }],
             },
+            approvals: AttentionApprovalSlice {
+                head: U64::ZERO,
+                records: Vec::new(),
+            },
             host_events: AttentionHostSlice {
                 head: U64::ZERO,
                 records: Vec::new(),
@@ -4313,6 +4364,125 @@ pub(crate) mod tests {
         );
     }
 
+    /// A page carrying only the broker transitions in `records`, past the cursor `from`.
+    fn approval_page(records: Vec<AttentionApprovalRecord>) -> AttentionSourcePage {
+        AttentionSourcePage {
+            approvals: AttentionApprovalSlice {
+                head: records.last().map_or(U64::ZERO, |last| last.sequence),
+                records,
+            },
+            ..question_page_without_a_question()
+        }
+    }
+
+    /// An empty page of a session whose sources hold nothing.
+    fn question_page_without_a_question() -> AttentionSourcePage {
+        AttentionSourcePage {
+            questions: AttentionQuestionSlice {
+                head: U64::ZERO,
+                records: Vec::new(),
+            },
+            ..question_page(SessionId::new(kr_ipc::new_uuid()))
+        }
+    }
+
+    /// One broker transition as a page carries it.
+    fn transition(
+        sequence: u64,
+        resource: PendingResourceId,
+        state: PendingState,
+        approval: bool,
+        interpreted: bool,
+    ) -> AttentionApprovalRecord {
+        AttentionApprovalRecord {
+            sequence: U64::new(sequence),
+            resource_id: resource,
+            state,
+            approval,
+            interpreted,
+            recorded_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+        }
+    }
+
+    /// KR-REQ-25.01: the broker's transitions of a pending approval raise and end the session's
+    /// pending-approval item. The transition that interpreted the approval raises it, once: the
+    /// recorded request before it is no approval, and a claim taken and given back, which makes the
+    /// approval pending again, is not a second raise. A terminal state ends it. A request nothing
+    /// interpreted raises nothing at any point, and the cursor moves past every record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interpreted_approval_is_pending_until_its_end_and_raised_once() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+        let approval = PendingResourceId::new(kr_ipc::new_uuid());
+        let request = PendingResourceId::new(kr_ipc::new_uuid());
+        let pending_approvals = |module: &Arc<AttentionModule>| {
+            module
+                .store()
+                .expect("the store")
+                .inbox(&owner(), &Viewer::Owner, true)
+                .expect("the inbox")
+                .into_iter()
+                .filter(|item| item.rule == kr_protocol::attention::AttentionRule::PendingApproval)
+                .collect::<Vec<_>>()
+        };
+
+        // Recorded, interpreted, claimed and given back, with a request nothing interprets beside it.
+        let taken = module
+            .take_page(
+                session_id,
+                &link,
+                Cursors::default(),
+                &approval_page(vec![
+                    transition(1, approval, PendingState::Pending, false, false),
+                    transition(2, request, PendingState::Pending, false, false),
+                    transition(3, approval, PendingState::Pending, true, true),
+                    transition(4, approval, PendingState::Claimed, true, false),
+                    transition(5, approval, PendingState::Pending, true, false),
+                ]),
+            )
+            .await
+            .expect("the store answers");
+        assert!(matches!(taken, Taken::Complete));
+        let raised = pending_approvals(&module);
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].session_id, Nullable::some(session_id));
+        assert_eq!(
+            raised[0].occurrences,
+            U64::new(1),
+            "a claim given back raises nothing again"
+        );
+        assert_eq!(
+            module.cursors(session_id).expect("the cursors").approvals,
+            5,
+            "the cursor is past every record, those that raise nothing included"
+        );
+
+        // The approval is answered, and the request nothing interpreted is cancelled.
+        let taken = module
+            .take_page(
+                session_id,
+                &link,
+                Cursors {
+                    approvals: 5,
+                    ..Cursors::default()
+                },
+                &approval_page(vec![
+                    transition(6, approval, PendingState::Resolved, true, false),
+                    transition(7, request, PendingState::Cancelled, false, false),
+                ]),
+            )
+            .await
+            .expect("the store answers");
+        assert!(matches!(taken, Taken::Complete));
+        assert!(pending_approvals(&module).is_empty(), "its end ends it");
+        assert_eq!(
+            module.cursors(session_id).expect("the cursors").approvals,
+            7
+        );
+    }
+
     /// A page that arrives after its session's closure is not taken: the closure holds the store
     /// while it takes the link away, and the page is taken only from the link that speaks for the
     /// session then. A page from a link that still does is taken.
@@ -4329,12 +4499,17 @@ pub(crate) mod tests {
             .session_closed(&Stub { unaccounted: true }, closed)
             .await;
         let late = module
-            .take_page(closed, &closed_link, 0, 0, &question_page(closed))
+            .take_page(
+                closed,
+                &closed_link,
+                Cursors::default(),
+                &question_page(closed),
+            )
             .await
             .expect("the store answers");
         assert!(matches!(late, Taken::Stale));
         let current = module
-            .take_page(open, &open_link, 0, 0, &question_page(open))
+            .take_page(open, &open_link, Cursors::default(), &question_page(open))
             .await
             .expect("the store answers");
         assert!(matches!(current, Taken::Complete));
@@ -4363,7 +4538,12 @@ pub(crate) mod tests {
         for (display, session_id) in [(1, closing), (2, slow), (3, standing)] {
             let (link, reader, writer) = linked(&temp, display, &module, session_id).await;
             module
-                .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                .take_page(
+                    session_id,
+                    &link,
+                    Cursors::default(),
+                    &question_page(session_id),
+                )
                 .await
                 .expect("the page is taken");
             ends.insert(session_id, (reader, writer));
@@ -4704,7 +4884,7 @@ pub(crate) mod tests {
         let closing = SessionId::new(kr_ipc::new_uuid());
         let (link, mut reader, mut writer) = linked(&temp, 1, &module, closing).await;
         module
-            .take_page(closing, &link, 0, 0, &question_page(closing))
+            .take_page(closing, &link, Cursors::default(), &question_page(closing))
             .await
             .expect("the page is taken");
         let assembling = {
@@ -5096,7 +5276,12 @@ pub(crate) mod tests {
         for (display, session_id) in [(1, raising), (2, other)] {
             let (link, reader, writer) = linked(&temp, display, &module, session_id).await;
             module
-                .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                .take_page(
+                    session_id,
+                    &link,
+                    Cursors::default(),
+                    &question_page(session_id),
+                )
                 .await
                 .expect("the page is taken");
             ends.insert(session_id, (reader, writer));
@@ -5227,7 +5412,12 @@ pub(crate) mod tests {
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let (link, mut reader, mut writer) = linked(&temp, 1, &module, session_id).await;
         module
-            .take_page(session_id, &link, 0, 0, &question_page(session_id))
+            .take_page(
+                session_id,
+                &link,
+                Cursors::default(),
+                &question_page(session_id),
+            )
             .await
             .expect("the page is taken");
         let reading = {
@@ -6189,7 +6379,12 @@ pub(crate) mod tests {
             async move {
                 let polled_on = std::thread::current().id();
                 module
-                    .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                    .take_page(
+                        session_id,
+                        &link,
+                        Cursors::default(),
+                        &question_page(session_id),
+                    )
                     .await
                     .expect("the page is taken");
                 polled_on
@@ -6275,7 +6470,12 @@ pub(crate) mod tests {
             let session_id = SessionId::new(kr_ipc::new_uuid());
             let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
             module
-                .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                .take_page(
+                    session_id,
+                    &link,
+                    Cursors::default(),
+                    &question_page(session_id),
+                )
                 .await
                 .expect("the page is taken");
             let decided = decisions(&module);
@@ -6309,7 +6509,7 @@ pub(crate) mod tests {
             let mut partial = question_page(session_id);
             partial.questions.head = U64::new(2);
             let taken = module
-                .take_page(session_id, &link, 0, 0, &partial)
+                .take_page(session_id, &link, Cursors::default(), &partial)
                 .await
                 .expect("the page is taken");
             assert!(matches!(taken, Taken::Partial));

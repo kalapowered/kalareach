@@ -443,6 +443,11 @@ impl WorkerService {
             .session()
             .journal()
             .map(crate::journal::Journal::attention_changes);
+        // A transition the broker commits for a pending approval wakes a held request for the
+        // session's attention sources as a host event does.
+        if let Some(changes) = &journal_changes {
+            broker.attach_attention_changes(Arc::clone(changes));
+        }
         let attention_fence = Arc::new(crate::attention_fence::AttentionFence::new(Arc::clone(
             &shared_clock,
         )));
@@ -2621,7 +2626,7 @@ impl WorkerService {
 
     /// Reads one page, holding the request while there is nothing to answer with.
     ///
-    /// It answers at once when either source has a record past its cursor, when the session's
+    /// It answers at once when any source has a record past its cursor, when the session's
     /// privacy generation has moved since the request arrived or is past the generation the
     /// request says the daemon has recorded, and when the request's bound runs out. Both
     /// subscriptions are taken before each read, so a commit between the read and the wait wakes
@@ -2661,6 +2666,7 @@ impl WorkerService {
                 Nullable::some(U64::new(self.runtime.session().oldest_retained_cursor()));
             let started = *generation.get_or_insert(page.privacy_generation.0);
             let answer = !page.questions.records.is_empty()
+                || !page.approvals.records.is_empty()
                 || !page.host_events.records.is_empty()
                 || page.privacy_generation.0 != started
                 || crate::attention_fence::behind(

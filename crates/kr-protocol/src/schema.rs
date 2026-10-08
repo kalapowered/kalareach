@@ -35,16 +35,16 @@ use crate::attachment::{
     TerminalResizeParams,
 };
 use crate::attention::{
-    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionAutomationSubject,
-    AttentionBarrier, AttentionBarrierAcknowledged, AttentionGap, AttentionHostRecord,
-    AttentionHostSlice, AttentionItem, AttentionItemRevision, AttentionQuestionRecord,
-    AttentionQuestionSlice, AttentionQuietHoursParams, AttentionQuietHoursResult,
-    AttentionReadParams, AttentionReadResult, AttentionRecordRef, AttentionRecordText,
-    AttentionSourcePage, AttentionSourcesRequest, AttentionTextAnswer, AttentionTextRequest,
-    ChangeSummary, LogViewState, QuietHours, RetainedLogView, ReviewAcknowledgeParams,
-    ReviewAcknowledgeResult, ReviewReadParams, ReviewReadResult, ReviewState, ReviewSubject,
-    SemanticChange, VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams,
-    VisitChangedResult,
+    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionApprovalRecord,
+    AttentionApprovalSlice, AttentionAutomationSubject, AttentionBarrier,
+    AttentionBarrierAcknowledged, AttentionGap, AttentionHostRecord, AttentionHostSlice,
+    AttentionItem, AttentionItemRevision, AttentionQuestionRecord, AttentionQuestionSlice,
+    AttentionQuietHoursParams, AttentionQuietHoursResult, AttentionReadParams, AttentionReadResult,
+    AttentionRecordRef, AttentionRecordText, AttentionSourcePage, AttentionSourcesRequest,
+    AttentionTextAnswer, AttentionTextRequest, ChangeSummary, LogViewState, QuietHours,
+    RetainedLogView, ReviewAcknowledgeParams, ReviewAcknowledgeResult, ReviewReadParams,
+    ReviewReadResult, ReviewState, ReviewSubject, SemanticChange, VisitAcknowledgeParams,
+    VisitAcknowledgeResult, VisitChangedParams, VisitChangedResult,
 };
 use crate::authority::MethodEntry;
 use crate::automation::{
@@ -316,6 +316,8 @@ pub fn protocol_schema() -> Value {
         "attention_barrier" => AttentionBarrier,
         "attention_barrier_acknowledged" => AttentionBarrierAcknowledged,
         "attention_gap" => AttentionGap,
+        "attention_approval_record" => AttentionApprovalRecord,
+        "attention_approval_slice" => AttentionApprovalSlice,
         "attention_host_record" => AttentionHostRecord,
         "attention_host_slice" => AttentionHostSlice,
         "attention_item" => AttentionItem,

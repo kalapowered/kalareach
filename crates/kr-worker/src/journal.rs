@@ -1012,6 +1012,107 @@ impl Journal {
         )
     }
 
+    /// Returns the broker ledger's last transition, or nought when it has recorded none.
+    ///
+    /// The ledger is the broker's, kept in this same file; a file without it has recorded no
+    /// transition. It is the head of the approvals the attention store reads, whatever kind of
+    /// resource each transition is about, so that the numbering the store follows has no hole.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn broker_approvals_head(&self) -> Result<u64> {
+        if !self.has_table("broker_events")? {
+            return Ok(0);
+        }
+        let head: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM broker_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(u64::try_from(head).unwrap_or_default())
+    }
+
+    /// Returns the broker's transitions after `after`, oldest first, at most `limit` of them, as
+    /// the attention store reads them.
+    ///
+    /// A resource is an approval from the transition that interpreted it, which is the only one
+    /// that raises attention; every transition of it from then on is marked as one of an
+    /// approval, so that its end is told, and every other transition carries only its place in
+    /// the numbering. No text is read, and nothing of the resource is decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails or a record cannot be read.
+    pub fn broker_approvals_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<kr_protocol::attention::AttentionApprovalRecord>> {
+        if !self.has_table("broker_events")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT event.sequence, event.state, event.resource_id, event.recorded_at_ms,
+                        event.cause = ?3,
+                        EXISTS (SELECT 1 FROM broker_events AS earlier
+                                WHERE earlier.resource_id = event.resource_id
+                                  AND earlier.sequence <= event.sequence
+                                  AND earlier.cause = ?3)
+                 FROM broker_events AS event
+                 WHERE event.sequence > ?1 ORDER BY event.sequence LIMIT ?2",
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        let rows = statement
+            .query_map(
+                params![
+                    i64::try_from(after).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    crate::broker::ledger::TransitionCause::Interpreted.as_str(),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, bool>(5)?,
+                    ))
+                },
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        let unreadable =
+            || unavailable_detail_owned("a broker transition could not be read".to_owned());
+        let mut records = Vec::new();
+        for row in rows {
+            let (sequence, state, resource, recorded_at_ms, interpreted, approval) =
+                row.map_err(|error| faulted(&self.health, error))?;
+            let state = kr_protocol::gateway::PendingState::ALL
+                .iter()
+                .copied()
+                .find(|candidate| candidate.as_str() == state)
+                .ok_or_else(unreadable)?;
+            let resource_id = kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes(
+                <[u8; 16]>::try_from(resource.as_slice()).map_err(|_| unreadable())?,
+            ));
+            records.push(kr_protocol::attention::AttentionApprovalRecord {
+                sequence: U64::new(u64::try_from(sequence).unwrap_or_default()),
+                resource_id,
+                state,
+                approval,
+                interpreted,
+                recorded_at_ms: TimestampMs::new(u64::try_from(recorded_at_ms).unwrap_or_default()),
+            });
+        }
+        Ok(records)
+    }
+
     /// Returns one question transition by its sequence, when the ledger still holds it.
     ///
     /// # Errors

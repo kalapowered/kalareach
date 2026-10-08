@@ -1751,11 +1751,14 @@ fn inbox(
     let journal = kr_worker::journal::Journal::open_read_only(&hosted.journal)
         .expect("the session's journal reads");
     let origin = kr_attention::Origin::Session(hosted.session_id);
-    let (questions, host_events) = {
+    let (questions, approvals, host_events) = {
         let engine = store.engine().expect("the store is this test's");
         (
             engine
                 .consumed(origin, AttentionSource::Questions)
+                .unwrap_or_default(),
+            engine
+                .consumed(origin, AttentionSource::Approvals)
                 .unwrap_or_default(),
             engine
                 .consumed(origin, AttentionSource::HostEvents)
@@ -1767,6 +1770,7 @@ fn inbox(
         &kr_protocol::attention::AttentionSourcesRequest {
             request_id: kr_protocol::ids::RequestId::new(1),
             questions_after: kr_protocol::scalars::U64::new(questions),
+            approvals_after: kr_protocol::scalars::U64::new(approvals),
             host_events_after: kr_protocol::scalars::U64::new(host_events),
             max_records: kr_protocol::scalars::U64::new(256),
             wait_ms: kr_protocol::scalars::U64::ZERO,

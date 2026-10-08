@@ -35,8 +35,10 @@ use core::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::gateway::PendingState;
 use crate::ids::{
-    ActorId, AgentTurnId, CausalRootId, ChangeSetId, QuestionId, RequestId, SessionId, WorkflowId,
+    ActorId, AgentTurnId, CausalRootId, ChangeSetId, PendingResourceId, QuestionId, RequestId,
+    SessionId, WorkflowId,
 };
 use crate::question::QuestionEventKind;
 use crate::recovery::HistoryGap;
@@ -222,6 +224,7 @@ wire_enum! {
     AttentionSource {
         Receipts => "receipts", "The worker's receipt journal.";
         Questions => "questions", "The question ledger.";
+        Approvals => "approvals", "The transitions of the session's pending approvals, which its broker records.";
         HostEvents => "host_events", "Terminal side effects with no attachment to go to.";
         Semantic => "semantic", "The session's own semantic events.";
         Automation => "automation", "The environment's workflow journal and the alerts it keeps.";
@@ -927,6 +930,8 @@ pub struct AttentionSourcesRequest {
     pub request_id: RequestId,
     /// The last question transition the store has read, or nought for none.
     pub questions_after: U64,
+    /// The last approval transition the store has read, or nought for none.
+    pub approvals_after: U64,
     /// The last host event the store has read, or nought for none.
     pub host_events_after: U64,
     /// The most records the page carries from each source, bounded by
@@ -970,6 +975,33 @@ pub struct AttentionQuestionRecord {
     /// The question's wording, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves
     /// it now, and null when it does not.
     pub text: Nullable<String>,
+}
+
+/// One transition of a pending resource the session's broker holds, as the attention store reads
+/// it.
+///
+/// Only an approval the broker has interpreted under a granted decoder raises attention, and only
+/// by the transition that interpreted it; every other transition travels so that the numbering of
+/// the source has no hole, and the store moves its cursor past it. A record carries no text: what
+/// an approval asks is the application's to show, and the store keeps and serves none of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionApprovalRecord {
+    /// Its place in the session's approval transitions.
+    pub sequence: U64,
+    /// The resource.
+    pub resource_id: PendingResourceId,
+    /// The state the resource moved to.
+    pub state: PendingState,
+    /// Whether the resource is an approval, which it is once the broker has interpreted it under
+    /// a granted decoder, and from this transition on or from an earlier one.
+    pub approval: bool,
+    /// Whether this transition is the one that interpreted the resource, which is what makes a
+    /// pending approval an actionable one. A claim given back, an answer on its way and every
+    /// later transition of the same approval are not.
+    pub interpreted: bool,
+    /// When this transition was recorded.
+    pub recorded_at_ms: TimestampMs,
 }
 
 /// One terminal side effect that had no attachment to go to, as the attention store reads it.
@@ -1040,12 +1072,22 @@ pub struct AttentionHostSlice {
     pub records: Vec<AttentionHostRecord>,
 }
 
+/// One source's part of a page: where the source stands, and its records after the cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionApprovalSlice {
+    /// The source's last record when it was read, or nought for none.
+    pub head: U64,
+    /// Its records after the cursor, oldest first, up to the head and the page's bounds.
+    pub records: Vec<AttentionApprovalRecord>,
+}
+
 /// A page of one session's attention source records.
 ///
 /// It is read in order: the moment first, then each source's head and its records after the
 /// cursor, then the session's privacy state, which decides which records carry text. A source
 /// whose last record in the page is its head, or which returned none with the cursor at or past
-/// its head, is complete; a page complete for both sources holds every record the session
+/// its head, is complete; a page complete for every source holds every record the session
 /// committed before `built_at_boot_ms`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1057,6 +1099,8 @@ pub struct AttentionSourcePage {
     pub built_at_boot_ms: U64,
     /// The question ledger.
     pub questions: AttentionQuestionSlice,
+    /// The transitions of the session's pending approvals.
+    pub approvals: AttentionApprovalSlice,
     /// The host events.
     pub host_events: AttentionHostSlice,
     /// The session's privacy generation the page's text was decided under, or null when the
