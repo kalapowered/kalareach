@@ -334,13 +334,18 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         }
     }
 
-    // Section 25 documents Slack, Discord, Telegram and email delivery, and each of them sends
-    // through a credential the host keeps in its secret store, never in a destination's endpoint.
-    // Section 23 names no method that hands the host one, so this build adds one. A credential
-    // decides who reads what a destination delivers, so it is the owner's own act at this machine:
-    // served on the local socket alone, asking for host management, and answering nothing that
-    // carries the credential back.
-    let delivery = [("delivery.destination.secret.set", EffectClass::Write)];
+    // Section 25 documents webhook, Slack, Discord, Telegram and email delivery to a destination
+    // the owner configures, and four of them send through a credential the host keeps in its
+    // secret store, never in a destination's endpoint. Section 23 names no method that creates a
+    // destination, takes one away or hands the host a credential, so this build adds three. Where
+    // content goes and who reads it is the owner's own act at this machine: each is served on the
+    // local socket alone, asking for host management, and the one that carries a credential
+    // answers nothing that carries it back.
+    let delivery = [
+        ("delivery.destination.configure", EffectClass::Write),
+        ("delivery.destination.remove", EffectClass::Write),
+        ("delivery.destination.secret.set", EffectClass::Write),
+    ];
     for (name, effect) in delivery {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
         assert_eq!(entry.effect, effect, "{name} carries its own effect class");
