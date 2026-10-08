@@ -6666,7 +6666,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
 #[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_checks_the_document_the_abandoned_daemon_read() {
-    let (mut host, one, document) =
+    let (host, one, document) =
         a_daemon_that_finds_its_document_under_its_own_configuration_home().await;
     let log = host.tree.root().join("starts.log");
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
