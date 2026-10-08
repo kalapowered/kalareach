@@ -121,6 +121,36 @@ struct GatewayState {
     asked: Vec<(String, u16)>,
     /// Deliveries refused because the bearer was not the latest one issued.
     bearers_refused: usize,
+    /// Every post to an address that is not one of the gateway's routes: an external destination.
+    posted: Vec<Posted>,
+}
+
+/// One post an external destination received.
+#[derive(Clone, Debug)]
+struct Posted {
+    url: String,
+    /// The JSON the adapter sent.
+    body: serde_json::Value,
+    /// The headers it sent, names in lower case.
+    headers: Vec<(String, String)>,
+}
+
+impl Posted {
+    /// The text of the message the post carries, whichever service it went to.
+    fn text(&self) -> String {
+        ["body", "text", "content"]
+            .into_iter()
+            .find_map(|member| self.body.get(member).and_then(serde_json::Value::as_str))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(held, _)| held.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 /// The Worker's push gateway, for what a host asks of it: renewals and revocations proven under
@@ -338,6 +368,11 @@ impl Gateway {
             .iter()
             .map(|(_, request)| request.clone())
             .collect()
+    }
+
+    /// The posts external destinations received, in order.
+    fn posted(&self) -> Vec<Posted> {
+        self.state().posted.clone()
     }
 
     /// The statuses the routes named were answered with, in order.
@@ -642,6 +677,18 @@ impl Gateway {
             .iter()
             .find(|(route, _)| url.ends_with(**route))
             .map(|(_, answer)| answer.clone());
+        // Anything that is not one of the gateway's routes is an address an external destination
+        // was configured with, and what it was sent is kept whatever it is answered with.
+        if !url.contains("/api/push/") {
+            self.state().posted.push(Posted {
+                url: url.to_owned(),
+                body: serde_json::from_slice(body).unwrap_or(serde_json::Value::Null),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| (name.to_ascii_lowercase(), (*value).to_owned()))
+                    .collect(),
+            });
+        }
         let answer = if self.down.load(Ordering::SeqCst) {
             Err(kr_client::ClientError::ConnectionEnded)
         } else if let Some(replied) = replied {
@@ -654,8 +701,10 @@ impl Gateway {
             || url.ends_with("/api/push/sender/revoke")
         {
             Ok(self.sender(url, body))
-        } else {
+        } else if url.contains("/api/push/") {
             Ok(Self::refusal(404, "NOT_FOUND"))
+        } else {
+            Ok(Self::answer(200, &serde_json::json!({ "ok": true })))
         };
         if let Ok(answered) = &answer {
             self.state().asked.push((url.to_owned(), answered.status));
@@ -1050,6 +1099,94 @@ impl Environment {
         self.controller()
             .delivery()
             .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
+            .expect("a read")
+    }
+
+    /// The owner configures an external destination at the daemon's local socket.
+    async fn configure(
+        &self,
+        params: &kr_protocol::delivery::DeliveryDestinationConfigureParams,
+    ) -> Result<
+        kr_protocol::delivery::DeliveryDestinationConfigureResult,
+        kr_protocol::error::ProtocolError,
+    > {
+        let mut client = self.host.client().await;
+        net_support::pairing::mutate(
+            self.environment_id(),
+            &mut client,
+            Method::DeliveryDestinationConfigure,
+            params,
+        )
+        .await
+    }
+
+    /// The owner removes a destination at the daemon's local socket.
+    async fn remove(
+        &self,
+        destination_id: &str,
+    ) -> Result<
+        kr_protocol::delivery::DeliveryDestinationRemoveResult,
+        kr_protocol::error::ProtocolError,
+    > {
+        let mut client = self.host.client().await;
+        net_support::pairing::mutate(
+            self.environment_id(),
+            &mut client,
+            Method::DeliveryDestinationRemove,
+            &kr_protocol::delivery::DeliveryDestinationRemoveParams {
+                destination_id: destination_id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// The owner hands the daemon a destination's credential at its local socket.
+    async fn keep_secret(
+        &self,
+        destination_id: &str,
+        secret: kr_protocol::delivery::DestinationSecret,
+    ) {
+        let mut client = self.host.client().await;
+        let _: kr_protocol::delivery::DeliveryDestinationSecretSetResult =
+            net_support::pairing::mutate(
+                self.environment_id(),
+                &mut client,
+                Method::DeliveryDestinationSecretSet,
+                &kr_protocol::delivery::DeliveryDestinationSecretSetParams {
+                    destination_id: destination_id.to_owned(),
+                    secret,
+                },
+            )
+            .await
+            .expect("the owner keeps the credential");
+    }
+
+    /// The destination the daemon holds under an identifier, if any.
+    fn destination_named(
+        &self,
+        destination_id: &str,
+    ) -> Option<kr_delivery::destination::DestinationRecord> {
+        let id =
+            kr_delivery::destination::DestinationId::new(destination_id).expect("an identifier");
+        self.controller()
+            .delivery()
+            .with(|producer| Ok(producer.journal().destination(&id).expect("a read")))
+            .expect("a read")
+    }
+
+    /// The notifications written for a destination, in the order they were admitted.
+    fn deliveries_to(&self, destination_id: &str) -> Vec<kr_delivery::journal::DeliveryRecord> {
+        self.controller()
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .into_iter()
+                    .filter(|record| record.destination_id.as_str() == destination_id)
+                    .collect())
+            })
             .expect("a read")
     }
 
@@ -2873,4 +3010,544 @@ async fn a_bearer_confirmed_before_a_renewal_that_retired_it_does_not_outlast_th
     })
     .await;
     assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// External destinations the owner configures
+// ---------------------------------------------------------------------------------------------
+
+/// The owner's configuration of a webhook.
+fn webhook(
+    destination_id: &str,
+    endpoint: &str,
+    idempotency_header: Option<&str>,
+    grant_id: kr_protocol::ids::GrantId,
+) -> kr_protocol::delivery::DeliveryDestinationConfigureParams {
+    configuration(
+        kr_protocol::delivery::ExternalDestinationKind::Webhook,
+        destination_id,
+        endpoint,
+        idempotency_header,
+        grant_id,
+    )
+}
+
+fn configuration(
+    kind: kr_protocol::delivery::ExternalDestinationKind,
+    destination_id: &str,
+    endpoint: &str,
+    idempotency_header: Option<&str>,
+    grant_id: kr_protocol::ids::GrantId,
+) -> kr_protocol::delivery::DeliveryDestinationConfigureParams {
+    kr_protocol::delivery::DeliveryDestinationConfigureParams {
+        destination_id: destination_id.to_owned(),
+        kind,
+        endpoint: endpoint.to_owned(),
+        idempotency_header: Nullable::from(idempotency_header.map(str::to_owned)),
+        rule_name: "tell the team".to_owned(),
+        grant_id,
+    }
+}
+
+/// KR-REQ-18.08, KR-REQ-25.23: the owner creates a webhook with `delivery.destination.configure`,
+/// and the next question a worker raises is posted to it, by the daemon, under the rule and the
+/// grant it was created with. The message is the host's generic alert and the sentence that says
+/// its recipients can read it; the question's own words are in neither. Nothing is posted before the
+/// destination exists, and nothing after it is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_webhook_the_owner_creates_is_told_of_the_next_question_and_not_after_it_is_removed() {
+    const WORDS: &str = "Deploy the release to production?";
+    const ENDPOINT: &str = "https://hooks.example.test/in/ops";
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let grant = phone.record.grant.grant_id;
+
+    // The control: a question raised before there is a destination reaches nobody.
+    environment._worker.ask("deploy-0", WORDS);
+    until_the_questions_are_settled(&environment, 1).await;
+    assert!(environment.gateway.posted().is_empty());
+
+    let created = environment
+        .configure(&webhook("ops", ENDPOINT, Some("Idempotency-Key"), grant))
+        .await
+        .expect("the owner creates a webhook");
+    assert!(created.in_force);
+    assert_eq!(
+        created.kind,
+        kr_protocol::delivery::ExternalDestinationKind::Webhook
+    );
+    assert!(
+        created.recipients_can_read.contains("Whoever runs"),
+        "{}",
+        created.recipients_can_read
+    );
+    let record = environment.destination_named("ops").expect("configured");
+    assert!(record.enabled);
+    assert_eq!(
+        record.rule.as_ref().and_then(|rule| rule.grant_id),
+        Some(grant)
+    );
+
+    environment._worker.ask("deploy-1", WORDS);
+    until("the webhook being posted to", || {
+        !environment.gateway.posted().is_empty()
+    })
+    .await;
+    let posted = environment.gateway.posted().remove(0);
+    assert_eq!(posted.url, ENDPOINT);
+    let text = posted.text();
+    assert!(text.contains("waiting for an answer"), "{text}");
+    assert!(
+        text.contains(kr_delivery::external::RECIPIENTS_CAN_READ),
+        "{text}"
+    );
+    for private in [WORDS, "deploy-1"] {
+        assert!(!text.contains(private), "the destination is told {private}");
+    }
+    assert_eq!(
+        posted.header("idempotency-key"),
+        posted.body["delivery_id"].as_str(),
+        "the identifier the destination deduplicates by is the message's own"
+    );
+
+    // Removed, it is told nothing more, and what it was told stays in the journal as history.
+    let removed = environment
+        .remove("ops")
+        .await
+        .expect("the owner removes it");
+    assert!(removed.found);
+    let posts = environment.gateway.posted().len();
+    environment._worker.ask("deploy-2", WORDS);
+    until_the_questions_are_settled(&environment, 3).await;
+    assert_eq!(environment.gateway.posted().len(), posts);
+    assert!(
+        environment
+            .destination_named("ops")
+            .is_none_or(|record| !record.enabled && record.rule.is_none())
+    );
+    environment
+        .remove("ops")
+        .await
+        .expect("removing twice is removing once");
+}
+
+/// KR-REQ-25.23: a destination is made only where the owner may make it and only under authority
+/// that stands. Each refusal leaves no destination: a paired device's identifier, a grant that is
+/// not found or that has been revoked, a service that sends with a credential none is kept for, an
+/// address the host would not send to, a header that is not a header name, a retry claim a service
+/// cannot keep, and a rule with no name. The control is the same webhook, accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_destination_is_refused_unless_the_owner_may_make_it_under_a_grant_that_stands() {
+    use kr_protocol::delivery::ExternalDestinationKind::{Slack, Telegram};
+    use kr_protocol::error::ErrorCode::InvalidArgument;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let leaving = environment.phone().await;
+    let grant = phone.record.grant.grant_id;
+    let endpoint = "https://hooks.example.test/in/ops";
+    unpair(&environment, leaving.device_id()).await;
+
+    let device_named = phone.device_id().to_string();
+    let mut refusals = vec![
+        (
+            "a paired device's identifier",
+            webhook(&device_named, endpoint, None, grant),
+        ),
+        (
+            "a grant that was never made",
+            webhook(
+                "ops",
+                endpoint,
+                None,
+                kr_protocol::ids::GrantId::new(uuid(0x99)),
+            ),
+        ),
+        (
+            "a grant that was revoked",
+            webhook("ops", endpoint, None, leaving.record.grant.grant_id),
+        ),
+        (
+            "a service that sends with a credential, with none kept",
+            configuration(Slack, "chat", "ops-channel", None, grant),
+        ),
+        (
+            "an address that is not HTTPS",
+            webhook("ops", "http://hooks.example.test/in", None, grant),
+        ),
+        (
+            "an address with a password in it",
+            webhook(
+                "ops",
+                "https://someone:secret@hooks.example.test/in",
+                None,
+                grant,
+            ),
+        ),
+        (
+            "a header that is not a header name",
+            webhook("ops", endpoint, Some("not a header"), grant),
+        ),
+        (
+            "a retry claim for a service that cannot keep it",
+            configuration(
+                Telegram,
+                "chat",
+                "@ops_team",
+                Some("Idempotency-Key"),
+                grant,
+            ),
+        ),
+    ];
+    let mut unnamed = webhook("ops", endpoint, None, grant);
+    unnamed.rule_name = String::new();
+    refusals.push(("a rule with no name", unnamed));
+    for (what, params) in &refusals {
+        let refused = environment
+            .configure(params)
+            .await
+            .expect_err("the owner's configuration is refused");
+        assert_eq!(refused.code, InvalidArgument, "{what}");
+        assert!(
+            environment
+                .destination_named(&params.destination_id)
+                .is_none(),
+            "{what} left a destination"
+        );
+    }
+
+    environment
+        .configure(&webhook("ops", endpoint, None, grant))
+        .await
+        .expect("the control: the same webhook, under a grant that stands, is made");
+    assert!(environment.destination_named("ops").is_some());
+}
+
+/// KR-REQ-25.23: the credentialed kinds are configured through the same method once their
+/// credential is kept with `delivery.destination.secret.set`, and each sends from the host to the
+/// service it names: Slack and Discord to the webhook address the owner handed over, Telegram to
+/// the Bot API under the bot's token. The credential is in none of the messages, and removing a
+/// destination takes its credential away. An email destination is made the same way; its sending
+/// is the mail adapter's own suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_own_service() {
+    use kr_protocol::delivery::DestinationSecret;
+    use kr_protocol::delivery::ExternalDestinationKind::{Discord, Email, Slack, Telegram};
+
+    const SLACK: &str = "https://hooks.slack.com/services/T0000/B0000/abcdefghijkl";
+    const DISCORD: &str = "https://discord.com/api/webhooks/123456789/abcdefghijkl_token";
+    const TELEGRAM_TOKEN: &str = "123456:ABCdefGHIjklMNOpqrSTUvwxYZ0123456789";
+    let secret_text =
+        |text: &str| kr_protocol::delivery::SecretText::new(text).expect("a credential");
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let grant = phone.record.grant.grant_id;
+
+    environment
+        .keep_secret(
+            "slack",
+            DestinationSecret::Slack {
+                webhook_url: secret_text(SLACK),
+            },
+        )
+        .await;
+    environment
+        .keep_secret(
+            "discord",
+            DestinationSecret::Discord {
+                webhook_url: secret_text(DISCORD),
+            },
+        )
+        .await;
+    environment
+        .keep_secret(
+            "telegram",
+            DestinationSecret::Telegram {
+                bot_token: secret_text(TELEGRAM_TOKEN),
+            },
+        )
+        .await;
+    for params in [
+        configuration(Slack, "slack", "ops-channel", None, grant),
+        configuration(Discord, "discord", "ops-channel", None, grant),
+        configuration(Telegram, "telegram", "@ops_team", None, grant),
+    ] {
+        let made = environment
+            .configure(&params)
+            .await
+            .expect("the owner makes it once its credential is kept");
+        assert!(made.in_force);
+    }
+
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("each service being posted to", || {
+        environment.gateway.posted().len() >= 3
+    })
+    .await;
+    let posts = environment.gateway.posted();
+    let to = |prefix: &str| {
+        posts
+            .iter()
+            .find(|posted| posted.url.starts_with(prefix))
+            .unwrap_or_else(|| panic!("nothing was posted to {prefix}"))
+    };
+    for posted in [
+        to(SLACK),
+        to("https://discord.com/api/webhooks/123456789/"),
+        to(&format!(
+            "https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        )),
+    ] {
+        let text = posted.text();
+        assert!(text.contains("waiting for an answer"), "{text}");
+        assert!(text.contains("can read"), "{text}");
+        for private in [SLACK, DISCORD, TELEGRAM_TOKEN, "Deploy the release?"] {
+            assert!(!text.contains(private), "a message carries {private}");
+        }
+    }
+
+    // A credentialed destination goes with its credential. The email destination is made and
+    // removed here, with no question in between.
+    let secrets = environment.host.tree().environment().secrets_dir();
+    let vault = |text: &str| !files_holding(&secrets, text.as_bytes()).is_empty();
+    assert!(
+        vault(TELEGRAM_TOKEN),
+        "the control: the credential is in the secret store"
+    );
+    environment.remove("telegram").await.expect("removed");
+    assert!(
+        !vault(TELEGRAM_TOKEN),
+        "removing the destination took its credential away"
+    );
+    environment
+        .keep_secret(
+            "mail",
+            DestinationSecret::Email {
+                account: kr_protocol::delivery::MailAccount {
+                    server: "smtp.example.test".to_owned(),
+                    port: kr_protocol::scalars::U64::new(465),
+                    security: kr_protocol::delivery::MailSecurity::ImplicitTls,
+                    username: secret_text("ops@example.test"),
+                    password: secret_text("a-password-for-the-account"),
+                    from_address: "ops@example.test".to_owned(),
+                },
+            },
+        )
+        .await;
+    environment
+        .configure(&configuration(
+            Email,
+            "mail",
+            "team@example.test",
+            None,
+            grant,
+        ))
+        .await
+        .expect("an email destination is made the same way");
+    environment.remove("mail").await.expect("removed");
+}
+
+/// KR-REQ-24.12, KR-REQ-25.24: after an attempt whose outcome nobody knows, a destination that said
+/// it deduplicates by an identifier is sent the same message under the same identifier, and one
+/// that said nothing is not sent it again: the record says it may have arrived, and may have
+/// arrived twice. Both are webhooks the owner created, and both are answered with a failure after
+/// the request left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_webhook_that_deduplicates_is_retried_after_an_unknown_outcome_and_one_that_does_not_is_not()
+ {
+    use kr_delivery::journal::DeliveryState;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let grant = phone.record.grant.grant_id;
+    environment
+        .gateway
+        .answer_route_with("/in/claimed", Some((500, "the receiver failed")));
+    environment
+        .gateway
+        .answer_route_with("/in/bare", Some((500, "the receiver failed")));
+    environment
+        .configure(&webhook(
+            "claimed",
+            "https://hooks.example.test/in/claimed",
+            Some("Idempotency-Key"),
+            grant,
+        ))
+        .await
+        .expect("a webhook that deduplicates");
+    environment
+        .configure(&webhook(
+            "bare",
+            "https://hooks.example.test/in/bare",
+            None,
+            grant,
+        ))
+        .await
+        .expect("a webhook that does not");
+
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    let posted_to = |suffix: &str| {
+        environment
+            .gateway
+            .posted()
+            .into_iter()
+            .filter(|posted| posted.url.ends_with(suffix))
+            .collect::<Vec<_>>()
+    };
+    until("both webhooks being posted to once", || {
+        !posted_to("/in/claimed").is_empty() && !posted_to("/in/bare").is_empty()
+    })
+    .await;
+    // The receiver recovers. Only the destination that deduplicates is sent the message again.
+    environment.gateway.answer_route_with("/in/claimed", None);
+    environment.gateway.answer_route_with("/in/bare", None);
+    let state_of = |destination: &str| {
+        environment
+            .deliveries_to(destination)
+            .first()
+            .map(|record| record.state)
+    };
+    until("the repeat being accepted", || {
+        state_of("claimed") == Some(DeliveryState::Accepted)
+    })
+    .await;
+    until("the other being marked", || {
+        state_of("bare") == Some(DeliveryState::DuplicateUncertain)
+    })
+    .await;
+    let claimed = posted_to("/in/claimed");
+    assert_eq!(claimed.len(), 2, "the message was sent again");
+    assert_eq!(
+        claimed[0].header("idempotency-key"),
+        claimed[1].header("idempotency-key"),
+        "under the identifier the first attempt carried"
+    );
+    assert!(claimed[0].header("idempotency-key").is_some());
+    assert_eq!(
+        posted_to("/in/bare").len(),
+        1,
+        "and the one that deduplicates by nothing was not sent it again"
+    );
+}
+
+/// KR-REQ-24.12: privacy mode turned on while an external message waits to be sent takes it back,
+/// and nothing is sent to the destination after it. The destination had asked for later, so
+/// nothing of the message had left when privacy mode began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn privacy_mode_turned_on_while_an_external_message_waits_cancels_it() {
+    use kr_delivery::journal::DeliveryState;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    environment
+        .gateway
+        .answer_route_with("/in/waiting", Some((429, "later")));
+    environment
+        .configure(&webhook(
+            "waiting",
+            "https://hooks.example.test/in/waiting",
+            Some("Idempotency-Key"),
+            phone.record.grant.grant_id,
+        ))
+        .await
+        .expect("a webhook");
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the destination asking for later", || {
+        environment
+            .deliveries_to("waiting")
+            .first()
+            .is_some_and(|record| record.state == DeliveryState::Retrying)
+    })
+    .await;
+
+    let mut client = environment.host.client().await;
+    let _: kr_protocol::privacy::PrivacyReport = net_support::pairing::mutate(
+        environment.environment_id(),
+        &mut client,
+        Method::PrivacySet,
+        &kr_protocol::privacy::PrivacySetParams { enabled: true },
+    )
+    .await
+    .expect("privacy mode turns on");
+    assert_eq!(
+        environment
+            .deliveries_to("waiting")
+            .first()
+            .map(|record| record.state),
+        Some(DeliveryState::Cancelled),
+        "privacy mode took the message back"
+    );
+
+    // The destination would take it now, and is not told.
+    environment.gateway.answer_route_with("/in/waiting", None);
+    let posts = environment.gateway.posted().len();
+    until_the_questions_are_settled(&environment, 1).await;
+    assert_eq!(environment.gateway.posted().len(), posts);
+}
+
+/// KR-REQ-16.10: removing a paired device's destination ends its delivery and owes the gateway a
+/// revocation of the authorisation behind it, as unpairing does, and leaves the device paired. The
+/// authorisation cannot be registered again; another can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn removing_a_paired_devices_destination_ends_its_delivery_and_leaves_it_paired() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let host_key = environment.host_signing_key();
+    let sender = PushSenderRecordId::new(uuid(0x6d));
+    let credential = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let device = phone.device_id().to_string();
+
+    let removed = environment
+        .remove(&device)
+        .await
+        .expect("the owner removes it");
+    assert!(removed.found);
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled && record.rule.is_none())
+    );
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none()
+    );
+    assert!(!secret_store_holds(&environment, bytes_of(&credential)));
+    until("the authorisation being revoked", || {
+        environment
+            .gateway
+            .authorisation(sender)
+            .is_some_and(|held| held.state == PushSenderState::Revoked)
+    })
+    .await;
+    assert!(
+        environment
+            .controller()
+            .devices()
+            .record_for_device(phone.device_id())
+            .expect("a read")
+            .is_some_and(|record| record.is_paired()),
+        "the device is still paired"
+    );
+
+    let again = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(0x6e)),
+        phone.installation(),
+        host_key,
+    );
+    phone
+        .register(&environment, &again)
+        .await
+        .expect("another authorisation registers");
+    assert!(environment.destination(phone.device_id()).is_some());
 }

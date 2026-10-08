@@ -705,6 +705,8 @@ impl Controller {
             | Method::GrantRevoke
             | Method::DeviceRevoke
             | Method::DevicePreviewKeyUpdate
+            | Method::DeliveryDestinationConfigure
+            | Method::DeliveryDestinationRemove
             | Method::DeliveryDestinationSecretSet => {
                 self.authority_change(actor_id, mutation, method, carried)
                     .await

@@ -197,6 +197,17 @@ impl DeliveryRuntime {
         &self.credentials
     }
 
+    /// What a delivery rule's grant lets its destination be told, or none when the grant does not
+    /// stand: it is not found, has not been redeemed, has run out, was revoked, or belongs to a
+    /// device that is no longer paired.
+    #[must_use]
+    pub fn recipient_scope(
+        &self,
+        rule: &kr_delivery::destination::DeliveryRule,
+    ) -> Option<kr_delivery::producer::RecipientScope> {
+        self.authority.scope_for(rule)
+    }
+
     /// Returns true once a transport has been attached.
     #[must_use]
     pub fn is_attached(&self) -> bool {

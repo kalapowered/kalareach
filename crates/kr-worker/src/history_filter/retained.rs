@@ -164,6 +164,8 @@ pub const fn result_content(method: Method) -> ResultContent {
         Method::EnvironmentEnrol
         | Method::EnvironmentForget
         | Method::EnvironmentRefresh
+        | Method::DeliveryDestinationConfigure
+        | Method::DeliveryDestinationRemove
         | Method::DeliveryDestinationSecretSet
         | Method::PrivacySet
         | Method::PairInvite

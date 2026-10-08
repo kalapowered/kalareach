@@ -399,6 +399,25 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Observe one enrolled environment now, and start it when the request asks for that.";
 
+    DeliveryDestinationConfigure = "delivery.destination.configure", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Create or replace an external notification destination: a webhook, Slack, Discord, \
+          Telegram or email, with where it sends, whether it deduplicates by an identifier, and \
+          the grant whose authority the content is intersected with. The grant has to stand, a \
+          paired device's identifier is not one a destination takes, and a service that sends \
+          with a credential needs one kept first with delivery.destination.secret.set.";
+
+    DeliveryDestinationRemove = "delivery.destination.remove", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Remove a notification destination, and the credential kept for it. What was queued \
+          for it and not sent is taken back, and the answer says how much. Removing a paired \
+          device's destination ends its delivery and owes the gateway a revocation of the \
+          device's authorisation, as unpairing does, without unpairing the device.";
+
     DeliveryDestinationSecretSet = "delivery.destination.secret.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -1713,6 +1732,8 @@ mod tests {
         ("plugin.install", &[ActionRight::HostManage]),
         // Where notifications go: an external destination's credential decides who reads what
         // it delivers.
+        ("delivery.destination.configure", &[ActionRight::HostManage]),
+        ("delivery.destination.remove", &[ActionRight::HostManage]),
         (
             "delivery.destination.secret.set",
             &[ActionRight::HostManage],
