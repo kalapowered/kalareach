@@ -49,6 +49,8 @@ use kr_protocol::scalars::{
 use kr_protocol::service::{ServiceRequestSignature, ServiceRequestSigner};
 use kr_protocol::session::{Dimensions, DisplayNumber, SessionState, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
+use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
+use kr_worker::broker::connectors::fixture;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -900,6 +902,47 @@ impl Worker {
         }
     }
 
+    /// Opens a Claude Code channel on this worker's own broker for the application instance
+    /// `number`, as the command backend hands one over once it has admitted it. With `bound` the
+    /// connector's package is bound to the instance, so what the channel relays is interpreted as
+    /// an approval a person can answer; without it a relayed request is recorded and has no
+    /// meaning here, and the application's own dialog answers it.
+    fn open_channel(&self, number: u8, bound: bool) -> OpenChannel {
+        let broker = self.service.broker();
+        register(broker, number);
+        let package = Package::new();
+        if bound {
+            package.bind(broker, number);
+        }
+        let channel = Channel::open(
+            package.launch(broker, number, Some(fixture::QUALIFIED_VERSION)),
+            number,
+            launched(number),
+        );
+        OpenChannel {
+            channel,
+            number,
+            _package: package,
+        }
+    }
+
+    /// Waits until the broker holds the request one channel relayed, and, when `interpreted`,
+    /// until it has interpreted it.
+    async fn until_relayed(&self, channel: &OpenChannel, request_id: &str, interpreted: bool) {
+        let broker = Arc::clone(self.service.broker());
+        let number = channel.number;
+        let quoted = format!("\"{request_id}\"");
+        until("the broker holding the relayed request", move || {
+            broker.pending_resources().iter().any(|resource| {
+                resource.application_instance_id
+                    == kr_worker::broker::channel_fixture::instance(number)
+                    && resource.request.upstream.as_str() == quoted
+                    && (!interpreted || resource.interpretation_verified)
+            })
+        })
+        .await;
+    }
+
     /// Asks a question from inside the session, as a verified source bound to it does.
     fn ask(&self, request: &str, question: &str) {
         self.service
@@ -932,6 +975,13 @@ impl Worker {
             )
             .expect("a verified source asks");
     }
+}
+
+/// One channel of the worker's application, and what keeps its package.
+struct OpenChannel {
+    channel: Channel,
+    number: u8,
+    _package: Package,
 }
 
 /// A daemon on the network with one adopted worker, and the keys of the environment's owner.
@@ -1338,6 +1388,54 @@ async fn until_the_questions_are_settled(environment: &Environment, questions: u
     .await;
 }
 
+/// Waits until the attention store has read every transition the worker's broker has announced,
+/// holds nothing it has not given the delivery journal, and the journal has produced from
+/// everything it took.
+async fn until_the_approvals_are_settled(environment: &Environment) {
+    let announced = environment
+        ._worker
+        .service
+        .broker()
+        .resource_snapshot()
+        .cursor
+        .sequence;
+    let origin = kr_attention::Origin::Session(environment.worker_session);
+    until(
+        "the store settling the broker's transitions with the delivery journal",
+        || {
+            let read = environment
+                .controller()
+                .attention()
+                .take_for_delivery(|store, _| {
+                    let consumed = store
+                        .engine()
+                        .map(|engine| {
+                            engine
+                                .consumed(
+                                    origin,
+                                    kr_protocol::attention::AttentionSource::Approvals,
+                                )
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    consumed >= announced && store.awaiting_delivery().ok() == Some(0)
+                })
+                .unwrap_or(false);
+            read && environment
+                .controller()
+                .delivery()
+                .with(|producer| {
+                    Ok(producer
+                        .journal()
+                        .pending_events(0, 1)
+                        .is_ok_and(|pending| pending.is_empty()))
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -1443,6 +1541,188 @@ async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_i
     })
     .await;
     assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Approvals a worker's application raises
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-25.01, KR-REQ-16.13: an approval an application raises through its channel reaches a
+/// registered device. The worker's broker records the relayed request and its interpretation, the
+/// attention store reads the broker's transitions and raises a pending approval, and the daemon
+/// delivers it through the gateway under the device's credential as the generic approval alert, with
+/// nothing of the request in the clear. The control is a request nothing gives a meaning (the
+/// connector's package is not bound to its application): the daemon has read and decided it before
+/// the interpreted one is relayed, and delivered nothing for it. Exactly one notification is written
+/// for the approval, though the broker records several transitions of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_approval_a_worker_relays_through_its_channel_is_delivered_as_an_approval_alert() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x91));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+
+    // The control: recorded by the broker, read by the store, and no approval to deliver.
+    let mut unbound = environment._worker.open_channel(3, false);
+    unbound.channel.relay("fghij").await;
+    environment
+        ._worker
+        .until_relayed(&unbound, "fghij", false)
+        .await;
+    until_the_approvals_are_settled(&environment).await;
+    assert_eq!(environment.deliveries(), 0, "no notification was written");
+    assert!(environment.gateway.delivered().is_empty());
+
+    let mut bound = environment._worker.open_channel(2, true);
+    bound.channel.relay("abcde").await;
+    environment
+        ._worker
+        .until_relayed(&bound, "abcde", true)
+        .await;
+    until("the approval being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    let request = environment.gateway.delivered().remove(0);
+    assert_eq!(request.sender_record_id, sender);
+    assert_eq!(request.hints.alert, PushAlert::ApprovalWaiting);
+    let wire = serde_json::to_string(&request).expect("the request");
+    for private in [
+        "Bash",
+        "List the files here",
+        "ls -la",
+        "abcde",
+        &environment.worker_session.to_string(),
+    ] {
+        assert!(!wire.contains(private), "the gateway is given {private}");
+    }
+    until_the_approvals_are_settled(&environment).await;
+    assert_eq!(
+        environment
+            .deliveries_to(&phone.device_id().to_string())
+            .len(),
+        1,
+        "one notification for the approval, whatever the broker recorded of it"
+    );
+    assert_eq!(environment.gateway.delivered().len(), 1);
+}
+
+/// KR-REQ-16.17, KR-REQ-25.01: twenty-two distinct approvals relayed at once are all retained by
+/// the host, and the gateway is given no more than the free limit allows. The first twenty are sent
+/// as approval alerts; the twenty-first opens the one attention update the five-minute window lets
+/// through, which is sent in their place; the twenty-second is collapsed into it, recorded and never
+/// sent, with the suppression the host shows locally. The allowance refills with the clock, a token
+/// every three seconds, so the figures are bounded by the time the daemon took over the burst, and
+/// are exactly these when it took less than three seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn twenty_two_approvals_at_once_are_all_retained_and_sent_within_the_burst_limit() {
+    use kr_delivery::journal::DeliveryState;
+
+    const RELAYED: usize = 22;
+    const BURST: usize = 20;
+    const MS_PER_TOKEN: u64 = 3_000;
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x92));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+
+    // Distinct request identifiers of the five-letter form Claude Code uses.
+    let requests: Vec<String> = ('a'..='z')
+        .filter(|letter| *letter != 'l')
+        .take(RELAYED)
+        .map(|letter| format!("abcd{letter}"))
+        .collect();
+    let mut bound = environment._worker.open_channel(2, true);
+    for request in &requests {
+        bound.channel.relay(request).await;
+    }
+    environment
+        ._worker
+        .until_relayed(&bound, requests.last().expect("a last request"), true)
+        .await;
+    until_the_approvals_are_settled(&environment).await;
+
+    let records = environment.deliveries_to(&phone.device_id().to_string());
+    assert_eq!(records.len(), RELAYED, "the host retains every request");
+    let collapsed: Vec<_> = records
+        .iter()
+        .filter(|record| record.state == DeliveryState::Collapsed)
+        .collect();
+    let updates: Vec<_> = records
+        .iter()
+        .filter(|record| record.state != DeliveryState::Collapsed && record.suppression.is_some())
+        .collect();
+    let alerts = records.len() - collapsed.len() - updates.len();
+    let took_ms = records
+        .iter()
+        .map(|record| record.admitted_at_ms.get())
+        .max()
+        .zip(
+            records
+                .iter()
+                .map(|record| record.admitted_at_ms.get())
+                .min(),
+        )
+        .map_or(0, |(last, first)| last - first);
+    let refilled = usize::try_from(took_ms / MS_PER_TOKEN).unwrap_or(usize::MAX);
+    assert!(
+        (BURST..=BURST + refilled).contains(&alerts),
+        "{alerts} alerts for the burst of {BURST} and {refilled} refilled: {records:?}"
+    );
+    assert!(updates.len() <= 1, "one attention update in the window");
+    if refilled == 0 {
+        assert_eq!(
+            (alerts, updates.len(), collapsed.len()),
+            (BURST, 1, 1),
+            "twenty alerts, the attention update, and the one it collapsed"
+        );
+    }
+    for record in &collapsed {
+        assert!(record.content.is_none() && !record.dispatched, "never sent");
+        assert!(record.suppression.is_some(), "the suppression is recorded");
+    }
+    for update in &updates {
+        assert!(
+            collapsed.iter().all(|record| record
+                .suppression
+                .as_ref()
+                .is_some_and(|suppression| suppression.collapsed_into == update.notification_id)),
+            "what was collapsed names the update that took its place"
+        );
+    }
+
+    // The gateway is given the alerts and the update, and nothing else.
+    until("the sends reaching the gateway", || {
+        environment.gateway.delivered().len() == alerts + updates.len()
+    })
+    .await;
+    let sent = environment.gateway.delivered();
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request.hints.alert == PushAlert::ApprovalWaiting)
+            .count(),
+        alerts
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request.hints.alert == PushAlert::AttentionUpdate)
+            .count(),
+        updates.len()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
