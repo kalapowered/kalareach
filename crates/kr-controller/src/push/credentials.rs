@@ -32,24 +32,32 @@
 //! # Which bearer is the latest
 //!
 //! The gateway keeps one bearer for an authorisation, and what changes it is a renewal and an
-//! issue by the device's installation; each stamps the credential it mints with the gateway's own
-//! clock. The host learns of a renewal from the gateway's answer and of an issue from the device,
-//! which hands the bearer over after the gateway has confirmed it, so two answers can be in flight
-//! at once and arrive in either order, and the order they arrive in says nothing of the order the
-//! gateway made them in. So whichever of two credentials for one authorisation was issued later
-//! is the one kept: a registration leaves a newer renewal in place, and a renewal that comes back
-//! late leaves a newer registration in place. The issue time a device hands over is the device's
-//! word, and a device that lies about it can keep a retired bearer for its own destination and
-//! nothing else; a credential issued in the future is refused before it reaches this store.
+//! issue by the device's installation; each stamps the credential it mints with the next revision
+//! of the record (`installation-push.ts`: the renewal and the issue both add one to the revision
+//! they read). The host learns of a renewal from the gateway's answer and of an issue from the
+//! device, which hands the bearer over after the gateway has confirmed it, so two answers can be
+//! in flight at once and arrive in either order, and the order they arrive in says nothing of the
+//! order the gateway made them in. So when a credential and the one held for the same
+//! authorisation meet and the held one changed while the other was on its way, the one with the
+//! higher revision is kept: a registration leaves a newer renewal in place, and a renewal that
+//! comes back late leaves a newer registration in place. A renewal that finds nothing changed
+//! since it was asked is the gateway's latest by construction, and is kept whatever the held
+//! credential claims.
+//!
+//! The revision on a credential a device hands over is the device's word. A device that lies about
+//! it can decide the outcome of that race for its own destination, which costs it a retired bearer
+//! and costs no other destination anything, and the next renewal the host asks for with nothing
+//! changed meanwhile replaces it.
 //!
 //! # Asking again after a refusal
 //!
 //! A renewal the gateway refuses or does not answer is asked for again after a wait that doubles
-//! with each refusal ([`renewal_backoff_ms`]), for as long as the credential held has not expired.
-//! A credential's expiry is the device's word, and one that says it is due when the gateway holds
-//! a longer life is refused at every ask: asked at every question tick, that costs the gateway's
-//! allowance for the host twenty-four requests an hour for as long as the credential lasts. A
-//! credential past its expiry is asked about at every attempt, because nothing presents it.
+//! with each refusal ([`renewal_backoff_ms`]). A credential's expiry is the device's word, and one
+//! that says it is due when the gateway holds a longer life is refused at every ask: asked at
+//! every question tick, that costs the gateway's allowance for the host twenty-four requests an
+//! hour for as long as the credential lasts. The wait holds for a credential past its expiry too,
+//! because the same word can make a credential expire at once, and the gateway counts two
+//! requests of the sixty an hour for this host key against every ask.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -86,41 +94,37 @@ struct Refusal {
     said: String,
 }
 
-/// The clocks the waits are counted on: one that only moves forward, and the host's time of day,
-/// which says whether a credential has expired.
+/// The clock the waits are counted on: one that only moves forward.
 #[derive(Clone)]
-struct Clocks {
-    steady: Arc<dyn Fn() -> u64 + Send + Sync>,
-    wall: Arc<dyn Fn() -> u64 + Send + Sync>,
-}
+struct Steady(Arc<dyn Fn() -> u64 + Send + Sync>);
 
-impl Default for Clocks {
+impl Default for Steady {
     fn default() -> Self {
-        Self {
-            steady: Arc::new(|| SystemClock.steady_ms()),
-            wall: Arc::new(|| SystemClock.now_ms()),
-        }
+        Self(Arc::new(|| SystemClock.steady_ms()))
     }
 }
 
-impl std::fmt::Debug for Clocks {
+impl std::fmt::Debug for Steady {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Clocks")
+        formatter.write_str("Steady")
     }
 }
 
 impl HeldCredentials {
-    /// Builds an empty store whose waits are counted on clocks a test moves.
+    /// Builds an empty store whose waits are counted on a clock a test moves.
     #[cfg(test)]
-    fn counting_on(
-        steady: Arc<dyn Fn() -> u64 + Send + Sync>,
-        wall: Arc<dyn Fn() -> u64 + Send + Sync>,
-    ) -> Self {
+    fn counting_on(steady: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         Self {
-            clocks: Clocks { steady, wall },
+            steady: Steady(steady),
             ..Self::default()
         }
     }
+}
+
+/// Whether `candidate` is a later credential of its authorisation than `held`: the gateway adds
+/// one to the record's revision with every renewal and every issue.
+fn later(candidate: &PushDeliveryCredential, held: &PushDeliveryCredential) -> bool {
+    candidate.revision > held.revision
 }
 
 /// How a held credential is replaced by a fresh one.
@@ -154,8 +158,8 @@ pub struct HeldCredentials {
     unsaved: Mutex<BTreeSet<PushSenderRecordId>>,
     /// When each authorisation whose renewal was refused may be asked about again.
     waits: Mutex<BTreeMap<PushSenderRecordId, Refusal>>,
-    /// The clocks the waits are counted on.
-    clocks: Clocks,
+    /// The clock the waits are counted on.
+    steady: Steady,
 }
 
 impl HeldCredentials {
@@ -251,9 +255,9 @@ impl HeldCredentials {
 
     /// Keeps the credential one authorisation was given: in the vault first, then in memory.
     ///
-    /// A credential issued earlier than the one held is not kept: a renewal that finished while
-    /// the gateway was confirming this one is newer, and replacing it would put back a bearer the
-    /// renewal retired. See the module's note on which bearer is the latest.
+    /// A credential of an earlier revision than the one held is not kept: a renewal that finished
+    /// while the gateway was confirming this one is newer, and replacing it would put back a
+    /// bearer the renewal retired. See the module's note on which bearer is the latest.
     ///
     /// # Errors
     ///
@@ -264,10 +268,7 @@ impl HeldCredentials {
             .lock()
             .map_err(|_| "an earlier change of the held credentials failed part way".to_owned())?;
         let held = self.current(credential.sender_record_id);
-        if held
-            .as_ref()
-            .is_some_and(|held| held.issued_at_ms > credential.issued_at_ms)
-        {
+        if held.as_ref().is_some_and(|held| later(held, &credential)) {
             return Ok(());
         }
         if let Some(vault) = &self.vault {
@@ -444,8 +445,9 @@ impl SenderCredentials for HeldCredentials {
         // gateway was answering stays a removal, and the renewed bearer is dropped here: the
         // gateway has a bearer this host will not use, and the authorisation it belongs to is
         // being revoked. A credential a device handed over and the gateway confirmed while this
-        // waited is kept when the gateway issued it later than this renewal, and this answer is
-        // that one. Otherwise the answer is the gateway's latest bearer.
+        // waited is kept when its revision is higher than this renewal's, and this answer is that
+        // one. With nothing changed meanwhile the renewal is the gateway's latest by construction,
+        // whatever revision the held credential claims.
         let _changing = self.changing.lock().map_err(|_| {
             kr_delivery::DeliveryError::Source(
                 "an earlier change of the held credentials failed part way".to_owned(),
@@ -456,7 +458,7 @@ impl SenderCredentials for HeldCredentials {
                 "the authorisation was removed while it was being renewed".to_owned(),
             ));
         };
-        if newest.issued_at_ms > renewed.issued_at_ms {
+        if newest.secret != current.secret && later(&newest, &renewed) {
             return Ok(newest);
         }
         // The vault first, then memory. A write the vault refuses is retried at the next
@@ -482,8 +484,7 @@ impl SenderCredentials for HeldCredentials {
 
 impl HeldCredentials {
     /// How many renewals of the credential held were refused in a row, or why none is asked for
-    /// now: the gateway is not asked while a refusal's wait lasts, unless the credential has
-    /// expired, which nothing presents until it is renewed.
+    /// now: the gateway is not asked while a refusal's wait lasts.
     fn refusals_so_far(
         &self,
         held: &PushDeliveryCredential,
@@ -496,16 +497,13 @@ impl HeldCredentials {
         let Some(last) = waits.get(&held.sender_record_id) else {
             return Ok(0);
         };
-        let steady_ms = (self.clocks.steady)();
-        let expired = (self.clocks.wall)() >= held.expires_at_ms.get();
+        let steady_ms = (self.steady.0)();
         match last.wait.until_steady_ms.checked_sub(steady_ms) {
-            Some(remaining) if remaining > 0 && !expired => {
-                Err(kr_delivery::DeliveryError::Source(format!(
-                    "{}; this host asks again in {} seconds",
-                    last.said,
-                    remaining.div_ceil(1000)
-                )))
-            }
+            Some(remaining) if remaining > 0 => Err(kr_delivery::DeliveryError::Source(format!(
+                "{}; this host asks again in {} seconds",
+                last.said,
+                remaining.div_ceil(1000)
+            ))),
             _ => Ok(last.wait.refusals),
         }
     }
@@ -529,7 +527,7 @@ impl HeldCredentials {
                 Refusal {
                     wait: Wait {
                         refusals: refusals_before.saturating_add(1),
-                        until_steady_ms: (self.clocks.steady)()
+                        until_steady_ms: (self.steady.0)()
                             .saturating_add(renewal_backoff_ms(refusals_before)),
                     },
                     said: said.to_owned(),
@@ -791,8 +789,8 @@ mod tests {
         assert_eq!(stored(&vault), renewed, "the vault has what is held");
     }
 
-    /// Answers a renewal only once it is let: with a credential the gateway issued at the time
-    /// given, or with a refusal.
+    /// Answers a renewal only once it is let: with a credential of the revision given, or with a
+    /// refusal.
     #[derive(Debug)]
     struct Gated {
         started: std::sync::mpsc::SyncSender<()>,
@@ -828,13 +826,11 @@ mod tests {
                 .expect("not poisoned")
                 .recv()
                 .expect("the test lets it go");
-            self.answer
-                .clone()
-                .map(|issued_at_ms| PushDeliveryCredential {
-                    secret: SecretBytes32::from_bytes([0xee; 32]),
-                    issued_at_ms: TimestampMs::new(issued_at_ms),
-                    ..held.clone()
-                })
+            self.answer.clone().map(|revision| PushDeliveryCredential {
+                secret: SecretBytes32::from_bytes([0xee; 32]),
+                revision: PushSenderRevision::new(revision),
+                ..held.clone()
+            })
         }
     }
 
@@ -844,7 +840,7 @@ mod tests {
         let credentials = Arc::new(HeldCredentials::new());
         let held = credential(3, 9, NOW + 2 * DAY);
         credentials.keep(held.clone()).expect("kept");
-        let (gate, started, go) = Gated::new(Ok(held.issued_at_ms.get() + 1));
+        let (gate, started, go) = Gated::new(Ok(2));
         credentials.attach_renewal(gate);
         let renewing = {
             let credentials = Arc::clone(&credentials);
@@ -860,18 +856,18 @@ mod tests {
         assert!(credentials.held(held.sender_record_id).is_none());
     }
 
-    /// Whichever of two credentials for one authorisation the gateway issued later is kept,
-    /// whichever order the host hears of them in. A renewal that was asked for first and answers
-    /// last, after the device handed over a bearer the gateway issued after it, gives that bearer
-    /// back; and a registration that is kept while a renewal is on its way gives way to the
-    /// renewal if the renewal is the later issue.
+    /// Whichever of two credentials for one authorisation has the higher revision is kept when the
+    /// held one changed while the other was on its way, whichever order the host hears of them in.
+    /// A renewal that was asked for first and answers last, after the device handed over a bearer
+    /// of a higher revision, gives that bearer back; a registration that is kept while a renewal
+    /// is on its way gives way to the renewal if the renewal has the higher revision.
     #[test]
-    fn the_credential_issued_later_is_kept_whichever_the_host_hears_of_last() {
+    fn the_credential_of_the_higher_revision_is_kept_whichever_the_host_hears_of_last() {
         let id = PushSenderRecordId::new(Uuid::from_bytes([3; 16]));
         let held = credential(3, 9, NOW + 2 * DAY);
-        let issued = held.issued_at_ms.get();
-        let handed_over = |secret: u8, at: u64| PushDeliveryCredential {
-            issued_at_ms: TimestampMs::new(at),
+        let revision = held.revision.get();
+        let handed_over = |secret: u8, revision: u64| PushDeliveryCredential {
+            revision: PushSenderRevision::new(revision),
             ..credential(3, secret, NOW + 2 * DAY)
         };
 
@@ -879,7 +875,7 @@ mod tests {
         // way, is the one that works.
         let credentials = Arc::new(HeldCredentials::new());
         credentials.hold(held.clone());
-        let (gate, started, go) = Gated::new(Ok(issued + 10));
+        let (gate, started, go) = Gated::new(Ok(revision + 1));
         credentials.attach_renewal(gate);
         let renewing = {
             let credentials = Arc::clone(&credentials);
@@ -887,7 +883,7 @@ mod tests {
             std::thread::spawn(move || credentials.renew(&held))
         };
         started.recv().expect("the renewal is on its way");
-        let theirs = handed_over(7, issued + 20);
+        let theirs = handed_over(7, revision + 2);
         credentials.keep(theirs.clone()).expect("kept");
         go.send(()).expect("let it go");
         let answered = renewing.join().expect("a caller").expect("an answer");
@@ -901,7 +897,7 @@ mod tests {
         // its way, which it retired.
         let credentials = Arc::new(HeldCredentials::new());
         credentials.hold(held.clone());
-        let (gate, started, go) = Gated::new(Ok(issued + 30));
+        let (gate, started, go) = Gated::new(Ok(revision + 2));
         credentials.attach_renewal(gate);
         let renewing = {
             let credentials = Arc::clone(&credentials);
@@ -909,18 +905,38 @@ mod tests {
             std::thread::spawn(move || credentials.renew(&held))
         };
         started.recv().expect("the renewal is on its way");
-        credentials.keep(handed_over(7, issued + 20)).expect("kept");
+        credentials
+            .keep(handed_over(7, revision + 1))
+            .expect("kept");
         go.send(()).expect("let it go");
         let answered = renewing.join().expect("a caller").expect("an answer");
-        assert_eq!(answered.issued_at_ms.get(), issued + 30);
+        assert_eq!(answered.revision.get(), revision + 2);
         assert_eq!(credentials.held(id), Some(answered));
 
         // And a registration that comes after a renewal that is already kept gives way to it.
         let later = credentials.held(id).expect("held");
         credentials
-            .keep(handed_over(8, issued + 5))
+            .keep(handed_over(8, revision))
             .expect("not kept, and not an error");
         assert_eq!(credentials.held(id), Some(later));
+    }
+
+    /// A renewal that finds nothing changed since it was asked is the gateway's latest bearer,
+    /// whatever revision the held credential claims: a device that wrote a high revision cannot
+    /// make the host throw the gateway's renewals away.
+    #[test]
+    fn a_renewal_nothing_changed_during_is_kept_whatever_the_held_credential_claims() {
+        let id = PushSenderRecordId::new(Uuid::from_bytes([3; 16]));
+        let claiming = PushDeliveryCredential {
+            revision: PushSenderRevision::new(1_000_000),
+            ..credential(3, 9, NOW + 2 * DAY)
+        };
+        let credentials = HeldCredentials::new();
+        credentials.hold(claiming.clone());
+        credentials.attach_renewal(Arc::new(Renewing::default()));
+        let renewed = credentials.renew(&claiming).expect("a renewal");
+        assert_ne!(renewed.secret, claiming.secret);
+        assert_eq!(credentials.held(id), Some(renewed));
     }
 
     /// An item at start that this build cannot read, or that is another authorisation's, is
@@ -1087,13 +1103,10 @@ mod tests {
     fn a_refused_renewal_is_not_asked_for_again_until_its_wait_is_over() {
         const MINUTE: u64 = 60 * 1000;
         let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
-        let credentials = HeldCredentials::counting_on(
-            {
-                let clock = Arc::clone(&clock);
-                Arc::new(move || clock.load(std::sync::atomic::Ordering::SeqCst))
-            },
-            Arc::new(|| NOW),
-        );
+        let credentials = HeldCredentials::counting_on({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(std::sync::atomic::Ordering::SeqCst))
+        });
         let held = credential(3, 9, NOW + 2 * DAY);
         credentials.hold(held.clone());
         let gateway = Arc::new(Refusing::default());
@@ -1126,11 +1139,12 @@ mod tests {
         }
     }
 
-    /// A credential past its expiry is asked about at every attempt, wait or no wait: nothing
-    /// presents it, so nothing is lost by asking, and the wait would hold back every notification.
+    /// A credential past its expiry waits after a refusal like any other. Its expiry is the
+    /// device's word, a gateway can refuse a record for good, and every ask costs two of the
+    /// sixty requests an hour the gateway takes from this host key.
     #[test]
-    fn an_expired_credential_is_renewed_whatever_the_last_refusal_said() {
-        let credentials = HeldCredentials::counting_on(Arc::new(|| 1_000_000), Arc::new(|| NOW));
+    fn a_refused_renewal_of_an_expired_credential_waits_like_any_other() {
+        let credentials = HeldCredentials::counting_on(Arc::new(|| 1_000_000));
         let held = credential(3, 9, NOW - 1_000);
         credentials.hold(held.clone());
         let gateway = Arc::new(Refusing::default());
@@ -1138,7 +1152,7 @@ mod tests {
         for _ in 0..3 {
             credentials.renew(&held).expect_err("refused");
         }
-        assert_eq!(*gateway.asked.lock().expect("not poisoned"), 3);
+        assert_eq!(*gateway.asked.lock().expect("not poisoned"), 1);
     }
 
     /// The wait reads the clock once, so a clock that moves between the check and the message
@@ -1147,13 +1161,10 @@ mod tests {
     #[test]
     fn the_time_left_of_a_wait_is_read_from_one_reading_of_the_clock() {
         let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let credentials = HeldCredentials::counting_on(
-            {
-                let reads = Arc::clone(&reads);
-                Arc::new(move || 180_000 * reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-            },
-            Arc::new(|| NOW),
-        );
+        let credentials = HeldCredentials::counting_on({
+            let reads = Arc::clone(&reads);
+            Arc::new(move || 180_000 * reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        });
         let held = credential(3, 9, NOW + 2 * DAY);
         credentials.hold(held.clone());
         let gateway = Arc::new(Refusing::default());
@@ -1173,7 +1184,7 @@ mod tests {
     /// was about the one that was held. The same bearer handed over again is not a new one.
     #[test]
     fn a_new_bearer_is_renewed_without_waiting_for_the_last_refusal() {
-        let credentials = HeldCredentials::counting_on(Arc::new(|| 1_000_000), Arc::new(|| NOW));
+        let credentials = HeldCredentials::counting_on(Arc::new(|| 1_000_000));
         let held = credential(3, 9, NOW + 2 * DAY);
         credentials.hold(held.clone());
         let gateway = Arc::new(Refusing::default());
@@ -1196,10 +1207,7 @@ mod tests {
     /// against the replacement.
     #[test]
     fn a_late_refusal_is_not_held_against_the_credential_that_replaced_it() {
-        let credentials = Arc::new(HeldCredentials::counting_on(
-            Arc::new(|| 1_000_000),
-            Arc::new(|| NOW),
-        ));
+        let credentials = Arc::new(HeldCredentials::counting_on(Arc::new(|| 1_000_000)));
         let held = credential(3, 9, NOW + 2 * DAY);
         credentials.hold(held.clone());
         let (gate, started, go) = Gated::new(Err("the gateway refused the renewal".to_owned()));

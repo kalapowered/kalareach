@@ -414,9 +414,10 @@ methods! {
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Remove a notification destination, and the credential kept for it. What was queued \
-          for it and not sent is taken back, and the answer says how much. Removing a paired \
-          device's destination ends its delivery and owes the gateway a revocation of the \
-          device's authorisation, as unpairing does, without unpairing the device.";
+          for it and not sent is taken back, and the answer says how much, and how many attempts \
+          were on the wire and can still arrive. Removing a paired device's destination ends its \
+          delivery and owes the gateway a revocation of the device's authorisation, as unpairing \
+          does, without unpairing the device.";
 
     DeliveryDestinationSecretSet = "delivery.destination.secret.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
