@@ -1308,18 +1308,6 @@ impl Broker {
         self.state().connection_dispatch.get(&connection).cloned()
     }
 
-    /// Returns what carries an instance's own operations, where anything does.
-    #[must_use]
-    pub fn dispatch_for(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>> {
-        self.state()
-            .instances
-            .get(&application_instance_id)
-            .and_then(|instance| instance.dispatch.clone())
-    }
-
     /// Returns whether an instance of this broker names `process` as its own, by its whole
     /// identity.
     ///

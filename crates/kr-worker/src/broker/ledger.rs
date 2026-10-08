@@ -1040,30 +1040,6 @@ impl Ledger {
 
     // -- the decoder ledger -------------------------------------------------------------------
 
-    /// Records what a decoder offered, against the resource it produced.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn record_decoding(
-        &self,
-        resource_id: PendingResourceId,
-        entry: &DecoderLedgerEntry,
-    ) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR REPLACE INTO broker_decoder_entries
-                     (resource_id, entry, recorded_at_ms) VALUES (?1, ?2, ?3)",
-                params![
-                    resource_id.get().as_bytes().as_slice(),
-                    encode(entry)?,
-                    i64::try_from(entry.decoded_at.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(|error| self.fault(error))?;
-        Ok(())
-    }
-
     /// Reads the decoder entry behind one pending resource.
     ///
     /// # Errors
@@ -1209,30 +1185,6 @@ impl Ledger {
     }
 
     // -- pending resources --------------------------------------------------------------------
-
-    /// Writes the record of a resource that was admitted while the journal was faulted.
-    ///
-    /// Section 11 requires the gap to be committed after storage recovers, and this is what
-    /// commits the resources that lived inside it. It is not a replay: the record says the
-    /// resource was volatile, and its state is whatever it actually reached.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn put_pending(
-        &self,
-        resource: &PendingResource,
-        decoder: Option<BrokerBindingId>,
-        dispatched: bool,
-    ) -> Result<()> {
-        put_pending_in(
-            &self.faults,
-            &self.connection,
-            resource,
-            decoder,
-            dispatched,
-        )
-    }
 
     /// Moves one pending resource from the state it is in to the state it is going to.
     ///
@@ -2117,23 +2069,6 @@ impl Ledger {
             .optional()
             .map_err(|error| self.fault(error))?
             .map(|cursor| StreamCursor::new(u64::try_from(cursor).unwrap_or(0))))
-    }
-
-    /// Returns how many pending resources this ledger holds in a given durability.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
-    pub fn count_pending(&self, durability: Durability, state: PendingState) -> Result<u64> {
-        let count: i64 = self
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM broker_pending WHERE durability = ?1 AND state = ?2",
-                params![durability.as_str(), state.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|error| self.fault(error))?;
-        Ok(u64::try_from(count).unwrap_or(0))
     }
 }
 

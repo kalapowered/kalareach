@@ -1440,12 +1440,6 @@ impl NativeGateway {
         Ok(registration)
     }
 
-    /// Returns the launch this endpoint was bound for.
-    #[must_use]
-    pub const fn native_launch(&self) -> &NativeLaunch {
-        &self.launch
-    }
-
     /// Returns the address a launched process is told to connect to.
     #[must_use]
     pub const fn address(&self) -> &ListenerAddress {
