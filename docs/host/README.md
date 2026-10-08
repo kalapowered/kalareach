@@ -3215,9 +3215,8 @@ next request of a pass that was running when the delay arrived. That pass ends a
 stopped. A fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A
 host under a fence is not held back by a delay at all, because its clients cannot tell cleanup from
 other work; only the question about an earlier publication and the status read `kr doctor` makes
-still stop at a delay, as they do outside a fence. One request escapes the rule: the client repeats a request that is safe to repeat once,
-by itself, after a short delay of ten seconds or less, and that repeat does not look at the record
-again. A
+still stop at a delay, as they do outside a fence. The clients do not send a request again on
+their own after a short delay: the carrier waits it out and asks again. A
 refusal only a person can clear that names a delay is waited for as long as the longer of the delay
 and five minutes, and new work still waits out the delay. A refusal that names a delay and one that needs a
 person can come in the same pass, for example when a publication is refused because the writer is
