@@ -4014,9 +4014,8 @@ keeps one request for records past the store's cursors waiting on it. The worker
 request as soon as it commits a question transition, the transition of an approval, a host event
 or a privacy transition, and after at most thirty seconds otherwise, so a question asked in a
 session is in the inbox within moments rather than at some later pass. A broker transition of any
-other request waits to go with the next page, unless the page ends before the broker's newest
-record, which is answered at once so that the transition of an approval behind a full page is not
-read late.
+other request waits to go with the next page. A page that ends before the broker's newest record is
+answered at once, so the transition of an approval behind a full page is not read late.
 
 A page is read in a fixed order: the moment, then each source's newest record and the records after
 the cursor up to it, then the session's privacy record. A page that reaches the newest record of
