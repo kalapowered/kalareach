@@ -335,13 +335,17 @@ fn a_case_no_file_can_be_given_to_fails_every_row_of_its_lane() {
         for row in ["KR-REQ-15.34", "KR-REQ-15.35", "KR-REQ-15.36", "KR-ACC-014"] {
             assert_eq!(document.identifiers[row].verdict, Verdict::Failed, "{row}");
         }
+        let swift_record = document.identifiers["KR-REQ-15.34"]
+            .tests
+            .iter()
+            .find(|test| test.test.ends_with("VoiceCaptureStateTests.swift"))
+            .expect("the Swift file's record");
         assert!(
-            document.identifiers["KR-REQ-15.34"].tests[0]
+            swift_record
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains(why)),
-            "{:?}",
-            document.identifiers["KR-REQ-15.34"].tests
+            "{swift_record:?}"
         );
     }
 }
