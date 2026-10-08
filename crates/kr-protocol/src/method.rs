@@ -419,6 +419,14 @@ methods! {
           delivery and owes the gateway a revocation of the device's authorisation, as unpairing \
           does, without unpairing the device.";
 
+    DeliveryDestinationList = "delivery.destination.list", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "List the notification destinations in service: a paired device's and the ones the \
+          owner configured, with where each sends and the grant it is told under. It never \
+          carries a credential.";
+
     DeliveryDestinationSecretSet = "delivery.destination.secret.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -1735,6 +1743,7 @@ mod tests {
         // it delivers.
         ("delivery.destination.configure", &[ActionRight::HostManage]),
         ("delivery.destination.remove", &[ActionRight::HostManage]),
+        ("delivery.destination.list", &[ActionRight::HostManage]),
         (
             "delivery.destination.secret.set",
             &[ActionRight::HostManage],

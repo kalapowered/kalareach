@@ -270,6 +270,7 @@ impl Controller {
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
+            Method::DeliveryDestinationList => self.delivery_destination_list(&request.params),
             Method::PrivacyStatus => self.privacy_status().await,
             Method::DescriptionSetup => self.description_setup(),
             _ => Err(ControllerError::InvalidArgument(format!(

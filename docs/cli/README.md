@@ -38,11 +38,12 @@ worker directly for what a session owns.
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
 | `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
+| `kr destination [list/configure/remove]` | — | The places this host sends notifications besides paired devices: a webhook, Slack, Discord, Telegram or email |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
 
-The commands from `kr project` to `kr privacy` act in this installation's own environment, or in the
+The commands from `kr project` to `kr destination` act in this installation's own environment, or in the
 one `--environment <id>` names. Each is a client of one method the control daemon serves, and
 the daemon decides every refusal. A command that removes or revokes something names it by its
 identifier, never by a label or a number.
@@ -1636,6 +1637,61 @@ what had already left it before privacy mode was turned on: backup archives and 
 with whether this host holds any way to ask for its removal. It changes nothing. A paired device
 whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
 `docs/host/README.md` has what each step does and what privacy mode does not reach.
+
+## `kr destination`
+
+A paired device is a place this host sends notifications because the device registered itself.
+`kr destination` is how you add the others: a webhook, a Slack, Discord or Telegram chat, or an
+email address. It goes through the control daemon on your own socket and nowhere else. A paired
+device cannot list, make or remove a destination, whatever rights its grant carries.
+
+```sh
+kr destination list
+kr destination configure ops --kind webhook --endpoint https://hooks.example.com/in/ops \
+    --grant <grant-id> --idempotency-header Idempotency-Key
+kr destination configure chat --kind slack --endpoint '#alerts' --grant <grant-id> \
+    --credential-file ./slack-address
+kr destination remove ops
+```
+
+`configure` takes the identifier you want, `--kind` (`webhook`, `slack`, `discord`, `telegram` or
+`email`), `--endpoint` and `--grant`. The endpoint says where a message goes: a webhook's HTTPS
+address, the name of the channel a Slack or Discord webhook posts to, a Telegram chat, or an email
+recipient. It is never a credential. The grant decides what the destination is told: the sessions,
+rights and history it reaches, and only while it stands, so a destination whose grant is revoked or
+has run out is told nothing. `--rule-name` labels the rule and defaults to the identifier; nothing
+selects a rule by its name. `--idempotency-header` is for a webhook that deduplicates by an
+identifier, and the host then sends each message's identifier under that header. Without it the
+host never retries a webhook after an outcome nobody knows, because the retry could be a second
+message. Configuring under an identifier already in use replaces that destination, and a paired
+device's identifier is refused.
+
+Every kind but a webhook sends with a credential, and `--credential-file` names the file that holds
+it: a Slack or Discord webhook address, a Telegram bot token, or for email a JSON document with
+`server`, `port`, `security` (`implicit_tls` or `starttls`), `username`, `password` and
+`from_address`. The command reads the file once and hands it to the daemon, which keeps it in its
+secret store. It is never an argument, because the process list and the shell's history would keep
+it, and the command never prints it: not in its text, in `--json`, in `list`, or in an error. A file
+that holds no credential of its kind is refused with its name and what it should hold, and nothing is
+configured. Every message to an external destination says that whoever can read the destination can
+read the message, and `configure` says it back to you.
+
+`remove` takes the destination away with the credential kept for it, and takes back what was queued
+for it and not sent. It says how many notifications that was, how many had been sent once so that
+what became of them cannot be settled, and how many attempts were on the wire, which finish and may
+still arrive. A paired device's destination is named by the device's identifier in `list`, and
+removing it ends delivery to the device without unpairing it. Removing an identifier nothing is
+configured under says so and exits with 0.
+
+`list` shows each destination in service: its identifier, its kind, where it sends, the grant it is
+told under, and whether it is in force. A destination whose push token the gateway rejected is out of
+service until its device registers again or you remove it. `--json` prints
+`{ "ok": true, "destinations": [ { "destination_id", "kind", "endpoint", "idempotency_header",
+"rule_name", "grant_id", "in_force", "configured_at_ms" } ] }`, with `endpoint` and
+`idempotency_header` null where the destination has none. `configure --json` prints
+`destination_id`, `kind`, `in_force` and `recipients_can_read`, and `remove --json` prints
+`destination_id`, `found`, `revoked`, `unresolved` and `fenced`. A refusal exits with a failure and
+is the daemon's own.
 
 ## `kr host import-journals`
 

@@ -617,6 +617,12 @@ export type ReverseOperation = 'filesystem_read' | 'filesystem_write' | 'termina
  */
 export type UpstreamMethod = string
 /**
+ * The kinds of destination this host delivers to: the five an owner configures and a paired
+ * device's own, made by the device's registration.
+ */
+export type DeliveryDestinationKind =
+  'push' | 'webhook' | 'slack' | 'discord' | 'telegram' | 'email'
+/**
  * How fetching the selected profile's files is going.
  */
 export type DescriptionDownload = 'not_started' | 'running' | 'verified' | 'cancelled' | 'failed'
@@ -2047,10 +2053,14 @@ export interface KalaReachProtocol {
   decoding_trust?: DecodingTrust
   delivery_destination_configure_params?: DeliveryDestinationConfigureParams
   delivery_destination_configure_result?: DeliveryDestinationConfigureResult
+  delivery_destination_kind?: DeliveryDestinationKind
+  delivery_destination_list_params?: DeliveryDestinationListParams
+  delivery_destination_list_result?: DeliveryDestinationListResult
   delivery_destination_remove_params?: DeliveryDestinationRemoveParams
   delivery_destination_remove_result?: DeliveryDestinationRemoveResult
   delivery_destination_secret_set_params?: DeliveryDestinationSecretSetParams
   delivery_destination_secret_set_result?: DeliveryDestinationSecretSetResult
+  delivery_destination_summary?: DeliveryDestinationSummary
   description_completion?: DescriptionCompletion
   description_configure_params?: DescriptionConfigureParams
   description_download?: DescriptionDownload
@@ -11169,6 +11179,62 @@ export interface DeliveryDestinationConfigureResult {
   recipients_can_read: string
 }
 /**
+ * Parameters of `delivery.destination.list`.
+ */
+export interface DeliveryDestinationListParams {}
+/**
+ * The result of `delivery.destination.list`: the destinations that have a rule, by identifier.
+ * One that was removed is not listed.
+ */
+export interface DeliveryDestinationListResult {
+  /**
+   * The destinations, ordered by identifier.
+   */
+  destinations: DeliveryDestinationSummary[]
+}
+/**
+ * One destination this host delivers to, as `delivery.destination.list` says it. It never carries
+ * a credential, and says only whether one is kept.
+ */
+export interface DeliveryDestinationSummary {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  configured_at_ms: string
+  /**
+   * The identifier the destination is configured under; a paired device's destination is
+   * named by the device's identifier.
+   */
+  destination_id: string
+  /**
+   * Where an owner's destination sends, as it was configured. Null for a paired device's, which
+   * the push gateway reaches.
+   */
+  endpoint: string | null
+  /**
+   * The grant whose authority the content is intersected with.
+   */
+  grant_id: GrantId | null
+  /**
+   * The header a webhook deduplicates by. Null when it deduplicates by nothing, and for every
+   * kind but a webhook.
+   */
+  idempotency_header: string | null
+  /**
+   * Whether the destination is in service. A destination the gateway rejected the token of is
+   * not, and stays listed until it is removed or its device registers again.
+   */
+  in_force: boolean
+  /**
+   * Which service it sends to.
+   */
+  kind: 'push' | 'webhook' | 'slack' | 'discord' | 'telegram' | 'email'
+  /**
+   * What the rule that sends to this destination is called.
+   */
+  rule_name: string
+}
+/**
  * Parameters of `delivery.destination.remove`.
  */
 export interface DeliveryDestinationRemoveParams {
@@ -16025,6 +16091,7 @@ export interface MethodEntry {
     | 'environment.refresh'
     | 'delivery.destination.configure'
     | 'delivery.destination.remove'
+    | 'delivery.destination.list'
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
@@ -24587,6 +24654,7 @@ export interface ServiceRequestPayload {
     | 'environment.refresh'
     | 'delivery.destination.configure'
     | 'delivery.destination.remove'
+    | 'delivery.destination.list'
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
