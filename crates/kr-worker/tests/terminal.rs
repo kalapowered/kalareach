@@ -1550,3 +1550,36 @@ async fn kr_req_10_50_a_screen_larger_than_a_preview_comes_back_marked_cut() {
     assert!(preview.truncated, "{preview:?}");
     assert_eq!(preview.lines.len(), kr_protocol::sharing::MAX_PREVIEW_LINES);
 }
+
+/// KR-REQ-10.50: a row the grid had to cut to keep it inside its byte bound is a screen the
+/// preview did not show whole, even when what remains is shorter than a preview line. The
+/// application drew five hundred cells of a link whose identifier is as long as a link may be,
+/// alternating bold and plain so that every cell is a run with a copy of the link of its own: the
+/// grid stops the row at its bound after fewer cells than a preview line holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_row_the_grid_cut_is_a_screen_the_preview_says_was_cut() {
+    let identifier = "i".repeat(2_026);
+    let host = host_sized(
+        &format!(
+            "printf '\\033]8;id={identifier};https://e.invalid/\\033\\\\'; \
+             i=0; while [ $i -lt 1000 ]; do printf 'a\\033[1mb\\033[0m'; i=$((i+1)); done; \
+             printf 'END\\n'; read -r _"
+        ),
+        Dimensions::new(2_048, 4),
+    )
+    .await;
+    produced(&host.runtime, b"END\r\n").await;
+
+    let preview = screen_previewed(&host, true)
+        .await
+        .screen
+        .0
+        .expect("a scope that includes the screen is shown it");
+    let shown = preview.lines.first().expect("the row is there");
+    assert!(
+        shown.chars().count() < kr_protocol::sharing::MAX_PREVIEW_LINE_CHARS,
+        "the grid stopped the row before the preview's own cut could: {}",
+        shown.chars().count()
+    );
+    assert!(preview.truncated, "{preview:?}");
+}

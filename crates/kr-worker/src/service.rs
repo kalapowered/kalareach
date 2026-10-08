@@ -3484,7 +3484,7 @@ impl WorkerService {
         }
         let outcome = match method {
             Method::SessionRead => self.session_read(&request.params, caller),
-            Method::SessionScreenPreview => self.session_screen_preview(&request.params),
+            Method::SessionScreenPreview => self.session_screen_preview(&request.params, caller),
             Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
@@ -5405,20 +5405,33 @@ impl WorkerService {
     /// Serves `session.screen.preview`: the visible lines a viewer holding a history scope would
     /// first see, which an issuer is shown before a share that includes them exists.
     ///
-    /// The lines come from the buffer that is showing and nothing else, and they pass through the
-    /// same filter every other surface does, built from the scope the caller names: a scope that
-    /// does not include the live screen is given none. The cut is the preview's own, and the caller
-    /// that must show the whole screen refuses one that was cut.
-    fn session_screen_preview(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    /// Only the local owner reads it: the owner is the issuer of every share, and a caller acting
+    /// under a grant has no business with a screen it is not itself given. The lines come from the
+    /// buffer that is showing and nothing else, and they pass through the same filter every other
+    /// surface does, built from the scope the caller names: a scope that does not include the live
+    /// screen is given none. The cut is the preview's own, and a row the grid had to cut counts as
+    /// one; the caller that must show the whole screen refuses a cut one.
+    fn session_screen_preview(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
+        if !caller.is_local_owner() {
+            return Err(WorkerError::PermissionDenied {
+                detail: "only this host's owner previews a session's screen".to_owned(),
+            });
+        }
         let params: kr_protocol::sharing::SessionScreenPreviewParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
         let filter = crate::history_filter::HistoryFilter::new(
             crate::history_filter::ViewerScope::from_history(&params.history, true),
         );
-        let lines = session.engine().visible_text();
+        let visible = session.engine().visible_text();
+        let screen = filter
+            .preview_live_screen(visible.lines.iter().map(String::as_str))
+            .map(|mut preview| {
+                preview.truncated |= visible.cut;
+                preview
+            });
         encode(&kr_protocol::sharing::SessionScreenPreviewResult {
-            screen: Nullable(filter.preview_live_screen(lines.iter().map(String::as_str))),
+            screen: Nullable(screen),
         })
     }
 

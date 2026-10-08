@@ -22,7 +22,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen` |
+//! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen`, `only_the_local_owner_previews_the_screen` |
 //! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket`, `a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope`, `the_local_owner_reads_the_last_command_on_either_socket` |
 //! | KR-REQ-10.51 | `a_local_caller_under_a_grant_reads_only_the_questions_its_scope_admits`, `the_local_owner_reads_every_question_on_either_socket`, `a_worker_states_that_it_holds_a_question_read_to_its_scope` |
 //! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not`, `a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected`, `a_detach_whose_succession_fails_after_its_marker_stays_unknown` |
@@ -657,6 +657,50 @@ impl Wired {
         answer(window, frame, request_id)
             .await
             .map(|page| page.to_typed().expect("a history page"))
+    }
+
+    /// A read of the screen a share that includes the live screen would give.
+    fn preview(&self, request_id: RequestId) -> Request {
+        Request {
+            request_id,
+            method: Method::SessionScreenPreview.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::sharing::SessionScreenPreviewParams {
+                session_id: self.session_id,
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: true,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+            })
+            .expect("encodes"),
+        }
+    }
+
+    /// Forwards a read of the screen preview for `actor`.
+    async fn preview_for(
+        &self,
+        daemon: &mut LocalClient,
+        actor: &ActorEnvelope,
+    ) -> Result<kr_protocol::sharing::SessionScreenPreviewResult, ProtocolError> {
+        let request_id = next_request();
+        let frame = forwarded_read(actor, self.preview(request_id), None);
+        answer(daemon, frame, request_id)
+            .await
+            .map(|previewed| previewed.to_typed().expect("a screen preview"))
+    }
+
+    /// Reads the screen preview in one of the owner's windows.
+    async fn preview_in(
+        &self,
+        window: &mut LocalClient,
+    ) -> Result<kr_protocol::sharing::SessionScreenPreviewResult, ProtocolError> {
+        let request_id = next_request();
+        let frame = ControlFrame::Request(self.preview(request_id));
+        answer(window, frame, request_id)
+            .await
+            .map(|previewed| previewed.to_typed().expect("a screen preview"))
     }
 
     /// Reports, as a managed root shell's hooks do, that `command` started at `started_at_ms`, and
@@ -1365,6 +1409,49 @@ async fn a_local_caller_under_a_grant_is_refused_the_retained_history() {
     assert!(refused.message.contains("retained history"), "{refused:?}");
 
     drop((proxy, phone));
+    wired.close();
+}
+
+/// KR-REQ-10.50: the screen an issuer is shown before a share exists is the owner's read. A caller
+/// acting under a grant is refused it, whichever socket it came in on, a paired device the daemon
+/// forwarded anyway included; the owner is served it in one of its windows and as the daemon
+/// forwards it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_local_owner_previews_the_screen() {
+    let wired = wired(TWO_BUFFERS).await;
+    common::produced(&wired.runtime, SCREEN_DRAWN).await;
+
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    for actor in [local_under_a_grant(1), device(1)] {
+        let refused = wired
+            .preview_for(&mut proxy, &actor)
+            .await
+            .expect_err("a caller under a grant is not given the screen");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    }
+
+    let forwarded = wired
+        .preview_for(&mut proxy, &the_owner_forwarded())
+        .await
+        .expect("the owner the daemon forwards previews the screen")
+        .screen
+        .0
+        .expect("the scope includes the screen");
+    assert!(
+        forwarded
+            .lines
+            .iter()
+            .any(|line| line.contains("kr-the-application-screen")),
+        "{forwarded:?}"
+    );
+    let mut window = wired.window().await;
+    let in_a_window = wired
+        .preview_in(&mut window)
+        .await
+        .expect("the owner previews the screen in one of its windows");
+    assert!(in_a_window.screen.0.is_some());
+
+    drop((window, proxy));
     wired.close();
 }
 
