@@ -58,6 +58,7 @@ mod configuration;
 mod create;
 mod host;
 mod inhibition;
+mod insertion;
 mod local;
 mod machine_group;
 pub mod plugin_runtime;

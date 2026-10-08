@@ -769,6 +769,56 @@ impl World {
         state
     }
 
+    /// Asks the daemon one question about a draft in the name of `session_id`, as this test's own
+    /// process, which no session's worker is.
+    async fn ask_about_a_draft_as_this_process(
+        &self,
+        session_id: SessionId,
+        step: kr_protocol::insertion::DraftStep,
+    ) -> kr_protocol::insertion::DraftAnswer {
+        let rendezvous = self
+            .environment()
+            .rendezvous_endpoint()
+            .expect("an endpoint");
+        let connection = kr_ipc::endpoint::Connection::connect(&rendezvous)
+            .await
+            .expect("connects to the rendezvous endpoint");
+        let (mut reader, mut writer) =
+            kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+        writer
+            .write_message(&ControlFrame::Hello(LocalHello {
+                offered_versions: vec![PROTOCOL_VERSION],
+                build_id: build(),
+                client: LocalClientKind::Worker,
+                capabilities: kr_protocol::scalars::CanonicalSet::new(),
+                max_receive: kr_protocol::hello::ReceiveLimits::default(),
+                origin: None,
+            }))
+            .await
+            .expect("the hello is written");
+        let acknowledged: ControlFrame = reader.read_message().await.expect("acknowledged");
+        assert!(matches!(acknowledged, ControlFrame::HelloAck(_)));
+        writer
+            .write_message(&ControlFrame::DraftWanted(Box::new(
+                kr_protocol::insertion::DraftWanted {
+                    session_id,
+                    actor_id: kr_protocol::ids::ActorId::new(format!(
+                        "local:{}",
+                        kr_ipc::paths::current_uid()
+                    ))
+                    .expect("a principal"),
+                    step,
+                },
+            )))
+            .await
+            .expect("the question is written");
+        let answer: ControlFrame = reader.read_message().await.expect("answered");
+        let ControlFrame::DraftAnswer(answer) = answer else {
+            panic!("the daemon answered {answer:?}");
+        };
+        *answer
+    }
+
     /// What the daemon was asked to start, in order.
     fn requested(&self) -> Vec<Requested> {
         self.requested
@@ -1104,6 +1154,106 @@ async fn a_process_that_is_not_a_sessions_worker_cannot_have_the_plugin_runtime_
     }
     assert!(world.services().is_empty());
     assert!(world.published_host().is_none());
+}
+
+/// Only the process the daemon recorded for a session reads, claims or settles what its drafts
+/// hold. This test's own process, which no session's worker is, asks in the name of a live session
+/// and of one nobody recorded, for each of the three questions, and is refused each time; the
+/// draft is as it was, and the refusal for a worker the daemon has not recorded yet tells it to ask
+/// again while the refusal for another process does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_process_that_is_not_a_sessions_worker_reads_claims_and_settles_nothing_of_its_drafts() {
+    use kr_protocol::error::{ErrorCode, RetryCategory};
+    use kr_protocol::insertion::{
+        DraftAnswer, DraftStep, InsertionBegin, InsertionReport, ReportedOutcome,
+    };
+    use kr_protocol::scalars::U64;
+
+    let Some(component) = well_behaved() else {
+        return;
+    };
+    let world = World::start(&component).await;
+    let created = world.session().await;
+    let session_id = created.session.session_id;
+    let draft = {
+        let service = world.controller().transfer().service();
+        let actor =
+            kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+                .expect("a principal");
+        service
+            .draft_create(
+                &actor,
+                &kr_protocol::transfer::DraftCreateParams {
+                    environment_id: world.environment_id,
+                    device_id: Nullable::null(),
+                    session_id: Nullable::some(session_id),
+                    application_instance_id: Nullable::null(),
+                    text: "a draft".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let transfer_id = kr_protocol::ids::TransferId::new(kr_ipc::new_uuid());
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let begin = InsertionBegin {
+        action_id,
+        draft_id: draft.draft_id,
+        transfer_id,
+        attempt: U64::new(0),
+        max_count: U64::new(4),
+        deadline_boot_ms: U64::new(u64::MAX),
+    };
+    let steps = [
+        DraftStep::Facts {
+            draft_id: draft.draft_id,
+        },
+        DraftStep::Begin(begin.clone()),
+        DraftStep::Report(InsertionReport {
+            action_id,
+            draft_id: draft.draft_id,
+            transfer_id,
+            attempt: U64::new(0),
+            outcome: ReportedOutcome::Failed {
+                detail: "not mine to say".to_owned(),
+            },
+        }),
+    ];
+    for (session, code, retry) in [
+        (
+            session_id,
+            ErrorCode::PermissionDenied,
+            RetryCategory::ConfigurationChange,
+        ),
+        (
+            SessionId::new(kr_ipc::new_uuid()),
+            ErrorCode::ResourceUnavailable,
+            RetryCategory::Transient,
+        ),
+    ] {
+        for step in &steps {
+            let answer = world
+                .ask_about_a_draft_as_this_process(session, step.clone())
+                .await;
+            let DraftAnswer::Refused(error) = answer else {
+                panic!("a process that is not the session's worker was answered: {answer:?}");
+            };
+            assert_eq!(error.code, code, "{error:?}");
+            assert_eq!(error.retry, retry, "{error:?}");
+        }
+    }
+    let unchanged = world
+        .controller()
+        .transfer()
+        .service()
+        .draft(
+            &kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+                .expect("a principal"),
+            draft.draft_id,
+        )
+        .expect("reads the draft");
+    assert_eq!(unchanged, draft, "the refusals changed nothing");
 }
 
 /// The group a process is in, as the operating system reports it.

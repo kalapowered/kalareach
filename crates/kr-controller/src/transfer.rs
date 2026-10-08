@@ -658,6 +658,40 @@ impl TransferModule {
         .await
     }
 
+    /// Answers one question a session's worker asks about a draft, on a blocking task that a dropped
+    /// connection cannot cancel part way: what it holds, a claim of one binding for an offer to the
+    /// agent, or the report of the offer.
+    ///
+    /// A refusal is the answer the service decided, under its code, and its retry category tells
+    /// the worker whether asking again can help.
+    pub(crate) async fn draft_step(
+        &self,
+        session_id: SessionId,
+        actor_id: ActorId,
+        step: kr_protocol::insertion::DraftStep,
+    ) -> kr_protocol::insertion::DraftAnswer {
+        use kr_protocol::insertion::{DraftAnswer, DraftStep};
+        let service = Arc::clone(&self.service);
+        blocking(move || {
+            Ok(match step {
+                DraftStep::Facts { draft_id } => {
+                    DraftAnswer::Facts(service.insertion_facts(&actor_id, session_id, draft_id)?)
+                }
+                DraftStep::Begin(begin) => DraftAnswer::Claim(Box::new(service.insertion_begin(
+                    &actor_id,
+                    session_id,
+                    &begin,
+                    kr_ipc::clock::boot_elapsed_ms(),
+                )?)),
+                DraftStep::Report(report) => DraftAnswer::Reported(
+                    service.record_insertion_outcome(&actor_id, session_id, &report)?,
+                ),
+            })
+        })
+        .await
+        .unwrap_or_else(DraftAnswer::Refused)
+    }
+
     /// Notes every session this host knows as one whose agent may be sent a prompt that names a
     /// draft without this host being told, the first time a daemon of this build starts over a
     /// transfer journal an earlier build wrote, and notes nothing at any start after.

@@ -36,8 +36,17 @@ use crate::error::{Result, TransferError};
 use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
 
 /// The schema version this build reads, and the one a journal holds nothing of the sessions of
-/// earlier builds at ([`Noting`]). A journal at it has the table of ended sessions.
-pub const SCHEMA_VERSION: i64 = 4;
+/// earlier builds at ([`Noting`]). A journal at it has the table of ended sessions and the columns
+/// that say which offer a binding was claimed for.
+pub const SCHEMA_VERSION: i64 = 5;
+
+/// The version before the columns that record who claimed a binding: a journal at it has the table
+/// of ended sessions and holds no claim. The step to [`SCHEMA_VERSION`] adds the columns and moves
+/// the version; a build that cannot read a claim then refuses the journal.
+///
+/// Remove this, with the step from it, once no supported upgrade can start from a journal at this
+/// version.
+const UNCLAIMED_VERSION: i64 = 4;
 
 /// The version of a journal that holds nothing of the sessions of earlier builds and may have no
 /// table of ended sessions: one that the build before that table made or settled. A journal that
@@ -312,8 +321,16 @@ pub struct BindingRow {
     pub external_destination: Option<String>,
     /// When it was bound.
     pub bound_at_ms: TimestampMs,
-    /// The order it was bound in.
+    /// The order it was bound in. A binding bound again is a new attempt, so this is the attempt
+    /// an offer is claimed for.
     pub ordinal: i64,
+    /// The offer that claimed the binding, as its owner names it: the actor and the action the
+    /// offer is made for. Absent until a claim, and kept after the offer is reported, so a repeat
+    /// of the report is recognised.
+    pub claimed_by: Option<String>,
+    /// The read grant the claim issued for the one file. It is not the binding's `grant_id`: a
+    /// draft's reply shows the latter and never the former.
+    pub claim_grant: Option<GrantId>,
 }
 
 /// One narrow read grant over one attachment.
@@ -615,6 +632,8 @@ impl Store {
                      external_destination TEXT,
                      bound_at_ms       INTEGER NOT NULL,
                      ordinal           INTEGER NOT NULL,
+                     claimed_by        TEXT,
+                     claim_grant       BLOB,
                      PRIMARY KEY (draft_id, transfer_id)
                  );
                  CREATE TABLE IF NOT EXISTS grants (
@@ -692,6 +711,12 @@ impl Store {
         // that no use has settled by then is refused, and registered again.
         self.add_column_if_absent("environment", "staging_fs", "BLOB")?;
         self.add_column_if_absent("scopes", "root_fs", "BLOB")?;
+        // The offer a binding was claimed for, and the read grant that claim issued. A journal at
+        // any version below the current one gets them here, empty, so that a journal the
+        // sessions of earlier builds keep at its version has them as well. Remove this once no
+        // supported upgrade can start from a store written before a binding could be claimed.
+        self.add_column_if_absent("draft_attachments", "claimed_by", "TEXT")?;
+        self.add_column_if_absent("draft_attachments", "claim_grant", "BLOB")?;
         match version {
             // A journal this build makes has no earlier build's session to note, and comes to the
             // current version with its table in one step.
@@ -700,6 +725,16 @@ impl Store {
             // version, so the table is added and the version is left.
             Some(UNSETTLED_VERSION) => self.add_ended_sessions(Some(UNSETTLED_VERSION))?,
             Some(SETTLED_VERSION) => self.add_ended_sessions(Some(SETTLED_VERSION))?,
+            // The table is there and the columns have just been added: the version is all that
+            // is left to move.
+            Some(UNCLAIMED_VERSION) => {
+                self.connection
+                    .execute(
+                        "UPDATE schema_version SET version = ?1",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(TransferError::store)?;
+            }
             Some(SCHEMA_VERSION) => {}
             Some(version) => {
                 return Err(TransferError::StoreUnavailable {
@@ -1485,6 +1520,24 @@ impl Store {
             ));
         }
         refuse_ended_session(&transaction, draft_id, None, Some(session_id))?;
+        // A prompt sends the draft as it stands, and an attachment being offered to the agent is
+        // not yet one the draft can be sent with: the offer would be answered for a draft that has
+        // already gone.
+        let being_offered: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM draft_attachments
+                                 WHERE draft_id = ?1 AND state = 'inserting')",
+                params![uuid_sql(draft_id.get())],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        if being_offered {
+            return Err(TransferError::DraftConflict {
+                detail: "an attachment of this draft is being offered to the agent, so the draft \
+                         cannot be sent until the offer is reported"
+                    .to_owned(),
+            });
+        }
         let held: Vec<(Uuid, Option<Uuid>, bool)> = {
             let mut statement = transaction
                 .prepare(
@@ -1745,6 +1798,16 @@ impl Store {
         unseen: &std::collections::BTreeSet<SessionId>,
     ) -> Result<std::collections::BTreeSet<SessionId>> {
         shielding_sessions(&self.connection, transfer_id, unseen)
+    }
+
+    /// Returns true when a session the draft targets, was sent to, or whose upload one of its
+    /// bindings holds has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn session_has_ended(&self, draft_id: DraftId, transfer_id: TransferId) -> Result<bool> {
+        session_has_ended(&self.connection, draft_id, Some(transfer_id), None)
     }
 
     /// Returns the session a draft was sent to, when it was sent to one.
@@ -2434,12 +2497,24 @@ impl Store {
         if changed == 0 {
             return Ok(None);
         }
+        // An offer that is no longer being made has no use for the read grant its claim issued.
+        if binding.state != InsertionState::Inserting
+            && let Some(claim_grant) = binding.claim_grant
+        {
+            transaction
+                .execute(
+                    "UPDATE grants SET revoked = 1 WHERE grant_id = ?1",
+                    params![uuid_sql(claim_grant.get())],
+                )
+                .map_err(TransferError::store)?;
+        }
         transaction
             .execute(
                 "INSERT OR REPLACE INTO draft_attachments
                      (draft_id, transfer_id, insertion_method, state, upstream_evidence,
-                      failure_detail, grant_id, external_destination, bound_at_ms, ordinal)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      failure_detail, grant_id, external_destination, bound_at_ms, ordinal,
+                      claimed_by, claim_grant)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     uuid_sql(binding.draft_id.get()),
                     uuid_sql(binding.transfer_id.get()),
@@ -2451,6 +2526,8 @@ impl Store {
                     binding.external_destination,
                     as_i64(binding.bound_at_ms.get()),
                     binding.ordinal,
+                    binding.claimed_by,
+                    binding.claim_grant.map(|value| uuid_sql(value.get())),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -2516,18 +2593,26 @@ impl Store {
                 .map_err(TransferError::store)?;
         }
         // The insertions no upstream evidence confirmed are few however many sessions have ended,
-        // so they are read once and matched against the set here.
-        type Held = (Uuid, Uuid, Option<Uuid>, Option<Uuid>, Option<Uuid>);
+        // so they are read once and matched against the set here. A binding a worker was claiming
+        // is among them: the worker that claimed it is gone, and nothing will report the offer.
+        type Held = (
+            Uuid,
+            Uuid,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<Uuid>,
+        );
         let held: Vec<Held> = {
             let mut statement = transaction
                 .prepare(
                     "SELECT binding.draft_id, binding.transfer_id, draft.session_id,
-                            prompt.session_id, upload.session_id
+                            prompt.session_id, upload.session_id, binding.claim_grant
                        FROM draft_attachments AS binding
                        JOIN drafts AS draft ON draft.draft_id = binding.draft_id
                        LEFT JOIN draft_prompts AS prompt ON prompt.draft_id = binding.draft_id
                        LEFT JOIN uploads AS upload ON upload.transfer_id = binding.transfer_id
-                      WHERE binding.state = 'recorded'",
+                      WHERE binding.state IN ('recorded', 'inserting')",
                 )
                 .map_err(TransferError::store)?;
             let rows = statement
@@ -2538,6 +2623,7 @@ impl Store {
                         optional_uuid(row, 2)?,
                         optional_uuid(row, 3)?,
                         optional_uuid(row, 4)?,
+                        optional_uuid(row, 5)?,
                     ))
                 })
                 .map_err(TransferError::store)?;
@@ -2545,8 +2631,8 @@ impl Store {
                 .map_err(TransferError::store)?
         };
         let mut failed = 0;
-        let mut drafts = Vec::new();
-        for (draft, transfer, targeted, sent, uploaded) in held {
+        let mut drafts: Vec<Uuid> = Vec::new();
+        for (draft, transfer, targeted, sent, uploaded, claim_grant) in held {
             let ended = [targeted, sent, uploaded]
                 .into_iter()
                 .flatten()
@@ -2558,26 +2644,70 @@ impl Store {
                 .execute(
                     "UPDATE draft_attachments
                         SET state = 'failed', failure_detail = NULL, bound_at_ms = ?3
-                      WHERE draft_id = ?1 AND transfer_id = ?2 AND state = 'recorded'",
+                      WHERE draft_id = ?1 AND transfer_id = ?2
+                        AND state IN ('recorded', 'inserting')",
                     params![uuid_sql(draft), uuid_sql(transfer), as_i64(at_ms.get())],
                 )
                 .map_err(TransferError::store)?;
             failed += changed;
-            if changed > 0 && !drafts.contains(&draft) {
-                drafts.push(draft);
+            if changed > 0 {
+                if let Some(grant) = claim_grant {
+                    transaction
+                        .execute(
+                            "UPDATE grants SET revoked = 1 WHERE grant_id = ?1",
+                            params![uuid_sql(grant)],
+                        )
+                        .map_err(TransferError::store)?;
+                }
+                if !drafts.contains(&draft) {
+                    drafts.push(draft);
+                }
+            }
+        }
+        // A draft whose target is gone is orphaned: kept, unbound, for explicit retargeting. A draft
+        // that was only sent to a session, or holds an upload of one, has its insertions failed above
+        // and is not orphaned, because it never targeted it.
+        let targeting: Vec<Uuid> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT draft_id, session_id FROM drafts
+                      WHERE session_id IS NOT NULL AND state <> 'orphaned'",
+                )
+                .map_err(TransferError::store)?;
+            let rows = statement
+                .query_map([], |row| Ok((uuid_column(row, 0)?, uuid_column(row, 1)?)))
+                .map_err(TransferError::store)?;
+            let mut targeting = Vec::new();
+            for row in rows {
+                let (draft, session) = row.map_err(TransferError::store)?;
+                if sessions.contains(&SessionId::new(session)) {
+                    targeting.push(draft);
+                }
+            }
+            targeting
+        };
+        for draft in &targeting {
+            if !drafts.contains(draft) {
+                drafts.push(*draft);
             }
         }
         for draft in drafts {
+            let orphaned = targeting.contains(&draft);
             transaction
                 .execute(
-                    "UPDATE drafts SET revision = revision + 1, updated_at_ms = ?2
+                    "UPDATE drafts SET revision = revision + 1, updated_at_ms = ?2,
+                            state = CASE WHEN ?3 THEN 'orphaned' ELSE state END
                       WHERE draft_id = ?1",
-                    params![uuid_sql(draft), as_i64(at_ms.get())],
+                    params![uuid_sql(draft), as_i64(at_ms.get()), orphaned],
                 )
                 .map_err(TransferError::store)?;
             record_event(
                 &transaction,
-                "draft.attachment.failed",
+                if orphaned {
+                    "draft.orphaned"
+                } else {
+                    "draft.attachment.failed"
+                },
                 &DraftId::new(draft).to_string(),
                 at_ms,
             )?;
@@ -2596,7 +2726,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT draft_id, transfer_id, insertion_method, state, upstream_evidence,
-                        failure_detail, grant_id, external_destination, bound_at_ms, ordinal
+                        failure_detail, grant_id, external_destination, bound_at_ms, ordinal,
+                        claimed_by, claim_grant
                  FROM draft_attachments WHERE draft_id = ?1 ORDER BY ordinal",
             )
             .map_err(TransferError::store)?;
@@ -2613,6 +2744,8 @@ impl Store {
                     external_destination: row.get(7)?,
                     bound_at_ms: timestamp(row.get(8)?),
                     ordinal: row.get(9)?,
+                    claimed_by: row.get(10)?,
+                    claim_grant: optional_uuid(row, 11)?.map(GrantId::new),
                 })
             })
             .map_err(TransferError::store)?;
@@ -3020,7 +3153,21 @@ fn refuse_ended_session(
     transfer_id: Option<TransferId>,
     also: Option<SessionId>,
 ) -> Result<()> {
-    let ended: bool = transaction
+    if session_has_ended(transaction, draft_id, transfer_id, also)? {
+        Err(TransferError::SessionEnded)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a session a draft targets, was sent to, or whose upload it holds has ended.
+fn session_has_ended(
+    connection: &Connection,
+    draft_id: DraftId,
+    transfer_id: Option<TransferId>,
+    also: Option<SessionId>,
+) -> Result<bool> {
+    connection
         .query_row(
             "SELECT EXISTS (
                  SELECT 1 FROM ended_sessions
@@ -3041,12 +3188,7 @@ fn refuse_ended_session(
             ],
             |row| row.get(0),
         )
-        .map_err(TransferError::store)?;
-    if ended {
-        Err(TransferError::SessionEnded)
-    } else {
-        Ok(())
-    }
+        .map_err(TransferError::store)
 }
 
 fn record_event(
@@ -3489,6 +3631,25 @@ mod tests {
             .expect("writes the journal");
     }
 
+    /// The table of bindings as a build before a binding could be claimed made it.
+    const BINDINGS_BEFORE_CLAIMS: &str = "CREATE TABLE draft_attachments (
+        draft_id BLOB NOT NULL, transfer_id BLOB NOT NULL, insertion_method TEXT NOT NULL,
+        state TEXT NOT NULL, upstream_evidence TEXT, failure_detail TEXT, grant_id BLOB,
+        external_destination TEXT, bound_at_ms INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+        PRIMARY KEY (draft_id, transfer_id));";
+
+    fn has_the_column(path: &std::path::Path, column: &str) -> bool {
+        rusqlite::Connection::open(path)
+            .expect("opens")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('draft_attachments') WHERE name = ?1",
+                [column],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reads the schema")
+            == 1
+    }
+
     fn recorded_version(path: &std::path::Path) -> i64 {
         rusqlite::Connection::open(path)
             .expect("opens")
@@ -3525,7 +3686,7 @@ mod tests {
         let path = directory.path().join("transfers.sqlite");
 
         let mut store = Store::open(&path, environment()).expect("creates and opens");
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
         assert!(has_the_table_of_ended_sessions(&path));
         assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
@@ -3566,6 +3727,44 @@ mod tests {
         let reopened = Store::open(&path, environment()).expect("opens again");
         assert_eq!(reopened.noting().expect("reads the noting"), Noting::Done);
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_four_journal_gains_the_columns_that_record_a_claim_and_moves_to_version_five() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(
+            &path,
+            UNCLAIMED_VERSION,
+            &format!(
+                "CREATE TABLE ended_sessions (session_id BLOB PRIMARY KEY, ended_at_ms INTEGER NOT NULL);
+                 {BINDINGS_BEFORE_CLAIMS}"
+            ),
+        );
+        assert!(!has_the_column(&path, "claimed_by"));
+        assert!(!has_the_column(&path, "claim_grant"));
+
+        let store = Store::open(&path, environment()).expect("migrates and opens");
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert!(has_the_column(&path, "claimed_by"));
+        assert!(has_the_column(&path, "claim_grant"));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
+    }
+
+    #[test]
+    fn a_journal_that_is_unsettled_gains_the_columns_and_keeps_its_version() {
+        // A journal of an earlier build's sessions: it stays at its version until they are settled,
+        // and it has the columns all the same, so a claim could be recorded in it. Claims are
+        // refused while it is unsettled.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(&path, UNSETTLED_VERSION, BINDINGS_BEFORE_CLAIMS);
+
+        let store = Store::open(&path, environment()).expect("migrates and opens");
+        assert_eq!(recorded_version(&path), UNSETTLED_VERSION);
+        assert!(has_the_column(&path, "claimed_by"));
+        assert!(has_the_column(&path, "claim_grant"));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Owed);
     }
 
     #[test]
