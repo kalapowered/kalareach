@@ -285,6 +285,8 @@ struct SessionState {
     /// other. Two locks would let a snapshot fall between the two writes and carry neither.
     outcomes: Mutex<Outcomes>,
     events: broadcast::Sender<Notification>,
+    /// True once the connection has ended, which a holder of the session may wait for.
+    ended: tokio::sync::watch::Sender<bool>,
     outstanding: AtomicU64,
     max_outstanding: u64,
 }
@@ -303,6 +305,8 @@ impl SessionState {
         let mut waiters = self.waiters();
         waiters.ended = true;
         waiters.pending.clear();
+        drop(waiters);
+        self.ended.send_replace(true);
     }
 
     fn waiters(&self) -> std::sync::MutexGuard<'_, Waiters> {
@@ -362,6 +366,7 @@ impl Session {
             cursors: Mutex::new(cursors),
             outcomes: Mutex::new(Outcomes::default()),
             events,
+            ended: tokio::sync::watch::channel(false).0,
             outstanding: AtomicU64::new(0),
             max_outstanding: limits.max_outstanding_mutations.get(),
         });
@@ -866,6 +871,16 @@ impl Session {
     /// would make the first event of the new one read as a duplicate.
     pub async fn reconnected(&self) {
         self.state.cursors.lock().await.reconnected();
+    }
+
+    /// Resolves once the connection has ended, whichever end ended it.
+    ///
+    /// The event stream does not say so: it belongs to the session, which lives as long as a holder
+    /// keeps it, so a holder that wants to know the host went away waits here.
+    pub async fn closed(&self) {
+        let mut ended = self.state.ended.subscribe();
+        // The value is read once the subscription exists, so an end that came first is not missed.
+        let _ = ended.wait_for(|ended| *ended).await;
     }
 
     /// Ends the session and the connection, waking every waiting call.
