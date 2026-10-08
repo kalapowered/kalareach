@@ -1515,7 +1515,10 @@ struct ActionRecord {
     ///
     /// A record is stamped, and its result converted, when it is next asked for. Remove the
     /// default, and the conversion of such a record's result that [`carry_result_forward`] makes,
-    /// once no supported upgrade starts from a record written before the format was recorded.
+    /// once no supported upgrade starts from a record written before the format was recorded. A
+    /// release that removes them reads no record at version 0, so its `migrates_from` for this
+    /// record is 1 and a switch to it is refused while an unstamped record is left; a release before
+    /// it therefore has the daemon stamp every record it finds.
     #[serde(default)]
     version: u32,
     /// The digest of the mutation this action was admitted for.

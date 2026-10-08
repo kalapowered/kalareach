@@ -7,8 +7,9 @@
 //! changes it only by its own owner-approved step: it joins a group, takes its part in a merge, or
 //! splits off into a fresh group. No other environment, no enrolment and no paired device writes
 //! the file. The one other write is the open's, which states the file's format in a record that
-//! states none and changes nothing else in it. The store does not decide who the owner is: its caller checks the owner's authority
-//! first, and the store records who approved each step and the action that carried it.
+//! states none and changes nothing else in it. The store does not decide who the owner is: its
+//! caller checks the owner's authority first, and the store records who approved each step and the
+//! action that carried it.
 //!
 //! The group is minted once, at the environment's first start, while the daemon holds the
 //! environment's singleton lock. The mint takes nothing from the machine or from the environment:
@@ -70,8 +71,9 @@ pub const RECORD_FILE: &str = "machine-group";
 /// none was written before the format was recorded and is read as this one, and written again
 /// stamped when the store opens; a record of a later format is refused and left as it is.
 ///
-/// Remove the reading of a record that states no format, and the stamping in [`MachineStore::open`],
-/// once no supported upgrade starts from one written before the format was recorded.
+/// Remove the reading of a record that states no format, and the stamping in
+/// [`MachineStore::open`], once no supported upgrade starts from one written before the format was
+/// recorded.
 pub const RECORD_VERSION: u32 = 1;
 
 /// The start of the name of every temporary file this store writes.
