@@ -516,6 +516,12 @@ impl Feed {
         }
     }
 
+    /// A week passes: the records the host finished with are dropped, as retention drops them.
+    pub(crate) fn forget_what_was_finished(&mut self) {
+        self.records
+            .retain(|_, record| record.settled_at_ms.is_none());
+    }
+
     fn host(&self) -> &Host {
         self.host.as_ref().expect("the host row")
     }
