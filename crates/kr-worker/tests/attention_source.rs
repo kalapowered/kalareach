@@ -614,11 +614,13 @@ async fn a_held_page_answers_when_a_host_event_is_committed() {
 }
 
 /// KR-REQ-25.01: a relayed approval committed to the broker's ledger while a request is held
-/// answers it at once, with the transitions the broker recorded. The test waits until the worker
-/// counts the request as held, so the approval is committed after the request found nothing and
-/// began to wait, and the request is held for twenty seconds while the answer is waited for five: a
-/// commit that did not wake it fails here. The request is not answered by the recorded request that
-/// comes before the approval is interpreted, which no one is waiting on, but by the interpretation.
+/// answers it at once, with the transitions the broker recorded, and a transition that is no
+/// approval's does not. The test waits until the worker counts the request as held, so the commits
+/// come after the request found nothing and began to wait. A request nothing interprets is relayed
+/// first, and once the broker has recorded it the held request is still held after a wait: it goes
+/// with the next page. The approval relayed then answers it, within five seconds of a request held
+/// for twenty, with the unbound request's record before it: a commit that did not wake it fails
+/// here, and so does an answer to every transition.
 #[tokio::test]
 async fn a_held_page_answers_when_an_approval_is_committed() {
     use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
@@ -627,13 +629,12 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
     let host = host().await;
     let broker = host.service.broker();
     register(broker, 2);
+    register(broker, 3);
     let package = Package::laid_out();
     package.bind(broker, 2);
-    let mut channel = Channel::open(
-        package.launch(broker, 2, Some(fixture::QUALIFIED_VERSION)),
-        2,
-        launched(2),
-    );
+    let launch = |number: u8| package.launch(broker, number, Some(fixture::QUALIFIED_VERSION));
+    let mut unbound = Channel::open(launch(3), 3, launched(3));
+    let mut bound = Channel::open(launch(2), 2, launched(2));
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let held_before = host.service.held_attention_requests();
     link.writer()
@@ -649,25 +650,43 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
     .await
     .expect("the worker holds the request");
 
-    channel.relay("abcde").await;
+    // A request no binding gives a meaning is recorded, and wakes nothing that is waiting for an
+    // approval.
+    unbound.relay("fghij").await;
+    let recorded = Arc::clone(&host.service);
+    tokio::time::timeout(Duration::from_secs(30), async move {
+        while recorded.broker().pending_resources().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the broker records the request");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), next_answer(&mut link))
+            .await
+            .is_err(),
+        "a transition that is no approval's is left for the next page"
+    );
+
+    bound.relay("abcde").await;
     let Answer::Page(woken) = within(&mut link, Duration::from_secs(5)).await else {
         panic!("expected the held page");
     };
+    let interpreted: Vec<_> = woken
+        .approvals
+        .records
+        .iter()
+        .filter(|record| record.interpreted)
+        .collect();
+    assert_eq!(interpreted.len(), 1, "the interpretation is in the page");
     assert_eq!(
-        woken
-            .approvals
-            .records
-            .iter()
-            .map(|record| record.sequence.get())
-            .collect::<Vec<_>>(),
-        vec![1, 2],
-        "the commit that woke the request is in the page, with the one before it"
+        woken.approvals.records[0].sequence,
+        U64::new(1),
+        "and the record of the request nothing interpreted comes before it"
     );
-    assert!(
-        woken.approvals.records[1].interpreted,
-        "and the second is the interpretation"
-    );
-    channel.close().await;
+    assert!(!woken.approvals.records[0].approval);
+    unbound.close().await;
+    bound.close().await;
 }
 
 /// KR-REQ-25.01: a broker transition serves no text, in a live worker or from its closed journal,
