@@ -2492,8 +2492,12 @@ struct Panned {
     _owner: Attached,
 }
 
-/// Builds the screen the next three tests start from: the application has written `x`, and then
+/// Builds the screen the next two tests start from: the application has written `x`, and then
 /// waits for a line before it wraps one, and for another before it writes `next`.
+///
+/// The application reads until it gets a line (`until read -r _; do :; done`), because a case that
+/// resizes the session while the application waits would otherwise find it written ahead: resizing
+/// a Windows console makes a plain `read` return with no line.
 async fn panned_terminal() -> Panned {
     let tall = Dimensions::new(4, 5);
     let short = Dimensions::new(4, 3);
@@ -2710,7 +2714,8 @@ async fn a_held_terminal_is_handed_the_stream_when_a_resize_leaves_a_screen_that
     let narrow = Dimensions::new(8, 5);
     let wide = Dimensions::new(12, 5);
     let host = host_with(
-        "stty -echo -echonl || exit 1; printf 'abcdefghij'; read -r _; printf 'after'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'abcdefghij'; until read -r _; do :; done; \
+         printf 'after'; read -r _",
         narrow,
         None,
         1024 * 1024,
@@ -2777,6 +2782,10 @@ async fn a_held_terminal_is_handed_the_stream_when_a_resize_leaves_a_screen_that
 /// the stream yet: forwarding begins at a boundary, so what it is kept off the stream by is the
 /// boundary, and the stream is handed to it once the sequence ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_resize_that_frees_a_held_terminal_mid_sequence_leaves_it_waiting_for_the_boundary() {
     let narrow = Dimensions::new(8, 5);
     let wide = Dimensions::new(12, 5);
@@ -2854,7 +2863,8 @@ async fn a_terminal_a_resize_leaves_projected_is_installed_once() {
     let tall = Dimensions::new(4, 5);
     let short = Dimensions::new(4, 3);
     let host = host_with(
-        "stty -echo -echonl || exit 1; printf 'x'; read -r _; printf 'ab'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'x'; until read -r _; do :; done; printf 'ab'; \
+         read -r _",
         tall,
         None,
         1024 * 1024,
