@@ -17,7 +17,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::update::{
     HANDOVER_HOLD_MS, HANDOVER_SETTLE_MS, HandoverStep, HostUpdateHandoverParams,
-    HostUpdateHandoverResult, ReleaseName,
+    HostUpdateHandoverResult, PathVariable, ReleaseName,
 };
 
 use crate::error::{ControllerError, Result};
@@ -1221,7 +1221,7 @@ impl Controller {
         let started = match (&params.step, self.started()) {
             (_, Ok(started)) => started,
             (HandoverStep::Prepare, Err(error)) => return Err(error),
-            (_, Err(_)) => (Vec::new(), String::new()),
+            (_, Err(_)) => StartedLike::default(),
         };
         let attempt = match params.step {
             HandoverStep::Prepare => {
@@ -1273,7 +1273,7 @@ impl Controller {
 
     /// How this daemon was started: its arguments, its program's own name left out, and its working
     /// directory. What a daemon of the release that replaces it is started with.
-    fn started(&self) -> Result<(Vec<String>, String)> {
+    fn started(&self) -> Result<StartedLike> {
         let arguments = std::env::args_os()
             .skip(1)
             .map(std::ffi::OsString::into_string)
@@ -1285,39 +1285,80 @@ impl Controller {
                         .to_owned(),
                 )
             })?;
-        let working_directory = std::env::current_dir()
-            .map_err(|_| {
-                ControllerError::InvalidArgument(
-                    "this daemon's working directory no longer exists or cannot be read, so a \
-                     daemon of another release cannot be started like it; stop this daemon, or \
-                     start it again from a directory that exists, and run the update again"
-                        .to_owned(),
-                )
-            })?
+        let directory = std::env::current_dir().map_err(|_| {
+            ControllerError::InvalidArgument(
+                "this daemon's working directory no longer exists or cannot be read, so a \
+                 daemon of another release cannot be started like it; stop this daemon, or \
+                 start it again from a directory that exists, and run the update again"
+                    .to_owned(),
+            )
+        })?;
+        let working_directory = directory
+            .clone()
             .into_os_string()
             .into_string()
             .map_err(|_| {
                 ControllerError::InvalidArgument(
                     "this daemon's working directory cannot be read as text, so a daemon of \
-                     another release cannot be started like it"
+                 another release cannot be started like it"
                         .to_owned(),
                 )
             })?;
-        Ok((arguments, working_directory))
+        // The variables a daemon of another release must be given for it to keep what this one
+        // keeps where this one keeps it. One that is not text cannot be given.
+        let environment = kr_protocol::hostinfo::configuration::path_variables()
+            .map(|name| {
+                let value = match std::env::var_os(name) {
+                    None => Nullable::null(),
+                    Some(value) => Nullable::some(value.into_string().map_err(|_| {
+                        ControllerError::InvalidArgument(format!(
+                            "the variable {name} of this daemon is not text, so a daemon of another \
+                             release cannot be started like it"
+                        ))
+                    })?),
+                };
+                Ok(PathVariable {
+                    name: name.to_owned(),
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Where this daemon reads its configuration document, from its own environment: an
+        // update checks the document there, and a daemon of another release is given the same
+        // variables, so it reads the same one.
+        let document = kr_worker::config::document_path(&self.paths);
+        let configuration_directory = document
+            .parent()
+            .map(|parent| directory.join(parent))
+            .and_then(|parent| parent.into_os_string().into_string().ok());
+        Ok(StartedLike {
+            arguments,
+            working_directory,
+            environment,
+            configuration_directory,
+        })
     }
 
     /// The answer to a step: how the daemon was started, and the attempt the answer is for.
-    fn started_as(
-        &self,
-        (arguments, working_directory): (Vec<String>, String),
-        attempt: Option<Uuid>,
-    ) -> HostUpdateHandoverResult {
+    fn started_as(&self, started: StartedLike, attempt: Option<Uuid>) -> HostUpdateHandoverResult {
         HostUpdateHandoverResult {
             attempt: Nullable(attempt),
             release: Nullable(ReleaseName::new(self.release.clone()).ok()),
             pid: U64::new(u64::from(std::process::id())),
-            arguments,
-            working_directory,
+            arguments: started.arguments,
+            working_directory: started.working_directory,
+            environment: started.environment,
+            configuration_directory: Nullable(started.configuration_directory),
         }
     }
+}
+
+/// How a daemon of another release is started like this one: what this daemon was started with,
+/// and where it keeps what it keeps. Empty where a step cannot say.
+#[derive(Default)]
+struct StartedLike {
+    arguments: Vec<String>,
+    working_directory: String,
+    environment: Vec<PathVariable>,
+    configuration_directory: Option<String>,
 }

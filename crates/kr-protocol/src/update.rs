@@ -1138,6 +1138,26 @@ pub struct HostUpdateHandoverResult {
     /// The directory it was started in; empty, as `arguments` is, where a `stop` or a `resume` cannot
     /// say.
     pub working_directory: String,
+    /// Each variable that decides where this daemon keeps something
+    /// ([`crate::hostinfo::configuration::path_variables`]), with the value it has in this
+    /// daemon's process, null where it has none. A `prepare` refuses where a value is not text; a
+    /// `stop` or a `resume` answers this empty where it cannot say.
+    pub environment: Vec<PathVariable>,
+    /// The directory this daemon reads its configuration document in, absolute, as this daemon
+    /// resolved it from its own environment; null where it cannot be said as text, and for a `stop`
+    /// or a `resume` that cannot say.
+    pub configuration_directory: Nullable<String>,
+}
+
+/// One variable that decides where a daemon keeps something, as the daemon has it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PathVariable {
+    /// The variable's name.
+    pub name: String,
+    /// Its value in the daemon's process; null where the process has none, which is not the same as
+    /// an empty value.
+    pub value: Nullable<String>,
 }
 
 #[cfg(test)]
@@ -1656,6 +1676,19 @@ mod tests {
             pid: U64::new(42),
             arguments: vec!["--runtime-dir".to_owned(), "/r".to_owned()],
             working_directory: "/s".to_owned(),
+            environment: vec![
+                PathVariable {
+                    name: "XDG_CONFIG_HOME".to_owned(),
+                    value: Nullable::some("/c".to_owned()),
+                },
+                PathVariable {
+                    name: "KR_STATE_DIR".to_owned(),
+                    value: Nullable::null(),
+                },
+            ],
+            configuration_directory: Nullable::some(
+                "/c/kalareach/environments/7c9e1b2a".to_owned(),
+            ),
         };
         let bytes = kr_cbor::to_canonical_vec(&result).expect("encodes");
         let back: HostUpdateHandoverResult =

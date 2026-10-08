@@ -15115,6 +15115,19 @@ export interface HostUpdateHandoverResult {
    */
   attempt: Uuid | null
   /**
+   * The directory this daemon reads its configuration document in, absolute, as this daemon
+   * resolved it from its own environment; null where it cannot be said as text, and for a `stop`
+   * or a `resume` that cannot say.
+   */
+  configuration_directory: string | null
+  /**
+   * Each variable that decides where this daemon keeps something
+   * ([`crate::hostinfo::configuration::path_variables`]), with the value it has in this
+   * daemon's process, null where it has none. A `prepare` refuses where a value is not text; a
+   * `stop` or a `resume` answers this empty where it cannot say.
+   */
+  environment: PathVariable[]
+  /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
@@ -15127,6 +15140,20 @@ export interface HostUpdateHandoverResult {
    * say.
    */
   working_directory: string
+}
+/**
+ * One variable that decides where a daemon keeps something, as the daemon has it.
+ */
+export interface PathVariable {
+  /**
+   * The variable's name.
+   */
+  name: string
+  /**
+   * Its value in the daemon's process; null where the process has none, which is not the same as
+   * an empty value.
+   */
+  value: string | null
 }
 /**
  * What a reviewer would see, before the workspace exists.

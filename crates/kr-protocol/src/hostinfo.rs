@@ -4583,6 +4583,9 @@ pub mod configuration {
         pub variable: &'static str,
         /// What it selects.
         pub selects: &'static str,
+        /// Whether what it selects is a place this host keeps something, so that a daemon started
+        /// without it keeps that something elsewhere ([`path_variables`]).
+        pub locates: bool,
     }
 
     /// The variables this build still reads that are not part of the precedence.
@@ -4620,111 +4623,136 @@ pub mod configuration {
     pub const UNGOVERNED: [UngovernedVariable; 25] = [
         UngovernedVariable {
             variable: "TMPDIR",
+            locates: true,
             selects: "the platform's per-user temporary directory, which is the macOS runtime root",
         },
         UngovernedVariable {
             variable: "XDG_RUNTIME_DIR",
+            locates: true,
             selects: "the platform's per-user runtime directory on Linux",
         },
         UngovernedVariable {
             variable: "XDG_STATE_HOME",
+            locates: true,
             selects: "the platform's per-user state directory on Linux",
         },
         UngovernedVariable {
             variable: "XDG_CONFIG_HOME",
+            locates: true,
             selects: "the platform's per-user configuration directory on Linux",
         },
         UngovernedVariable {
             variable: "HOME",
+            locates: true,
             selects: "the account's home directory, from which every default root is derived",
         },
         UngovernedVariable {
             variable: "PATH",
+            locates: false,
             selects: "where a capability probe looks for the tools it reports on",
         },
         UngovernedVariable {
             variable: "DISPLAY",
+            locates: false,
             selects: "the X display a desktop reading describes",
         },
         UngovernedVariable {
             variable: "XAUTHORITY",
+            locates: false,
             selects: "the X authority file a desktop reading describes",
         },
         UngovernedVariable {
             variable: "XDG_SESSION_ID",
+            locates: false,
             selects: "the login session a desktop reading describes on Linux",
         },
         UngovernedVariable {
             variable: "SESSIONNAME",
+            locates: false,
             selects: "the login session a desktop reading describes on Windows",
         },
         UngovernedVariable {
             variable: "LOCALAPPDATA",
+            locates: true,
             selects: "the account's local application data directory on Windows",
         },
         UngovernedVariable {
             variable: "USERPROFILE",
+            locates: true,
             selects: "the account's home directory where HOME is not set, as Windows names it, \
                       which an agent's tool configuration is written under",
         },
         UngovernedVariable {
             variable: "USER",
+            locates: false,
             selects: "the account name a host, a worker or a bridge helper reports for the login it \
                       runs in",
         },
         UngovernedVariable {
             variable: "LOGNAME",
+            locates: false,
             selects: "the same, for a worker or a bridge helper whose USER is missing, not valid \
                       Unicode or empty (for a worker, also only whitespace)",
         },
         UngovernedVariable {
             variable: "USERNAME",
+            locates: false,
             selects: "the same, as Windows names the account: for a host whose USER is missing or \
                       not valid Unicode, and for a worker or a bridge helper that passed over USER \
                       and LOGNAME in that way",
         },
         UngovernedVariable {
             variable: "HTTPS_PROXY",
+            locates: false,
             selects: "the proxy iroh's relay latency probe goes through when network.proxy_url \
                       names none",
         },
         UngovernedVariable {
             variable: "https_proxy",
+            locates: false,
             selects: "the same, where HTTPS_PROXY is not set",
         },
         UngovernedVariable {
             variable: "HTTP_PROXY",
+            locates: false,
             selects: "the proxy iroh's captive-portal check goes through when network.proxy_url \
                       names none",
         },
         UngovernedVariable {
             variable: "http_proxy",
+            locates: false,
             selects: "the same, where HTTP_PROXY is not set",
         },
         UngovernedVariable {
             variable: "ALL_PROXY",
+            locates: false,
             selects: "the proxy either of those relay checks goes through when network.proxy_url \
                       names none and the check's own variable is not set",
         },
         UngovernedVariable {
             variable: "all_proxy",
+            locates: false,
             selects: "the same, where ALL_PROXY is not set",
         },
         UngovernedVariable {
             variable: "NO_PROXY",
+            locates: false,
             selects: "the relays those two checks reach without the proxy the variables name",
         },
         UngovernedVariable {
             variable: "no_proxy",
+            locates: false,
             selects: "the same, where NO_PROXY is not set",
         },
         UngovernedVariable {
             variable: "REQUEST_METHOD",
+            locates: false,
             selects: "whether those two relay checks take a proxy from the environment at all: \
                       while it is set, as in a CGI program, they take none",
         },
         UngovernedVariable {
             variable: "SystemRoot",
+            locates: false,
             selects: "where the network endpoint reads the Windows hosts file, which may name an \
                       address for a relay or a discovery service",
         },
@@ -4742,6 +4770,20 @@ pub mod configuration {
     /// `network.relay_trust_anchors`, and reads neither variable. `kr doctor` says so, and says
     /// which of them is set here.
     pub const CERTIFICATE_STORE_VARIABLES: [&str; 2] = ["SSL_CERT_FILE", "SSL_CERT_DIR"];
+
+    /// The variables that decide where this host keeps something: the two [`ALLOWLIST`] names a
+    /// location, and the entries of [`UNGOVERNED`] that locate.
+    ///
+    /// A daemon started again by an update is given exactly the values its predecessor had for
+    /// these, so that it keeps what it keeps where its predecessor did.
+    pub fn path_variables() -> impl Iterator<Item = &'static str> {
+        ALLOWLIST.iter().map(|entry| entry.variable).chain(
+            UNGOVERNED
+                .iter()
+                .filter(|entry| entry.locates)
+                .map(|entry| entry.variable),
+        )
+    }
 
     /// Returns the variables in [`UNGOVERNED`] that this process actually has set.
     ///

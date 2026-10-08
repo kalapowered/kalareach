@@ -15871,6 +15871,24 @@
           ],
           "description": "The attempt the answer is for: the one `prepare` began, the one `stop` stopped under, and\nfor `resume` the one it ended, null when none was open."
         },
+        "configuration_directory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The directory this daemon reads its configuration document in, absolute, as this daemon\nresolved it from its own environment; null where it cannot be said as text, and for a `stop`\nor a `resume` that cannot say."
+        },
+        "environment": {
+          "description": "Each variable that decides where this daemon keeps something\n([`crate::hostinfo::configuration::path_variables`]), with the value it has in this\ndaemon's process, null where it has none. A `prepare` refuses where a value is not text; a\n`stop` or a `resume` answers this empty where it cannot say.",
+          "items": {
+            "$ref": "#/$defs/PathVariable"
+          },
+          "type": "array"
+        },
         "pid": {
           "$ref": "#/$defs/U64",
           "description": "Its process identifier."
@@ -15896,7 +15914,9 @@
         "release",
         "pid",
         "arguments",
-        "working_directory"
+        "working_directory",
+        "environment",
+        "configuration_directory"
       ],
       "type": "object"
     },
@@ -22438,6 +22458,32 @@
           "type": "string"
         }
       ]
+    },
+    "PathVariable": {
+      "additionalProperties": false,
+      "description": "One variable that decides where a daemon keeps something, as the daemon has it.",
+      "properties": {
+        "name": {
+          "description": "The variable's name.",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its value in the daemon's process; null where the process has none, which is not the same as\nan empty value."
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
     },
     "PayerAuthorisation": {
       "description": "Why this payer is the one billed.\n\nA relay credential cannot move the bill to another account. A sponsored lease names the\nauthorisation the sponsor gave, so the service can show which record made the transfer lawful\nand can refuse a lease that names none.",
