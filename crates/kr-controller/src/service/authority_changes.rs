@@ -1438,7 +1438,9 @@ impl Controller {
                 Ok(())
             } else {
                 Err(ControllerError::PermissionDenied {
-                    detail: "this device's grant has run out; pair again".to_owned(),
+                    detail: "this device's grant has run out, so it cannot rotate its key; the \
+                             owner can invite a device this host has not paired before"
+                        .to_owned(),
                 })
             }
         };
@@ -2240,13 +2242,11 @@ mod tests {
             .await;
             if lapses {
                 let error = outcome.expect_err("a grant that has run out writes nothing");
-                assert!(
-                    matches!(
-                        error,
-                        crate::error::ControllerError::PermissionDenied { .. }
-                    ),
-                    "{error}"
-                );
+                let crate::error::ControllerError::PermissionDenied { detail } = &error else {
+                    panic!("a grant that has run out is refused: {error}");
+                };
+                assert!(detail.contains("invite"), "{detail}");
+                assert!(!detail.contains("pair again"), "{detail}");
                 assert_eq!(host.revisions(), (1, Some(1)));
             } else {
                 outcome.expect("the control registers");

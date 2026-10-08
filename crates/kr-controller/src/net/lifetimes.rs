@@ -214,7 +214,9 @@ impl GrantLifetimes {
             Anchored::Unlimited => Ok(None),
             Anchored::Until(deadline) => Ok(Some(deadline)),
             Anchored::Over => Err(ControllerError::PermissionDenied {
-                detail: "this device's grant has run out; pair again".to_owned(),
+                detail: "this device's grant has run out; the owner can invite a device this host \
+                         has not paired before"
+                    .to_owned(),
             }),
         }
     }
@@ -1015,6 +1017,27 @@ mod tests {
             .expect("readable")
             .expect("the device");
         assert!(recorded.expired_at_ms.is_some(), "the expiry is on record");
+
+        // What a device whose grant has run out is told names a way forward this host takes: it
+        // refuses a second pairing of one device, so the owner invites a device it has not paired
+        // before. The end on record is read in a boot of its own, where no anchor is left.
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let rebooted = lifetimes_at(
+            &devices,
+            &ManualClock::new(),
+            &wall,
+            BootIdentity {
+                value: kr_protocol::scalars::Bytes::new(vec![0x5a; 16]),
+                ..boot
+            },
+            &Arc::new(UtcFloor::default()),
+        );
+        let refused = rebooted.deadline(&recorded);
+        let Err(ControllerError::PermissionDenied { detail }) = refused else {
+            panic!("a grant that has run out is refused its deadline: {refused:?}");
+        };
+        assert!(detail.contains("invite"), "{detail}");
+        assert!(!detail.contains("pair again"), "{detail}");
     }
 
     /// While this boot's clock continuity is lost, nothing proves an expiring grant in force,
