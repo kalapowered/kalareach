@@ -26,6 +26,13 @@ fn member(name: &str, absent: u32) -> Recording {
     }
 }
 
+fn cbor_member(name: &str, absent: u32) -> Recording {
+    Recording::CborMember {
+        member: name.to_owned(),
+        absent,
+    }
+}
+
 fn entry(
     store: &str,
     scope: StoreScope,
@@ -516,6 +523,44 @@ pub fn table() -> Vec<Store> {
                 Kept::Source("crates/kr-controller/src/agent_tools.rs", &["ActionRecord"]),
             ],
         },
+        // The records the client keeps on this device, in the user's state root.
+        Store {
+            entry: entry(
+                "kept-answers",
+                StoreScope::StateRoot,
+                "kept-answers/*.answer",
+                cbor_member("version", 0),
+                kr_client::answers::ANSWER_FORMAT,
+                0,
+            ),
+            owned: Vec::new(),
+            kept: vec![
+                protocol::<kr_protocol::envelope::ActionTarget>("ActionTarget"),
+                protocol::<kr_protocol::question::QuestionAnswer>("QuestionAnswer"),
+                Kept::Source("crates/kr-client/src/answers.rs", &["AnswerDraft"]),
+            ],
+        },
+        Store {
+            entry: entry(
+                "machine-merge-plan",
+                StoreScope::StateRoot,
+                "machine-merge-plan",
+                cbor_member("version", 0),
+                kr_cli::machine::PLAN_FORMAT,
+                0,
+            ),
+            owned: Vec::new(),
+            kept: vec![
+                protocol::<kr_protocol::machine::MachineGroup>("MachineGroup"),
+                protocol::<kr_protocol::machine::MachineExpected>("MachineExpected"),
+                protocol::<kr_protocol::envelope::MutationRequest>("MutationRequest"),
+                protocol::<kr_protocol::identity::EnvironmentEnrolment>("EnvironmentEnrolment"),
+                Kept::Source(
+                    "crates/kr-cli/src/machine.rs",
+                    &["Plan", "PlannedStep", "StepState", "Why", "Reach"],
+                ),
+            ],
+        },
         // The configuration document, wherever the environment keeps it.
         Store {
             entry: entry(
@@ -566,16 +611,6 @@ pub fn named() -> Vec<Named> {
             StoreScope::StateRoot,
             "environments",
             "the state directories of the environments, each of which is named under its own scope",
-        ),
-        content(
-            StoreScope::StateRoot,
-            "kept-answers",
-            "answers a person gave that the host has not taken, kept on this device by the client; not host state, so not a store of the host's (an unreadable one is reported by name)",
-        ),
-        leaf(
-            StoreScope::StateRoot,
-            "machine-merge-plan",
-            "the client's merge plan, kept on this device; not host state (an unreadable one is reported by name and moved aside by the person)",
         ),
         leaf(
             StoreScope::StateRoot,

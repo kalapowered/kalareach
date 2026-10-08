@@ -52,6 +52,19 @@ use crate::shown::{IoFault, Said, Shown};
 /// The extension every kept answer carries.
 const EXTENSION: &str = "answer";
 
+/// The format of a kept answer this build writes, recorded in it as `version`. A kept answer an
+/// earlier build wrote states none and is read as format 0, which differs from this format in the
+/// member alone.
+///
+/// Remove the reading of a kept answer that states no version once no supported upgrade starts
+/// from one written before the format was recorded.
+pub const ANSWER_FORMAT: u32 = 1;
+
+/// Whether a record states no format, which is how an earlier build wrote every one.
+const fn unstated(version: &u32) -> bool {
+    *version == 0
+}
+
 /// How long an answer this client sends asks the host to hold its admission.
 const ANSWER_TTL: DurationMs = DurationMs::new(120_000);
 
@@ -59,6 +72,11 @@ const ANSWER_TTL: DurationMs = DurationMs::new(120_000);
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnswerDraft {
+    /// The format of the record: [`ANSWER_FORMAT`] for one this build writes, 0 for one that states
+    /// none. A record of format 0 is written again without the member, so that one an earlier build
+    /// wrote reads back as the bytes it came from.
+    #[serde(default, skip_serializing_if = "unstated")]
+    pub version: u32,
     /// Where the answer goes: the environment, the session and its epoch.
     pub target: ActionTarget,
     /// The session the question belongs to.
@@ -470,12 +488,20 @@ fn read_draft(path: &Path) -> Result<AnswerDraft> {
         path: stored(path),
         fault: IoFault::from(error),
     })?;
-    kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).map_err(|error| {
-        AnswerError::Unreadable {
+    let draft: AnswerDraft = kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| AnswerError::Unreadable {
             path: stored(path),
             detail: Shown::cbor(&error),
-        }
-    })
+        })?;
+    // A later release's format is not read as this one: the member that says so is the only one
+    // this build knows to look at.
+    if draft.version > ANSWER_FORMAT {
+        return Err(AnswerError::Unreadable {
+            path: stored(path),
+            detail: Shown::said("it was kept by a later release of this client"),
+        });
+    }
+    Ok(draft)
 }
 
 /// What an answer that does not fit its question's form breaks, in words that carry none of it.
@@ -546,6 +572,7 @@ pub async fn answer<H: QuestionHost>(
     check_answer(question, &answer)
         .map_err(|_| AnswerError::Form(form_failure(question, &answer)))?;
     let draft = AnswerDraft {
+        version: ANSWER_FORMAT,
         target,
         session_id: question.session_id,
         question_id: question.question_id,

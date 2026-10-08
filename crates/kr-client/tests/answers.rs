@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kr_client::ClientError;
 use kr_client::answers::{
-    AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Reconciled, Retired, reconcile,
-    send,
+    ANSWER_FORMAT, AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Reconciled,
+    Retired, reconcile, send,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -715,4 +715,66 @@ async fn the_store_keeps_one_owner_only_file_per_question_and_writes_through_not
         "the link was replaced by the answer"
     );
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}
+
+/// KR-REQ-26.10: a kept answer states the format it is kept in, so that a release which changes the
+/// form of what it keeps can say which it reads. One an earlier build kept states none and is read
+/// as the format before there was one; one a later release kept is not read as this one.
+#[tokio::test]
+async fn a_kept_answer_states_its_format_and_one_of_a_later_format_is_not_read() {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+
+    let (directory, drafts) = store();
+    let kept = answer_offline(&drafts, &question(5)).await;
+    assert_eq!(kept.version, ANSWER_FORMAT);
+    let file = std::fs::read_dir(directory.path().join("answers"))
+        .expect("the directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "answer")
+        })
+        .expect("the kept answer's file");
+    let CanonicalValue::Map(record) = kr_cbor::decode(
+        &std::fs::read(&file).expect("reads"),
+        &kr_cbor::Limits::DEFAULT,
+    )
+    .expect("the record decodes") else {
+        panic!("a kept answer is a map");
+    };
+    assert_eq!(
+        record.get("version"),
+        Some(&CanonicalValue::integer(i128::from(ANSWER_FORMAT)).expect("an integer")),
+        "the record states its format"
+    );
+
+    // As an earlier build kept it: the same record, with no member that states a format.
+    let rewrite = |version: Option<i128>| {
+        let mut entries: Vec<(String, CanonicalValue)> = record
+            .entries()
+            .iter()
+            .filter(|(name, _)| name != "version")
+            .cloned()
+            .collect();
+        if let Some(version) = version {
+            entries.push((
+                "version".to_owned(),
+                CanonicalValue::integer(version).expect("an integer"),
+            ));
+        }
+        let map = CanonicalMap::from_entries(entries).expect("a map");
+        std::fs::write(&file, kr_cbor::encode(&CanonicalValue::Map(map))).expect("rewritten");
+    };
+    rewrite(None);
+    let earlier = drafts.drafts().expect("an earlier build's answer is read");
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(earlier[0].version, 0);
+    assert_eq!(earlier[0].question_id, kept.question_id);
+
+    rewrite(Some(i128::from(ANSWER_FORMAT) + 1));
+    assert!(
+        matches!(drafts.drafts(), Err(AnswerError::Unreadable { .. })),
+        "a later release's answer is not read as this one's"
+    );
 }

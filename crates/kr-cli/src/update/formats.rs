@@ -160,7 +160,7 @@ pub fn check(
                     why,
                 });
             };
-            match files(&directory, &listed.path) {
+            match files(&directory, listed) {
                 Ok(found) => {
                     for file in found {
                         if let Some(why) = look(listed, &file) {
@@ -238,12 +238,12 @@ fn configuration_directories(environment: &Environment) -> Vec<PathBuf> {
     found
 }
 
-/// The files a store's path names under a directory: the one file, or every record of a name in a
+/// The files a store names under a directory: the one file, or every record of an extension in a
 /// directory. A directory that is not there holds no record; one that cannot be listed is a store
 /// that cannot be read.
-fn files(directory: &Path, path: &str) -> Result<Vec<PathBuf>, Shown> {
-    let Some(inner) = path.strip_suffix("/*.json") else {
-        return Ok(vec![directory.join(path)]);
+fn files(directory: &Path, listed: &ReleaseStore) -> Result<Vec<PathBuf>, Shown> {
+    let Some((inner, extension)) = listed.records() else {
+        return Ok(vec![directory.join(&listed.path)]);
     };
     let entries = match std::fs::read_dir(directory.join(inner)) {
         Ok(entries) => entries,
@@ -266,7 +266,7 @@ fn files(directory: &Path, path: &str) -> Result<Vec<PathBuf>, Shown> {
         let path = entry.path();
         let record = path
             .extension()
-            .is_some_and(|extension| extension == "json")
+            .is_some_and(|candidate| candidate == extension)
             && path
                 .file_name()
                 .is_some_and(|name| !name.to_string_lossy().starts_with('.'));
@@ -334,6 +334,7 @@ fn read(listed: &ReleaseStore, file: &Path) -> Result<Option<u32>, Shown> {
             *absent,
             listed.scope == StoreScope::Configuration,
         ),
+        Recording::CborMember { member, absent } => cbor(file, member, *absent),
         Recording::Unknown => Err(Shown::said("its way of recording its version is not known")),
     }
 }
@@ -408,6 +409,48 @@ fn json(file: &Path, member: &str, absent: u32, lenient: bool) -> Result<Option<
         }),
         Some(Member::Other(_)) if lenient => Ok(None),
         Some(Member::Other(_)) => Err(Shown::said(
+            "the member that records its version is not a whole number",
+        )),
+    }
+}
+
+/// Reads the version a record in KR-CBOR-1 states in `member`; `absent` where it states none. A
+/// record that cannot be read as a map with a whole number there is refused.
+fn cbor(file: &Path, member: &str, absent: u32) -> Result<Option<u32>, Shown> {
+    use kr_cbor::CanonicalValue;
+
+    let bytes = match kr_ipc::install::read_regular_file(file, super::RECORD_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(Shown::said(
+                "it is not a regular file, or is larger than a record of its kind",
+            ));
+        }
+        Err(error) => {
+            return Err(shown!("it could not be read: {}", Shown::io(&error)));
+        }
+    };
+    let limits = kr_cbor::Limits {
+        max_message_len: bytes.len(),
+        max_items: bytes.len(),
+        max_collection_len: bytes.len(),
+        ..kr_cbor::Limits::DEFAULT
+    };
+    let Ok(CanonicalValue::Map(members)) = kr_cbor::decode(&bytes, &limits) else {
+        return Err(Shown::said("it is not a map in the canonical encoding"));
+    };
+    match members.get(member) {
+        None => Ok(Some(absent)),
+        Some(CanonicalValue::Integer(stated)) => stated
+            .as_u64()
+            .ok_or_else(|| Shown::said("the member that records its version is not a whole number"))
+            .and_then(|stated| {
+                u32::try_from(stated).map(Some).map_err(|_| {
+                    Shown::said("it records a version larger than any version a release reads")
+                })
+            }),
+        Some(_) => Err(Shown::said(
             "the member that records its version is not a whole number",
         )),
     }
@@ -521,29 +564,99 @@ mod tests {
         );
     }
 
-    /// A directory of records is listed, and one that cannot be listed is a store that cannot be
-    /// read: only a directory that is not there holds no record.
+    /// A directory of records is listed, by the extension the store names, and one that cannot be
+    /// listed is a store that cannot be read: only a directory that is not there holds no record.
     #[test]
     fn a_directory_of_records_that_cannot_be_listed_is_refused_and_one_that_is_not_there_is_not() {
+        let listed = |path: &str| ReleaseStore {
+            store: "records".to_owned(),
+            scope: StoreScope::StateRoot,
+            path: path.to_owned(),
+            recording: Recording::JsonMember {
+                member: "version".to_owned(),
+                absent: 0,
+            },
+            version: 1,
+            migrates_from: 0,
+        };
         let directory = tempfile::tempdir().expect("a directory");
         let records = directory.path().join("records");
         assert!(
-            files(directory.path(), "records/*.json")
+            files(directory.path(), &listed("records/*.json"))
                 .expect("no directory holds no record")
                 .is_empty()
         );
         std::fs::create_dir(&records).expect("a directory");
         record(&records, "one.json", "{}");
+        record(&records, "two.answer", "");
         record(&records, ".hidden.json", "{}");
         record(&records, "note.txt", "");
         assert_eq!(
-            files(directory.path(), "records/*.json").expect("lists"),
+            files(directory.path(), &listed("records/*.json")).expect("lists"),
             vec![records.join("one.json")]
+        );
+        assert_eq!(
+            files(directory.path(), &listed("records/*.answer")).expect("lists"),
+            vec![records.join("two.answer")]
         );
         // A file where the directory belongs cannot be listed.
         std::fs::remove_dir_all(&records).expect("removed");
         std::fs::write(&records, b"not a directory").expect("a file");
-        assert!(files(directory.path(), "records/*.json").is_err());
+        assert!(files(directory.path(), &listed("records/*.json")).is_err());
+    }
+
+    /// A record in KR-CBOR-1 states its version in its member, as a JSON record does: one that
+    /// states none is at the version the manifest gives for that, and one that is not a map, whose
+    /// member is not a whole number or is larger than any release reads cannot be shown to be in
+    /// range and is refused. A file that is not there is not checked.
+    #[test]
+    fn a_cbor_record_is_read_by_its_member_and_what_cannot_be_read_is_refused() {
+        use kr_cbor::{CanonicalMap, CanonicalValue, encode};
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let written = |name: &str, value: CanonicalValue| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, encode(&value)).expect("a record");
+            path
+        };
+        let map = |entries: Vec<(&str, CanonicalValue)>| {
+            CanonicalValue::Map(
+                CanonicalMap::from_entries(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.to_owned(), value)),
+                )
+                .expect("a map"),
+            )
+        };
+        let integer = |value: i128| CanonicalValue::integer(value).expect("an integer");
+        let read = |path: &Path| cbor(path, "version", 0).ok();
+        assert_eq!(
+            read(&written("one", map(vec![("version", integer(3))]))),
+            Some(Some(3))
+        );
+        assert_eq!(
+            read(&written("none", map(vec![("other", integer(1))]))),
+            Some(Some(0))
+        );
+        for (name, refused) in [
+            ("text", map(vec![("version", CanonicalValue::text("3"))])),
+            ("negative", map(vec![("version", integer(-1))])),
+            ("large", map(vec![("version", integer(4_294_967_296))])),
+            ("array", CanonicalValue::Array(vec![integer(1)])),
+        ] {
+            assert!(
+                cbor(&written(name, refused), "version", 0).is_err(),
+                "{name} cannot be read"
+            );
+        }
+        let torn = directory.path().join("torn");
+        std::fs::write(&torn, [0xa1, 0x67]).expect("a torn record");
+        assert!(cbor(&torn, "version", 0).is_err());
+        assert_eq!(
+            cbor(&directory.path().join("absent"), "version", 0).ok(),
+            Some(None)
+        );
     }
 
     fn rusqlite_open(path: &Path) -> rusqlite::Connection {

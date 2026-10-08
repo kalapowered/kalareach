@@ -624,6 +624,7 @@ mod cases {
 
     fn answer_draft(text: &str) -> crate::answers::AnswerDraft {
         crate::answers::AnswerDraft {
+            version: crate::answers::ANSWER_FORMAT,
             target: kr_protocol::envelope::ActionTarget {
                 environment_id: kr_protocol::ids::EnvironmentId::new(uuid(2)),
                 session_id: Nullable::some(SessionId::new(uuid(3))),

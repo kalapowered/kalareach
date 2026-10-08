@@ -90,6 +90,19 @@ use crate::stdout_line;
 /// The file the plan is kept in, in this user's own state directory.
 const PLAN_FILE: &str = "machine-merge-plan";
 
+/// The format of the plan this build writes, recorded in it as `version`. A plan an earlier build
+/// wrote states none and is read as format 0, which differs from this format in the member alone,
+/// and is written as this format the next time it is saved.
+///
+/// Remove the reading of a plan that states no version once no supported upgrade starts from one
+/// written before the format was recorded.
+pub const PLAN_FORMAT: u32 = 1;
+
+/// Whether a plan states no format, which is how an earlier build wrote every one.
+const fn unstated(version: &u32) -> bool {
+    *version == 0
+}
+
 /// The file the lock on the plan is taken on, beside the plan.
 const PLAN_LOCK_FILE: &str = "machine-merge-plan.lock";
 
@@ -623,6 +636,11 @@ async fn one_step<P: Serialize + ?Sized>(
 /// A merge over independent environments, kept by this client until each step has its result.
 #[derive(Clone, Serialize, Deserialize)]
 struct Plan {
+    /// The format of the plan: [`PLAN_FORMAT`] for one this build writes, 0 for one that states none.
+    /// A plan of format 0 is written again without the member, so that one an earlier build wrote
+    /// reads back as the bytes it came from.
+    #[serde(default, skip_serializing_if = "unstated")]
+    version: u32,
     /// The group the environments are merged into.
     into: MachineId,
     /// The group they are in now, and are moved out of.
@@ -790,19 +808,28 @@ fn load(paths: &HostPaths) -> Result<Option<Plan>> {
         max_collection_len: bytes.len(),
         ..kr_cbor::Limits::DEFAULT
     };
-    kr_cbor::from_canonical_slice(&bytes, &limits)
-        .map(Some)
-        .map_err(|_| {
-            CliError::Other(Shown::said(
-                "the merge plan this client keeps cannot be read; it is in this user's state \
-                 directory as machine-merge-plan, and the owner selects the environments again \
-                 once it is moved aside",
-            ))
-        })
+    let unreadable = || {
+        CliError::Other(Shown::said(
+            "the merge plan this client keeps cannot be read; it is in this user's state \
+             directory as machine-merge-plan, and the owner selects the environments again \
+             once it is moved aside",
+        ))
+    };
+    let plan: Plan = kr_cbor::from_canonical_slice(&bytes, &limits).map_err(|_| unreadable())?;
+    // A later release's format is not read as this one.
+    if plan.version > PLAN_FORMAT {
+        return Err(unreadable());
+    }
+    Ok(Some(plan))
 }
 
+/// The plan as it is kept: in this build's format, whatever format it was read in.
 fn encoded(plan: &Plan) -> Result<Vec<u8>> {
-    kr_cbor::to_canonical_vec(plan)
+    let kept = Plan {
+        version: PLAN_FORMAT,
+        ..plan.clone()
+    };
+    kr_cbor::to_canonical_vec(&kept)
         .map_err(|_| CliError::Other(Shown::said("the merge plan could not be encoded")))
 }
 
@@ -885,6 +912,7 @@ async fn plan_made(
         });
     }
     let plan = Plan {
+        version: PLAN_FORMAT,
         into,
         from,
         steps,
@@ -1490,6 +1518,8 @@ fn plan_document(plan: &Plan, kept: bool) -> Document {
 
 #[cfg(test)]
 mod tests {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+
     use super::*;
 
     fn group(
@@ -1525,6 +1555,67 @@ mod tests {
             mutation,
             state: StepState::Sent,
         }
+    }
+
+    /// KR-REQ-26.10: the plan states the format it is kept in. A plan an earlier build kept states
+    /// none, is read as the format before there was one and is kept in this format the next time it
+    /// is saved; a plan a later release kept is not read as this one.
+    #[test]
+    fn a_plan_states_its_format_and_one_of_a_later_format_is_not_read() {
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.paths();
+        let plan = |version| Plan {
+            version,
+            into: MachineId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
+            from: MachineId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            steps: vec![step()],
+            undo: Vec::new(),
+            undoing: false,
+        };
+        // A plan is kept in this build's format, whatever format it was read in.
+        save(paths, &plan(0)).expect("saves");
+        let kept = load(paths).expect("reads").expect("a plan is kept");
+        assert_eq!(kept.version, PLAN_FORMAT);
+
+        // As an earlier build kept it: the same plan, with no member that states a format.
+        let CanonicalValue::Map(record) = kr_cbor::decode(
+            &std::fs::read(plan_path(paths)).expect("reads"),
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("the plan decodes") else {
+            panic!("a plan is a map");
+        };
+        let rewrite = |version: Option<i128>| {
+            let mut entries: Vec<(String, CanonicalValue)> = record
+                .entries()
+                .iter()
+                .filter(|(name, _)| name != "version")
+                .cloned()
+                .collect();
+            if let Some(version) = version {
+                entries.push((
+                    "version".to_owned(),
+                    CanonicalValue::integer(version).expect("an integer"),
+                ));
+            }
+            let map = CanonicalMap::from_entries(entries).expect("a map");
+            std::fs::write(plan_path(paths), kr_cbor::encode(&CanonicalValue::Map(map)))
+                .expect("rewritten");
+        };
+        rewrite(None);
+        let earlier = load(paths).expect("reads").expect("a plan is kept");
+        assert_eq!(earlier.version, 0);
+        save(paths, &earlier).expect("saves");
+        assert_eq!(
+            load(paths).expect("reads").expect("kept").version,
+            PLAN_FORMAT
+        );
+
+        rewrite(Some(i128::from(PLAN_FORMAT) + 1));
+        assert!(
+            load(paths).is_err(),
+            "a later release's plan is not read as this one's"
+        );
     }
 
     fn at_the_precondition() -> MachineGroup {
@@ -1710,6 +1801,7 @@ mod tests {
         let mut done = step();
         done.state = StepState::Done(one_step_on());
         let mut plan = Plan {
+            version: PLAN_FORMAT,
             into: done.into,
             from: done.expected.machine_id,
             steps: vec![done],
@@ -1757,6 +1849,7 @@ mod tests {
             EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16]));
         never_sent.state = StepState::Refused(ErrorCode::InvalidArgument, Why::GivenUp);
         let mut plan = Plan {
+            version: PLAN_FORMAT,
             into: moved.into,
             from: moved.expected.machine_id,
             steps: vec![moved, never_sent],

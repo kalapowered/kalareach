@@ -558,7 +558,8 @@ pub struct ReleaseStore {
     /// Where its path starts.
     pub scope: StoreScope,
     /// Where it is, relative to the scope, its parts separated by `/`. A path that ends in
-    /// `/*.json` is every record of that name in a directory.
+    /// `/*.` and an extension of letters and digits, such as `/*.json`, is every record of that
+    /// extension in a directory.
     pub path: String,
     /// How its version is recorded.
     pub recording: Recording,
@@ -566,6 +567,24 @@ pub struct ReleaseStore {
     pub version: u32,
     /// The oldest version of the store this release brings forward when it opens it.
     pub migrates_from: u32,
+}
+
+/// The extension of a last part of a store's path that names every record of one extension in a
+/// directory: `json` for `*.json`.
+fn records_extension(part: &str) -> Option<&str> {
+    let extension = part.strip_prefix("*.")?;
+    (!extension.is_empty() && extension.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then_some(extension)
+}
+
+impl ReleaseStore {
+    /// The directory and the extension of a store that is every record of one extension in a
+    /// directory (`agent-tools/*.json`), or `None` for a store that is one file.
+    #[must_use]
+    pub fn records(&self) -> Option<(&str, &str)> {
+        let (directory, last) = self.path.rsplit_once('/')?;
+        records_extension(last).map(|extension| (directory, extension))
+    }
 }
 
 /// Where a store's path starts.
@@ -599,6 +618,14 @@ pub enum Recording {
     SqliteUserVersion,
     /// A member of a JSON record.
     JsonMember {
+        /// The member, a whole number.
+        member: String,
+        /// The version of a record that lacks the member.
+        #[serde(default)]
+        absent: u32,
+    },
+    /// A member of a record in KR-CBOR-1, a map of text keys.
+    CborMember {
         /// The member, a whole number.
         member: String,
         /// The version of a record that lacks the member.
@@ -956,7 +983,7 @@ impl ReleaseManifest {
             let parts: Vec<&str> = store.path.split('/').collect();
             for (index, part) in parts.iter().enumerate() {
                 let last = index + 1 == parts.len();
-                let glob = last && index > 0 && *part == "*.json";
+                let glob = last && index > 0 && records_extension(part).is_some();
                 if !glob
                     && (part.is_empty()
                         || *part == "."
@@ -988,7 +1015,8 @@ impl ReleaseManifest {
                     "records its version in a table with a name SQL cannot take",
                 ));
             }
-            if let Recording::JsonMember { member, .. } = &store.recording
+            if let Recording::JsonMember { member, .. } | Recording::CborMember { member, .. } =
+                &store.recording
                 && member.is_empty()
             {
                 return Err(refuse(name, "records its version in a member with no name"));
@@ -1450,6 +1478,8 @@ mod tests {
             "a*b",
             "*.json",
             "a/*.json/b",
+            "a/*.",
+            "a/*.j*son",
         ] {
             refused.push((
                 path,
@@ -1488,6 +1518,15 @@ mod tests {
                     scope: StoreScope::Configuration,
                     path: "config.json".to_owned(),
                     ..store("config", 1, 1)
+                },
+                ReleaseStore {
+                    scope: StoreScope::StateRoot,
+                    path: "kept-answers/*.answer".to_owned(),
+                    recording: Recording::CborMember {
+                        member: "version".to_owned(),
+                        absent: 0,
+                    },
+                    ..store("kept-answers", 1, 0)
                 },
             ])
             .check()

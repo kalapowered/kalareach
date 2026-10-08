@@ -1607,6 +1607,7 @@ mod tests {
 
     fn kept_draft_for(question: &Question) -> AnswerDraft {
         AnswerDraft {
+            version: kr_client::answers::ANSWER_FORMAT,
             target: crate::attach::target(&descriptor()),
             session_id: question.session_id,
             question_id: question.question_id,
