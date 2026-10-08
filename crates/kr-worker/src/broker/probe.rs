@@ -12,7 +12,7 @@
 //! much or prints something the declaration cannot read records no mode and says why, and does not
 //! stop a launch by itself: what the host could not read it does not guess at. One that did not
 //! finish is marked late, so that a launch that must not run in a mode it could not read can tell
-//! an application that did not answer from one whose answer holds no mode. A nonzero exit status
+//! an application that did not finish from one whose answer holds no mode. A nonzero exit status
 //! is not a failure: an application's diagnostic exits nonzero for a problem it reports in the
 //! output the host reads, and the output is the answer.
 

@@ -4657,8 +4657,9 @@ impl Session {
         if let Some(owned) = self.owned.as_mut() {
             owned.note_forced_now();
         }
-        // A shell whose status cannot be read may be running, so it is signalled as well. The
-        // identity recorded for it is checked before any signal, so one that has ended is skipped.
+        // A shell whose status cannot be read may be running, so it is signalled as well. Where a
+        // process is named by an identifier, the identity recorded for it is checked before any
+        // signal, so one that has ended is skipped.
         let shell = self
             .shell
             .as_mut()

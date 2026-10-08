@@ -501,8 +501,8 @@ async fn kr_req_07_64_a_refused_mode_is_a_named_failure_in_a_service_session_and
 /// stopped finishing; elsewhere, or for a package that refuses none, the launch goes ahead, and
 /// the application's own sandbox is left as it is: nothing is disabled and nothing is let out of
 /// the job. A probe that finished and printed nothing a mode can be read from is an answer, and
-/// the launch goes ahead in a service session too. The stand-ins that never finish never print
-/// either, so these cases decide by that and not by how soon the deadline passes.
+/// the launch goes ahead in a service session too. A stand-in that does not finish waits for ever,
+/// so these cases decide by that and not by how soon the deadline passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_launch_whose_probe_does_not_finish_is_a_named_failure_in_a_service_session()
 {
@@ -526,9 +526,13 @@ async fn kr_req_07_64_a_launch_whose_probe_does_not_finish_is_a_named_failure_in
         r#"[Console]::Out.Write('{"mode":"disabled"}'); Start-Sleep -Seconds 600"#,
     );
     let attempt = launch::launch(&printed_and_stalled, deadline, Some(true));
+    let error = attempt
+        .outcome
+        .expect_err("an answer that was not finished is no answer");
     assert!(
-        attempt.outcome.is_err(),
-        "an unfinished answer is no answer"
+        matches!(&error, kr_worker::broker::BrokerError::PreconditionFailed { detail }
+            if detail.contains("did not finish")),
+        "{error:?}"
     );
     assert!(!attempt.started, "nothing was started");
 

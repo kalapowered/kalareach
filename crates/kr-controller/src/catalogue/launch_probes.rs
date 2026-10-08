@@ -154,8 +154,9 @@ mod tests {
 
     /// How long these cases give a probe. The stand-in application is a file the machine has never
     /// run, and a machine can take longer than the daemon's own deadline to run one for the first
-    /// time, so a case decides by what the stand-in prints and not by how soon it prints.
-    const GENEROUS: Duration = Duration::from_secs(60);
+    /// time (a minute and more has been seen), so a case decides by what the stand-in prints and
+    /// not by how soon it prints.
+    const GENEROUS: Duration = Duration::from_secs(120);
 
     impl Store {
         fn new(name: &str) -> Self {

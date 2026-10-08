@@ -1255,7 +1255,7 @@ impl Backend {
     }
 
     /// Ends this backend: no more connections, no running admission, no endpoint, no credential, no
-    /// registration and no launch record.
+    /// registration, no launch record and no directory.
     ///
     /// Each admission task ends when it sees the state become retired, dropping its connection and
     /// any guard it holds. A launcher that looks later finds nothing and runs what was typed, which
@@ -1286,6 +1286,9 @@ impl Backend {
         {
             let _ = std::fs::remove_file(socket);
         }
+        // The directory goes with what was in it, so the names a session draws from are used up
+        // only by its live backends and not by every backend it ever had.
+        let _ = std::fs::remove_dir(&self.directory);
     }
 
     /// Marks this backend's line as over: unbound, it is retired now; being launched, its rollback

@@ -9,7 +9,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing |
+//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a backend is established under the longest runtime directory a Mac has by default, and a retired one leaves no directory; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -564,6 +564,10 @@ async fn kr_req_12_07_one_line_runs_one_integrated_invocation() {
         !directory.join("launch").exists(),
         "and its launch record: a launcher that looks late runs what was typed, which the \
          variable's file name says"
+    );
+    assert!(
+        !directory.exists(),
+        "and its directory, so a session's names are used up only by its live backends"
     );
 }
 

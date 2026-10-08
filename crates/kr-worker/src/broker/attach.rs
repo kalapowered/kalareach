@@ -607,7 +607,7 @@ pub struct NativeGateway {
     /// Whether this worker runs in a Windows service session, read once when the gateway is bound.
     ///
     /// It is [`in_service_session`] for every gateway this product binds. It is a field rather than
-    /// a call at the one place that reads it so that a test can put one gateway in each kind of
+    /// a call at the places that read it so that a test can put one gateway in each kind of
     /// session on any platform, and decide what a launch does there, instead of deciding it only
     /// on the machines that happen to be in one.
     in_service_session: bool,
@@ -1307,7 +1307,7 @@ impl NativeGateway {
     /// # Errors
     ///
     /// Returns [`BrokerError::PreconditionFailed`] in a Windows service session when the mode read
-    /// is one the package refuses there, and when the probe gave no answer in time for a package
+    /// is one the package refuses there, and when the probe did not finish in time for a package
     /// that refuses any: the mode is then unknown, and it may be one of them.
     fn read_vendor_mode(
         &self,
