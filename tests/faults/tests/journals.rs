@@ -72,7 +72,9 @@ fn session_on(path: &Path) -> Session {
 #[test]
 fn a_stored_intent_and_an_unanswered_marker_are_recovered_by_the_session_that_opens_them() {
     let (_directory, path) = made("unfinished-actions", Made::WithFault);
-    let stored = Journal::open_read_only(&path).expect("the stored journal opens to be read");
+    // The fixture is a store from an older schema version, which the worker that owns it brings
+    // forward when it opens it, and which a reader opens only after that.
+    let stored = Journal::open(&path).expect("the stored journal opens and is brought forward");
     assert_eq!(
         [1, 2, 3].map(|which| state_of(&stored, which)),
         [
