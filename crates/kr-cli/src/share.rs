@@ -1878,8 +1878,6 @@ mod tests {
             display_name: name.to_owned(),
             grant_id: GrantId::new(Uuid::from_bytes([seed; 16])),
             paired_at_ms: TimestampMs::new(1),
-            acknowledged_revision: Nullable::null(),
-            acknowledged_at_ms: Nullable::null(),
             revoked: false,
             keys: Nullable::null(),
             manages_host: false,

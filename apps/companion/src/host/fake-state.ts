@@ -364,8 +364,6 @@ export class ScriptedRecords {
         display_name: "Sam's iPhone",
         grant_id: idOf('e5e5e5e5', 1),
         paired_at_ms: String(ids.nowMs - 86_400_000),
-        acknowledged_revision: '4',
-        acknowledged_at_ms: String(ids.nowMs - 60_000),
         revoked: false,
         keys: null,
         manages_host: false,
@@ -379,8 +377,6 @@ export class ScriptedRecords {
         display_name: 'Old phone',
         grant_id: idOf('e5e5e5e5', 2),
         paired_at_ms: String(ids.nowMs - 900_000_000),
-        acknowledged_revision: '2',
-        acknowledged_at_ms: null,
         revoked: true,
         keys: null,
         manages_host: false,
@@ -395,8 +391,6 @@ export class ScriptedRecords {
         display_name: "Ricky's Mac",
         grant_id: idOf('e5e5e5e5', 3),
         paired_at_ms: String(ids.nowMs - 30 * 86_400_000),
-        acknowledged_revision: '4',
-        acknowledged_at_ms: String(ids.nowMs - 30_000),
         revoked: false,
         keys: null,
         manages_host: true,
@@ -410,8 +404,6 @@ export class ScriptedRecords {
         display_name: "Sam's iPad",
         grant_id: idOf('e5e5e5e5', 4),
         paired_at_ms: String(ids.nowMs - 5 * 86_400_000),
-        acknowledged_revision: '4',
-        acknowledged_at_ms: String(ids.nowMs - 90_000),
         revoked: false,
         keys: null,
         manages_host: false,
@@ -425,8 +417,6 @@ export class ScriptedRecords {
         display_name: 'Guest tablet',
         grant_id: idOf('e5e5e5e5', 5),
         paired_at_ms: String(ids.nowMs - 600_000),
-        acknowledged_revision: '4',
-        acknowledged_at_ms: String(ids.nowMs - 60_000),
         revoked: false,
         keys: null,
         manages_host: false,
@@ -440,8 +430,6 @@ export class ScriptedRecords {
         display_name: 'Lapsed laptop',
         grant_id: idOf('e5e5e5e5', 6),
         paired_at_ms: String(ids.nowMs - 3 * 86_400_000),
-        acknowledged_revision: '4',
-        acknowledged_at_ms: String(ids.nowMs - 3_600_000),
         revoked: false,
         keys: null,
         manages_host: false,
@@ -1218,7 +1206,8 @@ export class ScriptedRecords {
       devices: this.#devices.filter((device) => read.include_revoked || !device.revoked),
       authority_revision: '4',
       feed_synchronised_at_ms: String(this.#ids.nowMs - 30_000),
-      feed_stale: false
+      feed_stale: false,
+      feed_removed: false
     }
   }
 
