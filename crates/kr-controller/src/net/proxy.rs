@@ -53,6 +53,13 @@ pub struct Vouched<'a> {
     /// it holds results to a scope ([`kr_protocol::local::FORWARDED_RESULT_SCOPE`]), because an
     /// earlier worker ends the link a frame with a member it does not know arrived on.
     pub history: Option<&'a HistoryScope>,
+    /// Whether the grant the host decided this request under is a share, whose issuer was shown
+    /// the session's screen as text. A `session.attach` is then drawn that screen and no more.
+    ///
+    /// It goes only to a worker that states
+    /// [`kr_protocol::local::FORWARDED_PREVIEWED_SCREEN`], and an attach under a share is
+    /// refused for a worker that does not, since the worker would draw it more than was shown.
+    pub previewed_screen: bool,
 }
 use crate::service::Controller;
 
@@ -227,6 +234,9 @@ pub struct WorkerProxy {
     /// A worker of an earlier build keeps a retained answer whole and ends the link a mutation with
     /// a scope arrived on, so such a worker is sent none.
     holds_results_to_scopes: bool,
+    /// Whether the worker said, in the same answer, that it narrows an attachment to the screen a
+    /// share's issuer previewed when the attach asks it to.
+    narrows_to_previewed_screens: bool,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -314,6 +324,8 @@ impl WorkerProxy {
             kr_protocol::local::holds_question_reads_to_scopes(&acknowledgement.capabilities);
         let holds_results_to_scopes =
             kr_protocol::local::holds_results_to_scopes(&acknowledgement.capabilities);
+        let narrows_to_previewed_screens =
+            kr_protocol::local::narrows_to_previewed_screens(&acknowledgement.capabilities);
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -333,6 +345,7 @@ impl WorkerProxy {
             reads_history_scopes,
             holds_question_reads,
             holds_results_to_scopes,
+            narrows_to_previewed_screens,
         }))
     }
 
@@ -386,6 +399,18 @@ impl WorkerProxy {
         {
             return Err(self.cannot_hold_results_to_a_scope());
         }
+        // An attachment under a share is drawn the screen its issuer was shown, which a worker that
+        // does not state it narrows to would draw more of; it is not asked.
+        let previewed_screen =
+            vouched.previewed_screen && mutation.method.method() == Some(Method::SessionAttach);
+        if previewed_screen && !self.narrows_to_previewed_screens {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::UnsupportedCapability,
+                detail: "this session's worker is of a build that cannot draw a shared session's \
+                         screen as its issuer was shown it, so it is not asked"
+                    .to_owned(),
+            });
+        }
         let request_id = self.next_request_id();
         let mut forwarded = mutation.clone();
         // The request identity is this link's; the durable identity is the action's, and that
@@ -400,6 +425,7 @@ impl WorkerProxy {
                 .history
                 .filter(|_| self.holds_results_to_scopes)
                 .cloned(),
+            previewed_screen,
         }));
         let mut answered = self.call(request_id, &frame).await?;
         answered.holds_results_to_scopes = self.holds_results_to_scopes;

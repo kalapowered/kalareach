@@ -5591,9 +5591,8 @@ fn sets_a_title_and_a_link(title: &str, link: &str, word: &str) -> String {
 /// KR-REQ-25.10 and KR-REQ-10.50: what a recipient is sent of the live screen is what its issuer was
 /// shown. The issuer's preview is the screen's text; a window title and the target of a link are
 /// behind that text, so a recipient is sent neither, in the screen it joins, in the updates that
-/// follow, or in the bytes that follow, whichever way it is served. So is a device that acts under
-/// its pairing grant, which the host narrows by the same rule. The owner's own terminal, drawn the
-/// whole screen, is sent both.
+/// follow, or in the bytes that follow, whichever way it is served. The owner's own terminal and a
+/// device that acts under its pairing grant, whose pairing no preview described, are sent both.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer_was_not_shown() {
@@ -5712,7 +5711,8 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
     restoration.subscribed().expect("the order is kept");
 
     // And a device that acts under its pairing grant, which reaches the session and its live
-    // screen: the host narrows every caller that is not the owner at this machine by one rule.
+    // screen. No issuer was shown a preview of what it is sent, so it is sent the screen as the
+    // application wrote it.
     let own_device = Device::create(&loopback()).await;
     let mut own_grant = proposing(&[ActionRight::SessionView], SessionSelector::Any);
     own_grant.history.include_live_screen = true;
@@ -5760,11 +5760,7 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
             && rendering_kinds.contains("session.projection.delta"),
         "the other is served a rendering of its grid, installed and then updated: {rendering_kinds:?}"
     );
-    for (how, received) in [
-        ("bytes", &by_bytes),
-        ("a rendering", &by_rendering),
-        ("bytes, under a pairing grant", &by_pairing_grant),
-    ] {
+    for (how, received) in [("bytes", &by_bytes), ("a rendering", &by_rendering)] {
         for hidden in [HIDDEN_TITLE, HIDDEN_LINK, LATER_TITLE, LATER_LINK] {
             assert!(
                 !received.contains(hidden),
@@ -5774,6 +5770,14 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
         assert!(
             received.contains("a link"),
             "and is sent the text: {received:?}"
+        );
+    }
+    // The control: nothing was previewed to a device under its pairing grant, and it is sent the
+    // titles and the targets as the application wrote them.
+    for told in [HIDDEN_TITLE, HIDDEN_LINK, LATER_TITLE, LATER_LINK] {
+        assert!(
+            by_pairing_grant.contains(told),
+            "a device under its pairing grant is sent {told}: {by_pairing_grant:?}"
         );
     }
 

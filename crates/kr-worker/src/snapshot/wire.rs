@@ -282,7 +282,7 @@ pub fn keyboard_within(
     scope: crate::render::Scope,
 ) -> ProjectedKeyboard {
     let mut projected = keyboard(value);
-    if scope == crate::render::Scope::LiveScreen {
+    if !scope.shows_the_other_buffer() {
         let withheld = kr_protocol::projection::KittyKeyboardState {
             flags: Nullable(None),
             stack: Vec::new(),
@@ -309,7 +309,7 @@ pub fn saved_cursors_within(
     values
         .iter()
         .flatten()
-        .filter(|cursor| scope == crate::render::Scope::WholeScreen || cursor.buffer == active)
+        .filter(|cursor| scope.shows_the_other_buffer() || cursor.buffer == active)
         .map(|cursor| saved_cursor(cursor, scope))
         .collect()
 }

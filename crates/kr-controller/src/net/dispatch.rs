@@ -92,8 +92,8 @@ pub struct RemoteConnection {
     /// to the session's worker opened ([`Self::fix`]).
     fixed: std::sync::Mutex<Option<(kr_protocol::ids::SessionId, kr_protocol::ids::GrantId)>>,
     /// The end of every share this connection has decided a request under, by the share
-    /// ([`Self::grant_ended`] waits for them): one it opened its worker link under, and one it
-    /// only read under.
+    /// ([`Self::grant_ended`] waits for them): the one it opened its worker link under, and any
+    /// other a read or a mutation was decided under.
     share_bounds: std::sync::Mutex<
         std::collections::BTreeMap<kr_protocol::ids::GrantId, crate::grants::policy::HeldBound>,
     >,

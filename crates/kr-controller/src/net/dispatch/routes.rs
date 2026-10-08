@@ -742,6 +742,7 @@ impl RemoteConnection {
                                 actor: &envelope,
                                 grant_rights: &grant_rights,
                                 history: Some(&history),
+                                previewed_screen: false,
                             },
                             accepted,
                             &observer,
