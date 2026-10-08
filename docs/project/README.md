@@ -41,8 +41,9 @@ working tree.
   widening a grant that covers an existing one.
 * A linked worktree and a repository this host published are decided as exactly the recorded tree,
   never a directory inside it, and Git's search for the repository stops above the tree.
-* A repository the owner adopted records whether its path is its top level. At the top level the
-  path is decided as exactly the tree; below it, a directory inside the recorded tree is accepted.
+* A repository the owner adopted records whether its path is its top level. Where the record says
+  it is, the path is decided as exactly the tree; where it does not, a directory inside the
+  recorded tree is accepted.
 * One rule checks every recorded directory: the inode names it, the recorded filesystem says
   where. One that reports an identity is refused when it differs; the same under another device
   number is accepted. A project's record takes the number when the project is opened, and a

@@ -4218,9 +4218,10 @@ struct OpenedWorkspace {
 /// A project this host initialised or cloned was published at its path, so the directory there is
 /// its tree and nothing below it, and its own `.git` leads to its repository. A project the
 /// owner adopted keeps its Git directory wherever its configuration puts it. Its record says
-/// whether its path is the top level: where it is, the directory at the path is the tree and
-/// nothing below it; where the adoption named a directory below the top level, the directory at
-/// the path may lie inside the recorded tree.
+/// whether its path is the top level: where it does, the directory at the path is the tree and
+/// nothing below it; where the adoption named a directory below the top level, or the record
+/// predates the answer and says nothing, the directory at the path may lie inside the recorded
+/// tree.
 fn project_tree(project: &ProjectRow) -> RecordedTree {
     let git_dir = project.identity.git_dir;
     RecordedTree {

@@ -313,8 +313,8 @@ impl OpenedRepository {
     /// is asked anything. For a repository the owner registered whose record does not say that its
     /// path is the top level the directory at the path may lie inside the recorded tree
     /// ([`GitDirectory::Named`], `require_within`); for a tree this host made
-    /// ([`GitDirectory::AtTree`], [`GitDirectory::InsideTree`]) and for one the owner registered
-    /// at its top level it is the tree itself, and for a
+    /// ([`GitDirectory::AtTree`], [`GitDirectory::InsideTree`]) and for one whose record says that
+    /// its path is the top level it is the tree itself, and for a
     /// repository made inside its tree the tree's own `.git` must also be a directory, and the
     /// recorded one where a record names it, before Git starts. Git then
     /// reports the top level of the repository it finds, and that top level is decided before its
@@ -362,11 +362,12 @@ impl OpenedRepository {
         let ceiling = match recorded {
             Some(recorded) => {
                 // A tree this host made is at its own place and nowhere below it, and so is a
-                // repository the owner registered at its top level, so the directory at the path
-                // is the tree itself. A directory inside the tree is what Git would start in when
-                // a link at the path names one, and a repository found there is not the one the
-                // record is for. A repository the owner registered through a directory below its
-                // top level keeps that directory's path.
+                // repository whose record says that its path is the top level, so the directory
+                // at the path is the tree itself. A directory inside the tree is what Git would
+                // start in when a link at the path names one, and a repository found there is not
+                // the one the record is for. A repository the owner registered through a
+                // directory below its top level keeps that directory's path, and so does one
+                // whose record does not say.
                 let within = if recorded.git_dir.path_is_tree() {
                     decide_tree_before_git(&work_tree, recorded.tree)?;
                     work_tree.try_clone()?
