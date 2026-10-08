@@ -1994,6 +1994,24 @@ async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
     );
 }
 
+/// The parameter list of an answer: the decision a person chose, one of the two a request offers.
+fn decision_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "parameters": [{
+            "name": "decision",
+            "kind": {
+                "type": "choice",
+                "choices": [
+                    { "id": "allow", "label": "Allow" },
+                    { "id": "deny", "label": "Deny" },
+                ],
+            },
+            "label": "Decision",
+            "required": true,
+        }],
+    })
+}
+
 /// Registers the plugin action the resource tests below call, on the approval tests' binding: a
 /// component's `upstream.prompt` that names the pending resource it acts on.
 fn register_answer_action(host: &Host) {
@@ -2003,7 +2021,7 @@ fn register_answer_action(host: &Host) {
             "label": "Answer",
             "effect": "upstream.prompt",
             "implementation": { "type": "component" },
-            "parameters": { "parameters": [] },
+            "parameters": decision_parameters(),
             "description": "A prompt its component prepares",
             "confirmation_required": false,
         }))
@@ -2137,10 +2155,10 @@ async fn plugin_refusal(
 }
 
 /// Section 5: an action the package's component prepares is admitted as any other, and refused
-/// before its dispatch marker because this host calls no export of a component to prepare an
-/// effect, with that reason.
+/// before its dispatch marker while its component is not registered with the plugin runtime, with
+/// that reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_action_the_component_prepares_is_refused_because_no_component_is_called_to_prepare() {
+async fn an_action_whose_component_is_not_registered_is_refused_before_its_marker() {
     let host = host().await;
     let upstream = Arc::new(CountingUpstream::default());
     register(
@@ -2150,11 +2168,12 @@ async fn an_action_the_component_prepares_is_refused_because_no_component_is_cal
     register_answer_action(&host);
     let mut client = cli(&host).await;
     let (error, action_id) = plugin_refusal(&mut client, &host, 40, Nullable::null()).await;
-    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    // The link has not registered the component yet, and will: asking again can succeed.
+    assert_eq!(error.code, ErrorCode::ResourceUnavailable);
     assert!(
         error
             .message
-            .contains("this host calls no export of a component to prepare an effect"),
+            .contains("is not registered with the plugin runtime"),
         "{}",
         error.message
     );
@@ -2184,14 +2203,15 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
     let mut client = cli(&host).await;
 
     // The controls: the resource check passes, and the refusal is the one every plugin action
-    // meets here. Nothing about the live resource changed.
+    // meets here, that its component is not registered with the plugin runtime. Nothing about the
+    // live resource changed.
     assert_eq!(
         plugin_answer(&mut client, &host, 40, Nullable::null()).await,
-        (ErrorCode::UnsupportedCapability, ReceiptState::Rejected)
+        (ErrorCode::ResourceUnavailable, ReceiptState::Rejected)
     );
     assert_eq!(
         plugin_answer(&mut client, &host, 41, Nullable::some(live)).await,
-        (ErrorCode::UnsupportedCapability, ReceiptState::Rejected)
+        (ErrorCode::ResourceUnavailable, ReceiptState::Rejected)
     );
     assert_eq!(
         host.service
@@ -2780,6 +2800,17 @@ fn plugin_invocation(
     }
 }
 
+/// What an action whose component this suite never registers with a plugin runtime is refused with:
+/// a prompt is refused because its component is not registered yet, which can pass, and an
+/// attachment because it acts on a draft this worker does not read yet.
+fn expected_refusal(action: &str) -> ErrorCode {
+    if action == "prompt.send" {
+        ErrorCode::ResourceUnavailable
+    } else {
+        ErrorCode::UnsupportedCapability
+    }
+}
+
 /// Forwards one mutation as the control daemon does for a paired device acting under a grant
 /// that carries `grant_rights`.
 async fn forward_as_device(
@@ -2811,13 +2842,16 @@ async fn forward_as_device(
 /// binding, as the package declares them: an answer through the connector table's decision
 /// destination, and a prompt and an attachment its component prepares.
 fn register_class_actions(host: &Host) {
-    let declared = |id: &str, effect: &str, implementation: serde_json::Value| {
+    let declared = |id: &str,
+                    effect: &str,
+                    implementation: serde_json::Value,
+                    parameters: serde_json::Value| {
         serde_json::from_value::<kr_plugin_sdk::effect::ActionDeclaration>(serde_json::json!({
             "id": id,
             "label": id,
             "effect": effect,
             "implementation": implementation,
-            "parameters": { "parameters": [] },
+            "parameters": parameters,
             "description": format!("{id}, as the package declares it"),
             "confirmation_required": false,
         }))
@@ -2833,16 +2867,19 @@ fn register_class_actions(host: &Host) {
                     "request.answer",
                     "approval.respond",
                     serde_json::json!({ "type": "decision_destination", "decision": "decision" }),
+                    decision_parameters(),
                 ),
                 declared(
                     "prompt.send",
                     "upstream.prompt",
                     serde_json::json!({ "type": "component" }),
+                    serde_json::json!({ "parameters": [] }),
                 ),
                 declared(
                     "draft.attach",
                     "upstream.attachment",
                     serde_json::json!({ "type": "component" }),
+                    serde_json::json!({ "parameters": [] }),
                 ),
             ],
         )
@@ -2978,7 +3015,7 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
         .expect_err("no component's prepared effect reaches this broker");
         assert_eq!(
             refusal.code,
-            ErrorCode::UnsupportedCapability,
+            expected_refusal(action),
             "{action}, with the rights its class needs: {refusal:?}"
         );
     }
@@ -3012,7 +3049,7 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
         };
         assert_eq!(
             refusal.code,
-            ErrorCode::UnsupportedCapability,
+            expected_refusal(action),
             "{action}, from the local owner: {refusal:?}"
         );
     }
