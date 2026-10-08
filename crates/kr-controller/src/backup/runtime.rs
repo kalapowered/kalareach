@@ -54,10 +54,10 @@ use kr_transport::config::ProxyUrl;
 use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
 
-use crate::backup::quiet::{Owed, Quiet, Timer};
 use crate::backup::uploader::{Hold, Idle, PassReport, Stepped, Uploader};
 use crate::backup::{BackupService, BackupSignals};
 use crate::error::{ControllerError, Result};
+use crate::quiet::{Owed, Quiet, Timer};
 
 /// How long a condition only a person can clear waits before the host asks again.
 pub const OPERATOR_CEILING: Duration = Duration::from_secs(5 * 60);

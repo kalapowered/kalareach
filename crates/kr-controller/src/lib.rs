@@ -54,6 +54,7 @@ pub mod machine;
 pub mod privacy;
 pub mod project;
 pub mod push;
+pub mod quiet;
 pub mod registry;
 pub mod service;
 pub mod sharing;
