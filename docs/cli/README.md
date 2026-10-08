@@ -1646,22 +1646,26 @@ control daemon alone holds the sign-in:
 
 ```sh
 kr account sign-in    # print the address to open in a browser, and open it
-kr account show       # signed out, waiting for the browser, signed in at which service, or ended
+kr account show       # signed out, waiting for the browser, signed in, or ended
 ```
 
 `kr account sign-in` asks the daemon to listen on `127.0.0.1:8765`, the loopback address the desktop
 client is registered with, and prints the address to open with the port to forward for a host with
 no display (`ssh -L 8765:127.0.0.1:8765 <host>`). It opens the address in the default browser where
 there is one and always prints it. The command ends when the daemon is listening; the browser's page
-says how the sign-in ended, and `kr account show` says it again, with how the last attempt ended.
-Nothing either command prints is a token. `docs/host/README.md` has the rest, and
+says how the sign-in ended, and `kr account show` says it again, with how the last attempt that ended
+ended. Nothing either command prints is a token. The host signs in at the managed account service,
+which must be the voice broker its configuration names; `docs/host/README.md` has the rest, and
 `docs/voice/README.md` what a call does with the account.
 
 `--json` prints `{ "ok", "opened", "authorise_url", "redirect_address", "expires_at_ms" }` for
-`sign-in`, and `{ "ok", "state", "service", "email", "scopes", "last_attempt" }` for `show`, where
-`state` is `signed_out`, `waiting_for_browser`, `finishing`, `signed_in` or `ended` and the other
-fields are present only when they apply. A host whose configuration names no managed service refuses
-`sign-in` with `HOST_NOT_CONFIGURED`.
+`sign-in`; when the attempt had already ended by the time the command looked, it prints the `show`
+document instead. `show` prints `{ "ok", "state", "service", "unavailable", "email", "scopes",
+"last_attempt" }`, where `state` is `signed_out`, `waiting_for_browser`, `finishing`, `signed_in`
+or `ended`, and the other fields are present only when they apply: `service` is where the host signs
+in, and `unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it signs in
+nowhere. A host that signs in nowhere refuses `sign-in` with `HOST_NOT_CONFIGURED`, and one with a
+voice call open refuses it with `RESOURCE_UNAVAILABLE`.
 
 ## `kr host paths`
 

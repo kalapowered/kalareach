@@ -244,29 +244,37 @@ than leaving a host that appears to run and cannot be reached.
 Brokering a managed call spends an account's balance, so the host signs an account in on its own,
 at this machine. `kr account sign-in` asks the control daemon over its local socket
 (`account.sign_in`, served there alone and asking for host management). The daemon listens on the
-loopback address the desktop client is registered with, `127.0.0.1:8765`, and answers the address a
-person opens in a browser; the command opens it and always prints it, with a note for a host
-without a display: forward the port from the machine that has the browser,
-`ssh -L 8765:127.0.0.1:8765 <host>`, and open the printed address there. The daemon exchanges the
-answer with the service, keeps the grant in the host's secret store, and records the service's
-origin beside it. `kr account show` (`account.status`) says whether the host is signed out, waiting
-for the browser, signed in at which service, or ended, and how the last attempt ended. Nothing it
-prints or answers is a token.
+loopback address the desktop client is registered with, `127.0.0.1:8765`; the command reads the
+address a person opens in a browser from the daemon (`account.status`), opens it and always prints
+it, with a note for a host without a display: forward the port from the machine that has the
+browser, `ssh -L 8765:127.0.0.1:8765 <host>`, and open the printed address there. The daemon
+exchanges the answer with the service and keeps the grant in the host's secret store.
+`kr account show` says whether the host is signed out, waiting for the browser, signed in, or
+ended, and how the last attempt that ended ended. Nothing it prints or answers is a token.
 
-The grant is the one the companion keeps on a desktop: an access token that lasts ten minutes, and
-a refresh token that rotates on every use, so a second holder would end the sign-in. That is why
-only the daemon holds it. A call that needs a token asks for one when it needs it, and the daemon
-refreshes the grant then, never before. A token is presented only to the service the grant was
-signed in at. When the document names another broker origin than the one recorded, no token is
-presented, and the host says so until a person signs in again against the new origin. Signing in
-again replaces the grant and queues the old one for revocation. A host whose service ended the
-sign-in (a refresh token it no longer accepts) shows `ended` until then.
+The browser signs in at the managed account service, and the code it brings back is redeemable
+there and nowhere else, so the exchange, every refresh and every revocation go to that one service.
+The host presents a token to the voice broker its configuration names only when that broker is the
+account service (`voice.broker_origin` is `https://reach.kala.to`). A host whose broker is another
+service has nothing to sign in to: `kr account sign-in` says so and no token is presented. What the
+store holds is kept under the service's name, so a grant, and a revocation that waits to be sent, are
+reached only through the service that issued them.
+
+The grant is of the same kind as the one the companion keeps on a desktop: an access token that
+lasts ten minutes, and a refresh token that rotates on every use, so a second holder would end the
+sign-in. That is why only the daemon holds it. A call that needs a token asks for one when it needs
+it, and the daemon refreshes the grant then, never before. At start the daemon settles what an
+earlier run left: a grant whose revocation was queued is removed, and every revocation the service
+has not acknowledged is sent again, before any token is handed out. Signing in again replaces the
+grant and queues the old one for revocation. A host whose service ended the sign-in (a refresh token
+it no longer accepts) shows `ended` until then.
 
 The sign-in is single use and local: one attempt waits at a time, a newer one ends the older one,
 and nothing is waiting after fifteen minutes. A program that already holds the loopback address
-stops the attempt with `port_busy`. A host that held an account token file from an earlier version
-removes it once, when the daemon starts, because that file held no refresh credential; the person
-signs in.
+stops the attempt with `port_busy`. A call closes under the account it started under, so a sign-in
+is refused while a voice call is open on the host, and one that is waiting when a call opens ends
+without spending its code. A host that held an account token file from an earlier version removes it
+once, when the daemon starts, because that file held no refresh credential; the person signs in.
 
 ### How the daemon is started
 

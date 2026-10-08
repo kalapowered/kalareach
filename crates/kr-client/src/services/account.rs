@@ -1925,7 +1925,8 @@ impl SignedInAccount {
     /// an account shares: the host keeps one account for each environment in the one store the
     /// whole machine's daemons use.
     ///
-    /// A scope is a secret-store name segment: lower-case ASCII, digits, `.`, `-` and `_`.
+    /// A scope is one or more secret-store name segments separated by `/`: lower-case ASCII,
+    /// digits, `.`, `-` and `_`.
     #[must_use]
     pub fn in_scope(mut self, scope: impl Into<String>) -> Self {
         self.item_scope = Some(scope.into());

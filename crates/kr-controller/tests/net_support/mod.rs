@@ -67,6 +67,30 @@ pub fn write_document(
     .expect("the configuration document");
 }
 
+/// Where the managed account service stands for a daemon a suite starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountAt {
+    /// At its own fixed origin, which a suite's stand-in is not at.
+    Managed,
+    /// At the voice broker the configuration document names, as a deployment that serves both from
+    /// one origin does: a suite stands its service up there.
+    Broker,
+}
+
+/// The voice broker the configuration document of `temp` names, when it names one.
+fn broker_of(temp: &kr_ipc::testing::TempHost) -> Option<String> {
+    let environment = temp.environment();
+    let path = kr_protocol::hostinfo::configuration::document_path(
+        environment.state_dir(),
+        environment.state_root(),
+        environment.environment_id(),
+    );
+    let bytes = std::fs::read(path).ok()?;
+    kr_protocol::hostinfo::configuration::load(Some(&bytes))
+        .document
+        .and_then(|document| document.voice.broker_origin().map(str::to_owned))
+}
+
 /// A supervisor that starts nothing. These suites create no sessions.
 #[derive(Debug)]
 pub struct RefusingSupervisor;
@@ -115,6 +139,8 @@ pub struct Host {
     pub room: room::TestRoom,
     /// The network settings the host was started with, which a restart keeps.
     settings: NetworkSettings,
+    /// Where the account service stands for it, which a restart keeps.
+    account_at: AccountAt,
 }
 
 impl Host {
@@ -136,6 +162,16 @@ impl Host {
         owner: &DeviceKeys,
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
+        Self::start_with_document_at(owner, document, AccountAt::Broker).await
+    }
+
+    /// Starts a daemon whose configuration document is `document`, with the managed account
+    /// service at `account_at`.
+    pub async fn start_with_document_at(
+        owner: &DeviceKeys,
+        document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+        account_at: AccountAt,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         write_document(&temp, document);
         let mut host = Self::start_on(
@@ -145,6 +181,7 @@ impl Host {
                 endpoint: loopback(),
                 ..NetworkSettings::default()
             },
+            account_at,
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -169,6 +206,7 @@ impl Host {
                 endpoint: loopback(),
                 ..NetworkSettings::default()
             },
+            AccountAt::Managed,
         )
         .await
     }
@@ -192,6 +230,7 @@ impl Host {
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
             settings,
+            AccountAt::Managed,
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -223,6 +262,7 @@ impl Host {
             owner,
             room,
             settings,
+            account_at,
             ..
         } = self;
         clients.abort();
@@ -245,6 +285,7 @@ impl Host {
             room,
             owner,
             settings,
+            account_at,
         }
     }
 
@@ -254,31 +295,39 @@ impl Host {
         temp: kr_ipc::testing::TempHost,
         room: room::TestRoom,
         settings: NetworkSettings,
+        account_at: AccountAt,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
+        let account_origin = match account_at {
+            AccountAt::Managed => None,
+            AccountAt::Broker => broker_of(&temp),
+        };
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
-            Controller::start(ControllerSetup {
-                paths: environment.clone(),
-                environment_id,
-                identity: Box::new(move || {
-                    let store =
-                        open_store_in(&secrets).expect("a secret store for the test environment");
-                    Ok(
-                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                            .expect("an identity"),
-                    )
+            kr_controller::testing::with_account_origin(
+                account_origin.clone(),
+                Controller::start(ControllerSetup {
+                    paths: environment.clone(),
+                    environment_id,
+                    identity: Box::new(move || {
+                        let store = open_store_in(&secrets)
+                            .expect("a secret store for the test environment");
+                        Ok(
+                            ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                                .expect("an identity"),
+                        )
+                    }),
+                    secret_store: StoreSelection::File,
+                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    supervisor: Box::new(RefusingSupervisor),
+                    worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                    build_id: build(),
+                    release: "0".to_owned(),
+                    shell_packages: None,
+                    terminal: Box::new(kr_controller::supervision::NoTerminal),
                 }),
-                secret_store: StoreSelection::File,
-                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: Box::new(RefusingSupervisor),
-                worker_program: PathBuf::from("/nonexistent/kr-worker"),
-                build_id: build(),
-                release: "0".to_owned(),
-                shell_packages: None,
-                terminal: Box::new(kr_controller::supervision::NoTerminal),
-            })
+            )
         })
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
@@ -309,6 +358,7 @@ impl Host {
             owner_device: None,
             room,
             settings,
+            account_at,
         }
     }
 
@@ -405,6 +455,7 @@ pub struct Stopped {
     room: room::TestRoom,
     owner: Option<DeviceRecord>,
     settings: NetworkSettings,
+    account_at: AccountAt,
 }
 
 impl Stopped {
@@ -424,9 +475,13 @@ impl Stopped {
     /// `settings` and the stopped one's owner.
     pub async fn start(self, settings: NetworkSettings) -> Host {
         let Self {
-            temp, room, owner, ..
+            temp,
+            room,
+            owner,
+            account_at,
+            ..
         } = self;
-        let mut host = Host::start_on(temp, room, settings).await;
+        let mut host = Host::start_on(temp, room, settings, account_at).await;
         host.owner = owner;
         host
     }
