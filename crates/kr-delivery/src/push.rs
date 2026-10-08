@@ -154,6 +154,14 @@ pub trait DeliveryStatus: std::fmt::Debug + Send + Sync {
         let _ = steady_ms;
         true
     }
+
+    /// Gives back a question [`Self::reserve`] took and that was not put.
+    ///
+    /// A reservation is taken before the delivery it is for is claimed, and some of what follows
+    /// ends without a question: a renewal that is not asked for, a grant that ended, a notification
+    /// that expired. The allowance is the gateway's, counted by the question, and one that was
+    /// never put has not used it.
+    fn release(&self) {}
 }
 
 /// What a status question returned.
