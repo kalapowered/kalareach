@@ -1448,6 +1448,20 @@ async fn a_writer_nobody_enrolled_is_asked_for_again_only_as_a_person_can_act() 
     })
     .await;
 
+    // A later question turned back for another cause only a person can mend is the newer fact, and
+    // the remedy is the one it needs and not the one the pass before it asked for.
+    rig.served.web().fail(
+        STATUS,
+        1,
+        Moment::Refuse {
+            status: 402,
+            code: "QUOTA_EXHAUSTED",
+            retry_after_seconds: None,
+        },
+    );
+    let remedy = rig.storage_remedy().await;
+    assert!(remedy.contains("allowance"), "{remedy}");
+
     // The owner enrols the writer, and the next look at the service publishes.
     rig.owner_enrols_the_writer().await;
     timer.run_by_itself();
@@ -1681,7 +1695,17 @@ async fn a_woken_carrier_waits_only_for_what_is_left_of_a_delay() {
     // asked to be left alone, and waits the rest.
     timer.advance(Duration::from_secs(100));
     rig.admit(2, &[(3, plaintext(2048))]);
-    let (left, _) = within("the rest of the delay", timer.next_wait()).await;
+    // A pass the first admission woke may have asked for the whole delay before the clock moved:
+    // that wait was asked for at the earlier reading and is not the one this test is about.
+    let left = within("the rest of the delay", async {
+        loop {
+            let (asked, _) = timer.next_wait().await;
+            if asked < Duration::from_secs(600) {
+                break asked;
+            }
+        }
+    })
+    .await;
     assert_eq!(left, Duration::from_secs(500));
     assert!(!rig.published(1));
 }
@@ -1921,6 +1945,26 @@ async fn the_cleanup_privacy_mode_owes_ends_the_work_in_hand_whatever_the_token_
             .all(|request| request.token.as_deref() != Some("a-token-without-the-scope")),
         "nothing left the host with a token it could not use"
     );
+
+    // What the abandonment was turned back for was the host's own token and not a thing at the
+    // service. The person signs in again with a usable grant, and the doctor does not go on blaming
+    // the writer key or the service for it.
+    rig.controller
+        .host_account()
+        .keep_for_test(IssuedGrant {
+            access_token: AccountToken::new(TOKEN).expect("a token"),
+            expires_in_seconds: 3600,
+            refresh_token: RefreshToken::new("a-refresh-token").expect("a token"),
+            scopes: vec![
+                "openid".to_owned(),
+                "voice".to_owned(),
+                "backup.write".to_owned(),
+            ],
+            subject: "account-1".to_owned(),
+        })
+        .await;
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Ok, "{detail}");
 
     // Nothing is left owed, so privacy mode turns off.
     assert!(
