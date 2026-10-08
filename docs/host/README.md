@@ -3212,7 +3212,11 @@ hour for one, whatever the service writes. The daemon records the delay where th
 and its clients send nothing while a delay is owed: not the question about an earlier publication,
 not the first question about backup storage, not the status read `kr doctor` makes, and not the
 next request of a pass that was running when the delay arrived. That pass ends and says where it
-stopped. A fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A
+stopped. A fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed; a
+host under a fence is not held back by a delay at all, because the gate cannot tell cleanup from
+other work. One request escapes the rule: the client repeats a request that is safe to repeat once,
+by itself, after a short delay of ten seconds or less, and that repeat does not look at the record
+again. A
 refusal only a person can clear that names a delay is waited for as long as the longer of the delay
 and five minutes, and new work still waits out the delay. A refusal that names a delay and one that needs a
 person can come in the same pass, for example when a publication is refused because the writer is
@@ -3236,7 +3240,8 @@ admits generations to the outbox this carries. It serves no method of its own: `
 token is usable and when it stops being accepted, whether backup storage is on for the account and
 what allowance the service reports, what the last pass did, and what the service turned back,
 whether a status read or a pass met it. The check reads well only when the token is usable, backup
-storage is on, and neither the last status read nor the last pass was turned back. When the service
+storage is on, and neither the last status read nor the last pass that carried work was turned back.
+When the service
 refused the writer, the detail gives the start of the writer key's identifier for the owner to
 enrol. With no origin configured the check is not applicable. The status read happens once, for five
 seconds at most, and not at all while the service has asked to be left alone or the host has no
