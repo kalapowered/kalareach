@@ -99,15 +99,15 @@ pub enum GitDirectory {
     /// A record names it, and the repository keeps it wherever its configuration puts it: a
     /// checkout whose configuration sets `core.worktree` keeps it above its tree, so Git's search
     /// for the repository is not stopped above the tree. A repository the owner registered may
-    /// have been registered through a directory below its top level; the record says whether its
-    /// path is the top level, and where it is not, the directory at the recorded path is the tree
-    /// or lies inside it.
+    /// have been registered through a directory below its top level. Where the record says that
+    /// its path is the top level, the directory at the path is the tree itself; where it does not
+    /// say so, the directory at the recorded path is the tree or lies inside it.
     Named {
         /// The record of the repository's Git directory.
         recorded: RecordedIdentity,
-        /// Whether the record's path is the working tree's top level, which the registration
-        /// established when the repository was taken in: the directory at the path is then the
-        /// tree itself, never a directory inside it.
+        /// Whether the record says that its path is the working tree's top level: the directory
+        /// at the path is then the tree itself, never a directory inside it. A record an earlier
+        /// build wrote for an adoption by a path alone does not say so, whatever the path is.
         path_is_top_level: bool,
     },
     /// A record names it, and this host made the tree at the record's path: a linked worktree, or
@@ -366,8 +366,9 @@ impl OpenedRepository {
                 // at the path is the tree itself. A directory inside the tree is what Git would
                 // start in when a link at the path names one, and a repository found there is not
                 // the one the record is for. A repository the owner registered through a
-                // directory below its top level keeps that directory's path, and so does one
-                // whose record does not say.
+                // directory below its top level keeps that directory's path, and a record that
+                // does not say may have it, so the directory at either path may lie inside the
+                // tree.
                 let within = if recorded.git_dir.path_is_tree() {
                     decide_tree_before_git(&work_tree, recorded.tree)?;
                     work_tree.try_clone()?

@@ -77,9 +77,10 @@ pub struct ProjectRow {
     pub identity: RecordedRepository,
     /// The path it was created or adopted at, for a person to read.
     pub display_path: String,
-    /// Whether that path is the repository's working tree's top level, as opposed to a directory
-    /// below it, which an adoption may name. The creation or the adoption established it when the
-    /// repository was taken in; the directory at the path is then decided as exactly the tree.
+    /// Whether the record says that the path is the repository's working tree's top level, as
+    /// opposed to a directory below it, which an adoption may name. The creation or the adoption
+    /// writes what it found; the directory at the path is then decided as exactly the tree. A row
+    /// an earlier build wrote for an adoption by a path alone holds false, whatever the path is.
     pub path_is_top_level: bool,
     /// The remote it was cloned from, when it has one.
     pub remote: Option<RemoteSpecification>,
