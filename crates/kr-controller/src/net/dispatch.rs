@@ -91,10 +91,13 @@ pub struct RemoteConnection {
     /// The session this connection serves and the grant it acts under for it, fixed when the link
     /// to the session's worker opened ([`Self::fix`]).
     fixed: std::sync::Mutex<Option<(kr_protocol::ids::SessionId, kr_protocol::ids::GrantId)>>,
-    /// The end of the share the connection acts under, once it is fixed to one
-    /// ([`Self::grant_ended`] waits for it).
-    fixed_bound: std::sync::Mutex<Option<crate::grants::policy::HeldBound>>,
-    /// Notified when a grant is fixed, so that the wait for a grant's end looks at it.
+    /// The end of every share this connection has decided a request under, by the share
+    /// ([`Self::grant_ended`] waits for them): one it opened its worker link under, and one it
+    /// only read under.
+    share_bounds: std::sync::Mutex<
+        std::collections::BTreeMap<kr_protocol::ids::GrantId, crate::grants::policy::HeldBound>,
+    >,
+    /// Notified when a share's end is taken up, so that the wait for a grant's end looks at it.
     acting_changed: tokio::sync::Notify,
     /// Where a notification the proxy read is written.
     notifications: tokio::sync::mpsc::Sender<Relayed>,
@@ -151,7 +154,7 @@ impl RemoteConnection {
             authority,
             proxy: tokio::sync::Mutex::new(None),
             fixed: std::sync::Mutex::new(None),
-            fixed_bound: std::sync::Mutex::new(None),
+            share_bounds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             acting_changed: tokio::sync::Notify::new(),
             notifications,
             // What this connection said it could receive, never more than the protocol's own
@@ -237,7 +240,7 @@ impl RemoteConnection {
             authority,
             proxy: tokio::sync::Mutex::new(None),
             fixed: std::sync::Mutex::new(None),
-            fixed_bound: std::sync::Mutex::new(None),
+            share_bounds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             acting_changed: tokio::sync::Notify::new(),
             notifications,
             budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
@@ -300,10 +303,10 @@ impl RemoteConnection {
             .fixed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *self
-            .fixed_bound
+        self.share_bounds
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Returns the envelope every request on this connection is attributed to.

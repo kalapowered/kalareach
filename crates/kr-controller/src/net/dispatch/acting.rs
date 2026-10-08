@@ -167,28 +167,55 @@ impl RemoteConnection {
             None => {}
         }
         if acting.held == Held::Share {
-            if !self
-                .controller
-                .note_acting(self.connection_id, acting.grant.grant_id)
-            {
-                return Err(withdrawn());
-            }
-            let record = self.share_record(acting.grant.grant_id)?;
-            if record.revoked_at_ms.is_some() {
-                return Err(ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this grant has been revoked",
-                ));
-            }
-            *self
-                .fixed_bound
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(self.share_bound(&record)?);
+            let record = self.noted_share_record(acting.grant.grant_id)?;
+            self.hold_share_bound(acting.grant.grant_id, self.share_bound(&record)?);
         }
         *fixed = Some((session_id, acting.grant.grant_id));
         drop(fixed);
         self.acting_changed.notify_waiters();
         Ok(())
+    }
+
+    /// A share this connection is about to decide a request under, read from the grant store.
+    ///
+    /// The share is noted on the connection's registration **before** its record is read, and
+    /// every place that decides under a share reads it here, so the order is one rule and not a
+    /// habit of each caller: a revocation of the share either withdraws this connection, because
+    /// the share is noted, or has committed already, and the record says so. Read the other way
+    /// round, a revocation could land between the two and withdraw nothing.
+    ///
+    /// A share noted for a request that is then refused stays on the registration. A later
+    /// revocation of it fences this connection too, which is the safe direction.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a connection the host has withdrawn, a grant this device does not hold, and a
+    /// share that has been revoked.
+    pub(super) fn noted_share_record(
+        &self,
+        grant_id: GrantId,
+    ) -> std::result::Result<GrantRecord, ProtocolError> {
+        if !self.controller.note_acting(self.connection_id, grant_id) {
+            return Err(withdrawn());
+        }
+        let record = self.share_record(grant_id)?;
+        if record.revoked_at_ms.is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this grant has been revoked",
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Takes up the end of a share this connection decided a request under, so the connection is
+    /// ended when the share is, whether or not it ever opened a link to a worker under it.
+    pub(super) fn hold_share_bound(&self, grant_id: GrantId, bound: HeldBound) {
+        self.share_bounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(grant_id, bound);
+        self.acting_changed.notify_waiters();
     }
 
     /// Resolves once a grant this connection stands on has ended: the pairing grant that lets the
@@ -209,18 +236,18 @@ impl RemoteConnection {
             if !self.grant_is_current() {
                 return;
             }
-            let share = self
-                .fixed_bound
+            let shares: Vec<HeldBound> = self
+                .share_bounds
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(share) = &share
-                && !super::output::bounds_hold(
-                    &self.controller,
-                    std::slice::from_ref(share),
-                    crate::grants::policy::HeldBound::stands_at,
-                )
-            {
+                .values()
+                .cloned()
+                .collect();
+            if !super::output::bounds_hold(
+                &self.controller,
+                &shares,
+                crate::grants::policy::HeldBound::stands_at,
+            ) {
                 return;
             }
             let now = self.controller.clock.now();
@@ -233,17 +260,19 @@ impl RemoteConnection {
                     .grant_deadline
                     .map(|deadline| deadline.saturating_duration_since(now)),
                 until_utc(self.authority.grant_expires_at_ms),
-                share.as_ref().and_then(|share| {
-                    share
-                        .continuous_deadline()
-                        .map(|deadline| deadline.saturating_duration_since(now))
-                }),
-                share
-                    .as_ref()
-                    .and_then(|share| until_utc(share.utc_deadline_ms())),
             ]
             .into_iter()
             .flatten()
+            .chain(shares.iter().flat_map(|share| {
+                [
+                    share
+                        .continuous_deadline()
+                        .map(|deadline| deadline.saturating_duration_since(now)),
+                    until_utc(share.utc_deadline_ms()),
+                ]
+                .into_iter()
+                .flatten()
+            }))
             .min();
             match soonest {
                 // A clock can step forward and end a grant sooner than the time it has left, so
