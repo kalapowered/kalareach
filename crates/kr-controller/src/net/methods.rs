@@ -326,8 +326,15 @@ impl Controller {
                 let params: PairConfirmParams = decode(&mutation.params)?;
                 // The grant is issued at the authority revision in force when it is written.
                 let revision = self.authority_revision().await?;
-                blocking(move || pairing.confirm(&caller, &params, action, revision, &admission))
-                    .await
+                let confirmed = blocking(move || {
+                    pairing.confirm(&caller, &params, action, revision, &admission)
+                })
+                .await?;
+                // A device that now manages this host is a key the feed may be told can remove it.
+                if let Some(runtime) = self.feed_runtime() {
+                    runtime.wake();
+                }
+                Ok(confirmed)
             }
             Method::PairCancel => {
                 let pairing = self.pairing_service()?;

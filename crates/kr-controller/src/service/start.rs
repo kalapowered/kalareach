@@ -490,6 +490,9 @@ impl Controller {
         // a revision the registry has already used, and would report an old number as the one in
         // force.
         feed.note_revision(authority_revision);
+        // This host is the one enrolled host of its own feed: each host's feed is its own, so a
+        // record settles once this host has acknowledged it.
+        feed.enrol(host_device_id);
         sharing.grants().store_feed(&feed.snapshot())?;
         let attention = Arc::new(crate::attention::AttentionModule::open(
             &setup.paths,
@@ -632,8 +635,37 @@ impl Controller {
                     writer,
                     &origin,
                     tokens,
-                    timer,
+                    Arc::clone(&timer),
                 )?)
+            }
+        };
+        // The authority feed this host reads its remote revocations from, when its configuration
+        // document selects one. It signs as the host, with the authorisation key its pairings
+        // recorded, which is what the feed is addressed by. Nothing runs yet.
+        let feed_runtime = match started.authority.origin() {
+            None => None,
+            Some(origin) => {
+                let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
+                    ControllerError::NotConfigured(format!(
+                        "{} in this host's configuration document ({}) is not usable: {error}",
+                        kr_protocol::hostinfo::configuration::AUTHORITY_ORIGIN.key,
+                        kr_protocol::hostinfo::configuration::FILE_NAME,
+                    ))
+                })?;
+                let client = crate::authority_feed::managed_client(
+                    &origin,
+                    Self::proxy_of(&started)?.as_ref(),
+                    Arc::new(crate::push::sender::HostSigner::new(
+                        device_keys.authorisation.clone(),
+                    )),
+                )?;
+                Some(crate::authority_feed::FeedRuntime::new(
+                    client,
+                    &origin,
+                    kr_protocol::ids::DeviceId::new(setup.environment_id.get()),
+                    device_keys.authorisation.clone(),
+                    Arc::clone(&timer),
+                ))
             }
         };
         // External destinations' credentials are kept in the same store as this host's own keys,
@@ -736,6 +768,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_claim: ReadPause::default(),
             #[cfg(feature = "testing")]
+            after_a_feed_request_was_carried_out: ReadPause::default(),
+            #[cfg(feature = "testing")]
             after_the_retained_lookup: ReadPause::default(),
             #[cfg(feature = "testing")]
             before_a_connection_is_registered: ReadPause::default(),
@@ -787,6 +821,7 @@ impl Controller {
             plugin_runtime,
             backup,
             backup_runtime,
+            feed_runtime,
             transfer,
             project,
             qualification: std::sync::RwLock::new(qualification),
@@ -1007,6 +1042,20 @@ impl Controller {
         // client to ask before it looked would leave an enabled setting doing nothing until
         // somebody happened to run a command.
         let _ = controller.power_state().await;
+        // What the authority feed answered an earlier run, put right for the feed this host reads
+        // now: a removal stands for the feed that answered it and for no other, so an owner who
+        // pointed the host at another feed, or at none, has the grants that rest on the feed back
+        // before anything remote is decided. The carrier starts before the network does, so the
+        // first connection to arrive finds a synchronisation to wait for.
+        let removed = controller
+            .authority_feed_at_start(controller.started.authority.origin())
+            .await?;
+        if let Some(runtime) = &controller.feed_runtime {
+            if removed {
+                runtime.found_removed();
+            }
+            runtime.run(&controller);
+        }
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
         // that sessions this host is running do not exist. Registering it also lends the project

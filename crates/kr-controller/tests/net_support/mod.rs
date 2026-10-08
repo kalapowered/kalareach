@@ -94,6 +94,17 @@ pub struct Host {
     pub room: room::TestRoom,
     /// The network settings the host was started with, which a restart keeps.
     settings: NetworkSettings,
+    /// What else the host was started with, which a restart keeps.
+    waits: Waits,
+}
+
+/// What a suite hands a daemon besides its network settings.
+#[derive(Clone, Default)]
+pub struct Waits {
+    /// The timer the daemon's carriers wait by, when the suite holds their waits. A daemon started
+    /// with one also joins the network with its own key store, as a daemon's start does, so the
+    /// host key it signs a service's requests with is the one its pairings recorded.
+    pub timer: Option<Arc<dyn kr_controller::quiet::Timer>>,
 }
 
 impl Host {
@@ -118,8 +129,34 @@ impl Host {
                 endpoint: loopback(),
                 ..NetworkSettings::default()
             },
+            Waits::default(),
         )
         .await
+    }
+
+    /// Starts a daemon whose configuration document selects the authority feed at `origin`, whose
+    /// carrier waits by `timer`, with `owner` as its first owner.
+    pub async fn start_with_feed(
+        owner: &DeviceKeys,
+        origin: &str,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+    ) -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        write_feed_document(&temp, Some(origin));
+        let mut host = Self::start_on(
+            temp,
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            Waits { timer: Some(timer) },
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
     }
 
     /// Starts a daemon whose network selects the services `endpoint` names, with `owner` as its
@@ -141,6 +178,7 @@ impl Host {
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
             settings,
+            Waits::default(),
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -172,6 +210,7 @@ impl Host {
             owner,
             room,
             settings,
+            waits,
             ..
         } = self;
         clients.abort();
@@ -194,6 +233,7 @@ impl Host {
             room,
             owner,
             settings,
+            waits,
         }
     }
 
@@ -203,12 +243,13 @@ impl Host {
         temp: kr_ipc::testing::TempHost,
         room: room::TestRoom,
         settings: NetworkSettings,
+        waits: Waits,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
-            Controller::start(ControllerSetup {
+            let setup = ControllerSetup {
                 paths: environment.clone(),
                 environment_id,
                 identity: Box::new(move || {
@@ -227,7 +268,13 @@ impl Host {
                 release: "0".to_owned(),
                 shell_packages: None,
                 terminal: Box::new(kr_controller::supervision::NoTerminal),
-            })
+            };
+            async {
+                match &waits.timer {
+                    Some(timer) => Controller::start_on_timer(setup, Arc::clone(timer)).await,
+                    None => Controller::start(setup).await,
+                }
+            }
         })
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
@@ -240,7 +287,20 @@ impl Host {
             &controller,
             NetworkSetup {
                 settings: settings.clone(),
-                secrets: Arc::new(MemoryStore::new()),
+                secrets: if waits.timer.is_some() {
+                    Arc::from(
+                        controller
+                            .secret_store()
+                            .open(
+                                kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
+                                &environment.secrets_dir(),
+                            )
+                            .expect("the daemon's own key store")
+                            .store,
+                    )
+                } else {
+                    Arc::new(MemoryStore::new())
+                },
                 rendezvous: Some(Arc::new(room.clone())),
             },
         )
@@ -258,6 +318,7 @@ impl Host {
             owner_device: None,
             room,
             settings,
+            waits,
         }
     }
 
@@ -357,6 +418,7 @@ pub struct Stopped {
     room: room::TestRoom,
     owner: Option<DeviceRecord>,
     settings: NetworkSettings,
+    waits: Waits,
 }
 
 impl Stopped {
@@ -376,12 +438,50 @@ impl Stopped {
     /// `settings` and the stopped one's owner.
     pub async fn start(self, settings: NetworkSettings) -> Host {
         let Self {
-            temp, room, owner, ..
+            temp,
+            room,
+            owner,
+            waits,
+            ..
         } = self;
-        let mut host = Host::start_on(temp, room, settings).await;
+        let mut host = Host::start_on(temp, room, settings, waits).await;
         host.owner = owner;
         host
     }
+
+    /// Starts a daemon on the stopped one's environment tree as [`Self::start`] does, its carriers
+    /// waiting by `timer`.
+    pub async fn start_with_timer(self, timer: Arc<dyn kr_controller::quiet::Timer>) -> Host {
+        let Self {
+            temp,
+            room,
+            owner,
+            settings,
+            ..
+        } = self;
+        let mut host = Host::start_on(temp, room, settings, Waits { timer: Some(timer) }).await;
+        host.owner = owner;
+        host
+    }
+}
+
+/// Writes the configuration document that selects the authority feed at `origin`, or one that
+/// selects none, into a host tree.
+pub fn write_feed_document(host: &kr_ipc::testing::TempHost, origin: Option<&str>) {
+    let environment = host.environment();
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = 1;
+    document.authority.origin = origin
+        .map_or_else(kr_protocol::scalars::Nullable::null, |origin| {
+            kr_protocol::scalars::Nullable::some(origin.to_owned())
+        });
+    let path = kr_worker::config::document_path(&environment);
+    std::fs::create_dir_all(path.parent().expect("a state directory")).expect("the directory");
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("the document");
 }
 
 /// A device with keys of its own and an endpoint to dial from.

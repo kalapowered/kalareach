@@ -64,6 +64,7 @@ pub mod plugin_runtime;
 mod prompt;
 mod reads;
 mod recovery;
+pub(crate) mod remote_revocation;
 mod rendezvous;
 mod revocation;
 mod routes;
@@ -376,6 +377,8 @@ pub struct Controller {
     /// What carries the backup outbox to the managed storage service, when this host's
     /// configuration document selects one.
     backup_runtime: Option<crate::backup::runtime::BackupRuntime>,
+    /// The carrier of this host's authority feed, when its configuration document names one.
+    feed_runtime: Option<crate::authority_feed::FeedRuntime>,
     /// The configuration this daemon has put into force.
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the
@@ -429,6 +432,8 @@ pub struct Controller {
     /// its specification is made. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_claim: ReadPause,
+    #[cfg(feature = "testing")]
+    after_a_feed_request_was_carried_out: ReadPause,
     /// How the loop that serves one local connection paces what it writes unasked. A shipped build
     /// has the one pace the constants name; this host's own tests choose another.
     #[cfg(feature = "testing")]
@@ -916,6 +921,12 @@ impl Controller {
     #[must_use]
     pub const fn backup_runtime(&self) -> Option<&crate::backup::runtime::BackupRuntime> {
         self.backup_runtime.as_ref()
+    }
+
+    /// The carrier of this host's authority feed, when its configuration document names one.
+    #[must_use]
+    pub const fn feed_runtime(&self) -> Option<&crate::authority_feed::FeedRuntime> {
+        self.feed_runtime.as_ref()
     }
 }
 

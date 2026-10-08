@@ -985,7 +985,7 @@ impl Controller {
 
     /// This host's own device identity, derived from its environment.
     #[must_use]
-    pub(super) fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
+    pub(crate) fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
         kr_protocol::ids::DeviceId::new(self.paths.environment_id().get())
     }
 }

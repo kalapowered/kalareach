@@ -396,6 +396,15 @@ impl ServiceWeb {
         }
     }
 
+    /// A week passes in every authority feed: the records their hosts finished with are dropped, as
+    /// the feed's retention drops them, so a different request can then carry an identity an
+    /// earlier one did.
+    pub fn a_week_passes_in_the_feeds(&self) {
+        for feed in self.state.lock().expect("the state").feeds.values_mut() {
+            feed.forget_what_was_finished();
+        }
+    }
+
     /// Backup storage is turned on or off by some other client.
     pub fn set_backup(&self, on: bool) {
         let mut state = self.state.lock().expect("the state");

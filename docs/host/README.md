@@ -4878,6 +4878,30 @@ nothing had contradicted it would be worse than no list. The feed records that a
 owed from the moment a connection is established until one has happened on it, and an unreachable
 feed is reported stale rather than current.
 
+When the configuration document names an `authority.origin`, the daemon runs a carrier for the feed
+for as long as it lives; when it names none, no remote owner's revocation can reach the host and the
+owners paired with it revoke directly. The origin is read once, at start. The carrier signs as the
+host, with the authorisation key its pairings recorded, which is what the feed is addressed by, and
+reads the feed at four moments: when the daemon starts, when a connection is established, every 30
+seconds after that, and when an owner is paired or revoked. A connection waits for a read that began
+after it was admitted before anything it asks is answered, for at most five seconds, so a device
+the feed holds a revocation for is refused on its first request and not at the next poll; a feed
+that does not answer in that time leaves the status stale and the connection served.
+
+The host judges each request from its own records. A request addressed to another host, or that
+names nothing this host knows, is refused to the feed as an unknown target; one signed by a key that
+is not a paired device whose grant lets it manage this host is refused as lacking owner authority;
+a different request under an identity this host already took is refused as superseded. A request
+that passes is written down before it takes effect, carried out through the same revocation the
+owner at the machine makes, issued the revision the daemon's registry allocated, and acknowledged
+with the completion the barrier reports. A host that stops anywhere in that finishes the same
+request the same way and takes it once. A request for what the owner at the machine had already
+withdrawn changes nothing and is refused as covered, because there is no revision to issue for it.
+The host also tells the feed which keys may remove it: the owners it is paired with, the eight
+oldest pairings if there are more, and `kr doctor` says how many owners are beyond that. The feed
+takes the whole list at once, so the host compares it with what the feed lists on every answer and
+sends it again whenever they differ.
+
 A feed can also answer that this host was removed from it. A removal ends the feed's retention of
 everything addressed to the host, so the host learns no revocation from it again, and a revocation
 an owner published there and the host had not applied is gone. The host records the answer with the

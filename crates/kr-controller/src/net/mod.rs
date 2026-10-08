@@ -538,6 +538,13 @@ impl NetworkHost {
         let Ok(controller) = self.daemon() else {
             return;
         };
+        // Section 10: synchronise the authority feed at reconnect before affected remote access.
+        // A revocation the feed holds for this device is carried out before anything it asks is
+        // answered, so its first request finds its registration gone. A feed that does not answer
+        // in time leaves the status stale and does not hold the connection.
+        if let Some(runtime) = controller.feed_runtime() {
+            runtime.synchronised_before_serving().await;
+        }
         let (notifications, relayed) = tokio::sync::mpsc::channel(RELAY_DEPTH);
         // Section 9 makes the accepted deadline the earliest of the window's expiry, receipt time
         // plus the requested lifetime and any applicable authority deadline. A grant that runs out
