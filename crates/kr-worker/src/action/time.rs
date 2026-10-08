@@ -1419,6 +1419,13 @@ impl TimeContract {
             return;
         }
         self.trust_again(state, continuous_ms, wall_ms, reading.clone(), true);
+        // A restatement adds nothing to what the worker has proved, so it does not lower it: a
+        // clock inside the tolerance behind the worker's reading leaves the mark where it was.
+        if established.restated
+            && let (Some(reference), Some(mark)) = (reference, state.high_water.as_mut())
+        {
+            mark.wall_ms = mark.wall_ms.max(reference.wall_ms);
+        }
     }
 
     /// Returns what a host has to write down to keep its promises, and which change it is.
