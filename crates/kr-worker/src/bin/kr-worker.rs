@@ -334,7 +334,12 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 journal_path: Some(environment.journal_database(specification.session_id)),
             },
         )?
-        .with_plugin_admissions(admissions, Arc::clone(&sources)),
+        .with_plugin_admissions(admissions, Arc::clone(&sources))
+        .with_plugin_runtime(kr_worker::plugin_runtime::RuntimeRequest {
+            session_id,
+            rendezvous: arguments.rendezvous.clone(),
+            environment: environment.clone(),
+        }),
     );
     // The backends an integrated invocation is given before it runs, established from the
     // connectors the admissions carry; every later snapshot replaces them, and a resolve that finds
