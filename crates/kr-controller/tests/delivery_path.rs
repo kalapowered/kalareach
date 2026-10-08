@@ -1135,6 +1135,22 @@ impl Environment {
             .await
     }
 
+    /// Pairs a device whose grant reaches only `sessions`, and connects it.
+    async fn phone_for_sessions(&self, sessions: kr_protocol::grant::SessionSelector) -> Phone {
+        let keys = DeviceKeys::generate().expect("device keys");
+        let device = Device::with_keys(keys).await;
+        let mut grant = proposal(&[ActionRight::SessionView]);
+        grant.session_selector = sessions;
+        grant.history.lower_bound_ms = Nullable::some(TimestampMs::new(1));
+        let record = pair_with(&self.host, &device, &self.owner, grant).await;
+        let connection = RawDevice::connect(&self.host, &device, &record).await;
+        Phone {
+            device,
+            record,
+            connection,
+        }
+    }
+
     /// The same device, connected again after the daemon restarted: its keys and its pairing.
     async fn phone_with_keys_of(&self, phone: &Phone) -> Phone {
         let device = Device::with_keys(phone.device.keys().clone()).await;
@@ -3820,6 +3836,13 @@ async fn a_webhook_the_owner_creates_is_told_of_the_next_question_and_not_after_
     let text = posted.text();
     assert!(text.contains("waiting for an answer"), "{text}");
     assert!(
+        text.contains(&format!(
+            "A question is waiting in session {}.",
+            environment.worker_session
+        )),
+        "the host's own words name the session the grant reaches: {text}"
+    );
+    assert!(
         text.contains(kr_delivery::external::RECIPIENTS_CAN_READ),
         "{text}"
     );
@@ -4002,6 +4025,65 @@ async fn a_destination_is_refused_unless_the_owner_may_make_it_under_a_grant_tha
     assert!(environment.destination_named("ops").is_some());
 }
 
+/// KR-REQ-18.08, KR-REQ-25.23: what an external message names is checked against the grant of the
+/// rule that sends it. Two webhooks under two paired devices' grants: one reaches every session,
+/// and its message names the session a worker's question was asked in; the other reaches one other
+/// session, and is told nothing of this one, neither a message nor a record of one. The session
+/// the second grant reaches is asked about too, and its message names that session alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_external_message_names_only_the_sessions_its_grant_reaches() {
+    const WORDS: &str = "Deploy the release to production?";
+    let environment = Environment::start().await;
+    let everywhere = environment.phone().await;
+    let other_session = SessionId::new(kr_ipc::new_uuid());
+    let elsewhere = environment
+        .phone_for_sessions(kr_protocol::grant::SessionSelector::These {
+            session_ids: [other_session].into_iter().collect(),
+        })
+        .await;
+    for (name, grant) in [
+        ("everywhere", everywhere.record.grant.grant_id),
+        ("elsewhere", elsewhere.record.grant.grant_id),
+    ] {
+        environment
+            .configure(&webhook(
+                name,
+                &format!("https://hooks.example.test/in/{name}"),
+                None,
+                grant,
+            ))
+            .await
+            .expect("the owner creates a webhook");
+    }
+
+    environment._worker.ask("deploy-1", WORDS);
+    until(
+        "the webhook that reaches the session being posted to",
+        || !environment.gateway.posted().is_empty(),
+    )
+    .await;
+    until_the_questions_are_settled(&environment, 1).await;
+    let posted = environment.gateway.posted();
+    assert_eq!(posted.len(), 1, "one message, to one webhook");
+    assert_eq!(posted[0].url, "https://hooks.example.test/in/everywhere");
+    let text = posted[0].text();
+    assert!(
+        text.contains(&format!(
+            "A question is waiting in session {}.",
+            environment.worker_session
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&other_session.to_string()),
+        "and no other session: {text}"
+    );
+    assert!(
+        environment.deliveries_to("elsewhere").is_empty(),
+        "nothing was written for the webhook whose grant does not reach the session"
+    );
+}
+
 /// KR-REQ-25.23: the credentialed kinds are configured through the same method, with their
 /// credential in the request or kept before with `delivery.destination.secret.set`, and each sends
 /// from the host to the service it names: Slack and Discord to the webhook address the owner
@@ -4076,6 +4158,13 @@ async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_ow
     ] {
         let text = posted.text();
         assert!(text.contains("waiting for an answer"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "A question is waiting in session {}.",
+                environment.worker_session
+            )),
+            "{text}"
+        );
         assert!(text.contains("can read"), "{text}");
         for private in [SLACK, DISCORD, TELEGRAM_TOKEN, "Deploy the release?"] {
             assert!(!text.contains(private), "a message carries {private}");
