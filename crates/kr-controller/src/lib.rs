@@ -40,6 +40,7 @@ pub mod agent_tools;
 pub mod archive;
 pub mod attention;
 pub mod authority;
+pub mod authority_feed;
 pub mod automation;
 pub mod backup;
 pub mod bridge;
