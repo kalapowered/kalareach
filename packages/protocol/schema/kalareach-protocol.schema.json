@@ -9642,6 +9642,10 @@
           "description": "The identifier the destination was configured under.",
           "type": "string"
         },
+        "fenced": {
+          "$ref": "#/$defs/U64",
+          "description": "How many attempts were on the wire when the destination was removed. Each finishes and\nreports its answer, and the destination may still receive that message."
+        },
         "found": {
           "description": "Whether a destination was configured under it.",
           "type": "boolean"
@@ -9652,14 +9656,15 @@
         },
         "unresolved": {
           "$ref": "#/$defs/U64",
-          "description": "How many notifications an earlier attempt had sent now have an outcome nobody can settle."
+          "description": "How many queued notifications an earlier attempt had sent now have an outcome nobody can\nsettle."
         }
       },
       "required": [
         "destination_id",
         "found",
         "revoked",
-        "unresolved"
+        "unresolved",
+        "fenced"
       ],
       "type": "object"
     },
@@ -18927,7 +18932,7 @@
         },
         {
           "const": "delivery.destination.remove",
-          "description": "Remove a notification destination, and the credential kept for it. What was queued for it and not sent is taken back, and the answer says how much. Removing a paired device's destination ends its delivery and owes the gateway a revocation of the device's authorisation, as unpairing does, without unpairing the device.",
+          "description": "Remove a notification destination, and the credential kept for it. What was queued for it and not sent is taken back, and the answer says how much, and how many attempts were on the wire and can still arrive. Removing a paired device's destination ends its delivery and owes the gateway a revocation of the device's authorisation, as unpairing does, without unpairing the device.",
           "type": "string"
         },
         {
