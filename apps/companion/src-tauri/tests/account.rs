@@ -18,9 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use companion_tauri::account::carrier::{
-    Boxed, Browser, Carrier, Ending, Loopback, Plan, Unavailable,
+    Boxed, Browser, Carrier, Ending, Loopback, Plan, Reply, Unavailable,
 };
-use companion_tauri::account::loopback::Listener;
 use companion_tauri::account::{Account, AccountSlot, AccountView};
 use kr_client::services::ServiceFuture;
 use kr_client::services::account::{
@@ -30,6 +29,7 @@ use kr_client::services::account::{
     SignedInAccount, StoredGrant, code_challenge,
 };
 use kr_crypto::store::{MemoryStore, SecretStore};
+use kr_loopback::Listener;
 use tauri::Url;
 use tauri::test::{INVOKE_KEY, mock_builder, mock_context, noop_assets};
 use tauri::webview::InvokeRequest;
@@ -166,7 +166,7 @@ impl Carrier for PhoneSession {
             let answer = pending.answer(&answer_for(&url, self.redirect), Delivery::Terminal);
             Ending::Answered {
                 answer,
-                reply: None,
+                reply: Reply::default(),
             }
         })
     }
