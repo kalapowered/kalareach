@@ -639,7 +639,12 @@ pub fn assemble(
     let mut toolchain = identity::toolchain(&options.root, typescript);
     for step in executed {
         if matches!(step.step.reading, plan::Reading::Lane(_)) {
-            toolchain.phones.extend(step.tools.iter().cloned());
+            for (name, value) in &step.tools {
+                toolchain
+                    .phones
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
         }
     }
     let mut packages: Vec<PackageVersion> = map
@@ -916,7 +921,7 @@ impl<'a> Resolver<'a> {
                     LibtestOutcome::Failed => RunRecord {
                         step: index + 1,
                         outcome: Outcome::Failed,
-                        reason: None,
+                        reason: case.note.clone(),
                     },
                     LibtestOutcome::Ignored(reason) => RunRecord {
                         step: index + 1,

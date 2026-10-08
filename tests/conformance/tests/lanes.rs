@@ -5,7 +5,7 @@
 //! those of the same tests with one assertion broken, and `ios-xcode-26.3.json` is the iOS result
 //! of the Xcode on a hosted runner.
 //!
-//! KR-REQ-15.34, KR-REQ-15.35, KR-REQ-29.01.
+//! KR-REQ-29.01.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -291,6 +291,7 @@ fn a_failed_case_in_a_file_no_row_names_is_listed_and_a_case_no_file_declares_is
         name: "testElsewhere()".to_owned(),
         selector: "KalaReachNativeTests/ElsewhereTests/testElsewhere".to_owned(),
         outcome: LibtestOutcome::Passed,
+        note: None,
     });
     let document = assemble(
         Platform::MacOs,
@@ -385,6 +386,43 @@ fn the_phones_group_is_planned_for_linux_and_macos_and_not_for_windows() {
 }
 
 #[test]
+fn a_nested_class_belongs_to_the_file_of_the_class_around_it_and_to_no_other() {
+    let directory = "apps/companion/native/android/src/test/kotlin/p";
+    let mut map = Map::default();
+    map.lane_classes
+        .insert(format!("{directory}/Outer.kt"), vec!["p.Outer".to_owned()]);
+    map.lane_classes
+        .insert(format!("{directory}/Inner.kt"), vec!["p.Inner".to_owned()]);
+    let case = |class: &str| Case {
+        class: class.to_owned(),
+        name: "t".to_owned(),
+        selector: format!("{class}.t"),
+        outcome: LibtestOutcome::Passed,
+        note: None,
+    };
+    let document = assemble(
+        Platform::Linux,
+        &map,
+        &[executed(
+            step(Platform::Linux),
+            0,
+            Ok(vec![case("p.Outer$Inner"), case("p.Inner")]),
+        )],
+    );
+    assert!(document.problems.is_empty(), "{:?}", document.problems);
+    let document = assemble(
+        Platform::Linux,
+        &map,
+        &[executed(
+            step(Platform::Linux),
+            0,
+            Ok(vec![case("p.Elsewhere")]),
+        )],
+    );
+    assert_eq!(document.problems.len(), 1, "{:?}", document.problems);
+}
+
+#[test]
 fn the_result_tree_reads_the_same_from_the_two_xcode_versions_that_wrote_it() {
     // One was written by the Xcode of a developer's Mac, the other by the newest one a hosted runner
     // has; the cases and their results are the same.
@@ -437,6 +475,14 @@ fn results_that_disagree_with_themselves_are_refused() {
     );
     let directory = tempfile::tempdir().expect("a directory");
     assert!(lane::read_junit(directory.path()).is_err());
+    // A case reported twice, here by two files that hold the same class.
+    std::fs::write(directory.path().join("a.xml"), &gate).expect("a copy");
+    std::fs::write(directory.path().join("b.xml"), &gate).expect("a copy");
+    assert!(
+        lane::read_junit(directory.path())
+            .expect_err("a case that is reported twice")
+            .contains("reported twice")
+    );
 
     let tree = std::fs::read_to_string(fixtures().join("lane-results").join("ios-failing.json"))
         .expect("a result tree");
@@ -466,13 +512,15 @@ fn results_that_disagree_with_themselves_are_refused() {
         "Expected Failure",
     );
     let cases = lane::parse_xcode(&value).expect("read");
-    assert_eq!(
-        cases
-            .iter()
-            .filter(|case| case.outcome == LibtestOutcome::Failed)
-            .count(),
-        1
-    );
+    let expected: Vec<&Case> = cases
+        .iter()
+        .filter(|case| case.outcome == LibtestOutcome::Failed)
+        .collect();
+    assert_eq!(expected.len(), 1);
+    assert!(expected[0].note.is_some());
+    // Xcode ends 0 over a case that failed as expected, and only that case is a failure.
+    assert!(lane::agree_with_exit(Some(0), &cases).is_ok());
+    assert!(lane::agree_with_exit(Some(65), &cases).is_err());
 }
 
 /// Sets the result of the node called `name` wherever it is in `value`.

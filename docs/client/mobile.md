@@ -281,7 +281,7 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :krnative:test
 # The same tests through the scripts the conformance report runs. They leave what the tool wrote
 # where `--results` says and take the tool's own arguments after `--`. The Android script also runs
 # in a checkout that has not packaged the application, which has neither of the Gradle files Tauri's
-# build writes and the first command above needs; it writes them as comments and removes them again.
+# build writes and the Gradle command above needs; it writes them as comments and removes them again.
 scripts/android-unit-tests.sh
 scripts/ios-unit-tests.sh
 

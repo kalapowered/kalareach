@@ -4,9 +4,9 @@
 #
 #   scripts/android-unit-tests.sh [--results=<directory>] [-- <Gradle arguments>]
 #
-#   --results=<directory>   A directory made new for the run, which the JUnit files Gradle wrote
-#                           are copied into, whatever Gradle's exit status. The conformance report
-#                           reads them there.
+#   --results=<directory>   A directory the JUnit files Gradle wrote are copied into, whatever
+#                           Gradle's exit status; the `TEST-*.xml` files it already holds are
+#                           replaced. The conformance report reads them there.
 #   --                      What follows goes to Gradle after the task, for example
 #                           `--tests to.kala.reach.companion.mobile.VoiceCaptureGateTest.<method>`.
 #
@@ -83,8 +83,8 @@ status=0
 ) || status=$?
 
 if [ -n "$results" ]; then
-    rm -rf "${results:?}"
     mkdir -p "$results"
+    rm -f "${results:?}"/TEST-*.xml
     cp "$project"/build/krnative/test-results/test/*.xml "$results"/ 2> /dev/null || true
 fi
 exit "$status"

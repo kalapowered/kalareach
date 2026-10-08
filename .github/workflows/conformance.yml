@@ -343,15 +343,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
 
-      - name: Install the component target
-        timeout-minutes: 5
-        run: rustup target add wasm32-wasip2
-
-      - name: Build the test components
-        timeout-minutes: 15
-        shell: bash
-        run: bash scripts/build-plugin-fixtures.sh
-
       # The report reads the TypeScript tests with the packages' own compiler here too, to list them
       # as not run on this platform.
       - name: Install pnpm
@@ -373,6 +364,17 @@ jobs:
         run: |
           $temporary = (Get-Item $env:TEMP).FullName
           "KR_TEST_ARTIFACTS_DIR=$temporary\kr-conformance-evidence" >> $env:GITHUB_ENV
+
+      # Just before the report, so that a step that fails here is followed by the report and not by
+      # a job that stopped before it.
+      - name: Install the component target
+        timeout-minutes: 5
+        run: rustup target add wasm32-wasip2
+
+      - name: Build the test components
+        timeout-minutes: 15
+        shell: bash
+        run: bash scripts/build-plugin-fixtures.sh
 
       # The suites qualified on Windows, as the landing workflow's Windows job runs them, started
       # from PowerShell as they are there: a POSIX shell's runtime would enable privileges in their

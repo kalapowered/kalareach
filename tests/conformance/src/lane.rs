@@ -29,6 +29,9 @@ pub struct Case {
     pub selector: String,
     /// What it came to.
     pub outcome: Outcome,
+    /// Why it came to that, when the tool said more than the outcome: an expected failure is a
+    /// failure here, and the status of a tool that passes it is no sign that a case failed.
+    pub note: Option<String>,
 }
 
 /// Reads the JUnit files Gradle wrote into `directory`, one for each test class.
@@ -54,7 +57,20 @@ pub fn read_junit(directory: &Path) -> Result<Vec<Case>, String> {
             .map_err(|error| format!("{} could not be read: {error}", file.display()))?;
         cases.extend(parse_junit(&text).map_err(|error| format!("{}: {error}", file.display()))?);
     }
+    refuse_repeats(&cases)?;
     Ok(cases)
+}
+
+/// Refuses a case reported twice: the report keeps one record for a name, and a repeat that failed
+/// after a first that passed would be lost.
+fn refuse_repeats(cases: &[Case]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for case in cases {
+        if !seen.insert((&case.class, &case.name)) {
+            return Err(format!("{}.{} is reported twice", case.class, case.name));
+        }
+    }
+    Ok(())
 }
 
 /// What a `testsuite` element says about itself.
@@ -139,6 +155,7 @@ pub fn parse_junit(text: &str) -> Result<Vec<Case>, String> {
                     class,
                     name,
                     outcome: Outcome::Passed,
+                    note: None,
                 });
                 open = (!closes).then_some(cases.len() - 1);
             }
@@ -210,6 +227,7 @@ pub fn parse_xcode(value: &Value) -> Result<Vec<Case>, String> {
     if cases.is_empty() {
         return Err("no test case ran".to_owned());
     }
+    refuse_repeats(&cases)?;
     Ok(cases)
 }
 
@@ -222,9 +240,16 @@ fn walk(node: &Value, bundle: &str, suite: &str, cases: &mut Vec<Case>) -> Resul
         .to_owned();
     let result = node["result"].as_str();
     if kind == "Test Case" {
+        let mut note = None;
         let outcome = match result {
             Some("Passed") => Outcome::Passed,
-            Some("Failed" | "Expected Failure") => Outcome::Failed,
+            Some("Failed") => Outcome::Failed,
+            Some("Expected Failure") => {
+                note = Some(
+                    "the case expected to fail, and a case that fails is not a pass".to_owned(),
+                );
+                Outcome::Failed
+            }
             Some("Skipped") => Outcome::Skipped("skipped".to_owned()),
             other => {
                 return Err(format!(
@@ -239,6 +264,7 @@ fn walk(node: &Value, bundle: &str, suite: &str, cases: &mut Vec<Case>) -> Resul
             class: suite.to_owned(),
             name,
             outcome,
+            note,
         });
         return Ok(failed);
     }
@@ -269,9 +295,10 @@ fn walk(node: &Value, bundle: &str, suite: &str, cases: &mut Vec<Case>) -> Resul
 /// Returns the disagreement: a failed case under a status of 0, or a status that is not 0 with no
 /// failed case to account for it.
 pub fn agree_with_exit(exit: Option<i32>, cases: &[Case]) -> Result<(), String> {
+    // A case that expected to fail and did is a failure here and leaves the tool's status at 0.
     let failed = cases
         .iter()
-        .filter(|case| case.outcome == Outcome::Failed)
+        .filter(|case| case.outcome == Outcome::Failed && case.note.is_none())
         .count();
     match (exit, failed) {
         (Some(0), 0) => Ok(()),
@@ -286,12 +313,14 @@ pub fn agree_with_exit(exit: Option<i32>, cases: &[Case]) -> Result<(), String> 
     }
 }
 
-/// The classes a Kotlin, Java or Swift source file declares, as the tool that runs its tests names
-/// them: a Kotlin or Java class by its full name, a Swift class by its name.
+/// The classes a Kotlin, Java or Swift source file declares at its top level, as the tool that runs
+/// its tests names them: a Kotlin or Java class by its full name, a Swift class by its name.
 ///
-/// A declaration is a line that begins with modifiers and attributes and then `class`, so a word
-/// inside a comment or a string, `class func`, `class var` and `Foo::class` are none. A nested
-/// class counts as a declaration of its own.
+/// A declaration is a line that begins with modifiers and attributes and then `class`, outside every
+/// brace, comment and string. A word in a comment or a string, `class func`, `class var` and
+/// `Foo::class` are none. A class nested in another is not listed: a JVM names it `Outer$Inner`,
+/// which [`declares`] gives to the file of `Outer`, and a nested Swift class is a helper of the
+/// test around it.
 #[must_use]
 pub fn declared_classes(file: &str, source: &str) -> Vec<String> {
     const MODIFIERS: &[&str] = &[
@@ -314,38 +343,29 @@ pub fn declared_classes(file: &str, source: &str) -> Vec<String> {
     ];
     const NOT_CLASSES: &[&str] = &["func", "var", "let", "init", "subscript", "deinit"];
     let swift = file.ends_with(".swift");
+    let masked = mask(source);
     let mut package = String::new();
     let mut found = Vec::new();
-    let mut in_block_comment = false;
-    for line in source.lines() {
-        let mut line = line.trim();
-        if in_block_comment {
-            match line.split_once("*/") {
-                Some((_, rest)) => {
-                    in_block_comment = false;
-                    line = rest.trim();
-                }
-                None => continue,
-            }
-        }
-        if line.starts_with("/*") {
-            in_block_comment = !line.contains("*/");
-            continue;
-        }
-        if line.starts_with("//") || line.starts_with('*') || line.is_empty() {
+    let mut depth = 0_i64;
+    for line in masked.lines() {
+        let at_top = depth == 0;
+        depth += i64::try_from(line.matches('{').count()).unwrap_or(0)
+            - i64::try_from(line.matches('}').count()).unwrap_or(0);
+        let line = line.trim();
+        if !at_top || line.is_empty() {
             continue;
         }
         if !swift && let Some(rest) = line.strip_prefix("package ") {
             package = rest.trim().trim_end_matches(';').trim().to_owned();
             continue;
         }
-        let mut words = line.split_whitespace().peekable();
+        let mut words = line.split_whitespace();
         // Attributes are modifiers too, and one may carry arguments with spaces in them.
-        let mut depth = 0_i32;
+        let mut parentheses = 0_i32;
         let mut declared = None;
         while let Some(word) = words.next() {
-            if depth > 0 || word.starts_with('@') {
-                depth += i32::try_from(word.matches('(').count()).unwrap_or(0)
+            if parentheses > 0 || word.starts_with('@') {
+                parentheses += i32::try_from(word.matches('(').count()).unwrap_or(0)
                     - i32::try_from(word.matches(')').count()).unwrap_or(0);
                 continue;
             }
@@ -374,6 +394,91 @@ pub fn declared_classes(file: &str, source: &str) -> Vec<String> {
     found
 }
 
+/// The source with every comment, string and character literal blanked out, each newline kept: what
+/// is left is code, so a brace or a keyword in it is one. Block comments nest and a triple-quoted
+/// string spans lines, as in both languages.
+fn mask(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let starts = |at: usize, text: &str| {
+        text.chars()
+            .enumerate()
+            .all(|(i, c)| chars.get(at + i) == Some(&c))
+    };
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        if starts(at, "//") {
+            while at < chars.len() && chars[at] != '\n' {
+                out.push(' ');
+                at += 1;
+            }
+        } else if starts(at, "/*") {
+            let mut depth = 0_usize;
+            while at < chars.len() {
+                if starts(at, "/*") {
+                    depth += 1;
+                    out.push_str("  ");
+                    at += 2;
+                } else if starts(at, "*/") {
+                    depth -= 1;
+                    out.push_str("  ");
+                    at += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(chars[at]));
+                    at += 1;
+                }
+            }
+        } else if starts(at, "\"\"\"") {
+            out.push_str("   ");
+            at += 3;
+            while at < chars.len() && !starts(at, "\"\"\"") {
+                out.push(blank(chars[at]));
+                at += 1;
+            }
+            if at < chars.len() {
+                out.push_str("   ");
+                at += 3;
+            }
+        } else if c == '"' {
+            out.push(' ');
+            at += 1;
+            while at < chars.len() && chars[at] != '"' && chars[at] != '\n' {
+                let step = if chars[at] == '\\' { 2 } else { 1 };
+                for _ in 0..step.min(chars.len() - at) {
+                    out.push(' ');
+                }
+                at += step;
+            }
+            if at < chars.len() && chars[at] == '"' {
+                out.push(' ');
+                at += 1;
+            }
+        } else if c == '\''
+            && (chars.get(at + 2) == Some(&'\'')
+                || (chars.get(at + 1) == Some(&'\\') && chars.get(at + 3) == Some(&'\'')))
+        {
+            let length = if chars.get(at + 1) == Some(&'\\') {
+                4
+            } else {
+                3
+            };
+            for _ in 0..length {
+                out.push(' ');
+            }
+            at += length;
+        } else {
+            out.push(c);
+            at += 1;
+        }
+    }
+    out
+}
+
 /// Whether the class a tool reported is one the source file declares: the class itself, or a class
 /// nested in one of them, which a JVM names `Outer$Inner`.
 #[must_use]
@@ -391,17 +496,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_classes_of_a_file_are_those_that_begin_a_line_with_modifiers_and_class() {
-        let kotlin = "package to.kala.reach.companion.mobile\n\nimport org.junit.Test\n\n/*\n * class InAComment\n */\n// class AlsoAComment\nclass VoiceCaptureGateTest {\n    private class Switches : VoiceMediaSwitches {\n        val kind = Switches::class\n    }\n    @Test fun a() {}\n}\n\nclass SoftwareSealer : Sealer\n";
+    fn the_classes_of_a_file_are_the_top_level_ones_in_code() {
+        let kotlin = "package to.kala.reach.companion.mobile\n\nimport org.junit.Test\n\n/*\n * class InAComment\n */\n// class AlsoAComment\nclass VoiceCaptureGateTest {\n    private class Switches : VoiceMediaSwitches {\n        val kind = Switches::class\n    }\n    val text = \"\"\"\nclass InAString\n\"\"\"\n    @Test fun a() {}\n}\n\nclass SoftwareSealer : Sealer\n";
         assert_eq!(
             declared_classes("A.kt", kotlin),
             [
                 "to.kala.reach.companion.mobile.VoiceCaptureGateTest",
-                "to.kala.reach.companion.mobile.Switches",
                 "to.kala.reach.companion.mobile.SoftwareSealer",
             ]
         );
-        let swift = "import XCTest\n\n@MainActor\nfinal class A: XCTestCase {\n    override class func setUp() {}\n    class var shared: Int { 0 }\n    @available(iOS 17, *) private final class B {}\n}\n";
+        let swift = "import XCTest\n\n@MainActor\nfinal class A: XCTestCase {\n    override class func setUp() {}\n    class var shared: Int { 0 }\n    private final class Helper {}\n}\n@available(iOS 17, *) final class B: XCTestCase {}\n";
         assert_eq!(declared_classes("A.swift", swift), ["A", "B"]);
     }
 
@@ -420,6 +524,7 @@ mod tests {
             name: "t".to_owned(),
             selector: "C.t".to_owned(),
             outcome,
+            note: None,
         };
         assert!(agree_with_exit(Some(0), &[case(Outcome::Passed)]).is_ok());
         assert!(agree_with_exit(Some(1), &[case(Outcome::Failed)]).is_ok());

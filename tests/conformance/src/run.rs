@@ -166,7 +166,13 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
                 .lines()
                 .filter_map(|line| line.strip_prefix(TOOL_LINE))
                 .filter_map(|line| line.split_once(": "))
-                .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+                .map(|(name, value)| {
+                    let value = value.trim();
+                    (
+                        name.to_owned(),
+                        if value.is_empty() { "unknown" } else { value }.to_owned(),
+                    )
+                })
                 .collect();
             libtest::plain(&text)
         }

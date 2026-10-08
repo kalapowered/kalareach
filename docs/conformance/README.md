@@ -302,10 +302,12 @@ command that selects the title runs them all.
 A comment in a Kotlin or Swift file of the first two lanes keys that file as a whole: every case
 the lane reports for a class the file declares belongs to the rows its comments name, whichever
 test in the file the comment sits above. A failing case therefore fails every row its file names.
-The report reads the classes a file declares from the lines that begin with modifiers, attributes
-and `class` (a Kotlin or Java class by its package-qualified name), and it stops before it runs
-anything when a file that names a row declares none. A case the lane reports that no file of the
-lane declares, or that two declare, is a problem of the result.
+The report reads the classes a file declares from the lines outside every brace, comment and
+string that begin with modifiers, attributes and `class` (a Kotlin or Java class by its
+package-qualified name). A class nested in another belongs to the file of the class around it
+(a JVM reports it as `Outer$Inner`). The report stops before it runs anything when a file that
+names a row declares no class. A case the lane reports that no file of the lane declares, or that
+two declare, is a problem of the result, and so is a case reported twice.
 
 The two scripts run the tests unchanged and leave what the tool wrote at the path `--results` names:
 Gradle's JUnit files in a directory, and, for Xcode, the tree `xcrun xcresulttool get test-results
@@ -313,9 +315,10 @@ tests` prints for the result bundle, in one file with the bundle beside it. They
 `kr-tool: <name>: <value>` lines for the JDK and Gradle, or Xcode and the simulator, and the result
 lists them under `run.toolchain.phones`. The report checks the results before it uses them. A JUnit
 file has to agree with the counts its test suite states. A suite recorded as failed has to have a
-failed case under it. A result the report does not know (`unknown`) is refused, an expected failure
-counts as a failure, and the tool's exit status has to agree with the failed cases. Results that
-fail a check fail the lane's step and every file of the lane. A skipped case is not run, never
+failed case under it. A result the report does not know (`unknown`) is refused, and the tool's exit
+status has to agree with the failed cases. An expected failure is a failure of its case, with that
+as the reason, and does not count against the exit status, which Xcode leaves at 0 for it. Results
+that fail a check fail the lane's step and every file of the lane. A skipped case is not run, never
 passed.
 
 In the report of a platform that does not run a lane, that lane's files are shown as not run, with
