@@ -56,6 +56,17 @@ fn instance(byte: u8) -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([byte; 16]))
 }
 
+/// Carries one admitted plugin action to its transport, as the worker's service does once the
+/// session boundary is over.
+fn record_plugin_action(
+    broker: &Broker,
+    admitted: &MutationAdmission,
+) -> Result<kr_worker::broker::ActionInFlight, BrokerError> {
+    let taken = broker.take_plugin_action(admitted)?;
+    let (dispatch, request) = taken.transmission();
+    Ok(taken.submitted(dispatch.submit(&request)?))
+}
+
 fn binding(byte: u8) -> BrokerBindingId {
     BrokerBindingId::new(Uuid::from_bytes([byte; 16]))
 }
@@ -1964,6 +1975,7 @@ fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
             &caller("device-1"),
             binding(9),
             &invocation_of(package(), "prompt.preview"),
+            None,
             TimestampMs::new(2),
         )
         .expect_err("an observation-only binding is refused a write, whatever it is called");
@@ -1973,6 +1985,7 @@ fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
             &caller("device-1"),
             binding(9),
             &invocation_of(package(), "conversation.read"),
+            None,
             TimestampMs::new(3),
         )
         .expect_err("a read is not taken on the write path, whatever its label says");
@@ -2040,6 +2053,7 @@ fn kr_req_11_47_a_plan_whose_operation_is_another_class_is_refused_at_the_spend(
                 &caller("device-1"),
                 binding(9),
                 &invocation_of(package(), "prompt.send"),
+                None,
                 TimestampMs::new(at),
             )
             .expect("the invocation is admitted");
@@ -2051,9 +2065,7 @@ fn kr_req_11_47_a_plan_whose_operation_is_another_class_is_refused_at_the_spend(
             "{what}: {refusal}"
         );
         assert!(
-            broker
-                .record_plugin_action(&admitted, TimestampMs::new(at))
-                .is_err(),
+            record_plugin_action(&broker, &admitted).is_err(),
             "{what}: a plan nobody validated is not carried"
         );
         broker.abandon(&admitted);
@@ -2065,6 +2077,7 @@ fn kr_req_11_47_a_plan_whose_operation_is_another_class_is_refused_at_the_spend(
             &caller("device-1"),
             binding(9),
             &invocation_of(package(), "prompt.send"),
+            None,
             TimestampMs::new(10),
         )
         .expect("the invocation is admitted");
