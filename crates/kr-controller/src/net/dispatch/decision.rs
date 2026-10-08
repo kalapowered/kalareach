@@ -136,7 +136,13 @@ impl RemoteConnection {
         claims_geometry: bool,
         named: Option<kr_protocol::ids::GrantId>,
     ) -> std::result::Result<Asked, ProtocolError> {
-        let acting = self.acting_for(session_id, named)?;
+        // Voice acts under the voice grant the device holds, which the voice coordinator selects
+        // for itself, and never under a share.
+        let acting = if crate::voice::VoiceModule::serves(entry.method) {
+            self.acting_for(None, named)?
+        } else {
+            self.acting_for(session_id, named)?
+        };
         self.ask_under(acting, session_id, entry, claims_geometry)
     }
 
@@ -519,8 +525,9 @@ impl RemoteConnection {
     /// leases and offline bound, the environment and session its selectors admit, and every right
     /// the method requires under the conditions this request meets, taken from the grant as the
     /// policy and the configured rights ceiling leave it. A right the configuration removed is
-    /// refused by name, and a grant that decision finds expired ends this connection exactly as
-    /// its own deadline passing would. Last comes the history scope. A requirement that depends on the resolved
+    /// refused by name, and the pairing grant that decision finds expired ends this connection
+    /// exactly as its own deadline passing would; a share found expired refuses the request and
+    /// writes nothing on the device's record. Last comes the history scope. A requirement that depends on the resolved
     /// subject - resource ownership, a local caller's token - is the subject's to answer, and the
     /// worker answers it inside its own dispatch barrier where the subject cannot move.
     pub(super) fn check_grant(
