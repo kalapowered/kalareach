@@ -74,6 +74,9 @@ pub enum Request {
     /// What session descriptions offer on this host: the model's name, where its files come from
     /// and why a fetch failed: `kr host descriptions`.
     Descriptions,
+    /// The destinations notifications are sent to, as the owner named them: their identifiers,
+    /// where they send and what the rule that sends to them is called: `kr destination`.
+    Destinations,
 }
 
 /// Content the person asked to read.

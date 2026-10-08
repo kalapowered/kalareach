@@ -68,6 +68,7 @@ kr-controller = { workspace = true, features = ["testing"] }
 # and the tables they create.
 kr-automation.workspace = true
 kr-changeset.workspace = true
+# The destination tests also read the daemon's delivery journal for the destination a command made.
 kr-delivery.workspace = true
 kr-describe.workspace = true
 kr-plugin-catalogue.workspace = true

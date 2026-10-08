@@ -112,9 +112,9 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::EnvironmentInventory
         | Method::EnvironmentRefresh => None,
         Method::EnvironmentCapabilities => at(PLATFORMS, "What may be done on a desktop"),
-        Method::DeliveryDestinationConfigure | Method::DeliveryDestinationRemove => {
-            at(DELIVERY, "Configuring and removing a destination")
-        }
+        Method::DeliveryDestinationConfigure
+        | Method::DeliveryDestinationRemove
+        | Method::DeliveryDestinationList => at(DELIVERY, "Configuring and removing a destination"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
         Method::PrivacySet | Method::PrivacyStatus => at(HOST, "Privacy mode"),
         Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),

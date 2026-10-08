@@ -18,6 +18,7 @@
 //! | [`changeset`] | `kr changeset`: exact versions of a workspace's work |
 //! | [`diff`] | `kr diff`: reading changes, and applying or reverting one at a named destination |
 //! | [`device`] | `kr device`: the paired devices, and revoking one |
+//! | [`destination`] | `kr destination`: the places notifications go besides paired devices |
 //! | [`machine`] | `kr host machine`: the machine group an environment records, and the steps that change it |
 //! | [`plugin`] | `kr plugin`: plugin packages and the repositories they come from |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
@@ -51,6 +52,7 @@ pub mod contact;
 pub mod create;
 pub mod daemon;
 pub mod descriptions;
+pub mod destination;
 pub mod device;
 pub mod diff;
 pub mod doctor;
