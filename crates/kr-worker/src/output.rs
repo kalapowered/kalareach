@@ -638,7 +638,8 @@ impl OutputHub {
         oldest_retained_cursor: u64,
         scope_of: impl Fn(AttachmentId) -> crate::render::Scope,
     ) -> Vec<AttachmentId> {
-        let screen_only = screen_only_pieces(cursor, bytes, behind_the_screen);
+        // Cut only when a subscriber shown the live screen alone needs it.
+        let mut screen_only: Option<Vec<(u64, Arc<Vec<u8>>)>> = None;
         let mut resynchronised = Vec::new();
         let mut gone = Vec::new();
         for (id, subscriber) in &mut self.subscribers {
@@ -650,7 +651,8 @@ impl OutputHub {
                 if scope_of(*id).names_titles_and_links() || behind_the_screen.is_empty() {
                     &whole
                 } else {
-                    &screen_only
+                    screen_only
+                        .get_or_insert_with(|| screen_only_pieces(cursor, bytes, behind_the_screen))
                 };
             let size: usize = pieces.iter().map(|(_, piece)| piece.len()).sum();
             if size == 0 {
@@ -1143,10 +1145,14 @@ mod tests {
                 let OutputDelivery::Bytes { cursor, bytes } = delivery else {
                     panic!("an unexpected delivery: {delivery:?}");
                 };
+                stream.written(bytes.len());
                 taken.push((cursor, bytes.to_vec()));
             }
             taken
         };
+        // What a subscriber's queue is charged is what it is sent, and what it reads releases it.
+        assert_eq!(viewer.queued_bytes(), 6);
+        assert_eq!(owner.queued_bytes(), 15);
         assert_eq!(
             received(&mut owner),
             vec![(100, b"abTITLEcdLINKef".to_vec())]
@@ -1159,6 +1165,7 @@ mod tests {
                 (113, b"ef".to_vec())
             ]
         );
+        assert_eq!(viewer.queued_bytes(), 0);
 
         // A span that is nothing but a title is sent to the viewer as nothing at all, and its queue
         // is charged nothing for it.
@@ -1170,6 +1177,7 @@ mod tests {
             0,
             second_is_shown_the_live_screen,
         );
+        assert_eq!(viewer.queued_bytes(), 0);
         assert!(received(&mut viewer).is_empty());
         assert_eq!(received(&mut owner), vec![(200, b"TITLE".to_vec())]);
     }

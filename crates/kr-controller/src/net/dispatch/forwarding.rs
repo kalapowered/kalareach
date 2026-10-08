@@ -735,8 +735,8 @@ impl RemoteConnection {
     /// is; a share it finds expired ends the batch and the connection and writes nothing on the
     /// device's record. Any other refusal leaves the grant alone, because nothing about the grant
     /// has ended: a lapsed offline bound, for one, holds again once the authority feed
-    /// synchronises, and the device is told why by the next request it makes. Either way the batch is not written, and
-    /// the relay ends the connection.
+    /// synchronises, and the device is told why by the next request it makes. Either way the batch
+    /// is not written, and the relay ends the connection.
     pub async fn relay(&self, frame: &ControlFrame) -> bool {
         let attached = self
             .proxy
