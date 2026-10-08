@@ -710,6 +710,11 @@ pub struct HostPolicy {
     offline_cell: Arc<BoundCell>,
     /// The highest UTC reading this host has decided anything from.
     utc_floor: Arc<UtcFloor>,
+    /// True when the authority feed this host reads answered that it was removed from it.
+    ///
+    /// It is a fact about the feed and not a setting the owner chose, so it is not written with the
+    /// policy: the feed's own record keeps it, and the daemon sets it here when it starts.
+    feed_removed: bool,
 }
 
 /// The offline cell a policy starts with, before the daemon has anchored anything: a bound that has
@@ -756,6 +761,7 @@ impl HostPolicy {
             offline: None,
             offline_cell: offline_cell(None),
             utc_floor: Arc::new(UtcFloor::default()),
+            feed_removed: false,
         }
     }
 
@@ -1095,7 +1101,23 @@ impl HostPolicy {
             offline: stored.offline.0,
             offline_cell: offline_cell(stored.offline.0.as_ref()),
             utc_floor,
+            feed_removed: false,
         }
+    }
+
+    /// Records whether the authority feed this host reads answered that it was removed from it.
+    ///
+    /// Grants whose validity rests on the feed are refused while it is: an organisation's, and
+    /// personal remote access under a bounded offline-validity policy the owner chose. The default
+    /// non-expiring owner grant does not rest on the feed and is not touched.
+    pub const fn set_feed_removed(&mut self, removed: bool) {
+        self.feed_removed = removed;
+    }
+
+    /// Whether the feed this host reads answered that it was removed from it.
+    #[must_use]
+    pub const fn is_feed_removed(&self) -> bool {
+        self.feed_removed
     }
 
     /// Chooses a bounded offline-validity policy for personal remote access.
@@ -1187,6 +1209,9 @@ impl HostPolicy {
     ) -> std::result::Result<PolicyIntersection, Refusal> {
         match grant.organisation.as_ref() {
             Some(requirement) => {
+                if self.feed_removed {
+                    return Err(Refusal::AuthorityFeedRemoved);
+                }
                 let Some(enrolment) = self.enrolments.get(&requirement.organisation_id) else {
                     return Err(Refusal::MembershipUnusable {
                         refusal: MembershipRefusal::NoLease,
@@ -1251,6 +1276,14 @@ impl HostPolicy {
                 // Personal authority. It continues through an organisation outage, unless this
                 // host is exclusively organisation-managed, in which case there is no personal
                 // path left to continue on.
+                // The person at this machine is never locked out of it by a feed: the owner's way to
+                // act at the host is through this door.
+                if self.feed_removed
+                    && request.ingress != ActorIngress::LocalIpc
+                    && (self.exclusively_managed || self.offline.is_some())
+                {
+                    return Err(Refusal::AuthorityFeedRemoved);
+                }
                 let mut recovery = false;
                 let lease =
                     if self.exclusively_managed && request.method != Method::MembershipPresent {

@@ -512,6 +512,11 @@ fn every_rule_in_the_set_is_raised_by_the_typed_event_it_covers() {
                 grant_id: Some(GrantId::new(Uuid::from_bytes([5; 16]))),
             },
         ),
+        SourceEvent::new(
+            EventCursor::new(AttentionSource::Authority, 1_700_000_000_000),
+            TimestampMs::new(NOON + 9_000),
+            EventKind::AuthorityFeedRemoved,
+        ),
     ];
     for source in events {
         at += 60_001;

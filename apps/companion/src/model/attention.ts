@@ -80,6 +80,7 @@ export function kindOf(item: AttentionItem): AttentionKind {
     case 'attention.command_failed':
     case 'attention.adapter_failed':
     case 'attention.automation_paused':
+    case 'attention.authority_feed_removed':
       return 'failed_action'
     case 'attention.review_ready':
       return 'awaiting_review'
@@ -100,7 +101,8 @@ const RULE_WORDS: Readonly<Record<AttentionItem['rule'], string>> = {
   'attention.review_ready': 'Finished work is ready to review',
   'attention.host_contact_lost': 'This host is out of contact',
   'attention.application_notice': 'An application asked for your attention',
-  'attention.automation_paused': 'An automation stopped at one of its own limits'
+  'attention.automation_paused': 'An automation stopped at one of its own limits',
+  'attention.authority_feed_removed': 'This host no longer learns revocations from its feed'
 }
 
 /** The word each kind shows, which is the row's own label rather than a colour alone. */
