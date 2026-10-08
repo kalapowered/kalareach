@@ -9545,6 +9545,124 @@
       ],
       "type": "object"
     },
+    "DeliveryDestinationConfigureParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `delivery.destination.configure`.",
+      "properties": {
+        "destination_id": {
+          "description": "The identifier the destination is configured under: 1 to 128 bytes with no control\ncharacter, and not a paired device's identifier. Configuring under one already in use\nreplaces that destination.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "Where it sends, never a credential. A webhook's absolute HTTPS address; for Slack and\nDiscord the name of the channel the credential's webhook posts to; for Telegram the chat;\nfor email the recipient's address.",
+          "type": "string"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant whose authority the content is intersected with: which sessions the destination\nis told about, from when, and with which rights. It has to stand now, and a destination\nunder a grant that stops standing is told nothing."
+        },
+        "idempotency_header": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The header a webhook deduplicates by, when it does, such as `Idempotency-Key`. This host\nsends its delivery identifier under it, so a repeat of an attempt whose outcome is unknown\nis not a second message. Null for a destination that deduplicates by nothing, which is\nnever retried after an unknown outcome, and for every kind but a webhook."
+        },
+        "kind": {
+          "$ref": "#/$defs/ExternalDestinationKind",
+          "description": "Which service it sends to."
+        },
+        "rule_name": {
+          "description": "What the owner calls the rule that sends to this destination. A label: it selects nothing.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination_id",
+        "kind",
+        "endpoint",
+        "idempotency_header",
+        "rule_name",
+        "grant_id"
+      ],
+      "type": "object"
+    },
+    "DeliveryDestinationConfigureResult": {
+      "additionalProperties": false,
+      "description": "The result of `delivery.destination.configure`.",
+      "properties": {
+        "destination_id": {
+          "description": "The identifier the destination is configured under.",
+          "type": "string"
+        },
+        "in_force": {
+          "description": "Whether the destination is in service and sends from here on.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExternalDestinationKind",
+          "description": "Which service it sends to."
+        },
+        "recipients_can_read": {
+          "description": "Who can read what this destination delivers, in a sentence a person is shown.\n\nSection 25: the recipients of an external destination read what it delivers, and\nKalaReach's encrypted routing does not make those messages private.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination_id",
+        "kind",
+        "in_force",
+        "recipients_can_read"
+      ],
+      "type": "object"
+    },
+    "DeliveryDestinationRemoveParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `delivery.destination.remove`.",
+      "properties": {
+        "destination_id": {
+          "description": "The identifier the destination is configured under: an external destination's, or a paired\ndevice's, whose delivery then ends until its device registers a new authorisation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination_id"
+      ],
+      "type": "object"
+    },
+    "DeliveryDestinationRemoveResult": {
+      "additionalProperties": false,
+      "description": "The result of `delivery.destination.remove`.",
+      "properties": {
+        "destination_id": {
+          "description": "The identifier the destination was configured under.",
+          "type": "string"
+        },
+        "found": {
+          "description": "Whether a destination was configured under it.",
+          "type": "boolean"
+        },
+        "revoked": {
+          "$ref": "#/$defs/U64",
+          "description": "How many queued notifications nothing had sent were taken back unsent."
+        },
+        "unresolved": {
+          "$ref": "#/$defs/U64",
+          "description": "How many notifications an earlier attempt had sent now have an outcome nobody can settle."
+        }
+      },
+      "required": [
+        "destination_id",
+        "found",
+        "revoked",
+        "unresolved"
+      ],
+      "type": "object"
+    },
     "DeliveryDestinationSecretSetParams": {
       "additionalProperties": false,
       "description": "Parameters of `delivery.destination.secret.set`.",
@@ -14366,6 +14484,36 @@
         }
       ]
     },
+    "ExternalDestinationKind": {
+      "description": "The kinds of external destination the owner configures: a webhook, which sends with no\ncredential, and the four that do ([`DestinationSecretKind`]).",
+      "oneOf": [
+        {
+          "const": "webhook",
+          "description": "An HTTPS endpoint the owner names, which receives one POST for each message.",
+          "type": "string"
+        },
+        {
+          "const": "slack",
+          "description": "A Slack channel, through an incoming webhook kept as a credential.",
+          "type": "string"
+        },
+        {
+          "const": "discord",
+          "description": "A Discord channel, through a webhook kept as a credential.",
+          "type": "string"
+        },
+        {
+          "const": "telegram",
+          "description": "A Telegram chat, through a bot token kept as a credential.",
+          "type": "string"
+        },
+        {
+          "const": "email",
+          "description": "An email recipient, through a mail submission account kept as a credential.",
+          "type": "string"
+        }
+      ]
+    },
     "ExternalProviderPolicy": {
       "description": "What an organisation permits its members' clients to reach outside KalaReach.",
       "oneOf": [
@@ -18770,6 +18918,16 @@
         {
           "const": "environment.refresh",
           "description": "Observe one enrolled environment now, and start it when the request asks for that.",
+          "type": "string"
+        },
+        {
+          "const": "delivery.destination.configure",
+          "description": "Create or replace an external notification destination: a webhook, Slack, Discord, Telegram or email, with where it sends, whether it deduplicates by an identifier, and the grant whose authority the content is intersected with. The grant has to stand, a paired device's identifier is not one a destination takes, and a service that sends with a credential needs one kept first with delivery.destination.secret.set.",
+          "type": "string"
+        },
+        {
+          "const": "delivery.destination.remove",
+          "description": "Remove a notification destination, and the credential kept for it. What was queued for it and not sent is taken back, and the answer says how much. Removing a paired device's destination ends its delivery and owes the gateway a revocation of the device's authorisation, as unpairing does, without unpairing the device.",
           "type": "string"
         },
         {
@@ -38261,6 +38419,18 @@
     "decoding_trust": {
       "$ref": "#/$defs/DecodingTrust"
     },
+    "delivery_destination_configure_params": {
+      "$ref": "#/$defs/DeliveryDestinationConfigureParams"
+    },
+    "delivery_destination_configure_result": {
+      "$ref": "#/$defs/DeliveryDestinationConfigureResult"
+    },
+    "delivery_destination_remove_params": {
+      "$ref": "#/$defs/DeliveryDestinationRemoveParams"
+    },
+    "delivery_destination_remove_result": {
+      "$ref": "#/$defs/DeliveryDestinationRemoveResult"
+    },
     "delivery_destination_secret_set_params": {
       "$ref": "#/$defs/DeliveryDestinationSecretSetParams"
     },
@@ -38467,6 +38637,9 @@
     },
     "expiration_tombstone": {
       "$ref": "#/$defs/ExpirationTombstone"
+    },
+    "external_destination_kind": {
+      "$ref": "#/$defs/ExternalDestinationKind"
     },
     "fence_evidence": {
       "$ref": "#/$defs/FenceEvidence"

@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use kr_protocol::delivery::DestinationSecretKind;
+use kr_protocol::delivery::{DestinationSecretKind, ExternalDestinationKind};
 use kr_protocol::ids::{GrantId, InstallationId, PushSenderRecordId};
 use kr_protocol::scalars::{NotificationPreviewKey, StoredEnvelopeKey, TimestampMs};
 
@@ -147,6 +147,18 @@ impl DestinationKind {
             Self::Discord => Some(DestinationSecretKind::Discord),
             Self::Telegram => Some(DestinationSecretKind::Telegram),
             Self::Email => Some(DestinationSecretKind::Email),
+        }
+    }
+
+    /// The kind of destination the owner asked for.
+    #[must_use]
+    pub const fn for_external(kind: ExternalDestinationKind) -> Self {
+        match kind {
+            ExternalDestinationKind::Webhook => Self::Webhook,
+            ExternalDestinationKind::Slack => Self::Slack,
+            ExternalDestinationKind::Discord => Self::Discord,
+            ExternalDestinationKind::Telegram => Self::Telegram,
+            ExternalDestinationKind::Email => Self::Email,
         }
     }
 

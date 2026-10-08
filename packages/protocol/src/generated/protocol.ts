@@ -772,6 +772,11 @@ export type EventStream = 'session_state' | 'output' | 'attachments' | 'input_le
 export type HistoryGapCause =
   'retention' | 'host_capacity' | 'session_capacity' | 'spool_unavailable' | 'archive_incomplete'
 /**
+ * The kinds of external destination the owner configures: a webhook, which sends with no
+ * credential, and the four that do ([`DestinationSecretKind`]).
+ */
+export type ExternalDestinationKind = 'webhook' | 'slack' | 'discord' | 'telegram' | 'email'
+/**
  * What the payload of a `signed_authority_object` envelope decodes as.
  *
  * Section 20 signs an authorisation-bearing payload **before** encryption, so pairwise message
@@ -2054,6 +2059,10 @@ export interface KalaReachProtocol {
   declarative_table?: DeclarativeTable
   decoder_ledger_entry?: DecoderLedgerEntry1
   decoding_trust?: DecodingTrust
+  delivery_destination_configure_params?: DeliveryDestinationConfigureParams
+  delivery_destination_configure_result?: DeliveryDestinationConfigureResult
+  delivery_destination_remove_params?: DeliveryDestinationRemoveParams
+  delivery_destination_remove_result?: DeliveryDestinationRemoveResult
   delivery_destination_secret_set_params?: DeliveryDestinationSecretSetParams
   delivery_destination_secret_set_result?: DeliveryDestinationSecretSetResult
   description_completion?: DescriptionCompletion
@@ -2123,6 +2132,7 @@ export interface KalaReachProtocol {
   evidence_gap?: EvidenceGap
   evidence_reference?: EvidenceReference
   expiration_tombstone?: ExpirationTombstone
+  external_destination_kind?: ExternalDestinationKind
   fence_evidence?: FenceEvidence
   fenced_action?: FencedAction
   forwarded_authority?: ForwardedAuthority
@@ -11143,6 +11153,97 @@ export interface DecodingTrust {
   schema_versions: string[]
 }
 /**
+ * Parameters of `delivery.destination.configure`.
+ */
+export interface DeliveryDestinationConfigureParams {
+  /**
+   * The identifier the destination is configured under: 1 to 128 bytes with no control
+   * character, and not a paired device's identifier. Configuring under one already in use
+   * replaces that destination.
+   */
+  destination_id: string
+  /**
+   * Where it sends, never a credential. A webhook's absolute HTTPS address; for Slack and
+   * Discord the name of the channel the credential's webhook posts to; for Telegram the chat;
+   * for email the recipient's address.
+   */
+  endpoint: string
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * The header a webhook deduplicates by, when it does, such as `Idempotency-Key`. This host
+   * sends its delivery identifier under it, so a repeat of an attempt whose outcome is unknown
+   * is not a second message. Null for a destination that deduplicates by nothing, which is
+   * never retried after an unknown outcome, and for every kind but a webhook.
+   */
+  idempotency_header: string | null
+  /**
+   * Which service it sends to.
+   */
+  kind: 'webhook' | 'slack' | 'discord' | 'telegram' | 'email'
+  /**
+   * What the owner calls the rule that sends to this destination. A label: it selects nothing.
+   */
+  rule_name: string
+}
+/**
+ * The result of `delivery.destination.configure`.
+ */
+export interface DeliveryDestinationConfigureResult {
+  /**
+   * The identifier the destination is configured under.
+   */
+  destination_id: string
+  /**
+   * Whether the destination is in service and sends from here on.
+   */
+  in_force: boolean
+  /**
+   * Which service it sends to.
+   */
+  kind: 'webhook' | 'slack' | 'discord' | 'telegram' | 'email'
+  /**
+   * Who can read what this destination delivers, in a sentence a person is shown.
+   *
+   * Section 25: the recipients of an external destination read what it delivers, and
+   * KalaReach's encrypted routing does not make those messages private.
+   */
+  recipients_can_read: string
+}
+/**
+ * Parameters of `delivery.destination.remove`.
+ */
+export interface DeliveryDestinationRemoveParams {
+  /**
+   * The identifier the destination is configured under: an external destination's, or a paired
+   * device's, whose delivery then ends until its device registers a new authorisation.
+   */
+  destination_id: string
+}
+/**
+ * The result of `delivery.destination.remove`.
+ */
+export interface DeliveryDestinationRemoveResult {
+  /**
+   * The identifier the destination was configured under.
+   */
+  destination_id: string
+  /**
+   * Whether a destination was configured under it.
+   */
+  found: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revoked: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  unresolved: string
+}
+/**
  * Parameters of `delivery.destination.secret.set`.
  */
 export interface DeliveryDestinationSecretSetParams {
@@ -15978,6 +16079,8 @@ export interface MethodEntry {
     | 'environment.forget'
     | 'environment.inventory'
     | 'environment.refresh'
+    | 'delivery.destination.configure'
+    | 'delivery.destination.remove'
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
@@ -24539,6 +24642,8 @@ export interface ServiceRequestPayload {
     | 'environment.forget'
     | 'environment.inventory'
     | 'environment.refresh'
+    | 'delivery.destination.configure'
+    | 'delivery.destination.remove'
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
