@@ -141,6 +141,8 @@ pub struct Host {
     settings: NetworkSettings,
     /// Where the account service stands for it, which a restart keeps.
     account_at: AccountAt,
+    /// Where the host keeps its network keys, which a restart keeps: the same endpoint comes back.
+    secrets: Arc<MemoryStore>,
 }
 
 impl Host {
@@ -182,6 +184,7 @@ impl Host {
                 ..NetworkSettings::default()
             },
             account_at,
+            Arc::new(MemoryStore::new()),
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -207,6 +210,7 @@ impl Host {
                 ..NetworkSettings::default()
             },
             AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
         )
         .await
     }
@@ -231,6 +235,7 @@ impl Host {
             room::TestRoom::new(),
             settings,
             AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -263,6 +268,7 @@ impl Host {
             room,
             settings,
             account_at,
+            secrets,
             ..
         } = self;
         clients.abort();
@@ -286,6 +292,7 @@ impl Host {
             owner,
             settings,
             account_at,
+            secrets,
         }
     }
 
@@ -296,6 +303,7 @@ impl Host {
         room: room::TestRoom,
         settings: NetworkSettings,
         account_at: AccountAt,
+        secrets: Arc<MemoryStore>,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -340,7 +348,7 @@ impl Host {
             &controller,
             NetworkSetup {
                 settings: settings.clone(),
-                secrets: Arc::new(MemoryStore::new()),
+                secrets: Arc::clone(&secrets) as Arc<dyn kr_crypto::store::SecretStore>,
                 rendezvous: Some(Arc::new(room.clone())),
             },
         )
@@ -359,6 +367,7 @@ impl Host {
             room,
             settings,
             account_at,
+            secrets,
         }
     }
 
@@ -459,6 +468,7 @@ pub struct Stopped {
     owner: Option<DeviceRecord>,
     settings: NetworkSettings,
     account_at: AccountAt,
+    secrets: Arc<MemoryStore>,
 }
 
 impl Stopped {
@@ -482,9 +492,10 @@ impl Stopped {
             room,
             owner,
             account_at,
+            secrets,
             ..
         } = self;
-        let mut host = Host::start_on(temp, room, settings, account_at).await;
+        let mut host = Host::start_on(temp, room, settings, account_at, secrets).await;
         host.owner = owner;
         host
     }
