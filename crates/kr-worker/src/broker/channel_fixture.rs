@@ -97,12 +97,6 @@ pub struct Package {
     pub connector: Arc<InstalledConnector>,
 }
 
-impl Default for Package {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Package {
     /// Lays the package out on the internal disk and reads it.
     ///
@@ -111,7 +105,7 @@ impl Package {
     /// Panics when the package cannot be written or read, which in a test means the environment
     /// is unusable.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn laid_out() -> Self {
         let root = std::env::temp_dir().join(format!("kr-channels-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&root).expect("the store's directory");
         let source = fixture::claude_code_package(&root, Path::new(fixture::FORWARDER))

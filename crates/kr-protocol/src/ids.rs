@@ -703,7 +703,8 @@ opaque_id!(
     "The upstream agent's current turn identifier, where available."
 );
 opaque_id!(
-    /// An upstream approval request identifier.
+    /// An approval request identifier: the upstream's own, or the broker's identifier of the
+    /// pending resource it records the approval as.
     ApprovalRequestId,
     "An upstream approval request identifier. Opaque to KalaReach."
 );

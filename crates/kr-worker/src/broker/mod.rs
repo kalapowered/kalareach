@@ -2764,16 +2764,43 @@ impl Broker {
                 .filter(|record| !written.contains(record))
                 .cloned()
                 .collect();
+            // A transition made while the journal was faulted was announced and not recorded, so
+            // the ledger's last event about a resource can say less than the state it reaches
+            // here. Each such resource is given the event that says so, written with its state,
+            // and numbered above everything the broker spent while the journal was out: a
+            // consumer that follows the ledger reads the end of what it saw begin.
+            let owed = match recorder.as_ref() {
+                Some(recorder) => recorder.records_without_their_event(&fresh)?,
+                None => self.state().ledger.records_without_their_event(&fresh)?,
+            };
+            let events: Vec<_> = {
+                let mut state = self.state();
+                owed.iter()
+                    .map(|position| {
+                        state.next_transition_event(
+                            &fresh[*position].0,
+                            now,
+                            crate::broker::ledger::TransitionCause::Reconciliation,
+                            None,
+                        )
+                    })
+                    .collect()
+            };
             let sequence = match recorder.as_mut() {
-                Some(recorder) => recorder.commit_recovery(&fresh, &packages, &closing, row)?,
+                Some(recorder) => {
+                    recorder.commit_recovery(&fresh, &packages, &closing, row, &events)?
+                }
                 // A ledger held in memory: one connection, no file, nothing to wait on.
                 None => self
                     .state()
                     .ledger
-                    .commit_recovery(&fresh, &packages, &closing, row)?,
+                    .commit_recovery(&fresh, &packages, &closing, row, &events)?,
             };
             written = records;
             let mut state = self.state();
+            for event in &events {
+                state.remember(event);
+            }
             // The row is the gap's from now on, so a later pass or a later recovery updates it
             // rather than writing a second gap for the same interval.
             state.volatile.set_row(sequence);

@@ -36,7 +36,7 @@
 //! a matter of this host's own records, and every pass and every question is skipped: nothing is
 //! claimed, so nothing spends an attempt against a gateway nobody can reach.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,30 @@ struct Adapters {
     external: ExternalSenders,
 }
 
+/// The time the loop's passes read: the machine's, unless a test holds it still.
+///
+/// A held time is what makes a figure that depends on how long a burst took, such as how many
+/// notifications an allowance lets through, reproducible however slow the machine is. Rates are
+/// counted on the steady reading, which a test never holds.
+#[derive(Debug, Default)]
+struct PassClock {
+    /// The held time, or nought for the machine's own.
+    held_ms: AtomicU64,
+}
+
+impl Clock for PassClock {
+    fn now_ms(&self) -> u64 {
+        match self.held_ms.load(Ordering::SeqCst) {
+            0 => SystemClock.now_ms(),
+            held => held,
+        }
+    }
+
+    fn steady_ms(&self) -> u64 {
+        SystemClock.steady_ms()
+    }
+}
+
 /// The loop that drives one environment's delivery.
 #[derive(Debug)]
 pub struct DeliveryRuntime {
@@ -156,6 +180,8 @@ pub struct DeliveryRuntime {
     cadence: Cadence,
     runtime: tokio::runtime::Handle,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The time the passes read.
+    pass_clock: PassClock,
 }
 
 impl DeliveryRuntime {
@@ -188,7 +214,15 @@ impl DeliveryRuntime {
             cadence,
             runtime,
             tasks: Mutex::new(Vec::new()),
+            pass_clock: PassClock::default(),
         })
+    }
+
+    /// Holds the time the passes read at `at_ms`, so that everything the loop admits from now on
+    /// is admitted at that moment. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn hold_time_at(&self, at_ms: u64) {
+        self.pass_clock.held_ms.store(at_ms, Ordering::SeqCst);
     }
 
     /// The credentials this runtime delivers under.
@@ -361,7 +395,7 @@ impl DeliveryRuntime {
             generation: published.generation.get(),
             private: published.private,
         };
-        let now_ms = SystemClock.now_ms();
+        let now_ms = self.pass_clock.now_ms();
         let taken = attention.take_for_delivery(|store, offer| {
             self.module.with(|producer| {
                 producer
@@ -402,7 +436,7 @@ impl DeliveryRuntime {
             self.credentials.as_ref(),
             &adapters.external,
             self.authority.as_ref(),
-            &SystemClock,
+            &self.pass_clock,
         ) {
             eprintln!("kr-controller: a delivery pass did not finish: {error}");
         }

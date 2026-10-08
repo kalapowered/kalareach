@@ -576,8 +576,9 @@ impl Controller {
     /// destination is made, which is what section 25 means by a configured destination and an
     /// explicit rule or grant; a destination whose grant stops standing is told nothing, as every
     /// pass asks the grant again. A service that sends with a credential is configured with it:
-    /// the credential in the request is kept together with the destination, or not at all, and one
-    /// kept earlier ([`Self::delivery_destination_secret_set`]) serves when the request gives none.
+    /// the credential in the request is kept once the destination is written, and a refused
+    /// configuration keeps none; one kept earlier ([`Self::delivery_destination_secret_set`])
+    /// serves when the request gives none.
     ///
     /// The admission is asked again under the registry lock, which is held across the write, so a
     /// withdrawal that completes while this waited stops it.
@@ -631,7 +632,7 @@ impl Controller {
             Ok(())
         };
         admitted()?;
-        // A credential given with the configuration is kept with it or not at all.
+        // A credential given with the configuration is kept once the record is written.
         let wrote = match params.secret.as_ref() {
             Some(secret) => self
                 .delivery

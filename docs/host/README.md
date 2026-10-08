@@ -3995,13 +3995,16 @@ reading of the host time contract from the daemon.
 
 Three sources in each session's journal reach it: the question ledger, whose events carry the moment
 a request became pending; the transitions the session's broker records for the requests an
-application makes of a person, which is how an approval an application raises through its channel
-comes to be pending; and the journal's host events, which are the terminal side effects that had no
+application makes of a person, which is how an approval an application raises comes to be
+pending; and the journal's host events, which are the terminal side effects that had no
 attachment to go to. An approval is raised by the transition that interpreted it, the one that
 gave it a meaning a person can answer, and ended by the state it reaches when it is answered,
 withdrawn, expired or left uncertain; a request nothing has interpreted, a claim taken and given
-back and every other transition move the cursor and raise nothing. None of the three carries text
-but the question ledger and the host events: what an approval asks is the application's to show.
+back and every other transition move the cursor and raise nothing. A transition made while the
+journal was out is announced and not recorded, and the recovery that writes the states reached
+writes the event that says so with them, so the end of an approval that came in that stretch
+reaches the store when the journal is back. None of the three carries text but the question
+ledger and the host events: what an approval asks is the application's to show.
 For each live session the daemon opens a connection of its own to the
 session's worker, verified and bound to the daemon's generation like every other, and declared for
 attention: it carries the daemon's requests for these records and nothing else, and a newer one
@@ -4051,7 +4054,7 @@ clock ends it here.
 
 The store ends a session's live conditions only on a closure this daemon recorded and could account
 for: the worker's own handover, or a closure after a death the host confirmed. It then reads what
-is left of both sources from the session's journal, with the same reads a live worker answers
+is left of every source from the session's journal, with the same reads a live worker answers
 with, and finishes the session in one write. A pending approval, a pending request and its idle
 reminder leave the inbox as ended with the session, never as answered, approved or completed.
 Review work stays, and so do failed commands, notices and gaps. Finishing a session twice changes
@@ -4236,7 +4239,7 @@ them: replaying a record the engine has already consumed changes nothing, which 
 rebuild safe to run twice. What people and clients put there is not, and no replay restores it:
 the acknowledgements, the per-actor revisions, the visits and their log views, the quiet-hours
 window and the identities already given to announcements are records in their own right, and the
-store is where they live. It keeps a cursor for each session's two sources and one for the
+store is where they live. It keeps a cursor for each of a session's three sources and one for the
 workflow journal's attention records, and a write changes the rows a decision changed rather than
 the whole store.
 

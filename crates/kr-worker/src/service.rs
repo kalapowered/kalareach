@@ -199,8 +199,13 @@ pub struct WorkerService {
     /// never waits for the session's lock and the session never waits for the link. It is opened
     /// on first use and again after a read fails.
     attention_reader: Mutex<Option<crate::journal::Journal>>,
-    /// Woken when the session's journal commits a host event or a privacy transition.
+    /// Woken when the session's journal commits a host event, a privacy transition, or a
+    /// transition of a pending approval the broker records.
     journal_changes: Option<Arc<tokio::sync::Notify>>,
+    /// How many times a request for the attention sources has found nothing to answer with and
+    /// begun to wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    held_attention_requests: std::sync::atomic::AtomicU64,
     /// The session's side of the privacy fence around its attention text: the transition in
     /// progress, the statements that tell the control daemon about it, and the leases of the text
     /// this worker has answered with.
@@ -394,6 +399,16 @@ impl std::fmt::Debug for WorkerService {
 }
 
 impl WorkerService {
+    /// How many times a request for the attention sources has found nothing to answer with and
+    /// begun to wait, for this host's own tests: one that waits for it to count a request has
+    /// the request held before it commits what should wake it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn held_attention_requests(&self) -> u64 {
+        self.held_attention_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Builds a service for one session.
     ///
     /// # Errors
@@ -479,6 +494,8 @@ impl WorkerService {
             journal_path: binding.journal_path,
             attention_reader: Mutex::new(None),
             journal_changes,
+            #[cfg(feature = "testing")]
+            held_attention_requests: std::sync::atomic::AtomicU64::new(0),
             attention_fence,
             description_facts,
             broker,
@@ -2626,11 +2643,12 @@ impl WorkerService {
 
     /// Reads one page, holding the request while there is nothing to answer with.
     ///
-    /// It answers at once when any source has a record past its cursor, when the session's
-    /// privacy generation has moved since the request arrived or is past the generation the
-    /// request says the daemon has recorded, and when the request's bound runs out. Both
-    /// subscriptions are taken before each read, so a commit between the read and the wait wakes
-    /// the wait rather than falling between them. A request a newer one replaced
+    /// It answers at once when a question or a host event is past its cursor, when an approval's
+    /// transition is (a broker transition of any other request waits to go with the next page),
+    /// when the session's privacy generation has moved since the request arrived or is past the
+    /// generation the request says the daemon has recorded, and when the request's bound runs
+    /// out. Every subscription is taken before each read, so a commit between the read and the
+    /// wait wakes the wait rather than falling between them. A request a newer one replaced
     /// answers nothing: the replacement is checked before every read and before the answer is
     /// handed over, and it wins a wait that something else ends at the same moment.
     async fn finish_page(
@@ -2665,8 +2683,11 @@ impl WorkerService {
             page.output_floor =
                 Nullable::some(U64::new(self.runtime.session().oldest_retained_cursor()));
             let started = *generation.get_or_insert(page.privacy_generation.0);
+            // A broker transition that is no approval's waits for the next page rather than costing
+            // the daemon a commit of its own: it is read with the approval that follows it, or
+            // when the request's bound runs out.
             let answer = !page.questions.records.is_empty()
-                || !page.approvals.records.is_empty()
+                || page.approvals.records.iter().any(|record| record.approval)
                 || !page.host_events.records.is_empty()
                 || page.privacy_generation.0 != started
                 || crate::attention_fence::behind(
@@ -2693,6 +2714,9 @@ impl WorkerService {
                 }
                 return Some(ControlFrame::AttentionSourcePage(Box::new(page)));
             }
+            #[cfg(feature = "testing")]
+            self.held_attention_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::select! {
                 biased;
                 _ = &mut *cancelled => return None,

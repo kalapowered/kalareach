@@ -5844,10 +5844,10 @@ export interface AttentionQuestionSlice1 {
 /**
  * A request for one session's attention source records past where the store has read.
  *
- * The worker answers with an [`AttentionSourcePage`]. While neither source has a record past its
+ * The worker answers with an [`AttentionSourcePage`]. While no source has a record past its
  * cursor and the session's privacy state has not moved, it may hold the request for up to
- * `wait_ms`, answering as soon as a question transition, a host event or a privacy transition
- * is committed.
+ * `wait_ms`, answering as soon as a question transition, a host event, the transition of a
+ * pending approval or a privacy transition is committed.
  */
 export interface AttentionSourcesRequest {
   /**
@@ -11344,8 +11344,8 @@ export interface DeliveryDestinationListResult {
   destinations: DeliveryDestinationSummary[]
 }
 /**
- * One destination this host delivers to, as `delivery.destination.list` says it. It never carries
- * a credential.
+ * One destination this host delivers to, as `delivery.destination.list` says it. It carries no
+ * credential kept in the secret store.
  */
 export interface DeliveryDestinationSummary {
   /**

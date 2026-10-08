@@ -2789,6 +2789,8 @@ struct RecordingStore {
     inner: kr_crypto::store::MemoryStore,
     changes: std::sync::atomic::AtomicU64,
     refuse_writes: std::sync::atomic::AtomicBool,
+    /// Writes, then reports a failure, as a store does that fails at its last step.
+    fail_after_writing: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingStore {
@@ -2797,6 +2799,7 @@ impl RecordingStore {
             inner: kr_crypto::store::MemoryStore::new(),
             changes: std::sync::atomic::AtomicU64::new(0),
             refuse_writes: std::sync::atomic::AtomicBool::new(false),
+            fail_after_writing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2815,7 +2818,16 @@ impl kr_crypto::store::SecretStore for RecordingStore {
                 message: "this store refuses writes".to_owned(),
             });
         }
-        self.inner.set(name, secret)
+        self.inner.set(name, secret)?;
+        if self
+            .fail_after_writing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(kr_crypto::CryptoError::SecretStore {
+                message: "this store failed at its last step".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn get(
@@ -2887,7 +2899,7 @@ fn kept_under(
     .expect("a read")
 }
 
-/// KR-REQ-25.23: a credential given with a configuration is kept with it or not at all. The record
+/// KR-REQ-25.23: a credential given with a configuration is kept only once the record stands. The record
 /// is written first, under the admission the journal asks once its lock is held, and the credential
 /// is kept only after the record stands, so a refusal there, like a refusal of the record itself,
 /// asks nothing of the secret store: a destination being replaced goes on with the credential and
@@ -2989,6 +3001,79 @@ fn a_configuration_the_write_refuses_asks_nothing_of_the_credential_store() {
     assert_eq!(
         kept_under(&store, "chat").expect("kept").stamp,
         replaced.stamp
+    );
+}
+
+/// KR-REQ-25.23: a store that writes the credential and then reports a failure leaves a destination
+/// that does send, with the credential the record names, and the owner is told it may not: the
+/// error says "may send nothing" and never that the destination sends nothing. The control is
+/// the destination's record, which names the stamp the store holds.
+#[test]
+fn a_credential_the_store_writes_and_then_fails_over_is_at_work_and_the_error_says_it_may_not_be() {
+    let store = Arc::new(RecordingStore::new());
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = module_over(&store, &directory);
+    let environment = Environment {
+        module,
+        device_preview: kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        path: directory.path().join("delivery.sqlite3"),
+        _directory: directory,
+    };
+    store
+        .fail_after_writing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = environment
+        .module
+        .configure_with_secret_if(
+            &slack_destination("chat", "#new"),
+            &slack_credential("https://hooks.slack.com/services/T000/B000/new-credential"),
+            &|| Ok(()),
+        )
+        .expect_err("the store reports a failure");
+    assert!(
+        error.to_string().contains("may send nothing"),
+        "the owner is told what is known: {error}"
+    );
+    assert!(
+        !error.to_string().contains("sends nothing"),
+        "and not what is not: {error}"
+    );
+
+    let id = DestinationId::new("chat").expect("an identifier");
+    let configured = environment
+        .module
+        .with(|producer| Ok(producer.journal().destination(&id).expect("a read")))
+        .expect("a read")
+        .expect("the destination");
+    assert_eq!(
+        configured
+            .as_external()
+            .and_then(|external| external.credential.clone()),
+        kept_under(&store, "chat").map(|held| held.stamp),
+        "the record names the stamp the store holds"
+    );
+    take_and_produce(
+        &environment,
+        &notice(1, "a command failed"),
+        std::slice::from_ref(&configured),
+        1,
+    );
+    let external = ExternalDouble::answering(Vec::new());
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::queued(),
+            &GatewayDouble::queued(),
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &external,
+            &Granted(BTreeSet::new()),
+            &|| NOW,
+        )
+        .expect("a pass");
+    assert_eq!(
+        external.endpoints(),
+        vec!["#new".to_owned()],
+        "it sends, whatever the error said"
     );
 }
 

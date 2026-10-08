@@ -410,8 +410,8 @@ pub enum DeliveryDestinationKind {
     Email,
 }
 
-/// One destination this host delivers to, as `delivery.destination.list` says it. It never carries
-/// a credential.
+/// One destination this host delivers to, as `delivery.destination.list` says it. It carries no
+/// credential kept in the secret store.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryDestinationSummary {

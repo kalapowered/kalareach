@@ -151,7 +151,7 @@ async fn kr_req_12_18_a_relayed_approval_is_recorded_and_its_views_are_told() {
     let (runtime, mut view) = session_and_view(&host).await;
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     let mut launch = package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION));
     launch.views = Some((session(), Arc::downgrade(&runtime)));
     let mut channel = Channel::open(launch, 2, launched(2));
@@ -198,7 +198,7 @@ async fn kr_req_12_18_a_relayed_approval_is_recorded_and_its_views_are_told() {
 async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verdict() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(&broker, 2);
     let mut channel = Channel::open(
         package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
@@ -264,7 +264,7 @@ async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verd
 async fn kr_req_12_18_only_the_applications_own_channel_is_served_and_only_what_it_should_send() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     let launch = || package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION));
 
     // A program the application runs inherits its variables and starts a channel of its own. It is
@@ -326,7 +326,7 @@ async fn kr_req_12_18_only_the_applications_own_channel_is_served_and_only_what_
 async fn kr_req_12_18_a_closed_channel_settles_what_it_relayed() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(&broker, 2);
     let mut channel = Channel::open(
         package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
@@ -392,6 +392,15 @@ fn approvals_after(
     journal: &kr_worker::journal::Journal,
     after: u64,
 ) -> kr_protocol::attention::AttentionApprovalSlice {
+    approvals_page(journal, after, 64)
+}
+
+/// The same, at most `limit` of them: one page of the source.
+fn approvals_page(
+    journal: &kr_worker::journal::Journal,
+    after: u64,
+    limit: u64,
+) -> kr_protocol::attention::AttentionApprovalSlice {
     kr_worker::attention_source::page(
         journal,
         &kr_protocol::attention::AttentionSourcesRequest {
@@ -399,7 +408,7 @@ fn approvals_after(
             questions_after: kr_protocol::scalars::U64::ZERO,
             approvals_after: kr_protocol::scalars::U64::new(after),
             host_events_after: kr_protocol::scalars::U64::ZERO,
-            max_records: kr_protocol::scalars::U64::new(64),
+            max_records: kr_protocol::scalars::U64::new(limit),
             wait_ms: kr_protocol::scalars::U64::ZERO,
             fingerprint_key: kr_protocol::scalars::SecretBytes32::from_bytes([1; 32]),
             recorded_generation: Nullable::null(),
@@ -421,7 +430,7 @@ async fn kr_req_25_01_an_approval_reaches_the_attention_source_from_its_interpre
 {
     let directory = tempfile::tempdir().expect("a directory");
     let (broker, journal) = broker_over_a_journal(&directory.path().join("journal.sqlite3"));
-    let package = Package::new();
+    let package = Package::laid_out();
     register(&broker, 2);
     package.bind(&broker, 2);
     // The control: an instance with no binding of the package, whose relayed request nothing
@@ -522,9 +531,195 @@ async fn kr_req_25_01_an_approval_reaches_the_attention_source_from_its_interpre
             .is_empty()
     );
 
+    // Read one record at a time, the source is the same records in the same order, each page's
+    // head is the source's head, and the last page ends at it.
+    let whole = approvals_after(&journal, 0);
+    let mut one_at_a_time = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let page = approvals_page(&journal, cursor, 1);
+        assert_eq!(page.head, whole.head);
+        let Some(record) = page.records.into_iter().next() else {
+            break;
+        };
+        cursor = record.sequence.get();
+        one_at_a_time.push(record);
+    }
+    assert_eq!(one_at_a_time, whole.records);
+
     bound.close().await;
     assert!(matches!(bound.ended().await, ChannelEnd::Ended { .. }));
     assert!(matches!(unbound.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-25.01: a worker that starts again over the same journal carries on the numbering of the
+/// broker's transitions, so the store's cursor, which sat at the end of what it read before, reads
+/// exactly the new ones: none of the earlier records again, none of the new ones hidden below it,
+/// and no hole between the two.
+#[tokio::test]
+async fn kr_req_25_01_the_numbering_carries_on_when_the_broker_starts_again() {
+    let store = common::SharedStore::open();
+    let package = Package::laid_out();
+    let first = {
+        let broker = Arc::new(
+            Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+        );
+        register(&broker, 2);
+        package.bind(&broker, 2);
+        let mut channel = Channel::open(
+            package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+            2,
+            launched(2),
+        );
+        channel.relay("abcde").await;
+        eventually("the approval is interpreted", || {
+            relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+        })
+        .await;
+        channel.close().await;
+        assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+        approvals_after(&store.journal, 0)
+    };
+    let seen = first.head.get();
+    assert!(seen >= 3, "recorded, interpreted and ended");
+
+    // Another process of the same session: its broker numbers above what the ledger holds.
+    let broker = Arc::new(
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens again"),
+    );
+    register(&broker, 3);
+    package.bind(&broker, 3);
+    let mut channel = Channel::open(
+        package.launch(&broker, 3, Some(fixture::QUALIFIED_VERSION)),
+        3,
+        launched(3),
+    );
+    channel.relay("fghij").await;
+    eventually("the new approval is interpreted", || {
+        relayed(&broker, 3, "fghij").is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    let new_resource = relayed(&broker, 3, "fghij").expect("recorded").resource_id;
+    let later = approvals_after(&store.journal, seen);
+    assert_eq!(
+        later
+            .records
+            .iter()
+            .map(|record| record.sequence.get())
+            .collect::<Vec<_>>(),
+        (seen + 1..=later.head.get()).collect::<Vec<_>>(),
+        "the new records follow the old ones with no hole and repeat none"
+    );
+    assert!(
+        later
+            .records
+            .iter()
+            .all(|record| record.resource_id == new_resource),
+        "and are the new approval's alone"
+    );
+    assert!(later.records.iter().any(|record| record.interpreted));
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-25.01: an approval that ends while the journal is out is carried to whoever follows the
+/// session's approvals once the journal is back. Transitions made then are announced and not
+/// recorded, and the recovery that follows writes the state each resource reached; it writes the
+/// event that says so with it, so the follower reads the end without waiting for some later
+/// transition to show that numbers were spent. The control is an approval that stayed open through
+/// the whole gap, which the recovery gives no event, and whose item is therefore not ended.
+#[tokio::test]
+async fn kr_req_25_01_an_approval_that_ends_while_the_journal_is_out_is_carried_when_it_returns() {
+    let mut store = common::SharedStore::open();
+    let broker = Arc::new(
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+    );
+    let package = Package::laid_out();
+    let mut channels = Vec::new();
+    for (number, request) in [(2, "abcde"), (3, "fghij")] {
+        register(&broker, number);
+        package.bind(&broker, number);
+        let mut channel = Channel::open(
+            package.launch(&broker, number, Some(fixture::QUALIFIED_VERSION)),
+            number,
+            launched(number),
+        );
+        channel.relay(request).await;
+        eventually("the approval is interpreted", || {
+            relayed(&broker, number, request)
+                .is_some_and(|resource| resource.interpretation_verified)
+        })
+        .await;
+        channels.push(channel);
+    }
+    let mut open_through = channels.pop().expect("two channels");
+    let mut ending = channels.pop().expect("two channels");
+    let ended = relayed(&broker, 2, "abcde").expect("recorded").resource_id;
+    let stayed = relayed(&broker, 3, "fghij").expect("recorded").resource_id;
+    let before = approvals_after(&store.journal, 0);
+    assert!(
+        before
+            .records
+            .iter()
+            .any(|record| record.resource_id == ended && record.interpreted),
+        "the approval was raised"
+    );
+
+    // The store fails under the next approval, and the fence goes up. The channel that relayed the
+    // approval closes inside the gap, which settles what it relayed in memory only.
+    broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    open_through.relay("qrstu").await;
+    eventually("the fence is up", || {
+        broker.mode() == GatewayMode::NativeOnlyVolatile
+    })
+    .await;
+    ending.close().await;
+    assert!(matches!(ending.ended().await, ChannelEnd::Ended { .. }));
+    assert_eq!(
+        approvals_after(&store.journal, before.head.get())
+            .records
+            .len(),
+        0,
+        "nothing of the gap is recorded yet"
+    );
+
+    broker
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    store.recover_journal(20);
+    broker
+        .recover(TimestampMs::new(20))
+        .expect("the gap is committed");
+    let after = approvals_after(&store.journal, before.head.get());
+    let ends: Vec<_> = after
+        .records
+        .iter()
+        .filter(|record| record.resource_id == ended)
+        .collect();
+    assert_eq!(ends.len(), 1, "the end is written once: {after:?}");
+    assert_eq!(ends[0].state, PendingState::Cancelled);
+    assert!(
+        ends[0].approval && !ends[0].interpreted,
+        "it is the end of an approval and raises nothing"
+    );
+    assert!(
+        ends[0].sequence.get() > before.head.get() + 1,
+        "numbered above what the broker spent while the journal was out, so the hole shows"
+    );
+    assert!(
+        after
+            .records
+            .iter()
+            .all(|record| record.resource_id != stayed),
+        "an approval that stayed open through the gap is given no event"
+    );
+    open_through.close().await;
+    assert!(matches!(
+        open_through.ended().await,
+        ChannelEnd::Ended { .. }
+    ));
 }
 
 /// KR-REQ-25.01: whoever follows a session's approvals is woken by each transition the broker
@@ -538,7 +733,7 @@ async fn kr_req_25_01_a_relayed_approval_wakes_whoever_follows_the_approvals() {
     let changes = Arc::new(tokio::sync::Notify::new());
     broker.attach_attention_changes(Arc::clone(&changes));
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(&broker, 2);
     let mut channel = Channel::open(
         package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
@@ -564,7 +759,7 @@ async fn kr_req_12_18_no_channel_holds_a_recovery_open() {
     let broker = Arc::new(
         Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
     );
-    let package = Package::new();
+    let package = Package::laid_out();
     let mut channels = Vec::new();
     for (number, request) in [(2, "abcde"), (3, "fghij"), (4, "kmnop")] {
         register(&broker, number);
@@ -640,7 +835,7 @@ async fn kr_req_12_18_no_channel_holds_a_recovery_open() {
 async fn kr_req_12_18_a_channel_is_served_only_for_a_version_its_table_is_qualified_for() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     for version in [Some("2.1.277"), None] {
         let mut channel = Channel::open(package.launch(&broker, 2, version), 2, launched(2));
         assert_eq!(channel.next().await, None, "{version:?}: closed unread");
@@ -699,7 +894,7 @@ fn invoke(
 /// The answer action the package declares, as a registration builds it.
 #[test]
 fn an_answer_action_is_registered_as_an_answer() {
-    let package = Package::new();
+    let package = Package::laid_out();
     let declared = package
         .connector
         .manifest()
@@ -734,7 +929,7 @@ fn an_answer_action_is_registered_as_an_answer() {
 async fn kr_req_12_18_a_plugin_answer_is_refused_before_its_marker_for_what_it_cannot_answer() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(&broker, 2);
     register_actions(&broker, &package, 2);
     // Another package bound to the same instance, with an answer action of its own.
@@ -851,7 +1046,7 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_before_its_marker_for_what_it_c
 async fn kr_req_12_18_an_answer_to_an_approval_whose_channel_closed_is_told_it_ended() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(&broker, 2);
     register_actions(&broker, &package, 2);
     let other = kr_protocol::ids::PluginId::new("kalareach/other").expect("valid");
@@ -1017,7 +1212,7 @@ async fn kr_req_12_18_answering_follows_the_installations_grants() {
     // Granted both, and the answer right withdrawn afterwards.
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(&broker, 2);
     register_actions(&broker, &package, 2);
     let mut channel = Channel::open(
@@ -1093,7 +1288,7 @@ fn approval_evidence(
 async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is_open() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(&broker, 2);
     // A connection that holds 64 bytes unread: an answer does not fit while nothing reads it.
     let mut channel = Channel::open_with(
@@ -1185,7 +1380,7 @@ async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is
 async fn kr_req_12_18_only_the_channels_own_package_interprets_what_it_relays() {
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     let other = Digest256::from_bytes([7; 32]);
     let trust = decoding_trust(&package.connector, TimestampMs::new(1)).map(|trust| {
         kr_protocol::broker::DecodingTrust {
@@ -1245,7 +1440,7 @@ async fn kr_req_12_18_a_channels_identifier_is_not_restored_as_another_connectio
     use kr_protocol::ids::{MethodTableVersion, PluginId, UpstreamMethod};
     let broker = memory_broker();
     register(&broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     let mut channel = Channel::open(
         package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
         2,

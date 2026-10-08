@@ -3964,7 +3964,7 @@
     },
     "AttentionSourcesRequest": {
       "additionalProperties": false,
-      "description": "A request for one session's attention source records past where the store has read.\n\nThe worker answers with an [`AttentionSourcePage`]. While neither source has a record past its\ncursor and the session's privacy state has not moved, it may hold the request for up to\n`wait_ms`, answering as soon as a question transition, a host event or a privacy transition\nis committed.",
+      "description": "A request for one session's attention source records past where the store has read.\n\nThe worker answers with an [`AttentionSourcePage`]. While no source has a record past its\ncursor and the session's privacy state has not moved, it may hold the request for up to\n`wait_ms`, answering as soon as a question transition, a host event, the transition of a\npending approval or a privacy transition is committed.",
       "properties": {
         "approvals_after": {
           "$ref": "#/$defs/U64",
@@ -9863,7 +9863,7 @@
     },
     "DeliveryDestinationSummary": {
       "additionalProperties": false,
-      "description": "One destination this host delivers to, as `delivery.destination.list` says it. It never carries\na credential.",
+      "description": "One destination this host delivers to, as `delivery.destination.list` says it. It carries no\ncredential kept in the secret store.",
       "properties": {
         "configured_at_ms": {
           "$ref": "#/$defs/TimestampMs",
@@ -19152,7 +19152,7 @@
         },
         {
           "const": "delivery.destination.list",
-          "description": "List the notification destinations that have a rule: a paired device's and the ones the owner configured, each with where it sends, the grant it is told under and whether it is in force. A removed destination is not listed. It never carries a credential, and a webhook's address is given without its query and fragment.",
+          "description": "List the notification destinations that have a rule: a paired device's and the ones the owner configured, each with where it sends, the grant it is told under and whether it is in force. A removed destination is not listed. It carries no credential kept in the secret store, and does not say whether one is kept. A webhook's address is given without its query and fragment, but its path is given as it was configured, and a path can carry a token its owner put there.",
           "type": "string"
         },
         {

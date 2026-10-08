@@ -1545,12 +1545,47 @@ impl Ledger {
         Ok(())
     }
 
+    /// Returns the position of each of `records` whose state the ledger's last event about it
+    /// does not say.
+    ///
+    /// While the journal is faulted a transition is announced and not written, so the ledger's
+    /// last event about a resource can be an earlier state than the one the broker holds, or
+    /// there can be none. Those are the resources a recovery owes an event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn records_without_their_event(
+        &self,
+        records: &[(PendingResource, Option<BrokerBindingId>, bool)],
+    ) -> Result<Vec<usize>> {
+        let mut owed = Vec::new();
+        for (position, (resource, _, _)) in records.iter().enumerate() {
+            let last: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT state FROM broker_events WHERE resource_id = ?1
+                     ORDER BY sequence DESC LIMIT 1",
+                    params![resource.resource_id.get().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| self.fault(error))?;
+            if last.as_deref() != Some(resource.state.as_str()) {
+                owed.push(position);
+            }
+        }
+        Ok(owed)
+    }
+
     /// Commits an evidence gap and everything that happened inside it, in one transaction.
     ///
     /// Section 11 requires the gap to be committed after storage recovers. What is committed is
     /// the gap and the state each affected resource actually reached, in one transaction: a
     /// failure part way leaves the whole of it uncommitted, so the fence that follows is a fence
-    /// over a ledger that has not half-recorded a recovery.
+    /// over a ledger that has not half-recorded a recovery. A state change and the event that
+    /// announces it are one write, as section 24 asks, so `events` are written in the same
+    /// transaction as the states they are about.
     ///
     /// # Errors
     ///
@@ -1565,6 +1600,7 @@ impl Ledger {
         packages: &[(GatewayConnectionId, ApplicationInstanceId, PackageIdentity)],
         gap: &EvidenceGap,
         row: Option<i64>,
+        events: &[TransitionEvent],
     ) -> Result<i64> {
         let faults = self.faults.clone();
         let transaction = self
@@ -1609,6 +1645,9 @@ impl Ledger {
                 )
                 .map_err(|error| faults.of(error))?;
         }
+        for event in events {
+            write_event(&faults, &transaction, event)?;
+        }
         let sequence = match row {
             Some(row) => {
                 transaction
@@ -1643,6 +1682,9 @@ impl Ledger {
             }
         };
         transaction.commit().map_err(|error| faults.of(error))?;
+        if !events.is_empty() {
+            self.announce();
+        }
         Ok(sequence)
     }
 
@@ -3087,7 +3129,7 @@ mod tests {
         let mut gap = EvidenceGap::open("the journal faulted", TimestampMs::new(1), 0);
         gap.closed_at = Nullable::some(TimestampMs::new(2));
         let row = ledger
-            .commit_recovery(&[], &[], &gap, None)
+            .commit_recovery(&[], &[], &gap, None, &[])
             .expect("the gap is committed");
         assert!(
             ledger
