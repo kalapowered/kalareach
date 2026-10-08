@@ -496,6 +496,7 @@ export type HeldRead =
   | 'catalogueList'
   | 'deviceList'
   | 'grantList'
+  | 'voiceAllow'
 
 /** The reads of one kind a test is holding. */
 export interface HeldReads {
@@ -791,7 +792,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     environmentList: () =>
       reading('environmentList', () => {
         requireConnection()
-        return environments()
+        return environments(hostEnvironment, anotherHost ? 'another host · Linux' : null)
       }),
 
     sessionList: () =>
@@ -1372,7 +1373,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       const actions = asked.filter((action) => !voiceHeldBack.includes(action))
       const notHeld = asked.filter((action) => voiceHeldBack.includes(action))
       voiceHeldBack = []
-      return Promise.resolve({
+      return reading('voiceAllow', () => ({
         receipt: null,
         action_id: null,
         value: {
@@ -1386,7 +1387,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           },
           not_held_by_device: notHeld
         } satisfies VoiceAllowed
-      })
+      }))
     },
 
     voiceStart: (request) => {
@@ -2127,13 +2128,13 @@ function hostInfo(): HostInfoResult {
   } as unknown as HostInfoResult
 }
 
-function environments(): EnvironmentListResult {
+function environments(environmentId: string = ENVIRONMENT, label: string | null = null): EnvironmentListResult {
   return {
     environments: [
       {
         arch: 'aarch64',
-        environment_id: ENVIRONMENT,
-        label: 'studio · macOS',
+        environment_id: environmentId,
+        label: label ?? 'studio · macOS',
         live_sessions: '3',
         os: 'macos',
         os_user: 'rs',
