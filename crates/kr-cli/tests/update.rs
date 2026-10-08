@@ -6356,21 +6356,31 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
     assert_eq!(starts_in(&log), 0);
 }
 
-/// KR-REQ-26.10: after two updates that each left a daemon that does not start, a rollback goes back to
+/// KR-REQ-26.10: after three updates that each left a daemon that does not start, a rollback goes back to
 /// the last release whose daemon ran, which is the release the first of them began from and not the
 /// release before the current one, and starts none of the daemons that failed: each was tried once.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rollback_after_two_failed_updates_goes_back_to_the_last_release_that_ran() {
+async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_that_ran() {
     let mut host = Host::bare();
     let log = host.tree.root().join("starts.log");
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
-    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
-    let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3).whose_daemon_cannot_start(&log);
+    let failing = |name: &str, sequence: u64| {
+        Assembled::at_this_level(name, sequence).whose_daemon_cannot_start(&log)
+    };
+    let (two, three, four) = (
+        failing("0.2.0+bbbbbbbbbbbb", 2),
+        failing("0.3.0+cccccccccccc", 3),
+        failing("0.4.0+dddddddddddd", 4),
+    );
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
     let scratch = host.scratch("archives");
-    for (release, name) in [(&two, "two.tar.gz"), (&three, "three.tar.gz")] {
+    for (release, name) in [
+        (&two, "two.tar.gz"),
+        (&three, "three.tar.gz"),
+        (&four, "four.tar.gz"),
+    ] {
         let archive = scratch.join(name);
         release.archive(&archive);
         let (output, said) = host.kr_json(&[
@@ -6382,7 +6392,7 @@ async fn a_rollback_after_two_failed_updates_goes_back_to_the_last_release_that_
         ]);
         assert_eq!(output.status.code(), Some(1), "{said}");
     }
-    assert_eq!(starts_in(&log), 2);
+    assert_eq!(starts_in(&log), 3);
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(
@@ -6397,7 +6407,7 @@ async fn a_rollback_after_two_failed_updates_goes_back_to_the_last_release_that_
     );
     assert_eq!(
         starts_in(&log),
-        2,
+        3,
         "none of the daemons that failed was started again"
     );
 }
@@ -6915,6 +6925,18 @@ async fn a_rescue_to_a_release_with_another_root_of_the_version_the_failed_updat
     ]);
     assert_eq!(output.status.code(), Some(1), "{said}");
     host.put(&elder);
+    // The release that failed has no root file now, so the root its update recorded is the only
+    // record of the version it was to trust.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let share = host.store.release_directory(two.name()).join("share");
+        std::fs::set_permissions(&share, std::fs::Permissions::from_mode(0o755)).expect("opened");
+        let root_file = share.join("update-root.json");
+        std::fs::set_permissions(&root_file, std::fs::Permissions::from_mode(0o644))
+            .expect("opened");
+        std::fs::remove_file(&root_file).expect("removed");
+    }
 
     let (output, said) =
         host.kr_json(&["host", "rollback", "--to", elder.name().as_str(), "--json"]);
