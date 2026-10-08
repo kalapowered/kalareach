@@ -1114,7 +1114,7 @@
       "resource_selectors": [
         "device"
       ],
-      "summary": "Paired devices, their key purposes and each host's last authority acknowledgement.",
+      "summary": "Paired devices, their key purposes, when each pairing ends, and how the authority feed stands.",
       "version": 1
     },
     {
