@@ -59,6 +59,11 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
     state.choose_host(
         "this application is reaching the host you chose",
         |choice| {
+            // The host was found before this lock was taken, and it can have been forgotten since:
+            // a record forgotten while this choice waited is not one to connect to.
+            if !device.is_paired_with(host.host_device_id)? {
+                return Err(unknown_host());
+            }
             device.use_host(host.host_device_id)?;
             Ok(tauri::async_runtime::spawn(keep(
                 app.clone(),

@@ -361,6 +361,21 @@ impl Device {
         Ok(())
     }
 
+    /// Whether this computer holds a record of being paired with `host`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the records could not be read.
+    pub fn is_paired_with(&self, host: DeviceId) -> Result<bool> {
+        Ok(self
+            .pairing
+            .hosts
+            .list()
+            .map_err(|failure| failed(&failure))?
+            .iter()
+            .any(|each| each.host_device_id == host))
+    }
+
     /// Forgets a paired host: this computer's record of it goes, and with it the choice of it, and
     /// says whether it was the host in use.
     ///
@@ -368,14 +383,21 @@ impl Device {
     /// computer, one that revoked it among them. The host keeps whatever it holds of this device;
     /// that is the host's to remove.
     ///
+    /// A write of the records can report a failure after the record is gone, as one does whose
+    /// last step, making the rename durable, fails. What the records hold decides: a host no longer
+    /// in them is forgotten whatever the write said, and the rest of the forgetting is done, so no
+    /// connection is kept to a host this computer does not list.
+    ///
     /// # Errors
     ///
     /// Returns a local failure when the records could not be changed, and then nothing is.
     pub fn forget_host(&self, host: DeviceId) -> Result<bool> {
-        self.pairing
-            .hosts
-            .forget(host)
-            .map_err(|failure| failed(&failure))?;
+        if let Err(failure) = self.pairing.hosts.forget(host) {
+            // Still listed, or not readable: the host is not known to be forgotten.
+            if self.is_paired_with(host).unwrap_or(true) {
+                return Err(failed(&failure));
+            }
+        }
         let was_in_use = {
             let mut in_use = lock(&self.in_use);
             let was = *in_use == Some(host);
