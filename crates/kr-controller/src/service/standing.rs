@@ -18,6 +18,16 @@ enum Standing {
     Unrecorded,
 }
 
+/// Whose clock anchor holds a grant's end on the continuous clock when it is decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Anchor {
+    /// This host's own record of the grant, anchored the first time anything asks.
+    Host,
+    /// The connection that presents the grant, which anchored it when it was admitted and checks
+    /// it before every request.
+    Connection,
+}
+
 impl Controller {
     /// Arms the pause a lease presentation stops at once it has read the clock, before it waits
     /// for the policy's lock. Returns the end that says the presentation has arrived, and the end
@@ -392,6 +402,47 @@ impl Controller {
         now_ms: u64,
         read_at: kr_transport::clock::ContinuousInstant,
     ) -> kr_automation::Result<CanonicalSet<kr_protocol::rights::ActionRight>> {
+        self.decide_standing(record, ingress, now_ms, read_at, Anchor::Host)
+            .map(|intersection| intersection.rights)
+    }
+
+    /// Decides whether a paired device's pairing grant stands under this host's policy, for a
+    /// request decided under a share the device holds, and returns what it was decided under.
+    ///
+    /// The same decision as [`Self::decide_for_workflow`], except that the grant's own end on the
+    /// continuous clock is the connection's: it anchored the deadline when it was admitted and
+    /// checks it before every request, so this neither reads the grant store nor the device
+    /// directory again while the policy is locked. What comes back carries the membership lease
+    /// and the bounded offline validity the grant stands under, which bound the request as they
+    /// bound one decided under the pairing grant itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decide_for_workflow`].
+    pub(crate) fn decide_pairing_standing(
+        &self,
+        record: &crate::grants::GrantRecord,
+        now_ms: u64,
+        read_at: kr_transport::clock::ContinuousInstant,
+    ) -> kr_automation::Result<crate::grants::policy::PolicyIntersection> {
+        self.decide_standing(
+            record,
+            kr_protocol::actor::ActorIngress::PairedDevice,
+            now_ms,
+            read_at,
+            Anchor::Connection,
+        )
+    }
+
+    /// The decision behind [`Self::decide_for_workflow`] and [`Self::decide_pairing_standing`].
+    fn decide_standing(
+        &self,
+        record: &crate::grants::GrantRecord,
+        ingress: kr_protocol::actor::ActorIngress,
+        now_ms: u64,
+        read_at: kr_transport::clock::ContinuousInstant,
+        anchor: Anchor,
+    ) -> kr_automation::Result<crate::grants::policy::PolicyIntersection> {
         let grant_id = record.grant.grant_id;
         let unwritten = || {
             kr_automation::AutomationError::AuthorityUnavailable(
@@ -430,14 +481,17 @@ impl Controller {
         }
         // The grant's own bound in this boot, anchored the first time anything asks, on the floor
         // just written. It is read against the continuous clock after every wait.
-        let anchored = self.grant_anchor(record).map_err(|error| match error {
-            ControllerError::ClockUntrusted { detail } => {
-                kr_automation::AutomationError::PermissionDenied(format!(
-                    "grant {grant_id}: {detail}"
-                ))
-            }
-            other => kr_automation::AutomationError::AuthorityUnavailable(other.to_string()),
-        })?;
+        let anchored = match anchor {
+            Anchor::Host => Some(self.grant_anchor(record).map_err(|error| match error {
+                ControllerError::ClockUntrusted { detail } => {
+                    kr_automation::AutomationError::PermissionDenied(format!(
+                        "grant {grant_id}: {detail}"
+                    ))
+                }
+                other => kr_automation::AutomationError::AuthorityUnavailable(other.to_string()),
+            })?),
+            Anchor::Connection => None,
+        };
         // The decision stands on a reading no older than the lock it is taken under: the caller's,
         // carried forward by the time it waited on the continuous clock, and never earlier than
         // the wall clock read now.
@@ -458,7 +512,7 @@ impl Controller {
         // unavailable, because a daemon started in a new boot, where this anchor means nothing,
         // could find the grant in force by UTC.
         let decided = match decided {
-            Ok(_) if !anchored.holds_at(self.clock.now()) => {
+            Ok(_) if anchored.is_some_and(|anchored| !anchored.holds_at(self.clock.now())) => {
                 if !self.note_grant_lapse(record) {
                     return Err(unwritten());
                 }
@@ -491,7 +545,7 @@ impl Controller {
                         .map(|at| at.get()),
                 })
             }
-            decided => decided.map(|intersection| intersection.rights),
+            decided => decided,
         };
         decided.map_err(|refusal| {
             if refusal.is_clock_decided() {

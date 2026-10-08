@@ -906,30 +906,36 @@ pub(crate) fn offline_anchor(
 /// A paired device's request, as this host decided it.
 ///
 /// The time bounds it was decided under travel inside it, each as the snapshot the decision loaded
-/// with its cell: the membership lease ([`crate::grants::Permitted::lease`]), the bounded offline
-/// validity ([`crate::grants::Permitted::offline`]) and, for a request decided under a share, the
-/// share's own end.
+/// with its cell: the membership lease ([`crate::grants::Permitted::lease`]) and the bounded
+/// offline validity ([`crate::grants::Permitted::offline`]) and, for a request decided under a
+/// share, the share's own end and the bounds the device's pairing grant stands under.
 #[derive(Clone, Debug)]
 pub(crate) struct DeviceDecision {
     /// The decision itself.
     pub decided: crate::config::ceilings::Decided,
-    /// The end of the share the request was decided under, when it was decided under one: a bound
-    /// of its own, held as the others are.
-    pub share: Option<crate::grants::policy::HeldBound>,
+    /// The bounds of the other grant a request decided under a share also stands on: the share's
+    /// own end, and the lease and offline validity of the pairing grant that lets the device in at
+    /// all. Empty for a request decided under the pairing grant.
+    pub beside: Vec<crate::grants::policy::HeldBound>,
 }
 
 impl DeviceDecision {
     /// Every time bound the decision was taken under besides the grant's own, each as the
-    /// snapshot it loaded, with its cell.
+    /// snapshot it loaded, with its cell, and none twice.
     pub(crate) fn bounds(&self) -> Vec<crate::grants::policy::HeldBound> {
         let permitted = &self.decided.permitted;
-        permitted
+        let mut bounds: Vec<crate::grants::policy::HeldBound> = Vec::new();
+        for bound in permitted
             .lease
             .iter()
             .chain(permitted.offline.iter())
-            .chain(self.share.iter())
-            .cloned()
-            .collect()
+            .chain(self.beside.iter())
+        {
+            if !bounds.contains(bound) {
+                bounds.push(bound.clone());
+            }
+        }
+        bounds
     }
 }
 
@@ -1861,7 +1867,7 @@ impl Controller {
             }
             decided => decided.map(|decided| DeviceDecision {
                 decided,
-                share: None,
+                beside: Vec::new(),
             }),
         };
         if matches!(
