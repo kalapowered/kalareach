@@ -9,6 +9,7 @@
 
 mod net_support;
 
+use kr_controller::service::net::dispatch::EFFECT_WAIT;
 use kr_controller::sharing::ShareRequest;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ActionTarget;
@@ -281,20 +282,30 @@ async fn kr_req_25_10_an_expired_invitation_activates_nothing() {
 }
 
 /// KR-REQ-25.10: a connection is ended at the end of the share it acts under though a request of
-/// its is still waiting to be served. The device read under a share that lasts thirty seconds, and
-/// then sent a redemption that is held at the store; the host closes the connection when the share
-/// ends and does not wait for the request. (The end of the device's own pairing grant is bounded
-/// by the connection's deadline, so it would end this connection whatever else the host did.)
+/// its is still waiting to be served. The device read under a share, and then sent a redemption
+/// that is held at the store; the share ends, and the host closes the connection without waiting
+/// for the request. What a connection that was looked at only between requests would do is wait
+/// for the request, which the host gives up on after [`EFFECT_WAIT`], so the connection has to be
+/// closed well inside that wait. (The end of the device's own pairing grant is a day away, so
+/// nothing but the share's end can end the connection here.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_pending() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (device, record) = recipient(&host, &owner).await;
     let session_id = SessionId::new(kr_ipc::new_uuid());
-    let short = shared_for(&host, session_id, record.device_id, Some(30_000)).await;
     let other = shared(&host, SessionId::new(kr_ipc::new_uuid()), record.device_id).await;
-
     let connection = RawDevice::connect(&host, &device, &record).await;
+    // Written once the connection is up, so the share's life is spent on the exchange below and
+    // not on setting the connection up. It lasts a third of the host's wait for an effect.
+    let short = shared_for(
+        &host,
+        session_id,
+        record.device_id,
+        Some(u64::try_from(EFFECT_WAIT.as_millis() / 3).expect("a lifetime in milliseconds")),
+    )
+    .await;
+
     connection
         .mutate(
             Method::GrantRedeem,
@@ -336,18 +347,18 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
         "the request is pending: nothing was written"
     );
 
-    // The connection is closed at the share's end and the held request is never answered. A
-    // connection that is only looked at between requests is closed after the host's own wait for
-    // the held request gives up, and that request is answered first. The wait here is a guard
-    // against a hang, longer than either.
+    // The share ends while the request is held. The connection is closed then, and the request
+    // is never answered. A connection that is only looked at between requests is closed after the
+    // host gives up on the request, which is no earlier than the whole of its wait, so two thirds
+    // of that wait is the longest this one is given.
     let answered = connection
-        .answered_before_closing(held, std::time::Duration::from_secs(120))
+        .answered_before_closing(held, EFFECT_WAIT / 3 * 2)
         .await
-        .expect("the connection was closed");
+        .expect("the connection was closed inside the host's wait for the request");
     assert!(
         !answered,
         "the connection was ended with its share while a request of its was still pending, and \
-         not after the request had given up"
+         the request was not answered first"
     );
     go.send(()).expect("the held redemption is let go");
     host.stop().await;
