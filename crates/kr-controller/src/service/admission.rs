@@ -373,6 +373,20 @@ impl Controller {
         )
     }
 
+    /// Records the grant a connection acts under, so that a revocation of it reaches this
+    /// connection. Returns whether the connection is still registered: one that is not has been
+    /// withdrawn and acts under nothing.
+    pub(crate) fn note_acting(
+        &self,
+        connection_id: ConnectionId,
+        grant_id: kr_protocol::ids::GrantId,
+    ) -> bool {
+        self.admitted_table()
+            .get_mut(&connection_id)
+            .map(|registration| registration.acting = Some(grant_id))
+            .is_some()
+    }
+
     /// Withdraws one connection's registration.
     pub(super) fn deregister(&self, connection_id: ConnectionId) {
         self.admitted_table().remove(&connection_id);
@@ -872,6 +886,10 @@ pub(super) struct AdmittedConnection {
     pub(super) admitted_revision: kr_protocol::ids::AuthorityRevision,
     /// The latch of the write boundary this registration lets write, when it has one.
     latch: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The grant a network connection acts under for its session, once its link to that session's
+    /// worker is open. A revocation that reaches a grant fences the connections acting under it
+    /// and no others ([`super::barrier::Reach::Grants`]).
+    pub(super) acting: Option<kr_protocol::ids::GrantId>,
     /// The door the connection came through.
     door: Door,
 }
@@ -902,6 +920,7 @@ impl AdmittedConnection {
             actor_id,
             admitted_revision,
             latch: None,
+            acting: None,
             door: Door::Network,
         }
     }
@@ -917,6 +936,7 @@ impl AdmittedConnection {
             actor_id,
             admitted_revision,
             latch: None,
+            acting: None,
             door: Door::Local(kind),
         }
     }

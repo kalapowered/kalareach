@@ -110,6 +110,12 @@ const SECOND_MARKER: &str = "kalareach-again";
 /// The command that produces it.
 const SECOND_MARKER_COMMAND: &str = "printf 'kala%s-again\n' reach\n";
 
+/// What a third command prints, and the command that prints it.
+const THIRD_MARKER: &str = "kalareach-lastly";
+
+/// The command that produces it.
+const THIRD_MARKER_COMMAND: &str = "printf 'kala%s-lastly\n' reach\n";
+
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes, and is kept
@@ -852,13 +858,33 @@ async fn received_without_applying(
     panic!("the session's output never carried {wanted:?}: {seen:?}");
 }
 
-/// Takes the input lease, types `text`, and waits for it to come back as output.
+/// Takes the input lease, types `text`, and waits for [`MARKER`] to come back as output.
 async fn type_and_observe(
     session: &Session,
     environment_id: EnvironmentId,
     session_id: SessionId,
     attachment_id: AttachmentId,
     text: &str,
+) -> String {
+    type_and_wait_for(
+        session,
+        environment_id,
+        session_id,
+        attachment_id,
+        text,
+        MARKER,
+    )
+    .await
+}
+
+/// Takes the input lease, types `text`, and waits for `wanted` to come back as output.
+async fn type_and_wait_for(
+    session: &Session,
+    environment_id: EnvironmentId,
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+    text: &str,
+    wanted: &str,
 ) -> String {
     let acquired: InputAcquireResult = session
         .mutate(
@@ -899,7 +925,7 @@ async fn type_and_observe(
         written.forwarded_bytes.get() > 0,
         "the bytes reached the application"
     );
-    observe(session, &mut events, MARKER).await
+    observe(session, &mut events, wanted).await
 }
 
 /// Closes a session and waits for the daemon to record that its worker has gone.
@@ -4730,8 +4756,6 @@ async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until
 
     typing.close();
     session.close();
-    // A revocation fences every connection admitted before it, the owner's own included.
-    let mut local = host.client().await;
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
@@ -4948,6 +4972,319 @@ async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_op
 
     drop(reader);
     drop(terminal);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// A device the owner gave the session's live screen to for `lifetime_ms`, which redeemed the
+/// invitation and is attached and subscribed to the screen, and sends nothing from there on.
+struct Watching {
+    /// The recipient's endpoint, which the connection ends with when it is dropped.
+    _device: Device,
+    session: Session,
+    events: tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
+    grant_id: kr_protocol::ids::GrantId,
+}
+
+/// Pairs a device under a grant that reaches no session, shares the live screen of `session_id`
+/// with it as the local owner, and has the device redeem the invitation and follow the screen.
+async fn watching_a_shared_screen(
+    daemon: &RunningDaemon,
+    host: &Host,
+    owner: &DeviceKeys,
+    local: &mut LocalClient,
+    session_id: SessionId,
+    lifetime_ms: Option<u64>,
+) -> Watching {
+    let viewer = Device::create(&loopback()).await;
+    let viewer_record = pair_with(
+        daemon,
+        &viewer,
+        owner,
+        proposing(&[ActionRight::SessionView], SessionSelector::None),
+    )
+    .await;
+    let selection = kr_protocol::sharing::RoleSelection {
+        include_live_screen: true,
+        ..kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer)
+    };
+    let issued: kr_protocol::sharing::GrantCreateResult = local
+        .mutate(
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_session(host.environment_id, session_id),
+            &kr_protocol::sharing::GrantCreateParams {
+                session_id,
+                recipient_device_id: viewer_record.device_id,
+                parent_grant_id: Nullable::null(),
+                accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(
+                    &selection.actions(),
+                ),
+                selection,
+                lifetime_ms: Nullable(lifetime_ms.map(DurationMs::new)),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is written")
+        .to_typed()
+        .expect("decodes");
+    let session = connect(daemon, &viewer, &viewer_record).await;
+    let _: kr_protocol::sharing::GrantRedeemResult = session
+        .mutate(
+            Method::GrantRedeem,
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::null(),
+                session_epoch: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &ParamsValue::empty(),
+            &kr_protocol::sharing::GrantRedeemParams {
+                invitation_id: issued.preview.invitation_id,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the invitation is redeemed")
+        .to_typed()
+        .expect("decodes");
+    let watching = attach_one(
+        &session,
+        host.environment_id,
+        session_id,
+        &[AttachmentCapability::ObserveTerminal],
+    )
+    .await;
+    let events = session.events();
+    let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
+    let params = restoration
+        .subscribe_params(session_id, watching, &[EventStream::Output])
+        .expect("the stream is waiting to subscribe");
+    session
+        .subscribe_events(&params)
+        .await
+        .expect("the share includes the live screen, so the device subscribes");
+    restoration.subscribed().expect("the order is kept");
+    Watching {
+        _device: viewer,
+        session,
+        events,
+        grant_id: issued.grant.grant_id,
+    }
+}
+
+/// Waits until the session has exactly `attachments` attachments, as its owner reads them.
+///
+/// The worker detaches a connection's attachments when the host lets go of that connection's link,
+/// so the owner's own view of the session says when a device was released, whatever the device
+/// itself has been told.
+async fn waits_for_attachments(
+    local: &mut LocalClient,
+    session_id: SessionId,
+    attachments: u64,
+    why: &str,
+) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let read: SessionReadResult = local
+            .request(Method::SessionRead, &SessionReadParams { session_id })
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner's connection is served")
+            .to_typed()
+            .expect("decodes");
+        if read.session.attachment_count.get() == attachments {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{why}: the session holds {} attachments, not {attachments}",
+            read.session.attachment_count.get()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Withdraws a share as the local owner.
+async fn withdraw_share(local: &mut LocalClient, host: &Host, grant_id: kr_protocol::ids::GrantId) {
+    local
+        .mutate(
+            Method::GrantRevoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &kr_protocol::sharing::GrantRevokeParams { grant_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is revoked");
+}
+
+/// KR-REQ-25.10: withdrawing a share lets go of the connection that acts under it and no other. A
+/// device that types under its own pairing grant on the same session keeps both its attachments
+/// and is served after the withdrawal on the connection it had, and so is the owner on the
+/// connection that withdrew the share.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_shares_withdrawal_fences_what_acted_under_it_and_nothing_else() {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    let typist = Device::create(&loopback()).await;
+    let typist_record = pair(&daemon, &typist, &owner).await;
+    let typing = connect(&daemon, &typist, &typist_record).await;
+    let _attached = attach(&typing, host.environment_id, session_id).await;
+    let watching =
+        watching_a_shared_screen(&daemon, &host, &owner, &mut local, session_id, None).await;
+    waits_for_attachments(
+        &mut local,
+        session_id,
+        3,
+        "the typist's two and the recipient's",
+    )
+    .await;
+
+    withdraw_share(&mut local, &host, watching.grant_id).await;
+
+    waits_for_attachments(
+        &mut local,
+        session_id,
+        2,
+        "the recipient's attachment is let go of, and the typist's two are not",
+    )
+    .await;
+    let still_served: SessionReadResult = typing
+        .read(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("the device that did not act under the share is served");
+    assert_eq!(still_served.session.session_id, session_id);
+    // The owner's connection is the one that withdrew the share, and it is served on the same
+    // connection afterwards: the read above was made on it.
+
+    typing.close();
+    watching.session.close();
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// KR-REQ-25.10: a recipient whose share is withdrawn is sent no screen output after it, though it
+/// sends nothing. While the share stood it followed what a typist put on the screen; once the
+/// owner's view says its attachment is gone, the typist puts another line on the screen, and the
+/// recipient's connection has not been sent it.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_recipient_whose_share_is_withdrawn_is_sent_nothing_more() {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    let typist = Device::create(&loopback()).await;
+    let typist_record = pair(&daemon, &typist, &owner).await;
+    let typing = connect(&daemon, &typist, &typist_record).await;
+    let attached = attach(&typing, host.environment_id, session_id).await;
+    // The typist holds the input lease before anything is shared.
+    let printed = type_and_observe(
+        &typing,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        MARKER_COMMAND,
+    )
+    .await;
+    assert!(printed.contains(MARKER));
+    let mut watching =
+        watching_a_shared_screen(&daemon, &host, &owner, &mut local, session_id, None).await;
+
+    // While the share stands the recipient follows the screen.
+    typing
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the second command is accepted");
+    let followed = observe(&watching.session, &mut watching.events, SECOND_MARKER).await;
+    assert!(followed.contains(SECOND_MARKER));
+
+    withdraw_share(&mut local, &host, watching.grant_id).await;
+    waits_for_attachments(
+        &mut local,
+        session_id,
+        2,
+        "the recipient's attachment is let go of at the withdrawal",
+    )
+    .await;
+
+    // The screen changes after that, and the recipient is not sent the change. A revocation moves
+    // the host's authority revision on, which takes every device's input lease with it, so the
+    // typist takes the lease again.
+    let printed = type_and_wait_for(
+        &typing,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        THIRD_MARKER_COMMAND,
+        THIRD_MARKER,
+    )
+    .await;
+    assert!(printed.contains(THIRD_MARKER));
+    let mut received = String::new();
+    while let Ok(notification) = watching.events.try_recv() {
+        if notification.event_type.as_str() == "session.output" {
+            let event: OutputEvent = notification.payload.to_typed().expect("an output event");
+            received.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+        }
+    }
+    assert!(
+        !received.contains(THIRD_MARKER),
+        "nothing printed after the withdrawal reached the recipient: {received:?}"
+    );
+
+    typing.close();
+    watching.session.close();
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// KR-REQ-25.10: a recipient whose share runs out is let go of with it, though it sends nothing. The
+/// share lasts twenty seconds and the device spends them listening: the owner's view of the session
+/// shows its attachment until the share ends and not after.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_recipient_whose_share_runs_out_is_let_go_of_with_it() {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    let watching =
+        watching_a_shared_screen(&daemon, &host, &owner, &mut local, session_id, Some(20_000))
+            .await;
+    waits_for_attachments(&mut local, session_id, 1, "while the share lasts").await;
+    waits_for_attachments(
+        &mut local,
+        session_id,
+        0,
+        "the share ran out and the recipient, which sent nothing, was let go of",
+    )
+    .await;
+
+    watching.session.close();
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
