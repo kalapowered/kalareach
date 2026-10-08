@@ -97,6 +97,12 @@ pub struct Package {
     pub connector: Arc<InstalledConnector>,
 }
 
+impl Default for Package {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Package {
     /// Lays the package out on the internal disk and reads it.
     ///
