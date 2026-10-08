@@ -109,6 +109,15 @@ impl Controller {
                     .await?;
                 return Ok(());
             }
+            // A running worker asking about a draft: one question and one answer, from the process
+            // this daemon recorded for the session.
+            ControlFrame::DraftWanted(wanted) => {
+                let answer = self.draft_wanted(*wanted, peer).await;
+                writer
+                    .write_message(&ControlFrame::DraftAnswer(Box::new(answer)))
+                    .await?;
+                return Ok(());
+            }
             _ => {
                 return Err(ControllerError::rendezvous(
                     "the worker did not present a startup claim",

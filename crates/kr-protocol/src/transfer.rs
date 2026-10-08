@@ -82,12 +82,6 @@ pub const MAX_ORIGINAL_FILE_NAME_LEN: usize = 255;
 /// Maximum length of a declared media type, in bytes.
 pub const MAX_MEDIA_TYPE_LEN: usize = 127;
 
-/// Maximum length of the upstream evidence or failure detail an adapter reports, in characters.
-///
-/// Each is text a client shows and the draft keeps, and a draft's reply carries one of them per
-/// binding, so each is bounded rather than left to the adapter's generosity.
-pub const MAX_INSERTION_DETAIL_LEN: usize = 4096;
-
 /// Largest encoded transfer result, in bytes.
 ///
 /// A reply travels in one control frame, and a draft's reply carries every attachment bound to it
@@ -598,10 +592,18 @@ pub struct AttachmentReadGrant {
 pub enum InsertionState {
     /// The adapter was asked and the binding is recorded. This says nothing about the agent.
     Recorded,
-    /// The adapter reported upstream evidence. Only this state means the agent took the file.
+    /// The worker has claimed the binding and is offering the attachment to the agent. Nothing
+    /// else offers it, and the binding cannot be bound again until the offer is reported.
+    Inserting,
+    /// The adapter reported upstream evidence. Only this state means the receiver of a typed
+    /// request acknowledged it after the file was available to it.
     AcceptedByAgent,
-    /// The insertion failed. The draft and the completed upload are both retained for a retry.
+    /// The insertion failed, or nothing was offered. The draft and the completed upload are both
+    /// retained for a retry.
     Failed,
+    /// The offer may have reached the agent and nothing says whether it was taken. The draft and
+    /// the completed upload are retained; offering the attachment again is a new attempt.
+    Unknown,
 }
 
 impl InsertionState {
@@ -610,8 +612,10 @@ impl InsertionState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Recorded => "recorded",
+            Self::Inserting => "inserting",
             Self::AcceptedByAgent => "accepted_by_agent",
             Self::Failed => "failed",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -620,8 +624,10 @@ impl InsertionState {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "recorded" => Some(Self::Recorded),
+            "inserting" => Some(Self::Inserting),
             "accepted_by_agent" => Some(Self::AcceptedByAgent),
             "failed" => Some(Self::Failed),
+            "unknown" => Some(Self::Unknown),
             _ => None,
         }
     }
@@ -1212,8 +1218,10 @@ mod tests {
         }
         for state in [
             InsertionState::Recorded,
+            InsertionState::Inserting,
             InsertionState::AcceptedByAgent,
             InsertionState::Failed,
+            InsertionState::Unknown,
         ] {
             assert_eq!(InsertionState::parse(state.as_str()), Some(state));
         }

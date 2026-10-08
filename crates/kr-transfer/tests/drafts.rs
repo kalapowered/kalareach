@@ -4,15 +4,18 @@
 
 mod support;
 
+use kr_protocol::broker::ActionProvenance;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ApplicationInstanceId, DeviceId, DraftId, DraftRevision, SessionId};
+use kr_protocol::ids::{
+    ActionId, ApplicationInstanceId, DeviceId, DraftId, DraftRevision, SessionId,
+};
+use kr_protocol::insertion::ReportedOutcome;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AttachmentContribution, AttachmentHandle, DraftCreateParams,
     DraftState, DraftUpdateParams, InsertionMethod, InsertionState,
 };
-use kr_transfer::InsertionOutcome;
 use kr_transfer::service::{Action, Admission};
 use support::{Harness, pattern};
 
@@ -310,13 +313,15 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
 }
 
 /// KR-REQ-11.49: only upstream evidence makes an insertion accepted, and a failure keeps both the
-/// draft and the completed upload.
+/// draft and the completed upload. The offer that failed is offered again as a new attempt of the
+/// same binding, under a new action, and the draft holds one binding throughout.
 #[test]
 fn a_failed_insertion_keeps_the_draft_and_the_upload_and_only_evidence_accepts() {
     let harness = Harness::create();
     let bytes = pattern(1024);
     let handle = harness.publish(&bytes, "image/png", "photo.png");
     let created = draft(&harness);
+    let session = created.session_id.0.expect("a session");
     let bound = harness
         .service
         .draft_add_attachment(
@@ -325,81 +330,116 @@ fn a_failed_insertion_keeps_the_draft_and_the_upload_and_only_evidence_accepts()
                 draft_id: created.draft_id,
                 expected_revision: created.revision,
                 transfer_id: handle.transfer_id,
-                contribution: contribution(&handle, InsertionMethod::VerifiedComposerInsertion),
+                contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
             None,
         )
         .expect("binds the attachment");
     assert_eq!(bound.attachment.state, InsertionState::Recorded);
 
-    let failed = harness
-        .service
-        .record_insertion_outcome(
-            &harness.actor,
-            created.draft_id,
-            handle.transfer_id,
-            &InsertionOutcome::Failed {
-                detail: "the composer was not empty".to_owned(),
-            },
-        )
-        .expect("records the failure");
-    assert_eq!(failed.state, InsertionState::Failed);
+    let first = ActionId::new(Uuid::from_bytes([61; 16]));
+    harness
+        .claim(session, created.draft_id, handle.transfer_id, first)
+        .expect("claims the binding for the first offer");
+    let begin = harness.begin_of(session, created.draft_id, handle.transfer_id, first);
     assert_eq!(
-        failed.failure_detail.0.as_deref(),
-        Some("the composer was not empty")
+        harness
+            .report(
+                session,
+                &begin,
+                ReportedOutcome::Failed {
+                    detail: "the composer was not empty".to_owned(),
+                },
+            )
+            .expect("records the failure"),
+        InsertionState::Failed
     );
-    assert!(failed.upstream_evidence.as_ref().is_none());
-
-    // Both survive the failure, which is the whole point of keeping them separate.
     let read = harness
         .service
         .draft(&harness.actor, created.draft_id)
         .expect("the draft is still there");
     assert_eq!(read.text, "have a look at this");
     assert_eq!(read.attachments.len(), 1);
+    assert_eq!(read.attachments[0].state, InsertionState::Failed);
+    assert_eq!(
+        read.attachments[0].failure_detail.0.as_deref(),
+        Some("the composer was not empty")
+    );
+    assert!(read.attachments[0].upstream_evidence.as_ref().is_none());
     harness
         .service
         .attachment_handle(&harness.actor, handle.transfer_id)
         .expect("the completed upload is still there");
 
-    // Acceptance needs evidence, and empty evidence is not evidence.
-    let refusal = harness
+    // Acceptance needs evidence, and empty evidence is not evidence. A write into the terminal is
+    // not either.
+    let again = harness
         .service
-        .record_insertion_outcome(
+        .draft_add_attachment(
             &harness.actor,
-            created.draft_id,
-            handle.transfer_id,
-            &InsertionOutcome::AcceptedByAgent {
-                upstream_evidence: "   ".to_owned(),
+            &AgentDraftAddAttachmentParams {
+                draft_id: created.draft_id,
+                expected_revision: read.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
         )
-        .expect_err("refuses acceptance without evidence");
-    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
-
-    let accepted = harness
-        .service
-        .record_insertion_outcome(
-            &harness.actor,
-            created.draft_id,
-            handle.transfer_id,
-            &InsertionOutcome::AcceptedByAgent {
-                upstream_evidence: "upstream part msg_01H".to_owned(),
-            },
-        )
-        .expect("records the acceptance");
-    assert_eq!(accepted.state, InsertionState::AcceptedByAgent);
+        .expect("binds it again, as a new attempt of the same binding");
     assert_eq!(
-        accepted.upstream_evidence.0.as_deref(),
-        Some("upstream part msg_01H")
+        again.draft.attachments.len(),
+        1,
+        "one binding, not a second"
     );
-    assert!(accepted.failure_detail.as_ref().is_none());
-
-    // A retry after the failure is the same binding, not a second one.
-    let read = harness
+    let second = ActionId::new(Uuid::from_bytes([62; 16]));
+    harness
+        .claim(session, created.draft_id, handle.transfer_id, second)
+        .expect("claims the new attempt");
+    let begin = harness.begin_of(session, created.draft_id, handle.transfer_id, second);
+    for (outcome, code) in [
+        (
+            ReportedOutcome::AcceptedByAgent {
+                provenance: ActionProvenance::UpstreamTypedRpc,
+                evidence: "   ".to_owned(),
+            },
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            ReportedOutcome::AcceptedByAgent {
+                provenance: ActionProvenance::TerminalInput,
+                evidence: "the path was typed".to_owned(),
+            },
+            ErrorCode::PermissionDenied,
+        ),
+    ] {
+        let refusal = harness
+            .report(session, &begin, outcome)
+            .expect_err("is not acceptance");
+        assert_eq!(refusal.code(), code);
+    }
+    assert_eq!(
+        harness
+            .report(
+                session,
+                &begin,
+                ReportedOutcome::AcceptedByAgent {
+                    provenance: ActionProvenance::UpstreamTypedRpc,
+                    evidence: "upstream part msg_01H".to_owned(),
+                },
+            )
+            .expect("records the acceptance"),
+        InsertionState::AcceptedByAgent
+    );
+    let accepted = harness
         .service
         .draft(&harness.actor, created.draft_id)
         .expect("reads the draft");
-    assert_eq!(read.attachments.len(), 1);
+    assert_eq!(accepted.attachments.len(), 1);
+    assert_eq!(
+        accepted.attachments[0].upstream_evidence.0.as_deref(),
+        Some("upstream part msg_01H")
+    );
+    assert!(accepted.attachments[0].failure_detail.as_ref().is_none());
 }
 
 /// KR-REQ-11.49: an operation that claims a model media capability cannot present unsupported
@@ -778,13 +818,31 @@ fn a_declared_external_destination_is_recorded_and_disclosed() {
 }
 
 /// KR-REQ-24.09: ending a session fails what its agent never confirmed and leaves what it did, for
-/// a draft that was sent to the session. The binding the agent accepted stays accepted, a prompt,
-/// a binding or an adapter's late report for the ended session is refused, and an upload that
-/// belongs to the ended session cannot be bound to a draft that names none.
+/// a draft that targets the session. A binding the agent accepted stays accepted, one a worker was
+/// offering when it went fails and its read grant is revoked, a prompt, a binding or an adapter's
+/// late report for the ended session is refused, and an upload that belongs to the ended session
+/// cannot be bound to a draft that names none.
 #[test]
 fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
     let harness = Harness::create();
     let session = SessionId::new(Uuid::from_bytes([21; 16]));
+    let draft_for = |harness: &Harness, session: SessionId| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable::some(session),
+                    application_instance_id: Nullable::null(),
+                    text: "for the session".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
     let sessionless = |harness: &Harness| {
         harness
             .service
@@ -820,29 +878,29 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
         (bound.draft, handle)
     };
 
-    // A draft that names no session, two bindings, one of them accepted by the agent, then sent.
-    let (draft_one, first) = bind(&harness, &sessionless(&harness), "first.png");
+    // A draft for the session, two bindings: one the agent accepted, and one a worker was offering
+    // when it went. Then the draft is sent.
+    let (draft_one, first) = bind(&harness, &draft_for(&harness, session), "first.png");
     let (draft_one, second) = bind(&harness, &draft_one, "second.png");
+    let accepting = ActionId::new(Uuid::from_bytes([71; 16]));
     harness
-        .service
-        .record_insertion_outcome(
-            &harness.actor,
-            draft_one.draft_id,
-            second.transfer_id,
-            &InsertionOutcome::AcceptedByAgent {
-                upstream_evidence: "the agent's own part".to_owned(),
+        .claim(session, draft_one.draft_id, second.transfer_id, accepting)
+        .expect("claims the binding for an offer");
+    harness
+        .report(
+            session,
+            &harness.begin_of(session, draft_one.draft_id, second.transfer_id, accepting),
+            ReportedOutcome::AcceptedByAgent {
+                provenance: ActionProvenance::UpstreamTypedRpc,
+                evidence: "the agent's own part".to_owned(),
             },
         )
         .expect("records the agent's evidence");
-    harness
-        .service
-        .record_prompt(
-            &harness.actor,
-            draft_one.draft_id,
-            session,
-            &Admission::none(),
-        )
-        .expect("sends the draft to the session");
+    let offering = ActionId::new(Uuid::from_bytes([72; 16]));
+    let offered = harness
+        .claim(session, draft_one.draft_id, first.transfer_id, offering)
+        .expect("claims the other binding for an offer");
+    let offering_begin = harness.begin_of(session, draft_one.draft_id, first.transfer_id, offering);
 
     let accepted_before = harness
         .service
@@ -858,6 +916,10 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
         .end_session_insertions(&std::collections::BTreeSet::from([session]))
         .expect("ends the session's insertions");
     assert_eq!(failed, 1, "only the binding nobody confirmed");
+    assert!(
+        harness.service.read_grant(offered.grant.grant_id).is_err(),
+        "the grant of the offer that ended with its session is revoked"
+    );
     let read = harness
         .service
         .draft(&harness.actor, draft_one.draft_id)
@@ -892,13 +954,12 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
         .expect_err("a prompt for an ended session");
     assert_eq!(prompt.code(), ErrorCode::SessionClosed);
     let report = harness
-        .service
-        .record_insertion_outcome(
-            &harness.actor,
-            draft_one.draft_id,
-            first.transfer_id,
-            &InsertionOutcome::AcceptedByAgent {
-                upstream_evidence: "a report that came late".to_owned(),
+        .report(
+            session,
+            &offering_begin,
+            ReportedOutcome::AcceptedByAgent {
+                provenance: ActionProvenance::UpstreamTypedRpc,
+                evidence: "a report that came late".to_owned(),
             },
         )
         .expect_err("a report for an ended session");
@@ -1249,7 +1310,10 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
         ]))
         .expect("ends the sessions' insertions");
     assert_eq!(failed, 2, "one by the draft's target, one by its prompt");
-    for draft in [targeting.draft_id, sent.draft_id] {
+    for (draft, reporting_session) in [
+        (targeting.draft_id, targeted_session),
+        (sent.draft_id, sent_session),
+    ] {
         let read = harness
             .service
             .draft(&harness.actor, draft)
@@ -1259,13 +1323,19 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
         // A late report is refused by the draft's own session, there being no other to match: the
         // upload names none and the report carries none.
         let report = harness
-            .service
-            .record_insertion_outcome(
-                &harness.actor,
-                draft,
-                read.attachments[0].handle.transfer_id,
-                &InsertionOutcome::AcceptedByAgent {
-                    upstream_evidence: "a report that came late".to_owned(),
+            .report(
+                reporting_session,
+                &kr_protocol::insertion::InsertionBegin {
+                    action_id: ActionId::new(Uuid::from_bytes([73; 16])),
+                    draft_id: draft,
+                    transfer_id: read.attachments[0].handle.transfer_id,
+                    attempt: U64::new(0),
+                    max_count: U64::new(4),
+                    deadline_boot_ms: U64::new(0),
+                },
+                ReportedOutcome::AcceptedByAgent {
+                    provenance: ActionProvenance::UpstreamTypedRpc,
+                    evidence: "a report that came late".to_owned(),
                 },
             )
             .expect_err("a report for an ended session");

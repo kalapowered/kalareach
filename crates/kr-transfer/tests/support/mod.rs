@@ -11,8 +11,10 @@
 use std::sync::Arc;
 
 use kr_ipc::testing::TempHost;
-use kr_protocol::ids::{ActorId, EnvironmentId, SessionId, TransferId};
+use kr_protocol::ids::{ActionId, ActorId, DraftId, EnvironmentId, SessionId, TransferId};
+use kr_protocol::insertion::{InsertionBegin, InsertionClaim, InsertionReport, ReportedOutcome};
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
+use kr_protocol::transfer::InsertionState;
 use kr_protocol::transfer::{
     AttachmentHandle, ChunkDescriptor, ChunkLayout, UploadBeginParams, UploadBeginResult,
     UploadChunkParams, UploadFinishParams, UploadFinishResult,
@@ -58,6 +60,9 @@ pub fn at_the_first_refusal(
 
 /// Where the clock starts, so an expiry window is easy to read in a test.
 pub const START_MS: u64 = 1_700_000_000_000;
+
+/// The machine's boot clock as a claim is made at, in milliseconds.
+pub const BOOT_NOW_MS: u64 = 1_000;
 
 /// One environment's transfer service, its clock and its host tree.
 pub struct Harness {
@@ -210,6 +215,71 @@ impl Harness {
             &self.actor,
             &kr_protocol::transfer::UploadCancelParams { transfer_id },
             action,
+        )
+    }
+
+    /// The claim a worker of `session` makes of one binding of `draft_id`, at the attempt the draft
+    /// says it is at, for the offer `action` is made under.
+    pub fn begin_of(
+        &self,
+        session: SessionId,
+        draft_id: DraftId,
+        transfer_id: TransferId,
+        action: ActionId,
+    ) -> InsertionBegin {
+        let facts = self
+            .service
+            .insertion_facts(&self.actor, session, draft_id)
+            .expect("reads the draft's facts");
+        let attempt = facts
+            .bindings
+            .iter()
+            .find(|binding| binding.transfer_id == transfer_id)
+            .expect("the attachment is bound")
+            .attempt;
+        InsertionBegin {
+            action_id: action,
+            draft_id,
+            transfer_id,
+            attempt,
+            max_count: U64::new(4),
+            deadline_boot_ms: U64::new(BOOT_NOW_MS + 60_000),
+        }
+    }
+
+    /// Claims one binding for an offer, as a worker does.
+    pub fn claim(
+        &self,
+        session: SessionId,
+        draft_id: DraftId,
+        transfer_id: TransferId,
+        action: ActionId,
+    ) -> Result<InsertionClaim> {
+        self.service.insertion_begin(
+            &self.actor,
+            session,
+            &self.begin_of(session, draft_id, transfer_id, action),
+            BOOT_NOW_MS,
+        )
+    }
+
+    /// Reports what became of an offer the way its owner does.
+    pub fn report(
+        &self,
+        session: SessionId,
+        begin: &InsertionBegin,
+        outcome: ReportedOutcome,
+    ) -> Result<InsertionState> {
+        self.service.record_insertion_outcome(
+            &self.actor,
+            session,
+            &InsertionReport {
+                action_id: begin.action_id,
+                draft_id: begin.draft_id,
+                transfer_id: begin.transfer_id,
+                attempt: begin.attempt,
+                outcome,
+            },
         )
     }
 

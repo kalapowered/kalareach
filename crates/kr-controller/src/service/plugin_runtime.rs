@@ -61,6 +61,7 @@ use kr_plugin_service::launcher::{
     self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor, LaunchError,
 };
 use kr_protocol::admission::{PluginRuntimeState, PluginRuntimeUnavailable, PluginRuntimeWanted};
+use kr_protocol::ids::SessionId;
 use kr_protocol::limits::MAX_REPORT_DETAIL_BYTES;
 use kr_protocol::scalars::U64;
 use tokio::sync::watch;
@@ -444,37 +445,74 @@ fn unavailable(reason: &str, retry_after: Duration) -> PluginRuntimeState {
     })
 }
 
+/// Why a request on the rendezvous endpoint was not taken from the process that made it.
+#[derive(Debug)]
+pub(super) enum Asker {
+    /// The daemon has no record of that session's worker yet, or could not tell who is asking. The
+    /// asker is told to ask again.
+    NotYet(&'static str),
+    /// The process asking is not the worker the daemon recorded.
+    NotTheWorker(&'static str),
+}
+
+impl Asker {
+    /// Why, in words for the asker.
+    pub(super) const fn reason(&self) -> &'static str {
+        match self {
+            Self::NotYet(reason) | Self::NotTheWorker(reason) => reason,
+        }
+    }
+}
+
 impl Controller {
-    /// Answers a worker's request for the plugin runtime, from the process this daemon recorded
-    /// for the session and from no other.
+    /// Checks that a request on the rendezvous endpoint comes from the process this daemon recorded
+    /// for the session it names, as the kernel names that process, and from no other.
     ///
     /// A worker is recorded when its ready report has been taken, which can be a moment after it
     /// starts to serve; a request that arrives before is told to ask again, and is not admitted
     /// on a weaker proof.
-    pub(super) async fn plugin_runtime_wanted(
+    pub(super) async fn recorded_worker(
         &self,
-        wanted: PluginRuntimeWanted,
+        session_id: SessionId,
         peer: &PeerIdentity,
-    ) -> PluginRuntimeState {
-        let refuse = |reason: &str| unavailable(reason, NOT_RECORDED_RETRY);
+    ) -> std::result::Result<(), Asker> {
         let Some(pid) = peer.pid else {
-            return refuse("the platform did not report which process is asking");
+            return Err(Asker::NotYet(
+                "the platform did not report which process is asking",
+            ));
         };
         let Ok(asking) = kr_ipc::identity::process_start_identity(pid) else {
-            return refuse("the kernel would not describe the process that is asking");
+            return Err(Asker::NotYet(
+                "the kernel would not describe the process that is asking",
+            ));
         };
         let recorded = self
             .directory
             .lock()
             .await
-            .get(wanted.session_id)
+            .get(session_id)
             .map(|worker| worker.descriptor.process_start_identity.clone());
         match recorded {
-            None => refuse("this daemon has not recorded that session's worker yet"),
-            Some(recorded) if !recorded.matches(&asking) => {
-                refuse("the process that is asking is not the worker this daemon recorded")
-            }
-            Some(_) => self.plugin_runtime.request().await,
+            None => Err(Asker::NotYet(
+                "this daemon has not recorded that session's worker yet",
+            )),
+            Some(recorded) if !recorded.matches(&asking) => Err(Asker::NotTheWorker(
+                "the process that is asking is not the worker this daemon recorded",
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Answers a worker's request for the plugin runtime, from the process this daemon recorded
+    /// for the session and from no other.
+    pub(super) async fn plugin_runtime_wanted(
+        &self,
+        wanted: PluginRuntimeWanted,
+        peer: &PeerIdentity,
+    ) -> PluginRuntimeState {
+        match self.recorded_worker(wanted.session_id, peer).await {
+            Err(refusal) => unavailable(refusal.reason(), NOT_RECORDED_RETRY),
+            Ok(()) => self.plugin_runtime.request().await,
         }
     }
 }
