@@ -6546,6 +6546,65 @@ async fn a_failed_update_does_not_name_a_release_a_rollback_would_refuse() {
     assert_eq!(output.status.code(), Some(2), "{said}");
 }
 
+/// KR-REQ-26.10: a rollback without `--to` goes back to the last release whose daemon ran, and an update
+/// that goes on past a chain does not change which that is. The update from one to two fails, a rollback
+/// to one fails, and the update to three switches and fails: the failure names one, which ran, and
+/// not two, whose daemon never did, and a rollback without `--to` goes there.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_after_a_chain_leaves_the_release_that_ran_as_the_one_to_go_back_to() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let held = host.tree.root().join("held");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
+        .whose_daemon_cannot_start_while(&held, &log);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
+        .whose_daemon_cannot_start_while(&held, &log);
+    let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3)
+        .whose_daemon_cannot_start_while(&held, &log);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let scratch = host.scratch("archives");
+    let update = |release: &Assembled, name: &str| {
+        let archive = scratch.join(name);
+        release.archive(&archive);
+        host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ])
+    };
+    std::fs::write(&held, b"").expect("the daemons are held");
+    let (output, said) = update(&two, "two.tar.gz");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let (output, said) = host.kr_json(&["host", "rollback", "--to", one.name().as_str(), "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let (output, said) = update(&three, "three.tar.gz");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("kr host rollback goes back to {}", one.name())),
+        "the failure names the release that ran: {said}"
+    );
+
+    std::fs::remove_file(&held).expect("the daemons are let go");
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+}
+
 /// KR-REQ-26.10: a chain of failed updates that comes back to the release it began from still has a
 /// release to go back to, however many switches stop before they happen. A rollback from three to one
 /// and an update from one to three both fail to start a daemon; an update to four that the stores

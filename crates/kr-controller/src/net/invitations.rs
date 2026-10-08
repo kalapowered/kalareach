@@ -1117,7 +1117,6 @@ fn commit_pairing(
 /// another payload, for this pairing method or any other, is refused as `ID_CONFLICT`, which rolls
 /// the caller's transaction back with everything else it wrote.
 fn claim_action(transaction: &Connection, action: &PairingAction) -> Result<Option<PairingAction>> {
-    recorded(action.subject.method())?;
     if let Some(raw) = read_action_row(transaction, &action.actor, action.action_id)
         .map_err(ControllerError::registry)?
     {
@@ -1202,7 +1201,9 @@ fn read_action_row(
 /// The methods a recorded pairing action can name, each stored by its wire name.
 ///
 /// The reader of a row matches only these, so a method added here is one a release that does not
-/// have it refuses a row of. The stored-format lock reads the names from here.
+/// have it refuses a row of, and the stored-format lock reads the names from here. A method an
+/// [`ActionSubject`] gives that is not listed is one whose first row this release refuses to read
+/// back, which every method's replay test finds.
 pub const RECORDED_METHODS: [Method; 6] = [
     Method::OwnerConfirmationRequest,
     Method::OwnerConfirmationComplete,
@@ -1211,18 +1212,6 @@ pub const RECORDED_METHODS: [Method; 6] = [
     Method::PairConfirm,
     Method::PairCancel,
 ];
-
-/// Refuses to record a method that [`RECORDED_METHODS`] does not list: a row of it would be one that
-/// the reader of this release refuses, and the stored-format lock would not have moved for it.
-fn recorded(method: Method) -> Result<()> {
-    if RECORDED_METHODS.contains(&method) {
-        return Ok(());
-    }
-    Err(ControllerError::registry(format!(
-        "{} is not a method a pairing action records",
-        method.as_str()
-    )))
-}
 
 /// Decodes the row of one actor's pairing action.
 fn decode_action(actor: &ActorId, action_id: ActionId, raw: RawAction) -> Result<PairingAction> {
@@ -1850,15 +1839,6 @@ pub fn from_store_failure(error: &kr_pairing::PairingError) -> ControllerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A pairing action is recorded under a method the reader of its row matches, and under no other.
-    #[test]
-    fn a_method_the_reader_of_the_row_does_not_match_is_not_recorded() {
-        for method in RECORDED_METHODS {
-            recorded(method).expect("a listed method is recorded");
-        }
-        assert!(recorded(Method::EventsSnapshot).is_err());
-    }
 
     #[test]
     fn a_consumed_reason_is_stored_under_its_protocol_name() {

@@ -177,6 +177,12 @@ pub struct Transaction {
     /// It is kept until this one switches, so that nothing this one does before then can lose it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned: Option<Abandoned>,
+    /// The release the chain of failed updates this one belongs to began from, which is the last
+    /// release whose daemon ran: set once, by the first update that went on past a failed one,
+    /// and carried unchanged by every update after it. Absent when this update went on past no
+    /// failed one, and then the chain began from its `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub began_from: Option<ReleaseName>,
 }
 
 kr_client::debug_as_name!(Transaction);
@@ -186,7 +192,7 @@ kr_client::debug_as_name!(Transaction);
 ///
 /// One record however many updates failed in turn: a transaction that goes on past another that
 /// carried one of its own takes the daemons of both and the newer root of the two, so what is
-/// owed is one list and the record is never a tree.
+/// owed is one list and the record is never a tree. Its release is that of the latest of them.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Abandoned {
     /// The release the failed update began from.
@@ -238,14 +244,14 @@ fn newer_root(
 
 #[cfg(unix)]
 impl Transaction {
+    /// The release the chain of failed updates this one belongs to began from.
+    fn chain_start(&self) -> &ReleaseName {
+        self.began_from.as_ref().unwrap_or(&self.source)
+    }
+
     /// This update, failed, as what it owes: its daemons and its root together with those of the
     /// failed update it went on past, if it did.
     fn abandon(self) -> Abandoned {
-        // The release a chain of failed updates began from is the last whose daemon ran, which is
-        // what a rollback goes back to, unless the chain has come back to it: then it is the
-        // release the last of them began from. The release the last of them made current is the
-        // target.
-        let source = goes_back_to(&self);
         let (restarts, trusted_root) = match self.abandoned {
             Some(earlier) => (
                 merged(self.restarts, earlier.restarts),
@@ -254,7 +260,7 @@ impl Transaction {
             None => (self.restarts, self.trusted_root),
         };
         Abandoned {
-            source,
+            source: self.source,
             target: self.target,
             restarts,
             trusted_root,
@@ -284,8 +290,9 @@ impl Transaction {
 #[cfg(unix)]
 impl Abandoned {
     /// The update again, in the state of one whose switch happened, owing its daemons and those in
-    /// `newer`, which are the more recent record of any environment they share.
-    fn into_update(self, newer: Vec<Restart>) -> Transaction {
+    /// `newer`, which are the more recent record of any environment they share, in the chain that
+    /// began from `began_from`.
+    fn into_update(self, newer: Vec<Restart>, began_from: ReleaseName) -> Transaction {
         Transaction {
             source: self.source,
             target: self.target,
@@ -293,6 +300,7 @@ impl Abandoned {
             restarts: merged(newer, self.restarts),
             trusted_root: self.trusted_root,
             abandoned: None,
+            began_from: Some(began_from),
         }
     }
 }
@@ -1387,15 +1395,17 @@ async fn proceed(
     if report.check {
         return Ok(Vec::new());
     }
+    // What stands recorded now is an update that happened and left daemons unstarted, or nothing:
+    // this one goes on past it, in the chain it belongs to.
+    let before = record.update.take();
     record.update = Some(Transaction {
         source: source.clone(),
         target: target.release.clone(),
         state: TransactionState::Prepared,
         restarts: Vec::new(),
         trusted_root: trusted,
-        // What stands recorded now is an update that happened and left daemons unstarted, or
-        // nothing: this one goes on past it.
-        abandoned: record.update.take().map(Transaction::abandon),
+        began_from: before.as_ref().map(|before| before.chain_start().clone()),
+        abandoned: before.map(Transaction::abandon),
     });
     record.write(store)?;
     hand_over(
@@ -2047,8 +2057,11 @@ async fn unanswered_by(
 #[cfg(unix)]
 fn forget_update(store: &Store, record: &mut Record) {
     record.update = record.update.take().and_then(|ended| {
+        let began_from = ended.chain_start().clone();
         let restarts = ended.restarts;
-        ended.abandoned.map(|failed| failed.into_update(restarts))
+        ended
+            .abandoned
+            .map(|failed| failed.into_update(restarts, began_from))
     });
     let _ = record.write(store);
 }
@@ -2242,8 +2255,9 @@ async fn recover(store: &Store, record: &mut Record) -> Result<Recovered> {
         .map_err(|error| CliError::Other(said(&error)))?;
     if update.abandoned.is_some() && current.as_ref() != Some(&update.target) {
         let restarts = std::mem::take(&mut update.restarts);
+        let began_from = update.chain_start().clone();
         if let Some(failed) = update.abandoned.take() {
-            update = failed.into_update(restarts);
+            update = failed.into_update(restarts, began_from);
         }
         record.update = Some(update.clone());
         record.write(store)?;
@@ -2296,18 +2310,21 @@ fn left_part_way(why: &Shown, switched: bool, back_to: Option<&ReleaseName>) -> 
 }
 
 /// The release `kr host rollback` goes back to when none is named, for the failed update `update`,
-/// whose target is the release now current: the last release whose daemon ran, which is the one a
+/// whose target is the release now current: the last release whose daemon ran, which is the one the
 /// chain of failed updates began from, unless that is the release now current, and then the one
 /// `update` began from. It is a release a rollback takes only when it is older than the current
 /// one.
+///
+/// Both releases are fixed facts of the record, the first carried unchanged along the chain and
+/// the second the update's own, so no later switch can change what this gives for an update.
 #[cfg(unix)]
 fn goes_back_to(update: &Transaction) -> ReleaseName {
-    update
-        .abandoned
-        .as_ref()
-        .map(|failed| failed.source.clone())
-        .filter(|earliest| *earliest != update.target)
-        .unwrap_or_else(|| update.source.clone())
+    let start = update.chain_start();
+    if *start == update.target {
+        update.source.clone()
+    } else {
+        start.clone()
+    }
 }
 
 /// Whether the release `other` is older than the current release, whose manifest is `current`.
@@ -2472,6 +2489,7 @@ mod tests {
             state: TransactionState::Prepared,
             trusted_root: None,
             abandoned: None,
+            began_from: None,
             restarts: vec![Restart {
                 environment: environment.environment_id,
                 runtime_root: "/runtime".to_owned(),
