@@ -14,6 +14,7 @@
     reason = "each suite that includes this harness uses the part of it that it needs"
 )]
 
+#[cfg(unix)]
 pub mod acting;
 
 use std::path::{Path, PathBuf};
