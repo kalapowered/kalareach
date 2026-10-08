@@ -173,6 +173,21 @@ describe('the lists of a phone, when the host changes', () => {
   })
 })
 
+describe('the hosts list of a phone, when the second host refuses', () => {
+  it('shows no host of the first connection when the second refuses to list its own', async () => {
+    const { controls } = start()
+    await openTab('Hosts')
+    expect(await screen.findByText('studio · macOS')).toBeInTheDocument()
+    act(() => {
+      controls.switchHost('another-environment', { refuseEnvironmentList: true })
+    })
+    expect(
+      await screen.findByText(/may not list the environments of this host/)
+    ).toBeInTheDocument()
+    expect(screen.queryByText('studio · macOS')).toBeNull()
+  })
+})
+
 describe('the voice entry of a phone', () => {
   // KR-REQ-15.01: there is no one to talk to while no host is reached, so there is no entry.
   it('appears while a host is reached, and goes when it is lost', async () => {
