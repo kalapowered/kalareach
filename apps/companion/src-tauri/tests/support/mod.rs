@@ -430,10 +430,13 @@ impl Companion {
                 companion_tauri::commands::pairing_stop,
                 companion_tauri::commands::owner_confirmations,
                 companion_tauri::commands::owner_confirmation_review,
+                companion_tauri::commands::hosts_use,
                 companion_tauri::commands::connection_state,
                 companion_tauri::commands::session_list,
                 companion_tauri::commands::device_list,
                 companion_tauri::commands::voice_prepare,
+                companion_tauri::commands::voice_allow,
+                companion_tauri::commands::voice_scope,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
