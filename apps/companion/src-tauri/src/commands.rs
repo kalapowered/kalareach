@@ -127,6 +127,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("owner_confirmation_review", None),
     // The host a phone's commands go to.
     ("hosts_use", None),
+    ("hosts_forget", None),
     // Voice. The start names its method for the table, and this process refuses it before sending.
     ("voice_prepare", Some(Method::VoicePrepare)),
     ("voice_start", Some(Method::VoiceStart)),
@@ -288,6 +289,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         owner_confirmations,
         owner_confirmation_review,
         hosts_use,
+        hosts_forget,
         voice_prepare,
         voice_start,
         voice_stop,
@@ -1402,6 +1404,24 @@ pub async fn hosts_use<R: tauri::Runtime>(
     crate::hosts::use_host(&app, host).await
 }
 
+/// Forgets a host this computer is paired with, named by the reference the pairing screen listed it
+/// under, and says where that leaves the connection.
+///
+/// A local action that reaches no host, so it works after a host has revoked this computer. The
+/// host keeps what it holds of this device; this computer stops listing, using and trying it.
+#[tauri::command]
+pub fn hosts_forget<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::connection::ConnectionState> {
+    let host = state
+        .device()?
+        .host_by_reference(&reference)
+        .ok_or_else(crate::hosts::unknown_host)?;
+    crate::hosts::forget_host(&app, &host)
+}
+
 /// The confirmations this computer's hosts ask for, as descriptions, and the ceremony this
 /// computer offers.
 #[tauri::command]
@@ -1969,8 +1989,9 @@ mod tests {
                 "pairing_stop",
                 "owner_confirmations",
                 "owner_confirmation_review",
-                // The host a phone's commands go to: it pairs, and then it chooses.
+                // The host a phone's commands go to: it pairs, then it chooses, and it may forget.
                 "hosts_use",
+                "hosts_forget",
                 // Setup's own two. Neither performs a protocol operation: one reads this
                 // application's identity and one opens a settings pane by name.
                 "setup_identity",

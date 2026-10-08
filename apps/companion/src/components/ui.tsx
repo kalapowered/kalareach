@@ -15,7 +15,8 @@ import {
   useState,
   type ButtonHTMLAttributes,
   type HTMLAttributes,
-  type ReactNode
+  type ReactNode,
+  type Ref
 } from 'react'
 
 import markLight from '../assets/kala-mark.svg'
@@ -54,6 +55,8 @@ type ButtonTone = 'default' | 'primary' | 'sage' | 'danger' | 'quiet'
 interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'className'> {
   readonly tone?: ButtonTone
   readonly children: ReactNode
+  /** The button element, for a caller that moves focus to it. */
+  readonly ref?: Ref<HTMLButtonElement>
 }
 
 /** A button. */

@@ -361,6 +361,38 @@ impl Device {
         Ok(())
     }
 
+    /// Forgets a paired host: this computer's record of it goes, and with it the choice of it, and
+    /// says whether it was the host in use.
+    ///
+    /// A local action that reaches nothing, so it works for a host that no longer answers this
+    /// computer, one that revoked it among them. The host keeps whatever it holds of this device;
+    /// that is the host's to remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the records could not be changed, and then nothing is.
+    pub fn forget_host(&self, host: DeviceId) -> Result<bool> {
+        self.pairing
+            .hosts
+            .forget(host)
+            .map_err(|failure| failed(&failure))?;
+        let was_in_use = {
+            let mut in_use = lock(&self.in_use);
+            let was = *in_use == Some(host);
+            if was {
+                *in_use = None;
+            }
+            was
+        };
+        if was_in_use {
+            // A choice left behind names no record, so nothing reads it as a host in use.
+            let _ = std::fs::remove_file(&self.use_file);
+        }
+        lock(&self.contact).remove(&host);
+        (self.changed)();
+        Ok(was_in_use)
+    }
+
     /// The hosts this computer is an owner of, which it watches for confirmations.
     #[must_use]
     pub fn owner_hosts(&self) -> Vec<PairedHost> {

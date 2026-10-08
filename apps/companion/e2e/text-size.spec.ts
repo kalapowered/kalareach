@@ -112,6 +112,29 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       }
     ],
     [
+      'the hosts with the question about forgetting one open',
+      '&tab=hosts',
+      async (page) => {
+        await page.evaluate(() => {
+          window.krTestHost?.setPairing({
+            hosts: [
+              {
+                reference: 'studio-reference',
+                in_use: true,
+                name: 'studio-with-a-long-name-that-has-to-wrap',
+                owner: false,
+                authority: 'view sessions',
+                grant_expires_at_ms: null,
+                in_contact: null
+              }
+            ]
+          })
+        })
+        await page.getByTestId('forget-host').click()
+        await expect(page.getByTestId('forget-host-ask')).toBeVisible()
+      }
+    ],
+    [
       'the voice screen',
       '&tab=sessions',
       async (page) => {
