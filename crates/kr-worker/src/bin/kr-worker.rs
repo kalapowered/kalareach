@@ -372,6 +372,8 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.message.into());
     }
 
+    #[cfg(feature = "testing")]
+    hold_ready_for_a_test().await;
     let ready = ready_report(session_id, &endpoint, &runtime.session())?;
     // A ready report that does not arrive must not end the session. The shell is running, the
     // endpoint is bound, and the controller recovers by verifying this worker with a challenge
@@ -395,6 +397,23 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let _record = runtime.wait_closed().await;
     finish(&runtime, serving, bridge_server).await;
     Ok(())
+}
+
+/// Holds the ready report until a test lets it go.
+///
+/// A worker that has claimed its reservation, started its shell and not yet reported itself is a
+/// state a test can only reach by catching a moment, so a test that is to reach it on purpose names
+/// a file in `KR_TEST_HOLD_READY`, and the report waits until that file exists. Without the
+/// variable this returns at once, and the feature that compiles it in is one no shipped build
+/// enables.
+#[cfg(feature = "testing")]
+async fn hold_ready_for_a_test() {
+    let Some(release) = std::env::var_os("KR_TEST_HOLD_READY") else {
+        return;
+    };
+    while !std::path::Path::new(&release).exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// What this worker reports to the daemon that started it once its root shell is running.

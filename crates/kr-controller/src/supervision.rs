@@ -1028,6 +1028,34 @@ impl SystemdSupervisor {
     }
 }
 
+/// Kills everything in the transient service `label` started, through the user's service manager.
+///
+/// The unit's control group holds every process the worker started, including ones that left its
+/// session; the manager ends them all, and the manager's own word that the unit is not loaded
+/// (the unit was collected between the question and the call) is the outcome asked for. The
+/// command is given [`SERVICE_MANAGER_BOUND`] to answer.
+///
+/// # Errors
+///
+/// Returns why the manager could not be asked or refused.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_unit(label: &str) -> std::result::Result<(), String> {
+    let unit = format!("{label}.service");
+    match command_within(
+        "systemctl",
+        &["--user", "kill", "--signal=SIGKILL", &unit],
+        SERVICE_MANAGER_BOUND,
+    ) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("not loaded") => Ok(()),
+        Ok(output) => Err(format!(
+            "systemctl --user kill {unit}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(failure) => Err(failure.detail()),
+    }
+}
+
 /// The fallback supervisor: a detached process in its own process group.
 ///
 /// This is what a non-systemd Unix host uses, and what a macOS host without a GUI bootstrap domain
