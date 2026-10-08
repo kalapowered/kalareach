@@ -430,7 +430,10 @@ fn document_naming(origin: &str) -> ConfigurationDocument {
 
 /// Signs the host in as a finished browser sign-in would, with the tokens the service issued.
 async fn sign_in_with(host: &net_support::Host, grant: IssuedGrant) {
-    host.controller().host_account().keep_for_test(grant).await;
+    host.controller()
+        .host_account()
+        .keep_for_test(grant, true)
+        .await;
 }
 
 /// A sign-in at a service the test has no stand-in for.
@@ -1003,6 +1006,30 @@ async fn an_account_signed_in_at_one_service_is_not_presented_to_another() {
         first.seen().is_empty(),
         "the first service was sent nothing"
     );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a sign-in that no record names a service for is not presented anywhere: the
+/// daemon stopped between keeping the account and recording where it was signed in, and a bearer
+/// token with no known service is a token it cannot tell the destination of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_with_no_recorded_service_is_not_presented() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    host.controller()
+        .host_account()
+        .keep_for_test(broker.issue_grant(600), false)
+        .await;
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
+
+    assert!(
+        prepared.managed.as_ref().is_none(),
+        "no terms were read with an account no service is recorded for"
+    );
+    assert!(broker.seen().is_empty(), "the service was sent nothing");
     host.stop().await;
 }
 
