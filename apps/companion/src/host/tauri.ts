@@ -38,6 +38,7 @@ import type {
   TerminalViewState,
   VoiceCallState,
   VoiceClosure,
+  VoiceScope,
   Written
 } from './port'
 import { receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
@@ -230,6 +231,13 @@ export function tauriPort(): HostPort {
         expectedRateVersion: request.expectedRateVersion,
         subject
       }),
+    voiceScope: () => call<VoiceScope>('voice_scope', {}),
+    voiceAllow: (request, subject) =>
+      mutate(
+        'voice_allow',
+        { session_ids: request.sessionIds, actions: request.actions },
+        subject
+      ),
     voiceStop: (voiceSessionId, subject) =>
       call<VoiceClosure>('voice_stop', { voiceSessionId, subject }),
     voiceDelegate: (params, subject) => mutate('voice_delegate', params, subject),
@@ -237,6 +245,8 @@ export function tauriPort(): HostPort {
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
+    hostsUse: (reference) =>
+      call<ConnectionState>('hosts_use', { reference }).then(receivedConnection),
     pairingView: () => call<PairingView>('pairing_view', {}),
     pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
     pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),
