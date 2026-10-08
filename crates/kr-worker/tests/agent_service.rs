@@ -2802,12 +2802,12 @@ fn plugin_invocation(
 
 /// What an action whose component this suite never registers with a plugin runtime is refused with:
 /// a prompt is refused because its component is not registered yet, which can pass, and an
-/// attachment because it acts on a draft this worker does not read yet.
+/// attachment because the call names no draft for it to act on.
 fn expected_refusal(action: &str) -> ErrorCode {
     if action == "prompt.send" {
         ErrorCode::ResourceUnavailable
     } else {
-        ErrorCode::UnsupportedCapability
+        ErrorCode::DraftConflict
     }
 }
 

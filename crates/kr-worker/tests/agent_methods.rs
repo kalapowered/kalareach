@@ -2747,7 +2747,12 @@ async fn kr_req_23_30_a_preparation_spends_one_bound_from_the_wait_for_a_place_t
     };
     let request = Arc::new(
         broker
-            .prepare_request(&caller(), binding(), &invocation)
+            .prepare_request(
+                &caller(),
+                kr_protocol::ids::ActionId::new(Uuid::from_bytes([1; 16])),
+                binding(),
+                &invocation,
+            )
             .expect("the first pass finds it fit to prepare"),
     );
     let unavailable =
@@ -2760,7 +2765,7 @@ async fn kr_req_23_30_a_preparation_spends_one_bound_from_the_wait_for_a_place_t
     // and its token does not outlive it.
     let started = kr_ipc::now_ms().get();
     let within = Duration::from_millis(2_000);
-    unavailable(broker.prepare(&request, within).await);
+    unavailable(broker.prepare(&request, within, &|| true).await);
     host.until_asked(1).await;
     {
         let asked = host.asked.lock().expect("not poisoned");
@@ -2779,7 +2784,11 @@ async fn kr_req_23_30_a_preparation_spends_one_bound_from_the_wait_for_a_place_t
     }
 
     // With no more than the round trip left, nothing is asked.
-    unavailable(broker.prepare(&request, Duration::from_millis(400)).await);
+    unavailable(
+        broker
+            .prepare(&request, Duration::from_millis(400), &|| true)
+            .await,
+    );
     assert_eq!(
         host.count(),
         1,
@@ -2793,14 +2802,20 @@ async fn kr_req_23_30_a_preparation_spends_one_bound_from_the_wait_for_a_place_t
         .map(|_| {
             let broker = Arc::clone(&broker);
             let request = Arc::clone(&request);
-            tokio::spawn(
-                async move { broker.prepare(&request, Duration::from_millis(1_500)).await },
-            )
+            tokio::spawn(async move {
+                broker
+                    .prepare(&request, Duration::from_millis(1_500), &|| true)
+                    .await
+            })
         })
         .collect();
     host.until_asked(9).await;
     let queued_at = kr_ipc::now_ms().get();
-    unavailable(broker.prepare(&request, Duration::from_millis(2_500)).await);
+    unavailable(
+        broker
+            .prepare(&request, Duration::from_millis(2_500), &|| true)
+            .await,
+    );
     for holder in holders {
         unavailable(holder.await.expect("the preparation ends"));
     }
@@ -2829,11 +2844,19 @@ async fn kr_req_23_30_a_preparation_spends_one_bound_from_the_wait_for_a_place_t
         .map(|_| {
             let broker = Arc::clone(&broker);
             let request = Arc::clone(&request);
-            tokio::spawn(async move { broker.prepare(&request, Duration::from_secs(5)).await })
+            tokio::spawn(async move {
+                broker
+                    .prepare(&request, Duration::from_secs(5), &|| true)
+                    .await
+            })
         })
         .collect();
     host.until_asked(18).await;
-    unavailable(broker.prepare(&request, Duration::from_millis(1_000)).await);
+    unavailable(
+        broker
+            .prepare(&request, Duration::from_millis(1_000), &|| true)
+            .await,
+    );
     assert!(
         holders.iter().all(|holder| !holder.is_finished()),
         "the preparation that waited for a place outlasted the bound of its own wait"
@@ -2848,6 +2871,10 @@ async fn kr_req_23_30_a_preparation_spends_one_bound_from_the_wait_for_a_place_t
     for holder in holders {
         unavailable(holder.await.expect("the preparation ends"));
     }
-    unavailable(broker.prepare(&request, Duration::from_millis(2_000)).await);
+    unavailable(
+        broker
+            .prepare(&request, Duration::from_millis(2_000), &|| true)
+            .await,
+    );
     assert_eq!(host.count(), 19, "the places were not given back");
 }

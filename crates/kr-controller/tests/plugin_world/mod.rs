@@ -14,6 +14,8 @@
     reason = "each suite that includes this harness uses the part of it that it needs"
 )]
 
+pub mod acting;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -446,6 +448,12 @@ impl Hosted {
     /// durable record stays, nothing held in memory does, and the plugin host goes on running.
     /// What the new daemon is asked to start is counted from here.
     pub async fn restart(&mut self) {
+        self.stop_daemon().await;
+        self.start_daemon_again().await;
+    }
+
+    /// Stops the daemon: its listeners are closed and the daemon is let go.
+    pub async fn stop_daemon(&mut self) {
         for serving in self.serving.drain(..) {
             serving.abort();
             let _ = serving.await;
@@ -456,6 +464,10 @@ impl Hosted {
         })
         .await;
         drop(controller);
+    }
+
+    /// Starts a daemon on the same tree after [`Self::stop_daemon`].
+    pub async fn start_daemon_again(&mut self) {
         // The jobs of the hosts the earlier daemon started are still to be taken away, so the
         // record keeps them; what the new daemon is asked to start is what follows.
         self.counted_from = self.services.lock().expect("the record").len();

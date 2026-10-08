@@ -25,6 +25,8 @@
 //! | `prompt.other.method` | a routed method other than the one the action goes out as |
 //! | `cancel.terminal` | text for the terminal |
 //! | `cancel.present` | a redraw of its own document |
+//! | `attach.photo` | the attachment it was given, offered as that attachment |
+//! | `attach.other` | an attachment it was not given |
 //! | `cancel.fault` | a declared fault |
 //! | `cancel.loop` | nothing: it never returns |
 
@@ -180,6 +182,26 @@ impl Guest for Component {
                 PreparedOperation::Present,
                 arguments,
             )),
+            "attach.photo" | "attach.other" => {
+                let given = arguments
+                    .iter()
+                    .find_map(|argument| match &argument.value {
+                        Argument::AttachmentHandle(id) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Fault::Refused("no attachment was named".to_owned()))?;
+                let offered = if action == "attach.photo" {
+                    given
+                } else {
+                    "00000000-0000-0000-0000-000000000000".to_owned()
+                };
+                Ok(plan(
+                    action,
+                    EffectClass::UpstreamAttachment,
+                    PreparedOperation::UpstreamAttachment(offered),
+                    arguments,
+                ))
+            }
             "cancel.fault" => Err(Fault::Refused(format!("{action} is not something to do"))),
             "cancel.loop" => loop {
                 core::hint::spin_loop();
