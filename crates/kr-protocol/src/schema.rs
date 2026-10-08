@@ -164,9 +164,10 @@ use crate::projection::{
     ProjectionSnapshot,
 };
 use crate::push::{
-    PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
-    PushRegistrationAnswer, PushRegistrationChallenge, PushRequest, PushSenderRecord,
-    PushSenderRenewal, PushSenderRevocation,
+    DevicePushRegisterParams, DevicePushRegisterResult, PushDeliveryAck, PushDeliveryCredential,
+    PushDeliveryRequest, PushInstallationBinding, PushRegistrationAnswer,
+    PushRegistrationChallenge, PushRequest, PushSenderRecord, PushSenderRenewal,
+    PushSenderRevocation,
 };
 use crate::question::{
     Alert, AlertCreateParams, AlertCreateResult, AnswerRecord, Question, QuestionAnswer,
@@ -417,6 +418,8 @@ pub fn protocol_schema() -> Value {
         "device_keys_declaration" => DeviceKeysDeclaration,
         "device_preview_key_update_params" => DevicePreviewKeyUpdateParams,
         "device_preview_key_update_result" => DevicePreviewKeyUpdateResult,
+        "device_push_register_params" => DevicePushRegisterParams,
+        "device_push_register_result" => DevicePushRegisterResult,
         "device_revoke_params" => DeviceRevokeParams,
         "device_summary" => DeviceSummary,
         "grant" => Grant,

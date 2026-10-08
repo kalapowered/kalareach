@@ -571,18 +571,26 @@ impl Controller {
         ));
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
+        let destination_secrets =
+            crate::push::secrets::DestinationSecrets::new(secret_store, setup.environment_id);
         let delivery = Arc::new(crate::push::DeliveryModule::open(
             &setup.paths,
             device_keys.notification_preview,
             device_keys.stored_envelope,
-            crate::push::secrets::DestinationSecrets::new(secret_store, setup.environment_id),
+            destination_secrets.clone(),
         )?);
+        // What a paired device's installation was issued is kept in the same store, and taken back
+        // here for every push destination the journal holds, before the runtime delivers anything.
+        let held_credentials = Arc::new(crate::push::credentials::HeldCredentials::persisted(
+            destination_secrets,
+        ));
+        crate::push::load_held_credentials(&delivery, &held_credentials)?;
         // The runtime is built here and started once the daemon exists. Its renewals are proven
         // with this host's own authorisation key, which the installation named when it authorised
         // the host, and an external message's authority is the grant its rule names.
         let delivery_runtime = crate::push::runtime::DeliveryRuntime::new(
             Arc::clone(&delivery),
-            Arc::new(crate::push::credentials::HeldCredentials::new()),
+            held_credentials,
             Arc::new(
                 crate::push::authority::GrantedRecipients::new(
                     Arc::clone(&sharing),
@@ -921,6 +929,7 @@ impl Controller {
         // though it had: the next start tries again, and nothing serves a device from a directory
         // behind the journal in the meantime.
         controller.recover_preview_keys()?;
+        controller.recover_push_destinations()?;
         // Every closure the registry holds is known to the transfer journal before anything is
         // served, so a binding for a closed session is refused from the first request.
         crate::transfer::end_the_insertions_of_closed_sessions(&controller).await?;

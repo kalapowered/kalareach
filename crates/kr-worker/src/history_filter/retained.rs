@@ -173,6 +173,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::PairCancel
         | Method::DeviceRevoke
         | Method::DevicePreviewKeyUpdate
+        | Method::DevicePushRegister
         | Method::DeviceKeysComplete
         | Method::CatalogueAdd
         | Method::CatalogueSync
