@@ -675,8 +675,7 @@ impl Job {
         Ok(limits.BasicLimitInformation.LimitFlags)
     }
 
-    /// Returns the identifiers of every process the job currently holds, asking again with more
-    /// room while the answer is partial.
+    /// Reads the process holding `pid` as a member of this job, through one open handle.
     fn member(&self, pid: u32) -> MemberReading {
         // SAFETY: the rights and the identifier are values; the call returns a handle this process
         // owns, or null.
@@ -748,6 +747,8 @@ impl Job {
         }
     }
 
+    /// Returns the identifiers of every process the job currently holds, asking again with more
+    /// room while the answer is partial.
     fn process_ids(&self) -> std::io::Result<Vec<u32>> {
         let mut capacity = FIRST_QUERY_CAPACITY;
         loop {

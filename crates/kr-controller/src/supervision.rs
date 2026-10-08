@@ -1033,18 +1033,22 @@ impl SystemdSupervisor {
 /// The unit's control group holds every process the worker started, including ones that left its
 /// session; the manager ends them all, and the manager's own word that the unit is not loaded
 /// (the unit was collected between the question and the call) is the outcome asked for. The
-/// command is given [`SERVICE_MANAGER_BOUND`] to answer.
+/// command is given `bound` to answer, and no more than [`SERVICE_MANAGER_BOUND`]; one that does
+/// not answer is ended and given [`COLLECT_BOUND`] to be collected, which is on top of it.
 ///
 /// # Errors
 ///
 /// Returns why the manager could not be asked or refused.
 #[cfg(target_os = "linux")]
-pub(crate) fn kill_unit(label: &str) -> std::result::Result<(), String> {
+pub(crate) fn kill_unit(
+    label: &str,
+    bound: std::time::Duration,
+) -> std::result::Result<(), String> {
     let unit = format!("{label}.service");
     match command_within(
         "systemctl",
         &["--user", "kill", "--signal=SIGKILL", &unit],
-        SERVICE_MANAGER_BOUND,
+        bound.min(SERVICE_MANAGER_BOUND),
     ) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) if String::from_utf8_lossy(&output.stderr).contains("not loaded") => Ok(()),

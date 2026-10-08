@@ -1243,27 +1243,44 @@ impl Session {
         self.submit_owned();
     }
 
-    /// Writes the record of what the session owns, once, before the shell can run anything, and
-    /// starts the thread that keeps it up to date.
+    /// Writes the record of what the session owns, once, and starts the thread that keeps it up to
+    /// date.
     ///
-    /// The first record is written here and waited for, beside the session's summary: a worker
-    /// that dies a moment later leaves the root shell named. Every later one goes through the
-    /// thread, so nothing waits for the disk while the session is locked.
+    /// The first record is written here and waited for, beside the session's summary, so a worker
+    /// that dies a moment later leaves the root shell named. It holds only the root: the shell has
+    /// already started, and what it starts is recorded by the observations that follow. Every later
+    /// record goes through the thread, so nothing waits for the disk while the session is locked.
+    ///
+    /// A first write that fails is reported like any other journal failure, and does not stop the
+    /// thread from being started: it sends the record again at every observation, so the record
+    /// is there as soon as the journal answers. A thread that cannot be started is something this
+    /// host could not establish, and the closure says so.
     fn start_recording_owned(&mut self) {
         let (Some(owned), Some(journal)) = (self.owned.as_ref(), self.journal.as_mut()) else {
             return;
         };
         let record = owned.record();
-        if let Err(error) = journal.record_owned(self.config.session_id, &record) {
+        let first = journal.record_owned(self.config.session_id, &record);
+        let path = journal.path();
+        if let Err(error) = first {
             self.note_journal_failure(error);
-            return;
         }
-        let Some(path) = journal.path() else {
+        let Some(path) = path else {
             return;
         };
-        if let Ok(writer) = crate::owned_writer::OwnedWriter::start(path, self.config.session_id) {
-            writer.submit(record);
-            self.owned_writer = Some(writer);
+        match crate::owned_writer::OwnedWriter::start(path, self.config.session_id) {
+            Ok(writer) => {
+                writer.submit(record);
+                self.owned_writer = Some(writer);
+            }
+            Err(error) => {
+                if let Some(owned) = self.owned.as_ref() {
+                    owned.note_unestablished(format!(
+                        "the thread that keeps the record of the session's processes up to date \
+                         could not be started: {error}"
+                    ));
+                }
+            }
         }
     }
 

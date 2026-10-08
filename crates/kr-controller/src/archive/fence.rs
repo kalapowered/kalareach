@@ -190,9 +190,12 @@ impl ArchiveService {
         for process in &mut tracked {
             if matches!(process.state, Standing::Pending) {
                 match stop(&process.identity, kr_ipc::identity::Stop::Terminate) {
+                    // Whether the process is gone is the kernel's word, asked at the next look:
+                    // a version-bound signal that finds nothing can be a process that ran a new
+                    // program in between.
                     kr_ipc::identity::Stopped::Signalled
+                    | kr_ipc::identity::Stopped::Gone
                     | kr_ipc::identity::Stopped::Unsupported => {}
-                    kr_ipc::identity::Stopped::Gone => process.state = Standing::Ended,
                     kr_ipc::identity::Stopped::Refused(why)
                     | kr_ipc::identity::Stopped::Unsafe(why) => {
                         process.state = Standing::Refused(why);
@@ -200,11 +203,20 @@ impl ArchiveService {
                 }
             }
         }
-        while started.elapsed() < GRACE && tracked.iter().any(pending) {
-            tokio::time::sleep(POLL).await;
+        // The grace period is for everything this pass is to answer for: the recorded processes
+        // and whatever the unit's control group still holds, which the manager has also asked to
+        // end and which may need the time to do it.
+        loop {
             look(&mut tracked);
+            let group_empty = match group.as_mut() {
+                Some(group) => group.empty().await,
+                None => true,
+            };
+            if (!tracked.iter().any(pending) && group_empty) || started.elapsed() >= GRACE {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
         }
-        let mut forced_group = false;
         let mut forced_job = false;
         for process in &mut tracked {
             if matches!(process.state, Standing::Pending) {
@@ -221,8 +233,21 @@ impl ArchiveService {
                 }
             }
         }
+        // The unit's control group, once the grace period has gone and it still holds something.
+        // What the manager then ends was forced, whether or not the worker had recorded it.
+        let mut group_refused = None;
         if let Some(group) = group.as_mut() {
-            forced_group = group.force(started.elapsed()).await;
+            match group.force().await {
+                Forced::Nothing => {}
+                Forced::Killed => {
+                    for process in &mut tracked {
+                        if matches!(process.state, Standing::Pending) {
+                            process.forced = true;
+                        }
+                    }
+                }
+                Forced::Refused(why) => group_refused = Some(why),
+            }
         }
         let forced_until = Instant::now() + FORCED;
         loop {
@@ -239,71 +264,69 @@ impl ArchiveService {
 
         // What each process came to.
         let mut ended = Vec::new();
-        let mut accounted = true;
         for process in tracked {
-            match process.state {
-                Standing::Ended => ended.push(Ended {
-                    root: root.as_ref() == Some(&process.identity),
+            let is_root = root.as_ref() == Some(&process.identity);
+            let refusal = match &process.state {
+                Standing::Refused(why) => format!(": {why}"),
+                _ => String::new(),
+            };
+            // A refusal can come with an end that happened anyway, so the kernel is asked last.
+            match kr_ipc::identity::process_state(&process.identity) {
+                kr_ipc::identity::ProcessState::Ended => ended.push(Ended {
+                    root: is_root,
                     identity: process.identity,
                     forced: process.forced,
                 }),
-                Standing::Pending | Standing::Refused(_) => {
-                    accounted = false;
-                    let refusal = match process.state {
-                        Standing::Refused(why) => format!(": {why}"),
-                        _ => String::new(),
-                    };
-                    let state = kr_ipc::identity::process_state(&process.identity);
-                    // A refusal can come with an end that happened anyway.
-                    if matches!(state, kr_ipc::identity::ProcessState::Ended) {
-                        ended.push(Ended {
-                            root: root.as_ref() == Some(&process.identity),
-                            identity: process.identity,
-                            forced: process.forced,
-                        });
-                        accounted = true;
-                        continue;
-                    }
-                    surviving.push(survivor(
-                        &process.identity,
-                        &boundary,
-                        group.as_ref(),
-                        &refusal,
-                    ));
-                }
+                kr_ipc::identity::ProcessState::Running => surviving.push(survivor(
+                    &process.identity,
+                    &boundary,
+                    group.as_ref(),
+                    &format!("is still running{refusal}"),
+                )),
+                kr_ipc::identity::ProcessState::Unknown { detail } => surviving.push(survivor(
+                    &process.identity,
+                    &boundary,
+                    group.as_ref(),
+                    &format!(
+                        "may still be running: this host cannot say whether it ended ({detail})"
+                    ),
+                )),
             }
         }
         let mut boundary_confirmed = false;
         if let Some(group) = group.as_mut() {
-            let held = group.holders().await;
-            match held {
+            match group.holders().await {
                 Holders::None => boundary_confirmed = true,
                 Holders::Some(identities) => {
-                    accounted = false;
+                    let why = group_refused
+                        .as_deref()
+                        .map(|why| format!("; the service manager did not end it: {why}"))
+                        .unwrap_or_default();
                     for identity in identities {
                         if !surviving.iter().any(|resource| {
                             resource
                                 .detail
-                                .contains(&format!("process {} ", identity.pid))
+                                .starts_with(&format!("process {} ", identity.pid.get()))
                         }) {
-                            surviving.push(survivor(&identity, &boundary, Some(&*group), ""));
+                            surviving.push(survivor(
+                                &identity,
+                                &boundary,
+                                Some(&*group),
+                                &format!("is still running{why}"),
+                            ));
                         }
                     }
                 }
-                Holders::Unreadable(why) => {
-                    accounted = false;
-                    surviving.push(unestablished(why));
-                }
+                Holders::Unreadable(why) => surviving.push(unestablished(why)),
             }
         }
         // Windows: the job closed with the worker, and the claim holds only if nothing needed
         // help to end.
         let job = cfg!(windows) && record.is_some();
+        // A process this pass names as still there is never inside a complete claim, whatever else
+        // ended: the claim is read off the report it sits in.
         let complete = record.is_some()
-            && accounted
-            && !surviving
-                .iter()
-                .any(|resource| resource.kind == UNESTABLISHED)
+            && surviving.is_empty()
             && ((job && !forced_job) || (group.is_some() && boundary_confirmed));
         if forced_job {
             surviving.push(unestablished(
@@ -314,13 +337,17 @@ impl ArchiveService {
         }
         if !complete {
             surviving.push(unestablished(
-                "a process that left the terminal's session, a process the worker started outside \
-                 it, a process that began after the last record was written, and a process that \
-                 moved itself to another service or scope are not found on this host"
-                    .to_owned(),
+                if group.is_some() {
+                    "a process that moved itself to another service or scope is not found on this \
+                     host"
+                } else {
+                    "a process that left the terminal's session, a process the worker started \
+                     outside it and a process that began after the last record was written are \
+                     not found on this host"
+                }
+                .to_owned(),
             ));
         }
-        let _ = forced_group;
         Fenced {
             session_id,
             ended,
@@ -368,7 +395,7 @@ fn survivor(
     SurvivingResource {
         kind: "process".to_owned(),
         detail: format!(
-            "process {} (started {}) is still running{place}{refusal}",
+            "process {} (started {}) {refusal}{place}",
             identity.pid.get(),
             identity.start_value.get(),
         ),
@@ -465,6 +492,20 @@ enum Holders {
     Unreadable(String),
 }
 
+/// What asking the service manager to kill a group came to.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only a Linux host has a control group to kill")
+)]
+enum Forced {
+    /// The group held nothing, or had already been asked.
+    Nothing,
+    /// The manager was asked, and did not refuse.
+    Killed,
+    /// The manager refused, did not answer, or could not be asked.
+    Refused(String),
+}
+
 impl Group {
     /// The group at `path`, if its last component is the unit this reservation was started as.
     fn of(path: &str, unit: &str) -> Option<Self> {
@@ -484,20 +525,30 @@ impl Group {
         }
     }
 
-    /// Asks the service manager to kill everything in the unit, once the grace period has gone
-    /// and the group still holds processes.
-    async fn force(&mut self, elapsed: Duration) -> bool {
-        let _ = elapsed;
+    /// Asks the service manager to kill everything in the unit, if the group still holds
+    /// something.
+    async fn force(&mut self) -> Forced {
         if self.killed || self.empty().await {
-            return false;
+            return Forced::Nothing;
         }
         self.killed = true;
         #[cfg(target_os = "linux")]
         {
             let unit = self.unit.clone();
-            let _ = tokio::task::spawn_blocking(move || crate::supervision::kill_unit(&unit)).await;
+            return match tokio::task::spawn_blocking(move || {
+                crate::supervision::kill_unit(&unit, FORCED)
+            })
+            .await
+            {
+                Ok(Ok(())) => Forced::Killed,
+                Ok(Err(why)) => Forced::Refused(why),
+                Err(_) => {
+                    Forced::Refused("the call to the service manager did not finish".to_owned())
+                }
+            };
         }
-        true
+        #[cfg(not(target_os = "linux"))]
+        Forced::Nothing
     }
 
     /// Whether the kernel says the group holds nothing.
