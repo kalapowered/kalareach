@@ -5746,6 +5746,50 @@ async fn kr_host_terminal_clear_holds_the_preference_and_needs_no_directory_that
     );
 }
 
+/// A named pipe left at the saved terminal preference's name does not hold `kr host terminal`: the
+/// preference is read as a regular file only, and a pipe reads as no preference. A program that read
+/// it would wait for a writer for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipe_where_the_saved_terminal_preference_belongs_does_not_hold_kr() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let pipe = host
+        .tree
+        .environment()
+        .state_dir()
+        .join(kr_shell_integration::host::terminal::PREFERENCE_FILE);
+    let made = Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "a pipe is made");
+    let child = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["host", "terminal", "--json"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("kr runs");
+    // Ended by the test and not left waiting, so that a kr which does wait fails this case.
+    let output = finish_within(child, Duration::from_secs(30));
+    let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert!(
+        output.status.success(),
+        "kr host terminal: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["preferred"].is_null(),
+        "a pipe is no preference: {said}"
+    );
+}
+
 /* -------------------------------------------------------------------------------------------- */
 /* The stored formats                                                                            */
 /* -------------------------------------------------------------------------------------------- */

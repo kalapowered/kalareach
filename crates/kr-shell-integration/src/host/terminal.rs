@@ -225,16 +225,16 @@ fn stamp_preference_within(state_dir: &std::path::Path, patience: std::time::Dur
 
 /// Reads the terminal preference saved in an environment's state directory.
 ///
-/// No file, an unreadable one, a file longer than [`PREFERENCE_MAX_LEN`] and a document this build
-/// does not understand all read as no preference.
+/// Only a regular file of this user's is read, opened without waiting for a writer and without
+/// following a link, so a named pipe left at the preference's name cannot hold a command or a
+/// daemon's start. No file, anything that is not a regular file, an unreadable one, a file longer
+/// than [`PREFERENCE_MAX_LEN`] and a document this build does not understand all read as no
+/// preference.
 #[must_use]
 pub fn saved_preference(state_dir: &std::path::Path) -> Option<String> {
     let file = state_dir.join(PREFERENCE_FILE);
-    let length = std::fs::metadata(&file).ok()?.len();
-    if length > PREFERENCE_MAX_LEN {
-        return None;
-    }
-    parse_preference(&std::fs::read(&file).ok()?)
+    let bytes = kr_ipc::paths::read_owner_only_file(&file, PREFERENCE_MAX_LEN).ok()??;
+    parse_preference(&bytes)
 }
 
 /// Chooses the terminal a presented session opens in.
