@@ -68,6 +68,9 @@ pub enum Moment {
     /// The service holds the request open and answers nothing, until [`StorageWeb::release_held`]
     /// lets the connection go. It acts on nothing.
     Hold,
+    /// The service acts on the request and is slow to answer: the answer is given when
+    /// [`StorageWeb::release_held`] is called, and is the one the service would have given at once.
+    Slow,
     /// The service refuses the request as stated, without acting on it, as a service does that is
     /// rate limiting, out of room or fenced for maintenance.
     Refuse {
@@ -127,6 +130,8 @@ struct Upload {
     object: String,
     generation: u64,
     total: u64,
+    /// The most the creation declared, which the allowance holds for the upload until it ends.
+    declared: u64,
     hash: String,
     installation: String,
     account: Option<String>,
@@ -200,6 +205,8 @@ pub enum Handled {
     /// The service holds the request open and answers nothing until it is released. The count is
     /// the number of releases so far, which [`StorageWeb::held_until_released`] waits past.
     Held(u64),
+    /// The service acted on the request and gives its answer when it is released.
+    Slow(u64, ServiceHttpAnswer),
 }
 
 /// Managed storage and the backup manifest.
@@ -413,6 +420,7 @@ impl StorageWeb {
         token: Option<&str>,
         content: Option<&[u8]>,
     ) -> Handled {
+        let released = *self.released.borrow();
         let moment = {
             let mut faults = self.faults.lock().expect("the faults");
             let mut met = None;
@@ -481,6 +489,9 @@ impl StorageWeb {
         );
         if moment == Some(Moment::After) {
             return Handled::Lost;
+        }
+        if moment == Some(Moment::Slow) {
+            return Handled::Slow(released, answer);
         }
         Handled::Answer(answer)
     }
@@ -605,7 +616,7 @@ impl StorageWeb {
     /// What an in-process transport answers for one handled request.
     fn delivered(handled: Handled) -> kr_client::Result<ServiceHttpAnswer> {
         match handled {
-            Handled::Answer(answer) => Ok(answer),
+            Handled::Answer(answer) | Handled::Slow(_, answer) => Ok(answer),
             Handled::Lost | Handled::Held(_) => Err(ClientError::Host(ProtocolError::new(
                 ErrorCode::UpstreamUnavailable,
                 "the connection dropped".to_owned(),
@@ -999,6 +1010,7 @@ fn create(
             object,
             generation,
             total,
+            declared,
             hash,
             installation: caller.to_owned(),
             account: account.map(str::to_owned),
@@ -1262,7 +1274,7 @@ fn abort(
     }
     upload.state = UploadState::Cleaned;
     // What the abandonment gives back is what the upload reserved: the most it declared.
-    let released = upload.total;
+    let released = upload.declared;
     let key = (upload.archive.clone(), upload.object.clone());
     state.objects.remove(&key);
     answered(serde_json::json!({ "state": "cleaned", "released_bytes": released.to_string() }))
@@ -1608,38 +1620,65 @@ fn manifest(
         }));
     }
     let asked = &members["fetch"];
+    // The request is read before any collection is looked up, in the order the Worker reads it
+    // (`backup/index.ts`): the archive, the generation, then the checkpoint.
     let Some(archive) = identifier(&asked["archive_id"]) else {
         return refusal(400, "INVALID_REQUEST", "A fetch names the archive.");
+    };
+    let wanted = match asked.get("backup_generation") {
+        None => None,
+        Some(named) => match counter(named) {
+            Some(generation) if generation >= 1 => Some(generation),
+            _ => {
+                return refusal(
+                    400,
+                    "INVALID_REQUEST",
+                    "A generation is a counter from one.",
+                );
+            }
+        },
+    };
+    let checkpoint = asked.get("checkpoint").filter(|named| !named.is_null());
+    let checkpoint_generation = match checkpoint {
+        None => None,
+        Some(checkpoint) => {
+            let wholly_named = [
+                "archive_id",
+                "backup_generation",
+                "encrypted_manifest_hash",
+                "observed_at_ms",
+            ]
+            .iter()
+            .all(|member| checkpoint[member].is_string());
+            if !wholly_named {
+                return refusal(
+                    400,
+                    "INVALID_REQUEST",
+                    "A checkpoint names the archive, the generation and the manifest hash.",
+                );
+            }
+            if checkpoint["archive_id"].as_str() != Some(archive.as_str()) {
+                return refusal(
+                    400,
+                    "INVALID_REQUEST",
+                    "That checkpoint is about another archive.",
+                );
+            }
+            let Some(generation) = counter(&checkpoint["backup_generation"]) else {
+                return refusal(
+                    400,
+                    "INVALID_REQUEST",
+                    "A checkpoint generation is a counter.",
+                );
+            };
+            Some(generation)
+        }
     };
     let Some(collection) = state.collections.get(&archive) else {
         return refusal(404, "NOT_FOUND", "No such collection.");
     };
-    let wanted = match &asked["backup_generation"] {
-        serde_json::Value::Null => collection.generations.keys().next_back().copied(),
-        named => counter(named),
-    };
     // A caller that holds a verified checkpoint is not answered with anything older, and not with a
     // chain it cannot join: the service says it holds nothing to answer with.
-    let checkpoint = &asked["checkpoint"];
-    let checkpoint_generation = if checkpoint.is_null() {
-        None
-    } else {
-        if identifier(&checkpoint["archive_id"]).is_none_or(|named| named != archive) {
-            return refusal(
-                400,
-                "INVALID_REQUEST",
-                "That checkpoint is about another archive.",
-            );
-        }
-        let Some(generation) = counter(&checkpoint["backup_generation"]) else {
-            return refusal(
-                400,
-                "INVALID_REQUEST",
-                "A checkpoint generation is a counter.",
-            );
-        };
-        Some(generation)
-    };
     if checkpoint_generation.is_some_and(|held| held > collection.checkpoint) {
         return refusal(
             404,
@@ -1648,10 +1687,9 @@ fn manifest(
         );
     }
     let checkpointed = checkpoint_generation.and_then(|held| collection.generations.get(&held));
-    if let Some((_, held)) = checkpointed
-        && let hash = &checkpoint["encrypted_manifest_hash"]
-        && !hash.is_null()
-        && *hash != held["payload"]["descriptor"]["encrypted_manifest"]["encrypted_object_hash"]
+    if let (Some((_, held)), Some(checkpoint)) = (checkpointed, checkpoint)
+        && checkpoint["encrypted_manifest_hash"]
+            != held["payload"]["descriptor"]["encrypted_manifest"]["encrypted_object_hash"]
     {
         return refusal(
             404,
@@ -1659,9 +1697,10 @@ fn manifest(
             "This collection holds a different manifest at the generation that checkpoint names.",
         );
     }
-    let Some((generation, (_, publication))) =
-        wanted.and_then(|wanted| collection.generations.get_key_value(&wanted))
-    else {
+    let Some((generation, (_, publication))) = wanted.map_or_else(
+        || collection.generations.iter().next_back(),
+        |wanted| collection.generations.get_key_value(&wanted),
+    ) else {
         return refusal(404, "NOT_FOUND", "No such generation.");
     };
     if checkpoint_generation.is_some_and(|held| *generation < held) {
