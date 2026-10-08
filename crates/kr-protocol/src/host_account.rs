@@ -68,8 +68,9 @@ pub struct AccountReport {
     pub service: Nullable<String>,
     /// Why this host does not sign in or present its account: its configuration names no voice
     /// broker, names another service than the account service, or the host could not set up how to
-    /// reach the account service. A grant the host already keeps still shows in `state`, and
-    /// `account.sign_out` ends it, whatever the broker is.
+    /// reach the account service. For the first two, a grant the host already keeps still shows in
+    /// `state`, and `account.sign_out` ends it, whatever the broker is; for the third the host
+    /// reaches no account service, shows `signed_out` and refuses to sign out.
     pub unavailable: Nullable<SignInUnavailable>,
     /// The account this host is signed in as, or what stands in its way.
     pub state: AccountState,
@@ -187,7 +188,9 @@ pub enum AccountAttempt {
     /// The loopback address could not be opened for a reason other than another program holding
     /// it.
     ListenerFailed,
-    /// A managed voice call was open, and a call closes under the account it started under.
+    /// A managed voice call was open, and a call closes under the account it started under. The
+    /// account did not change: a code that had not been spent was left unspent, and one that had
+    /// is revoked.
     CallOpen,
 }
 

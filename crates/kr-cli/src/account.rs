@@ -97,8 +97,8 @@ pub async fn sign_in(selector: &EnvironmentSelector, json: bool) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns the daemon's refusal: this host signs in nowhere, a sign-in is finishing, or a voice
-/// call is open.
+/// Returns the daemon's refusal: this host cannot reach the account service, a sign-in is
+/// finishing, or a voice call is open.
 pub async fn sign_out(selector: &EnvironmentSelector, json: bool) -> Result<()> {
     let mut daemon = Daemon::open(&kr_ipc::paths::HostPaths::discover()?, selector).await?;
     let done: AccountSignedOut = daemon
@@ -266,7 +266,7 @@ const fn attempt_words(attempt: AccountAttempt) -> &'static str {
         AccountAttempt::Unreachable => "the service could not be reached",
         AccountAttempt::Superseded => "a newer attempt ended it",
         AccountAttempt::ListenerFailed => "the loopback address could not be opened",
-        AccountAttempt::CallOpen => "a voice call was open, so the code was not spent",
+        AccountAttempt::CallOpen => "a voice call was open, so the account did not change",
     }
 }
 
