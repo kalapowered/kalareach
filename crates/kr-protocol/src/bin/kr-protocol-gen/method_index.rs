@@ -129,6 +129,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
 
         Method::DeviceList | Method::DeviceRevoke | Method::DeviceKeysComplete => None,
         Method::DevicePreviewKeyUpdate => at(DELIVERY, "What travels, and what does not"),
+        Method::DevicePushRegister => at(DELIVERY, "A paired device becomes a destination"),
 
         Method::CatalogueList | Method::CataloguePin => None,
         Method::CatalogueAdd | Method::CatalogueRemove => at(CATALOGUE, "Enrolment comes first"),

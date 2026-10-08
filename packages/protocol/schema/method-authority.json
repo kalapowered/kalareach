@@ -777,6 +777,31 @@
       "ingress": [
         "paired_device"
       ],
+      "method": "device.push.register",
+      "name": "device.push.register",
+      "required_rights": [
+        {
+          "authority": "resource_owner",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "device"
+      ],
+      "summary": "Hand this host the delivery credential this device's installation was issued for it, so the host can notify this device. The host asks the gateway whether it takes the credential's bearer and holds the authorisation for the host's own key before it keeps anything.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "devices",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "paired_device"
+      ],
       "method": "device.keys.complete",
       "name": "device.keys.complete",
       "required_rights": [

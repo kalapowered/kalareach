@@ -1,43 +1,50 @@
-//! Renewing the authorisation this host delivers under, at the gateway that issued it.
+//! Renewing and revoking the authorisation this host delivers under, at the gateway that issued it.
 //!
 //! `push.sender.renew` is two requests, because the proof answers a nonce the gateway chose. The
 //! host asks for the nonce, and then returns it signed with the host key the installation named,
 //! and the gateway answers the second with a fresh credential. A captured renewal therefore
-//! answers a question that has already been asked and closed.
+//! answers a question that has already been asked and closed. `push.sender.revoke` is built the
+//! same way and ends the authorisation when its device is unpaired.
 //!
-//! Both requests are managed-service requests and carry the one signature every such request
-//! carries, a [`ServiceRequestSignature`] over the gateway's origin, the method, a fresh nonce,
-//! the time and the digest of the body. The digest is [`PushRequest::digest`], the push request
-//! digest the gateway recomputes from the body it received, so a signature covers this body and
-//! this method and no other.
+//! Both requests of either are managed-service requests and carry the one signature every such
+//! request carries, a [`ServiceRequestSignature`] over the gateway's origin, the method, a fresh
+//! nonce, the time and the digest of the body. The digest is [`PushRequest::digest`], the push
+//! request digest the gateway recomputes from the body it received, so a signature covers this
+//! body and this method and no other.
 //!
 //! The gateway is the one the held credential names. A renewal proof covers that origin, and a
 //! gateway checks the origin it is asked under, so a renewal could not be carried to any other.
 //!
 //! # What the host key signs
 //!
-//! [`HostSigner`] holds the host's authorisation key for delivery and signs exactly two kinds of
-//! transcript with it: a managed-service request and a renewal proof. Anything else it is handed is
-//! refused, so the seam cannot be used to sign a pairing bundle or a grant.
+//! [`HostSigner`] holds the host's authorisation key for delivery and signs exactly three kinds of
+//! transcript with it: a managed-service request, a renewal proof and a revocation. Anything else
+//! it is handed is refused, so the seam cannot be used to sign a pairing bundle or a grant.
 
 use std::sync::Arc;
 
 use kr_client::services::{ServiceHttpAnswer, ServiceSigner};
+use kr_protocol::ids::PushSenderRecordId;
 use kr_protocol::push::{
-    PUSH_SENDER_RENEWAL_DOMAIN, PushDeliveryCredential, PushRequest, PushSenderNonceRequest,
-    PushSenderRecord, PushSenderRenewRequest, PushSenderRenewal, PushSenderRenewalPayload,
-    PushSenderState,
+    PUSH_SENDER_RENEWAL_DOMAIN, PUSH_SENDER_REVOCATION_DOMAIN, PushDeliveryCredential, PushRequest,
+    PushRevocationReason, PushSenderNonceRequest, PushSenderRecord, PushSenderRenewRequest,
+    PushSenderRenewal, PushSenderRenewalPayload, PushSenderRevocation, PushSenderRevocationPayload,
+    PushSenderRevokeRequest, PushSenderState,
 };
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, Signature64, TimestampMs};
 use kr_protocol::service::{
     GatewayOrigin, ServiceRequestPayload, ServiceRequestSignature, ServiceRequestSigner,
 };
 
+use super::Confirmation;
 use super::credentials::CredentialRenewal;
 use super::transport::DeliveryTransports;
 
 /// The route both steps of a renewal are presented on.
 pub const RENEW_ROUTE: &str = "/api/push/sender/renew";
+
+/// The route both steps of a revocation are presented on.
+pub const REVOKE_ROUTE: &str = "/api/push/sender/revoke";
 
 /// The most bytes this client reads from an answer.
 ///
@@ -117,20 +124,23 @@ impl ServiceSigner for HostSigner {
         let transcript = [
             ServiceRequestSigner::Host.domain(),
             PUSH_SENDER_RENEWAL_DOMAIN,
+            PUSH_SENDER_REVOCATION_DOMAIN,
         ]
         .into_iter()
         .find_map(|domain| {
             kr_crypto::sign::SigningTranscript::from_canonical_bytes(domain, message.to_vec()).ok()
         })
         .ok_or_else(|| {
-            refused("the delivery key signs a managed-service request or a renewal proof")
+            refused(
+                "the delivery key signs a managed-service request, a renewal proof or a revocation",
+            )
         })?;
         kr_crypto::sign::sign(&self.key, &transcript)
             .map_err(|error| refused(format!("the renewal could not be signed: {error}")))
     }
 }
 
-/// The gateways this host renews its delivery credentials at.
+/// The gateways this host renews its delivery credentials at, and revokes authorisations at.
 #[derive(Clone, Debug)]
 pub struct GatewaySenders {
     transports: Arc<dyn DeliveryTransports>,
@@ -153,12 +163,13 @@ impl GatewaySenders {
         }
     }
 
-    /// Presents one signed request and returns the `data` of the gateway's answer.
-    fn call<T: serde::de::DeserializeOwned>(
+    /// Presents one signed request to one route and returns the gateway's answer as it came.
+    fn post(
         &self,
         origin: &GatewayOrigin,
+        route: &str,
         body: &PushRequest,
-    ) -> Result<T, String> {
+    ) -> Result<ServiceHttpAnswer, String> {
         let mut nonce = [0_u8; 32];
         kr_crypto::random_bytes(&mut nonce)
             .map_err(|error| format!("no fresh nonce could be drawn: {error}"))?;
@@ -186,12 +197,168 @@ impl GatewaySenders {
         let request = serde_json::to_vec(&SignedRequest { body, signature })
             .map_err(|error| format!("the request could not be encoded: {error}"))?;
         let transport = self.transports.to(origin)?;
-        let url = format!("{}{RENEW_ROUTE}", origin.as_str());
-        let answer = self
-            .runtime
+        let url = format!("{}{route}", origin.as_str());
+        self.runtime
             .block_on(async { transport.post_json(&url, &request, &[]).await })
-            .map_err(|error| format!("the gateway did not answer: {error}"))?;
-        data_of(&answer)
+            .map_err(|error| format!("the gateway did not answer: {error}"))
+    }
+
+    /// Asks the gateway for the nonce a renewal would answer, and nothing more.
+    ///
+    /// The gateway hands a nonce out at any time, but only for an authorisation that names this
+    /// host's signing key. So an answer says the gateway holds the authorisation and that this
+    /// host is the one it names, which renewing cannot show before the last week of a credential's
+    /// life. The nonce is never answered and lapses on its own; the gateway counts the request
+    /// against this host's allowance for renewing and revoking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Confirmation::Refused`] for the gateway's own refusal, `FORBIDDEN`, which says it
+    /// holds no such authorisation for this host's key, and [`Confirmation::NotAsked`] for
+    /// everything else that is not a nonce.
+    pub fn begin_renewal(
+        &self,
+        origin: &GatewayOrigin,
+        sender_record_id: PushSenderRecordId,
+    ) -> Result<(), Confirmation> {
+        let answer = self
+            .post(
+                origin,
+                RENEW_ROUTE,
+                &PushRequest::SenderRenew {
+                    request: PushSenderRenewRequest::Begin {
+                        request: PushSenderNonceRequest { sender_record_id },
+                    },
+                },
+            )
+            .map_err(Confirmation::NotAsked)?;
+        if answer.status == 403 && refusal_code(&answer) == Some("FORBIDDEN") {
+            return Err(Confirmation::Refused(
+                "the gateway holds no such authorisation for this host".to_owned(),
+            ));
+        }
+        data_of::<SenderChallenge>(&answer, "renewal")
+            .map(drop)
+            .map_err(Confirmation::NotAsked)
+    }
+
+    /// Presents one signed renewal request and returns the `data` of the gateway's answer.
+    fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        origin: &GatewayOrigin,
+        body: &PushRequest,
+    ) -> Result<T, String> {
+        data_of(&self.post(origin, RENEW_ROUTE, body)?, "renewal")
+    }
+}
+
+/// What asking a gateway to revoke an authorisation came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevocationAnswer {
+    /// The gateway ended the authorisation.
+    Revoked,
+    /// The gateway knows no authorisation for this host's key under that identifier, so there is
+    /// nothing for this host to end and no use in asking again. It says why, in this host's own
+    /// words.
+    Gone(String),
+    /// The revocation did not complete and may be asked for again: nobody answered, the answer was
+    /// not one this host reads, or the gateway refused for a reason that may pass.
+    Later(String),
+}
+
+/// How an authorisation this host no longer delivers under is ended at its gateway.
+pub trait SenderRevocation: std::fmt::Debug + Send + Sync {
+    /// Revokes one authorisation at the gateway that issued it, proven by this host's key. Blocks.
+    fn revoke(
+        &self,
+        origin: &GatewayOrigin,
+        sender_record_id: PushSenderRecordId,
+    ) -> RevocationAnswer;
+}
+
+impl SenderRevocation for GatewaySenders {
+    fn revoke(
+        &self,
+        origin: &GatewayOrigin,
+        sender_record_id: PushSenderRecordId,
+    ) -> RevocationAnswer {
+        let begin = match self.post(
+            origin,
+            REVOKE_ROUTE,
+            &PushRequest::SenderRevoke {
+                request: PushSenderRevokeRequest::Begin {
+                    request: PushSenderNonceRequest { sender_record_id },
+                },
+            },
+        ) {
+            Ok(answer) => answer,
+            Err(error) => return RevocationAnswer::Later(error),
+        };
+        // The gateway refuses the first step with FORBIDDEN when it holds no authorisation under
+        // that identifier for this host's key, and asking again cannot change that. A bare status
+        // says nothing of the kind: a proxy, a deployment without the route and a refusal to
+        // authenticate answer 403 as well, and the authorisation is then still active.
+        if begin.status == 403 && refusal_code(&begin) == Some("FORBIDDEN") {
+            return RevocationAnswer::Gone(
+                "the gateway holds no such authorisation for this host".to_owned(),
+            );
+        }
+        let challenge: SenderChallenge = match data_of(&begin, "revocation") {
+            Ok(challenge) => challenge,
+            Err(error) => return RevocationAnswer::Later(error),
+        };
+        let now_ms = kr_ipc::now_ms().get();
+        if challenge.expires_at_ms.get() <= now_ms {
+            return RevocationAnswer::Later(
+                "the gateway's nonce expired before it could be answered".to_owned(),
+            );
+        }
+        let payload = PushSenderRevocationPayload {
+            gateway_origin: origin.clone(),
+            gateway_nonce: challenge.gateway_nonce,
+            reason: PushRevocationReason::Unpaired,
+            requested_at_ms: TimestampMs::new(now_ms),
+            sender_record_id,
+        };
+        let proof = match payload.signing_input() {
+            Ok(proof) => proof,
+            Err(error) => {
+                return RevocationAnswer::Later(format!(
+                    "the revocation could not be encoded: {error}"
+                ));
+            }
+        };
+        let signature = match self.signer.sign(&proof) {
+            Ok(signature) => signature,
+            Err(error) => return RevocationAnswer::Later(error.to_string()),
+        };
+        let complete = match self.post(
+            origin,
+            REVOKE_ROUTE,
+            &PushRequest::SenderRevoke {
+                request: PushSenderRevokeRequest::Complete {
+                    revocation: PushSenderRevocation { payload, signature },
+                },
+            },
+        ) {
+            Ok(answer) => answer,
+            Err(error) => return RevocationAnswer::Later(error),
+        };
+        // Only an answer that reads as the gateway's success settles the debt; whatever else came
+        // back, the authorisation may still be active and the revocation is asked for again.
+        match data_of::<Revoked>(&complete, "revocation") {
+            Ok(Revoked { record })
+                if record.state == PushSenderState::Revoked
+                    && record.binding.sender_record_id == sender_record_id =>
+            {
+                RevocationAnswer::Revoked
+            }
+            Ok(_) => RevocationAnswer::Later(
+                "the gateway answered with a record that is not this authorisation's, revoked"
+                    .to_owned(),
+            ),
+            Err(error) => RevocationAnswer::Later(error),
+        }
     }
 }
 
@@ -263,6 +430,12 @@ struct SignedRequest<'a> {
     signature: ServiceRequestSignature,
 }
 
+/// What the gateway answers a completed revocation with: the authorisation as it now stands.
+#[derive(serde::Deserialize)]
+struct Revoked {
+    record: PushSenderRecord,
+}
+
 /// What the first step answers: the nonce the proof has to cover.
 #[derive(serde::Deserialize)]
 struct SenderChallenge {
@@ -292,11 +465,30 @@ struct Refusal {
     code: String,
 }
 
+/// The code of the gateway's refusal, when the answer is one of its refusals and the code is one
+/// this host knows.
+fn refusal_code(answer: &ServiceHttpAnswer) -> Option<&'static str> {
+    if answer.body.len() > MAX_ANSWER_BYTES {
+        return None;
+    }
+    match kr_client::services::json::read::<Envelope<serde::de::IgnoredAny>>(&answer.body) {
+        Ok(Envelope {
+            ok: false,
+            error: Some(refusal),
+            ..
+        }) => known_code(&refusal.code),
+        _ => None,
+    }
+}
+
 /// The `data` of one answer, or why there is none.
 ///
 /// The answer is read through the client's one reader, so a text that names a member twice is not
 /// a renewal, and what a failure says is where the text failed, never what it held.
-fn data_of<T: serde::de::DeserializeOwned>(answer: &ServiceHttpAnswer) -> Result<T, String> {
+fn data_of<T: serde::de::DeserializeOwned>(
+    answer: &ServiceHttpAnswer,
+    what: &str,
+) -> Result<T, String> {
     if answer.body.len() > MAX_ANSWER_BYTES {
         return Err(format!(
             "the gateway's answer was {} bytes, past the {MAX_ANSWER_BYTES} this host reads",
@@ -313,14 +505,11 @@ fn data_of<T: serde::de::DeserializeOwned>(answer: &ServiceHttpAnswer) -> Result
             error: Some(refusal),
             ..
         }) => Err(match known_code(&refusal.code) {
-            Some(code) => format!(
-                "the gateway refused the renewal ({}, {code})",
-                answer.status
-            ),
-            None => format!("the gateway refused the renewal ({})", answer.status),
+            Some(code) => format!("the gateway refused the {what} ({}, {code})", answer.status),
+            None => format!("the gateway refused the {what} ({})", answer.status),
         }),
         Ok(_) => Err(format!(
-            "the gateway answered {} without a renewal",
+            "the gateway answered {} without a {what}",
             answer.status
         )),
         Err(fault) => Err(format!(
@@ -499,10 +688,13 @@ mod tests {
         let fresh = credential(10, now() + 30 * 24 * 60 * 60 * 1000 - 1_000);
         let answer = renewed_answer(&record(&host, &fresh), &fresh).to_string();
         let read = |text: String| {
-            data_of::<SenderResult>(&ServiceHttpAnswer {
-                status: 200,
-                body: text.into_bytes(),
-            })
+            data_of::<SenderResult>(
+                &ServiceHttpAnswer {
+                    status: 200,
+                    body: text.into_bytes(),
+                },
+                "renewal",
+            )
         };
 
         // A member the renewal reads, and one nothing reads.
@@ -669,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn the_host_key_signs_a_request_or_a_renewal_proof_and_nothing_else() {
+    fn the_host_key_signs_a_request_a_renewal_proof_or_a_revocation_and_nothing_else() {
         let host = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key");
         let signer = HostSigner::new(host);
         let revocation = kr_protocol::push::PushSenderRevocationPayload {
@@ -679,12 +871,116 @@ mod tests {
             requested_at_ms: TimestampMs::new(1_000),
             sender_record_id: PushSenderRecordId::new(uuid(3)),
         };
-        assert!(
-            signer
-                .sign(&revocation.signing_input().expect("an input"))
-                .is_err(),
-            "a revocation is not a transcript this seam signs"
-        );
+        let input = revocation.signing_input().expect("an input");
+        let signature = signer.sign(&input).expect("a revocation is signed");
+        assert!(verifies(
+            &signer.public_key(),
+            PUSH_SENDER_REVOCATION_DOMAIN,
+            input,
+            &signature
+        ));
         assert!(signer.sign(b"not a transcript").is_err());
+    }
+
+    /// A revocation asks for a nonce and answers it under the host key, on its own route, and a
+    /// gateway that holds no such authorisation is told apart from one that did not answer.
+    #[test]
+    fn a_revocation_asks_for_a_nonce_and_answers_it_under_the_host_key() {
+        let host = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key");
+        let id = PushSenderRecordId::new(uuid(3));
+        let recorder = Arc::new(Recorder::default());
+        let revoked = |state: PushSenderState, id: PushSenderRecordId| {
+            let mut stands = record(&host, &credential(10, now() + 29 * 24 * 60 * 60 * 1000));
+            stands.binding.sender_record_id = id;
+            stands.state = state;
+            serde_json::json!({ "ok": true, "data": { "record": stands } })
+        };
+        *recorder.answers.lock().expect("not poisoned") = vec![
+            (200, challenge([7; 32])),
+            (200, revoked(PushSenderState::Revoked, id)),
+        ];
+        let runtime = runtime();
+        let revoker = senders(&recorder, &host, &runtime);
+        assert_eq!(revoker.revoke(&origin(), id), RevocationAnswer::Revoked);
+        let asked = recorder.asked.lock().expect("not poisoned").clone();
+        assert_eq!(asked.len(), 2);
+        let signed: PushRequest =
+            serde_json::from_value(asked[1].body["body"].clone()).expect("a push request body");
+        let PushRequest::SenderRevoke {
+            request: PushSenderRevokeRequest::Complete { revocation },
+        } = signed
+        else {
+            panic!("the second step is the revocation");
+        };
+        assert_eq!(asked[1].url, "https://reach.invalid/api/push/sender/revoke");
+        assert_eq!(
+            revocation.payload.gateway_nonce,
+            Nonce256::from_bytes([7; 32])
+        );
+        assert_eq!(revocation.payload.sender_record_id, id);
+        assert!(verifies(
+            host.public(),
+            PUSH_SENDER_REVOCATION_DOMAIN,
+            revocation.payload.signing_input().expect("an input"),
+            &revocation.signature,
+        ));
+
+        // The gateway's own refusal of the first step, FORBIDDEN, says it holds no such
+        // authorisation for this host's key: nothing is owed.
+        let ask = |answers: Vec<(u16, serde_json::Value)>| {
+            let recorder = Arc::new(Recorder::default());
+            *recorder.answers.lock().expect("not poisoned") = answers;
+            senders(&recorder, &host, &runtime).revoke(&origin(), id)
+        };
+        let refusal = |status: u16, code: &str| {
+            (
+                status,
+                serde_json::json!({ "ok": false, "error": { "code": code, "message": "no" } }),
+            )
+        };
+        assert!(matches!(
+            ask(vec![refusal(403, "FORBIDDEN")]),
+            RevocationAnswer::Gone(_)
+        ));
+
+        // A status alone says nothing of the kind: a proxy, a deployment without the route and a
+        // refusal to authenticate answer 403 as well, and the authorisation is still active.
+        for unsaid in [
+            (403, serde_json::json!("forbidden")),
+            (403, serde_json::json!({})),
+            refusal(403, "REAUTHENTICATION_REQUIRED"),
+            (404, serde_json::json!({})),
+            refusal(503, "SERVICE_UNAVAILABLE"),
+        ] {
+            assert!(
+                matches!(ask(vec![unsaid.clone()]), RevocationAnswer::Later(_)),
+                "{unsaid:?} leaves it owed"
+            );
+        }
+
+        // The second step settles the debt only as the gateway's success: anything else, a
+        // success that carries nothing included, leaves it owed.
+        for unsaid in [
+            refusal(403, "FORBIDDEN"),
+            refusal(503, "SERVICE_UNAVAILABLE"),
+            (200, serde_json::json!({ "ok": true })),
+            (200, serde_json::json!({ "ok": true, "data": {} })),
+            (200, serde_json::json!("done")),
+            (200, serde_json::json!({ "ok": false })),
+            // A record that is not revoked, and one that is another authorisation's.
+            (200, revoked(PushSenderState::Active, id)),
+            (
+                200,
+                revoked(PushSenderState::Revoked, PushSenderRecordId::new(uuid(9))),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ask(vec![(200, challenge([8; 32])), unsaid.clone()]),
+                    RevocationAnswer::Later(_)
+                ),
+                "{unsaid:?} leaves it owed"
+            );
+        }
     }
 }

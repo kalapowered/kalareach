@@ -61,7 +61,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{
-    CollapseId, InstallationId, NotificationId, PushRegistrationId, PushSenderRecordId,
+    CollapseId, DeviceId, InstallationId, NotificationId, PushRegistrationId, PushSenderRecordId,
     PushSenderRevision,
 };
 use crate::mailbox::{
@@ -707,6 +707,43 @@ impl PushDeliveryCredential {
     pub fn secret_digest(&self) -> Digest256 {
         credential_digest(&self.secret)
     }
+}
+
+/// Parameters of `device.push.register`.
+///
+/// A paired device hands its host the delivery credential its installation was issued for this
+/// host (`push.sender.issue`), over its paired channel, so the host can deliver to it. The device
+/// is the one the connection authenticated as; the parameters name no device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DevicePushRegisterParams {
+    /// The credential this installation was issued for this host. The host keeps this credential
+    /// once the gateway has taken its bearer and confirmed the authorisation for the host's own
+    /// key; it must name the installation the device's own authorisation key names.
+    pub credential: PushDeliveryCredential,
+    /// Whether the device wants notification previews. Without them it is sent the generic alert
+    /// alone. A registration that says nothing wants previews.
+    #[serde(default = "previews_wanted")]
+    pub previews_enabled: bool,
+}
+
+/// A registration that says nothing about previews wants them.
+const fn previews_wanted() -> bool {
+    true
+}
+
+/// The result of `device.push.register`. It never carries the credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DevicePushRegisterResult {
+    /// The device whose destination is configured.
+    pub device_id: DeviceId,
+    /// The installation the gateway knows it by.
+    pub installation_id: InstallationId,
+    /// The authorisation this host delivers under.
+    pub sender_record_id: PushSenderRecordId,
+    /// When the credential the host keeps stops working, unless it renews it first.
+    pub credential_expires_at_ms: TimestampMs,
 }
 
 /// The digest a delivery credential's bearer is stored and matched under.

@@ -552,6 +552,15 @@ methods! {
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "Rotate this device's own notification-preview key through its paired proof.";
 
+    DevicePushRegister = "device.push.register", Devices,
+    effect: Write, ingress: [PairedDevice], rights: [basis(ResourceOwner)], selectors: [Device],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Hand this host the delivery credential this device's installation was issued for it, \
+          so the host can notify this device. The host asks the gateway whether it takes the \
+          credential's bearer and holds the authorisation for the host's own key before it \
+          keeps anything.";
+
     DeviceKeysComplete = "device.keys.complete", Devices,
     effect: Write, ingress: [PairedDevice], rights: [basis(ResourceOwner)], selectors: [Device],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
