@@ -605,6 +605,31 @@ pub struct DraftSnapshot {
     pub draft_id: kr_protocol::ids::DraftId,
     /// Its revision when the snapshot was taken.
     pub revision: kr_protocol::scalars::U64,
+    /// The attachment an offer claimed from the draft, where the invocation is an offer.
+    pub attachment: Option<ClaimedAttachment>,
+}
+
+/// The one attachment an offer claimed, and the narrow read grant that came with the claim, as the
+/// frame to the upstream names them.
+///
+/// The file's original name is not here. It is metadata the upstream is not given: the grant's path
+/// is derived from the transfer's identifier alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedAttachment {
+    /// The transfer the attachment is.
+    pub transfer_id: kr_protocol::ids::TransferId,
+    /// The media type the upload declared.
+    pub media_type: String,
+    /// The exact size of the file.
+    pub byte_len: kr_protocol::scalars::U64,
+    /// The digest of the file's bytes, which the receiver checks what it reads against.
+    pub content_digest: kr_protocol::scalars::Digest256,
+    /// The environment-local path the grant lets the receiver read.
+    pub path: String,
+    /// When the grant expires.
+    pub expires_at_ms: kr_protocol::scalars::TimestampMs,
+    /// The environment the grant is valid in.
+    pub environment_id: kr_protocol::ids::EnvironmentId,
 }
 
 /// What stopping an instance actually does.

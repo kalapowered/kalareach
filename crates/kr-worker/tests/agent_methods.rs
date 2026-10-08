@@ -1162,6 +1162,7 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
     };
     let invoke = |action: &str, draft: Nullable<kr_protocol::ids::DraftId>| {
         let snapshot = draft.0.map(|draft_id| kr_worker::broker::DraftSnapshot {
+            attachment: None,
             draft_id,
             revision: kr_protocol::scalars::U64::new(1),
         });
@@ -1644,6 +1645,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
             Some(kr_worker::broker::DraftSnapshot {
                 draft_id: draft,
                 revision: kr_protocol::scalars::U64::new(1),
+                attachment: None,
             }),
             TimestampMs::new(2),
         )

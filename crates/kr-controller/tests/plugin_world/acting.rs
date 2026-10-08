@@ -96,6 +96,27 @@ pub enum Upstream {
     Silent,
     /// With a success, once the test lets it go.
     Holds(Arc<tokio::sync::Notify>),
+    /// With a success once it has opened the file the frame's attachment names and found in it the
+    /// size and the digest the frame says, as a receiver that is to acknowledge an attachment
+    /// does, and with an error that proves nothing was done otherwise.
+    Reads,
+}
+
+/// Whether the frame names a file the receiver can read, and the file holds what the frame says.
+fn the_file_is_as_framed(line: &str) -> bool {
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let attachment = &frame["params"]["attachment"];
+    let Some(path) = attachment["read_grant"]["path"].as_str() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let digest = Digest256::from_bytes(kr_cbor::sha256(&bytes));
+    attachment["byte_len"].as_u64() == Some(bytes.len() as u64)
+        && serde_json::to_value(digest).ok().as_ref() == Some(&attachment["content_digest"])
 }
 
 /// A daemon, this process as the worker of one session, a real plugin host with the preparing
@@ -397,6 +418,27 @@ impl Acting {
         }
     }
 
+    /// A prompt that names `draft_id`, as a caller at this machine sends it to the daemon, which
+    /// records the draft as sent and passes the prompt to this worker.
+    pub fn prompting(
+        &self,
+        client: &LocalClient,
+        draft_id: kr_protocol::ids::DraftId,
+    ) -> MutationRequest {
+        let mut mutation = self.invocation(client, "turn.cancel", b"{}");
+        mutation.method = Method::AgentPromptSubmit.into();
+        mutation.params = ParamsValue::from_typed(&kr_protocol::agent::AgentPromptParams {
+            target: AgentMutationTarget {
+                subject: subject(self.hosted.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            draft_id: Nullable::some(draft_id),
+            text: Nullable::null(),
+        })
+        .expect("encodes");
+        mutation
+    }
+
     /// What the scripted upstream has been written so far.
     pub fn frames(&self) -> Vec<String> {
         self.written.lock().expect("not poisoned").clone()
@@ -548,6 +590,7 @@ pub async fn scripted_upstream(
         let id = serde_json::from_str::<serde_json::Value>(&line)
             .ok()
             .and_then(|frame| frame.get("id").cloned());
+        let readable = the_file_is_as_framed(&line);
         written.lock().expect("not poisoned").push(line);
         let Some(id) = id else {
             continue;
@@ -564,6 +607,12 @@ pub async fn scripted_upstream(
             Upstream::Holds(release) => {
                 release.notified().await;
                 serde_json::json!({ "id": id, "result": { "ok": true } })
+            }
+            Upstream::Reads if readable => {
+                serde_json::json!({ "id": id, "result": { "ok": true } })
+            }
+            Upstream::Reads => {
+                serde_json::json!({ "id": id, "error": { "code": -32602, "message": "refused" } })
             }
         };
         if writer

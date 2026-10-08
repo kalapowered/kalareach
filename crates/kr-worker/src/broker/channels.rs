@@ -835,6 +835,7 @@ mod tests {
                     action: ActionName::new("prompt.send").expect("valid"),
                     draft_id: None,
                     draft_revision: None,
+                    attachment: None,
                     parameters: Vec::new(),
                     operation: None,
                     token: None,
