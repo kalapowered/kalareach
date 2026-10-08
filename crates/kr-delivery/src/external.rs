@@ -194,6 +194,11 @@ pub trait ExternalSender: std::fmt::Debug {
 /// decides *which resource*, which is the division the history filter states: its scope carries no
 /// session selector and every caller checks its own resources.
 ///
+/// A line with no session is the host's own words. It names no session content, so neither the
+/// selector nor the history filter has anything to decide about it: who may be told of it was
+/// decided where the notice was placed in an audience, and the message carries it whatever the
+/// viewer's history reaches.
+///
 /// # Errors
 ///
 /// Returns [`DeliveryError::NotAuthorised`] when the derived answer may not be served at all,
@@ -225,29 +230,31 @@ pub fn compose(
     // Resource authority first, because it does not depend on time and a line the grant does not
     // name is not a line whose timestamp is worth reading.
     let mut candidates = Vec::new();
+    let mut hosts_own = Vec::new();
     for line in lines {
         match line.session_id {
             Some(session) if !sessions.admits(session) => {
                 count(Withheld::ResourceNotGranted, 1);
             }
             _ if line.produced_at_ms.is_none() => count(Withheld::NoProductionTime, 1),
-            _ => candidates.push(line),
+            Some(_) => candidates.push(line),
+            None => hosts_own.push(line),
         }
     }
 
     let filtered = filter.filter(Surface::EventPage, candidates);
     count(Withheld::OutsideHistoryScope, filtered.withheld_entries());
-    let kept = filtered.kept;
+    let mut kept = filtered.kept;
 
-    // A message with no line of any session left in it is this host's own generic alert, and
-    // nothing in it was derived from an interval of anyone's history. Who may be told of it was
-    // decided where the notice was placed in an audience, by what it is about, so there is nothing
-    // left for the history filter to narrow; it says how many lines it left out, as any partial
-    // message does.
+    // A message with no line of any session left in it is this host's own generic alert and the
+    // host's own lines, and nothing in it was derived from an interval of anyone's history. Who
+    // may be told of it was decided where the notice was placed in an audience, by what it is
+    // about, so there is nothing left for the history filter to narrow; it says how many lines it
+    // left out, as any partial message does.
     if kept.is_empty() {
         return Ok(assemble(
             alert,
-            Vec::new(),
+            hosts_own,
             Provenance::over(SourceInterval::at(0)),
             withheld,
             delivery_id,
@@ -281,7 +288,7 @@ pub fn compose(
             // Rebuilding from the permitted interval is exactly dropping the lines outside it,
             // because this message is its lines and nothing else.
             let before = kept.len() as u64;
-            let narrowed: Vec<ContentLine> = kept
+            let mut narrowed: Vec<ContentLine> = kept
                 .iter()
                 .filter(|line| {
                     line.produced_at_ms
@@ -300,6 +307,7 @@ pub fn compose(
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
+            narrowed.extend(hosts_own);
             return Ok(assemble(alert, narrowed, rebuilt, withheld, delivery_id));
         }
         DerivedDecision::Omit { reason } => {
@@ -308,6 +316,7 @@ pub fn compose(
             )));
         }
     };
+    kept.extend(hosts_own);
     Ok(assemble(alert, kept, provenance, withheld, delivery_id))
 }
 
@@ -711,6 +720,61 @@ mod tests {
                     "{name}: and it says so"
                 );
             }
+        }
+    }
+
+    /// A line that names no session is the host's own words, and a message carries it for a viewer
+    /// whatever their history reaches and whether or not they may see a session at all, since
+    /// what the viewer may be told of the host was decided where the notice was placed in an
+    /// audience. The control: a line of a session from before the same viewer's bound is still
+    /// left out, and the message says one line was.
+    #[test]
+    fn a_line_with_no_session_is_carried_whatever_the_viewers_history() {
+        use kr_protocol::grant::HistoryScope;
+        use kr_protocol::scalars::{CanonicalSet, Nullable};
+        let no_history = HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        };
+        let viewers = [
+            ("a history cursor", ViewerScope::forwarded(5_000)),
+            (
+                "no retained history",
+                ViewerScope::from_history(&no_history, true),
+            ),
+            (
+                "no retained history and no session.view",
+                ViewerScope::from_history(&no_history, false),
+            ),
+        ];
+        for (name, viewer) in viewers {
+            let message = compose(
+                DestinationKind::Slack,
+                PushAlert::SessionNeedsAttention,
+                vec![
+                    line(None, Some(1_000), "the host's own words"),
+                    line(Some(session(1)), Some(1_000), "an old line"),
+                ],
+                &HistoryFilter::new(viewer),
+                &granted(&[session(1)]),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(
+                message.body.contains("the host's own words"),
+                "{name}: the host's words are carried"
+            );
+            assert!(
+                !message.body.contains("an old line"),
+                "{name}: and a session's line from before the bound is not"
+            );
+            assert_eq!(
+                message.withheld,
+                vec![(Withheld::OutsideHistoryScope, 1)],
+                "{name}: only the session's line was left out"
+            );
         }
     }
 
