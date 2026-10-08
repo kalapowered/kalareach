@@ -85,9 +85,11 @@ use crate::confirmation::{
 };
 use crate::delivery::{
     DeliveryDestinationConfigureParams, DeliveryDestinationConfigureResult,
+    DeliveryDestinationKind, DeliveryDestinationListParams, DeliveryDestinationListResult,
     DeliveryDestinationRemoveParams, DeliveryDestinationRemoveResult,
-    DeliveryDestinationSecretSetParams, DeliveryDestinationSecretSetResult, DestinationSecret,
-    DestinationSecretKind, ExternalDestinationKind, MailAccount, MailSecurity,
+    DeliveryDestinationSecretSetParams, DeliveryDestinationSecretSetResult,
+    DeliveryDestinationSummary, DestinationSecret, DestinationSecretKind, ExternalDestinationKind,
+    MailAccount, MailSecurity,
 };
 use crate::describe::{
     DescriptionCompletion, DescriptionConfigureParams, DescriptionDownload,
@@ -784,6 +786,10 @@ pub fn protocol_schema() -> Value {
         "delivery_destination_configure_result" => DeliveryDestinationConfigureResult,
         "delivery_destination_remove_params" => DeliveryDestinationRemoveParams,
         "delivery_destination_remove_result" => DeliveryDestinationRemoveResult,
+        "delivery_destination_list_params" => DeliveryDestinationListParams,
+        "delivery_destination_list_result" => DeliveryDestinationListResult,
+        "delivery_destination_summary" => DeliveryDestinationSummary,
+        "delivery_destination_kind" => DeliveryDestinationKind,
         "external_destination_kind" => ExternalDestinationKind,
         "delivery_destination_secret_set_params" => DeliveryDestinationSecretSetParams,
         "delivery_destination_secret_set_result" => DeliveryDestinationSecretSetResult,

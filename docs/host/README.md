@@ -4493,9 +4493,10 @@ message says so, and nothing in this host claims otherwise. A destination needs 
 **and** an explicit rule or grant, and the content is intersected with the recipient's own authority
 rather than assumed from the address.
 
-The owner creates and removes a destination on this host's own socket, with
-`delivery.destination.configure` and `delivery.destination.remove`; a paired device cannot, and its
-own destination is made by its own registration.
+The owner creates, lists and removes a destination on this host's own socket, with
+`delivery.destination.configure`, `delivery.destination.list` and `delivery.destination.remove`, or
+with `kr destination`; a paired device cannot, and its own destination is made by its own
+registration.
 
 A Slack, Discord, Telegram or email destination sends with a credential: a webhook address that is
 itself a bearer secret, a bot token, or a mail submission account. The owner hands it over with

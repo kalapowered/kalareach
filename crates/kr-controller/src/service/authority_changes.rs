@@ -332,6 +332,32 @@ impl Controller {
         })
     }
 
+    /// Lists the notification destinations in service, a paired device's and the owner's.
+    ///
+    /// A destination that was removed stays in the journal as the name of what was sent to it,
+    /// with no rule, and is not listed. What is listed is what the owner configured and what a
+    /// paired device's registration made: where it sends, the grant it is told under, and whether
+    /// it is in force. Nothing a credential is made of is read, and the answer says nothing of
+    /// whether one is kept.
+    pub(super) fn delivery_destination_list(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let _: kr_protocol::delivery::DeliveryDestinationListParams = parse(params)?;
+        let records = self.delivery.with(|producer| {
+            producer
+                .journal()
+                .destinations()
+                .map_err(|error| ControllerError::Storage {
+                    operation: "read the delivery destinations",
+                    detail: error.to_string(),
+                })
+        })?;
+        let mut destinations: Vec<_> = records
+            .iter()
+            .filter_map(destination_summary)
+            .collect::<Vec<_>>();
+        destinations.sort_by(|first, second| first.destination_id.cmp(&second.destination_id));
+        encode(&kr_protocol::delivery::DeliveryDestinationListResult { destinations })
+    }
+
     /// Records the four keys a device paired before this host kept them all declares, once.
     ///
     /// The device is the one the connection authenticated as, and the declaration is signed by the
@@ -1578,6 +1604,43 @@ pub(super) fn configure_params(
     params
         .to_typed()
         .map_err(|_| ControllerError::InvalidArgument(CONFIGURE_PARAMS_REFUSAL.to_owned()))
+}
+
+/// One destination as the list says it, or none for a destination that was removed.
+fn destination_summary(
+    record: &kr_delivery::destination::DestinationRecord,
+) -> Option<kr_protocol::delivery::DeliveryDestinationSummary> {
+    use kr_delivery::destination::{DestinationKind, Idempotency};
+    use kr_protocol::delivery::DeliveryDestinationKind as Listed;
+
+    let rule = record.rule.as_ref()?;
+    let (endpoint, idempotency_header) = match record.as_external() {
+        Some(external) => (
+            Some(external.endpoint.clone()),
+            match &external.idempotency {
+                Idempotency::Supported { field } => Some(field.clone()),
+                Idempotency::Unsupported => None,
+            },
+        ),
+        None => (None, None),
+    };
+    Some(kr_protocol::delivery::DeliveryDestinationSummary {
+        destination_id: record.id.to_string(),
+        kind: match record.destination.kind() {
+            DestinationKind::Push => Listed::Push,
+            DestinationKind::Webhook => Listed::Webhook,
+            DestinationKind::Slack => Listed::Slack,
+            DestinationKind::Email => Listed::Email,
+            DestinationKind::Discord => Listed::Discord,
+            DestinationKind::Telegram => Listed::Telegram,
+        },
+        endpoint: kr_protocol::scalars::Nullable(endpoint),
+        idempotency_header: kr_protocol::scalars::Nullable(idempotency_header),
+        rule_name: rule.name.clone(),
+        grant_id: kr_protocol::scalars::Nullable(rule.grant_id),
+        in_force: record.enabled,
+        configured_at_ms: record.configured_at_ms,
+    })
 }
 
 /// Reads the parameters of `delivery.destination.remove`.

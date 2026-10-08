@@ -337,13 +337,14 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // Section 25 documents webhook, Slack, Discord, Telegram and email delivery to a destination
     // the owner configures, and four of them send through a credential the host keeps in its
     // secret store, never in a destination's endpoint. Section 23 names no method that creates a
-    // destination, takes one away or hands the host a credential, so this build adds three. Where
-    // content goes and who reads it is the owner's own act at this machine: each is served on the
-    // local socket alone, asking for host management, and the one that carries a credential
-    // answers nothing that carries it back.
+    // destination, takes one away, lists them or hands the host a credential, so this build adds
+    // four. Where content goes and who reads it is the owner's own act at this machine: each is
+    // served on the local socket alone, asking for host management, and the one that carries a
+    // credential answers nothing that carries it back.
     let delivery = [
         ("delivery.destination.configure", EffectClass::Write),
         ("delivery.destination.remove", EffectClass::Write),
+        ("delivery.destination.list", EffectClass::Read),
         ("delivery.destination.secret.set", EffectClass::Write),
     ];
     for (name, effect) in delivery {
