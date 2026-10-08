@@ -755,6 +755,420 @@ impl Controller {
         outcome
     }
 
+    /// Registers a paired device's push destination under the action it arrived with, and keeps
+    /// what it produced.
+    ///
+    /// Retained like every authority change here: claimed before the effect, recorded after it, and
+    /// returned to a repeat of the same action. A registration that fails is refused under its
+    /// action; the device asks again under a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::device_push_register`] refused with, a conflict when the action
+    /// identifier was used for a different registration, a refusal while another attempt under the
+    /// same action has not finished, and an unknown outcome for an attempt that ended unrecorded.
+    pub async fn push_register_action(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get())? {
+            crate::grants::ActionClaim::Claimed { hold } => hold,
+            crate::grants::ActionClaim::Recorded(record) => {
+                return self
+                    .recorded_authority_change(actor_id, mutation, record)
+                    .await;
+            }
+        };
+        let outcome = self.device_push_register(actor_id, mutation, carried).await;
+        self.settle_claim(&hold, &outcome)?;
+        drop(hold);
+        outcome
+    }
+
+    /// Makes a paired device a destination this host delivers notifications to.
+    ///
+    /// Section 16 has the installation obtain the delivery credential from the gateway and pass it
+    /// to the host through the paired channel. What the pairing recorded is the rest: the device,
+    /// its grant, its preview key and its stored-envelope key. This puts the two together, after
+    /// checking what a device's word does not establish:
+    ///
+    /// 1. The credential names the official gateway and a lifetime section 16 allows, and its
+    ///    installation is the one this device's own authorisation key names
+    ///    ([`crate::push::check_offered_credential`]), so a device cannot register another's.
+    /// 2. No other destination, in service or not, names the installation or the authorisation,
+    ///    and no revocation of the authorisation is owed.
+    /// 3. The gateway takes the bearer and holds the authorisation for this host's key
+    ///    ([`crate::push::runtime::DeliveryRuntime::confirm`]), asked outside every lock this host
+    ///    holds. The authorisation's identifier, expiry and revision are still the device's word.
+    ///
+    /// Nothing is changed until all three hold. Then, with the registry held and the admission
+    /// asked again where the row is written, the destination is written, and a revocation of the
+    /// authorisation it sent under before is written down in the same transaction; and last the
+    /// credential goes to the secret store and memory. A host that stops between the two has a
+    /// destination with no credential, which delivers nothing until the device registers again,
+    /// and not a credential nothing names. A device that registers again keeps the state of its
+    /// preview-key rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] for a credential or a device that fails a
+    /// check, and for an authorisation the gateway refuses; a transient refusal when the gateway
+    /// could not be asked or did not answer as the gateway does; what the admission refuses with;
+    /// and a storage error when a store cannot be written.
+    pub async fn device_push_register(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::push::DevicePushRegisterParams = parse(&mutation.params)?;
+        let Some(device_id) = self.paired_device(actor_id) else {
+            return Err(ControllerError::InvalidArgument(
+                "only a paired device registers its own push destination".to_owned(),
+            ));
+        };
+        let now_ms = self.settled_now_ms();
+        let paired = |device_id: kr_protocol::ids::DeviceId| {
+            self.devices
+                .record_for_device(device_id)?
+                .filter(|record| record.is_paired())
+                .ok_or_else(|| {
+                    ControllerError::InvalidArgument(format!(
+                        "device {device_id} is not paired or has been revoked"
+                    ))
+                })
+        };
+        let recorded = paired(device_id)?;
+        if recorded.notification_preview.is_none() {
+            return Err(ControllerError::InvalidArgument(
+                "this device has no notification-preview key on record; it declares its keys \
+                 first"
+                    .to_owned(),
+            ));
+        }
+        let offered = params.credential;
+        crate::push::check_offered_credential(&offered, &recorded.authorisation, now_ms)?;
+        let destination_id = kr_delivery::destination::DestinationId::new(device_id.to_string())
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        self.refuse_a_destination_held_by_another(&destination_id, &offered)?;
+        let credentials = std::sync::Arc::clone(self.delivery_runtime().credentials());
+        // The gateway is asked off the runtime's threads and outside every lock this host holds:
+        // it can take as long as its deadlines allow, and nothing else waits for it.
+        let runtime = std::sync::Arc::clone(self.delivery_runtime());
+        let for_gateway = offered.clone();
+        tokio::task::spawn_blocking(move || runtime.confirm(device_id, &for_gateway))
+            .await
+            .map_err(|_| ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "the check of the credential stopped before it finished".to_owned(),
+            })?
+            .map_err(|confirmation| match confirmation {
+                // The gateway's own answer about this credential: asking again with it is asking
+                // for the same refusal, and the device has to issue another.
+                crate::push::Confirmation::Refused(detail) => ControllerError::InvalidArgument(
+                    format!("the gateway does not confirm the authorisation: {detail}"),
+                ),
+                crate::push::Confirmation::NotAsked(detail) => ControllerError::Refused {
+                    code: ErrorCode::UpstreamUnavailable,
+                    detail: format!(
+                        "the gateway could not be asked about the authorisation: {detail}"
+                    ),
+                },
+            })?;
+        let registry = self.registry.lock().await;
+        // Asked again with the registry held, which is where destinations are written: another
+        // device's registration for the same installation can have finished while the gateway was
+        // answering this one.
+        self.refuse_a_destination_held_by_another(&destination_id, &offered)?;
+        // The device's record and the destination are read again with the registry held, because
+        // both can have moved while the gateway was answering: a key rotation that landed in the
+        // directory must not be written back over by the key this registration read before it.
+        let recorded = paired(device_id)?;
+        let preview_key = recorded.notification_preview.ok_or_else(|| {
+            ControllerError::InvalidArgument("no preview key on record".to_owned())
+        })?;
+        let existing = self.delivery.with(|producer| {
+            producer
+                .journal()
+                .destination(&destination_id)
+                .map_err(|error| ControllerError::Storage {
+                    operation: "read a delivery destination",
+                    detail: error.to_string(),
+                })
+        })?;
+        let previous = existing
+            .as_ref()
+            .and_then(kr_delivery::destination::DestinationRecord::as_push);
+        let push = kr_delivery::destination::PushDestination {
+            installation_id: offered.installation_id,
+            sender_record_id: offered.sender_record_id,
+            preview_keys: previous.map_or_else(
+                || {
+                    kr_delivery::destination::PreviewKeys::only(
+                        preview_key,
+                        recorded.device_key_revision.get(),
+                    )
+                },
+                |held| held.preview_keys.clone(),
+            ),
+            previews_enabled: params.previews_enabled,
+            mailbox_key: recorded.stored_envelope,
+        };
+        let record = crate::push::DeliveryModule::push_destination(
+            destination_id,
+            push,
+            kr_delivery::destination::DeliveryRule {
+                name: "the paired device's own grant".to_owned(),
+                grant_id: Some(recorded.grant.grant_id),
+            },
+            now_ms,
+        );
+        // The admission, asked where the row is written: the connection's admission, and the
+        // device's own grant on both of its clocks, from memory alone.
+        let admitted = || {
+            self.check_admission(&registry, &carried)?;
+            if self.lifetimes().in_force_now(device_id, &recorded.grant) {
+                Ok(())
+            } else {
+                Err(ControllerError::PermissionDenied {
+                    detail: "this device's grant has run out; pair again".to_owned(),
+                })
+            }
+        };
+        admitted()?;
+        // An authorisation this destination sent under before, and does not now, is revoked: the
+        // debt is written in the transaction that moves the destination off it.
+        let replaced = previous
+            .map(|held| held.sender_record_id)
+            .filter(|old| *old != offered.sender_record_id);
+        let owing_origin = replaced.map(|old| {
+            credentials.held(old).map_or_else(
+                || crate::push::OFFICIAL_GATEWAY_ORIGIN.to_owned(),
+                |held| held.gateway_origin.as_str().to_owned(),
+            )
+        });
+        let owing = replaced
+            .zip(owing_origin.as_deref())
+            .map(|(old, origin)| (old, origin, now_ms));
+        if !self.delivery.configure_owing(&record, &admitted, owing)? {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the registration was not admitted".to_owned(),
+            });
+        }
+        credentials
+            .keep(offered.clone())
+            .map_err(|detail| ControllerError::Storage {
+                operation: "keep a delivery credential",
+                detail,
+            })?;
+        if let Some(old) = replaced {
+            self.retire_sender(old, &credentials);
+        }
+        drop(registry);
+        if replaced.is_some() {
+            self.delivery_runtime().sweep_revocations_soon();
+        }
+        encode(&kr_protocol::push::DevicePushRegisterResult {
+            device_id,
+            installation_id: offered.installation_id,
+            sender_record_id: offered.sender_record_id,
+            credential_expires_at_ms: offered.expires_at_ms,
+        })
+    }
+
+    /// Refuses a registration whose installation or authorisation another device's destination
+    /// holds. The journal allows one destination for an installation, and the delivery budget is
+    /// counted for it, so a device must not be able to take another's.
+    fn refuse_a_destination_held_by_another(
+        &self,
+        destination_id: &kr_delivery::destination::DestinationId,
+        offered: &kr_protocol::push::PushDeliveryCredential,
+    ) -> Result<()> {
+        self.delivery.with(|producer| {
+            let storage = |error: kr_delivery::DeliveryError| ControllerError::Storage {
+                operation: "read the delivery destinations",
+                detail: error.to_string(),
+            };
+            if producer
+                .journal()
+                .revocation_owed(offered.sender_record_id)
+                .map_err(storage)?
+            {
+                return Err(ControllerError::InvalidArgument(
+                    "that authorisation is being revoked; its installation requests a new one"
+                        .to_owned(),
+                ));
+            }
+            let destinations = producer.journal().destinations().map_err(storage)?;
+            for other in destinations
+                .iter()
+                .filter(|other| other.id != *destination_id)
+            {
+                let Some(push) = other.as_push() else {
+                    continue;
+                };
+                // Named by every destination that names it, in service or kept out of service as
+                // the name of what was sent to it. The journal allows one destination for an
+                // installation whatever became of it; an authorisation is refused for the same
+                // reason here, because each start removes the stored item of one a destination
+                // out of service names.
+                if push.sender_record_id == offered.sender_record_id
+                    || push.installation_id == offered.installation_id
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "that installation or authorisation already receives notifications for \
+                         another device"
+                            .to_owned(),
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Writes down that this host owes the gateway a revocation of one authorisation.
+    ///
+    /// The gateway's origin is read from the credential held, which is gone once the authorisation
+    /// is let go, so this is written first.
+    fn owe_revocation(
+        &self,
+        sender_record_id: kr_protocol::ids::PushSenderRecordId,
+        credentials: &crate::push::credentials::HeldCredentials,
+    ) -> Result<()> {
+        let origin = credentials.held(sender_record_id).map_or_else(
+            || crate::push::OFFICIAL_GATEWAY_ORIGIN.to_owned(),
+            |held| held.gateway_origin.as_str().to_owned(),
+        );
+        let now_ms = self.settled_now_ms();
+        self.delivery.with(|producer| {
+            producer
+                .journal_mut()
+                .owe_revocation(sender_record_id, &origin, now_ms)
+                .map_err(|error| ControllerError::Storage {
+                    operation: "write down a revocation owed to the gateway",
+                    detail: error.to_string(),
+                })
+        })
+    }
+
+    /// Lets go of an authorisation this host no longer delivers under: the held credential and its
+    /// item in the secret store.
+    fn retire_sender(
+        &self,
+        sender_record_id: kr_protocol::ids::PushSenderRecordId,
+        credentials: &crate::push::credentials::HeldCredentials,
+    ) {
+        if let Err(detail) = credentials.forget(sender_record_id) {
+            eprintln!(
+                "kr-controller: a delivery credential could not be removed from the secret \
+                 store: {detail}"
+            );
+        }
+    }
+
+    /// Ends a device's push destination: the destination, the credential held for it and its item
+    /// in the secret store, and owes the gateway a revocation of the authorisation behind it.
+    ///
+    /// Section 16: "Unpairing calls `push.sender.revoke` and removes credentials; revoked records
+    /// cannot renew." The revocation is written down before anything is removed, so a host that
+    /// stops part way knows what it owes, and it is asked for at once and then until the gateway
+    /// has taken it ([`crate::push::DeliveryModule::settle_revocations`]). The origin is read from
+    /// the credential held, which is gone once this has run.
+    ///
+    /// A device that has no destination has nothing to end, and ending one twice is ending it once.
+    pub(super) fn retire_push_destination(&self, device_id: kr_protocol::ids::DeviceId) {
+        let Ok(destination_id) =
+            kr_delivery::destination::DestinationId::new(device_id.to_string())
+        else {
+            return;
+        };
+        let now_ms = self.settled_now_ms();
+        let credentials = std::sync::Arc::clone(self.delivery_runtime().credentials());
+        let found = self.delivery.with(|producer| {
+            producer
+                .journal()
+                .destination(&destination_id)
+                .map_err(|error| ControllerError::Storage {
+                    operation: "read a delivery destination",
+                    detail: error.to_string(),
+                })
+        });
+        let record = match found {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("kr-controller: a device's push destination could not be read: {error}");
+                return;
+            }
+        };
+        let Some(push) = record.as_push() else {
+            return;
+        };
+        // A destination already out of service, kept without a rule as the name of what it was
+        // sent, was ended before: its revocation is owed or paid, and is not owed a second time.
+        if !record.enabled && record.rule.is_none() {
+            return;
+        }
+        let sender_record_id = push.sender_record_id;
+        if let Err(error) = self.owe_revocation(sender_record_id, &credentials) {
+            // The destination stays, so the next start or the next revocation finds it again.
+            eprintln!("kr-controller: a push destination was not ended: {error}");
+            return;
+        }
+        if let Err(error) = self.delivery.remove(&destination_id, now_ms) {
+            eprintln!("kr-controller: a push destination could not be removed: {error}");
+            return;
+        }
+        self.retire_sender(sender_record_id, &credentials);
+        self.delivery_runtime().sweep_revocations_soon();
+    }
+
+    /// Ends the push destination of every device that is no longer paired, at a start.
+    ///
+    /// A device is revoked, or its grant runs out, and a host stops before it has ended the
+    /// destination: nothing is delivered to it either way, because its grant no longer reaches
+    /// anything, but the destination, the credential and the authorisation would stay. Returns how
+    /// many destinations it ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destinations or the device directory cannot be read.
+    pub fn recover_push_destinations(&self) -> Result<usize> {
+        let destinations = self.delivery.with(|producer| {
+            producer
+                .journal()
+                .destinations()
+                .map_err(|error| ControllerError::Storage {
+                    operation: "read the delivery destinations",
+                    detail: error.to_string(),
+                })
+        })?;
+        let mut ended = 0;
+        for destination in destinations {
+            if destination.as_push().is_none() {
+                continue;
+            }
+            let Ok(device_id) = destination
+                .id
+                .as_str()
+                .parse::<kr_protocol::ids::DeviceId>()
+            else {
+                continue;
+            };
+            let paired = self
+                .devices
+                .record_for_device(device_id)?
+                .is_some_and(|record| record.is_paired());
+            if !paired {
+                self.retire_push_destination(device_id);
+                ended += 1;
+            }
+        }
+        Ok(ended)
+    }
+
     /// Brings the device directory up to the preview keys the delivery journal holds.
     ///
     /// A key update writes the delivery journal first and the device directory second. A host that

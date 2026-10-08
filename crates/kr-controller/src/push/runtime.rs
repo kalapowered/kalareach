@@ -12,11 +12,12 @@
 //!    announced is taken, which is [`DeliveryRuntime::attach_attention`]'s feed, whatever is taken
 //!    and not yet produced from is produced, and then the due outbox is claimed and sent, which is
 //!    [`DeliveryModule::run_due`].
-//! 3. **Questions on their own loop**, every [`Cadence::questions`]: credentials inside their
+//! 3. **Questions on their own loop**, every [`Cadence::questions`]: revocations owed to a gateway
+//!    for authorisations of devices since unpaired are asked for, credentials inside their
 //!    renewal window are renewed ahead of need, and a bounded batch of the outcomes nobody knows
-//!    is asked about, within a time budget ([`HeldCredentials::renew_due`] and
-//!    [`DeliveryModule::resolve_unknown`]). A slow answer must not hold a notification back, so
-//!    these questions never run on the loop that delivers.
+//!    is asked about, within a time budget ([`DeliveryModule::settle_revocations`],
+//!    [`HeldCredentials::renew_due`] and [`DeliveryModule::resolve_unknown`]). A slow answer must
+//!    not hold a notification back, so these questions never run on the loop that delivers.
 //!
 //! The gateway counts status questions against an hourly allowance whichever loop asks them. Each
 //! loop asks through a [`GatewayStatus`] of its own with a fixed share of that allowance
@@ -42,13 +43,14 @@ use std::time::{Duration, Instant};
 use kr_client::services::ServiceSigner;
 use kr_delivery::destination::{DestinationId, DestinationRecord};
 use kr_delivery::producer::RecipientAuthority;
+use kr_delivery::push::DeliveryStatus;
 
 use super::client::GatewayClient;
 use super::credentials::HeldCredentials;
 use super::external::ExternalSenders;
 use super::mail::MailSubmission;
 use super::sender::GatewaySenders;
-use super::status::{GatewayStatus, StatusAllowance};
+use super::status::{GatewayStatus, StatusAllowance, StatusBudget};
 use super::transport::DeliveryTransports;
 use super::{Clock, DeliveryModule, SystemClock};
 
@@ -80,6 +82,13 @@ impl Cadence {
     };
 }
 
+/// How many times an hour one paired device may have a credential it hands over confirmed with
+/// the gateway: a burst of three, then six an hour.
+pub const CONFIRMATIONS_PER_DEVICE: StatusAllowance = StatusAllowance {
+    burst: 3,
+    per_hour: 6,
+};
+
 /// The most unknown outcomes one sweep considers.
 ///
 /// A record the sweep may no longer ask about takes no question, so a sweep considers more records
@@ -93,6 +102,8 @@ pub const QUESTION_BUDGET: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 struct Adapters {
     sender: GatewayClient,
+    /// Renewals and revocations, proven with this host's key.
+    senders: Arc<GatewaySenders>,
     /// The pass's status questions, within its share.
     receipts: GatewayStatus,
     /// The sweep's status questions, within its share.
@@ -111,6 +122,8 @@ pub struct DeliveryRuntime {
     adapters: OnceLock<Adapters>,
     attention: OnceLock<Arc<crate::attention::AttentionModule>>,
     recovered: AtomicBool,
+    /// What each paired device may still ask the gateway about a credential it hands over.
+    confirmations: Mutex<std::collections::BTreeMap<kr_protocol::ids::DeviceId, StatusBudget>>,
     cadence: Cadence,
     runtime: tokio::runtime::Handle,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -139,6 +152,7 @@ impl DeliveryRuntime {
             adapters: OnceLock::new(),
             attention: OnceLock::new(),
             recovered: AtomicBool::new(false),
+            confirmations: Mutex::new(std::collections::BTreeMap::new()),
             cadence,
             runtime,
             tasks: Mutex::new(Vec::new()),
@@ -163,10 +177,16 @@ impl DeliveryRuntime {
     /// would put two sets of rules on one host's exchanges. Returns false when one was already
     /// attached.
     pub fn attach_transport(&self, transports: Arc<dyn DeliveryTransports>) -> bool {
+        let senders = Arc::new(GatewaySenders::new(
+            Arc::clone(&transports),
+            Arc::clone(&self.signer),
+            self.runtime.clone(),
+        ));
         let attached = self
             .adapters
             .set(Adapters {
                 sender: GatewayClient::new(Arc::clone(&transports), self.runtime.clone()),
+                senders: Arc::clone(&senders),
                 receipts: GatewayStatus::new(
                     Arc::clone(&transports),
                     self.runtime.clone(),
@@ -185,12 +205,7 @@ impl DeliveryRuntime {
             })
             .is_ok();
         if attached {
-            self.credentials
-                .attach_renewal(Arc::new(GatewaySenders::new(
-                    transports,
-                    Arc::clone(&self.signer),
-                    self.runtime.clone(),
-                )));
+            self.credentials.attach_renewal(senders);
         }
         attached
     }
@@ -350,11 +365,114 @@ impl DeliveryRuntime {
         }
     }
 
+    /// Asks the gateways for the revocations this host owes, when there is a transport to ask
+    /// through. Blocks.
+    pub fn sweep_revocations(&self) {
+        let Some(adapters) = self.adapters.get() else {
+            return;
+        };
+        let credentials = Arc::clone(&self.credentials);
+        let forget = move |sender_record_id| match credentials.forget(sender_record_id) {
+            Ok(()) => true,
+            Err(detail) => {
+                eprintln!(
+                    "kr-controller: a delivery credential could not be removed from the secret \
+                     store: {detail}"
+                );
+                false
+            }
+        };
+        if let Err(error) =
+            self.module
+                .settle_revocations(adapters.senders.as_ref(), &forget, &SystemClock)
+        {
+            eprintln!("kr-controller: owed revocations were not asked about: {error}");
+        }
+    }
+
+    /// Asks the gateway whether it holds an authorisation a device says it was issued, and takes
+    /// the bearer, before the host keeps anything of it. Blocks, so a caller on the daemon's
+    /// reactor runs it on a blocking thread.
+    ///
+    /// Two questions, because the gateway answers each of them at any time. The first is a status
+    /// question about a notification that does not exist, under the bearer the device handed
+    /// over: the gateway authenticates the bearer first, so its success says the bearer belongs
+    /// to an active authorisation that has not expired. The second is a renewal's opening, signed
+    /// with this host's key: the gateway hands out a nonce only for an authorisation that names
+    /// that key, so its success says the gateway holds the authorisation and this host is the one
+    /// it names. Renewing itself is not asked, because the gateway renews only in the last week
+    /// of a credential's life. Nothing is sent to the device and no notification is sent; the
+    /// gateway keeps the nonce until it lapses and counts both requests.
+    ///
+    /// What neither question shows is that the bearer is that authorisation's, or which
+    /// installation it is for: the identifier, the expiry and the revision in the credential are
+    /// the device's word. A bearer for another authorisation is found at the first delivery, which
+    /// the gateway refuses as aimed at another authorisation.
+    ///
+    /// A device may ask a few times an hour, whatever it hands over: the questions come out of the
+    /// gateway's allowances for this host, and a device that registers over and over would spend
+    /// the renewals and revocations of every other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Confirmation::Refused`] for the gateway's own refusal and
+    /// [`Confirmation::NotAsked`] when it was not asked, was not answered as the gateway answers,
+    /// or this device has asked too often.
+    pub fn confirm(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        credential: &kr_protocol::push::PushDeliveryCredential,
+    ) -> Result<(), super::Confirmation> {
+        use super::Confirmation::NotAsked;
+
+        let Some(adapters) = self.adapters.get() else {
+            return Err(NotAsked(
+                "this host has no transport to ask the gateway through".to_owned(),
+            ));
+        };
+        let allowed = self
+            .confirmations
+            .lock()
+            .map_err(|_| NotAsked("an earlier registration failed part way".to_owned()))?
+            .entry(device_id)
+            .or_insert_with(|| StatusBudget::new(CONFIRMATIONS_PER_DEVICE))
+            .take(SystemClock.steady_ms());
+        if !allowed {
+            return Err(NotAsked(
+                "this device has registered too often; try again later".to_owned(),
+            ));
+        }
+        // From the sweep's share, so a device that registers over and over cannot spend the
+        // pass's, which notifications a person is waiting on depend on.
+        if !adapters.unknown.reserve(SystemClock.steady_ms()) {
+            return Err(NotAsked(
+                "this host has asked the gateway too often; try again later".to_owned(),
+            ));
+        }
+        // The bearer first, from the larger allowance, so a bearer the gateway does not take
+        // costs this host's allowance for renewing and revoking nothing.
+        adapters
+            .unknown
+            .probe(credential, kr_delivery::preview::fresh_notification_id())?;
+        adapters
+            .senders
+            .begin_renewal(&credential.gateway_origin, credential.sender_record_id)
+    }
+
+    /// Starts a sweep of owed revocations on a blocking thread and does not wait for it, so an
+    /// unpairing does not wait for a gateway. What the sweep does not settle is owed still.
+    pub fn sweep_revocations_soon(self: &Arc<Self>) {
+        let sweeping = Arc::clone(self);
+        self.runtime
+            .spawn_blocking(move || sweeping.sweep_revocations());
+    }
+
     /// Runs one sweep of questions, and returns whether there was a transport to run it with.
     fn ask(&self) -> bool {
         let Some(adapters) = self.adapters.get() else {
             return false;
         };
+        self.sweep_revocations();
         let _ = self.credentials.renew_due(SystemClock.now_ms());
         if let Err(error) = self.module.resolve_unknown(
             &adapters.unknown,
