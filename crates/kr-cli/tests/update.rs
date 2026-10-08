@@ -2317,6 +2317,11 @@ async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
+        said["restarted"],
+        serde_json::json!([host.tree.environment_id().to_string()]),
+        "it says which daemon it started: {said}"
+    );
+    assert_eq!(
         host.daemon_build().await,
         format!("kr-controller/{}", two.name())
     );
