@@ -34,7 +34,7 @@
 //! slow disk holds one request's turn and not the reactor.
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::voice::AccountTokenFile;
@@ -54,7 +54,7 @@ use kr_transport::config::ProxyUrl;
 use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
 
-use crate::backup::quiet::{Quiet, Timer};
+use crate::backup::quiet::{Owed, Quiet, Timer};
 use crate::backup::uploader::{Hold, Idle, PassReport, Stepped, Uploader};
 use crate::backup::{BackupService, BackupSignals};
 use crate::error::{ControllerError, Result};
@@ -213,8 +213,10 @@ enum Wait {
     Signals,
     /// For `duration`, or until a fence is raised, or, when `wakeable`, until work arrives.
     Timed { duration: Duration, wakeable: bool },
-    /// For the delay the service asked for, or until a fence is raised, which leaves it owed.
-    Owed(Duration),
+    /// For `duration`, which is at least what is left of the delay the service asked for, or until a
+    /// fence is raised, which leaves it owed. What ends the wait clears the delay `until` names and
+    /// no other.
+    Owed { until: Instant, duration: Duration },
 }
 
 /// The clients a host with a storage service builds, and the key it signs them with.
@@ -291,23 +293,23 @@ impl Shared {
         self.account.token(BACKUP_WRITE_SCOPE).await.is_ok()
     }
 
-    /// What to wait on after the service held work back.
+    /// What to wait on after the service held work back. Any delay it named was recorded where
+    /// the answer arrived.
     fn after(&self, hold: Hold, backoff: &mut Backoff) -> Wait {
-        match hold.retry_after {
-            Some(delay) => {
-                self.quiet.owe(delay);
-                // At least what is left of every delay the service named, so that the wait ends
-                // the debt it settles.
-                let owed = self.quiet.left().unwrap_or(delay).max(delay);
-                Wait::Owed(if hold.needs_a_person() {
-                    owed
-                } else {
-                    backoff.next_delay().max(owed)
-                })
-            }
-            None if hold.needs_a_person() => Wait::Timed {
-                duration: OPERATOR_CEILING,
+        let owed = self.quiet.owed();
+        if hold.needs_a_person() {
+            // Waiting does not clear the cause, so the host asks again after five minutes or when
+            // work or a writer arrives, and after a longer delay the service named. Work that
+            // arrives sooner still waits out the delay: the next pass begins by looking at it.
+            return Wait::Timed {
+                duration: owed.map_or(OPERATOR_CEILING, |owed| OPERATOR_CEILING.max(owed.left)),
                 wakeable: true,
+            };
+        }
+        match owed {
+            Some(Owed { until, left }) => Wait::Owed {
+                until,
+                duration: backoff.next_delay().max(left),
             },
             None => Wait::Timed {
                 duration: backoff.next_delay(),
@@ -336,9 +338,12 @@ impl Shared {
             if matches!(report.idle, Some(Idle::Unavailable { .. })) {
                 observed.status_refusal = report.hold;
             }
-            // What held the work back stands until a pass carries work again: a pass that was
-            // turned back at its first question did none, and says nothing of what held it before.
-            if report.idle.is_none() {
+            // What the pass met while it carried work is what held the work back. When it met
+            // nothing, that stands cleared only if the pass ran its work to the end: one that
+            // stopped at a delay did not, and says nothing of what held the work before. A pass
+            // that was turned back at its first question carried no work, and what it met is the
+            // status refusal above.
+            if report.idle.is_none() && (report.hold.is_some() || report.quiet.is_none()) {
                 observed.pass_hold = report.hold;
             }
             observed.last_pass = Some(LastPass {
@@ -359,10 +364,13 @@ impl Shared {
         if let Some(hold) = report.hold {
             return self.after(hold, backoff);
         }
-        // The service may have asked to be left alone while the pass ran, by way of the question
-        // `kr doctor` put to it: the work that is left waits for that.
-        if let Some(left) = self.quiet.left() {
-            return Wait::Owed(left);
+        // The pass stopped because the service asked to be left alone, in an answer to some
+        // question, and work remains. It waits for the delay as it stood when the pass stopped.
+        if let Some(Owed { until, left }) = report.quiet {
+            return Wait::Owed {
+                until,
+                duration: left,
+            };
         }
         match report.idle {
             Some(Idle::BackupOff) => Wait::Timed {
@@ -409,12 +417,11 @@ impl Shared {
                     () = signals.fence.notified() => {}
                 }
             }
-            Wait::Owed(duration) => {
-                let seen = self.quiet.deadline();
+            Wait::Owed { until, duration } => {
                 tokio::select! {
                     // What was asked for has passed, unless the service asked for more while this
                     // waited.
-                    () = timer.sleep(duration) => self.quiet.passed(seen),
+                    () = timer.sleep(duration) => self.quiet.passed(until),
                     () = signals.fence.notified() => {}
                 }
             }
@@ -428,25 +435,23 @@ impl Shared {
         backup: &BackupService,
         backoff: &mut Backoff,
     ) -> Wait {
-        let (fenced, nothing_to_carry) = on_disk(|| {
-            let fenced = backup
+        let fenced = on_disk(|| {
+            backup
                 .privacy_status()
-                .is_ok_and(|privacy| privacy.inhibited_at().is_some());
-            // The test `Uploader::pass` makes before it asks the service anything.
-            let nothing = backup.outbox().is_ok_and(|outbox| outbox.is_empty())
-                && backup
-                    .store()
-                    .uploads()
-                    .is_ok_and(|uploads| uploads.is_empty());
-            (fenced, nothing)
+                .is_ok_and(|privacy| privacy.inhibited_at().is_some())
         });
         // A fence is answered whatever the service asked and whatever token the host holds: ending
         // work in flight is what the host owes, and a request that cannot be signed in is not sent.
         if !fenced {
-            if let Some(left) = self.quiet.left() {
-                return Wait::Owed(left);
+            if let Some(Owed { until, left }) = self.quiet.owed() {
+                return Wait::Owed {
+                    until,
+                    duration: left,
+                };
             }
             if !self.token_usable().await {
+                // The question `Uploader::pass` asks before it asks the service anything.
+                let nothing_to_carry = !uploader.has_work().unwrap_or(true);
                 // Nothing that carries the token leaves this host without a usable one. With
                 // nothing to carry there is nothing to check for either, and work arriving is
                 // what looks again.
@@ -720,6 +725,9 @@ impl BackupRuntime {
             }
             (Some(_), _) => detail.stated("backup storage is off for the account"),
             (None, Some(hold)) => hold_sentence(detail, hold, writer),
+            (None, None) if self.shared.quiet.left().is_some() => {
+                detail.stated("the service asked to be left alone, and the host is waiting it out")
+            }
             (None, None) => detail.stated("the service has not been asked yet"),
         };
         if let Some(pass) = observed.last_pass {
@@ -742,7 +750,7 @@ impl BackupRuntime {
         }
         if let Some(hold) = observed.pass_hold {
             detail = hold_sentence(
-                detail.stated("; the last pass was held back: "),
+                detail.stated("; the last pass that carried work was held back: "),
                 hold,
                 writer,
             );
@@ -762,6 +770,7 @@ impl BackupRuntime {
             && observed.status_refusal.is_none()
             && observed.pass_hold.is_none()
             && !observed.status_unanswered;
+        let backup_off = observed.status.is_some() && !backup_on && !observed.status_unanswered;
         let remedy = if well {
             None
         } else if state != TokenState::Usable {
@@ -769,13 +778,12 @@ impl BackupRuntime {
                 "Import an account token with the backup.write scope with `kr account token \
                  import`.",
             )
+        } else if backup_off {
+            Some("Turn backup storage on for the account.")
         } else {
-            match (observed.pass_hold.or(observed.status_refusal), backup_on) {
-                (Some(hold), _) => Some(remedy_for(hold)),
-                (None, false) if observed.status.is_some() && !observed.status_unanswered => {
-                    Some("Turn backup storage on for the account.")
-                }
-                _ => Some("Run `kr doctor` again once the service answers."),
+            match observed.pass_hold.or(observed.status_refusal) {
+                Some(hold) => Some(remedy_for(hold)),
+                None => Some("Run `kr doctor` again once the service answers."),
             }
         };
         DoctorCheck::new(
@@ -832,10 +840,15 @@ async fn drive(
     // to it binds the carrier like any other answer: a delay it names is waited out before the
     // first pass, and a refusal only a person can mend is waited for as one.
     let mut next = None;
-    if let Some(left) = shared.quiet.left() {
+    if let Some(Owed { until, left }) = shared.quiet.owed() {
         // The question the host asked about a publication an earlier run sent was turned back with
-        // a delay, which binds this one too.
-        next = Some(Wait::Owed(left));
+        // a delay, which binds this one too. A host that starts under a privacy fence is not held
+        // by it: the fence is raised again before this task runs, and its permit ends this wait at
+        // once.
+        next = Some(Wait::Owed {
+            until,
+            duration: left,
+        });
     } else if shared.token_usable().await
         && let Some(hold) = shared.read_status().await
     {

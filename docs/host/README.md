@@ -3208,10 +3208,13 @@ The carrier waits between passes as the service and the cause allow:
 | Nothing is owed | When something changes |
 
 A delay the service names binds every question to it, and the daemon never waits longer than an
-hour for one, whatever the service writes. The question the daemon asks about an earlier
-publication, its first question about backup storage, the status read `kr doctor` makes and each
-pass all wait it out, and a pass stops between two requests when a delay arrives while it runs. A
-fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A refusal that names a delay and one that needs a
+hour for one, whatever the service writes. The daemon records the delay where the answer arrives,
+and its clients send nothing while a delay is owed: not the question about an earlier publication,
+not the first question about backup storage, not the status read `kr doctor` makes, and not the
+next request of a pass that was running when the delay arrived. That pass ends and says where it
+stopped. A fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A
+refusal only a person can clear that names a delay is waited for as long as the longer of the delay
+and five minutes, and new work still waits out the delay. A refusal that names a delay and one that needs a
 person can come in the same pass, for example when a publication is refused because the writer is
 not enrolled and the question that follows is turned back with a delay. The pass ends at the delay
 and the daemon keeps the person's refusal for `kr doctor`. A refusal that names no delay may be about

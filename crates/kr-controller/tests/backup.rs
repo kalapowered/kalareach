@@ -17,7 +17,7 @@ use kr_client::services::{
     StorageLimits, StoragePrincipal, StorageService, StorageStatus, StorageUsage, StoredObject,
     UploadAborted, UploadCompleted, UploadCreated, UploadId, UploadPart, WriterSummary,
 };
-use kr_controller::backup::quiet::{Quiet, RealTimer};
+use kr_controller::backup::quiet::{Quiet, RealTimer, Timer};
 use kr_controller::backup::store::{
     AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, LocalState,
     ObligationKind, Production, Publication, Remote, SCHEMA_VERSION, Step, UploadRecord,
@@ -7053,6 +7053,11 @@ impl Host {
     }
 
     fn uploader(&self, now: u64) -> Uploader {
+        self.uploader_asked_to_wait(now, Arc::new(Quiet::new(Arc::new(RealTimer))))
+    }
+
+    /// An uploader whose service may ask it to be left alone, as `quiet` records.
+    fn uploader_asked_to_wait(&self, now: u64, quiet: Arc<Quiet>) -> Uploader {
         let storage: Arc<dyn StorageService> = self.web.clone();
         let manifest: Arc<dyn BackupManifestService> = self.web.clone();
         Uploader::new(
@@ -7060,7 +7065,7 @@ impl Host {
             storage,
             manifest,
             self.producer.writer.clone(),
-            Arc::new(Quiet::new(Arc::new(RealTimer))),
+            quiet,
             TimestampMs::new(now),
         )
     }
@@ -8469,6 +8474,131 @@ async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
     let backup = privacy(&host.service);
     let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+}
+
+/// A clock a test moves, which waits for nothing.
+#[derive(Debug)]
+struct Moving {
+    now: Mutex<std::time::Instant>,
+}
+
+impl Moving {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            now: Mutex::new(std::time::Instant::now()),
+        })
+    }
+
+    fn advance(&self, by: std::time::Duration) {
+        *self.now.lock().expect("the clock") += by;
+    }
+}
+
+impl Timer for Moving {
+    fn sleep(
+        &self,
+        _duration: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn now(&self) -> std::time::Instant {
+        *self.now.lock().expect("the clock")
+    }
+}
+
+/// A service that asked to be left alone is sent nothing until the delay has passed, and the pass
+/// says where it stopped, so that whatever runs it waits for what was left of the delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_stops_where_the_service_asked_to_be_left_alone_and_says_so() {
+    let host = Host::open();
+    host.admit(1, &[64]);
+    let clock = Moving::new();
+    let quiet = Arc::new(Quiet::new(clock.clone()));
+    let mut uploader = host.uploader_asked_to_wait(10_000, Arc::clone(&quiet));
+    quiet.owe(std::time::Duration::from_secs(600));
+
+    let report = uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    assert!(report.steps.is_empty(), "{:?}", report.steps);
+    assert_eq!(report.idle, None);
+    assert_eq!(
+        report.quiet.map(|owed| owed.left),
+        Some(std::time::Duration::from_secs(600))
+    );
+    assert!(
+        host.web.asked().is_empty(),
+        "nothing was sent inside the delay"
+    );
+
+    // Part of the delay passes, and what is left is what the pass would say.
+    clock.advance(std::time::Duration::from_secs(100));
+    let report = uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    assert_eq!(
+        report.quiet.map(|owed| owed.left),
+        Some(std::time::Duration::from_secs(500))
+    );
+    assert!(host.web.asked().is_empty());
+
+    // The delay passes, and the work goes.
+    clock.advance(std::time::Duration::from_secs(501));
+    let report = uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    assert_eq!(report.quiet, None);
+    assert_eq!(host.generation(1).remote, Remote::Published);
+}
+
+/// Ending work in flight under privacy mode does not wait out a delay the service asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_privacy_fence_ends_the_work_in_flight_inside_a_delay_the_service_asked_for() {
+    let host = Host::open();
+    host.admit(1, &[THREE_PARTS]);
+    let clock = Moving::new();
+    let quiet = Arc::new(Quiet::new(clock));
+    let service = Arc::clone(&host.service);
+    let owed = Arc::clone(&quiet);
+    host.web.when_a_part_arrives(move |number| {
+        if number == 1 {
+            owed.owe(std::time::Duration::from_secs(600));
+            let generation = PrivacyGeneration::new(1);
+            service
+                .raise_fence(generation, TimestampMs::new(11_000))
+                .expect("the fence is raised");
+            service
+                .cancel_undispatched_work(generation, TimestampMs::new(11_000))
+                .expect("undispatched work is taken back");
+        }
+    });
+    let mut uploader = host.uploader_asked_to_wait(10_000, quiet);
+    // The first pass ends where the fence took the part's attempt away, and the next ends the
+    // upload at the service.
+    let first = uploader
+        .pass(TimestampMs::new(12_000))
+        .await
+        .expect("a pass");
+    assert_eq!(first.quiet, None, "a fence is not held by a delay");
+    let report = uploader
+        .pass(TimestampMs::new(12_000))
+        .await
+        .expect("a pass");
+    assert_eq!(report.quiet, None, "a fence is not held by a delay");
+    assert_eq!(
+        host.web.asked(),
+        [
+            Asked::Status,
+            Asked::Create(member_of(1, 0)),
+            Asked::Part("upload-1".to_owned(), 1),
+            Asked::Abort("upload-1".to_owned()),
+        ],
+        "the part that was on its way, and then the abandonment"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
