@@ -4004,15 +4004,14 @@ back and every other transition move the cursor and raise nothing. A transition 
 journal was out is announced and not recorded, and the recovery that writes the states reached
 writes the event that says so with them, so the end of an approval that came in that stretch
 reaches the store when the journal is back. None of the three carries text but the question
-ledger and the host events: what an approval asks is the application's to show.
-For each live session the daemon opens a connection of its own to the
-session's worker, verified and bound to the daemon's generation like every other, and declared for
-attention: it carries the daemon's requests for these records and nothing else, and a newer one
-replaces the one before it. The daemon keeps one request for records past the store's cursors
-waiting on it. The worker answers that request as soon as it commits a question transition, a
-broker transition, a host event or a privacy transition, and after at most thirty seconds
-otherwise, so a question asked in a session is in the inbox within moments rather than at some
-later pass.
+ledger and the host events: what an approval asks is the application's to show. For each live
+session the daemon opens a connection of its own to the session's worker, verified and bound to
+the daemon's generation like every other, and declared for attention: it carries the daemon's
+requests for these records and nothing else, and a newer one replaces the one before it. The daemon
+keeps one request for records past the store's cursors waiting on it. The worker answers that
+request as soon as it commits a question transition, a broker transition, a host event or a
+privacy transition, and after at most thirty seconds otherwise, so a question asked in a session
+is in the inbox within moments rather than at some later pass.
 
 A page is read in a fixed order: the moment, then each source's newest record and the records after
 the cursor up to it, then the session's privacy record. A page that reaches the newest record of
@@ -4512,7 +4511,8 @@ registration.
 A Slack, Discord, Telegram or email destination sends with a credential: a webhook address that is
 itself a bearer secret, a bot token, or a mail submission account. The owner hands it over with
 the configuration, or with `delivery.destination.secret.set`, on this host's own socket, never from
-a paired device, and the answer says who will be able to read what the destination delivers. The daemon keeps the credential
+a paired device, and the answer says who will be able to read what the destination delivers. The
+daemon keeps the credential
 in its secret store under the destination's identifier, beside its own keys and nowhere else: not in
 the delivery journal, an answer, a log or an error. The journal holds a random stamp in its place,
 so a credential replaced under a configured destination never carries a notification admitted
