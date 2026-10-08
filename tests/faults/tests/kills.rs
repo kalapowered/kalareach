@@ -428,7 +428,7 @@ impl Host {
                     max_count: U64::new(2),
                     deadline_boot_ms: U64::new(now + 60_000),
                 },
-                now,
+                &|| now,
             )
             .expect("the attachment is claimed for the offer");
         offer
