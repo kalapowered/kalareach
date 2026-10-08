@@ -1034,7 +1034,8 @@ impl SystemdSupervisor {
 /// session; the manager ends them all, and the manager's own word that the unit is not loaded
 /// (the unit was collected between the question and the call) is the outcome asked for. The
 /// command is given `bound` to answer, and no more than [`SERVICE_MANAGER_BOUND`]; one that does
-/// not answer is ended and given [`COLLECT_BOUND`] to be collected, which is on top of it.
+/// not answer is ended and given [`COLLECT_BOUND`] to be collected, which is on top of it. A
+/// caller with a deadline of its own runs this on a thread it does not wait for past it.
 ///
 /// # Errors
 ///

@@ -527,6 +527,10 @@ impl Group {
 
     /// Asks the service manager to kill everything in the unit, if the group still holds
     /// something.
+    ///
+    /// The cleanup waits for the manager's answer no longer than [`FORCED`]. A manager that is
+    /// slower is not waited for: the command is ended on its own thread, which this does not
+    /// wait for, and the group is read again after the same period whatever came of it.
     async fn force(&mut self) -> Forced {
         if self.killed || self.empty().await {
             return Forced::Nothing;
@@ -535,14 +539,17 @@ impl Group {
         #[cfg(target_os = "linux")]
         {
             let unit = self.unit.clone();
-            match tokio::task::spawn_blocking(move || crate::supervision::kill_unit(&unit, FORCED))
-                .await
-            {
-                Ok(Ok(())) => Forced::Killed,
-                Ok(Err(why)) => Forced::Refused(why),
-                Err(_) => {
+            let asked =
+                tokio::task::spawn_blocking(move || crate::supervision::kill_unit(&unit, FORCED));
+            match tokio::time::timeout(FORCED, asked).await {
+                Ok(Ok(Ok(()))) => Forced::Killed,
+                Ok(Ok(Err(why))) => Forced::Refused(why),
+                Ok(Err(_)) => {
                     Forced::Refused("the call to the service manager did not finish".to_owned())
                 }
+                Err(_) => Forced::Refused(format!(
+                    "the service manager did not answer within {FORCED:?}"
+                )),
             }
         }
         #[cfg(not(target_os = "linux"))]
