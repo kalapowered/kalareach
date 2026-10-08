@@ -70,12 +70,13 @@ use crate::error::{DeliveryError, Result};
 /// asked about. Version 7 adds the stamp of the stored credential an external destination sends
 /// with, and binds a destination to it only when it has one, so every binding version 6 computed
 /// is computed the same way. Version 8 adds the time privacy mode was last turned off, which is
-/// how a decision made while it was on is told from one made after. A journal written under
-/// version 6 or 7 is brought forward in place, once, when it is opened ([`migrate_forward`]); a
-/// journal written under a version below 6 or above 8 is refused rather than read with the
-/// columns of another shape, matched against bindings this build no longer computes the same way,
-/// or trusted to hold no request it should not.
-const SCHEMA_VERSION: i64 = 8;
+/// how a decision made while it was on is told from one made after. Version 9 adds the table of
+/// revocations this host owes a gateway. A journal written under version 6, 7 or 8 is brought
+/// forward in place, once, when it is opened ([`migrate_forward`]); a journal written under a
+/// version below 6 or above 9 is refused rather than read with the columns of another shape,
+/// matched against bindings this build no longer computes the same way, or trusted to hold no
+/// request it should not.
+const SCHEMA_VERSION: i64 = 9;
 
 /// The oldest schema this build brings forward rather than refusing.
 const OLDEST_SCHEMA_VERSION: i64 = 6;
@@ -91,7 +92,7 @@ pub const REMOVED_BINDING: &str = "removed";
 /// A store that has lost one of them is refused rather than recreated: an empty outbox and an
 /// empty privacy row say the opposite of what is true about a host that had work queued or a fence
 /// up.
-const REQUIRED_TABLES: [&str; 11] = [
+const REQUIRED_TABLES: [&str; 12] = [
     "delivery_schema",
     "delivery_consumers",
     "delivery_events",
@@ -103,6 +104,7 @@ const REQUIRED_TABLES: [&str; 11] = [
     "delivery_budget",
     "delivery_secret",
     "delivery_privacy",
+    "delivery_revocations",
 ];
 
 /// The decision recorded on an event this journal produced notifications from.
@@ -1223,6 +1225,25 @@ impl DeliveryJournal {
         record: &DestinationRecord,
         admit: impl FnOnce() -> bool,
     ) -> Result<bool> {
+        self.configure_destination_owing(record, admit, None)
+    }
+
+    /// Writes down one configured destination as [`Self::configure_destination_if`] does, and, in
+    /// the same transaction, that this host owes the gateway a revocation of the authorisation
+    /// the destination sent under before, when it was another.
+    ///
+    /// One transaction, because they are one fact: a host that stops between a destination
+    /// moving to a new authorisation and the debt for the old one would never revoke it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn configure_destination_owing(
+        &mut self,
+        record: &DestinationRecord,
+        admit: impl FnOnce() -> bool,
+        owing: Option<(PushSenderRecordId, &str, u64)>,
+    ) -> Result<bool> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1302,6 +1323,14 @@ impl DeliveryJournal {
         };
         if !admit() {
             return Ok(false);
+        }
+        if let Some((sender_record_id, gateway_origin, now_ms)) = owing {
+            transaction.execute(
+                "INSERT OR IGNORE INTO delivery_revocations
+                     (sender_record_id, gateway_origin, queued_at_ms, attempts, next_attempt_at_ms)
+                 VALUES (?1, ?2, ?3, 0, ?3)",
+                params![sender_record_id.to_string(), gateway_origin, as_i64(now_ms)],
+            )?;
         }
         transaction.execute(
             "INSERT INTO delivery_destinations
@@ -1394,6 +1423,142 @@ impl DeliveryJournal {
             .transpose()?;
         transaction.commit()?;
         Ok(record)
+    }
+
+    /// Records that this host owes the gateway a revocation of one authorisation, due at once.
+    ///
+    /// Written when a device is unpaired, in the same breath as the destination and its credential
+    /// go, so a host that stops before the gateway has answered still knows what it owes. The
+    /// origin is kept because the credential that named it is gone by then. Owing the same
+    /// authorisation twice is owing it once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn owe_revocation(
+        &mut self,
+        sender_record_id: PushSenderRecordId,
+        gateway_origin: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO delivery_revocations
+                 (sender_record_id, gateway_origin, queued_at_ms, attempts, next_attempt_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?3)",
+            params![sender_record_id.to_string(), gateway_origin, as_i64(now_ms)],
+        )?;
+        Ok(())
+    }
+
+    /// The revocations this host owes whose turn has come, oldest first, at most `limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails and
+    /// [`DeliveryError::JournalUnreadable`] when a stored identifier is not one this build writes.
+    pub fn revocations_due(&self, now_ms: u64, limit: usize) -> Result<Vec<OwedRevocation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT sender_record_id, gateway_origin, queued_at_ms, attempts
+             FROM delivery_revocations WHERE next_attempt_at_ms <= ?1
+             ORDER BY queued_at_ms, sender_record_id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![as_i64(now_ms), i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        let mut owed = Vec::new();
+        for row in rows {
+            let (sender_record, gateway_origin, queued_at_ms, attempts) = row?;
+            owed.push(OwedRevocation {
+                sender_record_id: sender_record.parse().map_err(|_| {
+                    DeliveryError::JournalUnreadable(
+                        "a revocation is owed under an identifier this build does not write",
+                    )
+                })?,
+                gateway_origin,
+                queued_at_ms: as_u64(queued_at_ms),
+                attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+            });
+        }
+        Ok(owed)
+    }
+
+    /// Records that an owed revocation was tried and not settled, and when it is tried again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn note_revocation_attempt(
+        &mut self,
+        sender_record_id: PushSenderRecordId,
+        next_attempt_at_ms: u64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE delivery_revocations
+             SET attempts = attempts + 1, next_attempt_at_ms = ?2
+             WHERE sender_record_id = ?1",
+            params![sender_record_id.to_string(), as_i64(next_attempt_at_ms)],
+        )?;
+        Ok(())
+    }
+
+    /// Records that a revocation is no longer owed: the gateway has it, or will never take it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn settle_revocation(&mut self, sender_record_id: PushSenderRecordId) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM delivery_revocations WHERE sender_record_id = ?1",
+            params![sender_record_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this host owes the gateway a revocation of one authorisation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn revocation_owed(&self, sender_record_id: PushSenderRecordId) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM delivery_revocations WHERE sender_record_id = ?1",
+                params![sender_record_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every authorisation this host owes the gateway a revocation of, due or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails and
+    /// [`DeliveryError::JournalUnreadable`] when a stored identifier is not one this build writes.
+    pub fn owed_revocations(&self) -> Result<Vec<PushSenderRecordId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT sender_record_id FROM delivery_revocations")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut owed = Vec::new();
+        for row in rows {
+            owed.push(row?.parse().map_err(|_| {
+                DeliveryError::JournalUnreadable(
+                    "a revocation is owed under an identifier this build does not write",
+                )
+            })?);
+        }
+        Ok(owed)
     }
 
     /// Removes one destination.
@@ -3314,6 +3479,19 @@ impl DeliveryJournal {
     }
 }
 
+/// One revocation this host owes a gateway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwedRevocation {
+    /// The authorisation to revoke.
+    pub sender_record_id: PushSenderRecordId,
+    /// The gateway that issued it.
+    pub gateway_origin: String,
+    /// When the debt was written, in UTC milliseconds.
+    pub queued_at_ms: u64,
+    /// How many times it has been tried.
+    pub attempts: u32,
+}
+
 /// What removing one destination did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DestinationRemoval {
@@ -3806,7 +3984,7 @@ fn insert_notification(
     Ok(())
 }
 
-/// Brings a version 6 or version 7 journal forward to version 8, in one transaction.
+/// Brings a version 6, 7 or 8 journal forward to version 9, in one transaction.
 ///
 /// Version 7 added one column, the stamp of the stored credential an external destination sends
 /// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a
@@ -3816,11 +3994,12 @@ fn insert_notification(
 /// that has been through it and is out of it is given the time of this migration: the earlier
 /// build did not record when, so everything decided before this moment may have been decided while
 /// privacy mode was on, and none of it is sent. A journal that is still fenced records the time
-/// when it is lifted. The version is read again inside the transaction, so two openers cannot both
-/// add a column.
+/// when it is lifted. Version 9 adds the table of revocations this host owes a gateway, which no
+/// earlier journal can hold one of: an earlier build revoked nothing at unpairing.
+/// The version is read again inside the transaction, so two openers cannot both add a column.
 ///
 /// Remove this upgrade, with the arm of the open that calls it, once no supported upgrade starts
-/// from a journal written under version 6 or 7; `OLDEST_SCHEMA_VERSION` then moves up with it.
+/// from a journal written under version 6, 7 or 8; `OLDEST_SCHEMA_VERSION` then moves up with it.
 fn migrate_forward(connection: &mut Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -3844,6 +4023,17 @@ fn migrate_forward(connection: &mut Connection) -> Result<()> {
         transaction.execute(
             "UPDATE delivery_privacy SET lifted_at_ms = ?1 WHERE generation > 0 AND fenced = 0",
             params![as_i64(wall_ms())],
+        )?;
+    }
+    if version <= 8 {
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS delivery_revocations (
+                sender_record_id TEXT PRIMARY KEY,
+                gateway_origin TEXT NOT NULL,
+                queued_at_ms INTEGER NOT NULL,
+                attempts INTEGER NOT NULL,
+                next_attempt_at_ms INTEGER NOT NULL
+            );",
         )?;
     }
     if version < SCHEMA_VERSION {
@@ -4189,6 +4379,13 @@ const SCHEMA: &str = "
         generation INTEGER NOT NULL,
         fenced INTEGER NOT NULL,
         lifted_at_ms INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS delivery_revocations (
+        sender_record_id TEXT PRIMARY KEY,
+        gateway_origin TEXT NOT NULL,
+        queued_at_ms INTEGER NOT NULL,
+        attempts INTEGER NOT NULL,
+        next_attempt_at_ms INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS delivery_outbox_due ON delivery_outbox (due_at_ms);
     CREATE INDEX IF NOT EXISTS delivery_notifications_state
@@ -6769,6 +6966,7 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE delivery_destinations DROP COLUMN credential_stamp;
                  ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
+                 DROP TABLE delivery_revocations;
                  UPDATE delivery_schema SET version = 6;",
             )
             .expect("the version 6 shape");

@@ -13,7 +13,7 @@
 //! | [`client`] | Presenting a notification to the gateway its credential names |
 //! | [`status`] | Asking that gateway what became of one, by its identifier |
 //! | [`credentials`] | The bearer this host delivers under |
-//! | [`sender`] | Renewing it through the gateway's two-step signed exchange |
+//! | [`sender`] | Renewing and revoking it through the gateway's two-step signed exchanges |
 //! | [`external`] | The sender every external destination is handed to, and delivering to a webhook |
 //! | [`chat`] | Delivering to Slack, Discord and Telegram, and the shape of their credentials |
 //! | [`mail`] | Submitting mail over TLS under the owner's account, and the shape of an address |
@@ -26,11 +26,13 @@
 //! Two of them are the installation's - registering a token and issuing a sender authorisation -
 //! and reach the gateway from the phone. Two are this host's, `push.sender.renew` and
 //! `push.sender.revoke`, signed with the host key under the one managed-service signature,
-//! `ServiceRequestSignature`; renewal is in [`sender`].
+//! `ServiceRequestSignature`; both are in [`sender`].
 //!
-//! The one method this daemon *serves* is `device.preview_key.update`, which a paired device calls
-//! over its authenticated channel to register or rotate the notification-preview key section 16
-//! gives it. That is [`DeliveryModule::update_preview_key`].
+//! Two methods are *served* to a paired device over its authenticated channel:
+//! `device.preview_key.update` registers or rotates the notification-preview key section 16 gives
+//! it ([`DeliveryModule::update_preview_key`]), and `device.push.register` hands the host the
+//! delivery credential the device's installation was issued, which makes the device a destination
+//! (`Controller::device_push_register`).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -49,8 +51,9 @@ use kr_delivery::producer::{Producer, RecipientAuthority};
 use kr_delivery::push::{DeliveryStatus, NextAction, PushSender, SenderCredentials, StatusAnswer};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::delivery::DestinationSecret;
+use kr_protocol::ids::PushSenderRecordId;
 use kr_protocol::method::Method;
-use kr_protocol::push::PushDeliveryRequest;
+use kr_protocol::push::{PushDeliveryCredential, PushDeliveryRequest};
 use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
 
 use crate::error::{ControllerError, Result};
@@ -67,12 +70,160 @@ pub mod sender;
 pub mod status;
 pub mod transport;
 
+/// Takes back from the host's secret store the delivery credential of every push destination in
+/// service, so a restarted daemon delivers under the bearer it had.
+///
+/// A destination whose credential is not kept holds none: it is delivered to once its device
+/// registers again, and until then its notifications settle as revoked, which is what a host that
+/// holds no credential for an authorisation says. A destination out of service, and an
+/// authorisation the host owes the gateway a revocation of, take nothing back, and the item
+/// either has in the store is removed: a host that stopped between ending a destination and
+/// deleting its item would otherwise renew a credential for a device that is no longer paired. A
+/// store that cannot be read stops the start, as one that cannot say whether privacy mode is on
+/// does.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::Storage`] when the journal or the secret store cannot be read.
+pub fn load_held_credentials(
+    delivery: &DeliveryModule,
+    credentials: &credentials::HeldCredentials,
+) -> Result<usize> {
+    let storage = |detail| ControllerError::Storage {
+        operation: "read a delivery credential",
+        detail,
+    };
+    let (destinations, owed) = delivery.with(|producer| {
+        Ok((
+            producer.journal().destinations().map_err(unavailable)?,
+            producer.journal().owed_revocations().map_err(unavailable)?,
+        ))
+    })?;
+    for sender_record_id in &owed {
+        credentials.forget(*sender_record_id).map_err(storage)?;
+    }
+    let mut loaded = 0;
+    for destination in destinations {
+        let Some(push) = destination.as_push() else {
+            continue;
+        };
+        if !destination.enabled
+            || destination.rule.is_none()
+            || owed.contains(&push.sender_record_id)
+        {
+            credentials.forget(push.sender_record_id).map_err(storage)?;
+            continue;
+        }
+        if credentials.load(push.sender_record_id).map_err(storage)? {
+            loaded += 1;
+        }
+    }
+    Ok(loaded)
+}
+
+/// The origin of the push gateway KalaReach runs, section 16's "Workers push gateway".
+///
+/// It is the only gateway a paired device may name in a credential it hands this host. The origin
+/// a credential carries is where this host sends every notification, status question and renewal
+/// under it, so a device that could name any origin could make the host post to an address of its
+/// choosing: its own server, or a service on this host's network. A gateway of an installation's
+/// own is not one a host delivers through.
+pub const OFFICIAL_GATEWAY_ORIGIN: &str = kr_client::services::account::ACCOUNT_ORIGIN;
+
+/// What asking the gateway about a credential a device handed over came to, when it did not
+/// confirm it.
+///
+/// The difference is the device's: a refusal is the gateway's own answer about this credential,
+/// and asking again with it is asking again for the same refusal; a question that was not asked,
+/// or not answered as the gateway answers, says nothing about the credential and may be asked
+/// again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Confirmation {
+    /// The gateway refused: it holds no authorisation for this host's key under that identifier,
+    /// or the bearer is not an active authorisation's.
+    Refused(String),
+    /// No answer that says either way: nobody answered, or the answer was not the gateway's.
+    NotAsked(String),
+}
+
+/// How far ahead of this host's clock a credential's issue time may be: the clocks of a phone and
+/// a host differ, and a credential issued a moment from now is not a stale one.
+const CREDENTIAL_ISSUE_SKEW_MS: u64 = 5 * 60 * 1000;
+
+/// Checks the credential a paired device hands this host before the gateway is asked about it.
+///
+/// This is the part of the check that needs no one's word: the gateway is the official one, the
+/// credential lasts no longer than section 16 allows, it is not past its expiry and it was not
+/// issued in the future, and the installation it names is the one the device's own authorisation
+/// key names. That key is the one the host recorded when it paired the device, and an installation
+/// is the hash of the key it authenticates with, so a device cannot hand over another device's
+/// installation. What the gateway holds, the authorisation, this host's key and whether the bearer
+/// still works, only the gateway can say ([`runtime::DeliveryRuntime::confirm`]).
+///
+/// # Errors
+///
+/// Returns [`ControllerError::InvalidArgument`] naming the rule the credential broke, and never
+/// the credential.
+pub fn check_offered_credential(
+    credential: &PushDeliveryCredential,
+    device_authorisation: &kr_protocol::scalars::AuthorisationKey,
+    now_ms: u64,
+) -> Result<()> {
+    if credential.gateway_origin.as_str() != OFFICIAL_GATEWAY_ORIGIN {
+        return Err(ControllerError::InvalidArgument(
+            "this host delivers notifications through the KalaReach push gateway only, and the \
+             credential names another"
+                .to_owned(),
+        ));
+    }
+    if credential.installation_id != kr_protocol::service::installation_id(device_authorisation) {
+        return Err(ControllerError::InvalidArgument(
+            "the credential is for an installation that is not this device's own".to_owned(),
+        ));
+    }
+    if !credential.lifetime_within_maximum() {
+        return Err(ControllerError::InvalidArgument(
+            "a delivery credential lasts at most 30 days".to_owned(),
+        ));
+    }
+    if now_ms >= credential.expires_at_ms.get() {
+        return Err(ControllerError::InvalidArgument(
+            "the credential has expired; its installation requests a new authorisation".to_owned(),
+        ));
+    }
+    if credential.issued_at_ms.get() > now_ms.saturating_add(CREDENTIAL_ISSUE_SKEW_MS) {
+        return Err(ControllerError::InvalidArgument(
+            "the credential was issued in the future".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The file the environment's delivery journal lives in.
 pub const DELIVERY_JOURNAL: &str = "delivery.sqlite3";
 
 /// How many deliveries of each kind one pass takes out of the outbox: sends, and status questions
 /// about notifications the gateway is holding.
 pub const MAX_PASS: usize = 32;
+
+/// How many owed revocations one sweep asks about.
+const REVOCATIONS_PER_SWEEP: usize = 16;
+
+/// How long a revocation the gateway does not take is asked for: the life of a delivery credential.
+const REVOCATION_PATIENCE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// How many times a revocation is asked for at least before it is given up.
+const REVOCATION_MIN_ATTEMPTS: u32 = 3;
+
+/// How long after an unsettled attempt a revocation is asked for again: five minutes, doubling
+/// each time, to at most six hours.
+fn revocation_backoff_ms(attempts: u32) -> u64 {
+    const FIRST_MS: u64 = 5 * 60 * 1000;
+    const LONGEST_MS: u64 = 6 * 60 * 60 * 1000;
+    FIRST_MS
+        .saturating_mul(1_u64 << attempts.min(16))
+        .min(LONGEST_MS)
+}
 
 /// Where one pass reads the time.
 ///
@@ -464,6 +615,36 @@ impl DeliveryModule {
     /// credential of its kind kept under the identifier, and [`ControllerError::Storage`] when the
     /// secret store or the journal cannot be read or written.
     pub fn configure(&self, record: &DestinationRecord) -> Result<()> {
+        self.configure_if(record, &|| Ok(())).map(|_| ())
+    }
+
+    /// Records a destination as [`Self::configure`] does, asking `admitted` once the journal's
+    /// write lock is held and everything the write reads has been read, immediately before the
+    /// row is written. Returns whether it wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::configure`] returns, and what `admitted` refuses with.
+    pub fn configure_if(
+        &self,
+        record: &DestinationRecord,
+        admitted: &dyn Fn() -> Result<()>,
+    ) -> Result<bool> {
+        self.configure_owing(record, admitted, None)
+    }
+
+    /// Records a destination as [`Self::configure_if`] does and, in the same write, that this host
+    /// owes the gateway a revocation of `owing`'s authorisation at its origin, as of its time.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::configure_if`] returns.
+    pub fn configure_owing(
+        &self,
+        record: &DestinationRecord,
+        admitted: &dyn Fn() -> Result<()>,
+        owing: Option<(PushSenderRecordId, &str, u64)>,
+    ) -> Result<bool> {
         let mut record = record.clone();
         if let Destination::External(external) = &mut record.destination {
             if external.kind.credential().is_none() {
@@ -503,10 +684,25 @@ impl DeliveryModule {
                 // credential kept for what it replaced goes with it.
                 Destination::Push(_) => self.secrets.remove(&record.id)?,
             }
-            producer
+            let mut refused = None;
+            let wrote = producer
                 .journal_mut()
-                .configure_destination(&record)
-                .map_err(unavailable)
+                .configure_destination_owing(
+                    &record,
+                    || match admitted() {
+                        Ok(()) => true,
+                        Err(refusal) => {
+                            refused = Some(refusal);
+                            false
+                        }
+                    },
+                    owing,
+                )
+                .map_err(unavailable)?;
+            match refused {
+                Some(refusal) => Err(refusal),
+                None => Ok(wrote),
+            }
         })
     }
 
@@ -735,6 +931,94 @@ impl DeliveryModule {
                 .map_err(unavailable)
         })
         .map(Considered::HadItsTurn)
+    }
+
+    /// Asks the gateways to revoke the authorisations this host owes a revocation for, those whose
+    /// turn has come, and records what each came to.
+    ///
+    /// A revocation is owed from the moment a device is unpaired
+    /// ([`DeliveryJournal::owe_revocation`]) and stays owed across a restart until the gateway has
+    /// taken it or has said it never will, and until the host has let go of what it kept of the
+    /// authorisation. One that does not complete is asked for again later, further apart each
+    /// time, and given up when the credential it would have ended could no longer be in use:
+    /// thirty days, and some attempts.
+    ///
+    /// Returns how many were settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the journal cannot be read or written.
+    pub fn settle_revocations(
+        &self,
+        revoker: &dyn sender::SenderRevocation,
+        forget: &dyn Fn(PushSenderRecordId) -> bool,
+        clock: &dyn Clock,
+    ) -> Result<usize> {
+        let due = self.with(|producer| {
+            producer
+                .journal()
+                .revocations_due(clock.now_ms(), REVOCATIONS_PER_SWEEP)
+                .map_err(unavailable)
+        })?;
+        let mut settled = 0;
+        for owed in due {
+            // Whatever the host still keeps of an authorisation it is revoking goes first: the
+            // revocation needs this host's key and nothing of the bearer, and a bearer left in the
+            // secret store by a stop between ending a destination and deleting its item would be
+            // renewed for a device that is no longer paired.
+            let forgotten = forget(owed.sender_record_id);
+            let answer = match kr_protocol::service::GatewayOrigin::new(owed.gateway_origin.clone())
+            {
+                Ok(origin) => revoker.revoke(&origin, owed.sender_record_id),
+                // An origin this build would not send to is a debt it cannot pay.
+                Err(_) => sender::RevocationAnswer::Gone(
+                    "the gateway's origin is not one this host can reach".to_owned(),
+                ),
+            };
+            // A debt is paid when the gateway has taken it and the host has nothing left of the
+            // authorisation: an item the secret store refused to give up is asked for again.
+            let answer = match answer {
+                sender::RevocationAnswer::Revoked | sender::RevocationAnswer::Gone(_)
+                    if !forgotten =>
+                {
+                    sender::RevocationAnswer::Later(
+                        "the secret store has not given up the authorisation's credential"
+                            .to_owned(),
+                    )
+                }
+                other => other,
+            };
+            let now_ms = clock.now_ms();
+            // Patience runs out after thirty days and some attempts: a host that was off for the
+            // whole time has not been refused by anyone, and is asked a few times first.
+            let given_up = matches!(answer, sender::RevocationAnswer::Later(_))
+                && owed.attempts >= REVOCATION_MIN_ATTEMPTS
+                && now_ms.saturating_sub(owed.queued_at_ms) >= REVOCATION_PATIENCE_MS;
+            if given_up {
+                eprintln!(
+                    "kr-controller: a revocation owed to a gateway was not accepted in thirty \
+                     days and is no longer asked for"
+                );
+            }
+            self.with(|producer| {
+                let journal = producer.journal_mut();
+                match answer {
+                    sender::RevocationAnswer::Later(_) if !given_up => journal
+                        .note_revocation_attempt(
+                            owed.sender_record_id,
+                            now_ms.saturating_add(revocation_backoff_ms(owed.attempts)),
+                        )
+                        .map_err(unavailable),
+                    _ => journal
+                        .settle_revocation(owed.sender_record_id)
+                        .map_err(unavailable),
+                }
+            })?;
+            if !matches!(answer, sender::RevocationAnswer::Later(_)) || given_up {
+                settled += 1;
+            }
+        }
+        Ok(settled)
     }
 
     /// Drives one pass of the outbox.

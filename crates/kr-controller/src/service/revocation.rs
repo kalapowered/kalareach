@@ -221,6 +221,12 @@ impl Controller {
             let owes = revocation.debt.is_some() || record_debt.is_some();
             (revocation, lapsed, owes, own)
         };
+        // The device is unpaired, so the host stops delivering to it, forgets what it delivers
+        // under and owes the gateway a revocation (section 16). A revocation the admission lapsed
+        // before it began changed nothing and ends nothing.
+        if lapsed.is_none() {
+            self.retire_push_destination(device_id);
+        }
         match lapsed {
             // Nothing was withdrawn and nothing is owed, so there is nothing to finish.
             Some(error) if !owes => Err(error),
