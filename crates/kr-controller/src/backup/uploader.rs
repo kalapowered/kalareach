@@ -119,20 +119,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::error::ClientError;
-use kr_client::retry::UserAction;
 use kr_client::services::{
     ArchiveAnswer, BackupManifestService, BackupState, Dispatched, NewUpload, PartTable,
-    ServiceFuture, StorageService, StorageStatus, UploadId, UploadProgress, upload_parts,
+    StorageService, StorageStatus, UploadId, UploadProgress, upload_parts,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::SigningTranscript;
 use kr_protocol::archive::{
     ArchiveDescriptor, BACKUP_PUBLICATION_DOMAIN, BackupGenerationPublication,
-    BackupGenerationPublicationPayload, BackupWriterRecord,
+    BackupGenerationPublicationPayload,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
@@ -292,6 +291,8 @@ pub enum Stepped {
     Waiting {
         /// Why.
         reason: String,
+        /// What the service said that holds the work back, when it was the service.
+        hold: Option<Hold>,
     },
 }
 
@@ -389,7 +390,7 @@ impl Stepped {
                  was deleted from the account console, and this host no longer backs up to it. To \
                  back up again, enrol a new collection"
             ),
-            Self::Waiting { reason } => format!("backup is waiting: {reason}"),
+            Self::Waiting { reason, .. } => format!("backup is waiting: {reason}"),
         }
     }
 }
@@ -418,8 +419,6 @@ pub enum Idle {
 pub struct Hold {
     /// The code the refusal or the failure carried.
     pub code: ErrorCode,
-    /// What a person does about it.
-    pub action: UserAction,
     /// How long the service asked to be left alone, when it said.
     pub retry_after: Option<Duration>,
 }
@@ -437,19 +436,23 @@ impl Hold {
         };
         Self {
             code: error.code(),
-            action: error.user_action(),
             retry_after,
         }
     }
 
-    /// The hold that asks more of whoever waits: one a person must clear over one that passes, and
-    /// of two that pass the longer delay.
+    /// What two refusals met together hold back. Each says something the other does not, so
+    /// neither hides the other: a person must act if either needs one, and the service is left
+    /// alone for the longer of the delays it asked for.
     #[must_use]
-    pub fn stronger(self, other: Self) -> Self {
-        if (other.needs_a_person(), other.retry_after) > (self.needs_a_person(), self.retry_after) {
-            other
+    pub fn and(self, other: Self) -> Self {
+        let code = if other.needs_a_person() && !self.needs_a_person() {
+            other.code
         } else {
-            self
+            self.code
+        };
+        Self {
+            code,
+            retry_after: self.retry_after.max(other.retry_after),
         }
     }
 
@@ -511,169 +514,28 @@ struct Turn {
     unreclaimed: BTreeSet<(ArchiveId, BackupGeneration)>,
 }
 
-/// What the services answered in the step being taken, so a step that waited can say why.
-#[derive(Debug, Default)]
-struct Noted {
-    holds: Mutex<Vec<Hold>>,
+/// The only way the uploader reaches the backup store.
+///
+/// The store is a database on the disk behind one lock, and a step of the uploader runs on the
+/// daemon's reactor between its requests to the service. Every access goes through [`Self::run`],
+/// which hands the thread's other tasks to another thread while the access blocks, so a slow disk
+/// or a long write by another part of the daemon holds one request's turn and not the reactor.
+#[derive(Clone)]
+struct Disk {
+    backup: Arc<BackupService>,
 }
 
-impl Noted {
-    fn note(&self, error: &ClientError) {
-        self.holds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Hold::of(error));
-    }
-
-    /// The hold the step met, and clears what was noted. A cause a person must clear outranks one
-    /// that passes, and of two that pass the longer delay stands.
-    fn take(&self) -> Option<Hold> {
-        let mut noted = self.holds.lock().unwrap_or_else(PoisonError::into_inner);
-        let strongest = noted.iter().copied().reduce(Hold::stronger);
-        noted.clear();
-        strongest
-    }
-}
-
-/// A storage client that notes what the service refuses.
-#[derive(Debug)]
-struct NotingStorage {
-    inner: Arc<dyn StorageService>,
-    noted: Arc<Noted>,
-}
-
-impl NotingStorage {
-    async fn noted<T>(&self, answer: ServiceFuture<'_, T>) -> kr_client::Result<T> {
-        let answered = answer.await;
-        if let Err(error) = &answered {
-            self.noted.note(error);
-        }
-        answered
-    }
-}
-
-impl StorageService for NotingStorage {
-    fn status(&self) -> ServiceFuture<'_, StorageStatus> {
-        Box::pin(self.noted(self.inner.status()))
-    }
-
-    fn set_retention<'a>(
-        &'a self,
-        change: &'a kr_client::services::RetentionChange,
-    ) -> ServiceFuture<'a, kr_client::services::RetentionAnswer> {
-        Box::pin(self.noted(self.inner.set_retention(change)))
-    }
-
-    fn create_upload<'a>(
-        &'a self,
-        upload: &'a NewUpload,
-    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadCreated>> {
-        Box::pin(self.noted(self.inner.create_upload(upload)))
-    }
-
-    fn upload_part<'a>(
-        &'a self,
-        upload_id: &'a UploadId,
-        part: kr_client::services::UploadPart<'a>,
-    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::PartStored>> {
-        Box::pin(self.noted(self.inner.upload_part(upload_id, part)))
-    }
-
-    fn complete_upload<'a>(
-        &'a self,
-        upload_id: &'a UploadId,
-        table: &'a PartTable,
-    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadCompleted>> {
-        Box::pin(self.noted(self.inner.complete_upload(upload_id, table)))
-    }
-
-    fn abort_upload<'a>(
-        &'a self,
-        upload_id: &'a UploadId,
-    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::UploadAborted>> {
-        Box::pin(self.noted(self.inner.abort_upload(upload_id)))
-    }
-
-    fn read_object(
-        &self,
-        archive_id: ArchiveId,
-        object_id: BackupObjectId,
-        offset: u64,
-        length: u64,
-    ) -> ServiceFuture<'_, kr_client::services::ObjectRange> {
-        Box::pin(
-            self.noted(
-                self.inner
-                    .read_object(archive_id, object_id, offset, length),
-            ),
-        )
-    }
-
-    fn delete_object(
-        &self,
-        archive_id: ArchiveId,
-        object_id: BackupObjectId,
-    ) -> ServiceFuture<'_, kr_client::services::ObjectDeleted> {
-        Box::pin(self.noted(self.inner.delete_object(archive_id, object_id)))
-    }
-}
-
-/// A backup manifest client that notes what the service refuses.
-#[derive(Debug)]
-struct NotingManifest {
-    inner: Arc<dyn BackupManifestService>,
-    noted: Arc<Noted>,
-}
-
-impl NotingManifest {
-    async fn noted<T>(&self, answer: ServiceFuture<'_, T>) -> kr_client::Result<T> {
-        let answered = answer.await;
-        if let Err(error) = &answered {
-            self.noted.note(error);
-        }
-        answered
-    }
-}
-
-impl BackupManifestService for NotingManifest {
-    fn enrol<'a>(
-        &'a self,
-        record: &'a BackupWriterRecord,
-    ) -> ServiceFuture<'a, kr_client::services::Enrolled> {
-        Box::pin(self.noted(self.inner.enrol(record)))
-    }
-
-    fn publish<'a>(
-        &'a self,
-        publication: &'a BackupGenerationPublication,
-    ) -> ServiceFuture<'a, ArchiveAnswer<kr_client::services::Published>> {
-        Box::pin(self.noted(self.inner.publish(publication)))
-    }
-
-    fn publish_dispatched<'a>(
-        &'a self,
-        publication: &'a BackupGenerationPublication,
-    ) -> ServiceFuture<'a, Dispatched<ArchiveAnswer<kr_client::services::Published>>> {
-        Box::pin(self.noted(self.inner.publish_dispatched(publication)))
-    }
-
-    fn fetch<'a>(
-        &'a self,
-        archive_id: ArchiveId,
-        generation: Option<BackupGeneration>,
-        checkpoint: Option<&'a kr_protocol::pairing::GenerationCheckpoint>,
-    ) -> ServiceFuture<'a, Option<kr_client::services::FetchedGeneration>> {
-        Box::pin(self.noted(self.inner.fetch(archive_id, generation, checkpoint)))
+impl Disk {
+    fn run<T>(&self, access: impl FnOnce(&BackupService) -> T) -> T {
+        blocking(|| access(&self.backup))
     }
 }
 
 /// The executor that carries the backup outbox.
 pub struct Uploader {
-    backup: Arc<BackupService>,
+    disk: Disk,
     storage: Arc<dyn StorageService>,
     manifest: Arc<dyn BackupManifestService>,
-    /// What the services refused in the step being taken.
-    noted: Arc<Noted>,
     /// The writer's key, which signs every publication and whose generations this uploader
     /// publishes.
     writer: AuthorisationKeyPair,
@@ -713,18 +575,10 @@ impl Uploader {
         writer: AuthorisationKeyPair,
         now: TimestampMs,
     ) -> Self {
-        let noted = Arc::new(Noted::default());
         Self {
-            backup,
-            storage: Arc::new(NotingStorage {
-                inner: storage,
-                noted: Arc::clone(&noted),
-            }),
-            manifest: Arc::new(NotingManifest {
-                inner: manifest,
-                noted: Arc::clone(&noted),
-            }),
-            noted,
+            disk: Disk { backup },
+            storage,
+            manifest,
             writer,
             started_at_ms: now.get(),
             dispatched_here: BTreeSet::new(),
@@ -747,7 +601,7 @@ impl Uploader {
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
     pub async fn settle(&mut self, now: TimestampMs) -> Result<Vec<Stepped>> {
         let mut settled = Vec::new();
-        for attempt in self.backup.outbox()? {
+        for attempt in self.disk.run(|backup| backup.outbox())? {
             if attempt.step != Step::Publish
                 || attempt.status != AttemptStatus::Dispatched
                 || attempt.executor.as_deref() != Some(EXECUTOR)
@@ -755,8 +609,8 @@ impl Uploader {
                 continue;
             }
             let Some(generation) = self
-                .backup
-                .generation(attempt.archive_id, attempt.backup_generation)?
+                .disk
+                .run(|backup| backup.generation(attempt.archive_id, attempt.backup_generation))?
             else {
                 continue;
             };
@@ -764,11 +618,13 @@ impl Uploader {
                 continue;
             }
             settled.push(
-                match self.backup.note_published(
-                    attempt.sequence,
-                    PrivacyGeneration::new(attempt.privacy_generation),
-                    now,
-                ) {
+                match self.disk.run(|backup| {
+                    backup.note_published(
+                        attempt.sequence,
+                        PrivacyGeneration::new(attempt.privacy_generation),
+                        now,
+                    )
+                }) {
                     Ok(_) => Stepped::Settled {
                         sequence: attempt.sequence,
                     },
@@ -790,13 +646,13 @@ impl Uploader {
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
     pub async fn pass(&mut self, now: TimestampMs) -> Result<PassReport> {
         let mut report = PassReport::default();
-        if let Some(reason) = self.backup.unready() {
+        if let Some(reason) = self.disk.run(|backup| backup.unready()) {
             report.idle = Some(Idle::Unready { reason });
             return Ok(report);
         }
-        let uploads = self.backup.store().uploads()?;
-        let outbox = self.backup.outbox()?;
-        let privacy = self.backup.privacy_status()?;
+        let uploads = self.disk.run(|backup| backup.store().uploads())?;
+        let outbox = self.disk.run(|backup| backup.outbox())?;
+        let privacy = self.disk.run(|backup| backup.privacy_status())?;
         if outbox.is_empty()
             && uploads.is_empty()
             && self.reclaimable(&outbox, &privacy)?.is_empty()
@@ -822,34 +678,27 @@ impl Uploader {
             }
         }
         let mut turn = Turn::default();
-        self.noted.take();
         while let Some(stepped) = self.next(now, &mut turn).await? {
-            let held = self.noted.take();
-            let waiting = matches!(stepped, Stepped::Waiting { .. });
+            let held = match &stepped {
+                Stepped::Waiting { hold, .. } => *hold,
+                _ => None,
+            };
             report.steps.push(stepped);
-            let Some(hold) = held.filter(|_| waiting) else {
+            let Some(hold) = held else {
                 continue;
             };
-            report.hold = Some(report.hold.map_or(hold, |earlier| earlier.stronger(hold)));
+            let met = report.hold.map_or(hold, |earlier| earlier.and(hold));
+            report.hold = Some(met);
             // A service that asked to be left alone is not asked about the next attempt either:
             // the answer would be the same. A refusal that names no delay may be about this
             // attempt alone, an object the service already holds for example, so the pass goes on.
             // Under a privacy fence it goes on in every case, because what a fence owes is ending
             // work, and an attempt that needs no answer from the service ends anyway.
-            if !fenced && hold.retry_after.is_some() {
+            if !fenced && met.retry_after.is_some() {
                 break;
             }
         }
         Ok(report)
-    }
-
-    /// Asks the storage service what it says about backup storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns what the transport or the service answered when it did not say.
-    pub async fn status(&self) -> kr_client::Result<StorageStatus> {
-        self.storage.status().await
     }
 
     /// Takes the next step, or answers none when nothing can be done now.
@@ -865,11 +714,11 @@ impl Uploader {
     }
 
     async fn next(&mut self, now: TimestampMs, turn: &mut Turn) -> Result<Option<Stepped>> {
-        if self.backup.unready().is_some() {
+        if self.disk.run(|backup| backup.unready()).is_some() {
             return Ok(None);
         }
-        let privacy = self.backup.privacy_status()?;
-        let outbox = self.backup.outbox()?;
+        let privacy = self.disk.run(|backup| backup.privacy_status())?;
+        let outbox = self.disk.run(|backup| backup.outbox())?;
         for attempt in &outbox {
             if turn.waited.contains(&attempt.sequence)
                 || (attempt.status == AttemptStatus::Dispatched
@@ -879,8 +728,8 @@ impl Uploader {
                 continue;
             }
             let Some(generation) = self
-                .backup
-                .generation(attempt.archive_id, attempt.backup_generation)?
+                .disk
+                .run(|backup| backup.generation(attempt.archive_id, attempt.backup_generation))?
             else {
                 continue;
             };
@@ -930,7 +779,10 @@ impl Uploader {
     /* ---------------------------------------------------------------------- */
 
     fn dispatch(&mut self, attempt: &Attempt, now: TimestampMs) -> Result<Stepped> {
-        match self.backup.note_dispatched(attempt.sequence, EXECUTOR, now) {
+        match self
+            .disk
+            .run(|backup| backup.note_dispatched(attempt.sequence, EXECUTOR, now))
+        {
             Ok(()) => {
                 if attempt.step == Step::Publish {
                     self.dispatched_here.insert(attempt.sequence);
@@ -946,8 +798,8 @@ impl Uploader {
     /// Whether any object of `generation` is not yet at the service.
     fn outstanding(&self, generation: &GenerationRecord) -> Result<bool> {
         Ok(self
-            .backup
-            .objects(generation.archive_id, generation.backup_generation)?
+            .disk
+            .run(|backup| backup.objects(generation.archive_id, generation.backup_generation))?
             .iter()
             .any(|object| !object.is_acknowledged()))
     }
@@ -964,24 +816,24 @@ impl Uploader {
         turn: &mut Turn,
     ) -> Result<Stepped> {
         let objects = self
-            .backup
-            .objects(generation.archive_id, generation.backup_generation)?;
+            .disk
+            .run(|backup| backup.objects(generation.archive_id, generation.backup_generation))?;
         let Some(object) = objects.into_iter().find(|object| !object.is_acknowledged()) else {
             return self.accept(attempt, now);
         };
         if turn.restarted.contains(&key(&object)) {
-            return Ok(Stepped::Waiting {
-                reason: format!(
-                    "the upload of object {} ended in this pass, and the next pass uploads it again",
-                    object.object_id
-                ),
-            });
+            return Ok(waiting(format!(
+                "the upload of object {} ended in this pass, and the next pass uploads it again",
+                object.object_id
+            )));
         }
-        let recorded = self.backup.store().upload(
-            object.archive_id,
-            object.backup_generation,
-            object.object_id,
-        )?;
+        let recorded = self.disk.run(|backup| {
+            backup.store().upload(
+                object.archive_id,
+                object.backup_generation,
+                object.object_id,
+            )
+        })?;
         match recorded {
             None => self.create(attempt, generation, &object, now).await,
             Some(record) => {
@@ -1002,7 +854,7 @@ impl Uploader {
         // of it leaves.
         match staged(object) {
             Ok(_) => {}
-            Err(Unstaged::Unreadable(reason)) => return Ok(Stepped::Waiting { reason }),
+            Err(Unstaged::Unreadable(reason)) => return Ok(waiting(reason)),
             Err(Unstaged::NotAdmitted(reason)) => {
                 return self.give_up(attempt, generation, reason, now);
             }
@@ -1015,18 +867,20 @@ impl Uploader {
             total_bytes: object.encrypted_len,
             encrypted_object_hash: object.encrypted_object_hash,
         };
-        if !may_send(&self.backup, attempt)? {
+        if !self.disk.run(|backup| may_send(backup, attempt))? {
             return Ok(not_carried());
         }
         match self.storage.create_upload(&upload).await {
             Ok(ArchiveAnswer::Done(created)) => {
-                self.backup.store().record_upload(
-                    attempt.sequence,
-                    object.archive_id,
-                    object.backup_generation,
-                    object.object_id,
-                    created.upload_id.as_str(),
-                )?;
+                self.disk.run(|backup| {
+                    backup.store().record_upload(
+                        attempt.sequence,
+                        object.archive_id,
+                        object.backup_generation,
+                        object.object_id,
+                        created.upload_id.as_str(),
+                    )
+                })?;
                 Ok(Stepped::Created {
                     sequence: attempt.sequence,
                     object_id: object.object_id,
@@ -1035,15 +889,16 @@ impl Uploader {
             Ok(ArchiveAnswer::CollectionDeleted) => {
                 self.collection_deleted(attempt, generation, now)
             }
-            Ok(ArchiveAnswer::UploadGone) => Ok(Stepped::Waiting {
-                reason: "the service answered a creation as an upload it holds none of".to_owned(),
-            }),
-            Err(error) => Ok(Stepped::Waiting {
-                reason: format!(
+            Ok(ArchiveAnswer::UploadGone) => Ok(waiting(
+                "the service answered a creation as an upload it holds none of".to_owned(),
+            )),
+            Err(error) => Ok(held_by(
+                &error,
+                format!(
                     "the service did not create an upload of object {}: {error}",
                     object.object_id
                 ),
-            }),
+            )),
         }
     }
 
@@ -1061,7 +916,7 @@ impl Uploader {
         };
         let ciphertext = match staged(object) {
             Ok(ciphertext) => ciphertext,
-            Err(Unstaged::Unreadable(reason)) => return Ok(Stepped::Waiting { reason }),
+            Err(Unstaged::Unreadable(reason)) => return Ok(waiting(reason)),
             Err(Unstaged::NotAdmitted(reason)) => {
                 return self.give_up(attempt, generation, reason, now);
             }
@@ -1085,10 +940,10 @@ impl Uploader {
                 .min(table.part_count()),
         };
         if !progress.every_part_acknowledged() {
-            if !may_send(&self.backup, attempt)? {
+            if !self.disk.run(|backup| may_send(backup, attempt))? {
                 return Ok(not_carried());
             }
-            let backup = &*self.backup;
+            let disk = &self.disk;
             let mut failure: Option<ControllerError> = None;
             let mut withdrawn = false;
             let sent = {
@@ -1096,9 +951,7 @@ impl Uploader {
                 // leaves only while the store still holds this attempt for this uploader.
                 let mut keep = |progress: &UploadProgress| -> kr_client::Result<()> {
                     // Its own statement, so the store is let go before `may_send` reads it again.
-                    // The store is a database on the disk, written between two parts of an upload
-                    // that takes minutes, so the write does not hold a reactor thread.
-                    let recorded = blocking(|| {
+                    let recorded = disk.run(|backup| {
                         backup.store().note_parts_acknowledged(
                             object.archive_id,
                             object.backup_generation,
@@ -1107,7 +960,7 @@ impl Uploader {
                             u64::from(progress.parts_acknowledged),
                         )
                     });
-                    match recorded.and_then(|()| blocking(|| may_send(backup, attempt))) {
+                    match recorded.and_then(|()| disk.run(|backup| may_send(backup, attempt))) {
                         Ok(true) => Ok(()),
                         Ok(false) => {
                             withdrawn = true;
@@ -1138,15 +991,16 @@ impl Uploader {
                 Err(error) if not_permitted(&error) => {
                     self.abandon(record, &progress.upload_id, turn).await
                 }
-                Err(error) => Ok(Stepped::Waiting {
-                    reason: format!(
+                Err(error) => Ok(held_by(
+                    &error,
+                    format!(
                         "the upload of object {} stopped after part {}: {error}",
                         object.object_id, progress.parts_acknowledged
                     ),
-                }),
+                )),
             };
         }
-        if !may_send(&self.backup, attempt)? {
+        if !self.disk.run(|backup| may_send(backup, attempt))? {
             return Ok(not_carried());
         }
         match self
@@ -1161,20 +1015,20 @@ impl Uploader {
                     || completed.object.encrypted_object_hash != object.encrypted_object_hash
                     || completed.object.encrypted_len != object.encrypted_len
                 {
-                    return Ok(Stepped::Waiting {
-                        reason: format!(
-                            "the service completed the upload of object {} as another object",
-                            object.object_id
-                        ),
-                    });
+                    return Ok(waiting(format!(
+                        "the service completed the upload of object {} as another object",
+                        object.object_id
+                    )));
                 }
-                self.backup.note_object_uploaded(
-                    attempt.sequence,
-                    object.archive_id,
-                    object.backup_generation,
-                    object.object_id,
-                    now,
-                )?;
+                self.disk.run(|backup| {
+                    backup.note_object_uploaded(
+                        attempt.sequence,
+                        object.archive_id,
+                        object.backup_generation,
+                        object.object_id,
+                        now,
+                    )
+                })?;
                 Ok(Stepped::Stored {
                     sequence: attempt.sequence,
                     object_id: object.object_id,
@@ -1187,17 +1041,21 @@ impl Uploader {
             Err(error) if not_permitted(&error) => {
                 self.abandon(record, &progress.upload_id, turn).await
             }
-            Err(error) => Ok(Stepped::Waiting {
-                reason: format!(
+            Err(error) => Ok(held_by(
+                &error,
+                format!(
                     "the upload of object {} was not completed: {error}",
                     object.object_id
                 ),
-            }),
+            )),
         }
     }
 
     fn accept(&self, attempt: &Attempt, now: TimestampMs) -> Result<Stepped> {
-        match self.backup.note_attempt_accepted(attempt.sequence, now) {
+        match self
+            .disk
+            .run(|backup| backup.note_attempt_accepted(attempt.sequence, now))
+        {
             Ok(()) => Ok(Stepped::Accepted {
                 sequence: attempt.sequence,
             }),
@@ -1224,15 +1082,16 @@ impl Uploader {
                 })
             }
             Ok(ArchiveAnswer::UploadGone) => self.forget(record, turn),
-            Ok(ArchiveAnswer::CollectionDeleted) => Ok(Stepped::Waiting {
-                reason: "the service answered an abandonment as a deleted collection".to_owned(),
-            }),
-            Err(error) => Ok(Stepped::Waiting {
-                reason: format!(
+            Ok(ArchiveAnswer::CollectionDeleted) => Ok(waiting(
+                "the service answered an abandonment as a deleted collection".to_owned(),
+            )),
+            Err(error) => Ok(held_by(
+                &error,
+                format!(
                     "the upload of object {} was refused and could not be abandoned: {error}",
                     record.object_id
                 ),
-            }),
+            )),
         }
     }
 
@@ -1245,12 +1104,14 @@ impl Uploader {
     }
 
     fn drop_upload(&self, record: &UploadRecord, turn: &mut Turn) -> Result<()> {
-        self.backup.store().forget_upload(
-            record.archive_id,
-            record.backup_generation,
-            record.object_id,
-            &record.upload_id,
-        )?;
+        self.disk.run(|backup| {
+            backup.store().forget_upload(
+                record.archive_id,
+                record.backup_generation,
+                record.object_id,
+                &record.upload_id,
+            )
+        })?;
         turn.restarted.insert((
             record.archive_id,
             record.backup_generation,
@@ -1283,8 +1144,8 @@ impl Uploader {
             }
         }
         let everything_held = self
-            .backup
-            .objects(generation.archive_id, generation.backup_generation)?
+            .disk
+            .run(|backup| backup.objects(generation.archive_id, generation.backup_generation))?
             .iter()
             .all(ObjectRecord::is_acknowledged);
         if everything_held {
@@ -1294,7 +1155,7 @@ impl Uploader {
     }
 
     fn uploads_of(&self, generation: &GenerationRecord) -> Result<Vec<UploadRecord>> {
-        let uploads = self.backup.store().uploads()?;
+        let uploads = self.disk.run(|backup| backup.store().uploads())?;
         Ok(uploads
             .into_iter()
             .filter(|record| {
@@ -1337,13 +1198,14 @@ impl Uploader {
             }
             Err(error) => {
                 turn.unabandoned.insert(record.upload_id.clone());
-                Ok(Stepped::Waiting {
-                    reason: format!(
+                Ok(held_by(
+                    &error,
+                    format!(
                         "an upload of object {} that nothing carries any more could not be \
                          abandoned yet: {error}",
                         record.object_id
                     ),
-                })
+                ))
             }
         }
     }
@@ -1355,7 +1217,7 @@ impl Uploader {
         privacy: &PrivacyStatus,
         turn: &mut Turn,
     ) -> Result<Option<Stepped>> {
-        let uploads = self.backup.store().uploads()?;
+        let uploads = self.disk.run(|backup| backup.store().uploads())?;
         for record in uploads {
             if turn.unabandoned.contains(&record.upload_id) {
                 continue;
@@ -1366,8 +1228,8 @@ impl Uploader {
                     && attempt.step == Step::Upload
             });
             let producing = self
-                .backup
-                .generation(record.archive_id, record.backup_generation)?
+                .disk
+                .run(|backup| backup.generation(record.archive_id, record.backup_generation))?
                 .is_some_and(|generation| may_produce(&generation, privacy));
             if carried_on || producing {
                 continue;
@@ -1378,7 +1240,10 @@ impl Uploader {
     }
 
     fn stop(&self, attempt: &Attempt, reason: String, now: TimestampMs) -> Result<Stepped> {
-        match self.backup.note_attempt_stopped(attempt.sequence, now) {
+        match self
+            .disk
+            .run(|backup| backup.note_attempt_stopped(attempt.sequence, now))
+        {
             Ok(()) => Ok(Stepped::Stopped {
                 sequence: attempt.sequence,
                 reason,
@@ -1399,12 +1264,14 @@ impl Uploader {
         reason: String,
         now: TimestampMs,
     ) -> Result<Stepped> {
-        self.backup.store().cancel_production(
-            generation.archive_id,
-            generation.backup_generation,
-            &reason,
-            now,
-        )?;
+        self.disk.run(|backup| {
+            backup.store().cancel_production(
+                generation.archive_id,
+                generation.backup_generation,
+                &reason,
+                now,
+            )
+        })?;
         self.stop(attempt, reason, now)
     }
 
@@ -1422,23 +1289,28 @@ impl Uploader {
         now: TimestampMs,
     ) -> Result<Stepped> {
         let archive_id = generation.archive_id;
-        self.backup
-            .retire_writer(archive_id, generation.writer_key_id, now)?;
+        self.disk
+            .run(|backup| backup.retire_writer(archive_id, generation.writer_key_id, now))?;
         let detail = format!(
             "the backup collection of archive {archive_id} was deleted from the account console; \
              to back up again, enrol a new collection"
         );
-        for other in self.backup.generations()? {
+        for other in self.disk.run(|backup| backup.generations())? {
             if other.archive_id == archive_id && other.production == Production::Producing {
-                self.backup.store().cancel_production(
-                    archive_id,
-                    other.backup_generation,
-                    &detail,
-                    now,
-                )?;
+                self.disk.run(|backup| {
+                    backup.store().cancel_production(
+                        archive_id,
+                        other.backup_generation,
+                        &detail,
+                        now,
+                    )
+                })?;
             }
         }
-        match self.backup.note_attempt_stopped(attempt.sequence, now) {
+        match self
+            .disk
+            .run(|backup| backup.note_attempt_stopped(attempt.sequence, now))
+        {
             Ok(()) => Ok(Stepped::CollectionDeleted {
                 sequence: attempt.sequence,
                 archive_id,
@@ -1482,14 +1354,17 @@ impl Uploader {
         let held = self.held(generation).await;
         // What is said about the generation is read after the service answered: privacy mode may
         // have drawn its line while this host asked.
-        let privacy = &self.backup.privacy_status()?;
+        let privacy = &self.disk.run(|backup| backup.privacy_status())?;
         match held {
             Ok(true) => self.published(attempt, now),
             Ok(false) if now.get() >= since.saturating_add(WAITS_FOR_AN_ANSWER_MS) => {
                 // The note that it may have left goes only once the stop is written down: a stop
                 // the store refused leaves the attempt dispatched, and the next pass has to ask
                 // again rather than send.
-                match self.backup.note_attempt_stopped(sequence, now) {
+                match self
+                    .disk
+                    .run(|backup| backup.note_attempt_stopped(sequence, now))
+                {
                     Ok(()) => {
                         self.unanswered.remove(&sequence);
                         self.dispatched_here.remove(&sequence);
@@ -1505,28 +1380,25 @@ impl Uploader {
             }
             // An earlier process dispatched it, so its outcome is already one this host cannot
             // establish, and that is what a person is told while this host still asks.
-            Ok(false) if !self.dispatched_here.contains(&sequence) => Ok(Stepped::Waiting {
-                reason: format!(
-                    "the service does not hold the publication of backup generation {} of archive \
-                     {}, which may have left before this host restarted. That generation is \
-                     unknown. {}",
-                    generation.backup_generation.get(),
-                    generation.archive_id,
-                    never_complete(privacy_line(generation, privacy).as_deref())
-                ),
-            }),
-            Ok(false) => Ok(Stepped::Waiting {
-                reason: format!(
-                    "the publication of backup attempt {sequence} may still reach the service, \
-                     which does not hold it yet"
-                ),
-            }),
-            Err(error) => Ok(Stepped::Waiting {
-                reason: format!(
+            Ok(false) if !self.dispatched_here.contains(&sequence) => Ok(waiting(format!(
+                "the service does not hold the publication of backup generation {} of archive \
+                 {}, which may have left before this host restarted. That generation is \
+                 unknown. {}",
+                generation.backup_generation.get(),
+                generation.archive_id,
+                never_complete(privacy_line(generation, privacy).as_deref())
+            ))),
+            Ok(false) => Ok(waiting(format!(
+                "the publication of backup attempt {sequence} may still reach the service, \
+                 which does not hold it yet"
+            ))),
+            Err(error) => Ok(held_by(
+                &error,
+                format!(
                     "whether the service holds the publication of backup attempt {sequence} is \
                      not known: {error}"
                 ),
-            }),
+            )),
         }
     }
 
@@ -1538,9 +1410,9 @@ impl Uploader {
     ) -> Result<Stepped> {
         let publication = match self.publication(generation) {
             Ok(publication) => publication,
-            Err(reason) => return Ok(Stepped::Waiting { reason }),
+            Err(reason) => return Ok(waiting(reason)),
         };
-        if !may_send(&self.backup, attempt)? {
+        if !self.disk.run(|backup| may_send(backup, attempt))? {
             return Ok(not_carried());
         }
         // Written down before the request can leave and cleared only by an answer or by a refusal
@@ -1556,16 +1428,16 @@ impl Uploader {
             }
             Ok(Dispatched::Answered(ArchiveAnswer::UploadGone)) => {
                 self.unanswered.remove(&sequence);
-                Ok(Stepped::Waiting {
-                    reason: "the service answered a publication as an upload it holds none of"
-                        .to_owned(),
-                })
+                Ok(waiting(
+                    "the service answered a publication as an upload it holds none of".to_owned(),
+                ))
             }
             Ok(Dispatched::NotSent(error)) => {
                 self.unanswered.remove(&sequence);
-                Ok(Stepped::Waiting {
-                    reason: format!("the publication was not sent: {error}"),
-                })
+                Ok(held_by(
+                    &error,
+                    format!("the publication was not sent: {error}"),
+                ))
             }
             // The service answered and published nothing. One that already holds a generation of
             // the archive at or above this one never takes it, whatever the refusal said, so the
@@ -1573,33 +1445,44 @@ impl Uploader {
             // can land.
             Err(error @ ClientError::Refused { .. }) => {
                 self.unanswered.remove(&sequence);
-                if let Some(held) = self.passed_by(generation).await {
-                    let reason = format!(
-                        "the service already holds generation {} of archive {} and takes no \
-                         generation at or below it, so this one is never published and it is not \
-                         sent again. Generation {} carries its content",
-                        held.get(),
-                        generation.archive_id,
-                        held.get()
-                    );
-                    return self.give_up(attempt, generation, reason, now);
+                // What the service says to the question asked next is part of what holds this
+                // publication back: a person to act and a delay to wait are both owed.
+                let mut hold = Hold::of(&error);
+                match self.passed_by(generation).await {
+                    Ok(Some(held)) => {
+                        let reason = format!(
+                            "the service already holds generation {} of archive {} and takes no \
+                             generation at or below it, so this one is never published and it is \
+                             not sent again. Generation {} carries its content",
+                            held.get(),
+                            generation.archive_id,
+                            held.get()
+                        );
+                        return self.give_up(attempt, generation, reason, now);
+                    }
+                    Ok(None) => {}
+                    Err(asked) => hold = hold.and(Hold::of(&asked)),
                 }
                 Ok(Stepped::Waiting {
                     reason: format!("the service did not publish the generation: {error}"),
+                    hold: Some(hold),
                 })
             }
-            Err(error) => Ok(Stepped::Waiting {
-                reason: format!("the publication may have left and was not answered: {error}"),
-            }),
+            Err(error) => Ok(held_by(
+                &error,
+                format!("the publication may have left and was not answered: {error}"),
+            )),
         }
     }
 
     fn published(&mut self, attempt: &Attempt, now: TimestampMs) -> Result<Stepped> {
-        match self.backup.note_published(
-            attempt.sequence,
-            PrivacyGeneration::new(attempt.privacy_generation),
-            now,
-        ) {
+        match self.disk.run(|backup| {
+            backup.note_published(
+                attempt.sequence,
+                PrivacyGeneration::new(attempt.privacy_generation),
+                now,
+            )
+        }) {
             Ok(publication) => {
                 self.unanswered.remove(&attempt.sequence);
                 self.dispatched_here.remove(&attempt.sequence);
@@ -1635,21 +1518,29 @@ impl Uploader {
     /// publication at or above this generation.
     ///
     /// The service takes no generation at or below the newest it has held, so this generation is
-    /// then never published. None when the service holds nothing that high, when its newest is
-    /// this very publication, or when it cannot say now.
-    async fn passed_by(&self, generation: &GenerationRecord) -> Option<BackupGeneration> {
-        let newest = self
+    /// then never published. None when the service holds nothing that high, or when its newest is
+    /// this very publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the service answered when it did not say.
+    async fn passed_by(
+        &self,
+        generation: &GenerationRecord,
+    ) -> std::result::Result<Option<BackupGeneration>, ClientError> {
+        let Some(newest) = self
             .manifest
             .fetch(generation.archive_id, None, None)
-            .await
-            .ok()
-            .flatten()?;
+            .await?
+        else {
+            return Ok(None);
+        };
         let payload = &newest.publication.payload;
         let this_one = descriptor_of(generation).is_some_and(|descriptor| {
             payload.descriptor == descriptor && payload.writer_key_id == generation.writer_key_id
         });
         let held = payload.descriptor.backup_generation;
-        (held >= generation.backup_generation && !this_one).then_some(held)
+        Ok((held >= generation.backup_generation && !this_one).then_some(held))
     }
 
     /// The generation's publication, made the same way every time: the writer's signature over its
@@ -1697,11 +1588,11 @@ impl Uploader {
         loop {
             // Read afresh each time round: asking the service takes time, and privacy mode, or
             // the store, may have moved while it did.
-            if self.backup.unready().is_some() {
+            if self.disk.run(|backup| backup.unready()).is_some() {
                 return Ok(None);
             }
-            let outbox = self.backup.outbox()?;
-            let privacy = self.backup.privacy_status()?;
+            let outbox = self.disk.run(|backup| backup.outbox())?;
+            let privacy = self.disk.run(|backup| backup.privacy_status())?;
             let Some(work) = self
                 .reclaimable(&outbox, &privacy)?
                 .into_iter()
@@ -1727,14 +1618,15 @@ impl Uploader {
                 Ok(true) => return self.found_published(&generation, now, turn).map(Some),
                 Err(error) => {
                     turn.unreclaimed.insert(generation_key);
-                    return Ok(Some(Stepped::Waiting {
-                        reason: format!(
+                    return Ok(Some(held_by(
+                        &error,
+                        format!(
                             "whether the service holds backup generation {} of archive {}, which \
                              no publication can name any more, is not known: {error}",
                             generation.backup_generation.get(),
                             generation.archive_id
                         ),
-                    }));
+                    )));
                 }
             }
         }
@@ -1754,16 +1646,16 @@ impl Uploader {
         if privacy.inhibited_at().is_some() {
             return Ok(Vec::new());
         }
-        let generations = self.backup.generations()?;
-        let uploads = self.backup.store().uploads()?;
+        let generations = self.disk.run(|backup| backup.generations())?;
+        let uploads = self.disk.run(|backup| backup.store().uploads())?;
         let mut behind: Vec<(GenerationRecord, Vec<ObjectRecord>, bool)> = Vec::new();
         for record in &generations {
             if !self.left_behind(record, &generations, outbox, &uploads, privacy)? {
                 continue;
             }
             let objects = self
-                .backup
-                .objects(record.archive_id, record.backup_generation)?;
+                .disk
+                .run(|backup| backup.objects(record.archive_id, record.backup_generation))?;
             let unheld = self.unheld.contains(&generation_key(record))
                 || objects.iter().any(|object| object.released_at_ms.is_some());
             behind.push((record.clone(), objects, unheld));
@@ -1782,8 +1674,8 @@ impl Uploader {
                 continue;
             }
             for object in self
-                .backup
-                .objects(record.archive_id, record.backup_generation)?
+                .disk
+                .run(|backup| backup.objects(record.archive_id, record.backup_generation))?
             {
                 named
                     .entry((object.archive_id, object.object_id))
@@ -1849,10 +1741,11 @@ impl Uploader {
                 && newer.remote == Remote::Published
         });
         Ok(passed
-            && self
-                .backup
-                .store()
-                .authorises(record.archive_id, record.writer_key_id)?)
+            && self.disk.run(|backup| {
+                backup
+                    .store()
+                    .authorises(record.archive_id, record.writer_key_id)
+            })?)
     }
 
     /// Deletes one object of a generation no publication can name, and writes the answer down.
@@ -1870,12 +1763,14 @@ impl Uploader {
         now: TimestampMs,
         turn: &mut Turn,
     ) -> Result<Stepped> {
-        let asked = self.backup.store().note_deletion_asked(
-            generation.archive_id,
-            generation.backup_generation,
-            object.object_id,
-            now,
-        );
+        let asked = self.disk.run(|backup| {
+            backup.store().note_deletion_asked(
+                generation.archive_id,
+                generation.backup_generation,
+                object.object_id,
+                now,
+            )
+        });
         if let Err(error) = asked {
             let stepped = waiting_on(error)?;
             turn.unreclaimed.insert(generation_key(generation));
@@ -1890,23 +1785,26 @@ impl Uploader {
             Err(error) if error.code() == ErrorCode::UnknownSession => false,
             Err(error) => {
                 turn.unreclaimed.insert(generation_key(generation));
-                return Ok(Stepped::Waiting {
-                    reason: format!(
+                return Ok(held_by(
+                    &error,
+                    format!(
                         "object {} of backup generation {} of archive {} was not deleted at the \
                          service yet: {error}",
                         object.object_id,
                         generation.backup_generation.get(),
                         generation.archive_id
                     ),
-                });
+                ));
             }
         };
-        let recorded = self.backup.store().note_object_released(
-            generation.archive_id,
-            generation.backup_generation,
-            object.object_id,
-            now,
-        );
+        let recorded = self.disk.run(|backup| {
+            backup.store().note_object_released(
+                generation.archive_id,
+                generation.backup_generation,
+                object.object_id,
+                now,
+            )
+        });
         let stepped = match recorded {
             Ok(()) => Stepped::Released {
                 archive_id: generation.archive_id,
@@ -1930,21 +1828,23 @@ impl Uploader {
         now: TimestampMs,
         turn: &mut Turn,
     ) -> Result<Stepped> {
-        let sent = self.backup.attempts()?.into_iter().find(|attempt| {
-            attempt.archive_id == generation.archive_id
-                && attempt.backup_generation == generation.backup_generation
-                && attempt.step == Step::Publish
-        });
+        let sent = self
+            .disk
+            .run(|backup| backup.attempts())?
+            .into_iter()
+            .find(|attempt| {
+                attempt.archive_id == generation.archive_id
+                    && attempt.backup_generation == generation.backup_generation
+                    && attempt.step == Step::Publish
+            });
         let stepped = match sent {
             Some(attempt) => self.published(&attempt, now)?,
-            None => Stepped::Waiting {
-                reason: format!(
-                    "the service holds backup generation {} of archive {}, which this host has no \
-                     record of sending, so everything it named is kept",
-                    generation.backup_generation.get(),
-                    generation.archive_id
-                ),
-            },
+            None => waiting(format!(
+                "the service holds backup generation {} of archive {}, which this host has no \
+                 record of sending, so everything it named is kept",
+                generation.backup_generation.get(),
+                generation.archive_id
+            )),
         };
         if matches!(stepped, Stepped::Waiting { .. }) {
             turn.unreclaimed.insert(generation_key(generation));
@@ -2064,11 +1964,24 @@ fn not_permitted(error: &ClientError) -> bool {
 
 /// What a step is when the attempt it was about to send for is no longer this uploader's to send.
 fn not_carried() -> Stepped {
+    waiting(
+        "the store no longer holds that attempt for this uploader, or its generation may no \
+         longer produce"
+            .to_owned(),
+    )
+}
+
+/// A step that waits for a reason that is not the service's.
+const fn waiting(reason: String) -> Stepped {
+    Stepped::Waiting { reason, hold: None }
+}
+
+/// A step that waits because the service turned a request back or could not be reached, with what
+/// the service said.
+fn held_by(error: &ClientError, reason: String) -> Stepped {
     Stepped::Waiting {
-        reason:
-            "the store no longer holds that attempt for this uploader, or its generation may no \
-                 longer produce"
-                .to_owned(),
+        reason,
+        hold: Some(Hold::of(error)),
     }
 }
 
@@ -2087,9 +2000,7 @@ fn waiting_on(error: ControllerError) -> Result<Stepped> {
     match error {
         ControllerError::Refused { .. }
         | ControllerError::PermissionDenied { .. }
-        | ControllerError::InvalidArgument(_) => Ok(Stepped::Waiting {
-            reason: error.to_string(),
-        }),
+        | ControllerError::InvalidArgument(_) => Ok(waiting(error.to_string())),
         other => Err(other),
     }
 }
@@ -2122,13 +2033,9 @@ enum Unstaged {
 /// Runs `work`, which blocks on the disk, without holding a thread the reactor runs other tasks on.
 ///
 /// The daemon's runtime has worker threads to give up, and `block_in_place` hands this one's tasks
-/// to another while it blocks. A runtime of one thread has none, and there the work runs where it
-/// is, which is all a runtime of one thread can do.
+/// to another while it blocks. It needs a runtime with more than one thread, which is the daemon's.
 fn blocking<T>(work: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
-        _ => work(),
-    }
+    tokio::task::block_in_place(work)
 }
 
 /// Reads one object's staged ciphertext whole and holds it to what this host admitted.
