@@ -457,6 +457,16 @@ impl OwnedProcesses {
         }
         let root = u32::try_from(self.root.pid.get()).ok()?;
         let worker = std::process::id();
+        // The root shell leads its session, so the session keeps the root shell's identifier
+        // after the root shell has gone, and so do the processes still in it.
+        let session = rustix::process::Pid::from_raw(i32::try_from(root).ok()?)?;
+        let in_session = |pid: u32| {
+            i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
+                == Some(session)
+        };
         let mut members: Vec<ProcessStartIdentity> = Vec::new();
         let mut walked = std::collections::BTreeSet::new();
         let mut pending: Vec<(u32, ProcessStartIdentity)> = Vec::new();
@@ -493,7 +503,10 @@ impl OwnedProcesses {
             }
             let adopted = kr_ipc::identity::children_of(worker).ok()?;
             for child in adopted {
-                if walked.contains(&child) {
+                // A child of this worker in another session is read about no further: only the
+                // session's own are described, so what an observation reads follows this
+                // session's tree and not the worker's other children.
+                if walked.contains(&child) || !in_session(child) {
                     continue;
                 }
                 if let Ok(lineage) = kr_ipc::identity::process_lineage(child)
