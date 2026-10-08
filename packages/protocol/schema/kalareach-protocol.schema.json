@@ -3805,6 +3805,11 @@
           "const": "attention.automation_paused",
           "description": "A workflow revision or a causal chain was paused by one of its own limits.",
           "type": "string"
+        },
+        {
+          "const": "attention.authority_feed_removed",
+          "description": "The authority feed this host reads removed it, so it learns no revocation from it.",
+          "type": "string"
         }
       ]
     },
@@ -3834,6 +3839,11 @@
         {
           "const": "automation",
           "description": "The environment's workflow journal and the alerts it keeps.",
+          "type": "string"
+        },
+        {
+          "const": "authority",
+          "description": "The host's own record of the authority feed it reads.",
           "type": "string"
         }
       ]
@@ -4128,6 +4138,17 @@
           ],
           "description": "The last successful synchronisation, when there has been one."
         },
+        "removed_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the feed answered that this host was removed from it, when it did."
+        },
         "stale": {
           "description": "True when the feed could not be reached, so what is shown is stale.",
           "type": "boolean"
@@ -4143,6 +4164,7 @@
         "accepted_revision",
         "last_synchronised_at_ms",
         "stale",
+        "removed_at_ms",
         "unacknowledged_records"
       ],
       "type": "object"
@@ -10926,6 +10948,10 @@
           },
           "type": "array"
         },
+        "feed_removed": {
+          "description": "True when the feed answered that this host was removed from it.\n\nThe host then learns no revocation from the feed again. The default non-expiring owner\ngrants stay usable; organisation leases and grants under a bounded offline-validity policy\nare refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last\ntime the feed answered before that.",
+          "type": "boolean"
+        },
         "feed_stale": {
           "description": "True when the feed is unreachable, so the revocation status shown is stale.",
           "type": "boolean"
@@ -10946,7 +10972,8 @@
         "devices",
         "authority_revision",
         "feed_synchronised_at_ms",
-        "feed_stale"
+        "feed_stale",
+        "feed_removed"
       ],
       "type": "object"
     },
@@ -11078,30 +11105,8 @@
     },
     "DeviceSummary": {
       "additionalProperties": false,
-      "description": "One paired device as `device.list` reports it.\n\nSection 10 puts each host's last acknowledgement in the device list, because an offline host\ncannot apply a revocation it has not received and the person has to be able to see that.",
+      "description": "One paired device as `device.list` reports it.",
       "properties": {
-        "acknowledged_at_ms": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimestampMs"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "When that acknowledgement arrived."
-        },
-        "acknowledged_revision": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AuthorityRevision"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The last authority revision this device acknowledged."
-        },
         "device_id": {
           "$ref": "#/$defs/DeviceId",
           "description": "The device."
@@ -11143,8 +11148,6 @@
         "display_name",
         "grant_id",
         "paired_at_ms",
-        "acknowledged_revision",
-        "acknowledged_at_ms",
         "revoked",
         "keys",
         "manages_host"

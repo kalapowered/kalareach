@@ -193,9 +193,15 @@ impl Feed {
         now_ms: u64,
     ) -> Result<AuthorityRevision, String> {
         self.owner_authority(request)?;
+        // The daemon's registry allocates the revision, from the same sequence its own revocations
+        // draw on; here the next number stands for it.
+        let previous = record.accepted_revision();
         record
-            .apply(request.clone(), record.next_revision(), now_ms)
-            .map_err(|refusal| format!("{refusal:?}"))
+            .begin(request.clone(), previous, now_ms)
+            .map_err(|refusal| format!("{refusal:?}"))?;
+        let revision = AuthorityRevision::new(previous.get() + 1);
+        record.took_effect(request.request_id, revision);
+        Ok(revision)
     }
 
     /// Removes this host from the feed, which ends the retention of everything addressed to it.
@@ -425,11 +431,6 @@ async fn kr_req_10_46_a_published_request_is_retained_until_every_host_has_finis
         assert!(
             held.retained().is_empty(),
             "every enrolled host has acknowledged it"
-        );
-        assert_eq!(
-            held.last_acknowledgement(second_host),
-            Some(revision),
-            "the device list shows each host's last acknowledgement"
         );
 
         "a published revocation is retained until the host acknowledges its barrier as complete, and the host's record keeps it while another enrolled host has not answered".to_owned()
@@ -877,9 +878,21 @@ async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_ackn
             stale.last_synchronised_at_ms, current.last_synchronised_at_ms,
             "the last successful synchronisation is still what it was"
         );
+        // What an owner's device lists for this host is the feed's own summary of it, which an
+        // unreachable feed cannot refresh and a reachable one still serves.
+        let shown = feed
+            .host_client
+            .read(feed.address(), None, true)
+            .await
+            .expect("the host reads its feed");
         assert_eq!(
-            held.last_acknowledgement(feed.owner.device_id()),
-            Some(revision),
+            shown
+                .summary
+                .last_acknowledgement
+                .as_ref()
+                .expect("the last acknowledgement")
+                .authority_revision,
+            revision,
             "the device list still shows the last acknowledgement"
         );
         assert_eq!(stale.accepted_revision, revision);

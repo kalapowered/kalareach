@@ -829,9 +829,6 @@ pub struct DeviceListParams {
 }
 
 /// One paired device as `device.list` reports it.
-///
-/// Section 10 puts each host's last acknowledgement in the device list, because an offline host
-/// cannot apply a revocation it has not received and the person has to be able to see that.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceSummary {
@@ -843,10 +840,6 @@ pub struct DeviceSummary {
     pub grant_id: GrantId,
     /// When it was paired.
     pub paired_at_ms: TimestampMs,
-    /// The last authority revision this device acknowledged.
-    pub acknowledged_revision: Nullable<AuthorityRevision>,
-    /// When that acknowledgement arrived.
-    pub acknowledged_at_ms: Nullable<TimestampMs>,
     /// Whether the device has been revoked.
     pub revoked: bool,
     /// The device's four purpose-separated public keys, as its pairing bound them.
@@ -871,6 +864,13 @@ pub struct DeviceListResult {
     pub feed_synchronised_at_ms: Nullable<TimestampMs>,
     /// True when the feed is unreachable, so the revocation status shown is stale.
     pub feed_stale: bool,
+    /// True when the feed answered that this host was removed from it.
+    ///
+    /// The host then learns no revocation from the feed again. The default non-expiring owner
+    /// grants stay usable; organisation leases and grants under a bounded offline-validity policy
+    /// are refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last
+    /// time the feed answered before that.
+    pub feed_removed: bool,
 }
 
 /// Parameters of `device.revoke`.
@@ -1036,6 +1036,8 @@ pub struct AuthorityFeedStatus {
     pub last_synchronised_at_ms: Nullable<TimestampMs>,
     /// True when the feed could not be reached, so what is shown is stale.
     pub stale: bool,
+    /// When the feed answered that this host was removed from it, when it did.
+    pub removed_at_ms: Nullable<TimestampMs>,
     /// How many retained revocation records have not yet been acknowledged by every enrolled host.
     pub unacknowledged_records: u32,
 }

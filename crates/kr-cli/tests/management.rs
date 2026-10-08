@@ -1658,8 +1658,6 @@ async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
             display_name: "phone".to_owned(),
             grant_id: GrantId::new(Uuid::from_bytes([0x61; 16])),
             paired_at_ms: TimestampMs::new(1_000),
-            acknowledged_revision: Nullable::null(),
-            acknowledged_at_ms: Nullable::null(),
             revoked: false,
             keys: Nullable::null(),
             manages_host: false,
@@ -1667,6 +1665,7 @@ async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
         authority_revision: AuthorityRevision::new(1),
         feed_synchronised_at_ms: Nullable::null(),
         feed_stale: false,
+        feed_removed: false,
     };
     let revoked = RevocationResult {
         authority_revision: AuthorityRevision::new(2),

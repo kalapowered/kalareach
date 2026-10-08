@@ -50,7 +50,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::sharing::MembershipRefusal;
 
-pub use durable::{StoredFeed, StoredPolicy};
+pub use durable::{StoredFeed, StoredPolicy, StoredRemoval};
 pub use feed::{AuthorityFeed, FeedRefusal, RetainedRevocation};
 pub use organisation::LeaseRefused;
 pub use policy::{HostPolicy, PolicyIntersection};
@@ -158,6 +158,10 @@ pub enum Refusal {
         /// The last successful synchronisation, when there was one.
         last_synchronised_at_ms: Option<u64>,
     },
+    /// The authority feed this host reads answered that it was removed from it, so a grant whose
+    /// validity rests on the feed is refused until the owner acts at the host: an organisation's
+    /// lease, and personal remote access under a bounded offline-validity policy.
+    AuthorityFeedRemoved,
     /// The decision reads this host's clock, and the clock floor it would stand on is owed its
     /// record, so it is not taken until the floor is written down
     /// ([`policy::UtcFloor::bound`]).
@@ -242,6 +246,12 @@ impl Refusal {
             Self::OfflineValidityLapsed { .. } => {
                 "this host's bounded offline-validity policy has lapsed; the authority feed has \
                  not been reached inside it"
+                    .to_owned()
+            }
+            Self::AuthorityFeedRemoved => {
+                "the authority feed this host reads was removed, so grants that rest on it are \
+                 refused until the owner acts at the host, by pointing `authority.origin` in its \
+                 configuration document at another feed or at none"
                     .to_owned()
             }
             Self::FloorUnrecorded | Self::ExpiryUnrecorded { .. } => FLOOR_UNRECORDED.to_owned(),

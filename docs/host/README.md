@@ -4171,7 +4171,7 @@ attention records the journal does not yet record the store as having taken.
 
 ### The rule set
 
-Nine rules, each with a stable identifier that outlives any change to the wording it produces.
+Ten rules, each with a stable identifier that outlives any change to the wording it produces.
 
 | Rule | What raises it | Starts at | While it stands |
 | --- | --- | --- | --- |
@@ -4184,6 +4184,7 @@ Nine rules, each with a stable identifier that outlives any change to the wordin
 | `attention.host_contact_lost` | Contact with the host was lost | notable | urgent after a minute, then every five |
 | `attention.application_notice` | An `OSC 9`, `OSC 99` or `OSC 777` sequence | informational | announced once |
 | `attention.automation_paused` | One of its own limits paused a workflow revision or a causal chain | notable | announced once |
+| `attention.authority_feed_removed` | The authority feed this host reads answered that it was removed from it | urgent | announced once; stands until the host reads another feed or none |
 
 The idle reminder counts from the moment the request became pending, not from the last output: a
 session printing continuously while a question waits still owes the reminder, and a silent session
@@ -4197,6 +4198,11 @@ A paused workflow is one item per revision, however many refusals the pause prod
 enabling that revision again ends it. An exhausted causal chain is one item per chain. Nothing
 records the end of a chain's exhaustion, so its item stays in the inbox, and each actor
 acknowledges it for themselves.
+
+A host whose authority feed answers that it was removed from it raises one item, of its own and
+not of any session, which the owner at the machine and every device that manages the host see. It
+stands until the host reads another feed or none, which an owner brings about by changing
+`authority.origin` in the configuration document.
 
 An application notice is the one untrusted rule. Any process writing to the terminal can emit one,
 so the item says so and the rule cannot raise any other kind of item; nothing a notice says makes
@@ -4865,13 +4871,25 @@ than answered with somebody else's revision.
 
 Revocation records are retained until every enrolled host has acknowledged them or that host is
 explicitly removed; they do not share mailbox expiry or notification coalescing. A settled record is
-kept rather than deleted, because its revision is what a device list reports as that host's last
-acknowledgement and its identity is what stops the request being applied again. `device.list` shows
-each host's last acknowledgement beside the feed's own staleness, because an offline host cannot
-apply a revocation it has not received and a list that looked current because nothing had
-contradicted it would be worse than no list. The feed records that a synchronisation is owed from
-the moment a connection is established until one has happened on it, and an unreachable feed is
-reported stale rather than current.
+kept rather than deleted, because its identity is what stops the request being applied again.
+`device.list` shows the feed's staleness and the last time this host synchronised it, because an
+offline host cannot apply a revocation it has not received and a list that looked current because
+nothing had contradicted it would be worse than no list. The feed records that a synchronisation is
+owed from the moment a connection is established until one has happened on it, and an unreachable
+feed is reported stale rather than current.
+
+A feed can also answer that this host was removed from it. A removal ends the feed's retention of
+everything addressed to the host, so the host learns no revocation from it again, and a revocation
+an owner published there and the host had not applied is gone. The host records the answer with the
+origin that gave it, and from then on `device.list` and `kr doctor` say the feed was removed beside
+the last time it was synchronised, and the attention inbox holds an urgent item for the owner and
+for every device that manages the host. The grants that do not rest on the feed carry on: the
+default non-expiring owner grant is account-free and stays usable. The grants that do rest on it are
+refused until an owner acts at the host: an organisation's, and personal remote access under a
+bounded offline-validity policy the owner chose. The person at the machine is never refused. The
+owner acts by changing `authority.origin` in the configuration document to another feed or to none
+and starting the daemon again, which ends the removal and the item; a removal from one origin is no
+removal from another.
 
 ### What the host policy holds
 
@@ -4890,7 +4908,8 @@ reported stale rather than current.
 * **The bounded offline-validity policy.** Optional, and off by default: the non-expiring owner
   grant stays account-free and usable without an authority-feed dependency. An owner who chooses a
   bound gets that bound, measured from the last successful synchronisation, with the stale status
-  and the last sync visible beside it.
+  and the last sync visible beside it. A feed that removed the host is no feed to measure from, so
+  the grants under the bound are refused until the owner acts at the host.
 * **Revalidation after wake and reboot.** The policy, its restrictions, its enrolments and both
   floors are read back from the environment's authority store when the daemon starts, so a restart
   does not return an unrestricted host. Membership leases are not: a lease lasts at most fifteen

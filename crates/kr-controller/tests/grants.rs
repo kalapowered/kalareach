@@ -1801,6 +1801,106 @@ fn the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen() {
     );
 }
 
+/// A feed that removed the host is a reason to refuse only the grants whose validity rests on the
+/// feed: an organisation's, and personal remote access under the bounded policy the owner chose.
+/// The default non-expiring owner grant is account-free and stays usable, and the person at this
+/// machine is never locked out.
+#[test]
+fn a_removed_feed_refuses_only_the_grants_that_rest_on_it() {
+    let owner = grant(
+        1,
+        None,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        GrantExpiry::Never,
+    );
+    let stored = record(owner.clone());
+
+    // The default: no bound, no organisation.
+    let mut default = HostPolicy::personal(AuthorityRevision::new(1));
+    default.set_feed_removed(true);
+    decide(
+        &owner,
+        &stored,
+        &mut default,
+        request(Method::SessionRead, 900_000),
+    )
+    .expect("the default owner grant does not rest on the feed");
+
+    // The owner's bounded policy, with the bound still ahead of it.
+    let mut bounded = HostPolicy::personal(AuthorityRevision::new(1));
+    bounded.set_offline_validity(Some(OfflineValidityPolicy {
+        maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60_000_000),
+        last_synchronised_at_ms: Nullable::null(),
+    }));
+    bounded.note_feed_synchronised(100_000);
+    bounded.publish_unanchored(&bounded.clone());
+    decide(
+        &owner,
+        &stored,
+        &mut bounded,
+        request(Method::SessionRead, 150_000),
+    )
+    .expect("inside the bound while the feed stands");
+    bounded.set_feed_removed(true);
+    assert_eq!(
+        decide(
+            &owner,
+            &stored,
+            &mut bounded,
+            request(Method::SessionRead, 150_000)
+        ),
+        Err(Refusal::AuthorityFeedRemoved),
+        "inside the bound, but the feed that would extend it is gone"
+    );
+    let mut at_the_machine = request(Method::SessionRead, 150_000);
+    at_the_machine.ingress = ActorIngress::LocalIpc;
+    decide(&owner, &stored, &mut bounded, at_the_machine)
+        .expect("the person at this machine does not rest on the feed");
+    bounded.set_feed_removed(false);
+    decide(
+        &owner,
+        &stored,
+        &mut bounded,
+        request(Method::SessionRead, 150_000),
+    )
+    .expect("another feed puts the grant back");
+
+    // An organisation's grant.
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let held = organisation_grant(
+        organisation.organisation_id,
+        1,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+    );
+    let stored = record(held.clone());
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        device_id(0xf1),
+        &account(),
+        T,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+    );
+    decide(
+        &held,
+        &stored,
+        &mut policy,
+        request(Method::SessionRead, T + 1_000),
+    )
+    .expect("a lease inside its window");
+    policy.set_feed_removed(true);
+    assert_eq!(
+        decide(
+            &held,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, T + 1_000)
+        ),
+        Err(Refusal::AuthorityFeedRemoved)
+    );
+}
+
 #[test]
 fn an_expired_grant_is_refused_rather_than_downgraded_to_view_only() {
     let controller = grant(
@@ -2801,6 +2901,7 @@ fn a_lease_the_pinned_policy_signing_authority_did_not_sign_is_refused() {
 
 #[test]
 fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowledged() {
+    use kr_controller::grants::feed::Beginning;
     use kr_protocol::pairing::{RevocationRequest, RevocationTarget};
 
     let host = device_id(0xf0);
@@ -2822,19 +2923,34 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         signature: Signature64::from_bytes([0; 64]),
     };
 
-    // The request carries no revision at all. The host allocates the number, from the same
-    // sequence its own revocations use.
-    let issued = feed
-        .apply(published(1), feed.next_revision(), 2_000)
-        .expect("the host issues one");
-    assert_eq!(issued, AuthorityRevision::new(4));
+    // The request carries no revision at all. The daemon's registry allocates the number, from the
+    // same sequence its own revocations use, and the feed is told of it as the revocation completes.
+    let held_by_the_feed = AuthorityRevision::new(0);
+    assert_eq!(
+        feed.begin(published(1), held_by_the_feed, 2_000),
+        Ok(Beginning::New)
+    );
+    assert_eq!(
+        feed.record(published(1).request_id)
+            .expect("taken")
+            .authority_revision,
+        None,
+        "a request being applied has no revision yet, and is written down before it takes effect"
+    );
+    feed.note_revision(AuthorityRevision::new(4));
+    feed.took_effect(published(1).request_id, AuthorityRevision::new(4));
     assert_eq!(feed.accepted_revision(), AuthorityRevision::new(4));
 
     // A republished request is the same revocation, not a second one.
     assert_eq!(
-        feed.apply(published(1), feed.next_revision(), 2_100)
-            .expect("idempotent"),
-        issued
+        feed.begin(published(1), held_by_the_feed, 2_100),
+        Ok(Beginning::Resumed)
+    );
+    assert_eq!(
+        feed.record(published(1).request_id)
+            .expect("taken")
+            .authority_revision,
+        Some(AuthorityRevision::new(4))
     );
     assert_eq!(feed.accepted_revision(), AuthorityRevision::new(4));
 
@@ -2845,7 +2961,7 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         ..published(1)
     };
     assert_eq!(
-        feed.apply(impostor, feed.next_revision(), 2_150),
+        feed.begin(impostor, held_by_the_feed, 2_150),
         Err(FeedRefusal::AlreadyApplied)
     );
 
@@ -2855,14 +2971,14 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         ..published(2)
     };
     assert_eq!(
-        feed.apply(elsewhere, feed.next_revision(), 2_200),
+        feed.begin(elsewhere, held_by_the_feed, 2_200),
         Err(FeedRefusal::AnotherHost)
     );
 
-    // A local revocation consumes a revision too, and the feed is told, so the next feed entry
-    // cannot claim a number the registry has already used.
+    // A local revocation consumes a revision too, and the feed is told, so the number the feed
+    // holds is never behind the registry's.
     feed.note_revision(AuthorityRevision::new(7));
-    assert_eq!(feed.next_revision(), AuthorityRevision::new(8));
+    assert_eq!(feed.accepted_revision(), AuthorityRevision::new(7));
 
     // Retained until every enrolled host has acknowledged it.
     feed.enrol(device_id(0xd0));
@@ -2871,30 +2987,19 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     let request_id = RevocationRequestId::new(Uuid::from_bytes([1; 16]));
     assert!(!feed.acknowledge(request_id, device_id(0xd0)));
     assert_eq!(feed.retained().len(), 1, "one of two is not every one");
-    assert_eq!(
-        feed.last_acknowledgement(device_id(0xd0)),
-        Some(AuthorityRevision::new(4)),
-        "the device list shows each host's last acknowledgement"
-    );
     assert!(feed.acknowledge(request_id, device_id(0xd1)));
     assert!(
         feed.retained().is_empty(),
         "a settled record is no longer owed to anybody"
     );
 
-    // Settling is not forgetting. The acknowledgement history survives it, and so does the
-    // identity that stops the request being applied a second time.
+    // Settling is not forgetting: the identity that stops the request being applied a second time
+    // survives it.
     assert_eq!(feed.applied().len(), 1);
     assert_eq!(
-        feed.last_acknowledgement(device_id(0xd1)),
-        Some(AuthorityRevision::new(4)),
-        "a settled record is still what that host acknowledged"
-    );
-    assert_eq!(
-        feed.apply(published(1), feed.next_revision(), 3_000)
-            .expect("still idempotent"),
-        issued,
-        "a republished request after settlement does not take a second revision"
+        feed.begin(published(1), held_by_the_feed, 3_000),
+        Ok(Beginning::Resumed),
+        "a republished request after settlement is not taken as new"
     );
 
     // Reconnecting owes a synchronisation again, and an unreachable feed is stale rather than
@@ -2919,11 +3024,119 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     assert_eq!(restored.accepted_revision(), feed.accepted_revision());
     assert_eq!(restored.applied().len(), 1);
     assert_eq!(
-        restored.last_acknowledgement(device_id(0xd0)),
-        Some(AuthorityRevision::new(4))
+        restored
+            .record(request_id)
+            .map(|record| record.authority_revision),
+        Some(Some(AuthorityRevision::new(4)))
     );
     assert!(restored.synchronisation_owed());
     assert!(restored.status().stale);
+}
+
+/// A feed that answered that this host was removed from it says so, keeps the last
+/// synchronisation before it, settles what it was still owed, and forgets the removal once the host
+/// reads another feed. The removal survives a restart.
+#[test]
+fn a_removal_the_feed_answered_is_shown_kept_across_a_restart_and_forgotten_for_another_feed() {
+    let host = device_id(0xf0);
+    let mut feed = AuthorityFeed::new(host, AuthorityRevision::new(3));
+    feed.enrol(host);
+    feed.synchronised(5_000);
+    let request = kr_protocol::pairing::RevocationRequest {
+        request_id: RevocationRequestId::new(Uuid::from_bytes([9; 16])),
+        issuer_device_id: device_id(0xb0),
+        host_device_id: host,
+        target: kr_protocol::pairing::RevocationTarget::Devices {
+            device_ids: [device_id(0xc0)].into_iter().collect(),
+        },
+        issued_at_ms: TimestampMs::new(1_000),
+        issuer_key_id: kr_protocol::scalars::KeyId::from_bytes([7; 32]),
+        signature: Signature64::from_bytes([0; 64]),
+    };
+    feed.begin(request, AuthorityRevision::new(3), 5_100)
+        .expect("taken");
+    assert_eq!(
+        feed.retained().len(),
+        1,
+        "owed to the host until it answers"
+    );
+    assert!(!feed.is_removed());
+
+    feed.removed_from("https://feed.example", 6_000);
+    let status = feed.status();
+    assert_eq!(
+        status.removed_at_ms,
+        Nullable::some(TimestampMs::new(6_000))
+    );
+    assert_eq!(
+        status.last_synchronised_at_ms,
+        Nullable::some(TimestampMs::new(5_000)),
+        "a removal is not a synchronisation"
+    );
+    assert!(status.stale);
+    assert!(
+        feed.retained().is_empty(),
+        "the host was removed, so nothing is owed to it"
+    );
+    assert!(feed.is_removed_from("https://feed.example"));
+    assert!(!feed.is_removed_from("https://another.example"));
+
+    // The first answer is the one recorded.
+    feed.removed_from("https://feed.example", 9_000);
+    assert_eq!(
+        feed.status().removed_at_ms,
+        Nullable::some(TimestampMs::new(6_000))
+    );
+
+    let mut restored = AuthorityFeed::restore(&feed.snapshot());
+    assert!(
+        !restored.is_removed(),
+        "a removal is written down apart from the record"
+    );
+    restored.restore_removal(&feed.removal().expect("a removal"));
+    assert!(restored.is_removed_from("https://feed.example"));
+    assert_eq!(
+        restored.status().removed_at_ms,
+        Nullable::some(TimestampMs::new(6_000))
+    );
+
+    let mut elsewhere = restored;
+    elsewhere.clear_removal();
+    assert!(!elsewhere.is_removed());
+    assert_eq!(elsewhere.status().removed_at_ms, Nullable::null());
+}
+
+/// A host that stored its feed before the feed's removal was kept reads it back. The host's data on
+/// disk is not rewritten for it: this is the record as the earlier build wrote it.
+#[test]
+fn a_feed_stored_before_removals_were_kept_reads_back() {
+    #[derive(serde::Serialize)]
+    struct EarlierFeed {
+        host_device_id: DeviceId,
+        accepted: AuthorityRevision,
+        enrolled: CanonicalSet<DeviceId>,
+        records: Vec<()>,
+        last_synchronised_at_ms: Nullable<TimestampMs>,
+    }
+    let host = device_id(0xf0);
+    let written = kr_cbor::to_canonical_vec(&EarlierFeed {
+        host_device_id: host,
+        accepted: AuthorityRevision::new(7),
+        enrolled: [host].into_iter().collect(),
+        records: Vec::new(),
+        last_synchronised_at_ms: Nullable::some(TimestampMs::new(5_000)),
+    })
+    .expect("the earlier record encodes");
+    let stored: kr_controller::grants::StoredFeed =
+        kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT)
+            .expect("the earlier record is read by this build");
+    let feed = AuthorityFeed::restore(&stored);
+    assert!(!feed.is_removed());
+    assert_eq!(feed.accepted_revision(), AuthorityRevision::new(7));
+    assert_eq!(
+        feed.status().last_synchronised_at_ms,
+        Nullable::some(TimestampMs::new(5_000))
+    );
 }
 
 #[test]

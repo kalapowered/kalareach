@@ -40,11 +40,12 @@ enum Form {
     NoticeRecord,
     Workflow,
     Chain,
+    AuthorityFeed,
 }
 
 impl Form {
     #[cfg(test)]
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Approval,
         Self::Question,
         Self::Command,
@@ -56,6 +57,7 @@ impl Form {
         Self::NoticeRecord,
         Self::Workflow,
         Self::Chain,
+        Self::AuthorityFeed,
     ];
 
     const fn word(self) -> &'static str {
@@ -71,6 +73,7 @@ impl Form {
             Self::NoticeRecord => "notice_record",
             Self::Workflow => "workflow",
             Self::Chain => "chain",
+            Self::AuthorityFeed => "authority_feed",
         }
     }
 }
@@ -203,6 +206,12 @@ impl Subject {
     #[must_use]
     pub fn host() -> Self {
         Builder::of(Form::Host).done()
+    }
+
+    /// The host's authority feed having been removed, of which there is one.
+    #[must_use]
+    pub fn authority_feed() -> Self {
+        Builder::of(Form::AuthorityFeed).done()
     }
 
     /// An application's notice that carries its own identifier.

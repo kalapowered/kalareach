@@ -359,7 +359,8 @@ pub const fn alert_for(rule: AttentionRule) -> PushAlert {
         AttentionRule::CommandFailed
         | AttentionRule::AdapterFailed
         | AttentionRule::ApplicationNotice
-        | AttentionRule::AutomationPaused => PushAlert::SessionNeedsAttention,
+        | AttentionRule::AutomationPaused
+        | AttentionRule::AuthorityFeedRemoved => PushAlert::SessionNeedsAttention,
     }
 }
 
