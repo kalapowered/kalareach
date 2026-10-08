@@ -1115,18 +1115,24 @@ fn only_the_install_module_asks_where_its_program_is() {
 fn no_feature_that_exists_for_tests_is_on_in_a_program() {
     let workspace = workspace();
     let metadata = cargo_metadata(&workspace);
-    // The control on the real tree: the guard reads the crates that have the seams, so a reading
-    // that recognised none of the host's crates cannot pass.
+    // The control on the real tree: the guard reads the crates that have the seams, as host crates
+    // under `crates/`, so a reading that recognised none of them cannot pass.
     let has = |name: &str, feature: &str| {
         metadata["packages"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|package| package["name"] == name && package["features"].get(feature).is_some())
+            .any(|package| {
+                package["name"] == name
+                    && package["manifest_path"].as_str().is_some_and(|manifest| {
+                        normalise(Path::new(manifest)).starts_with(workspace.join("crates"))
+                    })
+                    && package["features"].get(feature).is_some()
+            })
     };
     assert!(
         has("kr-changeset", "fault-injection") && has("kr-project", "git-fixtures"),
-        "the workspace's metadata lists the features the guard is about"
+        "the workspace's metadata lists the features the guard is about, in host crates"
     );
     let turned_on = test_features_in_production(&metadata, &workspace);
     assert!(

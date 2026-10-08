@@ -336,7 +336,7 @@ impl OpenedRepository {
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] when the directory is not the recorded tree (nor
-    /// inside it, for a repository the owner registered), when the top level Git
+    /// inside it, for a repository the owner registered below its top level), when the top level Git
     /// reports is not the recorded tree, when the Git directory is not the recorded one, or what
     /// [`Self::open`] returns.
     pub fn open_recorded_tree(

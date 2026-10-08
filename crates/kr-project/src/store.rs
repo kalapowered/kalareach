@@ -722,8 +722,9 @@ impl Store {
             }
             // A store at this version was written by this build or by one that shares its version,
             // and a column added while the version stood still would otherwise never arrive. So
-            // every nullable column this build reads is added when it is missing, whatever the
-            // version says; the version moves on only for a change of contents.
+            // every column this build reads that has no value to compute is added when it is
+            // missing, whatever the version says; the version moves on only for a change of
+            // contents.
             Some(version) if version == SCHEMA_VERSION => add_missing_columns(&transaction)?,
             // Forward only. `CREATE TABLE IF NOT EXISTS` leaves a table that already exists
             // exactly as it was, so a store written by an earlier build has the tables and not
@@ -2793,7 +2794,8 @@ fn rebuild_retained_items(transaction: &Transaction<'_>) -> Result<()> {
 /// Each entry serves a store written by a build whose shape of that table lacked the column. Remove
 /// an entry once no supported upgrade starts from such a store, and the function with the last one.
 fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
-    // Every nullable column this build reads that some earlier shape of this schema did not have.
+    // Every column this build reads that some earlier shape of this schema did not have, each
+    // nullable or with a default.
     // The list is the whole of them rather than the ones added last: a store written by *any*
     // earlier build has to be readable, and a column that is already there costs one
     // `pragma_table_info` to find out.
