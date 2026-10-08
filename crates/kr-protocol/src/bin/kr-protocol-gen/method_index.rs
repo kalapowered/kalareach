@@ -114,6 +114,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         Method::EnvironmentCapabilities => at(PLATFORMS, "What may be done on a desktop"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
         Method::PrivacySet | Method::PrivacyStatus => at(HOST, "Privacy mode"),
+        Method::AccountSignIn | Method::AccountStatus => at(HOST, "Account sign-in"),
         Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),
         Method::DescriptionSetup | Method::DescriptionConfigure | Method::DescriptionDownload => {
             at(DESCRIBE, "Setup")

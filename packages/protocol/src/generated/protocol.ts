@@ -7,6 +7,65 @@
  */
 
 /**
+ * How the last sign-in attempt ended.
+ */
+export type AccountAttempt =
+  | 'signed_in'
+  | 'refused'
+  | 'service_refused'
+  | 'not_for_this_attempt'
+  | 'port_busy'
+  | 'timed_out'
+  | 'not_kept'
+  | 'unreachable'
+  | 'superseded'
+/**
+ * Where the host stands with an account.
+ */
+export type AccountState =
+  | {
+      state: 'signed_out'
+    }
+  | {
+      /**
+       * The address the person opens in a browser. It carries this attempt's state and nonce,
+       * so it is shown to the person who asked and to nobody else, and it is used once.
+       */
+      authorise_url: string
+      /**
+       * When the daemon stops waiting, in UTC milliseconds.
+       */
+      expires_at_ms: string
+      /**
+       * The address on this host the browser must reach to finish, such as `127.0.0.1:8765`. A
+       * person who opens the browser on another machine forwards this port to the host.
+       */
+      redirect_address: string
+      state: 'waiting_for_browser'
+    }
+  | {
+      state: 'finishing'
+    }
+  | {
+      /**
+       * The account's address, when the service said it.
+       */
+      email: string | null
+      /**
+       * The service the sign-in belongs to. A call is brokered at the service the host's
+       * configuration names, and a token from another service is never presented to it.
+       */
+      origin: string
+      /**
+       * The scopes the grant carries, as the service issued them.
+       */
+      scopes: string[]
+      state: 'signed_in'
+    }
+  | {
+      state: 'ended'
+    }
+/**
  * A UTC timestamp in milliseconds, as a decimal string in JSON.
  */
 export type TimestampMs = string
@@ -1933,6 +1992,12 @@ export type WorkflowRunStatus =
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
  */
 export interface KalaReachProtocol {
+  account_attempt?: AccountAttempt
+  account_report?: AccountReport
+  account_sign_in_params?: AccountSignInParams
+  account_sign_in_started?: AccountSignInStarted
+  account_state?: AccountState
+  account_status_params?: AccountStatusParams
   action_cancel_params?: ActionCancelParams
   action_cancel_result?: ActionCancelResult
   action_observation?: ActionObservation
@@ -2561,6 +2626,89 @@ export interface KalaReachProtocol {
   workspace_remove_result?: WorkspaceRemoveResult
   workspace_summary?: WorkspaceSummary
 }
+/**
+ * Where this host's sign-in stands: the answer to `account.status`.
+ */
+export interface AccountReport {
+  /**
+   * How the last attempt ended, until the next one begins. It is null before any attempt since
+   * the daemon started.
+   */
+  last_attempt: AccountAttempt | null
+  /**
+   * The managed service this host's configuration names as its voice broker, which is where a
+   * sign-in is made and where its token is presented. Null when the host names none.
+   */
+  service: string | null
+  /**
+   * The account this host is signed in as, or what stands in its way.
+   */
+  state:
+    | {
+        state: 'signed_out'
+      }
+    | {
+        /**
+         * The address the person opens in a browser. It carries this attempt's state and nonce,
+         * so it is shown to the person who asked and to nobody else, and it is used once.
+         */
+        authorise_url: string
+        /**
+         * When the daemon stops waiting, in UTC milliseconds.
+         */
+        expires_at_ms: string
+        /**
+         * The address on this host the browser must reach to finish, such as `127.0.0.1:8765`. A
+         * person who opens the browser on another machine forwards this port to the host.
+         */
+        redirect_address: string
+        state: 'waiting_for_browser'
+      }
+    | {
+        state: 'finishing'
+      }
+    | {
+        /**
+         * The account's address, when the service said it.
+         */
+        email: string | null
+        /**
+         * The service the sign-in belongs to. A call is brokered at the service the host's
+         * configuration names, and a token from another service is never presented to it.
+         */
+        origin: string
+        /**
+         * The scopes the grant carries, as the service issued them.
+         */
+        scopes: string[]
+        state: 'signed_in'
+      }
+    | {
+        state: 'ended'
+      }
+}
+/**
+ * Parameters of `account.sign_in`. The environment is the one the connection reaches.
+ */
+export interface AccountSignInParams {}
+/**
+ * What `account.sign_in` answers once the daemon is listening for the browser's answer.
+ *
+ * The address the person opens is not in it: the answer to a mutation is kept as the receipt of
+ * the action, and the address carries the attempt's state and nonce. `account.status` says it.
+ * Asking again with the same action answers the same attempt; asking with a new action ends the
+ * attempt that is waiting and starts another.
+ */
+export interface AccountSignInStarted {
+  /**
+   * When the daemon stops waiting for the browser, in UTC milliseconds.
+   */
+  expires_at_ms: string
+}
+/**
+ * Parameters of `account.status`. The environment is the one the connection reaches.
+ */
+export interface AccountStatusParams {}
 /**
  * What `action.cancel` names.
  */
@@ -15951,6 +16099,8 @@ export interface MethodEntry {
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
+    | 'account.sign_in'
+    | 'account.status'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'
@@ -24511,6 +24661,8 @@ export interface ServiceRequestPayload {
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
+    | 'account.sign_in'
+    | 'account.status'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'
