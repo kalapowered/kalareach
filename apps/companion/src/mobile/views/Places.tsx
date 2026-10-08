@@ -219,6 +219,7 @@ export function MobileHosts({
   return (
     <>
       <PairingFlow
+        focusTheField={false}
         chooseHost={async (reference) => {
           await port.hostsUse(reference)
         }}
