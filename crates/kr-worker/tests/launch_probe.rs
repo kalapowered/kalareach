@@ -170,6 +170,10 @@ fn kr_req_07_64_output_the_declaration_cannot_read_records_no_mode() {
     let probed = not_json.run(directory().path());
     assert_eq!(probed.mode, None);
     assert!(probed.unread.is_some(), "{probed:?}");
+    assert!(
+        !probed.late,
+        "it answered, with nothing a mode can be read from"
+    );
     let not_a_string = Standin::running(
         r#"printf '{"mode":7}'"#,
         r#"[Console]::Out.Write('{"mode":7}')"#,
@@ -200,6 +204,7 @@ fn kr_req_07_64_a_program_that_prints_more_than_the_cap_records_no_mode() {
             .is_some_and(|why| why.contains("more than 1000 bytes")),
         "{probed:?}"
     );
+    assert!(!probed.late, "it printed, and printed too much");
 }
 
 /// The process identifier a stand-in wrote to `file` in `directory`, once it has written all of it.
@@ -259,6 +264,7 @@ fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_starte
             .is_some_and(|why| why.contains("did not finish")),
         "{probed:?}"
     );
+    assert!(probed.late, "a probe that never finishes is late");
     for file in ["main.pid", "child.pid"] {
         let pid = written_pid(here.path(), file).expect("a process identifier");
         let started = std::time::Instant::now();
@@ -293,6 +299,7 @@ fn kr_req_07_64_a_program_that_cannot_start_records_no_mode_and_says_so() {
             .is_some_and(|why| why.contains("could not be started")),
         "{probed:?}"
     );
+    assert!(!probed.late, "it never ran, so it was not late");
 }
 
 // ---------------------------------------------------------------------------------------------

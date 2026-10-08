@@ -26,7 +26,8 @@
 //!   and has to reach a string.
 //! * The refused words are modes the application cannot run with in a Windows service session, the
 //!   session the worker runs in when no person is signed in. A launch whose mode is one of them
-//!   is a named failure before anything starts.
+//!   is a named failure before anything starts, and so is a launch there whose probe gives no
+//!   answer in time, since its mode is then unknown and may be one of them.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -108,7 +109,8 @@ impl LaunchProbe {
         ));
         if !self.refused_in_service_session.is_empty() {
             statement.push_str(&format!(
-                " A launch in a Windows service session is refused when the mode is one of: {}.",
+                " A launch in a Windows service session is refused when the mode is one of: {}, or \
+                 when the application gives no answer in time.",
                 quoted_all(&self.refused_in_service_session)
             ));
         }
@@ -541,7 +543,7 @@ mod tests {
              \"-c\" \"--config\" \"--enable\" \"--disable\". It reads the mode the application \
              runs in from \"/checks/sandbox.helpers/details/sandbox backend\" of what the \
              application prints. A launch in a Windows service session is refused when the mode is \
-             one of: \"elevated\"."
+             one of: \"elevated\", or when the application gives no answer in time."
         );
     }
 }

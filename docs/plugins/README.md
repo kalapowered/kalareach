@@ -201,7 +201,7 @@ probe; `kr plugin integration enable` and `disable` make it too, and a paired de
   records no mode.
 - `refused_in_service_session` lists up to eight modes, each one line of at most 64 bytes, that the
   application cannot run with in a Windows service session. A launch there whose mode is listed
-  fails by name before anything starts.
+  fails by name before anything starts, and so does one whose probe gives no answer in time.
 
 The probe runs only while the installation holds `launch.probe`. The owner confirms the capability
 on every release, because it runs the application's own executable with arguments the package chose.

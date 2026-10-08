@@ -4930,7 +4930,7 @@ and directory, with no input and no shell. The probe has five seconds and may pr
 KiB, and it runs in a job (a process group on Unix) that ends with it. A nonzero exit status is not
 a failure, because the diagnostic reports a problem in the output it prints. A probe that cannot
 start, does not finish, prints too much or prints nothing the pointer reaches records no mode and
-never stops the launch by itself.
+does not stop the launch by itself, apart from the case below.
 
 The options the declaration names are copied with their values from the launch's arguments, in the
 forms the vendor reads them: `-c v`, `-cv`, `-c=v`, `--config v` and `--config=v`. For Codex they
@@ -4938,7 +4938,8 @@ are `-c`, `--config`, `--enable` and `--disable`, and each of them changes what 
 Codex refuses `-p` and `--profile` before `doctor`, so they are not carried. A package can also list
 the modes its application cannot run with in a Windows service session, the session a worker has
 when no person is signed in. A launch there whose mode is listed fails by name before anything
-starts, where it would otherwise hang.
+starts, where it would otherwise hang. So does a launch there whose probe does not finish in time,
+because its mode is unknown and may be a listed one.
 
 This host starts no agent through the worker's launch, so on it only the diagnostics read,
 `host.doctor`, runs a probe. `kr doctor` makes that read. So do `kr plugin integration enable` and

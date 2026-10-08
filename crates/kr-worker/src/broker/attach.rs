@@ -1279,12 +1279,14 @@ impl NativeGateway {
     }
 
     /// Runs the application's launch probe, where the package declares one and the installation
-    /// holds the capability, and returns the intent with the mode it read recorded in its profile.
+    /// holds the capability that runs it, and returns the intent with the mode it read recorded in
+    /// its profile.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::PreconditionFailed`] when the mode read is one the package refuses
-    /// in the session this worker runs in.
+    /// Returns [`BrokerError::PreconditionFailed`] in a Windows service session when the mode read
+    /// is one the package refuses there, and when the probe gave no answer in time for a package
+    /// that refuses any: the mode is then unknown, and it may be one of them.
     fn read_vendor_mode(
         &self,
         intent: &crate::broker::profiles::LaunchIntent,
@@ -1312,6 +1314,19 @@ impl NativeGateway {
                     "the application's own configuration selects the mode {mode:?}, which its \
                      package says it cannot run in a Windows service session, and this worker \
                      runs in one, so nothing was started"
+                ),
+            });
+        }
+        // A probe that gave no answer leaves the mode unknown, and where the package refuses some
+        // mode in a service session the unknown one may be that mode. What the host cannot read
+        // it does not guess at, so there the launch does not go ahead on a guess.
+        if probed.late && !probe.refused_in_service_session.is_empty() && in_service_session() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "the application did not report the mode it runs in within {} ms, and its \
+                     package says some modes cannot run in a Windows service session, and this \
+                     worker runs in one, so the mode is unknown and nothing was started",
+                    self.probe_deadline.as_millis()
                 ),
             });
         }

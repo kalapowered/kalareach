@@ -9,10 +9,12 @@
 //! outlives the answer.
 //!
 //! The answer is a word or no word. A probe that cannot be started, does not finish, prints too
-//! much or prints something the declaration cannot read records no mode and says why; it never
-//! stops a launch by itself, because what the host could not read it does not guess at. A nonzero
-//! exit status is not a failure: an application's diagnostic exits nonzero for a problem it reports
-//! in the output the host reads, and the output is the answer.
+//! much or prints something the declaration cannot read records no mode and says why, and does not
+//! stop a launch by itself: what the host could not read it does not guess at. One that did not
+//! finish is marked late, so that a launch that must not run in a mode it could not read can tell
+//! an application that did not answer from one whose answer holds no mode. A nonzero exit status
+//! is not a failure: an application's diagnostic exits nonzero for a problem it reports in the
+//! output the host reads, and the output is the answer.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -34,6 +36,9 @@ pub struct Probed {
     pub mode: Option<String>,
     /// Why no mode was read, where none was.
     pub unread: Option<String>,
+    /// Whether the probe was still running when its deadline passed: the application did not
+    /// answer, as against one that answered with something no mode can be read from.
+    pub late: bool,
 }
 
 impl Probed {
@@ -41,6 +46,7 @@ impl Probed {
         Self {
             mode: Some(mode),
             unread: None,
+            late: false,
         }
     }
 
@@ -48,6 +54,14 @@ impl Probed {
         Self {
             mode: None,
             unread: Some(why.into()),
+            late: false,
+        }
+    }
+
+    fn late(why: impl Into<String>) -> Self {
+        Self {
+            late: true,
+            ..Self::unread(why)
         }
     }
 }
@@ -111,20 +125,24 @@ pub fn run_within(
     let outcome = receiver.recv_timeout(remaining);
     let printed = match outcome {
         Ok(Ok(printed)) if printed.len() <= cap => Ok(printed),
-        Ok(Ok(_)) => Err(format!(
+        Ok(Ok(_)) => Err(Probed::unread(format!(
             "{} printed more than {} bytes",
             executable.display(),
             cap
-        )),
-        Ok(Err(error)) => Err(format!(
+        ))),
+        Ok(Err(error)) => Err(Probed::unread(format!(
             "what {} printed could not be read: {error}",
             executable.display()
-        )),
-        Err(_) => Err(format!(
+        ))),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(Probed::late(format!(
             "{} did not finish within {} ms",
             executable.display(),
             deadline.as_millis()
-        )),
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(Probed::unread(format!(
+            "what {} printed was lost when its reader ended",
+            executable.display()
+        ))),
     };
     // Ended whatever happened: an application that printed its answer and then kept running is
     // not one this host leaves behind, and what it started goes with it.
@@ -146,7 +164,7 @@ pub fn run_within(
             },
             Probed::read,
         ),
-        Err(why) => Probed::unread(why),
+        Err(unanswered) => unanswered,
     }
 }
 
