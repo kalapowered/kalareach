@@ -36,6 +36,11 @@
 //! the account the change leaves, or is refused when none is left, and one that began before it was
 //! counted by the check. No call can hold a token of the old account across the change.
 //!
+//! A call whose device went silent does not hold the account for good. Before a request is refused
+//! for a call, the calls that are over are ended: one past its own deadline, and one the managed
+//! service says it no longer holds open (the coordinator asks it). A call the service cannot be
+//! asked about is held open until its deadline.
+//!
 //! Signing out removes the grant and asks the service to end it, under the same scope rule as
 //! signing in.
 
@@ -128,6 +133,18 @@ struct Running {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// The managed calls on this host, as the account needs to know them.
+pub trait Calls: Send + Sync {
+    /// Whether a managed call is open, or about to open or close.
+    fn open(&self) -> bool;
+
+    /// Ends the calls that are over without their device, so that they are no longer open: a call
+    /// past its own deadline, and one the managed service no longer holds open.
+    fn end_those_that_are_over(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
 struct Held {
     origin: String,
     account: Arc<dyn AccountService>,
@@ -143,9 +160,8 @@ struct Inner {
     /// when an earlier run stopped is removed, and every revocation the service has not
     /// acknowledged is sent again.
     recovered: tokio::sync::OnceCell<()>,
-    /// Whether a managed call is open on this host, or about to open or close, once the voice
-    /// service exists.
-    call_open: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// The managed calls on this host, once the voice service exists.
+    calls: std::sync::OnceLock<Arc<dyn Calls>>,
     /// True while the account is being changed: a request for a token waits until it has been.
     changing: tokio::sync::watch::Sender<bool>,
     /// How many requests for a token are waiting for a change to end, for a test to know that one has
@@ -223,7 +239,7 @@ impl HostAccount {
                 state: Mutex::new(State::default()),
                 running: tokio::sync::Mutex::new(None),
                 recovered: tokio::sync::OnceCell::new(),
-                call_open: std::sync::OnceLock::new(),
+                calls: std::sync::OnceLock::new(),
                 changing: tokio::sync::watch::channel(false).0,
                 #[cfg(feature = "testing")]
                 waiting: std::sync::atomic::AtomicUsize::new(0),
@@ -242,11 +258,11 @@ impl HostAccount {
         account
     }
 
-    /// Tells the account how to find out whether a managed call is open on this host, so that
-    /// signing in or out never changes the account a call closes under. A call is open from the
-    /// moment its start asks the broker until its close has been told.
-    pub fn watch_calls(&self, open: impl Fn() -> bool + Send + Sync + 'static) {
-        let _ = self.inner.call_open.set(Box::new(open));
+    /// Tells the account where the managed calls on this host are, so that signing in or out never
+    /// changes the account a call closes under. A call is open from the moment its start asks the
+    /// broker until its close has been told, or until it is over without its device.
+    pub fn watch_calls(&self, calls: Arc<dyn Calls>) {
+        let _ = self.inner.calls.set(calls);
     }
 
     /// Listens on `address` instead of the registered loopback address, for a test that runs
@@ -326,7 +342,7 @@ impl HostAccount {
     /// address.
     pub async fn sign_in(&self) -> Result<AccountSignInStarted> {
         self.inner.presenting()?;
-        if self.inner.a_call_is_open() {
+        if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
         }
         let mut running = self.inner.running.lock().await;
@@ -399,7 +415,7 @@ impl HostAccount {
     /// the next start removes it).
     pub async fn sign_out(&self) -> Result<AccountSignedOut> {
         let held = self.inner.service()?;
-        if self.inner.a_call_is_open() {
+        if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
         }
         let mut running = self.inner.running.lock().await;
@@ -589,7 +605,22 @@ impl Inner {
 
     /// Whether a call is open, or its start or its close is not finished.
     fn a_call_is_open(&self) -> bool {
-        self.call_open.get().is_some_and(|open| open())
+        self.calls.get().is_some_and(|calls| calls.open())
+    }
+
+    /// Whether a call is open once the calls that are over have been ended.
+    ///
+    /// Asked at the places a person's request is turned away for a call, so that a call whose
+    /// device is gone never turns one away for good. The check inside the change stays the plain
+    /// one: by then these have been ended, and a call that opened since is a real one.
+    async fn a_call_is_open_after_settling(&self) -> bool {
+        let Some(calls) = self.calls.get() else {
+            return false;
+        };
+        // Also when nothing counts as open: a call past its deadline no longer counts, and its
+        // record is still to be ended.
+        calls.end_those_that_are_over().await;
+        calls.open()
     }
 
     fn call_is_open() -> ControllerError {
@@ -651,7 +682,7 @@ impl Inner {
         };
         // A call closes under the account it started under. One that opened while the person was
         // in the browser ends this attempt before the code is spent, and the code expires unused.
-        if self.a_call_is_open() {
+        if self.a_call_is_open_after_settling().await {
             return AccountAttempt::CallOpen;
         }
         if let Err(error) = self.recover().await {
