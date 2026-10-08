@@ -207,8 +207,11 @@ impl RemoteConnection {
             ),
         );
         let authority = Arc::new(Authorisation {
-            grant_deadline: None,
-            grant_expires_at_ms: None,
+            grant_deadline: controller.lifetimes().deadline(&device).ok().flatten(),
+            grant_expires_at_ms: match device.grant.expiry {
+                kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
+                kr_protocol::grant::GrantExpiry::Never => None,
+            },
             controller: Arc::clone(controller),
             device_id: device.device_id,
             devices: Arc::clone(controller.devices()),

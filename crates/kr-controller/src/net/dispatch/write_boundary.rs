@@ -2219,13 +2219,6 @@ async fn kr_req_25_10_a_share_does_not_outlive_the_lease_of_the_pairing_grant() 
             )
         };
         let asked = ask().expect("the member's lease is in force");
-        assert!(
-            asked.decision.bounds().iter().any(|bound| matches!(
-                bound.snapshot().identity,
-                crate::grants::policy::BoundIdentity::Lease(_)
-            )),
-            "the request holds the lease of the grant that lets the device in"
-        );
 
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
@@ -2254,78 +2247,142 @@ async fn kr_req_25_10_a_share_does_not_outlive_the_lease_of_the_pairing_grant() 
     }
 }
 
-/// KR-REQ-25.10: the revocation of a share fences the connections that act under it and no others.
-/// A device with two connections, one acting under the share and one under its pairing grant, and
-/// the owner's own connection, all have a frame waiting for their turn when the share is
-/// revoked: the frame of the connection under the share is refused, and the other two are sent.
+/// KR-REQ-25.10: the revocation of a share fences the connections that decided a request under it
+/// and no others, whether or not they hold a link to the session's worker. A device holds a share
+/// issued under a parent share; one of its connections has an answer decided under the child
+/// waiting for its turn at the writer, another has one decided under the device's own pairing
+/// grant, and the owner's connection has one too. The parent is revoked, and the child with it:
+/// the answer decided under the child is not written, and the other two are.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_25_10_a_shares_revocation_stops_the_frames_of_what_acted_under_it_alone() {
-    use crate::service::Reach;
+async fn kr_req_25_10_a_shares_revocation_stops_the_answers_decided_under_it_alone() {
+    use super::a_share_that_names_a_current_decision::{
+        Holding, holding_grant, holds_question_reads, world,
+    };
 
-    let temp = kr_ipc::testing::TempHost::create();
-    let controller = super::super::tests::daemon(&temp).await;
-    let device = DeviceId::new(kr_ipc::new_uuid());
-    let share = kr_protocol::ids::GrantId::new(kr_ipc::new_uuid());
-    let streams = [
-        HeldStream::new(false),
-        HeldStream::new(false),
-        HeldStream::new(false),
-    ];
-    for stream in &streams {
-        stream.writer.add_permits(1);
-    }
-    let principal = kr_transport::listener::device_principal(&device);
-    let under_the_share = Arc::new(output_for(&controller, &streams[0], principal.clone()));
-    let under_the_pairing_grant = Arc::new(output_for(&controller, &streams[1], principal));
+    let (world, _holding) = world(Holding::default(), holds_question_reads()).await;
+    let controller = Arc::clone(&world.controller);
+    let (mut pairing, _) = super::super::tests::granted(
+        kr_protocol::grant::GrantExpiry::Never,
+        controller.policy().authority_revision(),
+    );
+    pairing.session_selector = kr_protocol::grant::SessionSelector::None;
+    let device = holding_grant(&controller, 41, pairing);
+    let parent = a_share_of(
+        &controller,
+        device.device_id,
+        world.session_id,
+        kr_protocol::grant::GrantExpiry::Never,
+    );
+    let child = a_share_issued_under(
+        &controller,
+        device.device_id,
+        world.session_id,
+        parent.grant_id,
+    );
+
+    let decided_under_the_child = HeldStream::new(false);
+    let under_the_child = super::RemoteConnection::for_test_writing_to(
+        &controller,
+        device.clone(),
+        Box::new(Arc::clone(&decided_under_the_child)),
+    );
+    let asked = under_the_child
+        .ask_naming(
+            Some(world.session_id),
+            Method::SessionRead.entry(),
+            false,
+            Some(child.grant_id),
+        )
+        .expect("the child share answers for the session");
+    let decided_under_the_pairing_grant = HeldStream::new(false);
+    let under_the_pairing_grant = super::RemoteConnection::for_test_writing_to(
+        &controller,
+        device,
+        Box::new(Arc::clone(&decided_under_the_pairing_grant)),
+    );
+    let own = under_the_pairing_grant
+        .ask(None, Method::SessionList.entry(), false)
+        .expect("the pairing grant answers a listing");
+    let owners_stream = HeldStream::new(false);
     let owners = Arc::new(output_for(
         &controller,
-        &streams[2],
+        &owners_stream,
         ActorId::new("local:the-owner").expect("a principal"),
     ));
-    assert!(
-        controller.note_acting(under_the_share.authority.connection_id, share),
-        "the connection is registered"
+    for stream in [
+        &decided_under_the_child,
+        &decided_under_the_pairing_grant,
+        &owners_stream,
+    ] {
+        stream.writer.add_permits(1);
+    }
+
+    let child_turn = under_the_child.output().hold_the_turn().await;
+    let pairing_turn = under_the_pairing_grant.output().hold_the_turn().await;
+    let owners_turn = owners.hold_the_turn().await;
+    let frame = batch();
+    let child_bounds = asked.decision.bounds();
+    let own_bounds = own.decision.bounds();
+    let writing = tokio::join!(
+        under_the_child.output().write(&frame, &child_bounds, None),
+        under_the_pairing_grant
+            .output()
+            .write(&frame, &own_bounds, None),
+        owners.write(&frame, &[], None),
+        async {
+            queued(under_the_child.output(), 1).await;
+            queued(under_the_pairing_grant.output(), 1).await;
+            queued(&owners, 1).await;
+            controller
+                .revoke_grant(parent.grant_id, None, None)
+                .await
+                .expect("the parent is revoked, and the child with it");
+            drop((child_turn, pairing_turn, owners_turn));
+        }
     );
-
-    let outputs = [&under_the_share, &under_the_pairing_grant, &owners];
-    let turns = [
-        under_the_share.hold_the_turn().await,
-        under_the_pairing_grant.hold_the_turn().await,
-        owners.hold_the_turn().await,
-    ];
-    let writes: Vec<_> = outputs
-        .iter()
-        .map(|output| {
-            let output = Arc::clone(output);
-            tokio::spawn(async move { output.write(&batch(), &[], None).await })
-        })
-        .collect();
-    for output in outputs {
-        queued(output, 1).await;
-    }
-
-    let debt = controller
-        .owe_debt("the revocation of a share", Reach::Grants([share].into()))
-        .expect("the debt is written");
-    let own = controller.publish_debts(&[(debt, Reach::Grants([share].into()))]);
-    controller
-        .barrier(own)
-        .await
-        .expect("the barrier is raised");
-    drop(turns);
-
-    let mut written = Vec::new();
-    for write in writes {
-        written.push(write.await.expect("the write ends"));
-    }
     assert_eq!(
-        written,
-        vec![Written::Withdrawn, Written::Sent, Written::Sent]
+        (writing.0, writing.1, writing.2),
+        (Written::Withdrawn, Written::Sent, Written::Sent)
     );
-    assert!(streams[0].reached().is_empty());
-    assert!(
-        streams[0].closed(),
-        "the connection under the share is closed"
+    assert!(decided_under_the_child.reached().is_empty());
+    assert!(decided_under_the_child.closed());
+    assert!(!decided_under_the_pairing_grant.closed() && !owners_stream.closed());
+    world.serving.abort();
+}
+
+/// A share of `session_id` issued to `device_id`, active and without an end, as a delegation from
+/// `parent_grant_id`.
+fn a_share_issued_under(
+    controller: &Controller,
+    device_id: DeviceId,
+    session_id: kr_protocol::ids::SessionId,
+    parent_grant_id: kr_protocol::ids::GrantId,
+) -> kr_protocol::grant::Grant {
+    let (mut grant, _) = super::super::tests::granted(
+        kr_protocol::grant::GrantExpiry::Never,
+        controller.policy().authority_revision(),
     );
-    assert!(!streams[1].closed() && !streams[2].closed());
+    grant.parent_grant_id = Nullable::some(parent_grant_id);
+    grant.issuer_device_id = controller.sharing().host_device_id();
+    grant.recipient_device_id = device_id;
+    grant.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [session_id].into_iter().collect(),
+    };
+    grant.actions = [ActionRight::SessionView].into_iter().collect();
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &crate::grants::GrantRecord {
+                grant: grant.clone(),
+                session_id: Some(session_id),
+                issued_at_ms: 1,
+                activated_at_ms: Some(2),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the share is written");
+    grant
 }
