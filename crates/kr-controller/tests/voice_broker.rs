@@ -20,6 +20,8 @@
 //! | KR-REQ-17.23 | `a_sign_out_ends_the_sign_in_that_is_waiting` |
 //! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_start_is_waiting_on_the_broker` |
 //! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_close_is_not_finished` |
+//! | KR-REQ-17.23 | `a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it_was` |
+//! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_is_made_under_the_account_it_leaves` |
 //! | KR-REQ-17.23 | `a_host_moved_off_the_managed_broker_can_still_end_the_sign_in_it_keeps` |
 //! | KR-REQ-17.23 | `an_account_the_store_could_not_settle_is_not_presented_until_it_is_settled` |
 //! | KR-REQ-17.23 | `each_refresh_presents_the_token_the_last_one_issued` |
@@ -392,6 +394,18 @@ async fn answer(mut stream: TcpStream, shared: &Shared) {
         authorization: authorization.clone(),
         body: body.clone(),
     });
+    // A request the suite holds waits here, after it is recorded, whichever service it is for.
+    let held = shared
+        .holds
+        .lock()
+        .expect("the holds")
+        .iter()
+        .find(|hold| hold.path == path)
+        .map(|hold| (Arc::clone(&hold.reached), hold.released.clone()));
+    if let Some((reached, mut released)) = held {
+        reached.notify_one();
+        let _ = released.wait_for(|released| *released).await;
+    }
     if path.starts_with("/auth/") {
         let (status, answer) = account_answer(shared, &path, authorization.as_deref(), &body);
         let _ = stream
@@ -412,17 +426,6 @@ async fn answer(mut stream: TcpStream, shared: &Shared) {
         let refusal = br#"{"ok":false,"error":{"code":"UNAUTHENTICATED","message":"No."}}"#;
         let _ = stream.write_all(&response(401, refusal)).await;
         return;
-    }
-    let held = shared
-        .holds
-        .lock()
-        .expect("the holds")
-        .iter()
-        .find(|hold| hold.path == path)
-        .map(|hold| (Arc::clone(&hold.reached), hold.released.clone()));
-    if let Some((reached, mut released)) = held {
-        reached.notify_one();
-        let _ = released.wait_for(|released| *released).await;
     }
     let data = match path.as_str() {
         "/api/voice/metadata" => serde_json::json!({
@@ -1625,6 +1628,145 @@ async fn an_account_never_changes_under_a_call_whose_close_is_not_finished() {
         "the close carried the account the call started under"
     );
     assert!(sign_out(&host).await.was_signed_in);
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a call that opens while a sign-in's code is being exchanged leaves the
+/// account as it was. The grant the exchange brought is revoked, and when the service cannot be told
+/// at once it is told when the daemon next starts; the call closes under the account it started
+/// under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it_was() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let exchange = broker.hold("/auth/oauth2/token");
+    // The new grant's revocation is refused, as a service that cannot be reached refuses it.
+    broker.refuse_revocations(true);
+
+    let (page, call) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        exchange.reached().await;
+        // The code is out at the service. A call opens now, under the account signed in.
+        let started = start_a_call(&host, &owner).await;
+        exchange.release();
+        started
+    });
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    let (_device, session, call) = call;
+    let report = settled(&host).await;
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::CallOpen)
+    );
+    assert!(
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the account is as it was: {report:?}"
+    );
+    assert!(
+        broker.revoked().is_empty(),
+        "the service refused the revocation of the grant that came for the turned-away sign-in"
+    );
+
+    let _ = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await;
+    let close = broker
+        .seen()
+        .into_iter()
+        .find(|request| request.path == "/api/voice/sessions/call-1/close")
+        .expect("the broker was told");
+    assert_eq!(
+        close.authorization.as_deref(),
+        Some(format!("Bearer {}", broker.access(1)).as_str()),
+        "the close carried the account the call started under"
+    );
+
+    // The turned-away grant is revoked when the daemon next starts, though nothing remembers it
+    // but the queue.
+    let stopped = host.shut_down().await;
+    broker.refuse_revocations(false);
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while broker.revoked().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the daemon sends the revocation again");
+    assert_eq!(broker.revoked(), [broker.refresh(2)]);
+    assert!(matches!(
+        account_report(&host).await.state,
+        AccountState::SignedIn { .. }
+    ));
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: while an account is being changed a request for a token waits for the
+/// change to end. A sign-in whose identity read names another account is undone, so a call that
+/// began under the grant it was about to remove would have lost its account: the start waits, and
+/// when the grant is gone it is refused and creates nothing at the broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_meets_an_account_being_changed_is_made_under_the_account_it_leaves() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, session, session_id, prepared) = ready(&host, &owner).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    broker.name_another_account();
+    // The grant is kept and the identity read follows: the account is being changed meanwhile.
+    let identity = broker.hold("/auth/oauth2/userinfo");
+
+    let (_page, started) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        identity.reached().await;
+        let params = start_params(session_id, &prepared);
+        let start = try_mutate(&session, host.environment_id, Method::VoiceStart, &params);
+        let release = async {
+            // The start has registered, and is asking for its token while the gate is up.
+            while !host.controller().voice().coordinator().calls_open() {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            identity.release();
+        };
+        let (started, ()) = tokio::join!(start, release);
+        started
+    });
+    let report = settled(&host).await;
+    assert_eq!(report.state, AccountState::SignedOut, "{report:?}");
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::NotForThisAttempt)
+    );
+    let made = started
+        .ok()
+        .and_then(|value| value.to_typed::<VoiceStartResult>().ok())
+        .is_some_and(|result| matches!(result.outcome, VoiceStartOutcome::Started { .. }));
+    assert!(!made, "no call was made under an account that was going");
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .all(|request| !request.path.starts_with("/api/voice/sessions")),
+        "nothing was created at the broker"
+    );
     host.stop().await;
 }
 

@@ -1668,8 +1668,8 @@ refused while a voice call is open.
 `sign-in`; when the attempt had already ended by the time the command looked, it prints the `show`
 document instead. `sign-out` prints `{ "ok", "was_signed_in", "service_told" }`. `show` prints `{ "ok", "state", "service", "unavailable", "email", "scopes",
 "last_attempt" }`, where `state` is `signed_out`, `waiting_for_browser`, `finishing`, `signed_in`
-or `ended`, and the other fields are present only when they apply: `service` is where the host signs
-in, and `unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it does not
+or `ended`, and the other fields are present only when they apply: `service` is the account service
+the host keeps its account for, and `unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it does not
 sign in or present an account. A host whose broker is not the account service refuses `sign-in` with
 `HOST_NOT_CONFIGURED`, shows a grant it still keeps, and signs it out; a host that cannot reach the
 account service at all refuses both. One with a voice call open refuses both with
