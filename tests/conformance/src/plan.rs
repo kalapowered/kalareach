@@ -1003,6 +1003,11 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "stopping a recorded process by its identity",
+            &["test", "--locked", "-p", "kr-ipc", "--test", "stop"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the local IPC library",
             &["test", "--locked", "-p", "kr-ipc", "--lib"],
         ),
@@ -1285,6 +1290,18 @@ fn windows() -> Vec<Step> {
                 "kr-worker",
                 "--test",
                 "persistence",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the archive's cleanup of a crashed session",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "archive",
             ],
         ),
         Step::cargo(
