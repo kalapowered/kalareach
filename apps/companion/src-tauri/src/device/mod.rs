@@ -342,10 +342,23 @@ impl Device {
     }
 
     /// Records that this application's commands go to `host`, and keeps it for the next run.
-    pub fn use_host(&self, host: DeviceId) {
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the choice could not be kept, and then it is not made: a
+    /// choice the next run would not find is not one this run reports.
+    pub fn use_host(&self, host: DeviceId) -> Result<()> {
+        let staging = self.use_file.with_extension("new");
+        std::fs::write(&staging, host.to_string())
+            .and_then(|()| std::fs::rename(&staging, &self.use_file))
+            .map_err(|error| {
+                CommandError::local_failure(format!(
+                    "this computer could not keep which host you chose: {error}"
+                ))
+            })?;
         *lock(&self.in_use) = Some(host);
-        let _ = std::fs::write(&self.use_file, host.to_string());
         (self.changed)();
+        Ok(())
     }
 
     /// The hosts this computer is an owner of, which it watches for confirmations.
