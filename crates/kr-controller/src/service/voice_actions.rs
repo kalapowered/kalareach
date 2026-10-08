@@ -48,7 +48,15 @@ impl Controller {
                 .unwrap_or_default()
                 .to_owned(),
         );
-        let _ = self.voice.set(Arc::new(module));
+        let module = Arc::new(module);
+        // A sign-in never changes the account a call closes under: it waits for the call to end.
+        let calls = Arc::downgrade(&module);
+        self.account.watch_calls(move || {
+            calls
+                .upgrade()
+                .is_some_and(|module| module.coordinator().live_sessions() > 0)
+        });
+        let _ = self.voice.set(module);
     }
 
     /// The managed broker the configuration document names, reached over a transport of its own

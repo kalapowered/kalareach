@@ -43,13 +43,16 @@ pub struct AccountStatusParams {}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountReport {
-    /// The managed service this host's configuration names as its voice broker, which is where a
-    /// sign-in is made and where its token is presented. Null when the host names none.
+    /// The account service this host signs in at, which is also where its token is presented: the
+    /// voice broker its configuration names, when that is the account service. Null when it is
+    /// not, and `unavailable` says why.
     pub service: Nullable<String>,
+    /// Why this host signs in nowhere, when `service` is null.
+    pub unavailable: Nullable<SignInUnavailable>,
     /// The account this host is signed in as, or what stands in its way.
     pub state: AccountState,
-    /// How the last attempt ended, until the next one begins. It is null before any attempt since
-    /// the daemon started.
+    /// How the most recent attempt that has ended ended. It stays while a newer attempt waits, and
+    /// is null before any attempt has ended since the daemon started.
     pub last_attempt: Nullable<AccountAttempt>,
 }
 
@@ -63,6 +66,20 @@ impl fmt::Debug for AccountReport {
             .field("last_attempt", &self.last_attempt)
             .finish()
     }
+}
+
+/// Why a host signs in nowhere.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInUnavailable {
+    /// The host's configuration names no voice broker.
+    NoBroker,
+    /// The voice broker it names is another service than the account service the host signs in at.
+    BrokerIsAnotherService,
+    /// The host could not set up how to reach the account service the way its configuration says.
+    NotUsable,
 }
 
 /// Where the host stands with an account.
@@ -86,8 +103,7 @@ pub enum AccountState {
     Finishing,
     /// An account is signed in.
     SignedIn {
-        /// The service the sign-in belongs to. A call is brokered at the service the host's
-        /// configuration names, and a token from another service is never presented to it.
+        /// The account service the sign-in was made at, which is also the voice broker.
         origin: String,
         /// The account's address, when the service said it.
         email: Nullable<String>,
@@ -145,6 +161,11 @@ pub enum AccountAttempt {
     Unreachable,
     /// A newer attempt ended this one.
     Superseded,
+    /// The loopback address could not be opened for a reason other than another program holding
+    /// it.
+    ListenerFailed,
+    /// A managed voice call was open, and a call closes under the account it started under.
+    CallOpen,
 }
 
 impl AccountAttempt {
@@ -161,6 +182,8 @@ impl AccountAttempt {
             Self::NotKept => "not_kept",
             Self::Unreachable => "unreachable",
             Self::Superseded => "superseded",
+            Self::ListenerFailed => "listener_failed",
+            Self::CallOpen => "call_open",
         }
     }
 }

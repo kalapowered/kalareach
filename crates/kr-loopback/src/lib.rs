@@ -471,7 +471,7 @@ mod tests {
         (!address.is_loopback() && !address.is_unspecified()).then_some(address)
     }
 
-    /// Test 11: the socket the listener binds is on loopback, so the machine's other address does
+    /// The socket the listener binds is on loopback, so the machine's other address does
     /// not reach it. The control, one bound to every interface the same way, is reached there, so
     /// the check can fail.
     #[tokio::test]
@@ -505,7 +505,7 @@ mod tests {
         );
     }
 
-    /// Test 12: a callback's rendering leaves out its address, which carries the code and state.
+    /// A callback's rendering leaves out its address, which carries the code and state.
     #[tokio::test]
     async fn a_callback_renders_without_its_address() {
         let listener = Listener::open_at("127.0.0.1:0".parse().expect("an address"), "127.0.0.1:0")

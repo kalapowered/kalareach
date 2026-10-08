@@ -14,7 +14,7 @@
 use kr_client::shown;
 use kr_protocol::host_account::{
     AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountState,
-    AccountStatusParams,
+    AccountStatusParams, SignInUnavailable,
 };
 use kr_protocol::method::Method;
 
@@ -122,9 +122,12 @@ fn say(report: &AccountReport, json: bool) {
 fn document(report: &AccountReport) -> Document {
     let mut document = Document::new()
         .with("ok", true)
-        .with("state", state_name(&report.state));
+        .with("state", report.state.name());
     if let Some(service) = report.service.as_ref() {
         document.set("service", Asked::location(Request::Account, service));
+    }
+    if let Some(unavailable) = report.unavailable.as_ref() {
+        document.set("unavailable", unavailable_name(*unavailable));
     }
     if let AccountState::SignedIn { email, scopes, .. } = &report.state {
         if let Some(email) = email.as_ref() {
@@ -144,22 +147,25 @@ fn document(report: &AccountReport) -> Document {
     document
 }
 
-/// The state's name, as a script reads it.
-const fn state_name(state: &AccountState) -> &'static str {
-    state.name()
-}
-
 /// Where the host's sign-in stands, as lines for a person.
 fn lines(report: &AccountReport) -> Vec<Line> {
     let mut lines = Vec::new();
-    match &report.service.as_ref() {
-        Some(service) => lines.push(stdout_line!(
-            "This host's managed service is {}.",
+    match (report.service.as_ref(), report.unavailable.as_ref()) {
+        (Some(service), _) => lines.push(stdout_line!(
+            "This host signs in at {}.",
             Asked::location(Request::Account, service)
         )),
-        None => lines.push(stdout_line!(
-            "This host names no managed service: set voice.broker_origin in its configuration \
-             document."
+        (None, Some(SignInUnavailable::BrokerIsAnotherService)) => lines.push(stdout_line!(
+            "This host's voice.broker_origin names another service than the managed account \
+             service, so there is nothing to sign in to and no account is presented."
+        )),
+        (None, Some(SignInUnavailable::NotUsable)) => lines.push(stdout_line!(
+            "This host cannot reach the managed account service the way its configuration says: \
+             the daemon's log says why."
+        )),
+        (None, Some(SignInUnavailable::NoBroker) | None) => lines.push(stdout_line!(
+            "This host names no managed voice service: set voice.broker_origin in its \
+             configuration document to the managed account service's origin."
         )),
     }
     match &report.state {
@@ -221,5 +227,16 @@ const fn attempt_words(attempt: AccountAttempt) -> &'static str {
         }
         AccountAttempt::Unreachable => "the service could not be reached",
         AccountAttempt::Superseded => "a newer attempt ended it",
+        AccountAttempt::ListenerFailed => "the loopback address could not be opened",
+        AccountAttempt::CallOpen => "a voice call was open, so the code was not spent",
+    }
+}
+
+/// Why a host signs in nowhere, as a script reads it.
+const fn unavailable_name(unavailable: SignInUnavailable) -> &'static str {
+    match unavailable {
+        SignInUnavailable::NoBroker => "no_broker",
+        SignInUnavailable::BrokerIsAnotherService => "broker_is_another_service",
+        SignInUnavailable::NotUsable => "not_usable",
     }
 }
