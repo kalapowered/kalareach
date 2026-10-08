@@ -229,12 +229,33 @@
           "member": "format",
           "absent": 0
         },
-        "version": 1,
+        "version": 2,
         "migrates_from": 1
       },
-      "digest": "4ee22e3280b2f0a32d77086d0e803a0bbbe2b5b41c520f884c4fa183e7ce28a0",
+      "digest": "fd20d2e0f80ff3f381b9c8d5c33355b3d534466748658c12948b02261e954f46",
       "kept": [
-        "Record, Transaction, TransactionState, Restart, Start (crates/kr-cli/src/update/mod.rs)"
+        "Record, Transaction, Abandoned, TransactionState, Restart, Start (crates/kr-cli/src/update/mod.rs)",
+        "PathVariable"
+      ]
+    },
+    {
+      "entry": {
+        "store": "kept-answers",
+        "scope": "state_root",
+        "path": "kept-answers/*.answer",
+        "recording": {
+          "kind": "cbor_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "c038af254e2f6ba6e0ade7588f84aa52c7c8744db0cfa879d135081e68f32fc6",
+      "kept": [
+        "ActionTarget",
+        "QuestionAnswer",
+        "AnswerDraft (crates/kr-client/src/answers.rs)"
       ]
     },
     {
@@ -253,6 +274,28 @@
       "digest": "0eac13e8d0ee5a58661b99541e1a6571ec7947ffa6a0fdaa4b7a40f7f5b57785",
       "kept": [
         "MachineGroup, Change, Step (crates/kr-controller/src/machine.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "machine-merge-plan",
+        "scope": "state_root",
+        "path": "machine-merge-plan",
+        "recording": {
+          "kind": "cbor_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "55892bbc2db4fd2dde73ce62a430224aef74caf2c99f5d9f70e58338eeece14d",
+      "kept": [
+        "MachineGroup",
+        "MachineExpected",
+        "MutationRequest",
+        "EnvironmentEnrolment",
+        "Plan, PlannedStep, StepState, Why, Reach (crates/kr-cli/src/machine.rs)"
       ]
     },
     {
@@ -299,10 +342,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 8,
+        "version": 9,
         "migrates_from": 1
       },
-      "digest": "86ddcc993cdc6ac5846bf257cf7ea5e0883d02abd876777fe1b58a1f9ec10b17",
+      "digest": "6009bb613da1dc6f1c68fc830f58255e72f3903d01cdcdad2b1ec2a38f5b338f",
       "kept": [
         "ProjectInitResult",
         "ProjectCloneResult",
@@ -399,10 +442,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 2,
+        "version": 4,
         "migrates_from": 1
       },
-      "digest": "84716b9ffd239748c85f547dcc9d9e50daf363ec4f6cfda0a4d9395d43438122",
+      "digest": "0de4cd24d45c59420ff100cc883787546aac3a4dfec2013b36b299f4457a4291",
       "kept": [
         "UploadBeginResult",
         "UploadChunkResult",
@@ -690,22 +733,6 @@
       "reason": "the store of releases on a platform whose default state root holds it; its record is the store install-record, and roots/<digest>.root is a frozen form (two paths separated by a NUL byte) that a change replaces with a file of another name",
       "children": [],
       "opaque": true,
-      "databases": false
-    },
-    {
-      "scope": "state_root",
-      "path": "kept-answers",
-      "reason": "answers a person gave that the host has not taken, kept on this device by the client; not host state, so not a store of the host's (an unreadable one is reported by name)",
-      "children": [],
-      "opaque": true,
-      "databases": false
-    },
-    {
-      "scope": "state_root",
-      "path": "machine-merge-plan",
-      "reason": "the client's merge plan, kept on this device; not host state (an unreadable one is reported by name and moved aside by the person)",
-      "children": [],
-      "opaque": false,
       "databases": false
     },
     {
