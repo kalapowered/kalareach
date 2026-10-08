@@ -327,39 +327,40 @@ impl Controller {
     pub async fn watch_closure(self: Arc<Self>, session_id: SessionId, reason: ClosureReason) {
         let deadline = std::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
         loop {
-            let identity = {
+            let worker = {
                 let registry = self.registry.lock().await;
-                registry
-                    .workers()
-                    .ok()
-                    .and_then(|workers| {
-                        workers
-                            .into_iter()
-                            .find(|record| record.session_id == session_id)
-                    })
-                    .map(|record| record.process_identity)
+                registry.workers().ok().and_then(|workers| {
+                    workers
+                        .into_iter()
+                        .find(|record| record.session_id == session_id)
+                })
             };
-            let Some(identity) = identity else {
+            let Some(worker) = worker else {
                 // The session has left this daemon's directory, which is what recording a closure
                 // does, so something else finished what this watcher was waiting for.
                 self.review_power_soon();
                 return;
             };
-            match kr_ipc::identity::process_state(&identity) {
+            match kr_ipc::identity::process_state(&worker.process_identity) {
                 kr_ipc::identity::ProcessState::Ended => {
-                    let _ = self
-                        .record_final(
+                    // A worker that handed over its own closure before it went has nothing more to
+                    // stop; one that did not is a crash, and what its session still owned is
+                    // stopped before its identity is released.
+                    if matches!(
+                        self.crash_flight(
                             session_id,
+                            worker.display_number,
+                            &worker.process_identity,
                             reason,
-                            &identity,
-                            &crate::archive::ArchiveService::nothing_fenced(session_id),
-                            true,
                         )
-                        .await;
-                    // The closure this watcher was waiting on has finished, so what it was
-                    // counted as is over. Whoever asked for it is not waiting for this.
-                    self.review_power_soon();
-                    return;
+                        .await,
+                        Ok(Some(_))
+                    ) {
+                        // The closure this watcher was waiting on has finished, so what it was
+                        // counted as is over. Whoever asked for it is not waiting for this.
+                        self.review_power_soon();
+                        return;
+                    }
                 }
                 kr_ipc::identity::ProcessState::Running
                 | kr_ipc::identity::ProcessState::Unknown { .. } => {}
@@ -382,6 +383,33 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be read or written.
     pub async fn reconcile(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
+        match self.reconcile_soon(session_id) {
+            Some(task) => match task.await {
+                Ok(outcome) => outcome,
+                Err(ended) if ended.is_panic() => std::panic::resume_unwind(ended.into_panic()),
+                Err(_) => Err(ControllerError::supervision(
+                    "this daemon stopped before it finished closing a session whose worker had gone",
+                )),
+            },
+            None => self.reconcile_session(session_id).await,
+        }
+    }
+
+    /// Starts [`Self::reconcile`] on a task this daemon owns, so a caller that stops waiting does
+    /// not stop what a dead worker's session is owed, and so several sessions can be reconciled at
+    /// once. `None` once this daemon is being let go.
+    pub(super) fn reconcile_soon(
+        &self,
+        session_id: SessionId,
+    ) -> Option<tokio::task::JoinHandle<Result<Option<ClosureRecord>>>> {
+        let me = self.me.upgrade()?;
+        Some(tokio::spawn(async move {
+            me.reconcile_session(session_id).await
+        }))
+    }
+
+    /// The body of [`Self::reconcile`].
+    async fn reconcile_session(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
         let record = {
             let registry = self.registry.lock().await;
             registry
@@ -392,42 +420,95 @@ impl Controller {
         let Some(record) = record else {
             return Ok(None);
         };
-        // The archive takes exclusive recovery ownership, and only on its own terms: the kernel
-        // is asked whether the recorded process is the process that was recorded, and only then
-        // is the endpoint fenced. A query the platform declines is not death, and leaves the
-        // session alone. Nothing here creates a worker.
+        let reason = self.why_a_worker_is_gone(session_id, record.profile);
+        self.crash_flight(
+            session_id,
+            record.display_number,
+            &record.process_identity,
+            reason,
+        )
+        .await
+    }
+
+    /// Closes the session of a worker the kernel confirms is gone, once, after stopping what the
+    /// session still owned.
+    ///
+    /// The archive takes exclusive recovery ownership, and only on its own terms: the kernel is
+    /// asked whether the recorded process is the process that was recorded, and only then is the
+    /// endpoint fenced. A query the platform declines is not death, and leaves the session alone
+    /// (`None`). Nothing here creates a worker.
+    ///
+    /// Section 9's recovery rules are the worker's, and a worker that crashed never ran them. They
+    /// run once here instead, before anything is served: a dispatch marker with no authoritative
+    /// outcome becomes `unknown`, and an accepted intent with no marker is rejected. A failure is
+    /// not a reason to leave the session open, so the closure is still written.
+    ///
+    /// Section 7's second half comes before the session identity is released: whatever the session
+    /// still owns is stopped, and what this host cannot account for is recorded. A closure written
+    /// before that would be a closure a crash between the two could not lead back to. A worker that
+    /// wrote its own closure before it went has stopped what it owned, and its account stands.
+    ///
+    /// One flight per session at a time: the second caller waits, and finds the closure.
+    pub(super) async fn crash_flight(
+        &self,
+        session_id: SessionId,
+        display_number: kr_protocol::session::DisplayNumber,
+        identity: &kr_protocol::identity::ProcessStartIdentity,
+        reason: ClosureReason,
+    ) -> Result<Option<ClosureRecord>> {
+        let flight = Arc::clone(
+            self.crash_flights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(session_id)
+                .or_default(),
+        );
+        let _alone = flight.lock().await;
+        let outcome = self
+            .crash_flight_alone(session_id, display_number, identity, reason)
+            .await;
+        // The entry goes once the session has a closure, which is what the next caller will find.
+        if matches!(self.registry.lock().await.closure(session_id), Ok(Some(_))) {
+            self.crash_flights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&session_id);
+        }
+        outcome
+    }
+
+    async fn crash_flight_alone(
+        &self,
+        session_id: SessionId,
+        display_number: kr_protocol::session::DisplayNumber,
+        identity: &kr_protocol::identity::ProcessStartIdentity,
+        reason: ClosureReason,
+    ) -> Result<Option<ClosureRecord>> {
+        if let Some(existing) = self.registry.lock().await.closure(session_id)? {
+            return Ok(Some(existing));
+        }
         let archive = self.archive();
-        let Ok(ownership) =
-            archive.take_ownership(session_id, record.display_number, &record.process_identity)
-        else {
+        let Ok(ownership) = archive.take_ownership(session_id, display_number, identity) else {
             return Ok(None);
         };
-        // Section 9's recovery rules are the worker's, and a worker that crashed never ran them.
-        // They run once here instead, before anything is served: a dispatch marker with no
-        // authoritative outcome becomes `unknown`, and an accepted intent with no marker is
-        // rejected. A failure is not a reason to leave the session open, so the closure is still
-        // written; what says the store was not reconciled is the archive, which reports an action
-        // still accepted or still dispatching when a reader asks.
+        // After ownership is taken, so a worker that wrote its closure in its last moments is read.
+        let own_closure = self.recovered_closure(session_id).is_some();
         let _ = archive.recover_journal(&ownership);
-        let reason = self.why_a_worker_is_gone(session_id, record.profile);
-        // Section 7's second half, before the session identity is released: whatever the session
-        // still owns is fenced, and what this host cannot account for is recorded. A closure
-        // written before that would be a closure a crash between the two could not lead back to.
-        let reported = ClosureRecord {
-            session_id,
-            session_epoch: SessionEpoch::V1,
-            reason,
-            root_exit_code: Nullable::null(),
-            root_signal: Nullable::null(),
-            terminated: Vec::new(),
-            surviving: Vec::new(),
-            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
-            durability: kr_protocol::session::Durability::Durable,
-            closed_at_ms: kr_ipc::now_ms(),
+        let fenced = if own_closure {
+            crate::archive::Fenced::nothing(session_id)
+        } else {
+            let unit = self
+                .registry
+                .lock()
+                .await
+                .reservation_for_session(session_id)
+                .ok()
+                .flatten()
+                .map(|reservation| crate::supervision::worker_label(reservation.reservation_id));
+            archive.fence_owned(&ownership, unit.as_deref()).await
         };
-        let fenced = archive.fence_owned(&ownership, &reported);
         let closure = self
-            .record_final(session_id, reason, &record.process_identity, &fenced, true)
+            .record_final(session_id, reason, identity, &fenced, true)
             .await?;
         Ok(Some(closure))
     }
@@ -534,13 +615,17 @@ impl Controller {
                 ),
             });
         }
-        // Whatever the fence did reach, recorded where a later reader is served it rather than
-        // only where this daemon can see it.
-        terminated.extend(fenced.stopped.iter().map(|identity| {
+        // Whatever the fence saw end, recorded where a later reader is served it rather than only
+        // where this daemon can see it.
+        terminated.extend(fenced.ended.iter().map(|ended| {
             kr_protocol::session::TerminatedProcess {
-                identity: identity.clone(),
-                name: Nullable::some("a process this session still owned".to_owned()),
-                forced: true,
+                identity: ended.identity.clone(),
+                name: Nullable::some(if ended.root {
+                    "the session's root shell".to_owned()
+                } else {
+                    "a process this session owned".to_owned()
+                }),
+                forced: ended.forced,
             }
         }));
         let record = ClosureRecord {
@@ -551,10 +636,15 @@ impl Controller {
             root_signal: Nullable::null(),
             terminated,
             surviving,
-            // The controller confirmed the worker process ended. It does not claim to have
-            // discovered every application that worker may have started, and a recovery or a
+            // What the fence could confirm, and only when this host saw the worker end: a closure
+            // written over a death nobody confirmed claims nothing. The controller never claims to
+            // have discovered every application the worker may have started, and a recovery or a
             // fence that could not finish is another thing it cannot account for.
-            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            ownership_coverage: if death_validated {
+                fenced.coverage
+            } else {
+                kr_protocol::session::OwnershipCoverage::Incomplete
+            },
             // Section 23 defines this as whether the *record* was written durably, which is what
             // `write_closure` below does or fails doing. It says nothing about whether the
             // session's own store was reconciled: a recovery pass that was skipped or failed is

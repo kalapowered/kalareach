@@ -827,6 +827,7 @@ impl Controller {
             inhibitor: Mutex::new(Inhibitor::new()),
             demand_scan: Mutex::new(DemandScan::default()),
             finalising: Mutex::new(()),
+            crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
             handover: super::host::Handover::default(),
             machine,
             lock,
@@ -1148,7 +1149,7 @@ impl Controller {
                     row.session_id,
                     ClosureReason::HostShutdown,
                     &row.process_identity,
-                    &crate::archive::ArchiveService::nothing_fenced(row.session_id),
+                    &crate::archive::Fenced::nothing(row.session_id),
                     validated,
                 )
                 .await?;
