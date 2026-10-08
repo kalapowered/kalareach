@@ -425,6 +425,22 @@ methods! {
     doc: "Where privacy mode stands: its generation, whether its last change has taken effect, \
           what each session still owes, what is kept and what had already left this host.";
 
+    AccountSignIn = "account.sign_in", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Start this host's own sign-in to the managed account service: listen on the loopback \
+          address the desktop client is registered with, answer the address a person opens in a \
+          browser, and keep the grant that comes back in this host's secret store. Nothing in the \
+          answer is a token.";
+
+    AccountStatus = "account.status", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Where this host's sign-in to the managed account service stands: signed out, waiting for \
+          the browser, signed in at which service, or ended, and how the last attempt ended.";
+
     HostUpdateHandover = "host.update.handover", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -1711,6 +1727,10 @@ mod tests {
         // Privacy mode: switching this host's retention, and reading what it kept and what left.
         ("privacy.set", &[ActionRight::HostManage]),
         ("privacy.status", &[ActionRight::HostManage]),
+        // This host's own sign-in to the managed account service: whose balance a phone's call
+        // spends is the owner's choice at this machine.
+        ("account.sign_in", &[ActionRight::HostManage]),
+        ("account.status", &[ActionRight::HostManage]),
         // Session descriptions: reading what is offered, and the two changes an owner makes.
         ("description.setup", &[ActionRight::HostManage]),
         ("description.configure", &[ActionRight::HostManage]),

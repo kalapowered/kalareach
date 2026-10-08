@@ -390,6 +390,30 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Managed voice spends an account's balance, so the host signs an account in on its own, at
+    // this machine: a write that starts the sign-in and a read of where it stands, both served on
+    // the local socket alone and asking for host management. A paired device neither starts nor
+    // reads them.
+    let account: [(&str, EffectClass); 2] = [
+        ("account.sign_in", EffectClass::Write),
+        ("account.status", EffectClass::Read),
+    ];
+    for (name, effect) in account {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(entry.group, MethodGroup::HostAndEnvironment);
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is the owner's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+    }
+
     // Section 26 ¶4 has a host inventory its live workers before it replaces a control daemon, and
     // defer the replacement when one of them could not be spoken to; the daemon being replaced
     // must first stop starting sessions and let the ones it is starting settle, or a worker could

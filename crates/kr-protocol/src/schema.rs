@@ -104,6 +104,10 @@ use crate::frame::StreamHeader;
 use crate::gateway::{DeclarativeTable, EvidenceGap, PendingResource, RichMethodTable};
 use crate::grant::Grant;
 use crate::hello::{ActionWindow, ClientOffer, ConnectReply, HelloReply, HostSelection};
+use crate::host_account::{
+    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountState,
+    AccountStatusParams,
+};
 use crate::hostinfo::{
     EffectiveConfiguration, EnvironmentListResult, HostDoctorResult, HostInfoResult, SupportBundle,
     configuration::ConfigurationDocument,
@@ -796,6 +800,13 @@ pub fn protocol_schema() -> Value {
         "privacy_set_params" => PrivacySetParams,
         "privacy_status_params" => PrivacyStatusParams,
         "privacy_unavailable" => PrivacyUnavailable,
+        // This host's own sign-in to the managed account service, appended for the same reason.
+        "account_attempt" => AccountAttempt,
+        "account_report" => AccountReport,
+        "account_sign_in_params" => AccountSignInParams,
+        "account_sign_in_started" => AccountSignInStarted,
+        "account_state" => AccountState,
+        "account_status_params" => AccountStatusParams,
         // Session descriptions: the setup read and the two writes, the facts a worker keeps per
         // session and the request and page the control daemon reads them with. Appended for the
         // same reason.

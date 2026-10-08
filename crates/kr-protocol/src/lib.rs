@@ -137,6 +137,7 @@ pub mod frame;
 pub mod gateway;
 pub mod grant;
 pub mod hello;
+pub mod host_account;
 pub mod hostinfo;
 pub mod identity;
 pub mod ids;
