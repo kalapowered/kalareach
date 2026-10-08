@@ -2319,24 +2319,52 @@ async fn a_devices_destination_ends_when_its_grant_runs_out_while_the_daemon_run
     );
 }
 
-/// The clocks of a daemon the test moves by hand, and a way to take both past a day.
+/// The clocks of a daemon the test takes forward by hand, and a way to take both past a day.
+///
+/// Both run with the machine's own, as a running host's do: a daemon that restarts finds the wall
+/// clock where the boot clock says it must be, and a wall clock that stood still while the machine
+/// ran would be one that went backwards. The test adds what it moves them by.
 struct Moved {
-    wall: Arc<std::sync::atomic::AtomicU64>,
-    continuous: kr_transport::clock::ManualClock,
+    wall_ahead_ms: Arc<std::sync::atomic::AtomicU64>,
+    continuous_ahead_ns: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The machine's continuous clock, taken forward by what a test adds to it.
+#[derive(Debug)]
+struct ContinuousAhead {
+    machine: kr_transport::clock::SystemContinuousClock,
+    ahead_ns: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl kr_transport::clock::ContinuousClock for ContinuousAhead {
+    fn now(&self) -> kr_transport::clock::ContinuousInstant {
+        let now = self.machine.now();
+        let ahead = Duration::from_nanos(self.ahead_ns.load(std::sync::atomic::Ordering::Acquire));
+        now.checked_add(ahead).unwrap_or(now)
+    }
 }
 
 impl Moved {
     fn new() -> (Self, kr_controller::service::Clocks) {
-        let continuous = kr_transport::clock::ManualClock::new();
-        let wall = Arc::new(std::sync::atomic::AtomicU64::new(now()));
+        let wall_ahead_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let continuous_ahead_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let clocks = kr_controller::service::Clocks {
-            continuous: Arc::new(continuous.clone()),
+            continuous: Arc::new(ContinuousAhead {
+                machine: kr_transport::clock::SystemContinuousClock::new(),
+                ahead_ns: Arc::clone(&continuous_ahead_ns),
+            }),
             wall: kr_controller::service::WallClock::from_fn({
-                let wall = Arc::clone(&wall);
-                move || wall.load(std::sync::atomic::Ordering::SeqCst)
+                let wall_ahead_ms = Arc::clone(&wall_ahead_ms);
+                move || now() + wall_ahead_ms.load(std::sync::atomic::Ordering::SeqCst)
             }),
         };
-        (Self { wall, continuous }, clocks)
+        (
+            Self {
+                wall_ahead_ms,
+                continuous_ahead_ns,
+            },
+            clocks,
+        )
     }
 
     /// Takes the wall clock two days on and leaves the continuous clock where it is: the grant
@@ -2344,7 +2372,7 @@ impl Moved {
     /// admitted under, which are counted on the continuous clock, have not.
     fn past_the_grant_by_utc(&self) {
         let days = Duration::from_secs(2 * 24 * 60 * 60);
-        self.wall.fetch_add(
+        self.wall_ahead_ms.fetch_add(
             u64::try_from(days.as_millis()).unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::SeqCst,
         );
@@ -2354,11 +2382,11 @@ impl Moved {
     /// lasts.
     fn past_the_grant(&self) {
         let days = Duration::from_secs(2 * 24 * 60 * 60);
-        self.wall.fetch_add(
-            u64::try_from(days.as_millis()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::SeqCst,
+        self.past_the_grant_by_utc();
+        self.continuous_ahead_ns.fetch_add(
+            u64::try_from(days.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Release,
         );
-        self.continuous.advance(days);
     }
 }
 
@@ -3898,7 +3926,7 @@ async fn a_grant_that_runs_out_while_a_configuration_waits_to_be_written_configu
             .delivery()
             .pause_before_destination_write();
         let hold = async {
-            tokio::task::spawn_blocking(move || arrived.recv())
+            tokio::task::spawn_blocking(move || arrived.recv_timeout(PATIENCE))
                 .await
                 .expect("the pause reports its arrival")
                 .expect("the write arrives");
