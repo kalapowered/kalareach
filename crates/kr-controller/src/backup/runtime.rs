@@ -337,6 +337,7 @@ impl Shared {
             }
             if matches!(report.idle, Some(Idle::Unavailable { .. })) {
                 observed.status_refusal = report.hold;
+                observed.status_unanswered = false;
             }
             // What the pass met while it carried work is what held the work back. When it met
             // nothing, that stands cleared only if the pass ran its work to the end: one that
@@ -786,7 +787,15 @@ impl BackupRuntime {
         } else if backup_off {
             Some("Turn backup storage on for the account.")
         } else {
-            match observed.pass_hold.or(observed.status_refusal) {
+            // The newest fact decides: a status read the service turned back is newer than the pass
+            // before it, and, while the answer in hand says storage is off, it is the pass's hold
+            // that is old.
+            let held = if observed.status.is_some() && !backup_on {
+                observed.status_refusal
+            } else {
+                observed.pass_hold.or(observed.status_refusal)
+            };
+            match held {
                 Some(hold) => Some(remedy_for(hold)),
                 None => Some("Run `kr doctor` again once the service answers."),
             }

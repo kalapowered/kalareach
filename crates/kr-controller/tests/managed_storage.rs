@@ -909,7 +909,7 @@ async fn a_status_turned_back_after_an_off_answer_is_not_told_as_backup_being_of
     );
     let remedy = rig.storage_remedy().await;
     assert!(
-        !remedy.contains("Turn backup storage on"),
+        remedy.contains("allowance"),
         "the newer refusal has its own remedy: {remedy}"
     );
 }
