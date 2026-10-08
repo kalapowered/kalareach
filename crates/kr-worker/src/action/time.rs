@@ -380,15 +380,18 @@ struct TimeState {
     /// publication, leaves it in force. A contract that restored a record never has it, and takes
     /// only an action of the owner made after it restored.
     adopting: bool,
-    /// The rollback this contract found and has not had answered, if it did.
+    /// The continuous reading, in this boot, at which the clock was last proved before a rollback
+    /// this contract found and has not had answered, if it found one.
     ///
-    /// A contract that distrusts its clock because of a rollback keeps what it knows of when it
-    /// found it, so that an older confirmation cannot clear it afterwards, whether that
-    /// confirmation is met in the look that found the rollback, in a later one, or after a
-    /// restart. A contract that restored a distrusted record holds one from the moment it
-    /// restored, since it cannot tell what the distrust rests on. It is dropped when the clock is
-    /// trusted again.
-    rollback: Option<Rollback>,
+    /// The rollback came after that reading, so a confirmation made at or before it cannot have
+    /// seen the rollback, and does not answer it: not in the look that found the rollback, not in
+    /// a later one, and not after a restart. A contract that restored a distrusted record holds
+    /// the reading it restored at, since it cannot tell what the distrust rests on. It is dropped
+    /// when the clock is trusted again.
+    unanswered_rollback: Option<u64>,
+    /// The lowest readings of the wall clock this contract took: what it holds against a
+    /// confirmation that a reading taken after it refutes.
+    readings: Readings,
     trust: WallClockTrust,
     checkpoint: Option<TimeCheckpoint>,
     revalidation_owed: bool,
@@ -440,42 +443,80 @@ struct Reference {
     proved_at: u64,
 }
 
-/// A rollback this contract found, and what the owner's confirmation has to be to answer it.
-///
-/// The rollback happened after the clock was last proved and before the look that found it, so a
-/// confirmation made before the clock was last proved cannot have seen it. One made between the
-/// two is an answer only if the clock that look read agrees with it: a clock that is a minute
-/// behind what the owner said, after the owner said it, is a rollback the owner did not see.
+/// A reading of the wall clock, and the continuous reading it was taken at.
 #[derive(Clone, Copy, Debug)]
-struct Rollback {
-    /// The continuous reading of this boot at which the clock was last proved before the rollback.
-    proved_at: u64,
-    /// The continuous reading of the look that found the rollback.
-    found_at: u64,
-    /// The wall reading that look took, when it took one. A contract that restored a distrusted
-    /// record knows no such reading, and answers only to a confirmation made after it restored.
-    found_wall_ms: Option<u64>,
+struct WallReading {
+    continuous_ms: u64,
+    wall_ms: u64,
 }
 
-impl Rollback {
-    /// Returns the rollback a look at `continuous_ms` found at `wall_ms` against a reading proved
-    /// at `proved_at`, joined to one already found: the later the clock was proved, the fewer the
-    /// confirmations that can have seen the rollback.
-    fn found(earlier: Option<Self>, proved_at: u64, continuous_ms: u64, wall_ms: u64) -> Self {
-        Self {
-            proved_at: earlier.map_or(proved_at, |earlier| earlier.proved_at.max(proved_at)),
-            found_at: continuous_ms,
-            found_wall_ms: Some(wall_ms),
+/// The lowest readings of the wall clock this contract took.
+///
+/// The owner's confirmation is followed only if every reading taken at or after the time it was
+/// made agrees with it ([`behind_the_confirmation`]), whenever the contract meets it: a
+/// confirmation published late is met after readings it has to answer to, and a clock that is
+/// right again by the next look does not take them back. How far a reading is from agreeing with
+/// a confirmation depends only on its level, the wall reading less the continuous clock carried
+/// forward at the rate the allowance credits, and on when the confirmation was made. So a reading
+/// that a later one is not higher than adds nothing: any confirmation the earlier one refutes, the
+/// later one refutes too. What is kept is the staircase of readings each lower than every later
+/// one, which is as small as the clock lets it be. Readings within a second of each other stand
+/// for one another, at the lower level and the later time, and at most [`Readings::CAPACITY`] are
+/// kept, the two oldest standing for each other past that; both err toward refusing.
+#[derive(Debug, Default)]
+struct Readings(Vec<WallReading>);
+
+impl Readings {
+    const CAPACITY: usize = 16;
+    const SAME_LEVEL_MS: i128 = 1_000;
+
+    fn level(reading: WallReading) -> i128 {
+        i128::from(reading.wall_ms) - i128::from(kr_ipc::clock::credited(reading.continuous_ms))
+    }
+
+    fn at_level(continuous_ms: u64, level: i128) -> WallReading {
+        let wall_ms = level + i128::from(kr_ipc::clock::credited(continuous_ms));
+        WallReading {
+            continuous_ms,
+            wall_ms: u64::try_from(wall_ms).unwrap_or(0),
         }
     }
 
-    /// Whether `established` answers this rollback.
-    fn is_answered_by(&self, established: &Establishment) -> bool {
-        established.boot_ms > self.proved_at
-            && (established.boot_ms > self.found_at
-                || self.found_wall_ms.is_some_and(|wall_ms| {
-                    !behind_the_confirmation(established, self.found_at, wall_ms)
-                }))
+    /// Keeps a reading taken at `continuous_ms`. A reading that comes after a later one counts as
+    /// taken at the later one's time, which errs toward refusing.
+    fn keep(&mut self, continuous_ms: u64, wall_ms: u64) {
+        let continuous_ms = continuous_ms.max(self.0.last().map_or(0, |last| last.continuous_ms));
+        let reading = WallReading {
+            continuous_ms,
+            wall_ms,
+        };
+        let level = Self::level(reading);
+        while self
+            .0
+            .last()
+            .is_some_and(|last| Self::level(*last) >= level)
+        {
+            self.0.pop();
+        }
+        if let Some(last) = self.0.last_mut()
+            && level - Self::level(*last) < Self::SAME_LEVEL_MS
+        {
+            *last = Self::at_level(continuous_ms, Self::level(*last));
+            return;
+        }
+        self.0.push(reading);
+        if self.0.len() > Self::CAPACITY {
+            let lowest = Self::level(self.0.remove(0));
+            self.0[0] = Self::at_level(self.0[0].continuous_ms, lowest);
+        }
+    }
+
+    /// Whether a reading taken at or after the time `established` was made is behind it.
+    fn refute(&self, established: &Establishment) -> bool {
+        self.0.iter().any(|reading| {
+            reading.continuous_ms >= established.boot_ms
+                && behind_the_confirmation(established, reading.continuous_ms, reading.wall_ms)
+        })
     }
 }
 
@@ -673,14 +714,10 @@ impl TimeContract {
         let adopting = recorded.is_none();
         // A distrusted record may rest on a rollback, and nothing recorded says when it was found:
         // only a confirmation made after this contract restored can be an answer to it.
-        let rollback = recorded
+        let unanswered_rollback = recorded
             .as_ref()
             .filter(|state| state.trust == WallClockTrust::Unresolved)
-            .map(|_| Rollback {
-                proved_at: now_continuous,
-                found_at: now_continuous,
-                found_wall_ms: None,
-            });
+            .map(|_| now_continuous);
         let followed = if recorded.is_some() {
             floor
                 .as_ref()
@@ -716,7 +753,8 @@ impl TimeContract {
                 restored: high_water,
                 followed,
                 adopting,
-                rollback,
+                unanswered_rollback,
+                readings: Readings::default(),
                 owner_confirmed: owner_confirmed_at_restore,
                 saved: high_water,
                 trust,
@@ -761,6 +799,7 @@ impl TimeContract {
             continuous_ms,
             active_ms,
         });
+        state.readings.keep(continuous_ms, wall_ms);
         // Only a host with nothing recorded starts its mark here. One that read a checkpoint back
         // has its mark from that, and overwriting it with whatever the clock reads now would throw
         // away the only thing a restarted host knows about its own past.
@@ -877,16 +916,12 @@ impl TimeContract {
         }
 
         state.last = Some(now);
+        state.readings.keep(continuous_ms, wall_ms);
         if let Some(reference) = reference.filter(|_| found.rolled_back) {
             // What the worker found ends what it can take from a restatement, and is not
-            // answered by a confirmation older than the rollback.
+            // answered by a confirmation made before the reading it was found against.
             state.adopting = false;
-            state.rollback = Some(Rollback::found(
-                state.rollback,
-                reference.proved_at,
-                continuous_ms,
-                wall_ms,
-            ));
+            state.unanswered_rollback = state.unanswered_rollback.max(Some(reference.proved_at));
         }
         if found.rolled_back && state.trust != WallClockTrust::Unresolved {
             state.trust = WallClockTrust::Unresolved;
@@ -1330,7 +1365,7 @@ impl TimeContract {
         state.critical = state.critical.saturating_add(1);
         state.trust = WallClockTrust::Trusted;
         state.owner_confirmed = owner;
-        state.rollback = None;
+        state.unanswered_rollback = None;
         state.checkpoint = Some(checkpoint.clone());
         state.high_water = Some(HighWater {
             wall_ms,
@@ -1351,23 +1386,23 @@ impl TimeContract {
     /// worker's own wall clock has to read that carried forward by the continuous time since, or
     /// later: it may be behind it by no more than the rollback tolerance and the rate allowance.
     ///
-    /// A rollback the worker found is answered only by a confirmation that can have seen it
-    /// ([`Rollback::is_answered_by`]): one made after the clock was last proved, and after the
-    /// look that found the rollback or agreeing with the clock that look read. An older
-    /// confirmation does not clear it, whether it is met in that look, in a later one, or after a
-    /// restart, and the clock reading right again by the second reading of the look does not
-    /// change that. The worker's mark, or its checkpoint when it has no mark, outranks a
-    /// confirmation made before that reading was proved in the same way: a wall clock behind it at
-    /// the second reading is a rollback the owner did not see. A restatement answers to that
-    /// reading whatever its age, since it adds nothing to what the worker knows, and never lowers
-    /// it.
+    /// The worker follows it only if every reading it took at or after the time the owner made it
+    /// agrees with it ([`Readings`]), whenever it meets it, and it has found no rollback against a
+    /// reading it proved at or after that time. A confirmation older than a rollback the worker
+    /// found cannot have seen it, so it does not clear it, whether it is met in the look that found
+    /// the rollback, in a later one, or after a restart, and the clock reading right again by the
+    /// second reading of the look does not change that. An owner who corrects a clock that ran
+    /// ahead of the truth is followed all the same: the worker's mark was proved before the owner
+    /// spoke, and the owner's word is what the clock agrees with since. A restatement answers to
+    /// the worker's mark whatever its age, since it adds nothing to what the worker knows, and
+    /// never lowers it.
     ///
-    /// A wall clock behind either is a rollback since, and the confirmation is spent all the same,
-    /// because one a worker met and could not follow is not one it follows when the clock next
-    /// reads right: the owner has said nothing about the clock in between. A worker that still
-    /// trusted its clock distrusts it then, as the daemon's record would. Only the next
-    /// confirmation ends that distrust. A step forward is not held against it, as it is not held
-    /// against a worker that never distrusted its clock: forward steps expire conservatively.
+    /// A confirmation the worker cannot follow is spent all the same, because one a worker met and
+    /// could not follow is not one it follows when the clock next reads right: the owner has said
+    /// nothing about the clock in between. A worker that still trusted its clock distrusts it then,
+    /// as the daemon's record would. Only the next confirmation ends that distrust. A step forward
+    /// is not held against a confirmation, as it is not held against a worker that never
+    /// distrusted its clock: forward steps expire conservatively.
     ///
     /// The reading is taken after the confirmation is loaded, never before: a worker that sampled
     /// its clock and was paused while the owner corrected it and confirmed would otherwise spend
@@ -1398,19 +1433,24 @@ impl TimeContract {
         }
         let continuous_ms = self.continuous.boot_elapsed_ms();
         let wall_ms = self.wall.now_ms().get();
+        state.readings.keep(continuous_ms, wall_ms);
         let reference = self.reference(state, continuous_ms);
-        // A restatement answers to the worker's reading whatever its age. An action of the owner
-        // answers only to one proved after the owner spoke: the owner may be correcting a clock
-        // that ran ahead of the truth.
-        let behind_its_own_reading = reference.is_some_and(|reference| {
-            (established.restated || reference.proved_at >= established.boot_ms)
-                && reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS
+        let behind_its_reference = reference.filter(|reference| {
+            reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS
         });
-        let behind_the_owner = behind_the_confirmation(&established, continuous_ms, wall_ms);
-        let not_answered = state
-            .rollback
-            .is_some_and(|rollback| !rollback.is_answered_by(&established));
-        if behind_the_owner || behind_its_own_reading || not_answered {
+        if let Some(reference) = behind_its_reference {
+            state.unanswered_rollback = state.unanswered_rollback.max(Some(reference.proved_at));
+        }
+        // A restatement answers to the worker's reading whatever its age. An action of the owner
+        // answers only to one proved before the owner spoke: it may be correcting a clock that ran
+        // ahead of the truth, and the clock behind a reading proved after it is a rollback it did
+        // not see.
+        let refused = state.readings.refute(&established)
+            || state
+                .unanswered_rollback
+                .is_some_and(|proved_at| established.boot_ms <= proved_at)
+            || (established.restated && behind_its_reference.is_some());
+        if refused {
             if state.trust == WallClockTrust::Trusted {
                 state.trust = WallClockTrust::Unresolved;
                 state.owner_confirmed = false;
@@ -1521,6 +1561,54 @@ mod tests {
 
     const WALL: u64 = 1_700_000_000_000;
     const AUTHORITY: &str = "time.example";
+
+    /// KR-REQ-09.18: the readings a worker keeps against the owner's confirmation never accept
+    /// what the whole history of its readings refutes, whatever the merging and the capacity do to
+    /// them. A clock that wanders, steps back and recovers fills the staircase past its capacity;
+    /// a confirmation made at any point of the run is refuted by the kept readings whenever it is
+    /// by every reading taken.
+    #[test]
+    fn the_kept_readings_refute_whatever_the_whole_history_refutes() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        for _ in 0..200 {
+            let mut kept = Readings::default();
+            let mut history = Vec::new();
+            let (mut continuous_ms, mut wall_ms) = (10_000_u64, WALL);
+            for _ in 0..(20 + next(60)) {
+                let passed = 1 + next(30_000);
+                continuous_ms += passed;
+                wall_ms = match next(4) {
+                    0 => wall_ms + passed + next(120_000),
+                    1 => (wall_ms + passed).saturating_sub(next(90_000)),
+                    _ => wall_ms + passed,
+                };
+                kept.keep(continuous_ms, wall_ms);
+                history.push((continuous_ms, wall_ms));
+            }
+            for _ in 0..50 {
+                let boot_ms = 10_000 + next(continuous_ms - 10_000);
+                let established = Establishment {
+                    count: 1,
+                    restated: false,
+                    wall_ms: WALL + (boot_ms - 10_000) + next(60_000),
+                    boot_ms,
+                };
+                let refuted_by_history = history.iter().any(|&(at, wall)| {
+                    at >= established.boot_ms && behind_the_confirmation(&established, at, wall)
+                });
+                assert!(
+                    !refuted_by_history || kept.refute(&established),
+                    "the kept readings accepted a confirmation a reading taken after it refutes"
+                );
+            }
+        }
+    }
 
     fn boot(byte: u8) -> BootIdentity {
         BootIdentity {
