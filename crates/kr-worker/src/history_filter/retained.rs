@@ -213,6 +213,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::OwnerConfirmationRequest
         | Method::OwnerConfirmationComplete
         | Method::GrantRevoke
+        | Method::GrantRedeem
         | Method::PushInstallationRegister
         | Method::PushSenderIssue
         | Method::PushSenderRenew
