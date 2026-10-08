@@ -31,9 +31,10 @@
 //! A call closes under the account it started under, and a start or a close asks for a token of its
 //! own. Signing in or out is refused while a call is open, which includes a start that is waiting on
 //! the broker and a close that is not finished (the coordinator counts both). The commit of a
-//! sign-in and the removal of a sign-out then take a gate that refuses every token request while
-//! they run: a start that begins after the check is refused its token, and one that began before it
-//! was counted by the check. No call can hold a token of the old account across the change.
+//! sign-in and the removal of a sign-out then raise a gate that makes every token request wait while
+//! they run: a start that begins after the check waits for the change to end and takes the token of
+//! the account the change leaves, and one that began before it was counted by the check. No call can
+//! hold a token of the old account across the change.
 //!
 //! Signing out removes the grant and asks the service to end it, under the same scope rule as
 //! signing in.
@@ -674,7 +675,9 @@ impl Inner {
                 };
                 if let Err(error) = held.signed_in.commit(issued, grant.nonce()).await {
                     eprintln!("kr-controller: a host sign-in could not be kept: {error}");
-                    let _ = held.account.revoke(&refresh).await;
+                    // The grant is not kept, so its token is ended: queued where the store allows,
+                    // and sent once where it does not.
+                    let _ = held.signed_in.revoke_unkept(refresh).await;
                     return AccountAttempt::NotKept;
                 }
                 if let Ok(IdentityRead::Disagreed) = held.signed_in.complete_identity().await {
@@ -684,7 +687,7 @@ impl Inner {
             }
             Ok(Exchanged::Refused { leftover }) => {
                 if let Some(leftover) = leftover {
-                    let _ = held.account.revoke(&leftover).await;
+                    let _ = held.signed_in.revoke_unkept(leftover).await;
                 }
                 AccountAttempt::ServiceRefused
             }
@@ -757,14 +760,12 @@ impl AccountTokenSource for HostTokens {
             // While the account is being changed a request waits for the change to end, so that a
             // call that starts then is made under the account the change leaves and not under one
             // that is about to go.
-            #[cfg(feature = "testing")]
-            let _waiting = Waiting::of(&self.inner);
-            let _ = self
-                .inner
-                .changing
-                .subscribe()
-                .wait_for(|changing| !*changing)
-                .await;
+            let mut changing = self.inner.changing.subscribe();
+            if *changing.borrow() {
+                #[cfg(feature = "testing")]
+                let _waiting = Waiting::of(&self.inner);
+                let _ = changing.wait_for(|changing| !*changing).await;
+            }
             if self.inner.recover().await.is_err() {
                 return Err(kr_client::ClientError::refusal(
                     ErrorCode::StorageUnavailable,
