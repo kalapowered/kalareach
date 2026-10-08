@@ -389,9 +389,6 @@ struct TimeState {
     /// the reading it restored at, since it cannot tell what the distrust rests on. It is dropped
     /// when the clock is trusted again.
     unanswered_rollback: Option<u64>,
-    /// The lowest readings of the wall clock this contract took: what it holds against a
-    /// confirmation that a reading taken after it refutes.
-    readings: Readings,
     trust: WallClockTrust,
     checkpoint: Option<TimeCheckpoint>,
     revalidation_owed: bool,
@@ -443,91 +440,83 @@ struct Reference {
     proved_at: u64,
 }
 
-/// A reading of the wall clock, and the continuous reading it was taken at.
+/// A wall reading as the staircase keeps it: when it was taken, as a continuous reading, and its
+/// level ([`level_of`]).
 #[derive(Clone, Copy, Debug)]
-struct WallReading {
+struct Kept {
     continuous_ms: u64,
-    wall_ms: u64,
+    level: i128,
+}
+
+/// A wall reading's level: the wall reading less what the continuous clock has credited since the
+/// boot began ([`kr_ipc::clock::credited_micros`]), in millionths of a millisecond, so that the
+/// level is exact.
+fn level_of(continuous_ms: u64, wall_ms: u64) -> i128 {
+    i128::from(wall_ms) * 1_000_000 - kr_ipc::clock::credited_micros(continuous_ms)
+}
+
+/// The level below which a reading taken at or after the owner's confirmation is behind it: the
+/// owner's reading less what the continuous clock has credited up to the time it was made, less the
+/// rollback tolerance. A reading taken at `continuous_ms` is behind the owner's reading, carried
+/// forward by the continuous clock, by more than the tolerance and the rate allowance exactly when
+/// its level is below this.
+fn refuting_level(established: &Establishment) -> i128 {
+    level_of(established.boot_ms, established.wall_ms)
+        - i128::from(MAX_WALL_CLOCK_ROLLBACK_MS) * 1_000_000
 }
 
 /// The lowest readings of the wall clock this contract took.
 ///
 /// The owner's confirmation is followed only if every reading taken at or after the time it was
-/// made agrees with it ([`behind_the_confirmation`]), whenever the contract meets it: a
+/// made agrees with it ([`refuting_level`]), whenever the contract meets it: a
 /// confirmation published late is met after readings it has to answer to, and a clock that is
-/// right again by the next look does not take them back. How far a reading is from agreeing with
-/// a confirmation depends only on its level, the wall reading less the continuous clock carried
-/// forward at the rate the allowance credits, and on when the confirmation was made. So a reading
-/// that a later one is not higher than adds nothing: any confirmation the earlier one refutes, the
-/// later one refutes too. What is kept is the staircase of readings each lower than every later
-/// one, which is as small as the clock lets it be. Readings within a second of each other stand
+/// right again by the next look does not take them back. Whether a reading agrees depends only on
+/// its level, and on when the confirmation was made. So a reading that a later one is not higher
+/// than adds nothing: any confirmation the earlier one refutes, the later one refutes too. What is
+/// kept is the staircase of readings each lower than every later one, which is as small as the
+/// clock lets it be, and exact. Two readings whose levels are within a second of each other stand
 /// for one another, at the lower level and the later time, and at most [`Readings::CAPACITY`] are
-/// kept, the two oldest standing for each other past that; both err toward refusing.
+/// kept, the two oldest standing for each other past that. Both can refuse a confirmation the
+/// readings taken would not have refuted, by up to a second, and never the other way.
 #[derive(Debug, Default)]
-struct Readings(Vec<WallReading>);
+struct Readings(Vec<Kept>);
 
 impl Readings {
     const CAPACITY: usize = 16;
-    const SAME_LEVEL_MS: i128 = 1_000;
-
-    fn level(reading: WallReading) -> i128 {
-        i128::from(reading.wall_ms) - i128::from(kr_ipc::clock::credited(reading.continuous_ms))
-    }
-
-    fn at_level(continuous_ms: u64, level: i128) -> WallReading {
-        let wall_ms = level + i128::from(kr_ipc::clock::credited(continuous_ms));
-        WallReading {
-            continuous_ms,
-            wall_ms: u64::try_from(wall_ms).unwrap_or(0),
-        }
-    }
+    /// A second, in the millionths of a millisecond a level is in.
+    const SAME_LEVEL: i128 = 1_000_000_000;
 
     /// Keeps a reading taken at `continuous_ms`. A reading that comes after a later one counts as
     /// taken at the later one's time, which errs toward refusing.
     fn keep(&mut self, continuous_ms: u64, wall_ms: u64) {
         let continuous_ms = continuous_ms.max(self.0.last().map_or(0, |last| last.continuous_ms));
-        let reading = WallReading {
-            continuous_ms,
-            wall_ms,
-        };
-        let level = Self::level(reading);
-        while self
-            .0
-            .last()
-            .is_some_and(|last| Self::level(*last) >= level)
-        {
+        let level = level_of(continuous_ms, wall_ms);
+        while self.0.last().is_some_and(|last| last.level >= level) {
             self.0.pop();
         }
         if let Some(last) = self.0.last_mut()
-            && level - Self::level(*last) < Self::SAME_LEVEL_MS
+            && level - last.level < Self::SAME_LEVEL
         {
-            *last = Self::at_level(continuous_ms, Self::level(*last));
+            last.continuous_ms = continuous_ms;
             return;
         }
-        self.0.push(reading);
+        self.0.push(Kept {
+            continuous_ms,
+            level,
+        });
         if self.0.len() > Self::CAPACITY {
-            let lowest = Self::level(self.0.remove(0));
-            self.0[0] = Self::at_level(self.0[0].continuous_ms, lowest);
+            let lowest = self.0.remove(0).level;
+            self.0[0].level = lowest;
         }
     }
 
     /// Whether a reading taken at or after the time `established` was made is behind it.
     fn refute(&self, established: &Establishment) -> bool {
-        self.0.iter().any(|reading| {
-            reading.continuous_ms >= established.boot_ms
-                && behind_the_confirmation(established, reading.continuous_ms, reading.wall_ms)
-        })
+        let refuting = refuting_level(established);
+        self.0
+            .iter()
+            .any(|kept| kept.continuous_ms >= established.boot_ms && kept.level < refuting)
     }
-}
-
-/// Whether a wall reading taken at `continuous_ms` is behind the owner's confirmation, carried
-/// forward by the continuous clock, by more than the rollback tolerance and the rate allowance.
-fn behind_the_confirmation(established: &Establishment, continuous_ms: u64, wall_ms: u64) -> bool {
-    let elapsed = continuous_ms.saturating_sub(established.boot_ms);
-    let expected = established.wall_ms.saturating_add(elapsed);
-    let slack = MAX_WALL_CLOCK_ROLLBACK_MS
-        .saturating_add(elapsed.saturating_sub(kr_ipc::clock::credited(elapsed)));
-    wall_ms.saturating_add(slack) < expected
 }
 
 /// The three clocks and the time service a contract reads, and the host's clock floor it
@@ -625,6 +614,9 @@ pub struct TimeContract {
     adapter: Arc<dyn TimeAdapter>,
     /// The host's clock floor, which every reading taken here is published in.
     floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
+    /// Every reading of the wall clock this contract took, kept for what a confirmation the owner
+    /// made before it is held to ([`Readings`]). Locked alone, or after `state`, never before it.
+    readings: Mutex<Readings>,
     state: Mutex<TimeState>,
 }
 
@@ -747,6 +739,7 @@ impl TimeContract {
             wall,
             adapter,
             floor,
+            readings: Mutex::new(Readings::default()),
             state: Mutex::new(TimeState {
                 critical: 0,
                 written: 0,
@@ -754,7 +747,6 @@ impl TimeContract {
                 followed,
                 adopting,
                 unanswered_rollback,
-                readings: Readings::default(),
                 owner_confirmed: owner_confirmed_at_restore,
                 saved: high_water,
                 trust,
@@ -792,14 +784,13 @@ impl TimeContract {
     fn sample(&self) {
         let continuous_ms = self.continuous.boot_elapsed_ms();
         let active_ms = self.active.active_elapsed_ms();
-        let wall_ms = self.wall.now_ms().get();
+        let wall_ms = self.wall_reading();
         self.publish(wall_ms);
         let mut state = self.lock();
         state.last = Some(Reading {
             continuous_ms,
             active_ms,
         });
-        state.readings.keep(continuous_ms, wall_ms);
         // Only a host with nothing recorded starts its mark here. One that read a checkpoint back
         // has its mark from that, and overwriting it with whatever the clock reads now would throw
         // away the only thing a restarted host knows about its own past.
@@ -864,7 +855,7 @@ impl TimeContract {
         // hiding it. Attributing it that way can only make a rollback look larger, never smaller.
         let continuous_ms = self.continuous.boot_elapsed_ms();
         let active_ms = self.active.active_elapsed_ms();
-        let wall_ms = self.wall.now_ms().get();
+        let wall_ms = self.wall_reading();
         // Published before anything is decided from it. The raw sample is still what the rollback
         // detection below compares: the floor only moves forward, so it cannot show that the wall
         // clock went back.
@@ -916,10 +907,9 @@ impl TimeContract {
         }
 
         state.last = Some(now);
-        state.readings.keep(continuous_ms, wall_ms);
         if let Some(reference) = reference.filter(|_| found.rolled_back) {
             // What the worker found ends what it can take from a restatement, and is not
-            // answered by a confirmation made before the reading it was found against.
+            // answered by a confirmation made at or before the reading it was found against.
             state.adopting = false;
             state.unanswered_rollback = state.unanswered_rollback.max(Some(reference.proved_at));
         }
@@ -1044,7 +1034,7 @@ impl TimeContract {
     /// tolerance forgave cannot give a deadline back the time it appeared to lose, beyond what the
     /// rate allowance gives.
     fn proven_wall_ms(&self, state: &TimeState) -> u64 {
-        let now = self.wall.now_ms().get();
+        let now = self.wall_reading();
         state.high_water.map_or(now, |mark| {
             now.max(mark.projected(self.continuous.boot_elapsed_ms()))
         })
@@ -1316,7 +1306,7 @@ impl TimeContract {
             let agreement = microseconds_to_millis(bound_of(offered))
                 .saturating_add(microseconds_to_millis(bound_of(&reading)))
                 .saturating_add(MAX_WALL_CLOCK_ROLLBACK_MS);
-            let host_now = self.wall.now_ms().get();
+            let host_now = self.wall_reading();
             if host_now.abs_diff(offered.wall_clock_ms.get()) > agreement {
                 return Err(refuse(
                     kr_protocol::action::RetrustRefusal::DisagreesWithThisHost,
@@ -1324,7 +1314,7 @@ impl TimeContract {
             }
         }
         let continuous_ms = self.continuous.boot_elapsed_ms();
-        let wall_clock_ms = self.wall.now_ms();
+        let wall_clock_ms = TimestampMs::new(self.wall_reading());
         let owner = matches!(
             evidence,
             kr_protocol::action::RetrustEvidence::OwnerRetrust { .. }
@@ -1432,8 +1422,7 @@ impl TimeContract {
             return;
         }
         let continuous_ms = self.continuous.boot_elapsed_ms();
-        let wall_ms = self.wall.now_ms().get();
-        state.readings.keep(continuous_ms, wall_ms);
+        let wall_ms = self.wall_reading();
         let reference = self.reference(state, continuous_ms);
         let behind_its_reference = reference.filter(|reference| {
             reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS
@@ -1442,10 +1431,10 @@ impl TimeContract {
             state.unanswered_rollback = state.unanswered_rollback.max(Some(reference.proved_at));
         }
         // A restatement answers to the worker's reading whatever its age. An action of the owner
-        // answers only to one proved before the owner spoke: it may be correcting a clock that ran
-        // ahead of the truth, and the clock behind a reading proved after it is a rollback it did
-        // not see.
-        let refused = state.readings.refute(&established)
+        // answers only to a reading proved at or after it: the owner may be correcting a clock
+        // that ran ahead of the truth, so a mark proved before the owner spoke is not held against
+        // it, and the clock behind a reading proved after it is a rollback the owner did not see.
+        let refused = self.readings_refute(&established)
             || state
                 .unanswered_rollback
                 .is_some_and(|proved_at| established.boot_ms <= proved_at)
@@ -1518,7 +1507,7 @@ impl TimeContract {
         let trust = self.lock().trust;
         let checkpoint = TimeCheckpoint {
             boot_identity: self.boot_identity.clone(),
-            wall_clock_ms: self.wall.now_ms(),
+            wall_clock_ms: TimestampMs::new(self.wall_reading()),
             continuous_ms: U64::new(continuous_ms),
             reading,
             trust,
@@ -1532,11 +1521,32 @@ impl TimeContract {
             object: object.name.clone(),
             reason,
             boot_identity: self.boot_identity.clone(),
-            expired_at_ms: self.wall.now_ms(),
+            expired_at_ms: TimestampMs::new(self.wall_reading()),
             // A UTC deadline is the only thing that can present an object in another boot, so an
             // object that carries one is an object this record is the last refusal of.
             cross_reboot: object.trusted_utc_deadline_ms.is_some(),
         }
+    }
+
+    /// Reads the wall clock, and keeps the reading: every reading this contract takes of it comes
+    /// through here. The continuous clock is read after the wall clock, so a pause between the two
+    /// puts the reading later, which errs toward refusing a confirmation.
+    fn wall_reading(&self) -> u64 {
+        let wall_ms = self.wall.now_ms().get();
+        let continuous_ms = self.continuous.boot_elapsed_ms();
+        self.readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keep(continuous_ms, wall_ms);
+        wall_ms
+    }
+
+    /// Whether a reading taken since the owner made `established` is behind it.
+    fn readings_refute(&self, established: &Establishment) -> bool {
+        self.readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .refute(established)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TimeState> {
@@ -1561,6 +1571,70 @@ mod tests {
 
     const WALL: u64 = 1_700_000_000_000;
     const AUTHORITY: &str = "time.example";
+
+    /// Whether a wall reading taken at `continuous_ms`, at or after the owner's confirmation, is
+    /// behind it, carried forward by the continuous clock, by more than the rollback tolerance and
+    /// the rate allowance, worked out from the rule itself rather than from a reading's level.
+    fn behind_the_confirmation(
+        established: &Establishment,
+        continuous_ms: u64,
+        wall_ms: u64,
+    ) -> bool {
+        let elapsed = i128::from(continuous_ms) - i128::from(established.boot_ms);
+        let allowance = i128::from(kr_ipc::clock::RATE_ALLOWANCE_PPM);
+        i128::from(wall_ms) * 1_000_000 + i128::from(MAX_WALL_CLOCK_ROLLBACK_MS) * 1_000_000
+            < i128::from(established.wall_ms) * 1_000_000 + elapsed * (1_000_000 - allowance)
+    }
+
+    /// KR-REQ-09.18: a reading the staircase replaces or merges still refutes what it refuted, to
+    /// the millisecond. A reading's level is exact, so the rate allowance's rounding to a
+    /// millisecond cannot separate two readings of one level, and the two merges move a level only
+    /// to a later time.
+    #[test]
+    fn a_replaced_or_merged_reading_still_refutes_what_it_refuted_to_the_millisecond() {
+        let confirmation = |boot_ms: u64, wall_ms: u64| Establishment {
+            count: 1,
+            restated: false,
+            wall_ms,
+            boot_ms,
+        };
+        for (boot_ms, wall_ms, first, second) in [
+            // The second reading is 1 ms above the first's level once the allowance is rounded.
+            (
+                1,
+                WALL + 5_001,
+                (10_000, WALL + 9_999),
+                (10_001, WALL + 10_000),
+            ),
+            (5_000, WALL, (10_000, WALL - 1), (15_000, WALL + 4_999)),
+        ] {
+            let established = confirmation(boot_ms, wall_ms);
+            assert!(
+                behind_the_confirmation(&established, first.0, first.1),
+                "the first reading refutes"
+            );
+            let mut kept = Readings::default();
+            kept.keep(first.0, first.1);
+            kept.keep(second.0, second.1);
+            assert!(kept.refute(&established), "and the staircase still does");
+        }
+
+        // The oldest two readings stand for each other past the capacity.
+        let established = confirmation(1, WALL + 5_001);
+        let mut kept = Readings::default();
+        kept.keep(10_000, WALL + 9_999);
+        for step in 1..=Readings::CAPACITY as u64 {
+            kept.keep(
+                10_000 + step * 30_000,
+                WALL + 9_999 + step * 30_000 + step * 2_000,
+            );
+        }
+        assert_eq!(kept.0.len(), Readings::CAPACITY);
+        assert!(
+            kept.refute(&established),
+            "the oldest reading's level survives"
+        );
+    }
 
     /// KR-REQ-09.18: the readings a worker keeps against the owner's confirmation never accept
     /// what the whole history of its readings refutes, whatever the merging and the capacity do to
@@ -1966,6 +2040,103 @@ mod tests {
             }),
             tombstones: Vec::new(),
         }
+    }
+
+    /// A wall clock whose `n`th reading from the time it is armed reads a minute low.
+    #[derive(Debug)]
+    struct FallsOnTheNthReading {
+        inner: ManualWallClock,
+        countdown: std::sync::atomic::AtomicI64,
+    }
+
+    impl WallClock for FallsOnTheNthReading {
+        fn now_ms(&self) -> TimestampMs {
+            let reading = self.inner.now_ms().get();
+            let n = self
+                .countdown
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            TimestampMs::new(if n == 1 { reading - 60_000 } else { reading })
+        }
+    }
+
+    /// KR-REQ-09.18: every reading of the wall clock a contract takes is held against a
+    /// confirmation the owner made before it, not only the readings its looks take. The owner
+    /// makes a confirmation and its publication is delayed; the wall clock reads a minute low once,
+    /// in the checkpoint a look renews, or in the reading that settles a UTC deadline; and the
+    /// confirmation is published afterwards, when the clock reads right again. The worker, which
+    /// trusts its clock, does not take the owner's word for a clock it saw a minute behind it.
+    #[test]
+    fn the_reading_a_checkpoint_or_a_deadline_takes_is_held_against_a_confirmation() {
+        use kr_ipc::floor::SharedFloor;
+
+        enum Reading {
+            TheCheckpointOfALook,
+            TheSettlingOfADeadline,
+            None,
+        }
+        let met_afterwards = |reading: Reading| {
+            let continuous = ManualSharedClock::new();
+            continuous.advance(Duration::from_secs(30));
+            let active = ManualActiveClock::new();
+            active.advance(Duration::from_secs(30));
+            let wall = Arc::new(FallsOnTheNthReading {
+                inner: ManualWallClock::new(WALL),
+                countdown: std::sync::atomic::AtomicI64::new(0),
+            });
+            let floor = Arc::new(SharedFloor::in_process(0));
+            let contract = TimeContract::new(
+                boot(2),
+                AUTHORITY,
+                TimeSources {
+                    continuous: Arc::new(continuous.clone()),
+                    active: Arc::new(active.clone()),
+                    wall: Arc::clone(&wall) as Arc<dyn WallClock>,
+                    adapter: Arc::new(RecordedTimeAdapter::new(qualified())),
+                    floor: Some(Arc::clone(&floor)),
+                },
+            );
+            assert_eq!(contract.trust(), WallClockTrust::Trusted);
+            let passes = |seconds: u64| {
+                continuous.advance(Duration::from_secs(seconds));
+                active.advance(Duration::from_secs(seconds));
+                wall.inner.advance(Duration::from_secs(seconds));
+            };
+            passes(10);
+            let confirmed = (wall.inner.now_ms().get(), continuous.boot_elapsed_ms());
+            passes(10);
+            match reading {
+                Reading::TheCheckpointOfALook => {
+                    wall.countdown
+                        .store(2, std::sync::atomic::Ordering::Release);
+                    contract.observe();
+                }
+                Reading::TheSettlingOfADeadline => {
+                    wall.countdown
+                        .store(1, std::sync::atomic::Ordering::Release);
+                    let _ = contract.settled_utc_ms();
+                }
+                Reading::None => {}
+            }
+            passes(10);
+            floor.establish(confirmed.0, confirmed.1);
+            contract.observe();
+            (contract.trust(), contract.durable_state().0.owner_confirmed)
+        };
+        assert_eq!(
+            met_afterwards(Reading::None),
+            (WallClockTrust::Trusted, true),
+            "the control: a clock that never fell follows the owner's word"
+        );
+        assert_eq!(
+            met_afterwards(Reading::TheCheckpointOfALook),
+            (WallClockTrust::Unresolved, false),
+            "the checkpoint a look renews reads a minute low"
+        );
+        assert_eq!(
+            met_afterwards(Reading::TheSettlingOfADeadline),
+            (WallClockTrust::Unresolved, false),
+            "the reading that settles a UTC deadline reads a minute low"
+        );
     }
 
     /// KR-REQ-09.19: a worker that never trusted its clock has no mark, and a clock that reads
