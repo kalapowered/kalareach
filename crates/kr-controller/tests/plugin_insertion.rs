@@ -592,6 +592,47 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
     assert_eq!(after.revision, draft.revision, "no claim was made");
 }
 
+/// What keeps a runtime reading its sockets and firing its timers while one of its tasks is held
+/// on a thread: a thread that hands the runtime a task every few milliseconds, until it is dropped.
+///
+/// A task of this runtime that waits inside a pause holds one of its threads, as a worker's own
+/// process would hold one of its own. When that is the thread that was reading the runtime's sockets
+/// and every other thread is asleep, nothing reads a socket or fires a timer until the pause ends,
+/// and a wait for the worker to go on would be a wait for the release it has not yet been given. A
+/// task handed to the runtime from outside wakes a sleeping thread, which polls the sockets and the
+/// timers when it goes to sleep again.
+struct Awake {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Awake {
+    fn start(runtime: tokio::runtime::Handle) -> Self {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // Until the sender is dropped.
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(std::time::Duration::from_millis(5))
+            {
+                drop(runtime.spawn(async {}));
+            }
+        });
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Writes a mutation to the worker without waiting for its answer.
 async fn write(
     client: &mut kr_ipc::client::LocalClient,
@@ -631,7 +672,10 @@ async fn kr_req_23_30_an_offer_claimed_when_its_connection_ends_is_rejected_and_
     write(&mut asking, mutation.clone()).await;
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
 
-    // A repeat of the offer holds the connection's loop inside the dispatch boundary.
+    // A repeat of the offer holds the connection's loop inside the dispatch boundary. The loop
+    // waits on a thread of this runtime, which may be the one that reads its sockets and fires its
+    // timers, so the runtime is kept polling for as long as the loop is held.
+    let _awake = Awake::start(tokio::runtime::Handle::current());
     let (arrived, release) = service.pause_inside_boundary();
     let mut repeat = mutation;
     repeat.request_id = RequestId::new(2);

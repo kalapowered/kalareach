@@ -871,6 +871,21 @@ fn a_session_that_ends_orphans_its_drafts_and_ends_the_offers_in_flight() {
         "a draft with no binding that targets the session is orphaned too"
     );
 
+    // The report of the offer that was in flight arrives after the end: it cannot change what the
+    // end decided, and the refusal says the session has ended.
+    let report = harness
+        .report(
+            ending,
+            &harness.begin_of(ending, created.draft_id, offered.transfer_id, action(91)),
+            accepted("too late"),
+        )
+        .expect_err("a report for a session that has ended");
+    assert_eq!(report.code(), ErrorCode::SessionClosed, "{report:?}");
+    assert_eq!(
+        state_of(&read(&harness, created.draft_id), offered.transfer_id),
+        InsertionState::Failed
+    );
+
     // Nothing is offered from an orphaned draft, and ending the session again changes nothing.
     let late = harness
         .service
