@@ -4281,6 +4281,25 @@
       ],
       "type": "object"
     },
+    "AuthoritySelection": {
+      "additionalProperties": false,
+      "description": "The authority feed this host reads its remote revocations from.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts, so a change applies at the next start. An owner whose host\nlost its feed points it at another service, or at none. Absent means this host has no feed:\nit takes revocations from the owners who reach it directly, and a remote owner's revocation\ncannot reach it.",
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The service's origin: an `https` origin, or an `http` origin on a loopback address,\nspelled as a gateway origin is, with no path and no trailing slash."
+        }
+      },
+      "type": "object"
+    },
     "BackupGeneration": {
       "description": "The backup generation an archive belongs to. Only its producer advances it.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -7747,6 +7766,13 @@
           "default": {},
           "description": "What the owner or an administrator wrote down for the agents of each package\n(`publisher/plugin`).\n\nSection 7 lets an agent whose own sandbox cannot nest under the session's job run under\nan **explicitly selected** reduced-ownership profile. A launch runs an agent under the\n`ownership` its profile records, and nothing reads this section for a launch: every\nprofile this host writes records `full`, and this host starts no agent through the\nworker's launch. So the section is validated, kept and reported as `agents.ownership`,\nand a change to it changes nothing a launch does. An entry names `reduced` or `full` for\none package, and nothing else; a package with no entry is `full`.",
           "type": "object"
+        },
+        "authority": {
+          "$ref": "#/$defs/AuthoritySelection",
+          "default": {
+            "origin": null
+          },
+          "description": "The authority feed this host reads its remote revocations from.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches it."
         },
         "ceilings": {
           "$ref": "#/$defs/ConfigurationCeilings",

@@ -321,8 +321,8 @@ impl InForce {
 
 /// The selections this daemon read when it started, which are what it acts on until it next starts.
 ///
-/// The network endpoint, the voice service and the backup uploader are built once, at startup, from the document on disk
-/// then. A later edit applies at the next start, and `kr doctor` compares the two so an owner who
+/// The network endpoint, the voice service, the backup uploader and the authority feed are built
+/// once, at startup, from the document on disk then. A later edit applies at the next start, and `kr doctor` compares the two so an owner who
 /// changed one can see that it is not in force yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Started {
@@ -332,6 +332,8 @@ pub struct Started {
     pub voice: configuration::VoiceSelection,
     /// The managed storage service this daemon uploads its backups to.
     pub storage: configuration::StorageSelection,
+    /// The authority feed this daemon reads its remote revocations from.
+    pub authority: configuration::AuthoritySelection,
 }
 
 impl Started {
@@ -343,6 +345,7 @@ impl Started {
             network: document.network.clone(),
             voice: document.voice.clone(),
             storage: document.storage.clone(),
+            authority: document.authority.clone(),
         })
     }
 }
@@ -1174,8 +1177,9 @@ pub fn network_check(
     let moved = Started::of(document) != *started;
     if moved {
         detail = detail.stated(
-            "; the configuration document now selects a different network, voice broker or storage \
-             service from the one this host started with, which applies at the next start",
+            "; the configuration document now selects a different network, voice broker, storage \
+             service or authority feed from the one this host started with, which applies at the \
+             next start",
         );
     }
     DoctorCheck::new(
