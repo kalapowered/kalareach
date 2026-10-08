@@ -36,9 +36,9 @@
 //! daemon states its record again, with the reading it has just taken ([`SharedFloor::restate`]),
 //! rather than records an action of the owner: that is how a worker that begins in a new boot
 //! learns of a confirmation made in an earlier one, and how a publication the daemon did not
-//! complete is made good. It is not a new action, so a worker takes it only while it has recorded
-//! nothing, has met no confirmation and has found no rollback, and any other worker spends it
-//! without following it. The limits are the words': a reading of zero, or one that 44 bits cannot
+//! complete is made good. It is not a new action, so a worker takes it only while it began with
+//! nothing recorded, has met no confirmation and has found no rollback, and any other worker spends
+//! it without following it. The limits are the words': a reading of zero, or one that 44 bits cannot
 //! hold, is published as a withdrawal or not stated, and the count of 19 bits repeats after
 //! 524,287 publications in one boot, which a reader that looks less often than that could take for
 //! no change.
@@ -222,8 +222,8 @@ pub struct Establishment {
     pub count: u64,
     /// Whether the daemon states its record again, with the reading it has just taken, rather
     /// than records an action of the owner: a worker takes it for what the record holds only while
-    /// it has recorded nothing, has met no confirmation and has found no rollback, and any other
-    /// worker spends it without following it.
+    /// it began with nothing recorded, has met no confirmation and has found no rollback, and any
+    /// other worker spends it without following it.
     pub restated: bool,
     /// The wall reading the owner established, in UTC milliseconds.
     pub wall_ms: u64,

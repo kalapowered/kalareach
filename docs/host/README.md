@@ -3871,27 +3871,31 @@ clock's continuity is lost. This restatement is how a worker that begins in a ne
 confirmation made in an earlier boot, and how a publication the daemon did not complete is made good
 for the workers that can still take one, as below. It is not an action of the owner.
 
-A worker follows an action of the owner that it has not met before when its own wall clock, read
-after it loaded the confirmation, is behind the owner's time, carried forward by the continuous
-clock, by no more than five seconds and the rate allowance. The wall clock must also be no more than
-five seconds behind the worker's own reading of the clock when the worker proved that reading at or
-after the owner spoke. That reading is the worker's mark carried forward by the continuous clock or,
-when the worker has no mark, the checkpoint it began with. The worker then trusts its clock again,
-whether it had distrusted it or not, keeps its expiration tombstones and writes its new mark down.
-From then on the owner is why it trusts its clock, so its time service stopping does not take that
-back. A worker follows each confirmation once. A wall clock that is behind either reading spends the
-confirmation without following it, and a worker that still trusted its clock then distrusts it, as
-the daemon's record would. A step forward is not held against it. A pause between the daemon's two
-clock readings can ask more of the worker's clock than the owner's word did, and fails in the same
-direction.
+A worker follows an action of the owner that it has not met before when every reading of its wall
+clock taken at or after the time the owner made it agrees with it: each is behind the owner's time,
+carried forward by the continuous clock, by no more than five seconds and the rate allowance. The
+readings include the one the worker takes after it loads the confirmation. The worker keeps the
+lowest readings it has taken, so a confirmation that the daemon publishes late is judged against
+what the clock read in the meantime, and a clock that reads right again by the next look does not
+take a reading back. The worker must also have found no rollback against a reading it proved at or
+after the time the owner spoke. That reading is its mark carried forward by the continuous clock or,
+when the worker has no mark, the checkpoint it began with. An owner who corrects a clock that ran
+ahead of the truth is followed all the same, because the worker proved that clock before the owner
+spoke. The worker then trusts its clock again, whether it had distrusted it or not, keeps its
+expiration tombstones and writes its new mark down. From then on the owner is why it trusts its
+clock, so its time service stopping does not take that back. A worker follows each confirmation
+once. A confirmation that fails either condition is spent without being followed, and a worker that
+still trusted its clock then distrusts it, as the daemon's record would. A step forward is not held
+against it. A pause between the daemon's two clock readings can ask more of the worker's clock than
+the owner's word did, and fails in the same direction.
 
-A rollback the worker found is answered only by a confirmation that could have seen it: one made
-after the worker last proved its clock, and either made after the look that found the rollback or
-agreeing with the clock that look read. An older confirmation does not clear the rollback, whether
-the worker meets it in that look, in a later one or after a restart, and a wall clock that reads
-right again before the worker's second reading of the look does not change that. A worker that
-restarts on a journal that records its clock as distrusted answers only to a confirmation made after
-it restarted. A later action of the owner ends that distrust.
+A confirmation made before a rollback the worker found cannot have seen it, so it does not end the
+distrust. The worker holds the rollback against every confirmation made at or before the last time
+it proved its clock before the rollback, and the readings it kept hold the rest against it. This is
+so whether the worker meets the confirmation in the look that found the rollback, in a later look or
+after a restart, and whether or not the clock reads right again by the worker's second reading of
+the look. A worker that restarts on a journal that records its clock as distrusted answers only to a
+confirmation made after it restarted. A later action of the owner ends that distrust.
 
 A restatement answers to a different rule, because it adds nothing to what the worker knows. A
 worker that began with nothing recorded, such as a new session, and has met no confirmation and
