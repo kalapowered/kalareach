@@ -36,10 +36,12 @@
 //! daemon states its record again, with the reading it has just taken ([`SharedFloor::restate`]),
 //! rather than records an action of the owner: that is how a worker that begins in a new boot
 //! learns of a confirmation made in an earlier one, and how a publication the daemon did not
-//! complete is made good, and a worker that is running does not take it for a new action. The
-//! limits are the words': a reading of zero, or one that 44 bits cannot hold, is published as a
-//! withdrawal or not stated, and the count of 19 bits repeats after 524,287 publications in one
-//! boot, which a reader that looks less often than that could take for no change.
+//! complete is made good. It is not a new action, so a worker takes it only while it has recorded
+//! nothing, has met no confirmation and has found no rollback, and any other worker spends it
+//! without following it. The limits are the words': a reading of zero, or one that 44 bits cannot
+//! hold, is published as a withdrawal or not stated, and the count of 19 bits repeats after
+//! 524,287 publications in one boot, which a reader that looks less often than that could take for
+//! no change.
 //!
 //! The words carry the owner's action only as far as the account boundary. Any process of the
 //! account that maps the file can write them, as it can raise the floor, and one forged write
@@ -219,8 +221,9 @@ pub struct Establishment {
     /// acted on before.
     pub count: u64,
     /// Whether the daemon states its record again, with the reading it has just taken, rather
-    /// than records an action of the owner: a worker that is running does not take it for a new
-    /// action, and one that begins takes it for what the record holds.
+    /// than records an action of the owner: a worker takes it for what the record holds only while
+    /// it has recorded nothing, has met no confirmation and has found no rollback, and any other
+    /// worker spends it without following it.
     pub restated: bool,
     /// The wall reading the owner established, in UTC milliseconds.
     pub wall_ms: u64,
@@ -451,8 +454,9 @@ impl SharedFloor {
     /// stated.
     ///
     /// For a worker that begins after the owner's action, in this boot or an earlier one, and for
-    /// a publication that did not complete. A worker that is running does not take it for a new
-    /// action of the owner ([`Establishment::restated`]).
+    /// a publication that did not complete. It is not a new action of the owner, so a worker that
+    /// has met a confirmation, found a rollback or restored a record does not follow it
+    /// ([`Establishment::restated`]).
     pub fn restate(&self, wall_ms: u64, boot_ms: u64) -> bool {
         let stated = Self::can_state(wall_ms, boot_ms);
         if stated {

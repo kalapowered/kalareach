@@ -392,12 +392,12 @@ impl ClockTrust {
     /// after the commit and before its stores, or between them) is made good at the next reading.
     /// A boot whose clock continuity is lost has no reading to say it with.
     ///
-    /// A restatement is not an action of the owner: a worker that is running, or that restored a
-    /// record, does not take it for one. That matters most when the floor shows a withdrawal
-    /// because the record, in memory, found a rollback whose write was lost when the daemon
-    /// stopped: the record then reads as confirmed again, and states it again over the withdrawal,
-    /// and no worker that found the rollback is cleared by it. A worker that begins after takes
-    /// what the record holds, as the daemon does.
+    /// A restatement is not an action of the owner: a worker that has met a confirmation, found a
+    /// rollback or restored a record does not follow it. That matters most when the floor shows a
+    /// withdrawal because the record, in memory, found a rollback whose write was lost when the
+    /// daemon stopped: the record then reads as confirmed again, and states it again over the
+    /// withdrawal, and no worker that found the rollback is cleared by it. A worker that begins
+    /// after takes what the record holds, as the daemon does.
     fn tell_the_workers(&self, state: &State, wall_ms: u64, boot_ms: u64) {
         let words = self.floor.words();
         if state.distrusted {
