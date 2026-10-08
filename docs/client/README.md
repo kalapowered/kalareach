@@ -931,7 +931,9 @@ and sends the request once more, signed afresh with a nonce of its own, at the s
 caller stated one. The second answer is the answer, whatever it is: its data, a refusal, or a second
 `SERVICE_CAPACITY` with its own delay for the caller to act on. There is never a third send, a
 request that is not safe to send again is never sent again, and every other refusal is the answer
-at once.
+at once. A caller that holds every question it asks to the delays a service names (the host's storage
+and backup manifest clients) builds its clients with `leaving_delays_to_the_caller`, and then the
+first answer, delay included, is the answer.
 
 A caller of `services::relay` finds out what became of a lease request whose outcome is unknown
 before it asks for anything else. Three answers leave it unknown: one that went missing, a success
