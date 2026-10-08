@@ -2304,30 +2304,50 @@ async fn only_the_gateways_own_success_confirms_a_bearer() {
         environment.phone().await,
     ];
     let unauthenticated = r#"{"ok":false,"error":{"code":"UNAUTHENTICATED","message":"no"}}"#;
-    let cases: [(u16, &str, kr_protocol::error::ErrorCode); 9] = [
-        (200, r#"{"ok":true}"#, UpstreamUnavailable),
-        (200, r#"{"ok":true,"data":{}}"#, UpstreamUnavailable),
+    // An acknowledgement of a notification, which a refusal does not carry.
+    let acknowledgement = PushDeliveryAck {
+        decided_at_ms: TimestampMs::new(now()),
+        notification_id: kr_protocol::ids::NotificationId::new(uuid(0x55)),
+        state: PushDeliveryState::Queued,
+        suppression: Nullable::null(),
+    };
+    let refusal_with = |data: serde_json::Value| {
+        serde_json::json!({
+            "ok": false,
+            "data": data,
+            "error": { "code": "UNAUTHENTICATED", "message": "no" },
+        })
+        .to_string()
+    };
+    let cases: [(u16, String, kr_protocol::error::ErrorCode); 9] = [
+        (200, r#"{"ok":true}"#.to_owned(), UpstreamUnavailable),
         (
             200,
-            r#"{"ok":true,"data":null,"error":{"code":"UNAUTHENTICATED","message":"no"}}"#,
+            r#"{"ok":true,"data":{}}"#.to_owned(),
             UpstreamUnavailable,
         ),
-        (200, unauthenticated, UpstreamUnavailable),
+        (
+            200,
+            r#"{"ok":true,"data":null,"error":{"code":"UNAUTHENTICATED","message":"no"}}"#
+                .to_owned(),
+            UpstreamUnavailable,
+        ),
+        (200, unauthenticated.to_owned(), UpstreamUnavailable),
         // A refusal whose `data` is not nothing is not the gateway's refusal either.
         (
             401,
-            r#"{"ok":false,"data":{},"error":{"code":"UNAUTHENTICATED","message":"no"}}"#,
+            refusal_with(serde_json::to_value(&acknowledgement).expect("an acknowledgement")),
             UpstreamUnavailable,
         ),
-        (401, "unauthorised", UpstreamUnavailable),
-        (403, "<html>blocked</html>", UpstreamUnavailable),
+        (401, "unauthorised".to_owned(), UpstreamUnavailable),
+        (403, "<html>blocked</html>".to_owned(), UpstreamUnavailable),
         (
             401,
-            r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"no"}}"#,
+            r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"no"}}"#.to_owned(),
             UpstreamUnavailable,
         ),
         // The control: the gateway refusing the bearer is its answer about this credential.
-        (401, unauthenticated, InvalidArgument),
+        (401, unauthenticated.to_owned(), InvalidArgument),
     ];
     for (index, (status, body, code)) in cases.iter().enumerate() {
         let phone = &phones[index / 3];
@@ -2656,6 +2676,8 @@ async fn a_second_sweep_does_not_ask_about_a_debt_the_first_is_asking_about() {
         PushSenderRecordId::new(uuid(0x69)),
         PushSenderRecordId::new(uuid(0x6b)),
     ];
+    // Two days left, so that the daemon's first round of questions renews both and shows it ran.
+    environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
     for (phone, sender) in phones.iter().zip(senders) {
         let credential =
             environment
@@ -2666,6 +2688,15 @@ async fn a_second_sweep_does_not_ask_about_a_debt_the_first_is_asking_about() {
             .await
             .expect("the credential is registered");
     }
+    // The first round of questions is the one other thing that sweeps, and it comes once, a moment
+    // after the daemon has a transport and then every five minutes. Let it come before the
+    // sweeps are looked at.
+    let renewals = environment.gateway.answers_on(RENEW_ROUTE).len();
+    let environment = environment.restart().await;
+    until("the first round of questions", || {
+        environment.gateway.answers_on(RENEW_ROUTE).len() >= renewals + 4
+    })
+    .await;
 
     // The first unpairing starts a sweep, whose first question is held at the gateway.
     let held = environment.gateway.hold(REVOKE_ROUTE, 0);
@@ -2684,6 +2715,7 @@ async fn a_second_sweep_does_not_ask_about_a_debt_the_first_is_asking_about() {
     // Another device is unpaired meanwhile. Its debt was written after the first sweep read its
     // list, and is asked about as soon as that sweep is done, not at the next round of questions.
     unpair(&environment, phones[1].device_id()).await;
+    assert_eq!(owed(&environment).len(), 2, "both debts are owed");
     assert_eq!(
         environment.gateway.answers_on(REVOKE_ROUTE),
         vec![200],
