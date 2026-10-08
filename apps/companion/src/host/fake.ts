@@ -35,7 +35,6 @@ import type {
   ShellLaunchResult,
   VoiceAction,
   VoiceContextResult,
-  VoiceGrantResult,
   VoiceManagedTerms,
   VoicePrepareResult,
   VoiceRate,
@@ -71,6 +70,7 @@ import type {
   TerminalView,
   TerminalViewState,
   TerminalWheel,
+  VoiceAllowed,
   VoiceAllowRequest,
   VoiceCallState,
   VoiceScope,
@@ -358,6 +358,13 @@ export interface FakeHostControls {
   readonly voiceAllows: VoiceAllowRequest[]
   /** Makes the next allowance of voice fail with `message`, as a host that refused it would. */
   failNextVoiceAllow(message: string): void
+  /**
+   * Has the next allowance of voice leave out `actions`, as a host does for actions this device's
+   * own access to it does not include, and say so.
+   */
+  holdBackOnNextVoiceAllow(actions: readonly VoiceAction[]): void
+  /** Has the next allowance of voice end without the host confirming it, as a lost answer does. */
+  leaveNextVoiceAllowUnconfirmed(): void
   /** What the next paste from the clipboard finds. */
   setPasteboard(result: PasteView): void
   /** The codes the page started pairing with, in order. */
@@ -613,6 +620,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   /** The words the host refuses a preparation with while no voice grant stands, or none. */
   let voiceGrantMissing: string | null = null
   let voiceAllowFailure: string | null = null
+  let voiceHeldBack: readonly VoiceAction[] = []
+  let voiceAllowUnconfirmed = false
 
   let accountView: AccountView = { state: 'signed_out', outcome: null }
   let accountUsage: UsageView = { state: 'signed_out' }
@@ -1338,16 +1347,23 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         voiceAllowFailure = null
         refuse('PERMISSION_DENIED', message)
       }
+      if (voiceAllowUnconfirmed) {
+        voiceAllowUnconfirmed = false
+        // The host may or may not have written the grant: what the page learns is the action's
+        // identity and nothing else.
+        return Promise.resolve({ receipt: null, action_id: 'voice-grant-action-1', value: null })
+      }
       voiceGrantMissing = null
-      const actions: VoiceAction[] = request.actions
+      const asked: VoiceAction[] = request.actions
         ? [...request.actions]
         : VOICE_DEFAULT_SCOPE.actions.map((each) => each.action)
+      const actions = asked.filter((action) => !voiceHeldBack.includes(action))
+      const notHeld = asked.filter((action) => voiceHeldBack.includes(action))
+      voiceHeldBack = []
       return Promise.resolve({
         receipt: null,
         action_id: null,
         value: {
-          grant_id: 'voice-grant-1',
-          device_id: 'this-device',
           statement: {
             actions,
             statements: actions.map(
@@ -1356,8 +1372,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
             ),
             unlocked_screen_actions: []
           },
-          not_held_by_device: []
-        } satisfies VoiceGrantResult
+          not_held_by_device: notHeld
+        } satisfies VoiceAllowed
       })
     },
 
@@ -1616,6 +1632,12 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     failNextVoiceAllow(message) {
       voiceAllowFailure = message
+    },
+    holdBackOnNextVoiceAllow(actions) {
+      voiceHeldBack = actions
+    },
+    leaveNextVoiceAllowUnconfirmed() {
+      voiceAllowUnconfirmed = true
     },
     sessionCreates,
     describe(sessionId, change) {
