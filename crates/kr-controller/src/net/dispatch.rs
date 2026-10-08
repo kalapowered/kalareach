@@ -51,7 +51,7 @@ use std::sync::atomic::AtomicBool;
 use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, RequestId};
+use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, GrantId, RequestId};
 use kr_transport::actor::ConnectionActor;
 use kr_transport::listener::AuthorisedSession;
 
@@ -59,6 +59,7 @@ use super::devices::DeviceRecord;
 use super::proxy::{RELAY_QUEUED_BYTES, RelayBudget, Relayed, WorkerProxy};
 use crate::service::Controller;
 
+mod acting;
 mod decision;
 mod forwarding;
 mod narrowing;
@@ -87,6 +88,9 @@ pub struct RemoteConnection {
     authority: Arc<Authorisation>,
     /// This connection's own link to the worker it has attached to, opened on first use.
     proxy: tokio::sync::Mutex<Option<Arc<WorkerProxy>>>,
+    /// The session this connection serves and the grant it acts under for it, fixed when the link
+    /// to the session's worker opened ([`Self::fix`]).
+    fixed: std::sync::Mutex<Option<(kr_protocol::ids::SessionId, kr_protocol::ids::GrantId)>>,
     /// Where a notification the proxy read is written.
     notifications: tokio::sync::mpsc::Sender<Relayed>,
     /// What this connection has queued for the device and not yet had written.
@@ -141,6 +145,7 @@ impl RemoteConnection {
             output: Arc::new(RemoteOutput::new(session, Arc::clone(&authority))),
             authority,
             proxy: tokio::sync::Mutex::new(None),
+            fixed: std::sync::Mutex::new(None),
             notifications,
             // What this connection said it could receive, never more than the protocol's own
             // bound: a peer that offered a smaller send queue is held to what it offered.
@@ -221,6 +226,7 @@ impl RemoteConnection {
             output: Arc::new(RemoteOutput::writing_to(sink, Arc::clone(&authority))),
             authority,
             proxy: tokio::sync::Mutex::new(None),
+            fixed: std::sync::Mutex::new(None),
             notifications,
             budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
             lost: Arc::new(tokio::sync::Notify::new()),
@@ -286,9 +292,8 @@ impl RemoteConnection {
     /// generation that admitted it. The revision is the one this request's grant check was made
     /// at, not the one the grant was issued under: the worker compares it with the revision it
     /// holds, so it has to be the moment the host actually looked.
-    fn envelope(&self, validated: AuthorityRevision) -> ActorEnvelope {
-        self.actor
-            .envelope(Some((self.device.grant.grant_id, validated)))
+    fn envelope(&self, grant_id: GrantId, validated: AuthorityRevision) -> ActorEnvelope {
+        self.actor.envelope(Some((grant_id, validated)))
     }
 
     /// Resolves once this connection's link to its worker has ended.
@@ -332,6 +337,9 @@ mod tests;
 
 #[cfg(test)]
 mod write_boundary;
+
+#[cfg(test)]
+mod a_share_a_device_holds;
 
 #[cfg(test)]
 mod a_share_that_names_a_current_decision;

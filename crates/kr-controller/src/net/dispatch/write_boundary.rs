@@ -1884,7 +1884,11 @@ async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_ref
         let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
         let asked = if retained {
             connection
-                .may_read_receipts(Some(session_id), Method::QuestionAnswer)
+                .may_read_receipts(
+                    Some(session_id),
+                    Method::QuestionAnswer,
+                    &connection.pairing_acting(),
+                )
                 .expect("the lease answers for the read")
         } else {
             connection
