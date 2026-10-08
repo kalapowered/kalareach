@@ -185,19 +185,19 @@ fn document(report: &AccountReport) -> Document {
 fn lines(report: &AccountReport) -> Vec<Line> {
     let mut lines = Vec::new();
     match (report.service.as_ref(), report.unavailable.as_ref()) {
-        (Some(service), _) => lines.push(stdout_line!(
+        (Some(service), None) => lines.push(stdout_line!(
             "This host signs in at {}.",
             Asked::location(Request::Account, service)
         )),
-        (None, Some(SignInUnavailable::BrokerIsAnotherService)) => lines.push(stdout_line!(
+        (_, Some(SignInUnavailable::BrokerIsAnotherService)) => lines.push(stdout_line!(
             "This host's voice.broker_origin names another service than the managed account \
-             service, so there is nothing to sign in to and no account is presented."
+             service, so it signs in nowhere and presents no account."
         )),
-        (None, Some(SignInUnavailable::NotUsable)) => lines.push(stdout_line!(
+        (_, Some(SignInUnavailable::NotUsable)) => lines.push(stdout_line!(
             "This host cannot reach the managed account service the way its configuration says: \
              the daemon's log says why."
         )),
-        (None, Some(SignInUnavailable::NoBroker) | None) => lines.push(stdout_line!(
+        (_, Some(SignInUnavailable::NoBroker)) | (None, None) => lines.push(stdout_line!(
             "This host names no managed voice service: set voice.broker_origin in its \
              configuration document to the managed account service's origin."
         )),
@@ -231,6 +231,12 @@ fn lines(report: &AccountReport) -> Vec<Line> {
                 "It carries {}.",
                 Asked::text(Request::Account, &scopes.join(", "))
             ));
+            if report.unavailable.as_ref().is_some() {
+                lines.push(stdout_line!(
+                    "This host presents no account while its configuration is as it is. \
+                     `kr account sign-out` ends the sign-in."
+                ));
+            }
         }
         AccountState::Ended => lines.push(stdout_line!(
             "The service ended the sign-in. `kr account sign-in` signs in again."
@@ -256,9 +262,7 @@ const fn attempt_words(attempt: AccountAttempt) -> &'static str {
         }
         AccountAttempt::PortBusy => "another program held the loopback address",
         AccountAttempt::TimedOut => "nothing came back in time",
-        AccountAttempt::NotKept => {
-            "the service signed the account in and this host could not keep it"
-        }
+        AccountAttempt::NotKept => "this host's secret store failed, so it could not keep it",
         AccountAttempt::Unreachable => "the service could not be reached",
         AccountAttempt::Superseded => "a newer attempt ended it",
         AccountAttempt::ListenerFailed => "the loopback address could not be opened",

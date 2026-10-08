@@ -22,7 +22,7 @@ export type AccountAttempt =
   | 'listener_failed'
   | 'call_open'
 /**
- * Why a host signs in nowhere.
+ * Why a host does not sign in or present its account.
  */
 export type SignInUnavailable = 'no_broker' | 'broker_is_another_service' | 'not_usable'
 /**
@@ -58,7 +58,7 @@ export type AccountState =
        */
       email: string | null
       /**
-       * The account service the sign-in was made at, which is also the voice broker.
+       * The account service the sign-in was made at.
        */
       origin: string
       /**
@@ -2643,9 +2643,9 @@ export interface AccountReport {
    */
   last_attempt: AccountAttempt | null
   /**
-   * The account service this host signs in at, which is also where its token is presented: the
-   * voice broker its configuration names, when that is the account service. Null when it is
-   * not, and `unavailable` says why.
+   * The account service this host keeps its account for, which is also where its token is
+   * presented when its voice broker is that service. Null when the host could not set up how to
+   * reach it, and `unavailable` says why.
    */
   service: string | null
   /**
@@ -2681,7 +2681,7 @@ export interface AccountReport {
          */
         email: string | null
         /**
-         * The account service the sign-in was made at, which is also the voice broker.
+         * The account service the sign-in was made at.
          */
         origin: string
         /**
@@ -2694,7 +2694,10 @@ export interface AccountReport {
         state: 'ended'
       }
   /**
-   * Why this host signs in nowhere, when `service` is null.
+   * Why this host does not sign in or present its account: its configuration names no voice
+   * broker, names another service than the account service, or the host could not set up how to
+   * reach the account service. A grant the host already keeps still shows in `state`, and
+   * `account.sign_out` ends it, whatever the broker is.
    */
   unavailable: SignInUnavailable | null
 }
@@ -2726,8 +2729,9 @@ export interface AccountSignOutParams {}
  */
 export interface AccountSignedOut {
   /**
-   * Whether the service has acknowledged ending the grant. When it has not, the grant is gone
-   * from this host and the daemon sends the revocation again when it next starts.
+   * Whether the service has acknowledged every revocation this host holds: the one just sent
+   * and any that were waiting. When it has not, the grant is gone from this host all the same,
+   * and the daemon sends what is left again when it next starts.
    */
   service_told: boolean
   /**
