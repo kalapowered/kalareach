@@ -813,6 +813,45 @@ async fn a_short_delay_the_service_names_is_waited_out_by_the_carrier_and_not_by
     );
 }
 
+/// A publication the service turned back as an outcome it cannot say is not sent again blind: the
+/// next look at the service asks whether it holds the generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_the_service_cannot_settle_is_found_by_the_fetch_and_not_sent_again() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    web.fail(
+        MANIFEST,
+        1,
+        Moment::Refuse {
+            status: 504,
+            code: "OUTCOME_UNKNOWN",
+            retry_after_seconds: None,
+        },
+    );
+    rig.admit(1, &[(1, plaintext(2048))]);
+    let (_, first) = within("the first pass is held back", timer.next_wait()).await;
+    let runtime = rig.controller.backup_runtime().expect("a carrier");
+    let finished = *runtime.passes().borrow();
+    first.notify_one();
+    rig.until("the pass after it finishes", |_| {
+        *runtime.passes().borrow() > finished
+    })
+    .await;
+
+    let publications = web
+        .arrived()
+        .iter()
+        .filter(|request| request.body.get("publish").is_some())
+        .count();
+    assert_eq!(
+        publications, 1,
+        "the publication the service could not settle was not sent again"
+    );
+    assert!(!rig.published(1));
+}
+
 /// The wait a daemon asks for after the service turned a request back, by what the refusal says.
 ///
 /// One case each for the reactions: ask again no sooner than the service asked, ask again soon,
