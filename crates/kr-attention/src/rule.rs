@@ -2,7 +2,8 @@
 //!
 //! Section 25 names eight rules, gives them stable identifiers and fixes the de-duplication window
 //! at sixty seconds; its automation paragraph, with section 17's workflow limits, adds a ninth for
-//! a workflow or a causal chain its own limits paused. [`RULES`] is that table, one entry per
+//! a workflow or a causal chain its own limits paused, and a tenth tells the owner that the
+//! authority feed a host reads removed it. [`RULES`] is that table, one entry per
 //! identifier, and [`rule`] is the only way to reach an entry, so a rule's policy cannot be decided
 //! twice in two places.
 //!
@@ -168,6 +169,19 @@ pub static RULES: &[Rule] = &[
         trusted: true,
         droppable: false,
     },
+    // A host whose feed was removed learns no revocation from it again, and the revocations an
+    // owner published and the host had not applied are gone. An owner who did not remove it has to
+    // find out, and a person at the host has to act, so it is urgent from the start, and it stands
+    // until the host reads another feed or none.
+    Rule {
+        id: AttentionRule::AuthorityFeedRemoved,
+        initial: AttentionLevel::Urgent,
+        steps: &[],
+        repeat_ms: None,
+        dedup_window_ms: DEDUPLICATION_WINDOW_MS,
+        trusted: true,
+        droppable: false,
+    },
 ];
 
 /// Returns the rule with this identifier.
@@ -243,6 +257,7 @@ mod tests {
                     | AttentionRule::AdapterFailed
                     | AttentionRule::HostContactLost
                     | AttentionRule::AutomationPaused
+                    | AttentionRule::AuthorityFeedRemoved
             );
             assert_eq!(
                 rule.droppable, !waiting,

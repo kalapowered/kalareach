@@ -122,18 +122,33 @@ pub struct StoredPolicy {
 pub struct StoredRevocation {
     /// The request a remote owner published.
     pub request: RevocationRequest,
-    /// The revision this host issued for it.
-    pub authority_revision: AuthorityRevision,
-    /// When this host applied it.
+    /// The revision this host issued for it, once the revocation has taken effect.
+    pub authority_revision: Nullable<AuthorityRevision>,
+    /// The revision the feed held when this host began to apply the request, which the revision
+    /// record it issues for it follows.
+    pub previous_revision: AuthorityRevision,
+    /// When this host began to apply it.
     pub applied_at_ms: TimestampMs,
     /// The enrolled hosts that have acknowledged it.
     pub acknowledged_by: CanonicalSet<DeviceId>,
     /// True once every enrolled host had acknowledged it.
     ///
-    /// A settled record is kept rather than deleted. Its revision is what a device list reports as
-    /// that host's last acknowledgement, and its identity is what stops the same request being
-    /// applied a second time under a new revision.
+    /// A settled record is kept rather than deleted. Its identity is what stops the same request
+    /// being applied a second time under a new revision.
     pub settled: bool,
+}
+
+/// The feed's answer that this host was removed from it, as it is written down.
+///
+/// It is kept apart from [`StoredFeed`]: a record is read back only if it re-encodes to the bytes
+/// it was read from, so a field added to `StoredFeed` would make every feed an earlier build wrote
+/// unreadable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRemoval {
+    /// The origin of the feed that answered. A host pointed at another feed is not removed from it.
+    pub origin: String,
+    /// When this host first read the answer.
+    pub at_ms: TimestampMs,
 }
 
 /// This host's half of the authority feed, as it is written down.
