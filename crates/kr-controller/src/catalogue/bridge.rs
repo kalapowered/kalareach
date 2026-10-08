@@ -530,6 +530,32 @@ impl WorkerBridge {
         true
     }
 
+    /// Returns where each member's accepted report says a binding's component stands, for the
+    /// bindings whose package ships one.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn components(
+        &self,
+    ) -> Vec<(
+        SessionId,
+        kr_protocol::ids::BrokerBindingId,
+        kr_protocol::admission::ComponentReport,
+    )> {
+        let mut components = Vec::new();
+        for (session_id, member) in &self.members().members {
+            if let Some(accepted) = member.accepted.as_ref() {
+                components.extend(accepted.report.bindings.iter().filter_map(|binding| {
+                    binding
+                        .component
+                        .0
+                        .clone()
+                        .map(|report| (*session_id, binding.binding_id, report))
+                }));
+            }
+        }
+        components
+    }
+
     /// Returns every package a member's accepted report says it would not read or bind.
     #[must_use]
     pub fn refusals(&self) -> Vec<(SessionId, PackageRefusal)> {
