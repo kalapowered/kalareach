@@ -58,9 +58,10 @@ pub struct Vouched<'a> {
     /// device's pairing grant.
     ///
     /// It goes only to a worker that states
-    /// [`kr_protocol::local::FORWARDED_PREVIEWED_SCREEN`]. An attach under a share is refused for a
-    /// worker that does not, since the worker would draw it more than was shown, and an attach
-    /// under a pairing grant is sent without it, as it always was.
+    /// [`kr_protocol::local::FORWARDED_SCREEN_BASIS`], whichever grant the attach was decided
+    /// under. An attach under a share is refused for a worker that does not, since the worker
+    /// would draw it more than was shown, and an attach under a pairing grant is sent without it,
+    /// as it always was.
     pub screen_basis: Option<ScreenBasis>,
 }
 use crate::service::Controller;
@@ -236,9 +237,9 @@ pub struct WorkerProxy {
     /// A worker of an earlier build keeps a retained answer whole and ends the link a mutation with
     /// a scope arrived on, so such a worker is sent none.
     holds_results_to_scopes: bool,
-    /// Whether the worker said, in the same answer, that it narrows an attachment to the screen a
-    /// share's issuer previewed when the attach asks it to.
-    narrows_to_previewed_screens: bool,
+    /// Whether the worker said, in the same answer, that it reads the screen basis of an attach
+    /// and draws the attachment the screen that grant allows.
+    reads_the_screen_basis: bool,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -326,8 +327,8 @@ impl WorkerProxy {
             kr_protocol::local::holds_question_reads_to_scopes(&acknowledgement.capabilities);
         let holds_results_to_scopes =
             kr_protocol::local::holds_results_to_scopes(&acknowledgement.capabilities);
-        let narrows_to_previewed_screens =
-            kr_protocol::local::narrows_to_previewed_screens(&acknowledgement.capabilities);
+        let reads_the_screen_basis =
+            kr_protocol::local::reads_the_screen_basis(&acknowledgement.capabilities);
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -347,7 +348,7 @@ impl WorkerProxy {
             reads_history_scopes,
             holds_question_reads,
             holds_results_to_scopes,
-            narrows_to_previewed_screens,
+            reads_the_screen_basis,
         }))
     }
 
@@ -406,7 +407,7 @@ impl WorkerProxy {
         let screen_basis = vouched
             .screen_basis
             .filter(|_| mutation.method.method() == Some(Method::SessionAttach));
-        if screen_basis == Some(ScreenBasis::Share) && !self.narrows_to_previewed_screens {
+        if screen_basis == Some(ScreenBasis::Share) && !self.reads_the_screen_basis {
             return Err(ControllerError::Refused {
                 code: kr_protocol::error::ErrorCode::UnsupportedCapability,
                 detail: "this session's worker is of a build that cannot draw a shared session's \
@@ -428,7 +429,7 @@ impl WorkerProxy {
                 .history
                 .filter(|_| self.holds_results_to_scopes)
                 .cloned(),
-            screen_basis: screen_basis.filter(|_| self.narrows_to_previewed_screens),
+            screen_basis: screen_basis.filter(|_| self.reads_the_screen_basis),
         }));
         let mut answered = self.call(request_id, &frame).await?;
         answered.holds_results_to_scopes = self.holds_results_to_scopes;
