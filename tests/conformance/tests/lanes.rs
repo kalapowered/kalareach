@@ -600,11 +600,16 @@ fn a_phone_test_file_whose_braces_do_not_balance_is_one_problem_that_names_it() 
     let text = std::fs::read_to_string(&source).expect("the fixture");
     let cut = text.rfind('}').expect("a closing brace");
     std::fs::write(&target, &text[..cut]).expect("a file");
+    // The directory holds no Cargo workspace, which is a problem of its own; the file has one.
     let map = map_of(root.path());
-    assert_eq!(map.problems.len(), 1, "{:?}", map.problems);
+    let own: Vec<&String> = map
+        .problems
+        .iter()
+        .filter(|problem| problem.starts_with(kotlin))
+        .collect();
+    assert_eq!(own.len(), 1, "{:?}", map.problems);
     assert!(
-        map.problems[0].starts_with(kotlin)
-            && map.problems[0].contains("cannot be read for its classes"),
+        own[0].contains("cannot be read for its classes"),
         "{:?}",
         map.problems
     );
