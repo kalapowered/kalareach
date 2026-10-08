@@ -394,11 +394,12 @@ somebody's answer, and a frame without one is news.
 
 | Request | What it does |
 | --- | --- |
-| `hello` | opens the connection and names the protocol |
+| `hello` | opens the connection, names the protocol and says which later requests the host answers |
 | `verify` | asks the host to sign a fresh challenge |
 | `register_binding` | compile the component, instantiate it, call `bind` |
 | `event` | offer one scoped source event to the binding's queue |
 | `snapshot` | ask the component for a fresh document |
+| `prepare_action` | ask the component to turn an invoked control into a proposed effect |
 | `checkpoint` | take the component's own resumable state |
 | `restore` | restore it |
 | `unbind` | remove the binding and its instance |
@@ -420,11 +421,22 @@ push. Everything that can enter a component runs in a task of its own, so readin
 never waits for the last one to finish. A connection holds up to sixteen such calls at once and up
 to sixty-four bindings; past either, the next request is refused rather than queued.
 
-The rich calls (`prepare-action`, `decode-request`, `encode-response`, and revising a binding's
-facts and attachments) are in the runtime's own API, inside the plugin host, and are not in this
-protocol. A worker cannot make them in process: it may link `kr-plugin-service`, which holds the
-protocol, the client and the launcher and no engine, and never `kr-plugin-runtime`. What travels
-between a worker and the host is the set above.
+`prepare-action` is the one rich call this protocol carries. A worker sends the invocation's token
+(the actor, the grant record, which is empty for the local owner, the binding revision, the action
+and the hash of the parameters a person saw) and the arguments in the order the action declares
+them, and is given back the plan the component proposed, as plain data, or the fault it declared.
+`decode-request`, `encode-response`, and revising a binding's facts and attachments are in the
+runtime's own API, inside the plugin host, and are not in this protocol. A worker cannot make any
+of them in process: it may link `kr-plugin-service`, which holds the protocol, the client and the
+launcher and no engine, and never `kr-plugin-runtime`.
+
+A worker and a host speak one protocol, which the host names in its `hello` answer and in its
+descriptor (`kr-plugin-host/2`; the request that prepares an action is the second protocol's).
+A host of another protocol is refused at the handshake, by name, and a worker sends it nothing,
+because a host ends the connection, and every binding on it, over a request it does not know. The
+daemon takes away a descriptor that names another protocol, and a host of another protocol that is
+still running holds its endpoint, so no runtime can be started until it ends. A host ends with the
+login session or a restart of the machine; a host of the current protocol is adopted as it is.
 
 A component's bytes travel as a location rather than as a payload: a control frame is bounded at
 1 MiB and a component may be sixteen times that. The worker sends the payload's path and the digest
@@ -462,10 +474,54 @@ a minute, and after twice that each time it is refused again, up to ten minutes.
 reach the runtime before a wait the daemon asked for or a backoff has passed, however often the
 broker's set changes meanwhile, except that a link nothing wants the runtime of any more forgets
 the wait, and the next binding that wants a component asks at once; the daemon's bound on starts
-is what holds a runtime that keeps ending. The worker's report on its admissions says that this host calls
-none of the component's exports beyond registering it for a binding, and an action the component
-prepares is refused before anything is sent, because this host calls no export of a component to
-prepare an effect.
+is what holds a runtime that keeps ending. The worker's report on its admissions says that this
+host calls none of the component's exports beyond registering it for a binding and preparing an
+action a person invokes.
+
+### An action a component prepares
+
+An action whose implementation is `component` runs in two passes, so that the call to another
+process never happens inside the boundary that revalidates an action and writes its dispatch marker.
+
+1. The first pass is the admission. The request goes through everything any mutation goes through
+   up to the receipt's `accepted` state: the envelope, the action window, the limits, the rights of
+   the action's class, and the arguments read against the parameters the action declares. It also
+   needs the binding's component to be registered with the runtime. The receipt then stays
+   `accepted` while the component is asked. A repeat of the
+   request is answered with that receipt, a cancellation rejects it, a revocation fences it, and the
+   worker's outstanding-action limit counts it.
+2. The component is asked outside every lock of the worker, on a task of its own, bounded by the
+   action's accepted deadline and a few seconds. The connection goes on serving the same client
+   meanwhile. A component that declines with a fault rejects the action with `INVALID_ARGUMENT`.
+   A component that is still being registered, a runtime that is gone, a component that traps and a
+   component that does not answer in time reject it with `RESOURCE_UNAVAILABLE`: a new request, with
+   a new action identifier, can succeed (a component that keeps trapping is disabled by the runtime,
+   and then the code is `UNSUPPORTED_CAPABILITY`). A repeat with the same identifier is answered
+   with the rejected receipt.
+3. The second pass is the ordinary pipeline with the plan in hand. It takes the dispatch barrier and
+   the session, checks the authority the connection holds, and then reads the receipt: an action
+   that was cancelled or fenced is answered with the receipt it has. Then it checks the authority
+   revision the daemon validated the action under and the action's deadline. Only then are the
+   binding, the declaration and the grant checked again, the invocation admitted, a token issued and
+   spent, and the plan validated against it. A package that registered the action again while it
+   was prepared has declared a different action, and the plan prepared for the first is carried by
+   no route of the second. A plan the broker refuses rejects the receipt: nothing was dispatched,
+   so it is `rejected` and not `refused` or `unknown`. A plan it accepts is the permit the dispatch
+   marker precedes, and the receipt then follows the upstream's answer as any operation's does.
+
+The component is asked after the request is accepted, so an action it prepares can reach the
+upstream after a request the same client sent later. A client that needs the order waits for the
+action's answer before it sends the next request. The arguments of every action that a component
+prepares or that answers a pending request are read against its declared parameters; the arguments
+of an action the host carries out itself by redrawing the package's document are read by no one.
+
+What the component proposes is a proposal. The worker builds the effect it validates from the
+invocation and the declaration, never from the component's words: the plan must be for the action
+invoked, of the class the declaration implies, with the arguments the component was given, and its
+operation must be the one the action declared. A plan that fills in fields of a routed method, or
+names a method other than the one the action goes out as, is refused by name, because what leaves
+is the invocation's own validated arguments. A component is therefore a veto, and a chooser of the
+one operation its action declared.
 
 The broker lives in `crates/kr-worker/src/broker`. Its way to a component is the plugin host,
 through the client in `crates/kr-plugin-service`: register a binding, offer events to its queue,
