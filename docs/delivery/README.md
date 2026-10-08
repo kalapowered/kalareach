@@ -70,6 +70,65 @@ the device. It is a keyed digest of what the host groups by, under a secret only
 journal holds, so two equal values tell a provider that they group and nothing about what they
 group.
 
+## A paired device becomes a destination
+
+Pairing records what a device is: its grant, its notification-preview key and its stored-envelope
+key. It does not make the device a place to send notifications, because delivery also needs the
+authorisation the device's installation holds at the push gateway. The installation obtains that
+authorisation and its delivery credential from the gateway, then hands the credential to the host
+with `device.push.register` over its paired connection. The call names no device: the host acts on
+the device the connection authenticated as.
+
+The host does not take the device's word for the credential. Before it keeps anything it checks
+that the credential names the KalaReach push gateway, lasts no longer than thirty days, has not
+expired, was not issued in the future, and is for the device's own installation: an installation is
+named by the hash of the key it authenticates with, and the host recorded that key when it paired
+the device. It refuses an authorisation or an installation that another destination names, in
+service or kept out of service as the name of what was sent to it, and an authorisation it is
+revoking. Then it asks the gateway two questions, outside every lock it holds, and at most a few
+times an hour for each device, because the gateway counts them against the host's allowances for
+status questions, renewals and revocations. The first is a status question about a notification
+that does not exist, under the bearer the device handed over: the gateway checks the bearer first,
+so its success says the bearer belongs to an active authorisation that has not expired. The second
+is the opening of a renewal, signed with the host's own key: the gateway hands out a nonce only for
+an authorisation that names that key, so its success says the gateway holds the authorisation and
+that this host is the one it names. Nothing is renewed, which the gateway does only in the last
+week of a credential's life. Only the gateway's own success and its own refusals count: a bare
+status, a missing route and an answer that is not the gateway's say nothing either way, and the
+device is told it may try again. A refusal the gateway gives is final for that credential.
+
+What neither question shows is that the bearer is that authorisation's, or that the expiry and the
+revision the device wrote in the credential are true: they are the device's word. A bearer for
+another authorisation is found at the first delivery, which the gateway refuses, and recovers
+through the host's renewal.
+
+The destination is named by the device's identifier, and its rule names the device's own grant. It
+is written first, with a note that the host owes the gateway a revocation of the authorisation the
+destination sent under before, if it was another; then the credential is kept. A host that stops
+between the two, or whose secret store refuses the second, has a destination with no credential,
+which delivers nothing until the device registers again, and never a credential nothing names. A
+device that registers again keeps the state of its preview-key rotation. The credential is kept in
+the host's secret store, beside its other secrets, and in memory, and never in the delivery
+journal. Every renewal is written to the store before memory, so a restart finds the bearer the
+gateway last issued; a write the store refuses is repeated on the next round of questions, because
+the bearer it would have kept is the only one the gateway takes. A credential past its expiry is
+loaded too, because renewal needs only the authorisation, the gateway and this host's key. A stored
+item this build cannot read, or that is another authorisation's, is removed at start and reported.
+
+Unpairing a device ends its destination. The daemon writes down that it owes the gateway a
+revocation of the authorisation behind it, removes the destination, and forgets the credential held
+for it, in memory and in the secret store. It asks at once and then every few minutes, further apart
+each time, until the gateway has revoked the authorisation and the host has let go of what it kept
+of it, or the gateway has refused the opening of the revocation with `FORBIDDEN`, which it gives for
+an authorisation it holds none of for this host's key, or thirty days and a few asks have passed.
+Any other answer, a bare status, a refusal that is not the gateway's own or a success whose record
+is not this authorisation's, revoked, leaves the revocation owed. The debt survives a restart, and a
+start forgets whatever the secret store still keeps of an authorisation a debt names, so a stop
+between ending a destination and deleting its item leaves nothing behind. A device revoked while
+the daemon was down, or whose grant the host has found to have run out, has its destination ended
+the same way at the next start. A destination that already received a notification stays in the
+journal, out of service and with no rule, as the name of what was sent to it.
+
 ## Who may be told
 
 A notification is built for a destination only when the recipient's grant reaches what the notice is
@@ -157,11 +216,12 @@ succeeded; one that fails is tried again before every pass. Then a pass runs eve
 what the attention store has announced, produces from what the journal has taken, and claims and
 sends whatever is due.
 
-Every few minutes, on a loop of its own, the daemon renews delivery credentials inside their renewal
-window, so a credential is current before a notification needs it, and asks about outcomes nobody
-knows. Those questions are rationed: a bounded batch at a time, within a time limit, and a question
-that finds nothing waits longer before it is asked again, so an old backlog cannot keep a newer
-notification from being asked about. Each record waits from the moment its question fell due, first
+Every few minutes, on a loop of its own, the daemon asks the gateways for the revocations it owes,
+renews delivery credentials inside their renewal window, so a credential is current before a
+notification needs it, and asks about outcomes nobody knows. The questions about outcomes are
+rationed: a bounded batch at a time, within a time limit, and a question that finds nothing waits
+longer before it is asked again, so an old backlog cannot keep a newer notification from being asked
+about. Each record waits from the moment its question fell due, first
 question or repeat, so a stream of new ones cannot keep an older one waiting either. An old
 notification is asked about less often, never dropped: the gateway keeps an answer for a time that
 runs from its own decision, which the host cannot see.
@@ -189,7 +249,8 @@ written is the one failure that counts as "nothing was sent".
 
 A renewal is two signed requests. The daemon asks the gateway for a nonce, then answers it with a
 proof signed by the host key the installation named when it authorised the host, and receives a
-fresh credential. The daemon holds credentials in memory and renews them; it never writes one down.
+fresh credential. The daemon holds credentials in memory and in the host's secret store, and renews
+them; it never writes one into the delivery journal.
 
 ## Rate limits, and what a person is told
 

@@ -16,6 +16,12 @@
 //!
 //! One item per destination, replaced in place: a store write replaces the value whole, so there is
 //! never an old credential left behind under another name when a new one is stored.
+//!
+//! A paired device's delivery credential is kept here too, in an item of its own named for the
+//! authorisation it belongs to rather than for the destination: a renewal knows the authorisation
+//! and nothing else, and the item has to be replaced where the renewal is made. The bearer is a
+//! 30-day secret the gateway keeps only the digest of, so it is kept as the host's other secrets
+//! are, in the platform's credential store, and never in the delivery journal.
 
 use std::fmt;
 use std::sync::Arc;
@@ -24,7 +30,8 @@ use kr_crypto::secret::SecretVec;
 use kr_crypto::store::{SecretName, SecretStore};
 use kr_delivery::destination::{CredentialStamp, DestinationId};
 use kr_protocol::delivery::DestinationSecret;
-use kr_protocol::ids::EnvironmentId;
+use kr_protocol::ids::{EnvironmentId, PushSenderRecordId};
+use kr_protocol::push::PushDeliveryCredential;
 
 use crate::error::{ControllerError, Result};
 
@@ -33,6 +40,8 @@ use crate::error::{ControllerError, Result};
 pub struct DestinationSecrets {
     store: Arc<dyn SecretStore>,
     scope: String,
+    /// The scope delivery credentials are kept in, beside the destinations' own.
+    push_scope: String,
 }
 
 impl fmt::Debug for DestinationSecrets {
@@ -42,6 +51,7 @@ impl fmt::Debug for DestinationSecrets {
             .debug_struct("DestinationSecrets")
             .field("store", &self.store.describe())
             .field("scope", &self.scope)
+            .field("push_scope", &self.push_scope)
             .finish()
     }
 }
@@ -53,6 +63,17 @@ pub struct HeldSecret {
     pub stamp: CredentialStamp,
     /// The credential.
     pub secret: DestinationSecret,
+}
+
+/// What the store holds for one authorisation's delivery credential.
+#[derive(Debug)]
+pub enum StoredCredential {
+    /// Nothing is kept.
+    Absent,
+    /// An item is kept that this build cannot read.
+    Unreadable,
+    /// The credential.
+    Held(PushDeliveryCredential),
 }
 
 /// The form an item takes in the store.
@@ -70,6 +91,7 @@ impl DestinationSecrets {
         Self {
             store,
             scope: format!("{environment_id}/delivery-destination"),
+            push_scope: format!("{environment_id}/push-credential"),
         }
     }
 
@@ -145,6 +167,82 @@ impl DestinationSecrets {
             stamp,
             secret: item.secret,
         }))
+    }
+
+    /// The item one authorisation's delivery credential is kept under.
+    fn push_name(&self, sender_record_id: PushSenderRecordId) -> Result<SecretName> {
+        let digest = kr_cbor::sha256(sender_record_id.to_string().as_bytes());
+        let hex = digest.iter().fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+        SecretName::new(format!("{}/{hex}", self.push_scope)).map_err(unavailable)
+    }
+
+    /// Keeps one authorisation's delivery credential, replacing the one kept for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the store refuses the write. The error names the
+    /// store's reason and never the credential.
+    pub fn put_push_credential(&self, credential: &PushDeliveryCredential) -> Result<()> {
+        // The encoded credential holds the bearer, so it lives in a buffer that clears itself.
+        let encoded = SecretVec::new(serde_json::to_vec(credential).map_err(|_| {
+            ControllerError::Storage {
+                operation: "keep a delivery credential",
+                detail: "the credential could not be encoded".to_owned(),
+            }
+        })?);
+        self.store
+            .set(
+                &self.push_name(credential.sender_record_id)?,
+                encoded.expose(),
+            )
+            .map_err(unavailable)
+    }
+
+    /// Reads one authorisation's delivery credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the store cannot be read. An item this build
+    /// cannot decode is not an error: it is [`StoredCredential::Unreadable`], for the caller to
+    /// decide what to do with.
+    pub fn push_credential(
+        &self,
+        sender_record_id: PushSenderRecordId,
+    ) -> Result<StoredCredential> {
+        let Some(held) = self
+            .store
+            .get(&self.push_name(sender_record_id)?)
+            .map_err(unavailable)?
+        else {
+            return Ok(StoredCredential::Absent);
+        };
+        // The refusal says the item is unreadable and nothing about what it holds.
+        Ok(serde_json::from_slice(held.expose())
+            .map_or(StoredCredential::Unreadable, StoredCredential::Held))
+    }
+
+    /// Writes bytes under one authorisation's item as they are, for a test that needs an item no
+    /// build wrote.
+    #[cfg(test)]
+    pub(super) fn put_raw_push_item(&self, sender_record_id: PushSenderRecordId, bytes: &[u8]) {
+        self.store
+            .set(&self.push_name(sender_record_id).expect("a name"), bytes)
+            .expect("a write");
+    }
+
+    /// Deletes one authorisation's delivery credential. Deleting one that is not kept succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the store refuses the deletion.
+    pub fn remove_push_credential(&self, sender_record_id: PushSenderRecordId) -> Result<()> {
+        self.store
+            .delete(&self.push_name(sender_record_id)?)
+            .map_err(unavailable)
     }
 
     /// Deletes one destination's credential. Deleting one that is not stored succeeds.

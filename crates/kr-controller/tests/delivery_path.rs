@@ -1,0 +1,2107 @@
+//! A running daemon delivers notifications to the destinations it was given.
+//!
+//! One real daemon on the loopback network, a real worker it adopts, and real pairing: a device is
+//! paired through the owner's confirmation and then speaks to the daemon over its own paired
+//! connection. Nothing here configures a destination by calling the delivery module. A paired
+//! device registers its push credential with `device.push.register`, and the daemon's own pass
+//! takes what the attention store announces and delivers it.
+//!
+//! The only stand-ins are the ones the product has no way to run in a test: the phone's side of the
+//! exchange (the device hands over what its installation was issued) and the push gateway, which
+//! answers renewals and revocations the way the Worker does, checking the host's signature under
+//! the key the authorisation names, and delivers to nobody.
+//!
+//! Everything is on the internal disk: the environment is a temporary host tree.
+
+mod net_support;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_controller::service::Controller;
+use kr_crypto::keys::DeviceKeys;
+use kr_crypto::store::open_store_in;
+use kr_ipc::endpoint::Listener;
+use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
+use kr_protocol::envelope::ActionTarget;
+use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::ids::{
+    ActionId, AuthorityRevision, BuildId, ConnectionId, ControllerGeneration, EnvironmentId,
+    InstallationId, PushSenderRecordId, PushSenderRevision, SessionEpoch, SessionId,
+};
+use kr_protocol::method::Method;
+use kr_protocol::push::{
+    DevicePushRegisterParams, DevicePushRegisterResult, PUSH_SENDER_RENEWAL_DOMAIN,
+    PUSH_SENDER_REVOCATION_DOMAIN, PushAlert, PushDeliveryAck, PushDeliveryCredential,
+    PushDeliveryRequest, PushDeliveryState, PushRatePolicy, PushRequest, PushSenderBinding,
+    PushSenderRecord, PushSenderRenewRequest, PushSenderRevokeRequest, PushSenderState,
+};
+use kr_protocol::question::{QuestionCreateParams, QuestionKind};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{
+    AuthorisationKey, EndpointKey, Nonce256, Nullable, SecretBytes32, TimestampMs, Uuid,
+};
+use kr_protocol::service::{ServiceRequestSignature, ServiceRequestSigner};
+use kr_protocol::session::{Dimensions, DisplayNumber, SessionState, ShellMode};
+use kr_protocol::worker::WorkerDescriptor;
+use kr_worker::runtime::SessionRuntime;
+use kr_worker::service::{ServiceBinding, WorkerService};
+use kr_worker::session::{Session, SessionConfig};
+
+use net_support::{Device, Host, RawDevice, pair_with, proposal};
+
+/// How long a test waits for something the daemon's own tick or the worker has to do.
+const PATIENCE: Duration = Duration::from_secs(60);
+
+/// The gateway the product delivers through.
+const GATEWAY: &str = "https://reach.kala.to";
+
+/// How long a credential the stand-in gateway issues lasts.
+const LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000 - 1_000;
+
+fn build() -> BuildId {
+    BuildId::new("kr-test/0").expect("a build identifier")
+}
+
+fn now() -> u64 {
+    kr_ipc::now_ms().get()
+}
+
+fn uuid(byte: u8) -> Uuid {
+    Uuid::from_bytes([byte; 16])
+}
+
+/// Waits until `holds` says it does, or the patience runs out.
+async fn until(what: &str, mut holds: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while !holds() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} did not happen in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The push gateway
+// ---------------------------------------------------------------------------------------------
+
+/// What the gateway holds for one authorisation an installation issued.
+#[derive(Clone, Debug)]
+struct Authorisation {
+    installation_id: InstallationId,
+    host_signing_key: AuthorisationKey,
+    state: PushSenderState,
+    revision: u64,
+    secret: [u8; 32],
+    expires_at_ms: u64,
+    /// When the credential was last renewed; nought for one never renewed.
+    renewed_at_ms: u64,
+}
+
+/// How long before a credential expires the gateway renews it, and how long after a renewal it
+/// renews once more for a host that lost the answer: the Worker's own rules.
+const RENEWAL_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const RENEWAL_RECOVERY_MS: u64 = 60 * 60 * 1000;
+
+#[derive(Debug, Default)]
+struct GatewayState {
+    authorisations: BTreeMap<PushSenderRecordId, Authorisation>,
+    /// The nonces handed out and not yet answered, with the purpose each was asked for.
+    nonces: BTreeSet<(&'static str, [u8; 32])>,
+    /// Every delivery taken, with the authorisation its bearer matched.
+    delivered: Vec<(PushSenderRecordId, PushDeliveryRequest)>,
+    /// The routes asked, in order, with the status each was answered with.
+    asked: Vec<(String, u16)>,
+    /// Deliveries refused because the bearer was not the latest one issued.
+    bearers_refused: usize,
+}
+
+/// The Worker's push gateway, for what a host asks of it: renewals and revocations proven under
+/// the host key the authorisation names, and deliveries under the latest bearer it issued.
+#[derive(Debug, Default)]
+struct Gateway {
+    state: Mutex<GatewayState>,
+    /// Answers nothing: a gateway nobody can reach.
+    down: AtomicBool,
+    /// How long the credentials it issues last, in milliseconds; a month when nothing says.
+    lifetime_ms: std::sync::atomic::AtomicU64,
+    /// Answers a revocation with a refusal that may pass: a gateway having a bad hour.
+    refuses_revocations: AtomicBool,
+    /// Has no status route: a deployment that answers 404 with nothing else.
+    no_status_route: AtomicBool,
+}
+
+impl Gateway {
+    /// What an installation does with the gateway: creates an authorisation for the host whose
+    /// signing key it names, and returns the credential it passes to the host.
+    fn issue(
+        &self,
+        sender_record_id: PushSenderRecordId,
+        installation_id: InstallationId,
+        host_signing_key: AuthorisationKey,
+    ) -> PushDeliveryCredential {
+        let mut secret = [0_u8; 32];
+        kr_crypto::random_bytes(&mut secret).expect("a secret");
+        let issued = now();
+        let authorisation = Authorisation {
+            installation_id,
+            host_signing_key,
+            state: PushSenderState::Active,
+            revision: 1,
+            secret,
+            expires_at_ms: issued + self.lifetime(),
+            renewed_at_ms: 0,
+        };
+        let credential = Self::credential_of(sender_record_id, &authorisation, issued);
+        self.state()
+            .authorisations
+            .insert(sender_record_id, authorisation);
+        credential
+    }
+
+    fn credential_of(
+        sender_record_id: PushSenderRecordId,
+        authorisation: &Authorisation,
+        issued_at_ms: u64,
+    ) -> PushDeliveryCredential {
+        PushDeliveryCredential {
+            expires_at_ms: TimestampMs::new(authorisation.expires_at_ms),
+            gateway_origin: kr_protocol::service::GatewayOrigin::new(GATEWAY).expect("an origin"),
+            installation_id: authorisation.installation_id,
+            issued_at_ms: TimestampMs::new(issued_at_ms),
+            revision: PushSenderRevision::new(authorisation.revision),
+            secret: SecretBytes32::from_bytes(authorisation.secret),
+            sender_record_id,
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, GatewayState> {
+        self.state.lock().expect("the gateway is not poisoned")
+    }
+
+    fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
+    }
+
+    fn refuse_revocations(&self, refuse: bool) {
+        self.refuses_revocations.store(refuse, Ordering::SeqCst);
+    }
+
+    fn lose_the_status_route(&self, lost: bool) {
+        self.no_status_route.store(lost, Ordering::SeqCst);
+    }
+
+    /// Makes the credentials it issues from now on last `lifetime_ms`.
+    fn issue_for(&self, lifetime_ms: u64) {
+        self.lifetime_ms.store(lifetime_ms, Ordering::SeqCst);
+    }
+
+    fn lifetime(&self) -> u64 {
+        match self.lifetime_ms.load(Ordering::SeqCst) {
+            0 => LIFETIME_MS,
+            set => set,
+        }
+    }
+
+    /// The revision of the credential the gateway last issued for one authorisation.
+    fn revision_of(&self, id: PushSenderRecordId) -> u64 {
+        self.authorisation(id).map_or(0, |held| held.revision)
+    }
+
+    /// The notifications delivered, in order.
+    fn delivered(&self) -> Vec<PushDeliveryRequest> {
+        self.state()
+            .delivered
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
+    /// The statuses the routes named were answered with, in order.
+    fn answers_on(&self, route: &str) -> Vec<u16> {
+        self.state()
+            .asked
+            .iter()
+            .filter(|(url, _)| url.ends_with(route))
+            .map(|(_, status)| *status)
+            .collect()
+    }
+
+    fn authorisation(&self, id: PushSenderRecordId) -> Option<Authorisation> {
+        self.state().authorisations.get(&id).cloned()
+    }
+
+    fn answer(status: u16, body: &serde_json::Value) -> ServiceHttpAnswer {
+        ServiceHttpAnswer {
+            status,
+            body: serde_json::to_vec(body).expect("an answer"),
+        }
+    }
+
+    fn refusal(status: u16, code: &str) -> ServiceHttpAnswer {
+        Self::answer(
+            status,
+            &serde_json::json!({ "ok": false, "error": { "code": code, "message": "no" } }),
+        )
+    }
+
+    /// Verifies a signature the way the Worker does: over the exact transcript, under the domain
+    /// it claims, with the key given.
+    fn verifies(
+        key: &AuthorisationKey,
+        domain: &str,
+        input: Vec<u8>,
+        signature: &kr_protocol::scalars::Signature64,
+    ) -> bool {
+        kr_crypto::sign::SigningTranscript::from_canonical_bytes(domain, input)
+            .and_then(|transcript| kr_crypto::sign::verify(key, &transcript, signature))
+            .is_ok()
+    }
+
+    /// A status question about a notification: the bearer is authenticated first, and the
+    /// gateway holds nothing under an identifier it was never given.
+    fn status(&self, headers: &[(&str, &str)]) -> ServiceHttpAnswer {
+        let state = self.state();
+        let presented = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| *value);
+        let known = state.authorisations.values().any(|held| {
+            let expected = {
+                use base64::Engine as _;
+                format!(
+                    "Bearer {}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(held.secret)
+                )
+            };
+            presented == Some(expected.as_str())
+                && held.state == PushSenderState::Active
+                && held.expires_at_ms > now()
+        });
+        if known {
+            Self::answer(200, &serde_json::json!({ "ok": true, "data": null }))
+        } else {
+            Self::refusal(401, "UNAUTHENTICATED")
+        }
+    }
+
+    /// Lets the credential the gateway last issued for one authorisation lapse, as it does for a
+    /// host that was away for a month.
+    fn lapse(&self, id: PushSenderRecordId) {
+        if let Some(held) = self.state().authorisations.get_mut(&id) {
+            held.expires_at_ms = now().saturating_sub(1_000);
+            held.renewed_at_ms = 0;
+        }
+    }
+
+    fn deliver(&self, body: &[u8], headers: &[(&str, &str)]) -> ServiceHttpAnswer {
+        let Ok(request) = serde_json::from_slice::<PushDeliveryRequest>(body) else {
+            return Self::refusal(400, "INVALID_REQUEST");
+        };
+        let mut state = self.state();
+        let Some(authorisation) = state.authorisations.get(&request.sender_record_id).cloned()
+        else {
+            return Self::refusal(403, "FORBIDDEN");
+        };
+        let expected = {
+            use base64::Engine as _;
+            format!(
+                "Bearer {}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(authorisation.secret)
+            )
+        };
+        let presented = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| *value);
+        if presented != Some(expected.as_str()) {
+            state.bearers_refused += 1;
+            return Self::refusal(401, "UNAUTHENTICATED");
+        }
+        if authorisation.state != PushSenderState::Active {
+            return Self::refusal(403, "FORBIDDEN");
+        }
+        let ack = PushDeliveryAck {
+            decided_at_ms: TimestampMs::new(now()),
+            notification_id: request.notification_id,
+            state: PushDeliveryState::Queued,
+            suppression: Nullable::null(),
+        };
+        state
+            .delivered
+            .push((request.sender_record_id, request.clone()));
+        Self::answer(200, &serde_json::json!({ "ok": true, "data": ack }))
+    }
+
+    /// One signed request to the renewal or the revocation route.
+    fn sender(&self, route: &str, body: &[u8]) -> ServiceHttpAnswer {
+        #[derive(serde::Deserialize)]
+        struct Signed {
+            body: PushRequest,
+            signature: ServiceRequestSignature,
+        }
+        let Ok(signed) = serde_json::from_slice::<Signed>(body) else {
+            return Self::refusal(400, "INVALID_REQUEST");
+        };
+        // The signature covers this body and this method, under the host's domain.
+        let covers = signed.signature.payload.method == signed.body.method()
+            && signed.body.digest().ok() == Some(signed.signature.payload.body_digest)
+            && signed
+                .signature
+                .payload
+                .signing_input(ServiceRequestSigner::Host)
+                .is_ok_and(|input| {
+                    Self::verifies(
+                        &signed.signature.public_key,
+                        ServiceRequestSigner::Host.domain(),
+                        input,
+                        &signed.signature.signature,
+                    )
+                });
+        if !covers {
+            // The Worker refuses a request whose signature does not hold with 401, before it
+            // looks at what the request is about.
+            return Self::refusal(401, "UNAUTHENTICATED");
+        }
+        let key = signed.signature.public_key;
+        let mut state = self.state();
+        let nonce_for = |state: &mut GatewayState,
+                         purpose: &'static str,
+                         id: PushSenderRecordId|
+         -> ServiceHttpAnswer {
+            match state.authorisations.get(&id) {
+                Some(held) if held.host_signing_key == key => {}
+                _ => return Self::refusal(403, "FORBIDDEN"),
+            }
+            let mut nonce = [0_u8; 32];
+            kr_crypto::random_bytes(&mut nonce).expect("a nonce");
+            state.nonces.insert((purpose, nonce));
+            Self::answer(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "gateway_nonce": Nonce256::from_bytes(nonce),
+                        "expires_at_ms": TimestampMs::new(now() + 60_000),
+                    },
+                }),
+            )
+        };
+        match signed.body {
+            PushRequest::SenderRenew {
+                request: PushSenderRenewRequest::Begin { request },
+            } if route.ends_with("/renew") => {
+                nonce_for(&mut state, "renew", request.sender_record_id)
+            }
+            PushRequest::SenderRevoke {
+                request: PushSenderRevokeRequest::Begin { request },
+            } if route.ends_with("/revoke") => {
+                if self.refuses_revocations.load(Ordering::SeqCst) {
+                    return Self::refusal(503, "SERVICE_UNAVAILABLE");
+                }
+                nonce_for(&mut state, "revoke", request.sender_record_id)
+            }
+            PushRequest::SenderRenew {
+                request: PushSenderRenewRequest::Complete { renewal },
+            } if route.ends_with("/renew") => {
+                let id = renewal.payload.sender_record_id;
+                let spent = state
+                    .nonces
+                    .remove(&("renew", *renewal.payload.gateway_nonce.as_bytes()));
+                let proven = renewal.payload.signing_input().is_ok_and(|input| {
+                    Self::verifies(&key, PUSH_SENDER_RENEWAL_DOMAIN, input, &renewal.signature)
+                });
+                let Some(held) = state.authorisations.get_mut(&id) else {
+                    return Self::refusal(403, "FORBIDDEN");
+                };
+                if !spent || !proven || held.host_signing_key != key {
+                    return Self::refusal(403, "FORBIDDEN");
+                }
+                // A revoked authorisation never renews.
+                if held.state != PushSenderState::Active {
+                    return Self::refusal(403, "FORBIDDEN");
+                }
+                // And an active one renews in the last week of its credential's life, or within
+                // an hour of a renewal whose answer was lost: never on the day it was issued.
+                let issued = now();
+                let due = held.expires_at_ms.saturating_sub(RENEWAL_WINDOW_MS) <= issued;
+                let recovering = held.renewed_at_ms > 0
+                    && issued.saturating_sub(held.renewed_at_ms) <= RENEWAL_RECOVERY_MS;
+                if !due && !recovering {
+                    return Self::refusal(403, "FORBIDDEN");
+                }
+                held.revision += 1;
+                kr_crypto::random_bytes(&mut held.secret).expect("a secret");
+                held.renewed_at_ms = issued;
+                held.expires_at_ms = issued + self.lifetime();
+                let credential = Self::credential_of(id, held, issued);
+                let record = PushSenderRecord {
+                    binding: PushSenderBinding {
+                        gateway_origin: credential.gateway_origin.clone(),
+                        host_endpoint_key: EndpointKey::from_bytes([4; 32]),
+                        host_signing_key: held.host_signing_key,
+                        installation_id: held.installation_id,
+                        rate_policy: PushRatePolicy::FREE,
+                        sender_record_id: id,
+                    },
+                    credential_expires_at_ms: credential.expires_at_ms,
+                    issued_at_ms: credential.issued_at_ms,
+                    revision: credential.revision,
+                    state: held.state,
+                };
+                Self::answer(
+                    200,
+                    &serde_json::json!({
+                        "ok": true,
+                        "data": { "record": record, "credential": credential },
+                    }),
+                )
+            }
+            PushRequest::SenderRevoke {
+                request: PushSenderRevokeRequest::Complete { revocation },
+            } if route.ends_with("/revoke") => {
+                let id = revocation.payload.sender_record_id;
+                let spent = state
+                    .nonces
+                    .remove(&("revoke", *revocation.payload.gateway_nonce.as_bytes()));
+                let proven = revocation.payload.signing_input().is_ok_and(|input| {
+                    Self::verifies(
+                        &key,
+                        PUSH_SENDER_REVOCATION_DOMAIN,
+                        input,
+                        &revocation.signature,
+                    )
+                });
+                let Some(held) = state.authorisations.get_mut(&id) else {
+                    return Self::refusal(403, "FORBIDDEN");
+                };
+                if !spent || !proven || held.host_signing_key != key {
+                    return Self::refusal(403, "FORBIDDEN");
+                }
+                held.state = PushSenderState::Revoked;
+                let credential = Self::credential_of(id, held, now());
+                let record = PushSenderRecord {
+                    binding: PushSenderBinding {
+                        gateway_origin: credential.gateway_origin.clone(),
+                        host_endpoint_key: EndpointKey::from_bytes([4; 32]),
+                        host_signing_key: held.host_signing_key,
+                        installation_id: held.installation_id,
+                        rate_policy: PushRatePolicy::FREE,
+                        sender_record_id: id,
+                    },
+                    credential_expires_at_ms: credential.expires_at_ms,
+                    issued_at_ms: credential.issued_at_ms,
+                    revision: credential.revision,
+                    state: held.state,
+                };
+                Self::answer(
+                    200,
+                    &serde_json::json!({ "ok": true, "data": { "record": record } }),
+                )
+            }
+            _ => Self::refusal(400, "INVALID_REQUEST"),
+        }
+    }
+}
+
+impl ServiceHttp for Gateway {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        let answer = if self.down.load(Ordering::SeqCst) {
+            Err(kr_client::ClientError::ConnectionEnded)
+        } else if url.ends_with("/api/push/deliver") {
+            Ok(self.deliver(body, headers))
+        } else if url.ends_with("/api/push/deliver/status") {
+            if self.no_status_route.load(Ordering::SeqCst) {
+                Ok(ServiceHttpAnswer {
+                    status: 404,
+                    body: b"not found".to_vec(),
+                })
+            } else {
+                Ok(self.status(headers))
+            }
+        } else if url.ends_with("/api/push/sender/renew")
+            || url.ends_with("/api/push/sender/revoke")
+        {
+            Ok(self.sender(url, body))
+        } else {
+            Ok(Self::refusal(404, "NOT_FOUND"))
+        };
+        if let Ok(answered) = &answer {
+            self.state().asked.push((url.to_owned(), answered.status));
+        }
+        Box::pin(async move { answer })
+    }
+}
+
+/// Every origin reached through the one gateway.
+#[derive(Debug)]
+struct Through(Arc<Gateway>);
+
+impl kr_controller::push::transport::DeliveryTransports for Through {
+    fn to(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+    ) -> Result<Arc<dyn ServiceHttp>, String> {
+        Ok(Arc::clone(&self.0) as Arc<dyn ServiceHttp>)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A daemon, a worker it adopts, and a paired device
+// ---------------------------------------------------------------------------------------------
+
+/// A worker for one session, in this process, on an environment tree a daemon of it serves.
+struct Worker {
+    service: Arc<WorkerService>,
+    session_id: SessionId,
+    _runtime: Arc<SessionRuntime>,
+}
+
+impl Worker {
+    /// Starts a worker for one session and records it the way a daemon records one it adopts. No
+    /// daemon may be running on the tree while this runs.
+    async fn start(tree: &kr_ipc::testing::TempHost, display: u64) -> Self {
+        let environment = tree.environment();
+        let environment_id = tree.environment_id();
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let controller_key = {
+            let store = open_store_in(&environment.secrets_dir()).expect("a secret store");
+            *ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                .expect("the daemon's identity")
+                .public_key()
+        };
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let display_number = DisplayNumber::new(display);
+        let process =
+            kr_ipc::identity::current_process_start_identity().expect("a process identity");
+        let identity = Arc::new(
+            WorkerIdentity::generate(
+                session_id,
+                SessionEpoch::V1,
+                boot.clone(),
+                process.clone(),
+                PROTOCOL_VERSION,
+            )
+            .expect("a session key"),
+        );
+        let project: PathBuf = tree.root().join("delivery-project");
+        std::fs::create_dir_all(&project).expect("the project directory");
+        let journal_path = environment.journal_database(session_id);
+        if let Some(parent) = journal_path.parent() {
+            std::fs::create_dir_all(parent).expect("the journal directory");
+        }
+        let config = SessionConfig {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number,
+            shell: kr_worker::pty::ShellCommand {
+                cwd: project.display().to_string(),
+                ..kr_worker::testing::posix_script("sleep 600")
+            },
+            shell_mode: ShellMode::NativeCompat,
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            dimensions: Dimensions::new(80, 24),
+            journal_path: Some(journal_path.clone()),
+            spool_directory: Some(environment.session_spool(session_id)),
+            worker_endpoint: None,
+            send_queue_bytes: 1024 * 1024,
+            resident_bytes: 64 * 1024,
+            time: kr_worker::action::time::TimeSources::system(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+        };
+        let mut session = Session::open(config).expect("opens the session");
+        session.launch().expect("launches the shell");
+        let runtime = Arc::new(
+            SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
+                .expect("starts the runtime"),
+        );
+        let endpoint = environment
+            .worker_endpoint(display_number)
+            .expect("an endpoint");
+        let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+        let public_key = *identity.public_key();
+        let service = Arc::new(
+            WorkerService::new(
+                Arc::clone(&runtime),
+                identity,
+                endpoint.clone(),
+                ServiceBinding {
+                    environment_id,
+                    boot_identity: boot.clone(),
+                    controller_public_key: controller_key,
+                    controller_generation: ControllerGeneration::new(1),
+                    journal_path: Some(journal_path),
+                    build_id: build(),
+                },
+            )
+            .expect("a worker service"),
+        );
+        tokio::spawn(Arc::clone(&service).serve(listener));
+        let mut registry = kr_controller::registry::Registry::open(
+            environment.registry_database(),
+            environment_id,
+        )
+        .expect("the registry");
+        registry
+            .adopt_worker(
+                &kr_controller::registry::WorkerRecord {
+                    session_id,
+                    display_number,
+                    public_key,
+                    process_identity: process.clone(),
+                    endpoint: endpoint.as_text(),
+                    profile: WorkerProfile::HeadlessUser,
+                    state: SessionState::Live,
+                    acknowledged_revision: AuthorityRevision::new(0),
+                },
+                Some(&DesktopBinding::none()),
+            )
+            .expect("the worker is recorded");
+        drop(registry);
+        kr_ipc::descriptor::publish(
+            &environment,
+            &WorkerDescriptor {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id,
+                display_number,
+                boot_identity: boot,
+                process_start_identity: process,
+                protocol_version: PROTOCOL_VERSION,
+                endpoint: endpoint.as_text(),
+                worker_public_key: public_key,
+                worker_profile: WorkerProfile::HeadlessUser,
+                published_at_ms: kr_ipc::now_ms(),
+            },
+        )
+        .expect("the worker's descriptor is published");
+        Self {
+            service,
+            session_id,
+            _runtime: runtime,
+        }
+    }
+
+    /// Asks a question from inside the session, as a verified source bound to it does.
+    fn ask(&self, request: &str, question: &str) {
+        self.service
+            .questions()
+            .create(
+                &kr_worker::questions::VerifiedSource {
+                    process: kr_ipc::identity::current_process_start_identity()
+                        .expect("a process identity"),
+                    executable: Some("/bin/agent".to_owned()),
+                    session_member: true,
+                    ancestry: true,
+                    launch_channel: true,
+                    connection_id: ConnectionId::new(kr_ipc::new_uuid()),
+                },
+                &QuestionCreateParams {
+                    session_id: self.session_id,
+                    request_id: request.to_owned(),
+                    agent_name: Nullable::some("an agent".to_owned()),
+                    context: "the release is tagged".to_owned(),
+                    question: question.to_owned(),
+                    kind: QuestionKind::Confirm,
+                    choices: Vec::new(),
+                    requested_expiry_ms: Nullable::null(),
+                    wait_ms: Nullable::null(),
+                },
+                kr_worker::questions::Now {
+                    utc_ms: kr_ipc::now_ms(),
+                    boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+                },
+            )
+            .expect("a verified source asks");
+    }
+}
+
+/// A daemon on the network with one adopted worker, and the keys of the environment's owner.
+struct Environment {
+    host: Host,
+    owner: DeviceKeys,
+    _worker: Worker,
+    worker_session: SessionId,
+    gateway: Arc<Gateway>,
+}
+
+/// A device paired with the daemon, connected, with the keys it declared at pairing.
+struct Phone {
+    device: Device,
+    record: kr_controller::service::net::devices::DeviceRecord,
+    connection: RawDevice,
+}
+
+impl Environment {
+    /// Starts a daemon on a fresh environment, bootstraps its owner, stops it, starts a worker on
+    /// the tree, and starts the daemon again, which adopts the worker. The daemon delivers through
+    /// the stand-in gateway.
+    async fn start() -> Self {
+        Self::start_attached(true).await
+    }
+
+    /// Starts as [`Self::start`] does, with the daemon delivering through the gateway only when
+    /// `attached` says so: a daemon with no transport asks no gateway anything.
+    async fn start_attached(attached: bool) -> Self {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = Host::start(&owner).await;
+        let stopped = host.shut_down().await;
+        let worker = Worker::start(stopped.tree(), 1).await;
+        let settings = stopped.settings().clone();
+        let host = stopped.start(settings).await;
+        let environment = Self {
+            host,
+            owner,
+            worker_session: worker.session_id,
+            _worker: worker,
+            gateway: Arc::new(Gateway::default()),
+        };
+        environment.until_adopted().await;
+        if attached {
+            environment.attach_gateway();
+        }
+        environment
+    }
+
+    /// Stops the daemon and starts another on the same tree, which finds the worker still running.
+    async fn restart(self) -> Self {
+        self.restart_attached(true).await
+    }
+
+    /// Restarts as [`Self::restart`] does, attaching the gateway only when `attached` says so.
+    async fn restart_attached(self, attached: bool) -> Self {
+        let Self {
+            host,
+            owner,
+            _worker,
+            worker_session,
+            gateway,
+        } = self;
+        let host = host.restart().await;
+        let environment = Self {
+            host,
+            owner,
+            _worker,
+            worker_session,
+            gateway,
+        };
+        environment.until_adopted().await;
+        if attached {
+            environment.attach_gateway();
+        }
+        environment
+    }
+
+    /// The daemon delivers through the stand-in gateway, as a shipped daemon delivers through the
+    /// managed transport.
+    fn attach_gateway(&self) {
+        assert!(
+            self.controller()
+                .attach_delivery_transport(Arc::new(Through(Arc::clone(&self.gateway))))
+        );
+    }
+
+    fn controller(&self) -> &Arc<Controller> {
+        self.host.controller()
+    }
+
+    fn environment_id(&self) -> EnvironmentId {
+        self.host.environment_id
+    }
+
+    /// The signing key the daemon proves its renewals and revocations with: the authorisation key
+    /// of the host's own device keys, which it keeps in its secret store.
+    fn host_signing_key(&self) -> AuthorisationKey {
+        let store = open_store_in(&self.host.tree().environment().secrets_dir())
+            .expect("the daemon's secret store");
+        kr_crypto::store::load_device_keys(
+            store.store.as_ref(),
+            &kr_controller::service::net::device_key_scope(self.environment_id()),
+        )
+        .expect("the host's keys are readable")
+        .expect("the daemon made its keys when it started")
+        .public_keys()
+        .authorisation
+    }
+
+    /// Waits until the daemon serves the worker's session.
+    async fn until_adopted(&self) {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let mut client = self.host.client().await;
+            let read = client
+                .request(
+                    Method::SessionRead,
+                    &kr_protocol::session::SessionReadParams {
+                        session_id: self.worker_session,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon");
+            if read.is_ok() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon never reached the worker: {read:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Pairs a device that may see sessions, and connects it.
+    async fn phone(&self) -> Phone {
+        self.phone_with(DeviceKeys::generate().expect("device keys"))
+            .await
+    }
+
+    /// The same device, connected again after the daemon restarted: its keys and its pairing.
+    async fn phone_with_keys_of(&self, phone: &Phone) -> Phone {
+        let device = Device::with_keys(phone.device.keys().clone()).await;
+        let record = phone.record.clone();
+        let connection = RawDevice::connect(&self.host, &device, &record).await;
+        Phone {
+            device,
+            record,
+            connection,
+        }
+    }
+
+    /// Pairs a device that holds `keys`, and connects it. The same keys paired again are the same
+    /// installation under a device identifier of its own.
+    async fn phone_with(&self, keys: DeviceKeys) -> Phone {
+        let device = Device::with_keys(keys).await;
+        let mut grant = proposal(&[ActionRight::SessionView]);
+        grant.history.lower_bound_ms = Nullable::some(TimestampMs::new(1));
+        let record = pair_with(&self.host, &device, &self.owner, grant).await;
+        let connection = RawDevice::connect(&self.host, &device, &record).await;
+        Phone {
+            device,
+            record,
+            connection,
+        }
+    }
+
+    /// What the daemon's journal holds for notifications.
+    fn deliveries(&self) -> usize {
+        self.controller()
+            .delivery()
+            .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
+            .expect("a read")
+    }
+
+    /// The destination the daemon holds for a device, if any.
+    fn destination(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+    ) -> Option<kr_delivery::destination::DestinationRecord> {
+        let id = kr_delivery::destination::DestinationId::new(device_id.to_string())
+            .expect("an identifier");
+        self.controller()
+            .delivery()
+            .with(|producer| Ok(producer.journal().destination(&id).expect("a read")))
+            .expect("a read")
+    }
+}
+
+impl Phone {
+    fn device_id(&self) -> kr_protocol::ids::DeviceId {
+        self.record.device_id
+    }
+
+    /// The installation this device's authorisation key names, which is what its installation
+    /// authenticates the gateway's exchanges with.
+    fn installation(&self) -> InstallationId {
+        kr_protocol::service::installation_id(&self.device.keys().public_keys().authorisation)
+    }
+
+    /// The device hands the daemon the credential its installation was issued.
+    async fn register(
+        &self,
+        environment: &Environment,
+        credential: &PushDeliveryCredential,
+    ) -> Result<DevicePushRegisterResult, kr_protocol::error::ProtocolError> {
+        self.connection
+            .mutate(
+                Method::DevicePushRegister,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment.environment_id()),
+                &DevicePushRegisterParams {
+                    credential: credential.clone(),
+                    previews_enabled: true,
+                },
+            )
+            .await
+            .map(|value| value.to_typed().expect("a registration result"))
+    }
+}
+
+/// The owner unpairs a device at the daemon's local socket.
+async fn unpair(environment: &Environment, device_id: kr_protocol::ids::DeviceId) {
+    let mut client = environment.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        environment.environment_id(),
+        &mut client,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams { device_id },
+    )
+    .await
+    .expect("the owner unpairs the device");
+}
+
+/// The revocations the daemon owes a gateway.
+fn owed(environment: &Environment) -> Vec<kr_delivery::journal::OwedRevocation> {
+    environment
+        .controller()
+        .delivery()
+        .with(|producer| {
+            Ok(producer
+                .journal()
+                .revocations_due(u64::MAX, 64)
+                .expect("a read"))
+        })
+        .expect("a read")
+}
+
+/// Waits until the attention store holds `questions` pending questions and the delivery journal
+/// has taken everything it announced: the daemon has decided what to tell, and whom.
+async fn until_the_questions_are_settled(environment: &Environment, questions: usize) {
+    until(
+        "the store settling its questions with the delivery journal",
+        || {
+            environment
+                .controller()
+                .attention()
+                .take_for_delivery(|store, _| {
+                    let raised = store
+                        .engine()
+                        .map(|engine| {
+                            engine
+                                .items()
+                                .filter(|item| {
+                                    item.rule == kr_protocol::attention::AttentionRule::PendingInput
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    raised >= questions && store.awaiting_delivery().ok() == Some(0)
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-16.08, KR-REQ-16.09, KR-REQ-16.12, KR-REQ-16.13: a paired device registers the
+/// credential its installation was issued, over its own paired connection, and the daemon then
+/// delivers the next question a worker raises to it, through the gateway, under that credential:
+/// the sealed preview opens with the device's own key, the
+/// plaintext alert is the generic one, and nothing of the session is in the clear. Before the
+/// registration the same question reaches nobody. After the daemon restarts, the next question is
+/// delivered with the phone saying nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_is_after_a_restart()
+{
+    const WORDS: &str = "Deploy the release to production?";
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x51));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+
+    // The control: a question raised before the device registers reaches nobody. The daemon has
+    // taken it, decided it, and has no destination to send it to.
+    environment._worker.ask("deploy-0", WORDS);
+    until_the_questions_are_settled(&environment, 1).await;
+    assert_eq!(environment.deliveries(), 0, "no notification was written");
+    assert!(environment.gateway.delivered().is_empty());
+    assert!(environment.destination(phone.device_id()).is_none());
+
+    let registered = phone
+        .register(&environment, &credential)
+        .await
+        .expect("the daemon registers a credential its gateway confirms");
+    assert_eq!(registered.device_id, phone.device_id());
+    assert_eq!(registered.sender_record_id, sender);
+    assert_eq!(
+        environment.gateway.answers_on("/api/push/sender/renew"),
+        vec![200],
+        "the daemon asked the gateway for a nonce under its own key, which only an authorisation \
+         that names that key is given, and renewed nothing"
+    );
+    assert_eq!(
+        environment.gateway.answers_on("/api/push/deliver/status"),
+        vec![200],
+        "and asked whether the bearer it was handed works"
+    );
+    let destination = environment
+        .destination(phone.device_id())
+        .expect("the device is a destination now");
+    let push = destination.as_push().expect("a push destination");
+    assert_eq!(push.sender_record_id, sender);
+    assert_eq!(
+        push.preview_keys.current,
+        *phone.device.keys().notification_preview.public(),
+        "the preview key is the one the pairing recorded"
+    );
+    assert_eq!(
+        destination.rule.as_ref().and_then(|rule| rule.grant_id),
+        Some(phone.record.grant.grant_id),
+        "and the rule is the device's own grant"
+    );
+
+    environment._worker.ask("deploy-1", WORDS);
+    until("the question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    let request = environment.gateway.delivered().remove(0);
+    assert_eq!(request.sender_record_id, sender);
+    assert_eq!(request.hints.alert, PushAlert::QuestionWaiting);
+    let host_preview = environment
+        .controller()
+        .delivery()
+        .with(|producer| Ok(*producer.preview_public()))
+        .expect("the host's preview key");
+    let opened = kr_delivery::preview::open_preview(
+        &phone.device.keys().notification_preview,
+        &host_preview,
+        request.preview.as_ref().expect("a preview"),
+        now(),
+    )
+    .expect("the device opens its own preview");
+    assert!(!format!("{opened:?}").contains(WORDS));
+    let wire = serde_json::to_string(&request).expect("the request");
+    for private in [WORDS, "deploy-1", &environment.worker_session.to_string()] {
+        assert!(!wire.contains(private), "the gateway is given {private}");
+    }
+    assert_eq!(
+        environment.gateway.state().bearers_refused,
+        0,
+        "every delivery was under the latest bearer the gateway issued"
+    );
+
+    // The daemon restarts. The bearer the gateway last issued is the one it finds, and the next
+    // question is delivered with the device saying nothing.
+    let environment = environment.restart().await;
+    let before = environment.gateway.delivered().len();
+    environment._worker.ask("deploy-2", WORDS);
+    until("the question after the restart being delivered", || {
+        environment.gateway.delivered().len() > before
+    })
+    .await;
+    assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a registration has to establish, and what it leaves alone
+// ---------------------------------------------------------------------------------------------
+
+/// Every file under `directory` that holds `needle`.
+fn files_holding(directory: &std::path::Path, needle: &[u8]) -> Vec<PathBuf> {
+    fn walk(directory: &std::path::Path, needle: &[u8], found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, needle, found);
+            } else if std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(directory, needle, &mut found);
+    found
+}
+
+/// The two spellings a bearer takes on a wire and in a file.
+fn spellings(secret: [u8; 32]) -> Vec<Vec<u8>> {
+    use base64::Engine as _;
+    vec![
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(secret)
+            .into_bytes(),
+        secret.to_vec(),
+    ]
+}
+
+fn bytes_of(credential: &PushDeliveryCredential) -> [u8; 32] {
+    credential
+        .secret
+        .expose()
+        .to_vec()
+        .try_into()
+        .expect("thirty-two bytes")
+}
+
+/// The credential the secret store holds for one authorisation, read the way a daemon that starts
+/// next would read it.
+fn stored_credential(
+    environment: &Environment,
+    sender: PushSenderRecordId,
+) -> Option<PushDeliveryCredential> {
+    let store = open_store_in(&environment.host.tree().environment().secrets_dir())
+        .expect("the daemon's secret store");
+    match kr_controller::push::secrets::DestinationSecrets::new(
+        Arc::from(store.store),
+        environment.environment_id(),
+    )
+    .push_credential(sender)
+    .expect("a read")
+    {
+        kr_controller::push::secrets::StoredCredential::Held(credential) => Some(credential),
+        _ => None,
+    }
+}
+
+/// Whether the secret store the daemon keeps its secrets in holds this bearer.
+fn secret_store_holds(environment: &Environment, secret: [u8; 32]) -> bool {
+    let secrets = environment.host.tree().environment().secrets_dir();
+    spellings(secret)
+        .iter()
+        .any(|spelling| !files_holding(&secrets, spelling).is_empty())
+}
+
+/// Whether any file the daemon keeps outside its secret store holds this bearer.
+fn state_holds(environment: &Environment, secret: [u8; 32]) -> Vec<PathBuf> {
+    let paths = environment.host.tree().environment();
+    let secrets = paths.secrets_dir();
+    spellings(secret)
+        .iter()
+        .flat_map(|spelling| files_holding(paths.state_dir(), spelling))
+        .filter(|path| !path.starts_with(&secrets))
+        .collect()
+}
+
+/// KR-REQ-16.08, KR-REQ-16.09: what a device's word does not establish, the gateway does, and
+/// nothing is kept until it has. Each refusal leaves no destination and no held credential, and
+/// the bearer a refused device offered is in no file the daemon keeps; the control is the same
+/// device registering a credential the gateway confirms to this host's key. A device cannot make
+/// the daemon deliver through another origin, register an installation its own authorisation key
+/// does not name, take an authorisation another device's destination holds, or register a
+/// credential the gateway does not take; and a gateway nobody can reach changes nothing that was
+/// already working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registration_is_kept_only_when_the_gateway_confirms_it_to_the_hosts_own_key() {
+    let environment = Environment::start().await;
+    let host_key = environment.host_signing_key();
+    let phone = environment.phone().await;
+    let other_phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x61));
+    let credentials = environment.controller().delivery_runtime().credentials();
+    let renewals = || {
+        environment
+            .gateway
+            .answers_on("/api/push/sender/renew")
+            .len()
+    };
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    let invalid = kr_protocol::error::ErrorCode::InvalidArgument;
+    let mut refused_bearers = Vec::new();
+
+    // Not the gateway this host delivers through.
+    let mut elsewhere = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    elsewhere.gateway_origin =
+        kr_protocol::service::GatewayOrigin::new("https://gateway.elsewhere.example")
+            .expect("an origin");
+    refused_bearers.push(bytes_of(&elsewhere));
+    let refused = phone
+        .register(&environment, &elsewhere)
+        .await
+        .expect_err("another gateway's credential is refused");
+    assert_eq!(refused.code, invalid);
+
+    // An installation this device's own authorisation key does not name: another device's, and
+    // one nobody's.
+    let theirs = environment
+        .gateway
+        .issue(sender, other_phone.installation(), host_key);
+    let nobodys = environment
+        .gateway
+        .issue(sender, InstallationId::new(uuid(0x62)), host_key);
+    for unfit in [&theirs, &nobodys] {
+        refused_bearers.push(bytes_of(unfit));
+        let refused = phone
+            .register(&environment, unfit)
+            .await
+            .expect_err("an installation that is not this device's own is refused");
+        assert_eq!(refused.code, invalid);
+    }
+
+    // Already expired, lasting longer than thirty days, and issued in the future.
+    let mut expired = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    expired.issued_at_ms = TimestampMs::new(now() - 60_000);
+    expired.expires_at_ms = TimestampMs::new(now() - 1_000);
+    let mut forever = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    forever.expires_at_ms = TimestampMs::new(forever.issued_at_ms.get() + 31 * 24 * 60 * 60 * 1000);
+    // Issued an hour from now, by a clock that is not this host's.
+    let mut early = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    early.issued_at_ms = TimestampMs::new(now() + 60 * 60 * 1000);
+    early.expires_at_ms = TimestampMs::new(early.issued_at_ms.get() + 29 * 24 * 60 * 60 * 1000);
+    for unfit in [&expired, &forever, &early] {
+        refused_bearers.push(bytes_of(unfit));
+        let refused = phone
+            .register(&environment, unfit)
+            .await
+            .expect_err("a credential section 16 does not allow is refused");
+        assert_eq!(refused.code, invalid);
+    }
+    assert_eq!(
+        (renewals(), probes()),
+        (0, 0),
+        "none of them reached the gateway"
+    );
+
+    // An authorisation the gateway holds for another host's key.
+    let someone_elses = AuthorisationKey::from_bytes([9; 32]);
+    let foreign = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(0x63)),
+        phone.installation(),
+        someone_elses,
+    );
+    refused_bearers.push(bytes_of(&foreign));
+    let refused = phone
+        .register(&environment, &foreign)
+        .await
+        .expect_err("the gateway does not name this host for it");
+    assert_eq!(
+        refused.code, invalid,
+        "a refusal that asking again does not change"
+    );
+    assert_eq!(
+        environment.gateway.answers_on("/api/push/sender/renew"),
+        vec![403],
+        "the gateway was asked for a nonce under the host's key and refused it"
+    );
+    assert_eq!(
+        environment.gateway.answers_on("/api/push/deliver/status"),
+        vec![200],
+        "after the bearer was put to it, which it takes"
+    );
+
+    // A bearer the gateway does not take: the authorisation is this host's, the secret is not.
+    let mut wrong = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    wrong.secret = SecretBytes32::from_bytes([0xab; 32]);
+    refused_bearers.push(bytes_of(&wrong));
+    let refused = phone
+        .register(&environment, &wrong)
+        .await
+        .expect_err("a bearer the gateway does not take is refused");
+    assert_eq!(refused.code, invalid);
+    assert_eq!(
+        environment.gateway.answers_on("/api/push/deliver/status"),
+        vec![200, 401]
+    );
+    assert_eq!(
+        renewals(),
+        1,
+        "and the nonce was not asked for, which costs the host's allowance for renewing"
+    );
+    assert!(environment.destination(phone.device_id()).is_none());
+    assert!(credentials.held(sender).is_none());
+    assert!(credentials.held(foreign.sender_record_id).is_none());
+
+    // The control: the credential the gateway does take is kept, as the device gave it.
+    let credential = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("a confirmed credential is registered");
+    assert!(environment.destination(phone.device_id()).is_some());
+    assert_eq!(
+        credentials.held(sender).expect("held").secret,
+        credential.secret
+    );
+
+    // Another device cannot take the authorisation this device's destination holds, even under an
+    // installation of its own.
+    let mut taken = credential.clone();
+    taken.installation_id = other_phone.installation();
+    let before = (renewals(), probes());
+    let refused = other_phone
+        .register(&environment, &taken)
+        .await
+        .expect_err("an authorisation one destination holds is not another's");
+    assert_eq!(refused.code, invalid);
+    assert!(environment.destination(other_phone.device_id()).is_none());
+    assert_eq!(
+        (renewals(), probes()),
+        before,
+        "and the gateway was not asked about it"
+    );
+
+    // A gateway nobody can reach, or one with no answer that says either way, confirms nothing and
+    // changes nothing that was already working. A bare 404 from a deployment without the status
+    // route is no evidence that a bearer works.
+    let held = credentials.held(sender).expect("held");
+    let unasked = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(0x65)),
+        other_phone.installation(),
+        host_key,
+    );
+    refused_bearers.push(bytes_of(&unasked));
+    environment.gateway.set_down(true);
+    let refused = other_phone
+        .register(&environment, &unasked)
+        .await
+        .expect_err("a registration the gateway cannot confirm");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::UpstreamUnavailable,
+        "a failure asking again may mend"
+    );
+    environment.gateway.set_down(false);
+    environment.gateway.lose_the_status_route(true);
+    let refused = other_phone
+        .register(&environment, &unasked)
+        .await
+        .expect_err("a status route that answers 404 confirms nothing");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    environment.gateway.lose_the_status_route(false);
+    assert!(environment.destination(other_phone.device_id()).is_none());
+    assert!(credentials.held(unasked.sender_record_id).is_none());
+    assert_eq!(
+        credentials.held(sender).expect("still held").secret,
+        held.secret
+    );
+    assert_eq!(
+        environment
+            .destination(phone.device_id())
+            .and_then(|record| record.as_push().map(|push| push.sender_record_id)),
+        Some(sender),
+        "and the destination still names the authorisation it named"
+    );
+
+    // The bearer is where the secret store keeps it, and no bearer a refused device offered is
+    // anywhere the daemon writes.
+    assert!(
+        secret_store_holds(&environment, bytes_of(&held)),
+        "the control: the secret store holds the bearer"
+    );
+    assert!(
+        state_holds(&environment, bytes_of(&held)).is_empty(),
+        "no journal or directory holds it"
+    );
+    for refused in refused_bearers {
+        assert!(!secret_store_holds(&environment, refused));
+        assert!(state_holds(&environment, refused).is_empty());
+    }
+}
+
+/// KR-REQ-16.10: unpairing a device ends its destination, forgets the credential held for it, in
+/// memory and in the secret store, and asks the gateway to revoke the authorisation, proven under
+/// the host's key. Nothing more is delivered to the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn unpairing_a_device_ends_its_destination_and_the_gateway_revokes_the_authorisation() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x71));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let credentials = environment.controller().delivery_runtime().credentials();
+    let bearer = bytes_of(&credential);
+    assert!(
+        secret_store_holds(&environment, bearer),
+        "the control: the secret store holds the bearer while the device is paired"
+    );
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("a question being delivered to the paired device", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+
+    unpair(&environment, phone.device_id()).await;
+
+    // The destination is out of service: gone, or kept without a rule as the name of the
+    // notification already sent to it.
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled && record.rule.is_none())
+    );
+    assert!(credentials.held(sender).is_none());
+    assert!(
+        !secret_store_holds(&environment, bearer),
+        "the secret store gave the bearer up"
+    );
+    until(
+        "the gateway being asked to revoke the authorisation",
+        || {
+            environment
+                .gateway
+                .authorisation(sender)
+                .is_some_and(|held| held.state == PushSenderState::Revoked)
+        },
+    )
+    .await;
+    assert_eq!(
+        environment.gateway.answers_on("/api/push/sender/revoke"),
+        vec![200, 200],
+        "a nonce, and then the revocation under the host key"
+    );
+    until("the revocation no longer being owed", || {
+        owed(&environment).is_empty()
+    })
+    .await;
+
+    // Nothing more is delivered to it.
+    let delivered = environment.gateway.delivered().len();
+    environment
+        ._worker
+        .ask("deploy-2", "Deploy the release again?");
+    until_the_questions_are_settled(&environment, 2).await;
+    assert_eq!(environment.gateway.delivered().len(), delivered);
+}
+
+/// KR-REQ-16.10: a revocation the gateway has not taken is owed, and is still owed after the
+/// daemon restarts. Here the daemon has no way to reach any gateway when the device is unpaired:
+/// the destination and its credential go at once, the debt is written down, and the revocation is
+/// made when a gateway can be reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_revocation_owed_when_no_gateway_can_be_reached_is_made_when_one_can() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x81));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+
+    // The daemon restarts and reaches no gateway, and the device is unpaired.
+    let environment = environment.restart_attached(false).await;
+    unpair(&environment, phone.device_id()).await;
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled)
+    );
+    let owing = owed(&environment);
+    assert_eq!(owing.len(), 1, "one revocation is owed");
+    assert_eq!(owing[0].sender_record_id, sender);
+    assert_eq!(owing[0].gateway_origin, GATEWAY);
+    assert_eq!(
+        environment
+            .gateway
+            .authorisation(sender)
+            .expect("held")
+            .state,
+        PushSenderState::Active,
+        "and the gateway still holds the authorisation"
+    );
+
+    // A stop between ending the destination and deleting its item leaves the item behind. It is
+    // put back here, and the next start removes it: nothing renews it for a device that is gone.
+    {
+        let store = open_store_in(&environment.host.tree().environment().secrets_dir())
+            .expect("the daemon's secret store");
+        kr_controller::push::secrets::DestinationSecrets::new(
+            Arc::from(store.store),
+            environment.environment_id(),
+        )
+        .put_push_credential(&credential)
+        .expect("the item is left behind");
+    }
+    assert!(secret_store_holds(&environment, bytes_of(&credential)));
+
+    // It is owed across another restart too.
+    let environment = environment.restart_attached(false).await;
+    assert_eq!(owed(&environment).len(), 1);
+    assert!(
+        !secret_store_holds(&environment, bytes_of(&credential)),
+        "and the start removed what was left of the authorisation"
+    );
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none()
+    );
+
+    // A gateway that can be reached is asked, and the debt is paid.
+    environment.attach_gateway();
+    until("the gateway being asked to revoke", || {
+        environment
+            .gateway
+            .authorisation(sender)
+            .is_some_and(|held| held.state == PushSenderState::Revoked)
+    })
+    .await;
+    until("the debt being settled", || owed(&environment).is_empty()).await;
+}
+
+/// KR-REQ-16.09: the daemon keeps the credential current with no phone awake or connected. One
+/// the gateway issued for two days, inside the renewal window, is renewed when the daemon starts;
+/// one found past its expiry in the secret store is renewed too, because the authorisation behind
+/// it has not lapsed. Each renewal is kept, so a daemon that starts again delivers under the
+/// bearer the gateway issued last, and the gateway never refuses one. An older copy of the
+/// credential, handed over again, is refused. The gateway renews only in the last week of a
+/// credential's life, as the Worker does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_daemon_renews_what_it_holds_with_the_phone_away_and_remembers_the_renewal() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x91));
+    // A credential with two days left: inside the seven days section 16 renews ahead of expiry.
+    environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    environment.gateway.issue_for(0);
+    let registered = environment.gateway.revision_of(sender);
+
+    // The daemon starts again, with the phone away. It renews at once, and the renewal is kept.
+    let environment = environment.restart().await;
+    until("the daemon renewing a credential in its window", || {
+        environment.gateway.revision_of(sender) > registered
+    })
+    .await;
+    let renewed = environment.gateway.revision_of(sender);
+    let credentials = environment.controller().delivery_runtime().credentials();
+    until(
+        "the daemon holding the credential the gateway issued",
+        || {
+            credentials
+                .held(sender)
+                .is_some_and(|held| held.revision.get() == renewed)
+        },
+    )
+    .await;
+
+    // And the renewal is in the secret store, where a daemon that starts next reads it from: the
+    // gateway renews again only in the last week of the new credential's life, or within an hour.
+    assert_eq!(
+        stored_credential(&environment, sender).map(|stored| stored.revision.get()),
+        Some(renewed),
+        "the renewed bearer was written before it was used"
+    );
+
+    // The copy the device kept is older than what the daemon holds, and is refused.
+    let reconnected = environment.phone_with_keys_of(&phone).await;
+    let refused = reconnected
+        .register(&environment, &credential)
+        .await
+        .expect_err("an older copy of a credential is refused");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+
+    // The copy in the secret store is found past its expiry, as it is by a daemon that was off for
+    // a month, and the gateway's record has lapsed with it. The daemon renews that too.
+    environment.gateway.lapse(sender);
+    {
+        let store = open_store_in(&environment.host.tree().environment().secrets_dir())
+            .expect("the daemon's secret store");
+        let vault = kr_controller::push::secrets::DestinationSecrets::new(
+            Arc::from(store.store),
+            environment.environment_id(),
+        );
+        let mut lapsed = stored_credential(&environment, sender).expect("the credential is kept");
+        lapsed.issued_at_ms = TimestampMs::new(now() - 31 * 24 * 60 * 60 * 1000);
+        lapsed.expires_at_ms = TimestampMs::new(now() - 1_000);
+        vault.put_push_credential(&lapsed).expect("a write");
+    }
+    let environment = environment.restart().await;
+    until("the daemon renewing a credential past its expiry", || {
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_some_and(|held| held.revision.get() > renewed)
+    })
+    .await;
+
+    let latest = environment
+        .controller()
+        .delivery_runtime()
+        .credentials()
+        .held(sender)
+        .expect("held");
+    assert_eq!(
+        stored_credential(&environment, sender),
+        Some(latest),
+        "and so is the renewal of a credential found past its expiry"
+    );
+
+    // And what it delivers under afterwards is the bearer the gateway issued last.
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert_eq!(environment.gateway.state().bearers_refused, 0);
+    let environment = environment.restart().await;
+    let before = environment.gateway.delivered().len();
+    environment
+        ._worker
+        .ask("deploy-2", "Deploy the release again?");
+    until("the question after another restart being delivered", || {
+        environment.gateway.delivered().len() > before
+    })
+    .await;
+    assert_eq!(
+        environment.gateway.state().bearers_refused,
+        0,
+        "the daemon remembered every renewal"
+    );
+}
+
+/// KR-REQ-16.10: a device that registers a new authorisation for its installation leaves the
+/// earlier one behind. The earlier credential goes from the secret store, the gateway is asked to
+/// revoke the authorisation, a question is delivered under the new one, and the preview-key
+/// rotation the device made in between is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_new_authorisation_replaces_the_earlier_one_and_the_gateway_revokes_it() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let host_key = environment.host_signing_key();
+    let old = PushSenderRecordId::new(uuid(0xb1));
+    let new = PushSenderRecordId::new(uuid(0xb2));
+    let first = environment
+        .gateway
+        .issue(old, phone.installation(), host_key);
+    phone
+        .register(&environment, &first)
+        .await
+        .expect("the first credential is registered");
+    assert!(secret_store_holds(&environment, bytes_of(&first)));
+
+    // The device rotates its preview key between the two registrations, and keeps the rotation.
+    let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    phone
+        .connection
+        .mutate(
+            Method::DevicePreviewKeyUpdate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment.environment_id()),
+            &kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+                device_id: phone.device_id(),
+                notification_preview: *rotated.public(),
+                revision: kr_protocol::ids::DeviceKeyRevision::new(2),
+            },
+        )
+        .await
+        .expect("the preview key rotates");
+
+    let second = environment
+        .gateway
+        .issue(new, phone.installation(), host_key);
+    phone
+        .register(&environment, &second)
+        .await
+        .expect("the second credential is registered");
+    let kept = environment
+        .destination(phone.device_id())
+        .expect("a destination");
+    let keys = &kept.as_push().expect("a push destination").preview_keys;
+    assert_eq!(
+        (keys.current, keys.revision),
+        (*rotated.public(), 2),
+        "registering again keeps the rotation the device made"
+    );
+    let credentials = environment.controller().delivery_runtime().credentials();
+    assert!(credentials.held(old).is_none());
+    assert!(
+        !secret_store_holds(&environment, bytes_of(&first)),
+        "the earlier bearer is gone from the secret store"
+    );
+    assert!(secret_store_holds(&environment, bytes_of(&second)));
+    until("the earlier authorisation being revoked", || {
+        environment
+            .gateway
+            .authorisation(old)
+            .is_some_and(|held| held.state == PushSenderState::Revoked)
+    })
+    .await;
+    until("the debt being paid", || owed(&environment).is_empty()).await;
+    assert_eq!(
+        environment.gateway.authorisation(new).expect("held").state,
+        PushSenderState::Active
+    );
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("a question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert_eq!(
+        environment
+            .gateway
+            .state()
+            .delivered
+            .last()
+            .map(|(sender, _)| *sender),
+        Some(new)
+    );
+}
+
+/// KR-REQ-16.10: while the host owes the gateway a revocation of an authorisation, a device cannot
+/// register it again: the sweep would revoke the one in use. Nothing changes, the gateway is not
+/// asked, and a question is delivered under the authorisation in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_authorisation_the_host_is_revoking_cannot_be_registered_again() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let host_key = environment.host_signing_key();
+    let old = PushSenderRecordId::new(uuid(0xb1));
+    let new = PushSenderRecordId::new(uuid(0xb2));
+    let first = environment
+        .gateway
+        .issue(old, phone.installation(), host_key);
+    phone
+        .register(&environment, &first)
+        .await
+        .expect("the first credential is registered");
+    assert!(secret_store_holds(&environment, bytes_of(&first)));
+
+    // The gateway is having a bad hour: the revocation of the earlier authorisation stays owed.
+    environment.gateway.refuse_revocations(true);
+    let second = environment
+        .gateway
+        .issue(new, phone.installation(), host_key);
+    phone
+        .register(&environment, &second)
+        .await
+        .expect("the second credential is registered");
+    let credentials = environment.controller().delivery_runtime().credentials();
+    assert!(credentials.held(old).is_none());
+    assert!(
+        !secret_store_holds(&environment, bytes_of(&first)),
+        "the earlier bearer is gone from the secret store"
+    );
+    assert!(secret_store_holds(&environment, bytes_of(&second)));
+    until(
+        "the revocation of the earlier authorisation being owed",
+        || {
+            owed(&environment)
+                .iter()
+                .any(|owing| owing.sender_record_id == old)
+        },
+    )
+    .await;
+
+    // While it is owed, the earlier authorisation cannot be registered again: the sweep would
+    // revoke the one in use. Nothing changes and the gateway is not asked.
+    let (renewals, probes) = (
+        environment
+            .gateway
+            .answers_on("/api/push/sender/renew")
+            .len(),
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len(),
+    );
+    let refused = phone
+        .register(&environment, &first)
+        .await
+        .expect_err("an authorisation being revoked is refused");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    assert_eq!(
+        (
+            environment
+                .gateway
+                .answers_on("/api/push/sender/renew")
+                .len(),
+            environment
+                .gateway
+                .answers_on("/api/push/deliver/status")
+                .len()
+        ),
+        (renewals, probes),
+        "and the gateway was not asked"
+    );
+    assert!(credentials.held(old).is_none());
+    assert_eq!(
+        environment
+            .destination(phone.device_id())
+            .and_then(|record| record.as_push().map(|push| push.sender_record_id)),
+        Some(new)
+    );
+
+    assert_eq!(
+        environment.gateway.authorisation(old).expect("held").state,
+        PushSenderState::Active,
+        "the gateway has not revoked it yet, and the host still owes it"
+    );
+    assert_eq!(
+        environment.gateway.authorisation(new).expect("held").state,
+        PushSenderState::Active
+    );
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("a question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert_eq!(
+        environment
+            .gateway
+            .state()
+            .delivered
+            .last()
+            .map(|(sender, _)| *sender),
+        Some(new)
+    );
+}
+
+/// A daemon with no way to reach a gateway cannot confirm a credential, and keeps none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_daemon_that_cannot_reach_a_gateway_registers_nothing() {
+    let environment = Environment::start_attached(false).await;
+    let phone = environment.phone().await;
+    let credential = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(0xc1)),
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    let refused = phone
+        .register(&environment, &credential)
+        .await
+        .expect_err("no gateway can be asked");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    assert!(environment.destination(phone.device_id()).is_none());
+    assert!(!secret_store_holds(&environment, bytes_of(&credential)));
+}
+
+/// KR-REQ-16.10: a device revoked while the daemon was not serving it leaves a destination and a
+/// credential behind. The daemon that starts next ends them and asks the gateway to revoke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_revoked_while_the_daemon_was_down_is_ended_at_the_next_start() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xd1));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    // The device directory records the revocation and the daemon stops before it does the rest.
+    environment
+        .controller()
+        .devices()
+        .revoke(phone.device_id(), TimestampMs::new(now()))
+        .expect("the device is revoked in the directory");
+    assert!(environment.destination(phone.device_id()).is_some());
+
+    let environment = environment.restart().await;
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled && record.rule.is_none())
+    );
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none()
+    );
+    assert!(!secret_store_holds(&environment, bytes_of(&credential)));
+    until("the gateway being asked to revoke", || {
+        environment
+            .gateway
+            .authorisation(sender)
+            .is_some_and(|held| held.state == PushSenderState::Revoked)
+    })
+    .await;
+}
+
+/// A destination in service with no credential kept for it, which is what a stop between writing a
+/// registration's destination and its credential leaves, delivers nothing: its notifications
+/// settle as revoked. The device registers again, and the next question is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_destination_with_no_credential_delivers_nothing_until_the_device_registers_again() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xe1));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    // The item is gone from the secret store, as it is when a stop came between the two writes.
+    {
+        let store = open_store_in(&environment.host.tree().environment().secrets_dir())
+            .expect("the daemon's secret store");
+        kr_controller::push::secrets::DestinationSecrets::new(
+            Arc::from(store.store),
+            environment.environment_id(),
+        )
+        .remove_push_credential(sender)
+        .expect("the item is removed");
+    }
+
+    let environment = environment.restart().await;
+    assert!(environment.destination(phone.device_id()).is_some());
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none()
+    );
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until_the_questions_are_settled(&environment, 1).await;
+    until("the notification being settled", || {
+        environment
+            .controller()
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| record.state == kr_delivery::journal::DeliveryState::Revoked))
+            })
+            .expect("a read")
+    })
+    .await;
+    assert!(
+        environment.gateway.delivered().is_empty(),
+        "nothing reached the gateway"
+    );
+
+    // The device registers again, and what comes next is delivered.
+    let reconnected = environment.phone_with_keys_of(&phone).await;
+    reconnected
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered again");
+    environment
+        ._worker
+        .ask("deploy-2", "Deploy the release again?");
+    until("the next question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+}
+
+/// A device that registers over and over has the gateway asked only a few times an hour: the
+/// questions come out of the gateway's allowances for this host, and a device must not be able to
+/// spend the renewals and revocations of every other. The fourth in a row is refused without the
+/// gateway being asked, and another device is not affected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_registers_over_and_over_is_not_confirmed_with_the_gateway_each_time() {
+    let environment = Environment::start().await;
+    let host_key = environment.host_signing_key();
+    let phone = environment.phone().await;
+    let other_phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xf1));
+    let mut wrong = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    wrong.secret = SecretBytes32::from_bytes([0xab; 32]);
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    for attempt in 1..=3 {
+        let refused = phone
+            .register(&environment, &wrong)
+            .await
+            .expect_err("a bearer the gateway does not take");
+        assert_eq!(
+            refused.code,
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            "attempt {attempt}"
+        );
+    }
+    assert_eq!(probes(), 3);
+    let good = environment
+        .gateway
+        .issue(sender, phone.installation(), host_key);
+    let refused = phone
+        .register(&environment, &good)
+        .await
+        .expect_err("the fourth in a row is not put to the gateway");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    assert_eq!(probes(), 3, "and the gateway was not asked");
+    assert!(environment.destination(phone.device_id()).is_none());
+
+    // Another device has its own allowance.
+    let theirs = environment.gateway.issue(
+        PushSenderRecordId::new(uuid(0xf2)),
+        other_phone.installation(),
+        host_key,
+    );
+    other_phone
+        .register(&environment, &theirs)
+        .await
+        .expect("another device is confirmed");
+}

@@ -32,6 +32,12 @@
 //! together stay under the gateway's limit. A question its share cannot cover is not put. Neither
 //! path can spend the other's share, so a steady run of one kind of question never stops the
 //! other kind being asked.
+//!
+//! A third path asks too: a paired device that registers a credential has the gateway asked
+//! whether it takes the bearer ([`GatewayStatus::probe`]). It spends the sweep's share, after a
+//! small allowance of the device's own, so a device that registers over and over spends neither
+//! the pass's share, which notifications a person is waiting on depend on, nor much of the
+//! sweep's.
 
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +46,7 @@ use kr_delivery::push::{DeliveryStatus, StatusAnswer};
 use kr_protocol::ids::NotificationId;
 use kr_protocol::push::{PushDeliveryAck, PushDeliveryCredential};
 
+use super::Confirmation;
 use super::client::bearer;
 use super::transport::DeliveryTransports;
 
@@ -205,6 +212,56 @@ impl GatewayStatus {
     }
 }
 
+impl GatewayStatus {
+    /// Asks whether the gateway takes this credential's bearer, with a question about a
+    /// notification that does not exist.
+    ///
+    /// The gateway authenticates the bearer before it looks for the notification, so a success
+    /// says the bearer belongs to an active authorisation that has not expired, and nothing is
+    /// delivered or changed by asking. Only the gateway's own success counts: a bare status, such
+    /// as a 404 from a deployment without the route, is no evidence of anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Confirmation::Refused`] for the gateway's own refusal of the bearer,
+    /// `UNAUTHENTICATED`, and [`Confirmation::NotAsked`] for anything else that is not its
+    /// success.
+    pub fn probe(
+        &self,
+        credential: &PushDeliveryCredential,
+        notification_id: NotificationId,
+    ) -> Result<(), Confirmation> {
+        let body = serde_json::to_vec(&StatusRequest { notification_id }).map_err(|error| {
+            Confirmation::NotAsked(format!("the question could not be encoded: {error}"))
+        })?;
+        let answer = self.exchange(credential, &body).map_err(|detail| {
+            Confirmation::NotAsked(format!("the gateway did not answer: {detail}"))
+        })?;
+        if answer.body.len() > MAX_ANSWER_BYTES {
+            return Err(Confirmation::NotAsked(
+                "the gateway's answer was longer than this host reads".to_owned(),
+            ));
+        }
+        match kr_client::services::json::read::<Probe>(&answer.body) {
+            Ok(Probe { ok: true, .. }) if answer.status == 200 => Ok(()),
+            Ok(Probe {
+                ok: false,
+                error: Some(refusal),
+            }) if answer.status == 401 && refusal.code == "UNAUTHENTICATED" => Err(
+                Confirmation::Refused("the gateway does not take that bearer".to_owned()),
+            ),
+            Ok(_) => Err(Confirmation::NotAsked(format!(
+                "the gateway answered {} without confirming the bearer",
+                answer.status
+            ))),
+            Err(fault) => Err(Confirmation::NotAsked(format!(
+                "the gateway's answer ({}) could not be read: {fault}",
+                answer.status
+            ))),
+        }
+    }
+}
+
 impl DeliveryStatus for GatewayStatus {
     fn reserve(&self, steady_ms: u64) -> bool {
         self.budget.take(steady_ms)
@@ -278,6 +335,20 @@ fn read_answer(answer: &ServiceHttpAnswer) -> StatusAnswer {
 #[derive(serde::Serialize)]
 struct StatusRequest {
     notification_id: NotificationId,
+}
+
+/// The envelope of an answer read for what it says about the credential asked with, and not for
+/// the outcome it carries.
+#[derive(serde::Deserialize)]
+struct Probe {
+    ok: bool,
+    error: Option<ProbeRefusal>,
+}
+
+/// The code of the gateway's refusal, the only word of it this host reads.
+#[derive(serde::Deserialize)]
+struct ProbeRefusal {
+    code: String,
 }
 
 /// The standard envelope the gateway answers with.

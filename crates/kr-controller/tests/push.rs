@@ -7607,3 +7607,247 @@ async fn privacy_mode_turned_on_between_the_take_and_the_send_sends_nothing() {
         host.stop().await;
     }
 }
+
+// ----- Revocations owed to a gateway ------------------------------------------------------------
+
+/// A gateway's answers to a host asking it to revoke, in the order they are given.
+#[derive(Debug, Default)]
+struct Revoking {
+    answers: Mutex<std::collections::VecDeque<kr_controller::push::sender::RevocationAnswer>>,
+    asked: Mutex<Vec<PushSenderRecordId>>,
+}
+
+impl kr_controller::push::sender::SenderRevocation for Revoking {
+    fn revoke(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+        sender_record_id: PushSenderRecordId,
+    ) -> kr_controller::push::sender::RevocationAnswer {
+        self.asked
+            .lock()
+            .expect("not poisoned")
+            .push(sender_record_id);
+        self.answers
+            .lock()
+            .expect("not poisoned")
+            .pop_front()
+            .expect("an answer the test gave")
+    }
+}
+
+/// KR-REQ-16.10: a revocation the gateway did not take is asked for again, further apart each
+/// time, until the gateway takes it; one the gateway says it never will take is not asked for
+/// again; one owed for as long as a credential lives is given up, but only after it was asked for
+/// a few times; and whatever the host still keeps of the authorisation goes before each ask.
+#[test]
+fn an_owed_revocation_is_asked_for_until_the_gateway_takes_it_or_says_it_never_will() {
+    use kr_controller::push::sender::RevocationAnswer::{Gone, Later, Revoked};
+
+    const MINUTE: u64 = 60_000;
+    const DAY: u64 = 24 * 60 * MINUTE;
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = DeliveryModule::open_at(
+        &directory.path().join("delivery.sqlite3"),
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
+    )
+    .expect("a delivery module");
+    let t0 = 1_700_000_000_000_u64;
+    let taken = PushSenderRecordId::new(uuid(1));
+    let refused = PushSenderRecordId::new(uuid(2));
+    let abandoned = PushSenderRecordId::new(uuid(3));
+    module
+        .with(|producer| {
+            for id in [taken, refused, abandoned] {
+                producer
+                    .journal_mut()
+                    .owe_revocation(id, "https://reach.invalid", t0)
+                    .expect("a debt");
+            }
+            Ok(())
+        })
+        .expect("the debts are written");
+    let due = |at: u64| -> Vec<PushSenderRecordId> {
+        module
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .revocations_due(at, 16)
+                    .expect("a read")
+                    .into_iter()
+                    .map(|owed| owed.sender_record_id)
+                    .collect())
+            })
+            .expect("a read")
+    };
+    let forgotten = Mutex::new(Vec::new());
+    let sweep = |at: u64, answers: Vec<kr_controller::push::sender::RevocationAnswer>| {
+        let revoking = Revoking::default();
+        *revoking.answers.lock().expect("not poisoned") = answers.into();
+        let settled = module
+            .settle_revocations(
+                &revoking,
+                &|id| {
+                    forgotten.lock().expect("not poisoned").push(id);
+                    true
+                },
+                &move || at,
+            )
+            .expect("a sweep");
+        (
+            settled,
+            revoking.asked.lock().expect("not poisoned").clone(),
+        )
+    };
+
+    // The first sweep: one the gateway cannot answer, one it refuses for good and one it cannot
+    // answer either. The host's own copy of each goes before the gateway is asked.
+    let (settled, asked) = sweep(
+        t0,
+        vec![
+            Later("no answer".to_owned()),
+            Gone("none".to_owned()),
+            Later("no".to_owned()),
+        ],
+    );
+    assert_eq!(settled, 1, "the refusal for good is settled");
+    assert_eq!(asked.len(), 3);
+    assert_eq!(
+        forgotten.lock().expect("not poisoned").len(),
+        3,
+        "and each was forgotten first"
+    );
+    assert_eq!(due(t0), Vec::<PushSenderRecordId>::new(), "the rest wait");
+    assert_eq!(due(t0 + 5 * MINUTE - 1).len(), 0);
+    assert_eq!(
+        due(t0 + 5 * MINUTE).len(),
+        2,
+        "five minutes later they are asked again"
+    );
+
+    // The second: the gateway takes one, and the other waits twice as long.
+    let (settled, _) = sweep(t0 + 5 * MINUTE, vec![Revoked, Later("no".to_owned())]);
+    assert_eq!(settled, 1);
+    assert_eq!(due(t0 + 15 * MINUTE).len(), 1);
+    assert_eq!(due(t0 + 15 * MINUTE - 1).len(), 0, "the wait doubled");
+
+    // One the gateway never takes is asked for at least three times, and is given up only once it
+    // has been owed for thirty days: a host that was off for a month has not been refused.
+    let mut at = t0 + 15 * MINUTE;
+    let mut times = 0;
+    while !due(u64::MAX).is_empty() {
+        let early = at < t0 + 30 * DAY;
+        let (settled, _) = sweep(at, vec![Later("still no".to_owned())]);
+        times += 1;
+        assert!(times < 20, "the debt is given up");
+        assert!(!early || settled == 0, "not given up before thirty days");
+        // Three asks a few hours apart, and then a host that has been off for a month.
+        at = if times < 3 {
+            at + 7 * 60 * MINUTE
+        } else {
+            t0 + 31 * DAY
+        };
+    }
+    assert!(
+        times >= 4,
+        "after the first ask, at least three more were made: {times}"
+    );
+}
+
+/// KR-REQ-16.10: a debt is paid when the gateway has taken it and the host has let go of what it
+/// kept of the authorisation. While the secret store refuses to give the credential up, the debt
+/// stays owed, though the gateway has revoked the authorisation, so a stored item that nothing
+/// else names is not forgotten.
+#[test]
+fn a_debt_stays_owed_while_the_host_cannot_let_go_of_what_it_kept() {
+    use kr_controller::push::sender::RevocationAnswer::Revoked;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = DeliveryModule::open_at(
+        &directory.path().join("delivery.sqlite3"),
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
+    )
+    .expect("a delivery module");
+    let id = PushSenderRecordId::new(uuid(1));
+    module
+        .with(|producer| {
+            producer
+                .journal_mut()
+                .owe_revocation(id, "https://reach.invalid", 1_000)
+                .expect("a debt");
+            Ok(())
+        })
+        .expect("the debt is written");
+    let owed = || {
+        module
+            .with(|producer| Ok(producer.journal().owed_revocations().expect("a read").len()))
+            .expect("a read")
+    };
+    let sweep = |at: u64, can_let_go: bool| {
+        let revoking = Revoking::default();
+        *revoking.answers.lock().expect("not poisoned") = [Revoked].into();
+        module
+            .settle_revocations(&revoking, &|_| can_let_go, &move || at)
+            .expect("a sweep")
+    };
+    assert_eq!(
+        sweep(1_000, false),
+        0,
+        "the gateway revoked it, and the host kept its item"
+    );
+    assert_eq!(owed(), 1);
+    assert_eq!(
+        sweep(1_000 + 24 * 60 * 60 * 1000, true),
+        1,
+        "and once the store lets go it is paid"
+    );
+    assert_eq!(owed(), 0);
+}
+
+/// KR-REQ-16.10: a host that was off for a month has not been refused by anyone. A revocation
+/// first asked for after thirty days is asked for a few times more before it is given up.
+#[test]
+fn a_revocation_is_asked_for_a_few_times_before_it_is_given_up() {
+    use kr_controller::push::sender::RevocationAnswer::Later;
+
+    const HOUR: u64 = 60 * 60 * 1000;
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = DeliveryModule::open_at(
+        &directory.path().join("delivery.sqlite3"),
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
+    )
+    .expect("a delivery module");
+    let id = PushSenderRecordId::new(uuid(1));
+    let t0 = 1_700_000_000_000_u64;
+    module
+        .with(|producer| {
+            producer
+                .journal_mut()
+                .owe_revocation(id, "https://reach.invalid", t0)
+                .expect("a debt");
+            Ok(())
+        })
+        .expect("the debt is written");
+    let still_owed = || {
+        module
+            .with(|producer| Ok(producer.journal().owed_revocations().expect("a read").len() == 1))
+            .expect("a read")
+    };
+    // Nothing asked until a month and a day have gone by; then four asks, each after the last
+    // one's wait, and only the fourth gives it up.
+    let mut at = t0 + 31 * 24 * HOUR;
+    for ask in 1..=4 {
+        let revoking = Revoking::default();
+        *revoking.answers.lock().expect("not poisoned") = [Later("no answer".to_owned())].into();
+        module
+            .settle_revocations(&revoking, &|_| true, &move || at)
+            .expect("a sweep");
+        assert_eq!(still_owed(), ask < 4, "after ask {ask}");
+        at += 7 * HOUR;
+    }
+}
