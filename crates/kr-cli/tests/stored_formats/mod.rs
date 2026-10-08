@@ -83,6 +83,30 @@ pub struct LockedName {
     pub path: String,
     /// Why it has no version.
     pub reason: String,
+    /// For a directory, the names it may hold.
+    pub children: Vec<String>,
+    /// Whether a directory's content is left alone.
+    pub opaque: bool,
+    /// Whether SQLite databases that are not stores are kept in it.
+    pub databases: bool,
+}
+
+impl LockedName {
+    /// What the code says of `name`, as the lock holds it.
+    fn of(name: &Named) -> Self {
+        Self {
+            scope: name.scope,
+            path: name.name.to_owned(),
+            reason: name.reason.to_owned(),
+            children: name
+                .children
+                .iter()
+                .map(|child| (*child).to_owned())
+                .collect(),
+            opaque: name.opaque,
+            databases: name.databases,
+        }
+    }
 }
 
 impl Lock {
@@ -541,8 +565,8 @@ pub fn findings(lock: &Lock, observed: &[Observed], named: &[Named]) -> Vec<Stri
                 name.name,
                 scope_name(name.scope)
             )),
-            Some(locked) if locked.reason != name.reason => found.push(format!(
-                "the reason {} under the {} has no version gives differs from the lock's: write the lock",
+            Some(locked) if *locked != LockedName::of(name) => found.push(format!(
+                "what the code says of {} under the {}, which has no version, differs from the lock's: write the lock",
                 name.name,
                 scope_name(name.scope)
             )),
@@ -678,14 +702,7 @@ pub fn write(
         })
         .collect();
     stores.sort_by(|left, right| left.entry.store.cmp(&right.entry.store));
-    let mut names: Vec<LockedName> = named
-        .iter()
-        .map(|name| LockedName {
-            scope: name.scope,
-            path: name.name.to_owned(),
-            reason: name.reason.to_owned(),
-        })
-        .collect();
+    let mut names: Vec<LockedName> = named.iter().map(LockedName::of).collect();
     names.sort_by(|left, right| {
         (scope_name(left.scope), &left.path).cmp(&(scope_name(right.scope), &right.path))
     });
@@ -759,9 +776,9 @@ fn claims_in(scope: StoreScope, table: &[Store], named: &[Named]) -> Vec<(String
         if parts.len() == 1 {
             claim(parts[0].to_owned(), Vec::new(), false, false, sqlite);
         } else {
-            // The first part is the directory, and the second what it holds directly: a name, a
-            // pattern, or a directory of records that is looked into no further.
-            let leaked: &'static str = Box::leak(parts[1].to_owned().into_boxed_str());
+            // The first part is the directory, and the rest what it holds: a name or a pattern,
+            // or a path down to one.
+            let leaked: &'static str = Box::leak(parts[1..].join("/").into_boxed_str());
             claim(parts[0].to_owned(), vec![leaked], false, false, false);
         }
         for owned in &store.owned {
@@ -844,19 +861,7 @@ pub fn unnamed(state_root: &Path, table: &[Store], named: &[Named]) -> Vec<Strin
             };
             let is_directory = child.file_type().is_ok_and(|kind| kind.is_dir());
             if is_directory && !covers.opaque && !covers.children.is_empty() {
-                let Ok(inner) = std::fs::read_dir(child.path()) else {
-                    continue;
-                };
-                for entry in inner.flatten() {
-                    let inner_name = entry.file_name().to_string_lossy().into_owned();
-                    let listed = covers.children.iter().any(|pattern| {
-                        matches(pattern, &inner_name)
-                            || (!pattern.contains('*') && is_sidecar_of(&inner_name, pattern))
-                    });
-                    if !listed {
-                        found.push(format!("{relative}/{inner_name}"));
-                    }
-                }
+                unlisted(&child.path(), &relative, &covers.children, &mut found);
             }
         }
     };
@@ -904,6 +909,38 @@ pub fn unnamed(state_root: &Path, table: &[Store], named: &[Named]) -> Vec<Strin
     found.sort();
     found.dedup();
     found
+}
+
+/// Every entry of `directory` that none of `patterns` lists, as a path under `relative`. A pattern
+/// is a name, or a path down to one: its first part lists a directory, and the rest what that holds.
+fn unlisted(directory: &Path, relative: &str, patterns: &[&str], found: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let here = format!("{relative}/{name}");
+        let mut listed = false;
+        let mut deeper: Vec<&str> = Vec::new();
+        for pattern in patterns {
+            match pattern.split_once('/') {
+                None => {
+                    listed |= matches(pattern, &name)
+                        || (!pattern.contains('*') && is_sidecar_of(&name, pattern));
+                }
+                Some((first, rest)) if matches(first, &name) => {
+                    listed = true;
+                    deeper.push(rest);
+                }
+                Some(_) => {}
+            }
+        }
+        if !listed {
+            found.push(here);
+        } else if !deeper.is_empty() && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            unlisted(&entry.path(), &here, &deeper, found);
+        }
+    }
 }
 
 fn has_sqlite_header(path: &Path) -> bool {

@@ -141,17 +141,9 @@ pub fn table() -> Vec<Store> {
                 ),
                 Kept::Words(
                     "launch phases",
-                    [
-                        LaunchPhase::Reserved,
-                        LaunchPhase::Spawned,
-                        LaunchPhase::Claimed,
-                        LaunchPhase::Live,
-                        LaunchPhase::Fenced,
-                        LaunchPhase::Failed,
-                        LaunchPhase::Closed,
-                    ]
-                    .map(|phase| phase.as_str().to_owned())
-                    .to_vec(),
+                    LaunchPhase::ALL
+                        .map(|phase| phase.as_str().to_owned())
+                        .to_vec(),
                 ),
             ],
         },
@@ -256,7 +248,7 @@ pub fn table() -> Vec<Store> {
                 protocol::<session::SessionCreateParams>("SessionCreateParams"),
                 Kept::Source(
                     "crates/kr-automation/src/store.rs",
-                    &["StoredEvent", "JournalEventKind"],
+                    &["StoredEvent", "JournalEventKind", "EventChain"],
                 ),
             ],
         },
@@ -485,6 +477,7 @@ pub fn table() -> Vec<Store> {
                     "crates/kr-controller/src/catalogue/native_bridge/tree.rs",
                     &["Identity"],
                 ),
+                Kept::Source("crates/kr-worker/src/broker/bridge.rs", &["BridgeSurface"]),
             ],
         },
         Store {
@@ -517,6 +510,7 @@ pub fn table() -> Vec<Store> {
             owned: Vec::new(),
             kept: vec![
                 protocol::<skill::AgentToolsInstallResult>("AgentToolsInstallResult"),
+                protocol::<skill::AgentToolsRemoveResult>("AgentToolsRemoveResult"),
                 Kept::Source("crates/kr-controller/src/agent_tools.rs", &["ActionRecord"]),
             ],
         },

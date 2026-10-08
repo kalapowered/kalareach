@@ -5005,6 +5005,72 @@ async fn an_update_is_refused_naming_a_store_the_new_release_cannot_read() {
     );
 }
 
+/// KR-REQ-26.10: a release that lists a store by a scope or a way of recording its version that
+/// this build does not know cannot be checked against, so the switch is refused naming the store
+/// before anything is surveyed or stopped: no update is recorded as begun and the daemon keeps
+/// serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_listed_in_a_way_this_kr_does_not_know_refuses_the_switch_before_anything_stops() {
+    let (host, one, _two, _archive) = host_to_update().await;
+    let mut stores = release_stores();
+    stores.push(ReleaseStore {
+        store: "ledgers".to_owned(),
+        scope: StoreScope::Unknown,
+        path: "ledgers.sqlite".to_owned(),
+        recording: Recording::SqliteUserVersion,
+        version: 1,
+        migrates_from: 1,
+    });
+    stores.push(ReleaseStore {
+        store: "journals".to_owned(),
+        scope: StoreScope::Environment,
+        path: "journals.sqlite".to_owned(),
+        recording: Recording::Unknown,
+        version: 1,
+        migrates_from: 1,
+    });
+    let target = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(stores);
+    let archive = host.scratch("archives").join("newer-kinds.tar.gz");
+    target.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("ledgers") && message.contains("a scope this kr does not know"),
+        "the store of an unknown scope is named: {said}"
+    );
+    assert!(
+        message.contains("journals")
+            && message.contains("a way of recording its version this kr does not know"),
+        "the store of an unknown recording is named: {said}"
+    );
+    assert!(
+        host.record()["update"].is_null(),
+        "no update began: {}",
+        host.record()
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon was never stopped"
+    );
+}
+
 /// KR-REQ-26.10: a store of a host's that is too old for the release switched to is named as well,
 /// and so is a store whose version cannot be read: an environment whose transfer journal is at
 /// version 1 against a release that migrates from 2, and one whose record of enrolments is not
@@ -5257,6 +5323,93 @@ async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
         host.record()
     );
 
+    // The root the host recorded is damaged: a rollback would settle on the older root of the
+    // release it goes back to, and so it is refused before anything is switched.
+    let kept = std::fs::read(host.store.record()).expect("the record");
+    let mut damaged: Value = serde_json::from_slice(&kept).expect("JSON");
+    for signature in damaged["trusted_root"]["signatures"]
+        .as_array_mut()
+        .expect("the recorded root is signed")
+    {
+        let sig = signature["sig"].as_str().expect("a signature").to_owned();
+        let first = if sig.starts_with('0') { '1' } else { '0' };
+        signature["sig"] = Value::String(format!("{first}{}", &sig[1..]));
+    }
+    std::fs::write(host.store.record(), damaged.to_string()).expect("damaged");
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a root the host cannot establish stops the rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("this host kept is not signed by the root keys it names"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert!(
+        host.record()["update"].is_null(),
+        "and no update is left recorded: {}",
+        host.record()
+    );
+    std::fs::write(host.store.record(), &kept).expect("restored");
+
+    // The root of the release to go back to is damaged: refused before anything is switched too.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root_file = host
+            .store
+            .release_directory(one.name())
+            .join("share")
+            .join("update-root.json");
+        let share = root_file.parent().expect("a directory");
+        let (file_mode, directory_mode) = (
+            std::fs::metadata(&root_file)
+                .expect("the root")
+                .permissions(),
+            std::fs::metadata(share)
+                .expect("the directory")
+                .permissions(),
+        );
+        let original = std::fs::read(&root_file).expect("the root");
+        std::fs::set_permissions(share, std::fs::Permissions::from_mode(0o755)).expect("opened");
+        std::fs::set_permissions(&root_file, std::fs::Permissions::from_mode(0o644))
+            .expect("opened");
+        std::fs::write(&root_file, b"{ not a root").expect("damaged");
+        let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a root of the target that cannot be read stops the rollback: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("update channel's root"),
+            "{said}"
+        );
+        assert_eq!(
+            host.store.current().expect("reads"),
+            Some(two.name().clone()),
+            "nothing was switched"
+        );
+        assert!(host.record()["update"].is_null(), "{}", host.record());
+        std::fs::write(&root_file, &original).expect("restored");
+        std::fs::set_permissions(&root_file, file_mode).expect("closed");
+        std::fs::set_permissions(share, directory_mode).expect("closed");
+    }
+
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
@@ -5280,6 +5433,13 @@ async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
         output.status.code(),
         Some(1),
         "the archive of the release left is signed by the retired key and is refused: {said}"
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not signed by the release keys"),
+        "and it is refused for the signature: {said}"
     );
     assert_eq!(
         host.store.current().expect("reads"),
@@ -5422,18 +5582,30 @@ async fn no_file_of_a_state_root_goes_unnamed() {
             .join("another.sqlite"),
     )
     .expect("a database beside a store's");
+    std::fs::create_dir_all(environment.state_dir().join("agent-tools").join("actions"))
+        .expect("the directory of retained actions");
+    std::fs::write(
+        environment
+            .state_dir()
+            .join("agent-tools")
+            .join("actions")
+            .join("stray.record"),
+        b"nor this",
+    )
+    .expect("a file in a directory two below a store's");
     let unnamed = stored_formats::unnamed(&root, &table, &named);
     for expected in [
         format!("{prefix}/stray"),
         format!("{prefix}/changesets/stray.record"),
         format!("{prefix}/projects/another.sqlite"),
+        format!("{prefix}/agent-tools/actions/stray.record"),
     ] {
         assert!(
             unnamed.contains(&expected),
             "{expected} is found: {unnamed:?}"
         );
     }
-    assert_eq!(unnamed.len(), 3, "and nothing else: {unnamed:?}");
+    assert_eq!(unnamed.len(), 4, "and nothing else: {unnamed:?}");
 }
 
 /// Writes `stored-formats.lock` from the code and a daemon's files, refusing a change that would
@@ -5445,9 +5617,16 @@ async fn no_file_of_a_state_root_goes_unnamed() {
 #[ignore = "writes stored-formats.lock"]
 async fn write_the_lock() {
     let host = a_host_whose_daemon_has_run().await;
-    let committed = std::fs::read(stored_formats::lock_path())
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<stored_formats::Lock>(&bytes).ok());
+    // A lock that is not there is the first; one that is there and cannot be read is not written
+    // over, which would lift the refusals the writer makes against it.
+    let committed = match std::fs::read(stored_formats::lock_path()) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<stored_formats::Lock>(&bytes)
+                .expect("stored-formats.lock is a lock; repair it before it is written again"),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("stored-formats.lock could not be read: {error}"),
+    };
     let lock = stored_formats::write(
         committed.as_ref(),
         &observed_stores(&host),
@@ -5483,6 +5662,43 @@ fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
         stored_formats::findings(&lock, &[store(7, "aa", "registry.sqlite")], &[]).is_empty(),
         "the lock matches itself"
     );
+
+    // A name the code gives to a thing under the state root is held to the lock as the stores are:
+    // one the lock lacks is found, and so is one whose terms differ.
+    let note = stored_formats::Named {
+        scope: StoreScope::Environment,
+        name: "scratch",
+        children: &[],
+        opaque: false,
+        databases: false,
+        reason: "a leftover that holds nothing",
+    };
+    let registry = [store(7, "aa", "registry.sqlite")];
+    assert!(
+        !stored_formats::findings(&lock, &registry, &[note]).is_empty(),
+        "a name the code has and the lock does not"
+    );
+    let with_note = stored_formats::write(Some(&lock), &registry, &[note]).expect("is written");
+    assert!(stored_formats::findings(&with_note, &registry, &[note]).is_empty());
+    for changed in [
+        stored_formats::Named {
+            databases: true,
+            ..note
+        },
+        stored_formats::Named {
+            opaque: true,
+            ..note
+        },
+        stored_formats::Named {
+            children: &["a.json"],
+            ..note
+        },
+    ] {
+        assert!(
+            !stored_formats::findings(&with_note, &registry, &[changed]).is_empty(),
+            "a name whose terms moved"
+        );
+    }
 
     // The tables or a kept value changed and the version stood still.
     let moved = [store(7, "bb", "registry.sqlite")];

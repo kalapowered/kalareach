@@ -14,9 +14,10 @@
         "version": 1,
         "migrates_from": 0
       },
-      "digest": "63aa3a1c41e66ca5062ccb98c95d2bbe11ba2e4516a8725fcf3d14edcc1cb05b",
+      "digest": "229a74397c636e7453e591bc3c9bd0df702823e8e6d8b67f7e8b27363cbfe672",
       "kept": [
         "AgentToolsInstallResult",
+        "AgentToolsRemoveResult",
         "ActionRecord (crates/kr-controller/src/agent_tools.rs)"
       ]
     },
@@ -267,10 +268,11 @@
         "version": 1,
         "migrates_from": 1
       },
-      "digest": "75bad157991f441a1901251bf84d094e39ec0fc94e76f32bfcaa2622bfa3cbae",
+      "digest": "1a81eab700160413b61f94aa856dc33396787af7a67d932c51cb0136519ea10f",
       "kept": [
         "Journal, State, Release, RecordedFacts, Removal, Change, Staging, Publication, Kept (crates/kr-controller/src/catalogue/native_bridge/journal.rs)",
-        "Identity (crates/kr-controller/src/catalogue/native_bridge/tree.rs)"
+        "Identity (crates/kr-controller/src/catalogue/native_bridge/tree.rs)",
+        "BridgeSurface (crates/kr-worker/src/broker/bridge.rs)"
       ]
     },
     {
@@ -423,7 +425,7 @@
         "version": 7,
         "migrates_from": 6
       },
-      "digest": "9a713af0d46c27fe20cbf8255f9b8e99d1d6be5098afef691633a79dfff84c4f",
+      "digest": "1f7fd3db726ef731c40bbb97e2cf51af3c1510d2c8ea334ceee1ed58fc903b8d",
       "kept": [
         "WorkflowDefinition",
         "NodeOutput",
@@ -436,7 +438,7 @@
         "RequestReviewParams",
         "AttentionNoticeParams",
         "SessionCreateParams",
-        "StoredEvent, JournalEventKind (crates/kr-automation/src/store.rs)"
+        "StoredEvent, JournalEventKind, EventChain (crates/kr-automation/src/store.rs)"
       ]
     }
   ],
@@ -444,167 +446,266 @@
     {
       "scope": "environment",
       "path": "*.partial",
-      "reason": "a temporary file an interrupted write left; nothing reads it"
+      "reason": "a temporary file an interrupted write left; nothing reads it",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": ".*.tmp",
-      "reason": "a temporary file an interrupted write left; nothing reads it"
+      "reason": "a temporary file an interrupted write left; nothing reads it",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": ".config.lock",
-      "reason": "the lock on the configuration document; empty"
+      "reason": "the lock on the configuration document; empty",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": ".machine-group.*",
-      "reason": "a temporary file an interrupted step left; nothing reads it"
+      "reason": "a temporary file an interrupted step left; nothing reads it",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "backup",
-      "reason": "the backup service's staging area: objects in the archive's own formats"
+      "reason": "the backup service's staging area: objects in the archive's own formats",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "boot",
-      "reason": "the boot the environment last ran in; a record that does not decode is read as none and written again, which costs one pass over sessions of an earlier boot"
+      "reason": "the boot the environment last ran in; a record that does not decode is read as none and written again, which costs one pass over sessions of an earlier boot",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "capabilities",
-      "reason": "the capability revision, a number as text; an environment whose record cannot be read keeps revision zero"
+      "reason": "the capability revision, a number as text; an environment whose record cannot be read keeps revision zero",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "catalogue",
-      "reason": "the plugin catalogue's repositories: TUF metadata and package payloads in the formats TUF and the package format fix, and each repository's trust checkpoint under datastore/ in TUF's metadata form; the catalogue's database is the store of that name"
+      "reason": "the plugin catalogue's repositories: TUF metadata and package payloads in the formats TUF and the package format fix, and each repository's trust checkpoint under datastore/ in TUF's metadata form; the catalogue's database is the store of that name",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "controller-identity",
-      "reason": "a marker that the controller's keys were made, which names the kind of key store; read as absent when it cannot be read"
+      "reason": "a marker that the controller's keys were made, which names the kind of key store; read as absent when it cannot be read",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "controller-service.lock",
-      "reason": "the lock on the service definition; empty"
+      "reason": "the lock on the service definition; empty",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "controller.lock",
-      "reason": "the daemon's singleton lock, which holds its process number as text"
+      "reason": "the daemon's singleton lock, which holds its process number as text",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "controller.log",
-      "reason": "the daemon's log, as text"
+      "reason": "the daemon's log, as text",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "environment",
-      "reason": "the environment's identity, written once as text and never changed"
+      "reason": "the environment's identity, written once as text and never changed",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "jobs",
-      "reason": "per-session launch definitions and their diagnostics, named by session and read by every daemon's sweep, so a name does not change"
+      "reason": "per-session launch definitions and their diagnostics, named by session and read by every daemon's sweep, so a name does not change",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "login-session",
-      "reason": "written only on Windows, which keeps no store of releases; a record that does not decode is an error that names it"
+      "reason": "written only on Windows, which keeps no store of releases; a record that does not decode is an error that names it",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "models",
-      "reason": "the description model's files and their markers, downloaded content that a marker compared whole with the one expected says is complete"
+      "reason": "the description model's files and their markers, downloaded content that a marker compared whole with the one expected says is complete",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "plugin-cache",
-      "reason": "compiled plugin components, a cache written again when absent"
+      "reason": "compiled plugin components, a cache written again when absent",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "power.json",
-      "reason": "a document the sleep setting used to live in; nothing reads it"
+      "reason": "a document the sleep setting used to live in; nothing reads it",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "secrets",
-      "reason": "the secret store's fallback files, one per name, in the secret store's own format"
+      "reason": "the secret store's fallback files, one per name, in the secret store's own format",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "services",
-      "reason": "plugin service directories"
+      "reason": "plugin service directories",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "sessions",
-      "reason": "the per-session journals, which keep the archive's own rule (kr host import-journals)"
+      "reason": "the per-session journals, which keep the archive's own rule (kr host import-journals)",
+      "children": [],
+      "opaque": true,
+      "databases": true
     },
     {
       "scope": "environment",
       "path": "spool",
-      "reason": "output history, a bounded spool the archive's own rule reads"
+      "reason": "output history, a bounded spool the archive's own rule reads",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "terminfo",
-      "reason": "terminal descriptions compiled from the build's own, written again when absent"
+      "reason": "terminal descriptions compiled from the build's own, written again when absent",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "environment",
       "path": "workers",
-      "reason": "one working directory per worker"
+      "reason": "one working directory per worker",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": ".*.tmp",
-      "reason": "a temporary file an interrupted write left; nothing reads it"
+      "reason": "a temporary file an interrupted write left; nothing reads it",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "entry-locks",
-      "reason": "the locks that keep two writers of one startup file apart; empty files"
+      "reason": "the locks that keep two writers of one startup file apart; empty files",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "environment-id",
-      "reason": "written once, as text, and never changed: a build reads no other form"
+      "reason": "written once, as text, and never changed: a build reads no other form",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "environments",
-      "reason": "the state directories of the environments, each of which is named under its own scope"
+      "reason": "the state directories of the environments, each of which is named under its own scope",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "host",
-      "reason": "the store of releases on a platform whose default state root holds it; its record is the store install-record, and roots/<digest>.root is a frozen form (two paths separated by a NUL byte) that a change replaces with a file of another name"
+      "reason": "the store of releases on a platform whose default state root holds it; its record is the store install-record, and roots/<digest>.root is a frozen form (two paths separated by a NUL byte) that a change replaces with a file of another name",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "kept-answers",
-      "reason": "answers a person gave that the host has not taken, kept on this device by the client; not host state, so not a store of the host's (an unreadable one is reported by name)"
+      "reason": "answers a person gave that the host has not taken, kept on this device by the client; not host state, so not a store of the host's (an unreadable one is reported by name)",
+      "children": [],
+      "opaque": true,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "machine-merge-plan",
-      "reason": "the client's merge plan, kept on this device; not host state (an unreadable one is reported by name and moved aside by the person)"
+      "reason": "the client's merge plan, kept on this device; not host state (an unreadable one is reported by name and moved aside by the person)",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "machine-merge-plan.lock",
-      "reason": "the lock on the merge plan; empty"
+      "reason": "the lock on the merge plan; empty",
+      "children": [],
+      "opaque": false,
+      "databases": false
     },
     {
       "scope": "state_root",
       "path": "run",
-      "reason": "the runtime root on a platform whose default state root holds it; nothing in it outlives a boot"
+      "reason": "the runtime root on a platform whose default state root holds it; nothing in it outlives a boot",
+      "children": [],
+      "opaque": true,
+      "databases": false
     }
   ]
 }
