@@ -238,6 +238,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::HostUpdateHandover
         | Method::HostClockEstablish
         | Method::AccountSignIn
+        | Method::AccountSignOut
         | Method::DescriptionConfigure
         | Method::DescriptionDownload => Environment,
         _ => Unclassified,

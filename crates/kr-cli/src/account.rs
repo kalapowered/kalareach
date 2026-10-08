@@ -1,11 +1,12 @@
-//! `kr account`: signing this host in to the managed account service, and saying where that stands.
+//! `kr account`: signing this host in to the managed account service and out of it, and saying where
+//! that stands.
 //!
 //! Managed voice spends an account's balance, so the host presents an account token of its own,
-//! and the control daemon alone holds the sign-in that makes one. Both commands go through the
+//! and the control daemon alone holds the sign-in that makes one. Every command goes through the
 //! daemon under this user's own authority on this host. `sign-in` asks it to listen on the
 //! loopback address the desktop client is registered with, prints the address a person opens in a
-//! browser and opens it; the daemon exchanges the answer and keeps the account. `show` reads where
-//! that stands.
+//! browser and opens it; the daemon exchanges the answer and keeps the account. `sign-out` has the
+//! daemon remove the account and ask the service to end it. `show` reads where that stands.
 //!
 //! **Nothing the daemon holds is printed.** The address to open carries this attempt's state and
 //! nonce, and is shown to the person who asked, as the command that asked for it; what is said of
@@ -13,8 +14,8 @@
 
 use kr_client::shown;
 use kr_protocol::host_account::{
-    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountState,
-    AccountStatusParams, SignInUnavailable,
+    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountSignOutParams,
+    AccountSignedOut, AccountState, AccountStatusParams, SignInUnavailable,
 };
 use kr_protocol::method::Method;
 
@@ -87,6 +88,39 @@ pub async fn sign_in(selector: &EnvironmentSelector, json: bool) -> Result<()> {
             "The host stops waiting at {} in UTC milliseconds. `kr account show` says how it \
              ended.",
             started.expires_at_ms.get()
+        ));
+    }
+    Ok(())
+}
+
+/// `kr account sign-out`: removes this host's account and asks the service to end it.
+///
+/// # Errors
+///
+/// Returns the daemon's refusal: this host signs in nowhere, a sign-in is finishing, or a voice
+/// call is open.
+pub async fn sign_out(selector: &EnvironmentSelector, json: bool) -> Result<()> {
+    let mut daemon = Daemon::open(&kr_ipc::paths::HostPaths::discover()?, selector).await?;
+    let done: AccountSignedOut = daemon
+        .mutate(Method::AccountSignOut, &AccountSignOutParams {})
+        .await?;
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("was_signed_in", done.was_signed_in)
+                .with("service_told", done.service_told),
+        );
+    } else if !done.was_signed_in {
+        output::line(&stdout_line!("No account was signed in."));
+    } else if done.service_told {
+        output::line(&stdout_line!(
+            "Signed out. The account service has ended the sign-in."
+        ));
+    } else {
+        output::line(&stdout_line!(
+            "Signed out. The account service could not be told, so the daemon tells it when it \
+             next starts."
         ));
     }
     Ok(())

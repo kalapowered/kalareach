@@ -202,6 +202,7 @@ impl Controller {
                 | Method::DeliveryDestinationSecretSet
                 | Method::PrivacySet
                 | Method::AccountSignIn
+                | Method::AccountSignOut
                 | Method::SessionRename
                 | Method::DescriptionConfigure
                 | Method::DescriptionDownload
