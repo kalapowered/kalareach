@@ -72,7 +72,7 @@ HOST_ONLY = {
     "kr-attention": "docs/host/README.md: the attention engine a host runs",
     "kr-delivery": "docs/delivery/README.md: the delivery journal and push outbox a host keeps",
     "kr-describe": "docs/describe/README.md: local session descriptions on the host",
-    "kr-loopback": "docs/client/README.md: the loopback listener a desktop sign-in's answer comes back to",
+    "kr-loopback": "docs/host/README.md: the loopback listener a desktop sign-in's answer comes back to",
     "kr-describe-model": "docs/describe/README.md: the inference process a host runs",
     "kr-plugin-host": "docs/plugins/runtime.md: the per-environment plugin process",
     "kr-plugin-runtime": "docs/plugins/runtime.md: where a plugin component runs",
