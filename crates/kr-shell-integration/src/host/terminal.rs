@@ -145,29 +145,35 @@ pub fn preference_document(id: &str) -> String {
 }
 
 /// Writes the saved terminal preference again with its format stated, where the file is a document
-/// this build reads that states none: it was written before the format was recorded. A file this
-/// build does not read, and one that states a format, is left as it is.
+/// this build reads that states none, or states `0`: it was written before the format was
+/// recorded. A file this build does not read, and one that states a format, is left as it is.
+///
+/// The file is read as a regular file of its own size, once to decide and once more just before it
+/// is written, and left alone if it changed between: `kr host terminal` writes it without a lock,
+/// so a choice made in the moment between that second read and the write is the one thing this
+/// cannot keep.
 ///
 /// Remove it, with the reading of a document that states no format, once no supported upgrade
 /// starts from one written before the format was recorded.
 pub fn stamp_preference(state_dir: &std::path::Path) {
     let file = state_dir.join(PREFERENCE_FILE);
-    let Ok(about) = std::fs::metadata(&file) else {
+    let read = || kr_ipc::paths::read_owner_only_file(&file, PREFERENCE_MAX_LEN);
+    let Ok(Some(bytes)) = read() else {
         return;
     };
-    if about.len() > PREFERENCE_MAX_LEN {
+    let unstamped =
+        serde_json::from_slice::<std::collections::BTreeMap<String, serde_json::Value>>(&bytes)
+            .is_ok_and(|members| {
+                members
+                    .get(PREFERENCE_VERSION_KEY)
+                    .is_none_or(|stated| stated.as_u64() == Some(0))
+            });
+    if !unstamped {
         return;
     }
-    let Ok(bytes) = std::fs::read(&file) else {
-        return;
-    };
-    let stated =
-        serde_json::from_slice::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>(&bytes)
-            .is_ok_and(|members| members.contains_key(PREFERENCE_VERSION_KEY));
-    if stated {
-        return;
-    }
-    if let Some(chosen) = parse_preference(&bytes) {
+    if let Some(chosen) = parse_preference(&bytes)
+        && read().is_ok_and(|again| again.as_deref() == Some(bytes.as_slice()))
+    {
         let _ =
             kr_ipc::paths::write_owner_only_file(&file, preference_document(&chosen).as_bytes());
     }
@@ -658,28 +664,54 @@ mod tests {
         );
     }
 
-    /// A preference saved before the format was recorded is written again with it stated, by the
-    /// daemon's start; one that states a format, and a file this build does not read, are left as
-    /// they are.
+    /// A preference saved before the format was recorded, or saved stating `0`, is written again
+    /// with it stated, by the daemon's start; one that states a format, a file this build does not
+    /// read and one that is not a file are left as they are, and the last is not waited for.
     #[test]
     fn a_preference_saved_before_the_format_was_recorded_is_written_again_stamped() {
         let directory = tempfile::tempdir().expect("a directory");
         let file = directory.path().join(PREFERENCE_FILE);
-        std::fs::write(&file, br#"{"terminal": "iterm2"}"#).expect("an older preference");
-        stamp_preference(directory.path());
-        assert_eq!(
-            std::fs::read_to_string(&file).expect("reads"),
-            preference_document("iterm2"),
-            "written again with its format stated"
-        );
+        let save = |bytes: &[u8]| {
+            kr_ipc::paths::write_owner_only_file(&file, bytes).expect("a file");
+        };
+        for older in [
+            &br#"{"terminal": "iterm2"}"#[..],
+            &br#"{"terminal": "iterm2", "version": 0}"#[..],
+        ] {
+            save(older);
+            stamp_preference(directory.path());
+            assert_eq!(
+                std::fs::read_to_string(&file).expect("reads"),
+                preference_document("iterm2"),
+                "written again with its format stated"
+            );
+        }
         for kept in [
             preference_document("kitty").into_bytes(),
             br#"{"terminal": "iterm2", "version": 9}"#.to_vec(),
             b"not a document".to_vec(),
         ] {
-            std::fs::write(&file, &kept).expect("a file");
+            save(&kept);
             stamp_preference(directory.path());
             assert_eq!(std::fs::read(&file).expect("reads"), kept, "left as it is");
+        }
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&file).expect("removed");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&file)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "a named pipe where the file would be");
+            stamp_preference(directory.path());
+            assert!(
+                std::os::unix::fs::FileTypeExt::is_fifo(
+                    &std::fs::symlink_metadata(&file)
+                        .expect("still there")
+                        .file_type()
+                ),
+                "the pipe is neither waited for nor replaced"
+            );
         }
     }
 

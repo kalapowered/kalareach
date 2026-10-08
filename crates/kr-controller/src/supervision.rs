@@ -1405,7 +1405,8 @@ pub struct InstalledTerminals {
 }
 
 impl InstalledTerminals {
-    /// Returns a presenter that reads one environment's saved preference.
+    /// Returns a presenter that reads one environment's saved preference, after writing it again
+    /// with its format stated where it states none.
     #[must_use]
     pub fn in_environment(state_dir: PathBuf) -> Self {
         // A preference saved before its format was recorded is written again, stamped.

@@ -6,7 +6,8 @@
 //! each environment records its own group, in a file of its own beside its other state, and
 //! changes it only by its own owner-approved step: it joins a group, takes its part in a merge, or
 //! splits off into a fresh group. No other environment, no enrolment and no paired device writes
-//! the file. The store does not decide who the owner is: its caller checks the owner's authority
+//! the file. The one other write is the open's, which states the file's format in a record that
+//! states none and changes nothing else in it. The store does not decide who the owner is: its caller checks the owner's authority
 //! first, and the store records who approved each step and the action that carried it.
 //!
 //! The group is minted once, at the environment's first start, while the daemon holds the
@@ -66,8 +67,11 @@ use crate::singleton::SingletonLock;
 pub const RECORD_FILE: &str = "machine-group";
 
 /// The format of the record this build writes, recorded in it as `version`. A record that states
-/// none was written before the format was recorded and is read as this one; a record of a later
-/// format is refused and left as it is.
+/// none was written before the format was recorded and is read as this one, and written again
+/// stamped when the store opens; a record of a later format is refused and left as it is.
+///
+/// Remove the reading of a record that states no format, and the stamping in [`MachineStore::open`],
+/// once no supported upgrade starts from one written before the format was recorded.
 pub const RECORD_VERSION: u32 = 1;
 
 /// The start of the name of every temporary file this store writes.
@@ -287,8 +291,9 @@ impl MachineStore {
     /// Returns [`ControllerError::PermissionDenied`] when `lock` is not this environment's
     /// singleton lock, and a storage failure when the record cannot be created, or exists and is
     /// damaged or belongs to another environment, or when another change held the record for as
-    /// long as this call could wait. A record that is refused is left as it is: a group minted over
-    /// it would be a change the owner never approved.
+    /// long as this call could wait, or when a record that states no format cannot be written again
+    /// stamped. A record that is refused is left as it is: a group minted over it would be a change
+    /// the owner never approved.
     pub fn open(lock: &SingletonLock, paths: &EnvironmentPaths, now_ms: u64) -> Result<Self> {
         let deadline = Instant::now() + kr_flush::HELD_RENAME_BOUND;
         let store = Self {
@@ -304,7 +309,8 @@ impl MachineStore {
             None => store.mint(now_ms, deadline)?,
             // A record written before the format was recorded is written again as it stood,
             // stamped, so that it is not left behind for ever: no step changes it while the
-            // environment's group is not moved.
+            // environment's group is not moved. A record that cannot be written again is not a
+            // record this daemon could change at its next step either, so the open fails.
             Some(record) if record.version < RECORD_VERSION => store.publish(
                 &MachineGroup {
                     version: RECORD_VERSION,
@@ -2762,7 +2768,7 @@ mod tests {
     }
 
     /// The record names the format it is written in, a record written before the format was named
-    /// is read, and the next step writes it back stamped.
+    /// is read, and written back stamped when the store opens.
     #[test]
     fn the_record_names_its_format_and_a_record_that_names_none_is_read() {
         let environment = Environment::create();

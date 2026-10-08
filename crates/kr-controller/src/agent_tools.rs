@@ -1513,9 +1513,9 @@ struct ActionRecord {
     /// The format of the record: [`ACTION_RECORD_VERSION`] in every record this build writes, `0`
     /// in one that states none, which an earlier build wrote.
     ///
-    /// Remove the default, and the conversion of such a record's result that
-    /// [`carry_result_forward`] makes, once no supported upgrade starts from a record written before
-    /// the format was recorded.
+    /// A record is stamped, and its result converted, when it is next asked for. Remove the
+    /// default, and the conversion of such a record's result that [`carry_result_forward`] makes,
+    /// once no supported upgrade starts from a record written before the format was recorded.
     #[serde(default)]
     version: u32,
     /// The digest of the mutation this action was admitted for.
@@ -1524,6 +1524,27 @@ struct ActionRecord {
     state: String,
     /// What the effect produced, once it has: its canonical encoding, in hexadecimal.
     result: Option<String>,
+}
+
+impl ActionRecord {
+    /// This record in the shape this build writes: its result converted by
+    /// [`carry_result_forward`] and re-encoded, and its format stated. `None` when the result
+    /// cannot be read, which is left for the answer to refuse.
+    fn carried_forward(&self) -> Option<Self> {
+        let result = match self.result.as_deref() {
+            None => None,
+            Some(text) => {
+                let value = kr_cbor::decode(&unhex(text)?, &kr_cbor::Limits::DEFAULT).ok()?;
+                Some(hex(&kr_cbor::encode(&carry_result_forward(value).ok()?)))
+            }
+        };
+        Some(Self {
+            version: ACTION_RECORD_VERSION,
+            digest: self.digest.clone(),
+            state: self.state.clone(),
+            result,
+        })
+    }
 }
 
 impl Installer {
@@ -1557,16 +1578,14 @@ impl Installer {
                 token: action_id.to_string(),
             });
         }
-        // A record written before the format was recorded is written again as it stands, stamped.
-        if record.version < ACTION_RECORD_VERSION {
-            self.write_action(
-                actor_id,
-                action_id,
-                &ActionRecord {
-                    version: ACTION_RECORD_VERSION,
-                    ..record.clone()
-                },
-            )?;
+        // A record written before the format was recorded is written again in this build's shape,
+        // its result converted and its format stated, so that a stamped record is wholly current.
+        // The answer is owed either way: a record that cannot be written stays as it was and is
+        // written the next time it is asked for.
+        if record.version < ACTION_RECORD_VERSION
+            && let Some(current) = record.carried_forward()
+        {
+            let _ = self.write_action(actor_id, action_id, &current);
         }
         match (record.state.as_str(), record.result) {
             ("applied", Some(result)) => Ok(Some(decode_result(&result)?)),
@@ -2891,6 +2910,22 @@ mod tests {
         let result: AgentToolsInstallResult = answer.to_typed().expect("this build can read it");
         assert!(result.already_installed);
         assert!(result.unresolved.is_empty());
+
+        // The record was written again: stamped, and holding the result in this build's shape, so
+        // the conversion is no longer needed to read it.
+        let text =
+            std::fs::read_to_string(installer.action_path(&actor, action)).expect("a record");
+        let record: ActionRecord = serde_json::from_str(&text).expect("a record");
+        assert_eq!(record.version, ACTION_RECORD_VERSION);
+        let kept = kr_cbor::decode(
+            &unhex(&record.result.expect("a result")).expect("hexadecimal"),
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("a value");
+        let kr_cbor::CanonicalValue::Map(kept) = kept else {
+            panic!("a result is a map");
+        };
+        assert!(kept.get("unresolved").is_some(), "the result is converted");
     }
 
     /// A retained installation action names the format it is written in, and one of a later format

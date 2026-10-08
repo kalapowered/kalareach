@@ -1156,8 +1156,13 @@ pub const ENTRY_RECORD_NAME: &str = "shell-entries.json";
 const ENTRY_RECORD_LIMIT: u64 = 1024 * 1024;
 
 /// The format of the record this build writes, recorded in it as `version`. A record that states
-/// none was written before the format was recorded and is read as this one; a record of a later
+/// none was written before the format was recorded and is read as this one, and written again
+/// stamped the next time `kr shell install` or `kr shell remove` holds it; a record of a later
 /// format is not one this build writes, and is refused.
+///
+/// Remove the reading of a record that states no format, and the stamping in
+/// [`EntryRecord::hold`], once no supported upgrade starts from one written before the format was
+/// recorded.
 pub const ENTRY_RECORD_VERSION: u32 = 1;
 
 /// The startup files `kr shell install` has put an entry in, for each shell.
@@ -1263,7 +1268,8 @@ impl EntryRecord {
     /// # Errors
     ///
     /// Returns [`RecordError::Store`] when the directory cannot be made this user's own, or when
-    /// another `kr` held the record for the whole of the wait.
+    /// another `kr` held the record for the whole of the wait, and the failure to write a record
+    /// of an earlier format again, stamped.
     pub fn hold(&self) -> Result<HeldRecord<'_>, RecordError> {
         kr_ipc::paths::create_private_tree(&self.directory, &self.directory)?;
         let lock = FileLock::take(&self.path)

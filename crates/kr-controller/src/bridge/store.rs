@@ -208,7 +208,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns a failure when the file exists but cannot be read, or is not a record this build
-    /// understands.
+    /// understands, or when a file that states no format cannot be written again stamped.
     pub fn open(state_dir: &std::path::Path) -> Result<Self> {
         let path = state_dir.join("environments.json");
         let mut unstamped = false;
