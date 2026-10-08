@@ -274,6 +274,9 @@ export function MobileHosts({
         chooseHost={async (reference) => {
           await port.hostsUse(reference)
         }}
+        forgetHost={async (reference) => {
+          await port.hostsForget(reference)
+        }}
       />
       {error ? <Banner tone="warning" title="The hosts could not be read" detail={error} /> : null}
       {rows ? (

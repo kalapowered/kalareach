@@ -841,6 +841,14 @@ export interface HostPort {
    */
   hostsUse(reference: string): Promise<ConnectionState>
 
+  /**
+   * Forgets a host this computer is paired with, named by its pairing-screen reference: it is no
+   * longer listed, used or tried. A local action that reaches no host, so it works for one that has
+   * revoked this computer. Resolves with where the connection stands: unchanged unless the host
+   * was the one in use, and then there is none until another is chosen.
+   */
+  hostsForget(reference: string): Promise<ConnectionState>
+
   /** Everything the pairing screen shows. */
   pairingView(): Promise<PairingView>
   /** Changes the service codes go through, before an attempt starts. */

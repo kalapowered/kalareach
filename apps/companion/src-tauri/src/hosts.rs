@@ -74,6 +74,28 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
     Ok(state.connection_state())
 }
 
+/// Forgets `host`: this computer no longer lists it, uses it or tries it, and says where that
+/// leaves the connection.
+///
+/// A local action. It reaches no host, so it works for one that no longer answers, among them one
+/// that revoked this computer. When `host` is the one in use its connection ends and none is in
+/// use until the person chooses another; any other host's connection is left as it is.
+///
+/// # Errors
+///
+/// Returns a local failure when this computer's pairing records could not be changed, and then the
+/// host is still listed.
+pub fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<ConnectionState> {
+    let state = app.state::<AppState>();
+    let device = state.device()?;
+    state.forget_host(
+        "no host is in use: you forgot the one this application was reaching",
+        || device.forget_host(host.host_device_id),
+    )?;
+    let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+    Ok(state.connection_state())
+}
+
 /// Takes up the host this application's commands went to the last time, when there was one and
 /// this computer is still paired with it. Nothing is waited for.
 pub fn resume<R: Runtime>(app: &AppHandle<R>) {
