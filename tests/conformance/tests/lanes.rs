@@ -2,7 +2,8 @@
 //! committed, and the results Gradle and Xcode wrote for them, taken from real runs (the files in
 //! `tests/fixtures/lane-results/`, with the machine's name and the simulator's identifier taken
 //! out, pruned to the files of the tree in `tests/fixtures/lanes/`). The `-failing` results are
-//! those of the same tests with one assertion broken.
+//! those of the same tests with one assertion broken, and `ios-xcode-26.3.json` is the iOS result
+//! of the Xcode on a hosted runner.
 //!
 //! KR-REQ-15.34, KR-REQ-15.35, KR-REQ-29.01.
 
@@ -381,6 +382,22 @@ fn the_phones_group_is_planned_for_linux_and_macos_and_not_for_windows() {
     assert!(runs(Platform::Windows).is_empty());
     assert!(plan::group_absent_reason(Group::Phones, Platform::Windows).is_some());
     assert_eq!(Group::ALL.last(), Some(&Group::Phones));
+}
+
+#[test]
+fn the_result_tree_reads_the_same_from_the_two_xcode_versions_that_wrote_it() {
+    // One was written by the Xcode of a developer's Mac, the other by the newest one a hosted runner
+    // has; the cases and their results are the same.
+    let named = |cases: Vec<Case>| -> Vec<(String, String, LibtestOutcome)> {
+        cases
+            .into_iter()
+            .map(|case| (case.class, case.name, case.outcome))
+            .collect()
+    };
+    let developer = named(xcode("ios.json"));
+    let runner = named(xcode("ios-xcode-26.3.json"));
+    assert_eq!(developer.len(), 49);
+    assert_eq!(runner, developer);
 }
 
 #[test]
