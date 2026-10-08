@@ -97,6 +97,7 @@ impl Controller {
     /// resolved and stops occupying the environment; a launch that may have started is preserved,
     /// never respawned, and keeps its slot until something confirms what happened to it.
     pub(super) async fn recover_reservations(&self) -> Result<()> {
+        let mut crashed = Vec::new();
         let unresolved = {
             let registry = self.registry.lock().await;
             let mut rows = registry.reservations_in(LaunchPhase::Reserved)?;
@@ -143,10 +144,18 @@ impl Controller {
                 // as though nothing had run.
                 LaunchPhase::Claimed => {
                     let held = self.hold_reservation(reservation.reservation_id).await;
-                    self.recover_claim(&reservation, &held).await?;
+                    // A worker confirmed gone has what its session owned stopped on a task of its
+                    // own; every such task is started before any is waited for, so a daemon that
+                    // starts beside several of them costs one bound and not one each.
+                    if let Some(task) = self.recover_claim_started(&reservation, &held).await? {
+                        crashed.push(task);
+                    }
                 }
                 _ => {}
             }
+        }
+        for task in crashed {
+            let _ = task.await;
         }
         self.recover_workers().await?;
         Ok(())
@@ -161,6 +170,28 @@ impl Controller {
         reservation: &crate::registry::Reservation,
         held: &ReservationHold,
     ) -> Result<()> {
+        match self.recover_claim_started(reservation, held).await? {
+            Some(task) => match task.await {
+                Ok(outcome) => outcome.map(|_| ()),
+                Err(ended) if ended.is_panic() => std::panic::resume_unwind(ended.into_panic()),
+                Err(_) => Err(ControllerError::supervision(
+                    "this daemon stopped before it finished closing a session whose worker had gone",
+                )),
+            },
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::recover_claim`] up to the point where a worker confirmed gone has what its session
+    /// owned stopped, which runs on a task this daemon owns and is returned for the caller to wait
+    /// for, so that a request that goes does not stop it half way and a start can run several at
+    /// once.
+    async fn recover_claim_started(
+        &self,
+        reservation: &crate::registry::Reservation,
+        held: &ReservationHold,
+    ) -> Result<Option<tokio::task::JoinHandle<Result<Option<kr_protocol::session::ClosureRecord>>>>>
+    {
         let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
         let challenged = match reservation.claimed_key {
             Some(key) => Some(
@@ -188,7 +219,7 @@ impl Controller {
             .await?;
             let mut registry = self.registry.lock().await;
             registry.resolve_claim(reservation.reservation_id, LaunchPhase::Live)?;
-            return Ok(());
+            return Ok(None);
         }
         let ended = reservation
             .launcher_identity
@@ -208,15 +239,14 @@ impl Controller {
                 .clone()
                 .expect("the identity was just read");
             // What the session owned is stopped, as it is for any other crash.
-            self.crash_flight(
+            return Ok(self.crash_flight_soon(
                 reservation.session_id,
                 reservation.display_number,
-                &identity,
+                identity,
                 ClosureReason::WorkerCrash,
-            )
-            .await?;
+            ));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Looks again for a worker whose claim this daemon has not resolved.
