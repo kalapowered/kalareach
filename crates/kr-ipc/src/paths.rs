@@ -330,7 +330,8 @@ impl EnvironmentPaths {
 
     /// Returns the controller's owner-only rendezvous endpoint.
     ///
-    /// Only a worker's startup handshake is accepted there.
+    /// Only a worker's startup handshake, and a running worker's request for the plugin runtime, are
+    /// accepted there.
     ///
     /// # Errors
     ///
