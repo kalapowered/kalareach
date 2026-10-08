@@ -71,7 +71,9 @@ pub struct Notice {
     /// The attention rule this was raised under.
     pub rule: String,
     /// One line naming the subject in the host's own words, or empty when the only words for it
-    /// are a session's text, which a notice never holds. It never leaves the seal.
+    /// are a session's text, which a notice never holds. A push destination carries it inside the
+    /// seal. An external message carries it as a line only for a rule whose words are the host's
+    /// own identifiers and the name of a limit (an automation paused by one), and for no other.
     pub summary: String,
     /// The session it belongs to, when it belongs to one.
     pub session_id: Option<SessionId>,
@@ -209,9 +211,10 @@ impl Audience {
 pub struct Production {
     /// What the notification is about.
     pub notice: Notice,
-    /// The lines an external message carries, already selected by the caller.
+    /// The lines an external message carries: the host's sentence for the rule, and the notice's
+    /// summary for the rule that carries it.
     ///
-    /// Empty for a push destination, which carries a summary and no lines.
+    /// A push destination carries none of them: its preview is sealed from the notice.
     #[serde(default)]
     pub lines: Vec<ContentLine>,
 }
@@ -219,8 +222,9 @@ pub struct Production {
 impl Notice {
     /// Builds a notice from one attention announcement.
     ///
-    /// The summary is the announcement's own line when that line is the host's own words, and it
-    /// goes inside the seal. A line that is a session's text is left out: the attention store keeps
+    /// The summary is the announcement's own line when that line is the host's own words. It goes
+    /// inside a push destination's seal, and into an external message only for the rule that
+    /// carries it. A line that is a session's text is left out: the attention store keeps
     /// none of a session's text, only where to read it, so this journal never holds it either. A
     /// consumer that sends a session's text reads it when it sends, under the control daemon's
     /// privacy fence (`delivery_texts` and `release_delivery` on the daemon's attention module).
@@ -643,14 +647,12 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
         AttentionRule::ReviewReady => {
             format!("An agent turn finished{place} and is ready to review.")
         }
-        AttentionRule::AdapterFailed => format!("An adapter failed{place}."),
+        AttentionRule::AdapterFailed => format!("An adapter needs attention{place}."),
         AttentionRule::HostContactLost => "Contact with the host was lost.".to_owned(),
         AttentionRule::ApplicationNotice => {
             format!("A program{place} asked the terminal for a notification.")
         }
-        AttentionRule::AutomationPaused => {
-            "A workflow was paused by one of its own limits.".to_owned()
-        }
+        AttentionRule::AutomationPaused => "Automation was paused by a limit.".to_owned(),
     };
     let line = |text: String| ContentLine {
         session_id: notice.session_id,
@@ -658,7 +660,10 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
         text,
     };
     let mut lines = vec![line(sentence)];
-    if !notice.summary.is_empty() {
+    // Only a rule whose summary is made of the host's own identifiers and the name of a limit
+    // goes out with it. A summary the host composes from a command line, a turn or a notice's body is free text
+    // that a person or a program wrote, and a rule that carries it is a decision of its own.
+    if rule == AttentionRule::AutomationPaused && !notice.summary.is_empty() {
         lines.push(line(notice.summary.clone()));
     }
     lines
@@ -1463,7 +1468,9 @@ impl Producer {
             external_destination.kind,
             notice.alert,
             lines.to_vec(),
-            &HistoryFilter::new(scope.viewer),
+            // The reach the audience admitted the notice under: a grant with no history bound
+            // reaches what was first seen at or after its own start.
+            &HistoryFilter::new(scope.viewer.live_from(scope.history_from_ms)),
             &scope.sessions,
             external::delivery_id(external_destination, notification_id),
         )?;
@@ -2903,6 +2910,147 @@ mod tests {
         producer
             .take_from_attention(attention, &|_| true, authority, SCOPE, privacy, 1_000)
             .expect("a take")
+    }
+
+    /// A recipient whose grant keeps the right to be told of the host and of automation and none
+    /// to see a session, with no history of its own: what it may be sent is the host's own words.
+    #[derive(Debug)]
+    struct HostOnly;
+
+    impl HostOnly {
+        fn scope() -> RecipientScope {
+            RecipientScope {
+                viewer: ViewerScope::from_history(
+                    &kr_protocol::grant::HistoryScope {
+                        lower_bound_ms: Nullable::null(),
+                        include_live_screen: false,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
+                    false,
+                ),
+                sessions: SessionSelector::Any,
+                rights: [ActionRight::AutomationManage, ActionRight::HostManage]
+                    .into_iter()
+                    .collect(),
+                grant_id: GrantId::new(Uuid::from_bytes([9; 16])),
+                recipient: DeviceId::new(Uuid::from_bytes([10; 16])),
+                history_from_ms: 0,
+            }
+        }
+    }
+
+    impl RecipientAuthority for HostOnly {
+        fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+            Some(Self::scope())
+        }
+
+        fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+            Some(Self::scope())
+        }
+    }
+
+    /// Takes what `attention` announces for a webhook under `authority`, produces from it, and
+    /// returns the one message the journal holds, with the notice's summary it was produced from.
+    fn message_for(
+        attention: &mut Attention,
+        authority: &dyn RecipientAuthority,
+    ) -> (String, String) {
+        let mut producer = producer();
+        let destination = webhook("hook");
+        producer
+            .journal_mut()
+            .configure_destination(&destination)
+            .expect("a destination");
+        let taken = take(&mut producer, attention, authority, NORMAL);
+        assert_eq!(taken.taken, 1, "the announcement is taken");
+        let pending = producer.journal().pending_events(0, 10).expect("a read");
+        let production = kr_cbor::from_canonical_slice::<Production>(
+            &pending[0].notice,
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("the production inputs");
+        let finished = producer
+            .finish_pending(std::slice::from_ref(&destination), authority, 1_000)
+            .expect("production");
+        assert_eq!(finished.admitted, 1, "the message is admitted");
+        let record = producer.journal().deliveries().expect("a read").remove(0);
+        let content: serde_json::Value =
+            serde_json::from_slice(&record.content.expect("the message")).expect("a document");
+        (
+            content["body"].as_str().expect("a body").to_owned(),
+            production.notice.summary,
+        )
+    }
+
+    /// A limit that paused a causal chain is told in the host's own words to a grant that may be
+    /// told of automation and sees no session: the message carries a sentence that is true of a
+    /// chain as of a workflow, the summary the host made of it, and no note that anything was left
+    /// out, because a line that names no session is not history.
+    #[test]
+    fn an_automation_paused_by_a_limit_is_told_to_a_grant_that_sees_no_session() {
+        use kr_protocol::attention::AttentionAutomationSubject;
+
+        let mut attention = store();
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::new(AttentionSource::Automation, 1),
+                    TimestampMs::new(NOON),
+                    EventKind::AutomationPaused {
+                        subject: AttentionAutomationSubject::CausalChain {
+                            causal_root_id: kr_protocol::ids::CausalRootId::new(Uuid::from_bytes(
+                                [11; 16],
+                            )),
+                        },
+                        reason: "its causal budget ran out".to_owned(),
+                        grant_id: Some(HostOnly::scope().grant_id),
+                    },
+                ),
+                reading(0, NOON),
+            )
+            .expect("the store records the pause");
+        let (body, summary) = message_for(&mut attention, &HostOnly);
+        assert!(summary.contains("its causal budget ran out"), "{summary}");
+        assert!(body.contains("Automation was paused by a limit."), "{body}");
+        assert!(
+            body.contains(&summary),
+            "the summary of an automation pause is carried: {body}"
+        );
+        assert!(!body.contains("left out"), "{body}");
+    }
+
+    /// An adapter's failure is told as a failure that needs attention and nothing more: the words
+    /// the host holds for it (the adapter and what it reported) are a summary that stays with the
+    /// host, since a rule whose words a program wrote is not one that goes out unless it is decided.
+    #[test]
+    fn an_adapter_that_needs_attention_is_told_without_the_words_it_reported() {
+        let mut attention = store();
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::new(AttentionSource::Receipts, 2),
+                    TimestampMs::new(NOON),
+                    EventKind::AdapterFailed {
+                        plugin_id: kr_protocol::ids::PluginId::new("git").expect("an identifier"),
+                        session_id: None,
+                        detail: "the index is locked by a person called Sam".to_owned(),
+                    },
+                ),
+                reading(0, NOON),
+            )
+            .expect("the store records the failure");
+        let (body, summary) = message_for(&mut attention, &HostOnly);
+        assert!(
+            summary.contains("the index is locked"),
+            "the control: the host holds the words it was given: {summary}"
+        );
+        assert!(body.contains("An adapter needs attention."), "{body}");
+        assert!(
+            !body.contains("the index is locked"),
+            "and the message does not carry them: {body}"
+        );
+        assert!(!body.contains("left out"), "{body}");
     }
 
     /// A paired device in one destination, to every one of which a notification is admitted.

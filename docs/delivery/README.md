@@ -443,7 +443,8 @@ the destination may send nothing: usually the store holds no credential for it, 
 fail at its last step after it has written one, and then the destination sends. Handing the
 credential over again repairs either case. Configuring under an identifier that is in use replaces
 that destination. A webhook, which sends with none, takes away any credential kept for what it
-replaced, once the new destination is written.
+replaced, once the new destination is written. If the secret store refuses that removal, the host
+logs it, the configuration stands, and the old credential stays in the store, used by nothing.
 
 The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
 told, and every pass asks the grant again, so a destination under a grant that stops standing is
@@ -593,13 +594,18 @@ An external message does name what happened and where, in the host's own words. 
 takes an announcement for delivery it writes, with the notice and before the source's cursor
 moves, the lines the message will carry: one sentence per rule ("A question is waiting in session
 ...", "An approval is waiting in session ...", "A command failed in session ...") that names the
-session by its identifier, dated by when the condition was first seen, and the host's own summary
-when the notice has one. Nothing a session said is in them, and a worker's words cannot be: the
-attention store keeps none. The lines are checked when the message is composed, against the grant of
-the rule that sends it: a line naming a session the grant does not reach, or dated before the
-history the grant reaches, is left out and counted in the message, and a notice about a session the
-grant does not reach produces no message for that destination at all. A recovery that produces
-from the same event again composes the same message, because the lines were written with it.
+session by its identifier and dated by when the condition was first seen. A notice about an
+automation paused by a limit adds the host's own summary of it, which is made of identifiers and
+the name of a limit; no other rule carries a summary out. Nothing a session said is in the lines, and a
+worker's words cannot be: the attention store keeps none. The lines are checked when the message
+is composed, against the grant of the rule that sends it, as far as each is about a session: a
+line naming a session the grant does not reach, or dated before the history the grant reaches
+(for a grant with no history bound, before the grant began), is left out and counted in the
+message, and a notice about a session the grant does not reach produces no message for that
+destination at all. A line that names no session is the host's own words about the host or an
+automation, and the grant's right to be told of that is all it needs. A recovery that produces
+from the same event again composes from the same input lines and applies the destination's
+current grant to them again.
 
 A request already handed to a transport can still leave after a lease lapses or privacy mode turns
 on, within that sender's own deadline. What it carries then is only the generic alert, the host's
