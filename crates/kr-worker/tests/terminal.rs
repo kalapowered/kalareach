@@ -1432,3 +1432,121 @@ async fn a_screen_a_restoration_cannot_carry_is_never_continued_as_a_raw_stream(
         "on a screen that still holds what was there before it: {drawn:?}"
     );
 }
+
+/// What the worker says a share's issuer would be shown of the screen, for a scope that includes
+/// the live screen or one that does not.
+async fn screen_previewed(
+    host: &Host,
+    include_live_screen: bool,
+) -> kr_protocol::sharing::SessionScreenPreviewResult {
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .request(
+            Method::SessionScreenPreview,
+            &kr_protocol::sharing::SessionScreenPreviewParams {
+                session_id: host.session_id,
+                history: kr_protocol::grant::HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the preview is answered")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// KR-REQ-10.50: the preview of a shared live screen is the text of the buffer that is showing and
+/// nothing behind it. The application printed a line on the primary screen, switched to the
+/// alternate one and printed another: the preview carries the second and not the first, which a
+/// recipient would see only if the application went back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_screen_preview_is_the_buffer_that_is_showing_and_not_the_one_behind_it() {
+    let host = host(
+        "printf 'on the primary screen\\n'; printf '\\033[?1049h'; \
+         printf 'on the alternate screen\\n'; read -r _",
+    )
+    .await;
+    produced(&host.runtime, b"on the alternate screen\r\n").await;
+
+    let preview = screen_previewed(&host, true)
+        .await
+        .screen
+        .0
+        .expect("a scope that includes the screen is shown it");
+    assert!(!preview.truncated);
+    assert!(
+        preview
+            .lines
+            .iter()
+            .any(|line| line == "on the alternate screen"),
+        "{preview:?}"
+    );
+    assert!(
+        !preview.lines.iter().any(|line| line.contains("primary")),
+        "the buffer that is not showing is not previewed: {preview:?}"
+    );
+}
+
+/// KR-REQ-10.50: what has scrolled off the screen is not previewed. The application printed sixty
+/// numbered lines on a screen of twenty-four, so the preview ends on the sixtieth and begins
+/// where the screen does, with the first thirty-six nowhere in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_screen_preview_holds_no_line_that_scrolled_off() {
+    let host =
+        host("i=1; while [ $i -le 60 ]; do printf 'line %s\\n' $i; i=$((i+1)); done; read -r _")
+            .await;
+    produced(&host.runtime, b"line 60\r\n").await;
+
+    let preview = screen_previewed(&host, true)
+        .await
+        .screen
+        .0
+        .expect("a scope that includes the screen is shown it");
+    assert_eq!(preview.lines.last().map(String::as_str), Some("line 60"));
+    assert!(
+        preview.lines.len() <= usize::try_from(CANONICAL.1).expect("rows"),
+        "{preview:?}"
+    );
+    for scrolled in ["line 1", "line 12", "line 36"] {
+        assert!(
+            !preview.lines.iter().any(|line| line == scrolled),
+            "{scrolled:?} scrolled off: {preview:?}"
+        );
+    }
+}
+
+/// KR-REQ-10.50: a scope that does not include the live screen is shown none of it, whatever is on
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_scope_without_the_live_screen_previews_none_of_it() {
+    let host = host("printf 'a secret on the screen\\n'; read -r _").await;
+    produced(&host.runtime, b"a secret on the screen\r\n").await;
+    assert_eq!(screen_previewed(&host, false).await.screen.0, None);
+}
+
+/// KR-REQ-10.50: a screen too large for a preview comes back cut and says so, which is what a
+/// caller that must show all of what it shares needs to refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_screen_larger_than_a_preview_comes_back_marked_cut() {
+    let host = host_sized(
+        "i=1; while [ $i -le 280 ]; do printf 'row %s\\n' $i; i=$((i+1)); done; read -r _",
+        Dimensions::new(80, 300),
+    )
+    .await;
+    produced(&host.runtime, b"row 280\r\n").await;
+
+    let preview = screen_previewed(&host, true)
+        .await
+        .screen
+        .0
+        .expect("a scope that includes the screen is shown it");
+    assert!(preview.truncated, "{preview:?}");
+    assert_eq!(preview.lines.len(), kr_protocol::sharing::MAX_PREVIEW_LINES);
+}
