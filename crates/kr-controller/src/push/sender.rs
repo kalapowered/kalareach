@@ -499,7 +499,7 @@ fn data_of<T: serde::de::DeserializeOwned>(
         Ok(Envelope {
             ok: true,
             data: Some(data),
-            ..
+            error: None,
         }) if answer.status == 200 => Ok(data),
         Ok(Envelope {
             error: Some(refusal),

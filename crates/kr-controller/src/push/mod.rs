@@ -1344,14 +1344,25 @@ impl DeliveryModule {
         };
         // Section 16 renews rather than presenting a credential the gateway has refused, and a
         // renewal that has not happened is not a renewal. So a credential inside its renewal
-        // window, or one the last answer refused, is renewed **before** anything is presented,
-        // and a renewal that did not produce a credential stops this attempt: presenting the old
-        // one again would get the same answer and count as another attempt at the notification.
+        // window, or one the last answer refused, is renewed **before** anything is presented.
+        // For one the last answer refused, or one past its expiry, and for a question about what
+        // became of a notification, a renewal that did not produce a credential stops this
+        // attempt: presenting the old one again would get the same answer and count as another
+        // attempt at the notification.
         let credential = if delivery.next == NextAction::RenewThenSend
             || kr_delivery::push::needs_renewal(&held, now_ms)
         {
             match credentials.renew(&held) {
                 Ok(renewed) => renewed,
+                // A renewal ahead of need that did not happen leaves the bearer working until its
+                // expiry: the gateway has not refused it, and holding the notification back would
+                // lose it for a credential the host will get to renewing again. A bearer the
+                // gateway refused, and one past its expiry, are another matter.
+                Err(_)
+                    if delivery.next == NextAction::Send && now_ms < held.expires_at_ms.get() =>
+                {
+                    held
+                }
                 Err(error) => {
                     return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
                 }
