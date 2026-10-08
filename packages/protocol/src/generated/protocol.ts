@@ -10817,8 +10817,10 @@ export interface StartupSelection {
  */
 export interface VoiceSelection {
   /**
-   * The broker's origin: an absolute `https` or `http` address in lower case, with no path,
-   * no trailing slash and no port its scheme already implies.
+   * The broker's origin: an absolute `https` address, or an `http` one on `localhost`,
+   * `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path, no trailing
+   * slash and no port its scheme already implies. An `http` origin cannot be combined with
+   * `network.proxy_url`, because a proxy would carry the account token in clear text.
    */
   broker_origin?: string | null
 }

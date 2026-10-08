@@ -2421,8 +2421,10 @@ pub mod configuration {
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields, default)]
     pub struct VoiceSelection {
-        /// The broker's origin: an absolute `https` or `http` address in lower case, with no path,
-        /// no trailing slash and no port its scheme already implies.
+        /// The broker's origin: an absolute `https` address, or an `http` one on `localhost`,
+        /// `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path, no trailing
+        /// slash and no port its scheme already implies. An `http` origin cannot be combined with
+        /// `network.proxy_url`, because a proxy would carry the account token in clear text.
         pub broker_origin: Nullable<String>,
     }
 
@@ -3088,18 +3090,35 @@ pub mod configuration {
             }
         }
         problems.extend(network_problems(&document.network));
-        if let Some(origin) = document.voice.broker_origin()
-            && !is_broker_origin(origin)
-        {
-            problems.push(
-                Sentence::new()
-                    .stated("voice.broker_origin (")
-                    .withheld(super::export::ContentClass::Location, origin)
-                    .stated(
-                        ") is not an https or http origin with a lower-case host or a canonical \
-                         address, no port its scheme implies, no path and no trailing slash",
-                    ),
-            );
+        if let Some(origin) = document.voice.broker_origin() {
+            if is_broker_origin(origin) {
+                // A proxy carries the request in absolute form whatever its address, a loopback
+                // one included, so the account token would cross it unprotected.
+                if origin.starts_with("http://") && document.network.proxy_url().is_some() {
+                    problems.push(
+                        Sentence::new()
+                            .stated("voice.broker_origin (")
+                            .withheld(super::export::ContentClass::Location, origin)
+                            .stated(
+                                ") is a plain-HTTP address, which network.proxy_url would carry \
+                                 in clear text with the account token: use an https broker or \
+                                 select no proxy",
+                            ),
+                    );
+                }
+            } else {
+                problems.push(
+                    Sentence::new()
+                        .stated("voice.broker_origin (")
+                        .withheld(super::export::ContentClass::Location, origin)
+                        .stated(
+                            ") is not an https origin, or an http origin on localhost, 127.0.0.1 \
+                             or [::1], of at most 128 bytes, with a lower-case host or a \
+                             canonical address, no port its scheme implies, no path and no \
+                             trailing slash",
+                        ),
+                );
+            }
         }
         if problems.is_empty() {
             Ok(())
@@ -4045,8 +4064,8 @@ pub mod configuration {
     /// The longest trust-anchor path this schema records.
     pub const MAX_PATH_LEN: usize = 4096;
 
-    /// The longest a relay URL, a discovery URL or origin, or a broker origin may be, as an
-    /// invitation carries it: a network hint is at most 253 bytes of printable ASCII.
+    /// The longest a relay URL, or a discovery URL or origin, may be, as an invitation carries it:
+    /// a network hint is at most 253 bytes of printable ASCII.
     pub const MAX_HINT_LEN: usize = 253;
 
     /// Whether `value` fits a network hint: 1 to [`MAX_HINT_LEN`] bytes of printable ASCII and
@@ -4118,18 +4137,22 @@ pub mod configuration {
             && !value.split('.').any(str::is_empty)
     }
 
-    /// Whether `value` is an origin a managed broker is addressed at: an `https` or `http` scheme
-    /// and a canonical authority, with no path and no trailing slash.
+    /// Whether `value` is an origin a managed broker is addressed at: an `https` origin, or an
+    /// `http` one on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in a canonical
+    /// authority with no path and no trailing slash.
     ///
     /// The broker compares origins by their spelling, so a second spelling of one address would
     /// be a second service to it, and it reads a host made of the characters a number is written
     /// in as an address. Such a host is refused here unless it is the canonical spelling of an
-    /// IPv4 address, which the authority rule has already required of an all-digit one.
+    /// IPv4 address, which the authority rule has already required of an all-digit one. The host
+    /// reaches the broker through the same gateway rule every other managed service follows, which
+    /// carries a token only over transport security, so an origin that rule refuses is refused
+    /// here and the daemon never starts with a broker it cannot reach.
     fn is_broker_origin(value: &str) -> bool {
         let Some((authority, path, implied)) = service_address(value) else {
             return false;
         };
-        value.len() <= MAX_HINT_LEN
+        crate::service::GatewayOrigin::new(value).is_ok()
             && path.is_empty()
             && is_canonical_authority(authority, implied)
             && crate::pairing::split_authority(authority).is_ok_and(|(host, _, bracketed)| {
@@ -8259,6 +8282,10 @@ mod tests {
             // Read by the broker as an address, and not the canonical spelling of one.
             "https://a1.be",
             "https://cafe.b0e",
+            // Plain HTTP is for the three loopback spellings the gateway rule admits, and no other.
+            "http://voice.example.com",
+            "http://127.0.0.2:8080",
+            "http://[::2]:8080",
         ] {
             let mut document = ConfigurationDocument::empty();
             document.voice.broker_origin = Nullable::some(origin.to_owned());
@@ -8270,6 +8297,42 @@ mod tests {
                 "{origin}: {problems:?}"
             );
         }
+
+        // The three loopback spellings are admitted for plain HTTP, and a host name past the
+        // gateway rule's 128 bytes is refused as the gateway rule refuses it.
+        for origin in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.voice.broker_origin = Nullable::some(origin.to_owned());
+            configuration::validate(&document).unwrap_or_else(|problems| {
+                panic!("{origin} is a loopback origin: {problems:?}");
+            });
+        }
+        let too_long = format!("https://{}.example", "a".repeat(120));
+        assert!(too_long.len() > crate::service::MAX_GATEWAY_ORIGIN_LEN);
+        let mut document = ConfigurationDocument::empty();
+        document.voice.broker_origin = Nullable::some(too_long);
+        configuration::validate(&document).expect_err("an origin past the gateway rule's bound");
+
+        // A proxy would carry a plain-HTTP broker's request, account token and all, in clear text,
+        // so the two are not selected together; an https broker through a proxy is fine.
+        let mut document = ConfigurationDocument::empty();
+        document.voice.broker_origin = Nullable::some("http://127.0.0.1:8080".to_owned());
+        document.network.proxy_url = Nullable::some("http://proxy.example.com:3128".to_owned());
+        let problems =
+            configuration::validate(&document).expect_err("a plain-HTTP broker and a proxy");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.as_str().contains("voice.broker_origin")
+                    && problem.as_str().contains("network.proxy_url")),
+            "{problems:?}"
+        );
+        document.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
+        configuration::validate(&document).expect("an https broker through a proxy");
 
         // A document whose network section does not validate is not this host's to rewrite, so an
         // edit to any other section of it is refused rather than applied on top.
