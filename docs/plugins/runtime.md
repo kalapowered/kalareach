@@ -5,8 +5,9 @@ side of the same contract: where a component actually runs, what bounds it, and 
 misbehaves.
 
 A component runs in `kr-plugin-host`, one process per environment, started when a binding first
-needs one. A worker never links the engine. It registers a binding with that process and keeps its
-own ledger, so a component that traps costs its binding and nothing else.
+needs one. A worker never links the engine. It asks the control daemon for the process, registers a
+binding with it and keeps its own ledger, so a component that traps costs its binding and nothing
+else.
 
 ```text
 kr-controller ──start job──▶ service manager ──▶ kr-plugin-host ──▶ component instance
@@ -314,8 +315,28 @@ entry is a reason to recompile rather than a reason to refuse the binding.
 ## The service
 
 One process per environment, `kr-plugin-host`, started by the control daemon through the same
-supervisor trait a worker is started through: a launchd job, a systemd transient user service, or a
-detached process, in each case its own job outside the daemon's kill tree.
+supervisor trait a worker is started through: a launchd job, a systemd transient user service, or
+a detached process (which on Windows is created outside the daemon's kill-on-close job), in each
+case its own job outside the daemon's kill tree.
+
+The daemon starts it when a worker asks and not before. The request travels on the daemon's
+rendezvous endpoint, after the hello a worker sends there, as a `PluginRuntimeWanted` frame naming
+the session, and the answer is a `PluginRuntimeState`: running, or unavailable with a reason and how
+long to leave before asking again. The daemon answers only the process it recorded for that
+session, as the kernel names it now. A worker that sends the request before the daemon has recorded
+it is told to ask again.
+
+The daemon's holder for the runtime is idle, starting, running or failed. A request in idle first
+looks at the descriptor a previous daemon published: a runtime that answers a challenge is kept,
+one whose process has ended is retired, and one whose process is running and does not answer is
+answered as unreachable for ten seconds. A descriptor whose content this build refuses (another
+protocol, another environment, not a descriptor) is retired; one that cannot be read at all, a link
+or a file another account could write, is left in place and answered as unreachable. Otherwise
+the daemon starts one, every request that arrives meanwhile waits for that one attempt, and an
+attempt that fails is answered from memory for ten seconds. At most five runtimes are started in
+ten minutes. A runtime in running is judged by the kernel's account of its process, not by whether
+a descriptor exists, and one the daemon did not start is adopted without a fence. Nothing here ends
+a process: a runtime that has stopped answering stays until it ends.
 
 ### What proves which process is answering
 
@@ -428,11 +449,23 @@ effective capabilities, never from what a caller describes: observation from
 upstream action from `upstream.action`; and the approval interpreter from `approval.decode`, with
 the right to answer only where `approval.respond` is granted beside it. The decoding trust comes
 from the admitted package's connector table, and the actions from its verified manifest's
-declarations. A package with a component binds for its declarative parts, and the binder does not
-register the component with the plugin host yet. Until it does, the worker's report on its
-admissions says the component's capabilities are temporarily unavailable because the plugin runtime
-is not running on the host, which the doctor's catalogue check carries, and an action the component
-prepares is refused before anything is sent, with the same reason.
+declarations. A package with a component binds for its declarative parts, and the worker also
+registers the component with the plugin runtime, as the component link of
+`crates/kr-worker/src/plugin_runtime.rs` describes. The broker pins the component the admissions
+named when the binding was made, so a binding that stays on a release after an upgrade registers
+that release's component. The link reads which bindings want a component from the broker each time
+round, registers those not yet registered, unbinds those that ended, were forgotten or lost their
+rich capabilities, and reports where each component stands in the worker's report on its bindings:
+pending, with the step it is at (asking the control daemon, connecting, registering), registered,
+unavailable with the reason, or disabled. A binding the runtime refuses is offered again after half
+a minute, and after twice that each time it is refused again, up to ten minutes. The link does not
+reach the runtime before a wait the daemon asked for or a backoff has passed, however often the
+broker's set changes meanwhile, except that a link nothing wants the runtime of any more forgets
+the wait, and the next binding that wants a component asks at once; the daemon's bound on starts
+is what holds a runtime that keeps ending. The worker's report on its admissions says that this host calls
+none of the component's exports beyond registering it for a binding, and an action the component
+prepares is refused before anything is sent, because this host calls no export of a component to
+prepare an effect.
 
 The broker lives in `crates/kr-worker/src/broker`. Its way to a component is the plugin host,
 through the client in `crates/kr-plugin-service`: register a binding, offer events to its queue,
