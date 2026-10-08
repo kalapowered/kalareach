@@ -6605,6 +6605,65 @@ async fn an_update_after_a_chain_leaves_the_release_that_ran_as_the_one_to_go_ba
     );
 }
 
+/// KR-REQ-26.10: an update after a chain of failed ones that stops before its switch leaves the chain as it
+/// was, with the release it began from to go back to. The updates to two and to three both fail to start a
+/// daemon; an update to four that the stores refuse after it has recorded itself ends without a switch; and a
+/// rollback without `--to` then goes to one, which ran, and not to two, whose daemon never did.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_that_stops_before_its_switch_leaves_the_start_of_the_chain_to_go_back_to() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let held = host.tree.root().join("held");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
+        .whose_daemon_cannot_start_while(&held, &log);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
+        .whose_daemon_cannot_start_while(&held, &log);
+    let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3)
+        .whose_daemon_cannot_start_while(&held, &log);
+    let four =
+        Assembled::at_this_level("0.4.0+dddddddddddd", 4).reading(reading_transfers_from_2());
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let scratch = host.scratch("archives");
+    let update = |release: &Assembled, name: &str| {
+        let archive = scratch.join(name);
+        release.archive(&archive);
+        host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ])
+    };
+    std::fs::write(&held, b"").expect("the daemons are held");
+    for (release, name) in [(&two, "two.tar.gz"), (&three, "three.tar.gz")] {
+        let (output, said) = update(release, name);
+        assert_eq!(output.status.code(), Some(1), "{said}");
+    }
+    let journal = kr_transfer::staging::StagingArea::store_path(&host.tree.environment());
+    rusqlite::Connection::open(&journal)
+        .expect("opens")
+        .execute("UPDATE schema_version SET version = 1", [])
+        .expect("an earlier version");
+    let (output, said) = update(&four, "four.tar.gz");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+
+    std::fs::remove_file(&held).expect("the daemons are let go");
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+}
+
 /// KR-REQ-26.10: a chain of failed updates that comes back to the release it began from still has a
 /// release to go back to, however many switches stop before they happen. A rollback from three to one
 /// and an update from one to three both fail to start a daemon; an update to four that the stores
