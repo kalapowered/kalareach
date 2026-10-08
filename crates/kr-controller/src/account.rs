@@ -670,8 +670,8 @@ impl Inner {
                     // when the daemon next starts.
                     if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
                         eprintln!(
-                            "kr-controller: a refused sign-in's token was sent to the service but \
-                             could not be kept for a second try: {error}"
+                            "kr-controller: a refused sign-in's token was sent to the service, but \
+                             the store failed: {error}"
                         );
                     }
                     return AccountAttempt::CallOpen;
@@ -714,36 +714,37 @@ async fn ended(cancel: &mut watch::Receiver<bool>) {
     }
 }
 
-/// A request for a token that is waiting for a change of the account to end, counted for a test:
-/// it is counted from the first poll of the gate that finds it still up, and not before.
-#[cfg(feature = "testing")]
-struct Waiting<'a>(&'a Inner);
+/// A request for a token that is waiting for a change of the account to end, counted for a test.
+struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
 
-#[cfg(feature = "testing")]
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        self.0
-            .waiting
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Waits until `changing` is down, and counts the wait for a test only while the gate is up.
-async fn until_down(inner: &Inner, changing: &mut tokio::sync::watch::Receiver<bool>) {
-    #[cfg(feature = "testing")]
+/// Waits until `changing` is down. When `count` is given, the wait is counted in it from the first
+/// poll that finds the gate still up, and not before: a request that does not wait is not counted,
+/// and neither is a yield the runtime makes of a task that has used up its budget.
+async fn until_down(
+    count: Option<&std::sync::atomic::AtomicUsize>,
+    changing: &mut tokio::sync::watch::Receiver<bool>,
+) {
     let mut counted = None;
-    let mut wait = std::pin::pin!(changing.wait_for(|changing| !*changing));
+    // Outside the task's budget: an exhausted budget makes the wait yield before it has looked at
+    // the gate, which is not a wait for a change.
+    let mut wait = std::pin::pin!(tokio::task::unconstrained(
+        changing.wait_for(|changing| !*changing)
+    ));
     std::future::poll_fn(|context| {
         let polled = wait.as_mut().poll(context);
-        #[cfg(feature = "testing")]
-        if polled.is_pending() && counted.is_none() {
-            inner
-                .waiting
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            counted = Some(Waiting(inner));
+        if polled.is_pending()
+            && counted.is_none()
+            && let Some(count) = count
+        {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            counted = Some(Waiting(count));
         }
-        #[cfg(not(feature = "testing"))]
-        let _ = inner;
         polled.map(|_| ())
     })
     .await;
@@ -777,7 +778,11 @@ impl AccountTokenSource for HostTokens {
             // that is about to go.
             let mut changing = self.inner.changing.subscribe();
             if *changing.borrow() {
-                until_down(&self.inner, &mut changing).await;
+                #[cfg(feature = "testing")]
+                let count = Some(&self.inner.waiting);
+                #[cfg(not(feature = "testing"))]
+                let count = None;
+                until_down(count, &mut changing).await;
             }
             if self.inner.recover().await.is_err() {
                 return Err(kr_client::ClientError::refusal(
@@ -789,5 +794,59 @@ impl AccountTokenSource for HostTokens {
             }
             held.signed_in.token(scope).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    use super::until_down;
+
+    /// The gate's wait is counted only while the gate is up. A task whose budget is spent has its next
+    /// wait on the runtime's own channel cut short before the channel is looked at; that is not a wait
+    /// for the gate, and it is not counted.
+    #[tokio::test]
+    async fn a_task_whose_budget_is_spent_does_not_count_as_waiting_at_a_gate_that_is_down() {
+        let count = AtomicUsize::new(0);
+        let (_sender, mut gate) = tokio::sync::watch::channel(false);
+        let (ready, counted) = std::future::poll_fn(|context| {
+            // Spend this poll's budget: the runtime's own yield comes when none is left.
+            loop {
+                let mut spend = Box::pin(tokio::task::consume_budget());
+                if spend.as_mut().poll(context).is_pending() {
+                    break;
+                }
+            }
+            let mut wait = Box::pin(until_down(Some(&count), &mut gate));
+            let ready = wait.as_mut().poll(context).is_ready();
+            Poll::Ready((ready, count.load(Ordering::SeqCst)))
+        })
+        .await;
+        assert!(ready, "the gate is down, so there is nothing to wait for");
+        assert_eq!(counted, 0, "nothing waited");
+    }
+
+    /// A request that meets a gate that is up is counted while it waits, and not after.
+    #[tokio::test]
+    async fn a_request_at_a_gate_that_is_up_is_counted_until_the_gate_comes_down() {
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let (sender, gate) = tokio::sync::watch::channel(true);
+        let waiting = {
+            let count = std::sync::Arc::clone(&count);
+            let mut gate = gate;
+            tokio::spawn(async move { until_down(Some(&count), &mut gate).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request is counted while it waits");
+        sender.send_replace(false);
+        waiting.await.expect("the wait ends");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "counted no longer");
     }
 }

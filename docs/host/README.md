@@ -300,8 +300,9 @@ replaces, the read of the account's identity that follows it, and the removal of
 the revocations that follow it. Each request the account service is sent has a deadline of its own.
 A sign-in that replaces a grant and then undoes itself sends up to two rounds of revocations (up to
 sixteen each), the read of the account's identity and, when its access token is near its end, a
-refresh, all behind the one gate, so a start that meets the gate waits at most the sum of those
-deadlines. A call record stays until its device stops the call; a phone that is lost during a call
+refresh, all behind the one gate; a refresh that a request outside a call (a preparation's) was
+making when the change began is waited for as well. A start that meets the gate waits at most the
+sum of those deadlines. A call record stays until its device stops the call; a phone that is lost during a call
 keeps `kr account sign-in` and `sign-out` refused until the daemon restarts.
 
 `kr account sign-out` (`account.sign_out`, served on the local socket alone, asking for host
