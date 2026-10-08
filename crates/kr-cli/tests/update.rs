@@ -5686,6 +5686,62 @@ async fn a_rollback_to_a_release_with_another_root_of_the_trusted_version_is_ref
     );
 }
 
+/// KR-REQ-26.10: `kr host terminal --clear` changes the saved preference while holding it, as the
+/// daemon's stamping of its format does, and an environment that has no state directory yet has
+/// nothing to clear and needs none held: with the preference held by another change the command is
+/// refused and leaves the file; once it is let go the command clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn kr_host_terminal_clear_holds_the_preference_and_needs_no_directory_that_is_not_there() {
+    use kr_shell_integration::host::terminal::{
+        PREFERENCE_FILE, hold_preference, preference_document,
+    };
+
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let clear = |host: &Host| host.kr_json(&["host", "terminal", "--clear", "--json"]);
+    let (output, said) = clear(&host);
+    assert!(
+        output.status.success(),
+        "an environment that has not run has nothing to clear: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let state_dir = host.tree.environment().state_dir().to_path_buf();
+    let file = state_dir.join(PREFERENCE_FILE);
+    kr_ipc::paths::write_owner_only_file(&file, preference_document("iterm2").as_bytes())
+        .expect("a preference");
+    let held = hold_preference(&state_dir).expect("held");
+    let (output, said) = clear(&host);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a change of the preference waits for the one under way and is refused: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not hold"),
+        "{said}"
+    );
+    assert!(file.exists(), "and the preference is left");
+    drop(held);
+    let (output, said) = clear(&host);
+    assert!(
+        output.status.success(),
+        "kr host terminal --clear: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !file.exists(),
+        "and once it is let go the command clears it"
+    );
+}
+
 /* -------------------------------------------------------------------------------------------- */
 /* The stored formats                                                                            */
 /* -------------------------------------------------------------------------------------------- */
