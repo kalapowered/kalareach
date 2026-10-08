@@ -2584,6 +2584,7 @@ Each worker has its own SQLite journal in write-ahead-logging mode with full syn
 | `observations` | additive evidence about an action: its provenance, the subject and version it saw, the source cursor and what it claims |
 | `closure` | the session's final record |
 | `session` | the session's own summary, so a reader with no worker can still say what the session was |
+| `owned_processes` | one row: the processes the session owns that had not ended when last observed, each by identifier and start value, with the boot, the control group the worker ran in, and what it could not establish, so a control daemon can stop what a crashed worker left |
 | `host_events` | an application notice that had no attachment to go to, and where in the output stream it happened |
 | `outbox` | the event each state transition committed with: its immutable identifier, the stream, the subsystem, the actor and action, the subject revision and the content class |
 | `outbox_cursors` | one row per consumer: how far it has taken the outbox and how much it has taken |
@@ -2871,22 +2872,43 @@ writing was lost, so a reader is told the record has holes rather than reading c
 "This session kept nothing" and "this host cannot say what this session kept" are different answers
 and a reader is owed the second one.
 
-**A worker crash closes the session.** The controller takes recovery ownership, runs section 9's two
-recovery rules over the journal the worker left (a dispatch marker with no authoritative outcome
-becomes `unknown` and is never dispatched again, and an accepted intent with no marker is rejected),
-then asks what is still owned, and only then records the closure. The closure record carries the
-terminated process identities, whatever the fence reached, the resources known to survive, and an
-ownership-coverage flag that never claims every application was discovered. Nothing is rebuilt from
-terminal history.
+**A worker crash closes the session, and what it still owned is stopped first.** The controller
+takes recovery ownership, runs section 9's two recovery rules over the journal the worker left (a
+dispatch marker with no authoritative outcome becomes `unknown` and is never dispatched again, and
+an accepted intent with no marker is rejected), stops what the session still owned, and only then
+records the closure. The closure record carries the terminated process identities and which of them
+had to be forced, the processes that outlasted the attempt, and an ownership-coverage flag that
+never claims every application was discovered. Nothing is rebuilt from terminal history. A worker
+that wrote its own closure before it went has stopped what it owned, and its record stands.
 
-**What the fence reaches is nothing, and it says so.** A worker's descendants join the process group
-it led, and once the worker has gone the kernel is free to give its number to an unrelated process
-whose group would answer to it; the root shell also starts a session of its own, so its jobs need
-not be in the worker's group even while the worker lives. Stopping what such a group held would be
-stopping somebody else's processes on the strength of a coincidence. The boundary that would work is
-the one the platform keeps (the transient unit or Job the supervisor started the worker in, named
-from the reservation and unable to name anything else), and this host does not stop one. So the
-coverage is incomplete and the record says which part of it this host could not account for.
+**What the cleanup stops, and by what.** The worker writes down the processes its session owns in
+its journal (the `owned_processes` table), each by identifier and start value, and rewrites that
+record as the set changes. Each process is recorded from one reading that gives its start and the
+fact that puts it in the session's tree (its parent, its terminal, its group, or the session's job),
+so an identifier the kernel gave to a stranger after the process it listed ended is not recorded.
+The record belongs to one boot: one from another boot, one from an earlier build that names no boot,
+and a missing one are not acted on, and the closure says why. A recorded process is stopped only
+through the platform's hold on it: a process descriptor on Linux, the kernel's own version of the
+process on macOS (which the kernel checks again as it signals), an open handle on Windows. A
+platform that offers none of these does not signal the process by its number. On Unix the cleanup
+asks (terminate, hang up, continue), waits the five-second period section 7 gives a closing
+session, ends what is left, and waits two seconds more. On Windows the worker's job object held the
+whole tree and closed with the worker; the cleanup waits for that, and ends by handle only what is
+left. A worker that ran as a systemd service also ran in that service's control group, named from
+the reservation and unable to name anything else. The cleanup reads the group from the kernel, asks
+the manager to kill what it still holds, and reaches a process the worker never saw.
+
+**What it cannot reach, and what a survivor means.** A process that left the terminal's session, a
+process the worker started outside it, a process that began after the worker's last record and, on
+Linux, one that moved itself to another service or scope are not found. macOS has no control group,
+so there the record and the terminal are all there is. A process that outlasts the attempt, such as
+one the platform will not let this host signal, is fenced rather than stopped: the worker that
+served it is dead, and its endpoint, descriptor and terminal are gone, so it cannot act as the
+session. The closure names it by identifier, start value and where it ran, with incomplete
+coverage, so that nobody reads it as gone. The next session's control group is named from its own
+reservation, and the number of its endpoint only grows, so no later session shares an identity with
+a survivor. Coverage is complete only where the cleanup confirmed a boundary: a control group the
+worker ran in and the kernel read empty, or a job that needed no help.
 
 **A closed session can be collected.** A session with no worker has no maintenance tick, so the
 archive has a collection of its own (`ArchiveService::collect`) that applies the bounds belonging
