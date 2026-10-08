@@ -125,11 +125,14 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // The owner's confirmations of this computer's hosts.
     ("owner_confirmations", None),
     ("owner_confirmation_review", None),
+    // The host a phone's commands go to.
+    ("hosts_use", None),
     // Voice. The start names its method for the table, and this process refuses it before sending.
     ("voice_prepare", Some(Method::VoicePrepare)),
     ("voice_start", Some(Method::VoiceStart)),
     ("voice_stop", Some(Method::VoiceStop)),
-    ("voice_grant", Some(Method::VoiceGrant)),
+    ("voice_allow", Some(Method::VoiceGrant)),
+    ("voice_scope", None),
     ("voice_delegate", Some(Method::VoiceDelegate)),
     ("voice_context", Some(Method::VoiceContext)),
     // The two local silences and the call's own state. They reach no service at all. This process
@@ -177,6 +180,9 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
             Method::EnvironmentList,
         ],
     ),
+    // The host's own account of which environment it is, read once the connection to a paired
+    // host is up: the connection carries none on its handshake.
+    ("hosts_use", &[Method::HostInfo]),
     ("owner_confirmations", &[Method::OwnerConfirmationPending]),
     (
         "owner_confirmation_review",
@@ -281,10 +287,12 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         pairing_stop,
         owner_confirmations,
         owner_confirmation_review,
+        hosts_use,
         voice_prepare,
         voice_start,
         voice_stop,
-        voice_grant,
+        voice_allow,
+        voice_scope,
         voice_delegate,
         voice_context,
         voice_set_muted,
@@ -307,7 +315,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
 ///
 /// Serialised as the empty map the protocol's request shape expects, rather than as a null.
 #[derive(Debug, Serialize)]
-struct NoParams {}
+pub(crate) struct NoParams {}
 
 /// The subject preconditions this application states.
 ///
@@ -1031,10 +1039,96 @@ pub fn voice_call_state() -> Result<crate::audio::VoiceCallState> {
     crate::audio::call_state()
 }
 
-mutate_command!(
-    /// Creates or updates a voice grant.
-    voice_grant, Method::VoiceGrant, kr_protocol::voice::VoiceGrantParams
-);
+/// One action a voice grant permits, as the person is shown it before allowing it.
+#[derive(Debug, Serialize)]
+pub struct VoiceScopeAction {
+    /// The action, by its protocol name.
+    pub action: kr_protocol::voice::VoiceAction,
+    /// The sentence that states it.
+    pub sentence: &'static str,
+    /// True when using it still takes a confirmation on an unlocked screen every time.
+    pub needs_unlocked_screen: bool,
+}
+
+/// What allowing voice on this device permits by default.
+#[derive(Debug, Serialize)]
+pub struct VoiceScope {
+    /// The default actions, each in the sentence that states it.
+    pub actions: Vec<VoiceScopeAction>,
+}
+
+/// What a voice grant permits when the person chooses nothing further, from the protocol's own
+/// table, so the surface that asks the question cannot word an action more softly than the host
+/// states it. It reaches nothing: the page asks before it allows, and allowing sends the same
+/// actions back for the host to check.
+#[tauri::command]
+pub fn voice_scope() -> VoiceScope {
+    VoiceScope {
+        actions: kr_protocol::voice::VoiceAction::ALL
+            .iter()
+            .filter(|action| action.in_default_scope())
+            .map(|action| VoiceScopeAction {
+                action: *action,
+                sentence: action.statement(),
+                needs_unlocked_screen: action.needs_unlocked_screen(),
+            })
+            .collect(),
+    }
+}
+
+/// What the page asks of `voice_allow`: which sessions, and which actions. The device is not here.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceAllow {
+    /// The sessions the grant covers. None covers every session the device's own grant covers.
+    session_ids: Vec<String>,
+    /// The actions to permit. Absent takes the default scope of section 15 paragraph 13.
+    actions: Option<Vec<kr_protocol::voice::VoiceAction>>,
+}
+
+/// Lets the person allow what a voice call on this device may do, for the host it is paired with.
+///
+/// The grant is this device's own, so native code names the device: the page does not hold the
+/// identity the host gave it, and a grant for any other device is a host-management change that
+/// this application, a paired device, does not make. The answer states every action the grant
+/// permits and every one the device's own grant could not carry.
+#[tauri::command]
+pub async fn voice_allow(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    let allowed: VoiceAllow = decode(params)?;
+    let session_ids = allowed
+        .session_ids
+        .iter()
+        .map(|id| {
+            id.parse()
+                .map_err(|_| CommandError::invalid("that is not a session identifier"))
+        })
+        .collect::<Result<Vec<kr_protocol::ids::SessionId>>>()?;
+    let typed = kr_protocol::voice::VoiceGrantParams {
+        device_id: state.paired_device_id()?,
+        session_ids: session_ids.into_iter().collect(),
+        actions: kr_protocol::scalars::Nullable::from(
+            allowed.actions.map(|actions| actions.into_iter().collect()),
+        ),
+    };
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    submitted(
+        session
+            .mutate(
+                Method::VoiceGrant,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await,
+    )
+}
 /// The request a delegation continues, when it carries the evidence a host asked for.
 ///
 /// `None` is a first submission, which is a new intent and takes a new identity.
@@ -1258,6 +1352,25 @@ pub fn pairing_start_read(state: State<'_, AppState>) -> Result<()> {
 pub async fn pairing_stop(state: State<'_, AppState>) -> Result<()> {
     state.device()?.stop().await;
     Ok(())
+}
+
+/// Takes a host this computer is paired with as the one its commands go to, and says where that
+/// stands once the first attempt to reach it has ended.
+///
+/// The page names the host by the reference the pairing screen listed it under. The choice is kept
+/// across runs, and a connection that ends is taken up again; the application says it is not
+/// connected for as long as it is not.
+#[tauri::command]
+pub async fn hosts_use<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::connection::ConnectionState> {
+    let host = state
+        .device()?
+        .host_by_reference(&reference)
+        .ok_or_else(crate::hosts::unknown_host)?;
+    crate::hosts::use_host(&app, host).await
 }
 
 /// The confirmations this computer's hosts ask for, as descriptions, and the ceremony this
@@ -1827,10 +1940,14 @@ mod tests {
                 "pairing_stop",
                 "owner_confirmations",
                 "owner_confirmation_review",
+                // The host a phone's commands go to: it pairs, and then it chooses.
+                "hosts_use",
                 // Setup's own two. Neither performs a protocol operation: one reads this
                 // application's identity and one opens a settings pane by name.
                 "setup_identity",
                 "setup_open_settings",
+                // What allowing voice permits, read from the protocol's table: nothing is contacted.
+                "voice_scope",
                 // Voice's own two. Both contact nothing: section 15 paragraph 10 keeps local mute
                 // and transport closure working when the broker fails, and a silence that had to
                 // be granted by a service is one that would fail at exactly the moment a person
@@ -2075,7 +2192,7 @@ mod tests {
             voice_prepare,
             voice_start,
             voice_stop,
-            voice_grant,
+            voice_allow,
             voice_delegate,
             voice_context,
         ]);

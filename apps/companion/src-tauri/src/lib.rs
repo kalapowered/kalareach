@@ -31,6 +31,7 @@ pub mod connection;
 pub mod device;
 pub mod error;
 pub mod export;
+pub mod hosts;
 pub mod links;
 pub mod owner;
 pub mod pairing;
@@ -82,10 +83,15 @@ pub fn run() {
             app.manage(account::AccountSlot::new(account_builder(
                 app.handle().clone(),
             )));
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                reach_local_host(handle).await;
-            });
+            // A computer with a host of its own reaches that one. A phone has none, and takes up
+            // the paired host it was last told to use, once its pairing records are open below.
+            #[cfg(desktop)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    reach_local_host(handle).await;
+                });
+            }
             // The account is built off the thread the platform starts the application on: opening
             // the secure store on a phone asks the native half, which runs on that thread.
             let handle = app.handle().clone();
@@ -96,6 +102,8 @@ pub fn run() {
             });
             watch_drops(app.handle());
             open_pairing(app.handle());
+            #[cfg(mobile)]
+            hosts::resume(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -298,7 +306,25 @@ pub fn start_pairing<R: tauri::Runtime>(
     let emitter = app.clone();
     let device = device::Device::with(data, parts, move || {
         if let Ok(device) = emitter.state::<AppState>().device() {
-            let _ = emitter.emit(pairing::PAIRING_EVENT, device.view());
+            let view = device.view();
+            let paired = matches!(
+                view.state,
+                kr_client::pairing::candidate::AttemptState::Paired { .. }
+            );
+            let _ = emitter.emit(pairing::PAIRING_EVENT, view);
+            // A computer that reaches no host takes the first one it pairs with as the one its
+            // commands go to, so a phone that has just paired is talking to the host it paired with
+            // without a second step. Once a host is in use, this does nothing.
+            if paired
+                && device.host_in_use().is_none()
+                && !emitter.state::<AppState>().connection_state().connected
+                && let Some(host) = device.newest_host()
+            {
+                let app = emitter.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = hosts::use_host(&app, host).await;
+                });
+            }
         }
     })?;
     let emitter = app.clone();
@@ -318,6 +344,7 @@ pub fn start_pairing<R: tauri::Runtime>(
 pub const DROPPED_EVENT: &str = "kr://dropped";
 
 /// Connects to the controller on this machine and starts publishing its events.
+#[cfg(desktop)]
 async fn reach_local_host(app: tauri::AppHandle) {
     use tauri::{Emitter as _, Manager as _};
 
