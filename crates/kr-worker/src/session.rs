@@ -1246,46 +1246,55 @@ impl Session {
     /// Writes the record of what the session owns, once, and starts the thread that keeps it up to
     /// date.
     ///
-    /// The first record is written here and waited for, beside the session's summary, so a worker
-    /// that dies a moment later leaves the root shell named. It holds only the root: the shell has
-    /// already started, and what it starts is recorded by the observations that follow. Every later
-    /// record goes through the thread, so nothing waits for the disk while the session is locked.
+    /// The thread is started first, so that a thread that cannot be started is in the first record
+    /// as something this host could not establish. The first record is written here and waited
+    /// for, beside the session's summary, so a worker that dies a moment later leaves the root
+    /// shell named. It holds only the root: the shell has already started, and what it starts is
+    /// recorded by the observations that follow. Every later record goes through the thread, so
+    /// nothing waits for the disk while the session is locked.
     ///
-    /// A first write that fails is reported like any other journal failure, and does not stop the
-    /// thread from being started: it sends the record again at every observation, so the record
-    /// is there as soon as the journal answers. A thread that cannot be started is something this
-    /// host could not establish, and the closure says so.
+    /// A first write that fails is reported like any other journal failure and does not stop the
+    /// thread from being used: it sends the record again at every observation, so the record is
+    /// there as soon as the journal answers.
     fn start_recording_owned(&mut self) {
+        self.start_owned_writer();
         let (Some(owned), Some(journal)) = (self.owned.as_ref(), self.journal.as_mut()) else {
             return;
         };
         let record = owned.record();
-        let first = journal.record_owned(self.config.session_id, &record);
-        let path = journal.path();
-        if let Err(error) = first {
+        if let Err(error) = journal.record_owned(self.config.session_id, &record) {
             self.note_journal_failure(error);
         }
-        let Some(path) = path else {
+        if let Some(writer) = self.owned_writer.as_ref() {
+            writer.submit(record);
+        }
+    }
+
+    /// Starts the thread that writes the record, if there is none and the journal is a file. A
+    /// thread that cannot be started is noted as something this host could not establish, and
+    /// is tried again at the next observation.
+    fn start_owned_writer(&mut self) {
+        if self.owned_writer.is_some() {
+            return;
+        }
+        let (Some(owned), Some(path)) = (
+            self.owned.as_ref(),
+            self.journal.as_ref().and_then(Journal::path),
+        ) else {
             return;
         };
         match crate::owned_writer::OwnedWriter::start(path, self.config.session_id) {
-            Ok(writer) => {
-                writer.submit(record);
-                self.owned_writer = Some(writer);
-            }
-            Err(error) => {
-                if let Some(owned) = self.owned.as_ref() {
-                    owned.note_unestablished(format!(
-                        "the thread that keeps the record of the session's processes up to date \
-                         could not be started: {error}"
-                    ));
-                }
-            }
+            Ok(writer) => self.owned_writer = Some(writer),
+            Err(error) => owned.note_unestablished(format!(
+                "the thread that keeps the record of the session's processes up to date could \
+                 not be started: {error}"
+            )),
         }
     }
 
     /// Hands the thread the record of what the session owns as it stands.
-    fn submit_owned(&self) {
+    fn submit_owned(&mut self) {
+        self.start_owned_writer();
         if let (Some(owned), Some(writer)) = (self.owned.as_ref(), self.owned_writer.as_ref()) {
             writer.submit(owned.record());
         }
