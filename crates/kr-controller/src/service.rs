@@ -60,6 +60,7 @@ mod host;
 mod inhibition;
 mod local;
 mod machine_group;
+pub mod plugin_runtime;
 mod prompt;
 mod reads;
 mod recovery;
@@ -347,7 +348,10 @@ pub struct Controller {
     /// recorded before the listener serves anything, so no connection can be admitted before the
     /// revocation path can reach it.
     network: std::sync::OnceLock<Arc<net::NetworkGuard>>,
-    supervisor: Box<dyn WorkerSupervisor>,
+    supervisor: Arc<dyn WorkerSupervisor>,
+    /// The environment's plugin runtime: started through `supervisor` when a worker first asks
+    /// for it, and never at this daemon's start.
+    plugin_runtime: Arc<plugin_runtime::PluginRuntime>,
     /// The environment's backup service: the generations this host has produced, their staged
     /// ciphertext and the outbox that carries them.
     ///
