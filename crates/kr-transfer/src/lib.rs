@@ -113,8 +113,7 @@ pub use crate::download::{DownloadWriter, publish_transfer};
 pub use crate::error::{Result, TransferError};
 pub use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
 pub use crate::service::{
-    InsertionOutcome, Recovery, RetainEverything, RetainedOutcome, SessionRetention, Sweep,
-    TransferService,
+    Recovery, RetainEverything, RetainedOutcome, SessionRetention, Sweep, TransferService,
 };
 pub use crate::staging::{StagingArea, StorageName};
 pub use crate::store::{Limits, Noting, Store};

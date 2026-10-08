@@ -1070,6 +1070,8 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         // A worker's request for the plugin runtime and the daemon's answer are that pair's own.
         | ControlFrame::PluginRuntimeWanted(_)
         | ControlFrame::PluginRuntimeState(_)
+        | ControlFrame::DraftWanted(_)
+        | ControlFrame::DraftAnswer(_)
         | ControlFrame::Forwarded(_)
         | ControlFrame::ForwardedRead(_)
         // A marked retained answer travels between a host and a worker, never to a client: what a
