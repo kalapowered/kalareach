@@ -119,12 +119,12 @@ fn holds_results() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
 
 /// What a worker of this build states when it also draws an attachment under a share the screen
 /// its issuer was shown.
-fn narrows_to_previewed_screens() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+fn a_worker_that_reads_the_screen_basis() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
     [
         kr_protocol::local::FORWARDED_HISTORY_SCOPE,
         kr_protocol::local::FORWARDED_QUESTION_SCOPE,
         kr_protocol::local::FORWARDED_RESULT_SCOPE,
-        kr_protocol::local::FORWARDED_PREVIEWED_SCREEN,
+        kr_protocol::local::FORWARDED_SCREEN_BASIS,
     ]
     .into_iter()
     .map(|capability| {
@@ -1037,7 +1037,7 @@ async fn kr_req_10_50_an_attach_under_a_share_asks_for_the_previewed_screen_and_
         let (world, holding) = world(
             Holding::default(),
             if worker_narrows {
-                narrows_to_previewed_screens()
+                a_worker_that_reads_the_screen_basis()
             } else {
                 holds_results()
             },
