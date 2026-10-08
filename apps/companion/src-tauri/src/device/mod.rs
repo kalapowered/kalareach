@@ -114,6 +114,9 @@ pub struct Device {
     running: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     progress: watch::Sender<AttemptState>,
     contact: Mutex<BTreeMap<DeviceId, bool>>,
+    /// The host this application's commands go to, remembered across runs in `use_file`.
+    in_use: Mutex<Option<DeviceId>>,
+    use_file: PathBuf,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -220,6 +223,10 @@ impl Device {
             hosts: Arc::new(hosts),
         };
         let origin_file = data.join("pairing-origin");
+        let use_file = data.join("command-host");
+        let in_use = std::fs::read_to_string(&use_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<DeviceId>().ok());
         let origin = std::fs::read_to_string(&origin_file)
             .ok()
             .and_then(|text| RendezvousOrigin::new(text.trim()).ok())
@@ -233,6 +240,8 @@ impl Device {
             running: Mutex::new(None),
             progress: watch::channel(AttemptState::Idle).0,
             contact: Mutex::new(BTreeMap::new()),
+            in_use: Mutex::new(in_use),
+            use_file,
             changed: Box::new(changed),
         }))
     }
@@ -273,6 +282,7 @@ impl Device {
     #[must_use]
     pub fn view(&self) -> PairingView {
         let contact = lock(&self.contact).clone();
+        let in_use = *lock(&self.in_use);
         let hosts = self
             .pairing
             .hosts
@@ -284,7 +294,7 @@ impl Device {
                 let in_contact = host
                     .is_owner()
                     .then(|| contact.get(&host.host_device_id).copied().unwrap_or(false));
-                HostRow::of(host, in_contact)
+                HostRow::of(host, in_use == Some(host.host_device_id), in_contact)
             })
             .collect();
         PairingView {
@@ -294,6 +304,48 @@ impl Device {
             invitation: self.held_summary(),
             hosts,
         }
+    }
+
+    /// The paired host the page named by `reference`, when this computer has one by that name.
+    #[must_use]
+    pub fn host_by_reference(&self, reference: &str) -> Option<PairedHost> {
+        self.pairing
+            .hosts
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|host| hosts::reference_of(host) == reference)
+    }
+
+    /// The host this application's commands went to when it last ran or was last told, when this
+    /// computer is still paired with it.
+    #[must_use]
+    pub fn host_in_use(&self) -> Option<PairedHost> {
+        let id = (*lock(&self.in_use))?;
+        self.pairing
+            .hosts
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|host| host.host_device_id == id)
+    }
+
+    /// The host this computer paired with last, when it has paired with any.
+    #[must_use]
+    pub fn newest_host(&self) -> Option<PairedHost> {
+        self.pairing
+            .hosts
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .last()
+    }
+
+    /// Records that this application's commands go to `host`, and keeps it for the next run.
+    pub fn use_host(&self, host: DeviceId) {
+        *lock(&self.in_use) = Some(host);
+        let _ = std::fs::write(&self.use_file, host.to_string());
+        (self.changed)();
     }
 
     /// The hosts this computer is an owner of, which it watches for confirmations.
