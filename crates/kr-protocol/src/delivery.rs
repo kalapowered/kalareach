@@ -333,9 +333,11 @@ pub struct DeliveryDestinationConfigureParams {
     /// under a grant that stops standing is told nothing.
     pub grant_id: GrantId,
     /// The credential the destination sends with, for every service but a webhook, or null to
-    /// leave the one already kept under the identifier. When it is given, it is kept and the
-    /// destination is configured together: a configuration the host refuses leaves the credential
-    /// kept before it as it was. It has to be the credential of the destination's service.
+    /// leave the one already kept under the identifier. When it is given, the destination is
+    /// configured first and the credential is kept after it: a configuration the host refuses
+    /// leaves the credential kept before it as it was, and a credential the store refuses leaves
+    /// a destination that may send nothing. It has to be the credential of the destination's
+    /// service.
     pub secret: Nullable<DestinationSecret>,
 }
 

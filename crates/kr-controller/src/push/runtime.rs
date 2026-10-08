@@ -137,8 +137,9 @@ struct Adapters {
 /// The time the loop's passes read: the machine's, unless a test holds it still.
 ///
 /// A held time is what makes a figure that depends on how long a burst took, such as how many
-/// notifications an allowance lets through, reproducible however slow the machine is. Rates are
-/// counted on the steady reading, which a test never holds.
+/// notifications an allowance lets through, reproducible however slow the machine is: the
+/// notification allowance refills by the time held here. The steady reading, on which the status
+/// questions and the nonce allowance are counted, is the machine's own and a test never holds it.
 #[derive(Debug, Default)]
 struct PassClock {
     /// The held time, or nought for the machine's own.
