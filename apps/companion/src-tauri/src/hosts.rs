@@ -81,19 +81,22 @@ pub fn resume<R: Runtime>(app: &AppHandle<R>) {
     let Ok(device) = state.device() else {
         return;
     };
-    if let Some(host) = device.host_in_use() {
-        let _ = state.choose_host(
-            "this application is reaching the host you chose",
-            |choice| {
-                Ok(tauri::async_runtime::spawn(keep(
-                    app.clone(),
-                    host,
-                    choice,
-                    None,
-                )))
-            },
-        );
-    }
+    // The host is read inside the step that makes the choice, so a choice the person made a moment
+    // earlier is not replaced by the one read before it.
+    let _ = state.choose_host(
+        "this application is reaching the host you chose",
+        |choice| {
+            let host = device
+                .host_in_use()
+                .ok_or_else(CommandError::not_connected)?;
+            Ok(tauri::async_runtime::spawn(keep(
+                app.clone(),
+                host,
+                choice,
+                None,
+            )))
+        },
+    );
 }
 
 /// Keeps a connection to `host` for `choice`: reaches it, forwards what it publishes, and when it

@@ -2164,6 +2164,23 @@ impl SignedInAccount {
         self.write_pending(&entries)
     }
 
+    /// Ends a refresh token this account was issued and will not keep, such as one that came for a
+    /// sign-in an open call turned away. It is queued before it is sent, so a service that cannot
+    /// be reached is told again at the next recovery, and returns how many revocations the service
+    /// has still not acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be changed; nothing is queued then.
+    pub async fn revoke_unkept(&self, refresh_token: RefreshToken) -> Result<usize> {
+        {
+            let _held = self.hold().await?;
+            // A name no kept grant carries, so recovery never takes it for a grant's own queue.
+            self.queue("unkept", refresh_token)?;
+        }
+        self.send_pending().await
+    }
+
     /// Keeps a sign-in's tokens, replacing any grant this device held, whose revocation is queued.
     ///
     /// # Errors

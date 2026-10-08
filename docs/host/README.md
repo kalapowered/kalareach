@@ -279,17 +279,24 @@ stops the attempt with `port_busy`. A host that held an account token file from 
 removes it once, when the daemon starts, because that file held no refresh credential; the person
 signs in.
 
-A call closes under the account it started under, so the account never changes under one. A call is
-open from the moment its start asks the broker, through the time it is live, until its close has
-been told to the broker, and the daemon counts all three. A sign-in or a sign-out is refused while a
-call is open, and a sign-in that is waiting when a call opens ends without spending its code. A
-change then raises a gate that refuses every token request while it is made: a start that begins
-after the check is refused its token, and one that began before it was counted by the check, so no
-call holds a token of the old account across the change. The exchange of a sign-in is a request that
-waits on the service, and a call can open while it does: the new grant is then revoked and the
-attempt ends as `call_open`; nothing the call holds changes. The gate is raised for the commit of a
-sign-in, the read of the account's identity that follows it, and the removal of a sign-out with the
-revocation that follows it.
+A call closes under the account it started under, so the account never changes under a call this
+host knows. A call is open from the moment its start asks the broker, through the time it is live,
+until its close has been told to the broker, and the daemon counts all three. (A start whose
+outcome the broker could not tell is not known as a call, because the host has no identifier to
+close, and a change of account loses no close for it.) A sign-in or a sign-out is refused while a
+call is open, and a sign-in that is waiting when a call opens ends without spending its code.
+
+A change raises a gate before it reads the calls, and a request for a token waits while the gate is
+up. A start registers itself before it asks for a token, so it is either counted by the check, which
+refuses the change, or it finds the gate up and waits for the change to end; it is then made under
+the account the change leaves, or refused when none is left. A call the check counts waits at most
+as long as the check. The exchange of a sign-in is a request that waits on the service, and a call
+can open while it does: the new grant is then queued for revocation, and told to the service now and
+again at the next start if it cannot be, and the attempt ends as `call_open`; nothing the call holds
+changes. The gate is raised for the commit of a sign-in, the read of the account's identity that
+follows it, and the removal of a sign-out with the revocation that follows it. A call record stays
+until its device stops the call; a phone that is lost during a call keeps `kr account sign-in` and
+`sign-out` refused until the daemon restarts.
 
 `kr account sign-out` (`account.sign_out`, served on the local socket alone, asking for host
 management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret
