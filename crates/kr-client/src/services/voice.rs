@@ -1770,6 +1770,21 @@ impl AccountTokenSource for AccountTokenFile {
                     ),
                 ));
             }
+            // The service turns an expired token away as no account at all, whose answer does not
+            // say that the token expired, so the file's own statement of when it stops being
+            // accepted is read first and nothing leaves this host with a token that has stopped.
+            if stored
+                .expires_at_ms
+                .is_some_and(|expires_at_ms| expires_at_ms <= kr_ipc::now_ms().get())
+            {
+                return Err(ClientError::refusal(
+                    ErrorCode::PermissionDenied,
+                    Shown::said(
+                        "the imported account token has expired. Import a new one with `kr \
+                         account token import <path>`.",
+                    ),
+                ));
+            }
             if !stored.carries(scope) {
                 return Err(ClientError::refusal(
                     ErrorCode::PermissionDenied,
@@ -2394,6 +2409,44 @@ mod tests {
                 .await
                 .is_ok()
         );
+        std::fs::remove_file(&path).expect("the stored token is removed");
+        std::fs::remove_dir(&directory).expect("the directory is removed");
+    }
+
+    /// A token the file says has stopped being accepted is not handed over, whatever the service
+    /// would have answered, so nothing leaves the host with it. A token with no stated expiry is,
+    /// and so is one that has not yet stopped.
+    #[tokio::test]
+    async fn a_token_that_has_expired_is_not_handed_over() {
+        let directory =
+            std::env::temp_dir().join(format!("kr-token-expiry-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a directory on the internal disk");
+        let path = account_token_path(&directory);
+        let document = |expires: &str| {
+            format!(
+                r#"{{"origin":"https://reach.example","accessToken":"a-secret-value",
+                     "scopes":["voice"]{expires}}}"#
+            )
+        };
+        let hand_over = async |expires: String| {
+            let stored =
+                StoredAccountToken::read(document(&expires).as_bytes()).expect("a token document");
+            kr_ipc::paths::write_owner_only_file(&path, &stored.write().expect("bytes"))
+                .expect("the stored token");
+            AccountTokenFile::at(path.clone()).token(VOICE_SCOPE).await
+        };
+        let error = hand_over(r#","expiresAtMs":1"#.to_owned())
+            .await
+            .expect_err("a token that has stopped is not handed over");
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+        assert!(!error.to_string().contains("a-secret-value"), "{error}");
+        let later = kr_ipc::now_ms().get() + 600_000;
+        hand_over(format!(r#","expiresAtMs":{later}"#))
+            .await
+            .expect("a token that has not stopped");
+        hand_over(String::new())
+            .await
+            .expect("a token with no stated expiry");
         std::fs::remove_file(&path).expect("the stored token is removed");
         std::fs::remove_dir(&directory).expect("the directory is removed");
     }
