@@ -33,7 +33,9 @@ import type {
   SessionListResult,
   SessionReadResult,
   ShellLaunchResult,
+  VoiceAction,
   VoiceContextResult,
+  VoiceGrantResult,
   VoiceManagedTerms,
   VoicePrepareResult,
   VoiceRate,
@@ -69,7 +71,9 @@ import type {
   TerminalView,
   TerminalViewState,
   TerminalWheel,
+  VoiceAllowRequest,
   VoiceCallState,
+  VoiceScope,
   VoiceStartRequest,
   Written
 } from './port'
@@ -342,6 +346,18 @@ export interface FakeHostControls {
   announceVoiceDelegation(delegationId: string, action?: string | null): void
   /** Changes what the pairing screen shows, as native code would publish it. */
   setPairing(change: Partial<PairingView>): void
+  /** The references the page asked to use as the host its commands go to, in order. */
+  readonly usedHosts: string[]
+  /**
+   * Has the host refuse the voice preparation until the person has allowed voice, as a host that
+   * holds no voice grant for this device does; allowing it lifts the refusal. `reason` is the
+   * host's own words.
+   */
+  requireVoiceGrant(reason?: string): void
+  /** Every allowance of voice the page asked for, as it asked. */
+  readonly voiceAllows: VoiceAllowRequest[]
+  /** Makes the next allowance of voice fail with `message`, as a host that refused it would. */
+  failNextVoiceAllow(message: string): void
   /** What the next paste from the clipboard finds. */
   setPasteboard(result: PasteView): void
   /** The codes the page started pairing with, in order. */
@@ -592,6 +608,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     startCapture: seed.capture
   }
   const voiceStarts: VoiceStartRequest[] = []
+  const voiceAllows: VoiceAllowRequest[] = []
+  const usedHosts: string[] = []
+  /** The words the host refuses a preparation with while no voice grant stands, or none. */
+  let voiceGrantMissing: string | null = null
+  let voiceAllowFailure: string | null = null
 
   let accountView: AccountView = { state: 'signed_out', outcome: null }
   let accountUsage: UsageView = { state: 'signed_out' }
@@ -1204,6 +1225,18 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       publishPairing({ invitation: null, state: { state: 'idle' } })
       return Promise.resolve()
     },
+    hostsUse: (reference) => {
+      if (!pairing.hosts.some((host) => host.reference === reference)) {
+        refuse('INVALID_ARGUMENT', 'This computer is not paired with that host.')
+      }
+      usedHosts.push(reference)
+      publishPairing({
+        hosts: pairing.hosts.map((host) => ({ ...host, in_use: host.reference === reference }))
+      })
+      connected = true
+      for (const listener of connectionListeners) listener(connectionNow())
+      return Promise.resolve(connectionNow())
+    },
     onPairing: (listener) => register(pairingListeners, listener),
     ownerConfirmations: () => Promise.resolve(owner),
     ownerConfirmationReview: (reference) => {
@@ -1276,6 +1309,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
     voicePrepare: (params) => {
       requireConnection()
+      if (voiceGrantMissing !== null) refuse('PERMISSION_DENIED', voiceGrantMissing)
       const asked = requireFields(params, ['session_ids', 'selected'])
       const selected = Array.isArray(asked.selected) ? (asked.selected as readonly string[]) : []
       const sessions = Array.isArray(asked.session_ids) ? (asked.session_ids as string[]) : []
@@ -1292,6 +1326,38 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           voice.terms === 'unread'
             ? "This host could not read the managed service's terms, so a managed call cannot start from here: the managed service did not answer"
             : null
+      })
+    },
+
+    voiceScope: () => Promise.resolve(VOICE_DEFAULT_SCOPE),
+    voiceAllow: (request) => {
+      requireConnection()
+      voiceAllows.push(request)
+      if (voiceAllowFailure !== null) {
+        const message = voiceAllowFailure
+        voiceAllowFailure = null
+        refuse('PERMISSION_DENIED', message)
+      }
+      voiceGrantMissing = null
+      const actions: VoiceAction[] = request.actions
+        ? [...request.actions]
+        : VOICE_DEFAULT_SCOPE.actions.map((each) => each.action)
+      return Promise.resolve({
+        receipt: null,
+        action_id: null,
+        value: {
+          grant_id: 'voice-grant-1',
+          device_id: 'this-device',
+          statement: {
+            actions,
+            statements: actions.map(
+              (action) =>
+                VOICE_DEFAULT_SCOPE.actions.find((each) => each.action === action)?.sentence ?? ''
+            ),
+            unlocked_screen_actions: []
+          },
+          not_held_by_device: []
+        } satisfies VoiceGrantResult
       })
     },
 
@@ -1542,6 +1608,14 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     withoutQualifiedShell() {
       qualifiedShell = false
+    },
+    usedHosts,
+    voiceAllows,
+    requireVoiceGrant(reason = 'PERMISSION_DENIED: no voice grant covers this device') {
+      voiceGrantMissing = reason
+    },
+    failNextVoiceAllow(message) {
+      voiceAllowFailure = message
     },
     sessionCreates,
     describe(sessionId, change) {
@@ -1868,6 +1942,32 @@ const VOICE_SCOPE: Omit<VoicePrepareResult, 'managed' | 'managed_unavailable' | 
   token_cap: 8000,
   message_count: 20,
   broker_origin: 'https://reach.kala.to'
+}
+
+/** What allowing voice permits by default, in the protocol's own sentences. */
+const VOICE_DEFAULT_SCOPE: VoiceScope = {
+  actions: [
+    {
+      action: 'navigate',
+      sentence: 'Move between the sessions this grant covers.',
+      needs_unlocked_screen: false
+    },
+    {
+      action: 'status',
+      sentence: 'Read what a session is doing.',
+      needs_unlocked_screen: false
+    },
+    {
+      action: 'brief',
+      sentence: 'Hear a briefing built from the selected context.',
+      needs_unlocked_screen: false
+    },
+    {
+      action: 'compose_prompt',
+      sentence: 'Compose a prompt without submitting it.',
+      needs_unlocked_screen: false
+    }
+  ]
 }
 
 /**

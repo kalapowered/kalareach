@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
+import { VoiceGrantStep } from './VoiceGrantStep'
 import { VoiceSurface, type VoiceSurfaceActions } from './VoiceSurface'
 import {
   asCaptureState,
@@ -24,7 +25,13 @@ import {
   type RunningCall
 } from './model'
 import { useApp } from '../app/state'
-import { failureMessage as portFailureMessage, failureWords, follow, watch } from '../host/port'
+import {
+  failureCode,
+  failureMessage as portFailureMessage,
+  failureWords,
+  follow,
+  watch
+} from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
 import type { VoiceAction, VoiceDelegateParams } from '@kalareach/protocol'
 import type { Surface } from '../mobile/platform'
@@ -66,7 +73,14 @@ class AskFailed extends Error {
   }
 }
 
-export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNode {
+export function VoiceRoute({
+  surface,
+  embedded = false
+}: {
+  readonly surface: Surface
+  /** True inside the phone's shell, which has a main region of its own. */
+  readonly embedded?: boolean
+}): ReactNode {
   const { port } = useApp()
   const params = useMemo(() => {
     if (typeof window === 'undefined') return new URLSearchParams()
@@ -74,6 +88,14 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
   }, [])
 
   const [choice, setChoice] = useState<ProviderChoice | null>(null)
+  /**
+   * The host's words when it would not prepare a call because this device holds no voice grant for
+   * the sessions asked about, and none otherwise. While it is set the person is asked to allow
+   * voice instead of being shown a call that cannot start.
+   */
+  const [needsGrant, setNeedsGrant] = useState<string | null>(null)
+  /** The sessions the person allowed voice for here, which the preparation is then asked about. */
+  const [allowed, setAllowed] = useState<readonly string[] | null>(null)
   const [call, setCall] = useState<RunningCall | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
@@ -131,10 +153,11 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
 
   // The session this screen was opened for, when an address named one. The preparation is asked
   // about that selection, and a start then names exactly the sessions the preparation answered.
-  const sessionIds = useMemo(() => {
-    const named = params.get('session')
-    return named ? [named] : []
+  const named = useMemo(() => {
+    const one = params.get('session')
+    return one ? [one] : []
   }, [params])
+  const sessionIds = allowed ?? named
 
   // What a call would be, read before one exists. Nothing is created by asking, which is the whole
   // reason this read exists: a person can be told what a call would send and then decline it.
@@ -164,10 +187,19 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
     let current = true
     void prepare()
       .then((prepared) => {
-        if (current) setChoice(prepared)
+        if (!current) return
+        setNeedsGrant(null)
+        setChoice(prepared)
       })
       .catch((error: unknown) => {
-        if (current) setNotice(failureMessage(error))
+        if (!current) return
+        // A host that holds no voice grant for this device is not a failure to report: it is the
+        // first question, and the person answers it.
+        if (failureCode(error instanceof AskFailed ? error.payload : error) === 'PERMISSION_DENIED') {
+          setNeedsGrant(failureMessage(error))
+          return
+        }
+        setNotice(failureMessage(error))
       })
     return () => {
       current = false
@@ -472,8 +504,24 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
     [applyLocalState, busy, choice, port, prepare, sessionIds]
   )
 
+  if (needsGrant !== null && !call) {
+    return (
+      <Region embedded={embedded} surface={surface}>
+        <VoiceGrantStep
+          port={port}
+          refusal={needsGrant}
+          named={named}
+          onAllowed={(ids) => {
+            setNeedsGrant(null)
+            setAllowed(ids)
+          }}
+        />
+      </Region>
+    )
+  }
+
   return (
-    <main id="main" tabIndex={-1} data-surface={surface}>
+    <Region embedded={embedded} surface={surface}>
       <VoiceSurface
         choice={choice}
         call={call && { ...call, hostReachable }}
@@ -482,6 +530,24 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         notice={notice}
         actions={actions}
       />
+    </Region>
+  )
+}
+
+/** The screen's region: the page's main one, or a plain one inside a shell that has its own. */
+function Region({
+  embedded,
+  surface,
+  children
+}: {
+  readonly embedded: boolean
+  readonly surface: Surface
+  readonly children: ReactNode
+}): ReactNode {
+  if (embedded) return <div data-surface={surface}>{children}</div>
+  return (
+    <main id="main" tabIndex={-1} data-surface={surface}>
+      {children}
     </main>
   )
 }
