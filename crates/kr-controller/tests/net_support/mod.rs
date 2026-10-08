@@ -775,10 +775,10 @@ impl RawDevice {
     }
 
     /// Reads what the host sends until it closes the control stream, and says whether it answered
-    /// `request` before it did. Gives up on a stream that is still open after `patience`, which is
-    /// a guard against a hang and decides nothing.
+    /// `request` before it did.
     ///
-    /// `None` when the stream was still open at the end of `patience`.
+    /// `None` when the stream was still open at the end of `patience`: a caller that says the host
+    /// closes it inside a given time is told so by this.
     pub async fn answered_before_closing(
         &self,
         request: kr_protocol::ids::RequestId,
