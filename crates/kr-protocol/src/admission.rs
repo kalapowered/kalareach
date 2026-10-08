@@ -231,6 +231,41 @@ pub struct ComponentReport {
     pub reason_cut: bool,
 }
 
+/// A worker's request that the plugin runtime be running, sent to the control daemon on its
+/// rendezvous endpoint.
+///
+/// The runtime is started when a binding first needs a component and not before, so this is what a
+/// worker sends when one of its bindings holds a package that ships one. The daemon accepts it only
+/// from the process it recorded for the session, as the kernel names that process; the reply is a
+/// [`PluginRuntimeState`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PluginRuntimeWanted {
+    /// The session whose worker asks.
+    pub session_id: SessionId,
+}
+
+/// The control daemon's answer to a [`PluginRuntimeWanted`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntimeState {
+    /// The runtime is running and its descriptor is published: the worker connects to it and
+    /// registers its bindings.
+    Running,
+    /// The runtime cannot be reached now.
+    Unavailable(PluginRuntimeUnavailable),
+}
+
+/// Why the plugin runtime cannot be reached, and when to ask again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PluginRuntimeUnavailable {
+    /// Why, cut to the report's bound.
+    pub reason: String,
+    /// How long the worker leaves before it asks again, in milliseconds.
+    pub retry_after_ms: U64,
+}
+
 /// One live binding, as a worker reports it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
