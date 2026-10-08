@@ -961,8 +961,20 @@ impl Environment {
     /// Starts as [`Self::start`] does, with the daemon delivering through the gateway only when
     /// `attached` says so: a daemon with no transport asks no gateway anything.
     async fn start_attached(attached: bool) -> Self {
+        Self::start_on(attached, None).await
+    }
+
+    /// Starts as [`Self::start`] does, on clocks the test moves by hand.
+    async fn start_on_clocks(clocks: kr_controller::service::Clocks) -> Self {
+        Self::start_on(true, Some(clocks)).await
+    }
+
+    async fn start_on(attached: bool, clocks: Option<kr_controller::service::Clocks>) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
-        let host = Host::start(&owner).await;
+        let host = match clocks {
+            Some(clocks) => Host::start_on_clocks(&owner, clocks).await,
+            None => Host::start(&owner).await,
+        };
         let stopped = host.shut_down().await;
         let worker = Worker::start(stopped.tree(), 1).await;
         let settings = stopped.settings().clone();
@@ -1906,6 +1918,81 @@ async fn unpairing_ends_the_destination_even_when_the_device_record_cannot_be_wr
             .iter()
             .all(|device| device.device_id != phone.device_id()),
         "the device is unpaired"
+    );
+}
+
+/// KR-REQ-16.10: a device whose grant runs out while the daemon runs is no longer paired, and its
+/// destination, the credential held for it and the authorisation behind it end with that, as they do
+/// at its unpairing. The daemon runs on clocks the test moves by hand, so the grant runs out when
+/// the test says and not when the machine's clock does. The control is the same device before its
+/// grant runs out: its destination is in service and the question is delivered to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_devices_destination_ends_when_its_grant_runs_out_while_the_daemon_runs() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let continuous = kr_transport::clock::ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(now()));
+    let environment = Environment::start_on_clocks(kr_controller::service::Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: kr_controller::service::WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    })
+    .await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x73));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let credentials = environment.controller().delivery_runtime().credentials();
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the control question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_some_and(|record| record.enabled)
+    );
+    assert!(credentials.held(sender).is_some());
+
+    // The grant `proposal` gives a session invitation lasts a day.
+    let day = Duration::from_secs(24 * 60 * 60);
+    wall.fetch_add(2 * day.as_millis() as u64, Ordering::SeqCst);
+    continuous.advance(2 * day);
+    environment
+        ._worker
+        .ask("deploy-2", "Deploy the release again?");
+
+    until("the device's destination ending", || {
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled && record.rule.is_none())
+    })
+    .await;
+    until("the credential being given up", || {
+        credentials.held(sender).is_none()
+    })
+    .await;
+    assert!(
+        !secret_store_holds(&environment, bytes_of(&credential)),
+        "the secret store gave the bearer up"
+    );
+    // The stand-in gateway reads the real time and the daemon's clock is two days ahead of it, so
+    // the revocation is not made here; that it is owed, durably, is what ending the destination
+    // leaves behind.
+    assert!(
+        owed(&environment)
+            .iter()
+            .any(|debt| debt.sender_record_id == sender),
+        "the authorisation is owed a revocation"
     );
 }
 
