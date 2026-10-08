@@ -888,6 +888,82 @@ async fn kr_req_25_10_a_connection_is_ended_by_the_clock_that_ends_a_grant_it_st
     }
 }
 
+/// KR-REQ-25.10: a connection that only read under a share, and opened no link to the session's
+/// worker under it, is ended with the share all the same: the share is a grant it stood on for as
+/// long as that read could be followed by another. Its pairing grant outlasts the share here, so
+/// nothing but the share's own end can end the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_connection_is_ended_with_a_share_it_only_read_under() {
+    use std::sync::atomic::Ordering;
+
+    for on_the_continuous_clock in [true, false] {
+        let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+        let holding = std::sync::Arc::new(std::sync::Mutex::new(Holding::default()));
+        let world = fake::fake_world_on(
+            Some(clocks),
+            serving(std::sync::Arc::clone(&holding), holds_question_reads()),
+        )
+        .await;
+        fake::acknowledged(&world.controller, world.session_id);
+        let now = wall.load(Ordering::SeqCst);
+        let device = paired(&world.controller, 31, SessionSelector::None);
+        let held_share = share(
+            &world,
+            &device,
+            &[ActionRight::SessionView],
+            &[],
+            true,
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 60_000),
+            },
+        );
+        let connection = super::RemoteConnection::for_test(&world.controller, device);
+        let acting = connection
+            .acting_for(Some(world.session_id), Some(held_share.grant_id))
+            .expect("the share is held");
+        connection
+            .ask_under(
+                acting,
+                Some(world.session_id),
+                Method::QuestionRead.entry(),
+                false,
+            )
+            .expect("the read is decided under the share");
+
+        let ended = connection.grant_ended();
+        tokio::pin!(ended);
+        assert!(
+            !has_ended(&mut ended).await,
+            "nothing has ended yet (continuous clock: {on_the_continuous_clock})"
+        );
+        // The control: a second short of the end, on the clock that ends it.
+        if on_the_continuous_clock {
+            continuous.advance(std::time::Duration::from_secs(59));
+        } else {
+            wall.store(now + 59_000, Ordering::SeqCst);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !has_ended(&mut ended).await,
+            "a share a second short of its end has not ended (continuous clock: {on_the_continuous_clock})"
+        );
+        if on_the_continuous_clock {
+            continuous.advance(std::time::Duration::from_secs(2));
+        } else {
+            wall.store(now + 61_000, Ordering::SeqCst);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), &mut ended)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the connection is ended with the share it read under (continuous clock: \
+                     {on_the_continuous_clock})"
+                )
+            });
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-19.01: a view-only recipient binds no attachment through `agent.draft.add_attachment`. The
 /// call needs the right to upload and the right to prompt an agent, which no share a session is
 /// shared with carries and which a call that names no session takes from the device's pairing

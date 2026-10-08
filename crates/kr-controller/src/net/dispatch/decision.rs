@@ -633,27 +633,16 @@ impl RemoteConnection {
                 }
                 other => ProtocolError::new(ErrorCode::PermissionDenied, other.to_string()),
             })?;
-        // The share is noted on this connection's registration before its record is read, so a
-        // revocation of it either withdraws this connection or has committed already and the
-        // record says so.
-        if !self
-            .controller
-            .note_acting(self.connection_id, acting.grant_id)
-        {
-            return Err(super::acting::withdrawn());
-        }
-        let record = self.share_record(acting.grant_id)?;
-        if record.revoked_at_ms.is_some() {
-            return Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this grant has been revoked",
-            ));
-        }
+        let record = self.noted_share_record(acting.grant_id)?;
         let decided = self
             .controller
             .decide_for_device(&record.grant, &record, request)
             .map_err(|refusal| refusal.to_protocol_error())?;
-        let mut beside = vec![self.share_bound(&record)?];
+        // The share's end also ends this connection, though the request is only a read and the
+        // connection opens no link under it.
+        let bound = self.share_bound(&record)?;
+        self.hold_share_bound(acting.grant_id, bound.clone());
+        let mut beside = vec![bound];
         beside.extend(standing.lease);
         beside.extend(standing.offline);
         Ok(super::super::DeviceDecision { beside, ..decided })
