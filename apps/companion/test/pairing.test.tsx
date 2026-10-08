@@ -336,8 +336,8 @@ describe('pairing with a host', () => {
     act(() => {
       controls.setPairing({
         hosts: [
-          { name: 'studio', owner: true, authority: 'manage the host as an owner', grant_expires_at_ms: null, in_contact: true },
-          { name: 'build box', owner: false, authority: 'view sessions', grant_expires_at_ms: null, in_contact: null }
+          { reference: 'studio-ref', in_use: false, name: 'studio', owner: true, authority: 'manage the host as an owner', grant_expires_at_ms: null, in_contact: true },
+          { reference: 'box-ref', in_use: false, name: 'build box', owner: false, authority: 'view sessions', grant_expires_at_ms: null, in_contact: null }
         ]
       })
     })
