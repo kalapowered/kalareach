@@ -99,7 +99,7 @@ impl Quiet {
     }
 
     /// Ends a delay that has passed, unless the service has asked for more since `until`.
-    pub fn passed(&self, until: Instant) {
+    pub(super) fn passed(&self, until: Instant) {
         let mut owed = self.until();
         if *owed == Some(until) {
             *owed = None;

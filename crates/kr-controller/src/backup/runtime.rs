@@ -770,7 +770,12 @@ impl BackupRuntime {
             && observed.status_refusal.is_none()
             && observed.pass_hold.is_none()
             && !observed.status_unanswered;
-        let backup_off = observed.status.is_some() && !backup_on && !observed.status_unanswered;
+        // An answer that backup storage is off is the newest fact only while no later question to
+        // the service was turned back.
+        let backup_off = observed.status.is_some()
+            && !backup_on
+            && !observed.status_unanswered
+            && observed.status_refusal.is_none();
         let remedy = if well {
             None
         } else if state != TokenState::Usable {

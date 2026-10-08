@@ -8555,6 +8555,45 @@ async fn a_pass_stops_where_the_service_asked_to_be_left_alone_and_says_so() {
     assert_eq!(host.generation(1).remote, Remote::Published);
 }
 
+/// An abandonment the host does not send because the service asked to be left alone is not an
+/// abandonment the service refused: the upload is kept, and abandoned when the delay has passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandonment_put_off_by_a_delay_is_kept_and_sent_when_the_delay_has_passed() {
+    let host = Host::open();
+    host.admit(1, &[TWO_PARTS]);
+    let clock = Moving::new();
+    let quiet = Arc::new(Quiet::new(clock.clone()));
+    let mut uploader = host.uploader_asked_to_wait(10_000, Arc::clone(&quiet));
+    // The upload is begun, and then the collection is deleted from the account console: the
+    // production is cancelled, the attempt stops, and nothing carries the upload any more.
+    steps_until(&mut uploader, 10_000, "created").await;
+    host.web.delete_collection(archive_id());
+    steps_until(&mut uploader, 10_000, "collection deleted").await;
+    quiet.owe(std::time::Duration::from_secs(600));
+
+    let put_off = uploader
+        .step(TimestampMs::new(11_000))
+        .await
+        .expect("a step")
+        .expect("a step is taken");
+    assert!(
+        matches!(put_off, Stepped::Waiting { .. }),
+        "the abandonment waits, and is not read as refused: {put_off:?}"
+    );
+    assert_eq!(host.web.count(|asked| matches!(asked, Asked::Abort(_))), 0);
+
+    // The delay passes, and the upload that was kept is abandoned.
+    clock.advance(std::time::Duration::from_secs(601));
+    let steps = passes(&mut uploader, 12_000).await;
+    assert!(
+        kinds(&steps)
+            .iter()
+            .any(|kind| matches!(*kind, "abandoned" | "unabandoned")),
+        "{steps:?}"
+    );
+    assert_eq!(host.web.count(|asked| matches!(asked, Asked::Abort(_))), 1);
+}
+
 /// Ending work in flight under privacy mode does not wait out a delay the service asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_fence_ends_the_work_in_flight_inside_a_delay_the_service_asked_for() {

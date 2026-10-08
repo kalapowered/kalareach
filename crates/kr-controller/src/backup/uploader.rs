@@ -123,7 +123,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::error::ClientError;
-use kr_client::retry::UserAction;
 use kr_client::services::{
     ArchiveAnswer, BackupManifestService, BackupState, Dispatched, NewUpload, PartTable,
     ServiceFuture, StorageService, StorageStatus, UploadId, UploadProgress, upload_parts,
@@ -564,14 +563,17 @@ impl Gate {
         if fenced {
             return Ok(());
         }
-        Err(ClientError::Refused {
-            error: ProtocolError::new(
-                ErrorCode::ServiceCapacity,
-                "the service asked to be left alone, so this request was not sent".to_owned(),
+        // The host's own refusal and not an answer of the service's: nothing left, so the callers
+        // that read a refusal as the service's last word (an abandonment it would not make) must
+        // not read this as one. The delay itself is in `Quiet`, where the service's answer put it.
+        Err(ClientError::Host(ProtocolError::new(
+            ErrorCode::ServiceCapacity,
+            format!(
+                "the service asked to be left alone for another {} seconds, so this request was not \
+                 sent",
+                left.as_secs().saturating_add(1)
             ),
-            retry_after_seconds: Some(left.as_secs().saturating_add(1)),
-            action: UserAction::Wait,
-        })
+        )))
     }
 
     /// Remembers a delay the service named in an answer.
@@ -839,9 +841,13 @@ impl Uploader {
                 continue;
             };
             // A service that asked to be left alone is not asked about the next publication either,
-            // and not by the first pass: the delay is recorded where the answer arrived, and the
-            // clients send nothing while it is owed.
+            // and not by the first pass: the delay is recorded where the answer arrived. The gate
+            // sends nothing while it is owed, except under a privacy fence, which opens it for
+            // every request, so the loop stops here instead.
             if !matches!(self.held(&generation).await, Ok(true)) {
+                if self.quiet.left().is_some() {
+                    break;
+                }
                 continue;
             }
             settled.push(

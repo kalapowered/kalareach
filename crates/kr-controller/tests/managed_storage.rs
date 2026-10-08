@@ -399,6 +399,17 @@ impl Rig {
             .expect("a result of the declared shape")
     }
 
+    /// What the doctor tells a person to do about the storage service.
+    async fn storage_remedy(&self) -> String {
+        let result = self.doctor().await;
+        result
+            .checks
+            .iter()
+            .find(|check| check.id() == "managed-storage")
+            .and_then(|check| check.remedy().map(str::to_owned))
+            .expect("a remedy")
+    }
+
     async fn storage_check(&self) -> (DoctorStatus, String) {
         let result = self.doctor().await;
         let check = result
@@ -864,6 +875,43 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
         rig.until("generation 1 is published", |rig| rig.published(1))
             .await;
     }
+}
+
+/// Backup storage was off when the doctor last asked, and a later question was turned back: the
+/// doctor says the later fact and its remedy, and not that backup storage is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_turned_back_after_an_off_answer_is_not_told_as_backup_being_off() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            backup_on: false,
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    assert!(detail.contains("backup storage is off"), "{detail}");
+    let remedy = rig.storage_remedy().await;
+    assert!(remedy.contains("Turn backup storage on"), "{remedy}");
+
+    web.fail(
+        STATUS,
+        1,
+        Moment::Refuse {
+            status: 402,
+            code: "QUOTA_EXHAUSTED",
+            retry_after_seconds: None,
+        },
+    );
+    let remedy = rig.storage_remedy().await;
+    assert!(
+        !remedy.contains("Turn backup storage on"),
+        "the newer refusal has its own remedy: {remedy}"
+    );
 }
 
 /// An account the service no longer knows is a thing only a person can mend, so the daemon waits for
