@@ -323,6 +323,20 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: true,
     },
     StoreDescriptor {
+        name: "owned_processes",
+        holds: "the processes the session owns that had not ended when last observed, with the \
+                boot, the control group and what the worker could not establish, so a control \
+                daemon can stop what a crashed worker left",
+        durability: Durability::CrashDurable,
+        retention: Retention::SessionLifetime,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::ArchiveService,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
         name: "privacy",
         holds: "the privacy generation in force, whether privacy mode is on, and where each \
                 attention source stood at the last transition",
@@ -614,6 +628,7 @@ mod tests {
             "host_time",
             "privacy",
             "closure",
+            "owned_processes",
             "journal_gaps",
             "broker_schema",
             "broker_bindings",

@@ -1055,6 +1055,118 @@ fn a_version_two_journal_is_brought_forward_in_place_and_keeps_its_rows() {
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
+/// The summary a worker of an earlier build wrote of a session whose root shell is `root`.
+fn summary_with_root(
+    session_id: SessionId,
+    root: Option<kr_protocol::identity::ProcessStartIdentity>,
+) -> kr_protocol::session::SessionSummary {
+    kr_protocol::session::SessionSummary {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+        display_number: DisplayNumber::new(1),
+        state: kr_protocol::session::SessionState::Live,
+        shell_mode: ShellMode::NativeCompat,
+        shell_path: "/bin/sh".to_owned(),
+        cwd: "/".to_owned(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        desktop: DesktopBinding::none(),
+        created_at_ms: kr_ipc::now_ms(),
+        dimensions: Dimensions::new(80, 24),
+        attachment_count: U64::new(0),
+        application_state: Nullable::null(),
+        root_process: Nullable(root),
+        closure: Nullable::null(),
+        environment_sources: None,
+    }
+}
+
+/// Makes a current journal into the one a worker of the build before wrote: no record of what the
+/// session owns, and the version before.
+fn as_version_six(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("opens the journal");
+    connection
+        .execute_batch("DROP TABLE owned_processes; UPDATE schema_version SET version = 6;")
+        .expect("steps it back");
+}
+
+#[test]
+fn a_version_six_journal_gains_the_record_of_its_processes_seeded_with_its_root_shell() {
+    // The step makes the table, and seeds it from the root shell the session's summary named. The
+    // seeded row holds no boot, because a start value read by an earlier build cannot be tied to
+    // one, and says so: a control daemon reads it for the receipt and signals nothing on its
+    // strength. A journal whose summary names no root gets the table and no row.
+    let root = kr_protocol::identity::ProcessStartIdentity::new(
+        4242,
+        kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+        7,
+    );
+    for (name, summary_root) in [("named", Some(root.clone())), ("unnamed", None)] {
+        let path = journal_path(&format!("version-six-{name}"));
+        let session_id = fixture_session();
+        {
+            let mut journal = Journal::open(&path).expect("opens");
+            journal
+                .record_session(&summary_with_root(session_id, summary_root.clone()))
+                .expect("records the summary");
+        }
+        as_version_six(&path);
+        let journal = Journal::open(&path).expect("steps it forward");
+        assert_eq!(
+            journal.schema_version().expect("a version"),
+            migration::CURRENT
+        );
+        let read = journal.read_owned(session_id).expect("reads the record");
+        match summary_root {
+            Some(root) => {
+                let record = read.expect("the step seeded the root shell");
+                assert_eq!(record.root, root);
+                assert_eq!(record.processes, vec![root]);
+                assert_eq!(record.boot, None, "a seeded row is tied to no boot");
+                assert!(!record.limits.is_empty(), "and says what it does not know");
+            }
+            None => assert_eq!(read, None, "no root was named, so none is invented"),
+        }
+        drop(journal);
+        std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+    }
+}
+
+#[test]
+fn what_a_worker_records_of_its_processes_is_read_back_whole() {
+    let path = journal_path("owned-round-trip");
+    let session_id = fixture_session();
+    let mut journal = Journal::open(&path).expect("opens");
+    let identity = |pid: u64| {
+        kr_protocol::identity::ProcessStartIdentity::new(
+            pid,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            pid * 3,
+        )
+    };
+    let record = kr_worker::ownership::OwnedRecord {
+        boot: kr_ipc::identity::boot_identity().ok(),
+        root: identity(10),
+        processes: vec![identity(10), identity(11)],
+        cgroup: Some("/user.slice/kr-worker-x.service".to_owned()),
+        boundary: "the terminal's process group".to_owned(),
+        limits: vec!["a limit".to_owned()],
+    };
+    journal.record_owned(session_id, &record).expect("records");
+    let newer = kr_worker::ownership::OwnedRecord {
+        processes: vec![identity(10)],
+        ..record.clone()
+    };
+    journal.record_owned(session_id, &newer).expect("replaces");
+    assert_eq!(
+        journal.read_owned(session_id).expect("reads"),
+        Some(newer),
+        "the latest record replaces the one before it"
+    );
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
 #[test]
 fn the_importer_brings_a_version_one_journal_to_the_current_version_once() {
     // KR-REQ-24.30's explicit importer, for both shapes a build recording version 1 wrote: the

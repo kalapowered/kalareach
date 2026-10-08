@@ -21,7 +21,7 @@
 //!   successor already refused it, and [`crate::persistence::import`] reads it.
 
 /// The schema version this build reads after migration.
-pub const CURRENT: i64 = 6;
+pub const CURRENT: i64 = 7;
 
 /// The oldest schema version this build's ladder brings forward on its own.
 ///
@@ -62,6 +62,12 @@ pub static LADDER: &[Migration] = &[
         to: 6,
         summary: "where the attention sources stood at the last privacy transition, and the starting \
                   privacy record of a journal that never changed privacy mode",
+    },
+    Migration {
+        from: 6,
+        to: 7,
+        summary: "the processes the session owns, so a control daemon can stop what a crashed worker \
+                  left, seeded with the root shell the session's summary names",
     },
 ];
 
@@ -165,6 +171,25 @@ pub fn tables_at(version: i64) -> &'static [&'static str] {
             "outbox_cursors",
             "journal_gaps",
         ],
+        5 | 6 => &[
+            "schema_version",
+            "receipts",
+            "results",
+            "receipt_events",
+            "closure",
+            "session",
+            "host_events",
+            "observations",
+            "host_time",
+            "fence_evidence",
+            "fence_state",
+            "fence_delivery",
+            "fence_forgotten",
+            "outbox",
+            "outbox_cursors",
+            "journal_gaps",
+            "privacy",
+        ],
         _ => &[
             "schema_version",
             "receipts",
@@ -183,6 +208,7 @@ pub fn tables_at(version: i64) -> &'static [&'static str] {
             "outbox_cursors",
             "journal_gaps",
             "privacy",
+            "owned_processes",
         ],
     }
 }

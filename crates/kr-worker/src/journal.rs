@@ -392,6 +392,7 @@ impl Journal {
                         (3, 4) => self.migrate_3_to_4()?,
                         (4, 5) => self.migrate_4_to_5()?,
                         (5, 6) => self.migrate_5_to_6()?,
+                        (6, 7) => self.migrate_6_to_7()?,
                         _ => {
                             return Err(unavailable_detail_owned(format!(
                                 "no migration is implemented from schema version {} to {}",
@@ -544,6 +545,136 @@ impl Journal {
                 faulted(&self.health, error)
             })?;
         Ok(())
+    }
+
+    /// Adds the record of the processes the session owns, seeded with the root shell the session's
+    /// summary names.
+    ///
+    /// A journal written under version 6 recorded the root shell's identity in the session's
+    /// summary and nothing below it. The seeded row says so: it names the root, holds no boot
+    /// (the start value of a process read by an earlier build cannot be tied to a boot), and says
+    /// that only the root shell was known. A control daemon reads it for the receipt and signals
+    /// nothing on its strength.
+    ///
+    /// This serves a journal written under version 6. Remove it, with its entry in the ladder, once
+    /// no supported upgrade starts from a version 6 journal.
+    fn migrate_6_to_7(&self) -> Result<()> {
+        let summary: Option<Vec<u8>> = if self.has_table("session")? {
+            self.connection
+                .query_row("SELECT summary FROM session LIMIT 1", [], |row| row.get(0))
+                .optional()
+                .map_err(|error| faulted(&self.health, error))?
+        } else {
+            None
+        };
+        let seeded = summary
+            .and_then(|bytes| {
+                kr_cbor::from_canonical_slice::<kr_protocol::session::SessionSummary>(
+                    &bytes,
+                    &kr_cbor::Limits::DEFAULT,
+                )
+                .ok()
+            })
+            .and_then(|summary| {
+                summary
+                    .root_process
+                    .0
+                    .map(|root| (summary.session_id, root))
+            })
+            .map(|(session_id, root)| {
+                let record = crate::ownership::OwnedRecord {
+                    boot: None,
+                    root: root.clone(),
+                    processes: vec![root],
+                    cgroup: None,
+                    boundary: "the session's root shell, as its summary recorded it".to_owned(),
+                    limits: vec![
+                        "this session's journal was written by a worker that recorded only its \
+                         root shell"
+                            .to_owned(),
+                    ],
+                };
+                (session_id, record)
+            });
+        let encoded = seeded
+            .as_ref()
+            .map(|(session_id, record)| {
+                kr_cbor::to_canonical_vec(record)
+                    .map(|bytes| (session_id.get().as_bytes().to_vec(), bytes))
+            })
+            .transpose()
+            .map_err(|error| unavailable_detail_owned(error.to_string()))?;
+        let result = (|| -> rusqlite::Result<()> {
+            self.connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS owned_processes (
+                     session_id BLOB PRIMARY KEY,
+                     record     BLOB NOT NULL
+                 );",
+            )?;
+            if let Some((session_id, bytes)) = &encoded {
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO owned_processes (session_id, record) VALUES (?1, ?2)",
+                    params![session_id, bytes],
+                )?;
+            }
+            self.connection
+                .execute_batch("UPDATE schema_version SET version = 7; COMMIT;")
+        })();
+        result.map_err(|error| {
+            let _ = self.connection.execute_batch("ROLLBACK;");
+            faulted(&self.health, error)
+        })
+    }
+
+    /// Returns the path of the database this journal is open on, if it is open on a file.
+    #[must_use]
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        self.connection
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    /// Records the processes the session owns, replacing the record before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_owned(
+        &mut self,
+        session_id: kr_protocol::ids::SessionId,
+        record: &crate::ownership::OwnedRecord,
+    ) -> Result<()> {
+        write_owned(&self.connection, session_id, record)
+            .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Reads the record of the processes the session owns, if the worker wrote one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails, and the store's own
+    /// corruption error when the stored record cannot be decoded.
+    pub fn read_owned(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<Option<crate::ownership::OwnedRecord>> {
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT record FROM owned_processes WHERE session_id = ?1",
+                params![session_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| faulted(&self.health, error))?;
+        encoded
+            .map(|bytes| {
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|_| self.corrupt("a stored record cannot be decoded"))
+            })
+            .transpose()
     }
 
     /// Whether this journal's file holds a table.
@@ -4057,8 +4188,31 @@ pub(crate) fn create_current_objects(connection: &Connection) -> rusqlite::Resul
                      recorded_at_ms   INTEGER NOT NULL,
                      questions_head   INTEGER NOT NULL DEFAULT 0,
                      host_events_head INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE IF NOT EXISTS owned_processes (
+                     session_id BLOB PRIMARY KEY,
+                     record     BLOB NOT NULL
                  );",
     )
+}
+
+/// Writes the record of the processes a session owns on `connection`.
+///
+/// The connection may be the journal's own or one a writer opened beside it: the table is the only
+/// thing either writes.
+pub(crate) fn write_owned(
+    connection: &Connection,
+    session_id: kr_protocol::ids::SessionId,
+    record: &crate::ownership::OwnedRecord,
+) -> rusqlite::Result<()> {
+    let encoded = kr_cbor::to_canonical_vec(record)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    connection.execute(
+        "INSERT INTO owned_processes (session_id, record) VALUES (?1, ?2)
+         ON CONFLICT (session_id) DO UPDATE SET record = excluded.record",
+        params![session_id.get().as_bytes().as_slice(), encoded],
+    )?;
+    Ok(())
 }
 
 /// Writes the privacy record a journal starts with, when it has none: privacy mode off at the first
