@@ -47,6 +47,7 @@ pub(super) async fn daemon_passing_by_hand(
         setup(temp),
         crate::service::Clocks::system(),
         crate::service::barrier::PassSchedule::ByHand(schedule),
+        std::sync::Arc::new(crate::backup::runtime::RealTimer),
     )
     .await
     .expect("the daemon starts");

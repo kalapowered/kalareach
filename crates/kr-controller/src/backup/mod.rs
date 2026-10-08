@@ -30,13 +30,16 @@
 //! generation is sealed; the filenames are inside the encrypted manifest. `backup.sqlite` holds
 //! identities, hashes, sizes, states and the paths of ciphertext.
 
+pub mod runtime;
 mod statements;
 pub mod store;
 pub mod uploader;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::Notify;
 
 use kr_crypto::backup::{
     GenerationExpectation, Material, RestoreAdmissions, RestoreGeneration, SealedArchive,
@@ -443,6 +446,21 @@ impl RestoreRequest<'_> {
 pub struct BackupService {
     store: Mutex<BackupStore>,
     readiness: Mutex<Readiness>,
+    signals: Arc<BackupSignals>,
+}
+
+/// What tells whatever carries the outbox to the service that there is something to do.
+///
+/// Each is a standing permit rather than a message: a change made while the carrier is busy is
+/// still there to be seen when it looks again, and several changes are one look.
+#[derive(Debug, Default)]
+pub struct BackupSignals {
+    /// Work arrived or became possible: a generation was admitted, a writer was enrolled or a
+    /// fence was released.
+    pub work: Notify,
+    /// A privacy fence was raised, which the carrier answers whatever else it is waiting for,
+    /// because the cleanup a fence owes waits for work in flight to end.
+    pub fence: Notify,
 }
 
 impl BackupService {
@@ -458,6 +476,7 @@ impl BackupService {
         Ok(Self {
             store: Mutex::new(BackupStore::open(state_dir)?),
             readiness: Mutex::new(Readiness::default()),
+            signals: Arc::default(),
         })
     }
 
@@ -472,7 +491,14 @@ impl BackupService {
         Ok(Self {
             store: Mutex::new(BackupStore::in_memory(staging_root)?),
             readiness: Mutex::new(Readiness::default()),
+            signals: Arc::default(),
         })
+    }
+
+    /// What tells the carrier of the outbox that there is something to do.
+    #[must_use]
+    pub fn signals(&self) -> Arc<BackupSignals> {
+        Arc::clone(&self.signals)
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, BackupStore> {
@@ -646,6 +672,7 @@ impl BackupService {
         match Self::fence_within_store(&mut store, generation, now_ms) {
             Ok(fenced) => {
                 self.note_step_succeeded(PrivacyStep::Fence, generation.get());
+                self.signals.fence.notify_one();
                 Ok(fenced)
             }
             Err(error) => {
@@ -684,6 +711,7 @@ impl BackupService {
             match Self::fence_within_store(&mut store, generation, now_ms) {
                 Ok(fenced) => {
                     self.note_step_succeeded(PrivacyStep::Fence, generation.get());
+                    self.signals.fence.notify_one();
                     Ok(fenced)
                 }
                 Err(error) => {
@@ -884,7 +912,10 @@ impl BackupService {
         archive_id: ArchiveId,
         now_ms: TimestampMs,
     ) -> Result<()> {
-        self.store().enrol_writer(writer_key_id, archive_id, now_ms)
+        self.store()
+            .enrol_writer(writer_key_id, archive_id, now_ms)?;
+        self.signals.work.notify_one();
+        Ok(())
     }
 
     /// Retires a backup writer for one archive, so its unfinished generations there stop being
@@ -920,8 +951,11 @@ impl BackupService {
         resumed_generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<FenceRelease> {
-        self.store()
-            .release_fence(fence_generation.get(), resumed_generation.get(), now_ms)
+        let released =
+            self.store()
+                .release_fence(fence_generation.get(), resumed_generation.get(), now_ms)?;
+        self.signals.work.notify_one();
+        Ok(released)
     }
 
     /// Stages one sealed generation and records it.
@@ -1062,6 +1096,7 @@ impl BackupService {
                 return Err(error);
             }
         };
+        self.signals.work.notify_one();
         Ok(Admitted {
             archive_id,
             backup_generation,

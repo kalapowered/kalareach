@@ -373,6 +373,9 @@ pub struct Controller {
     /// calls rather than answers, so what belongs to the daemon is the accounting: what was
     /// admitted, what is staged, what has been dispatched and what became of it.
     backup: Arc<crate::backup::BackupService>,
+    /// What carries the backup outbox to the managed storage service, when this host's
+    /// configuration document selects one.
+    backup_runtime: Option<crate::backup::runtime::BackupRuntime>,
     /// The configuration this daemon has put into force.
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the
@@ -907,6 +910,12 @@ impl Controller {
     #[must_use]
     pub fn backup(&self) -> &Arc<crate::backup::BackupService> {
         &self.backup
+    }
+
+    /// What carries the backup outbox to the managed storage service, when this host selects one.
+    #[must_use]
+    pub const fn backup_runtime(&self) -> Option<&crate::backup::runtime::BackupRuntime> {
+        self.backup_runtime.as_ref()
     }
 }
 

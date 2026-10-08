@@ -2107,6 +2107,8 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
                 relay_leases: Some(Arc::new(NullService)),
                 push: Some(Arc::new(NullService)),
                 sync_backup: Some(Arc::new(NullService)),
+                storage: Some(Arc::new(NullService)),
+                backup_manifest: Some(Arc::new(NullService)),
                 managed_inference: Some(Arc::new(NullService)),
             },
         ),
@@ -2429,6 +2431,8 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
         relay_leases: Some(Arc::clone(&fork) as _),
         push: Some(Arc::clone(&fork) as _),
         sync_backup: Some(Arc::clone(&fork) as _),
+        storage: None,
+        backup_manifest: None,
         managed_inference: Some(Arc::clone(&fork) as _),
     };
     let before = clients.availability();
