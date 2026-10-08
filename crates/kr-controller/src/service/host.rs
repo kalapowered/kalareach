@@ -813,7 +813,12 @@ impl Controller {
         let directory = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         let probed = tokio::task::spawn_blocking(move || {
             let reading = integrations.read(&snapshot.packages);
-            crate::catalogue::launch_probes::report(&reading, &search_path, &directory)
+            crate::catalogue::launch_probes::report(
+                &reading,
+                &search_path,
+                &directory,
+                kr_worker::broker::probe::DEADLINE,
+            )
         });
         match tokio::time::timeout(DOCTOR_READS, probed).await {
             Ok(Ok(reports)) => reports,

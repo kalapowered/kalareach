@@ -67,23 +67,13 @@ impl Probed {
 }
 
 /// Runs `probe` against `executable` for a launch whose own arguments are `launch`, in
-/// `directory`, and reads the mode from what it prints.
+/// `directory`, and reads the mode from what it prints, with `deadline` to print it and end and
+/// `cap` bytes of output. A launch and the doctor give [`DEADLINE`] and [`MAX_OUTPUT_BYTES`]; this
+/// host's own tests give a longer deadline, so that they decide by what a program prints and not by
+/// how soon a machine starts it, or a smaller cap.
 ///
 /// The probe runs in this process's environment, which is the environment the launch it precedes
 /// runs in, and in the launch's own directory. It belongs on a thread that may block.
-#[must_use]
-pub fn run(executable: &Path, probe: &LaunchProbe, launch: &[String], directory: &Path) -> Probed {
-    run_within(
-        executable,
-        probe,
-        launch,
-        directory,
-        DEADLINE,
-        MAX_OUTPUT_BYTES,
-    )
-}
-
-/// [`run`] with the deadline and the output cap named, which this host's own tests set small.
 #[must_use]
 pub fn run_within(
     executable: &Path,

@@ -15,6 +15,7 @@
 //! as not granted, and nothing is run.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use kr_protocol::hostinfo::{LaunchProbeReport, LaunchProbeState};
 use kr_protocol::scalars::Nullable;
@@ -28,13 +29,14 @@ pub const MAX_REPORTS: usize = 64;
 /// no more than [`MAX_REPORTS`] of them.
 ///
 /// It resolves each package's executable on `search_path`, runs the probes against them in
-/// `directory`, and belongs on a thread that may block: each probe is given the time its own
-/// deadline allows.
+/// `directory`, and belongs on a thread that may block: each probe is given `deadline` to print its
+/// answer and end, which is [`kr_worker::broker::probe::DEADLINE`] for the daemon's own reads.
 #[must_use]
 pub fn report(
     reading: &Reading,
     search_path: &[PathBuf],
     directory: &Path,
+    deadline: Duration,
 ) -> Vec<LaunchProbeReport> {
     let mut reports = Vec::new();
     for (package, read) in &reading.packages {
@@ -50,6 +52,7 @@ pub fn report(
             connector,
             search_path,
             directory,
+            deadline,
         ));
     }
     reports.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
@@ -63,6 +66,7 @@ fn one(
     connector: &InstalledConnector,
     search_path: &[PathBuf],
     directory: &Path,
+    deadline: Duration,
 ) -> LaunchProbeReport {
     let report = |state: LaunchProbeState,
                   executable: Option<&Path>,
@@ -96,7 +100,14 @@ fn one(
         );
     }
     // The doctor holds no launch, so no options of one are carried.
-    let probed = kr_worker::broker::probe::run(&executable, probe, &[], directory);
+    let probed = kr_worker::broker::probe::run_within(
+        &executable,
+        probe,
+        &[],
+        directory,
+        deadline,
+        kr_worker::broker::probe::MAX_OUTPUT_BYTES,
+    );
     match probed.mode {
         Some(mode) => report(LaunchProbeState::Read, Some(&executable), Some(mode), None),
         None => report(
@@ -140,6 +151,11 @@ mod tests {
 
     /// The file the stand-in application writes in the directory it runs in, which says it ran.
     const RAN: &str = "ran";
+
+    /// How long these cases give a probe. The stand-in application is a file the machine has never
+    /// run, and a machine can take longer than the daemon's own deadline to run one for the first
+    /// time, so a case decides by what the stand-in prints and not by how soon it prints.
+    const GENEROUS: Duration = Duration::from_secs(60);
 
     impl Store {
         fn new(name: &str) -> Self {
@@ -240,7 +256,7 @@ mod tests {
         search: &[PathBuf],
     ) -> Vec<LaunchProbeReport> {
         let reading = Integrations::new().read(&[package]);
-        report(&reading, search, &store.0)
+        report(&reading, search, &store.0, GENEROUS)
     }
 
     fn words(arguments: &[String]) -> Vec<&str> {
