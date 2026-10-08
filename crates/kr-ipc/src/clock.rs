@@ -141,8 +141,8 @@ pub const fn credited(elapsed_ms: u64) -> u64 {
     elapsed_ms.saturating_sub(elapsed_ms.saturating_mul(RATE_ALLOWANCE_PPM) / 1_000_000)
 }
 
-/// What `elapsed_ms` of continuous time credits, in millionths of a millisecond: [`credited`]
-/// without its rounding to a millisecond, for a comparison that has to be exact.
+/// What `elapsed_ms` of continuous time credits, in units of a millionth of a millisecond:
+/// [`credited`] without its rounding to a millisecond, for a comparison that has to be exact.
 #[must_use]
 pub const fn credited_micros(elapsed_ms: u64) -> i128 {
     elapsed_ms as i128 * (1_000_000 - RATE_ALLOWANCE_PPM as i128)

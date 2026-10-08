@@ -457,9 +457,8 @@ fn level_of(continuous_ms: u64, wall_ms: u64) -> i128 {
 
 /// The level below which a reading taken at or after the owner's confirmation is behind it: the
 /// owner's reading less what the continuous clock has credited up to the time it was made, less the
-/// rollback tolerance. A reading taken at `continuous_ms` is behind the owner's reading, carried
-/// forward by the continuous clock, by more than the tolerance and the rate allowance exactly when
-/// its level is below this.
+/// rollback tolerance. A reading is behind the owner's reading, carried forward by the continuous
+/// clock, by more than the tolerance and the rate allowance exactly when its level is below this.
 fn refuting_level(established: &Establishment) -> i128 {
     level_of(established.boot_ms, established.wall_ms)
         - i128::from(MAX_WALL_CLOCK_ROLLBACK_MS) * 1_000_000
@@ -468,18 +467,25 @@ fn refuting_level(established: &Establishment) -> i128 {
 /// The lowest readings of the wall clock this contract took.
 ///
 /// The owner's confirmation is followed only if every reading taken at or after the time it was
-/// made agrees with it ([`refuting_level`]), whenever the contract meets it: a
-/// confirmation published late is met after readings it has to answer to, and a clock that is
-/// right again by the next look does not take them back. Whether a reading agrees depends only on
-/// its level, and on when the confirmation was made. So a reading that a later one is not higher
-/// than adds nothing: any confirmation the earlier one refutes, the later one refutes too. What is
-/// kept is the staircase of readings each lower than every later one, which is as small as the
-/// clock lets it be, and exact. Two readings whose levels are within a second of each other stand
-/// for one another, at the lower level and the later time, and at most [`Readings::CAPACITY`] are
-/// kept, the two oldest standing for each other past that. Both can refuse a confirmation the
-/// readings taken would not have refuted, by up to a second, and never the other way.
+/// made agrees with it ([`refuting_level`]), whenever the contract meets it: a confirmation
+/// published late is met after readings it has to answer to, and a clock that is right again by
+/// the next look does not take them back. Whether a reading agrees depends only on its level, and
+/// on when the confirmation was made. So a reading that a later one is not higher than adds
+/// nothing: any confirmation the earlier one refutes, the later one refutes too. What is kept is
+/// the staircase of readings each lower than every later one, which is as small as the clock lets
+/// it be, and exact.
+///
+/// Two things keep it small, and both err toward refusing. Two readings whose levels are within a
+/// second of each other stand for one another, at the lower level and the later time, which can
+/// refuse a confirmation by up to a second that the readings taken would not have refused. And at
+/// most [`Readings::CAPACITY`] readings are kept: the oldest is let go, and a confirmation made at
+/// or before the time of the oldest one let go is refused, whatever the readings kept say.
 #[derive(Debug, Default)]
-struct Readings(Vec<Kept>);
+struct Readings {
+    kept: Vec<Kept>,
+    /// The time of the latest reading let go, if one was.
+    let_go: Option<u64>,
+}
 
 impl Readings {
     const CAPACITY: usize = 16;
@@ -489,33 +495,36 @@ impl Readings {
     /// Keeps a reading taken at `continuous_ms`. A reading that comes after a later one counts as
     /// taken at the later one's time, which errs toward refusing.
     fn keep(&mut self, continuous_ms: u64, wall_ms: u64) {
-        let continuous_ms = continuous_ms.max(self.0.last().map_or(0, |last| last.continuous_ms));
+        let continuous_ms =
+            continuous_ms.max(self.kept.last().map_or(0, |last| last.continuous_ms));
         let level = level_of(continuous_ms, wall_ms);
-        while self.0.last().is_some_and(|last| last.level >= level) {
-            self.0.pop();
+        while self.kept.last().is_some_and(|last| last.level >= level) {
+            self.kept.pop();
         }
-        if let Some(last) = self.0.last_mut()
+        if let Some(last) = self.kept.last_mut()
             && level - last.level < Self::SAME_LEVEL
         {
             last.continuous_ms = continuous_ms;
             return;
         }
-        self.0.push(Kept {
+        self.kept.push(Kept {
             continuous_ms,
             level,
         });
-        if self.0.len() > Self::CAPACITY {
-            let lowest = self.0.remove(0).level;
-            self.0[0].level = lowest;
+        if self.kept.len() > Self::CAPACITY {
+            let oldest = self.kept.remove(0);
+            self.let_go = self.let_go.max(Some(oldest.continuous_ms));
         }
     }
 
     /// Whether a reading taken at or after the time `established` was made is behind it.
     fn refute(&self, established: &Establishment) -> bool {
         let refuting = refuting_level(established);
-        self.0
-            .iter()
-            .any(|kept| kept.continuous_ms >= established.boot_ms && kept.level < refuting)
+        self.let_go.is_some_and(|time| established.boot_ms <= time)
+            || self
+                .kept
+                .iter()
+                .any(|kept| kept.continuous_ms >= established.boot_ms && kept.level < refuting)
     }
 }
 
@@ -1378,14 +1387,15 @@ impl TimeContract {
     ///
     /// The worker follows it only if every reading it took at or after the time the owner made it
     /// agrees with it ([`Readings`]), whenever it meets it, and it has found no rollback against a
-    /// reading it proved at or after that time. A confirmation older than a rollback the worker
-    /// found cannot have seen it, so it does not clear it, whether it is met in the look that found
-    /// the rollback, in a later one, or after a restart, and the clock reading right again by the
-    /// second reading of the look does not change that. An owner who corrects a clock that ran
-    /// ahead of the truth is followed all the same: the worker's mark was proved before the owner
-    /// spoke, and the owner's word is what the clock agrees with since. A restatement answers to
-    /// the worker's mark whatever its age, since it adds nothing to what the worker knows, and
-    /// never lowers it.
+    /// reading it proved at or after that time. A confirmation made at or before the last time the
+    /// worker proved its clock before a rollback it found cannot have seen the rollback, so it
+    /// does not clear it, whether it is met in the look that found the rollback, in a later one,
+    /// or after a restart, and the clock reading right again by the second reading of the look
+    /// does not change that. One made after that time clears it if the readings since agree with
+    /// it. An owner who corrects a clock that ran ahead of the truth is followed all the same: the
+    /// worker's mark was proved before the owner spoke, and the owner's word is what the clock
+    /// agrees with since. A restatement answers to the worker's mark whatever its age, since it
+    /// adds nothing to what the worker knows, and never lowers it.
     ///
     /// A confirmation the worker cannot follow is spent all the same, because one a worker met and
     /// could not follow is not one it follows when the clock next reads right: the owner has said
@@ -1586,10 +1596,9 @@ mod tests {
             < i128::from(established.wall_ms) * 1_000_000 + elapsed * (1_000_000 - allowance)
     }
 
-    /// KR-REQ-09.18: a reading the staircase replaces or merges still refutes what it refuted, to
-    /// the millisecond. A reading's level is exact, so the rate allowance's rounding to a
-    /// millisecond cannot separate two readings of one level, and the two merges move a level only
-    /// to a later time.
+    /// KR-REQ-09.18: a reading the staircase replaces still refutes what it refuted, to the
+    /// millisecond. A reading's level is exact, so the rate allowance's rounding to a millisecond
+    /// cannot separate two readings of one level, and the merge moves a level only to a later time.
     #[test]
     fn a_replaced_or_merged_reading_still_refutes_what_it_refuted_to_the_millisecond() {
         let confirmation = |boot_ms: u64, wall_ms: u64| Establishment {
@@ -1618,21 +1627,45 @@ mod tests {
             kept.keep(second.0, second.1);
             assert!(kept.refute(&established), "and the staircase still does");
         }
+    }
 
-        // The oldest two readings stand for each other past the capacity.
-        let established = confirmation(1, WALL + 5_001);
+    /// KR-REQ-09.18: past its capacity a worker lets its oldest reading go, and refuses a
+    /// confirmation made at or before the time of the one it let go, whatever the readings it kept
+    /// say; one made after it is judged by the readings kept, exactly. The readings here rise by
+    /// two seconds of level each, so none replaces or merges another, and every one agrees with a
+    /// confirmation made between the first two.
+    #[test]
+    fn a_confirmation_made_before_the_oldest_reading_let_go_is_refused_and_a_later_one_is_judged() {
+        let confirmation = |boot_ms: u64| Establishment {
+            count: 1,
+            restated: false,
+            wall_ms: WALL + boot_ms,
+            boot_ms,
+        };
         let mut kept = Readings::default();
-        kept.keep(10_000, WALL + 9_999);
+        kept.keep(10_000, WALL + 10_000);
         for step in 1..=Readings::CAPACITY as u64 {
             kept.keep(
-                10_000 + step * 30_000,
-                WALL + 9_999 + step * 30_000 + step * 2_000,
+                10_000 + step * 30_001,
+                WALL + 10_000 + step * 30_001 + step * 2_000,
             );
         }
-        assert_eq!(kept.0.len(), Readings::CAPACITY);
+        assert_eq!(kept.kept.len(), Readings::CAPACITY, "the staircase is full");
+        assert_eq!(kept.let_go, Some(10_000), "and the first reading went");
         assert!(
-            kept.refute(&established),
-            "the oldest reading's level survives"
+            kept.refute(&confirmation(10_000)),
+            "a confirmation made at the time of the reading let go is refused"
+        );
+        assert!(
+            !kept.refute(&confirmation(10_001)),
+            "one made after it, with every reading kept agreeing with it, is not"
+        );
+        assert!(
+            kept.refute(&Establishment {
+                wall_ms: WALL + 10_001 + 200_000,
+                ..confirmation(10_001)
+            }),
+            "and the readings kept still refute a confirmation they are behind"
         );
     }
 
@@ -1680,7 +1713,7 @@ mod tests {
                     (continuous_ms, wall_ms)
                 };
                 kept.keep(taken_at, wall_taken);
-                fullest = fullest.max(kept.0.len());
+                fullest = fullest.max(kept.kept.len());
                 history.push((taken_at, wall_taken));
             }
             for trial in 0..50 {
