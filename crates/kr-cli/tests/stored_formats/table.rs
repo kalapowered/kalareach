@@ -7,7 +7,7 @@
 
 use kr_protocol::update::{Recording, ReleaseStore, StoreScope};
 
-use super::{Claim, Kept, Named, Store, protocol};
+use super::{Claim, Kept, Named, Store, Writers, protocol};
 
 fn version(number: i64) -> u32 {
     u32::try_from(number).expect("a version is a small number")
@@ -64,6 +64,7 @@ pub fn table() -> Vec<Store> {
     let mut stores = vec![
         // The store of releases itself.
         Store {
+            writers: Writers::Update,
             entry: entry(
                 "install-record",
                 StoreScope::Install,
@@ -86,6 +87,7 @@ pub fn table() -> Vec<Store> {
         },
         // The startup files an install wrote an entry to, which a removal works from.
         Store {
+            writers: Writers::Commands,
             entry: entry(
                 "shell-entries",
                 StoreScope::StateRoot,
@@ -102,6 +104,7 @@ pub fn table() -> Vec<Store> {
         },
         // The environment's own state directory.
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "registry",
                 StoreScope::Environment,
@@ -156,6 +159,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "attention",
                 StoreScope::Environment,
@@ -177,6 +181,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "backup",
                 StoreScope::Environment,
@@ -189,6 +194,7 @@ pub fn table() -> Vec<Store> {
             kept: vec![protocol::<archive::ArchiveDescriptor>("ArchiveDescriptor")],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "delivery",
                 StoreScope::Environment,
@@ -209,6 +215,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "descriptions",
                 StoreScope::Environment,
@@ -221,6 +228,7 @@ pub fn table() -> Vec<Store> {
             kept: Vec::new(),
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "privacy",
                 StoreScope::Environment,
@@ -233,6 +241,7 @@ pub fn table() -> Vec<Store> {
             kept: Vec::new(),
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "workflows",
                 StoreScope::Environment,
@@ -262,6 +271,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "catalogue",
                 StoreScope::Environment,
@@ -298,6 +308,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "changesets",
                 StoreScope::Environment,
@@ -323,6 +334,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "projects",
                 StoreScope::Environment,
@@ -357,6 +369,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "transfers",
                 StoreScope::Environment,
@@ -383,6 +396,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "environments",
                 StoreScope::Environment,
@@ -406,6 +420,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "machine-group",
                 StoreScope::Environment,
@@ -421,6 +436,7 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
+            writers: Writers::Commands,
             entry: entry(
                 "terminal-preference",
                 StoreScope::Environment,
@@ -443,6 +459,7 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
+            writers: Writers::Commands,
             entry: entry(
                 "controller-service",
                 StoreScope::Environment,
@@ -458,6 +475,7 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "native-bridges",
                 StoreScope::Environment,
@@ -490,6 +508,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "agent-tools",
                 StoreScope::Environment,
@@ -508,6 +527,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Daemon,
             entry: entry(
                 "agent-tool-actions",
                 StoreScope::Environment,
@@ -525,6 +545,7 @@ pub fn table() -> Vec<Store> {
         },
         // The records the client keeps on this device, in the user's state root.
         Store {
+            writers: Writers::Commands,
             entry: entry(
                 "kept-answers",
                 StoreScope::StateRoot,
@@ -541,6 +562,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            writers: Writers::Commands,
             entry: entry(
                 "machine-merge-plan",
                 StoreScope::StateRoot,
@@ -563,6 +585,7 @@ pub fn table() -> Vec<Store> {
         },
         // The configuration document, wherever the environment keeps it.
         Store {
+            writers: Writers::Commands,
             entry: entry(
                 "configuration",
                 StoreScope::Configuration,

@@ -5921,6 +5921,45 @@ async fn no_file_of_a_state_root_goes_unnamed() {
     assert_eq!(unnamed.len(), 4, "and nothing else: {unnamed:?}");
 }
 
+/// KR-REQ-26.10: no record a command writes is raised past version 1 while nothing holds a command
+/// off between an update's check of the stores and its switch.
+///
+/// A switch is checked against every version on disk, and a `kr` command that is not held off can
+/// write a record after the check and before the switch, or a program of a newer release that a
+/// rollback left running can write one after it. Neither can put a record out of the range of the
+/// release switched to while every record a command writes is at version 1, which every release
+/// reads. Raising such a record's version needs the writer barrier first: every writer of the record
+/// takes a lock the update holds exclusively across its check and its switch, and refuses to write a
+/// version that the current release does not write.
+///
+/// Remove this test once all of these hold: the barrier and the rule for a pinned program have
+/// landed; a state root names the store that serves it, and a `kr` outside a store takes that
+/// store's barrier or refuses to write; the configuration document of an environment with no
+/// running daemon is found where its next daemon reads it, or the switch is refused for it; and,
+/// for as long as a supported release has no barrier, the `migrates_from` of each record a command
+/// writes stays at or below the version that release writes.
+#[test]
+fn no_record_a_command_writes_is_raised_past_version_one_while_no_barrier_exists() {
+    let past: Vec<String> = stored_formats::table::table()
+        .into_iter()
+        .filter(|store| {
+            store.writers == stored_formats::Writers::Commands && store.entry.version != 1
+        })
+        .map(|store| {
+            format!(
+                "{} is at version {}",
+                store.entry.store, store.entry.version
+            )
+        })
+        .collect();
+    assert!(
+        past.is_empty(),
+        "a record a command writes cannot be raised past version 1 until every writer of it \
+         takes the lock an update holds exclusively across its check and its switch: {}",
+        past.join("; ")
+    );
+}
+
 /// Writes `stored-formats.lock` from the code and a daemon's files, refusing a change that would
 /// bring the lock past a version that was not raised.
 ///

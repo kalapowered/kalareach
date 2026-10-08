@@ -143,8 +143,27 @@ impl Lock {
 /* The table                                                                                    */
 /* -------------------------------------------------------------------------------------------- */
 
+/// Who writes a store, which decides whether a switch can find it at a version no release in the
+/// range reads.
+///
+/// Required of every store, so that adding one forces the decision. It cannot see a writer a later
+/// change adds to a store already listed; a review of the change has to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writers {
+    /// Only an environment's control daemon, or a program that holds the environment's singleton
+    /// lock, which an update holds across its check of the stores and its switch.
+    Daemon,
+    /// Only a program that holds the update lock.
+    Update,
+    /// A command, or another program, that takes a lock of its own and neither of those: nothing
+    /// holds it off between an update's check and its switch.
+    Commands,
+}
+
 /// A store as the code declares it.
 pub struct Store {
+    /// Who writes it.
+    pub writers: Writers,
     /// What a release lists for it, from the versions the store's crate writes.
     pub entry: ReleaseStore,
     /// The other names the store owns in its scope.
