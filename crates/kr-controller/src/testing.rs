@@ -7,6 +7,29 @@ use std::time::Duration;
 
 use crate::error::{ControllerError, Result};
 
+tokio::task_local! {
+    /// Where the account service stands for the daemon being started in this task.
+    static ACCOUNT_ORIGIN: String;
+}
+
+/// Runs `start` so that the daemon it starts signs in at the account service standing at `origin`
+/// instead of the managed one.
+///
+/// The managed service's origin is fixed, because the browser signs in there and a code is
+/// redeemable nowhere else. A suite that stands its own service up gives the daemon that service's
+/// origin here, for the length of one start.
+pub async fn with_account_origin<F: Future>(origin: Option<String>, start: F) -> F::Output {
+    match origin {
+        Some(origin) => ACCOUNT_ORIGIN.scope(origin, start).await,
+        None => start.await,
+    }
+}
+
+/// The origin a suite stood the account service at for the start in progress, when it did.
+pub(crate) fn account_origin() -> Option<String> {
+    ACCOUNT_ORIGIN.try_with(Clone::clone).ok()
+}
+
 /// How long a start is given to take over an environment that is still held.
 ///
 /// A daemon lets go of its environment once nothing of it is left, and its own tasks can hold it

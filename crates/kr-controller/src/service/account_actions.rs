@@ -11,11 +11,27 @@ use crate::error::{ControllerError, Result};
 
 use super::{Controller, parse};
 
+/// The account service's origin: the one the browser signs in at, which the issuer every answer is
+/// checked against belongs to.
+#[cfg(not(any(test, feature = "testing")))]
+fn account_origin() -> String {
+    kr_client::services::account::ACCOUNT_ORIGIN.to_owned()
+}
+
+/// The account service's origin, or the one a suite stands its own service at.
+#[cfg(any(test, feature = "testing"))]
+fn account_origin() -> String {
+    crate::testing::account_origin()
+        .unwrap_or_else(|| kr_client::services::account::ACCOUNT_ORIGIN.to_owned())
+}
+
 impl Controller {
-    /// The host's own sign-in to the managed account service, at the broker origin the
-    /// configuration document names, through the proxy it selects.
+    /// The host's own sign-in to the managed account service, through the proxy the configuration
+    /// document selects.
     ///
-    /// A host that names no broker, or one this daemon cannot reach a service at, signs in
+    /// The account service is the one the browser signs in at, and a code is redeemable only
+    /// there, so every request of the sign-in goes there and the voice broker is presented a token
+    /// only when it is that service. A host whose broker is another service, or none, signs in
     /// nowhere; what stands in the way is said on standard error, as for the voice broker.
     pub(super) fn build_host_account(
         started: &crate::config::Started,
@@ -23,30 +39,44 @@ impl Controller {
         environment_id: kr_protocol::ids::EnvironmentId,
         runtime_root: &std::path::Path,
     ) -> crate::account::HostAccount {
-        let service = started.voice.broker_origin().and_then(|origin| {
-            let unavailable = |reason: &dyn std::fmt::Display| {
-                eprintln!("kr-controller: no host sign-in: {reason}");
-            };
-            let gateway = GatewayOrigin::new(origin)
-                .inspect_err(|error| unavailable(&format_args!("voice.broker_origin: {error}")))
-                .ok()?;
-            let proxy = Self::proxy_of(started)
-                .inspect_err(|error| unavailable(error))
-                .ok()?;
-            let transport = Arc::new(crate::managed_transport::ManagedTransport::new(
-                gateway,
-                proxy,
-                kr_client::services::HttpDeadlines::default(),
-            ));
-            Some(crate::account::Service {
-                origin: origin.to_owned(),
-                account: Arc::new(kr_client::services::ManagedAccountService::at_origin(
-                    origin,
-                    transport,
-                    kr_client::services::account::Client::Desktop,
-                )),
-            })
-        });
+        use kr_protocol::host_account::SignInUnavailable;
+
+        let unusable = |reason: &dyn std::fmt::Display| {
+            eprintln!("kr-controller: no host sign-in: {reason}");
+            SignInUnavailable::NotUsable
+        };
+        let service = match started.voice.broker_origin() {
+            None => Err(SignInUnavailable::NoBroker),
+            Some(broker) => {
+                let origin = account_origin();
+                if broker == origin {
+                    GatewayOrigin::new(&origin)
+                        .map_err(|error| unusable(&format_args!("the account service: {error}")))
+                        .and_then(|gateway| {
+                            let proxy =
+                                Self::proxy_of(started).map_err(|error| unusable(&error))?;
+                            let transport =
+                                Arc::new(crate::managed_transport::ManagedTransport::new(
+                                    gateway,
+                                    proxy,
+                                    kr_client::services::HttpDeadlines::default(),
+                                ));
+                            Ok(crate::account::Service {
+                                account: Arc::new(
+                                    kr_client::services::ManagedAccountService::at_origin(
+                                        origin.clone(),
+                                        transport,
+                                        kr_client::services::account::Client::Desktop,
+                                    ),
+                                ),
+                                origin,
+                            })
+                        })
+                } else {
+                    Err(SignInUnavailable::BrokerIsAnotherService)
+                }
+            }
+        };
         crate::account::HostAccount::new(store, environment_id, runtime_root, service)
     }
 

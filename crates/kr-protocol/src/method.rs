@@ -430,9 +430,9 @@ methods! {
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Start this host's own sign-in to the managed account service: listen on the loopback \
-          address the desktop client is registered with, answer the address a person opens in a \
-          browser, and keep the grant that comes back in this host's secret store. Nothing in the \
-          answer is a token.";
+          address the desktop client is registered with, and keep the grant that comes back from \
+          the person's browser in this host's secret store. The address the person opens is read \
+          with account.status. Nothing in the answer is a token.";
 
     AccountStatus = "account.status", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
