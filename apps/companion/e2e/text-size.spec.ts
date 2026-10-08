@@ -89,6 +89,48 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     ['the attention inbox', '&tab=attention', null],
     ['the session list', '&tab=sessions', null],
     ['the hosts', '&tab=hosts', null],
+    [
+      'the hosts with one paired',
+      '&tab=hosts',
+      async (page) => {
+        await page.evaluate(() => {
+          window.krTestHost?.setPairing({
+            hosts: [
+              {
+                reference: 'studio-reference',
+                in_use: false,
+                name: 'studio-with-a-long-name-that-has-to-wrap',
+                owner: false,
+                authority: 'view sessions',
+                grant_expires_at_ms: null,
+                in_contact: null
+              }
+            ]
+          })
+        })
+        await expect(page.getByTestId('use-host')).toBeVisible()
+      }
+    ],
+    [
+      'the voice screen',
+      '&tab=sessions',
+      async (page) => {
+        await page.getByTestId('voice-entry').click()
+        await expect(page.getByRole('button', { name: 'Start voice session' })).toBeVisible()
+      }
+    ],
+    [
+      'the question that allows voice',
+      '&tab=sessions',
+      async (page) => {
+        await page.evaluate(() => {
+          window.krTestHost?.requireVoiceGrant('PERMISSION_DENIED: name the sessions this call may reach')
+        })
+        await page.getByTestId('voice-entry').click()
+        await expect(page.getByRole('heading', { name: 'Allow voice on this phone' })).toBeVisible()
+        await expect(page.getByTestId('voice-scope')).toBeVisible()
+      }
+    ],
     ['the account', '&tab=account', null],
     ['a session’s conversation', `&session=${SESSION}`, null],
     [
