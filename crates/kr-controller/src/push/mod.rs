@@ -409,7 +409,10 @@ impl DeliveryModule {
     pub const fn serves(method: Method) -> bool {
         matches!(
             method,
-            Method::DevicePreviewKeyUpdate | Method::DeliveryDestinationSecretSet
+            Method::DevicePreviewKeyUpdate
+                | Method::DeliveryDestinationConfigure
+                | Method::DeliveryDestinationRemove
+                | Method::DeliveryDestinationSecretSet
         )
     }
 

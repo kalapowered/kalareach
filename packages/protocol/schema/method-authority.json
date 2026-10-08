@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 162,
+  "method_count": 164,
   "methods": [
     {
       "capability": "none",
@@ -196,6 +196,64 @@
         "environment"
       ],
       "summary": "Observe one enrolled environment now, and start it when the request asks for that.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "delivery.destination.configure",
+      "name": "delivery.destination.configure",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Create or replace an external notification destination: a webhook, Slack, Discord, Telegram or email, with where it sends, whether it deduplicates by an identifier, and the grant whose authority the content is intersected with. The grant has to stand, a paired device's identifier is not one a destination takes, and a service that sends with a credential needs one kept first with delivery.destination.secret.set.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "delivery.destination.remove",
+      "name": "delivery.destination.remove",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Remove a notification destination, and the credential kept for it. What was queued for it and not sent is taken back, and the answer says how much. Removing a paired device's destination ends its delivery and owes the gateway a revocation of the device's authorisation, as unpairing does, without unpairing the device.",
       "version": 1
     },
     {

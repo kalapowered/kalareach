@@ -1,4 +1,10 @@
-//! External notification destinations: the credential one of them sends with.
+//! External notification destinations: creating and removing one, and the credential one of them
+//! sends with.
+//!
+//! The owner creates a destination with `delivery.destination.configure`: which service, where it
+//! sends, whether it deduplicates by an identifier, and the grant whose authority the content is
+//! intersected with. `delivery.destination.remove` takes one away. A paired device is a
+//! destination too, but it is made by the device's own registration, never by these two.
 //!
 //! Section 25 documents Slack, Discord, Telegram and email delivery beside webhooks, and each of
 //! those four sends through a credential. A Slack or Discord incoming-webhook address is itself a
@@ -18,7 +24,8 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::Zeroize as _;
 
-use crate::scalars::U64;
+use crate::ids::GrantId;
+use crate::scalars::{Nullable, U64};
 
 /// The longest part of a credential, in bytes.
 pub const MAX_SECRET_TEXT_LEN: usize = 4096;
@@ -187,6 +194,45 @@ impl fmt::Display for DestinationSecretKind {
     }
 }
 
+/// The kinds of external destination the owner configures: a webhook, which sends with no
+/// credential, and the four that do ([`DestinationSecretKind`]).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalDestinationKind {
+    /// An HTTPS endpoint the owner names, which receives one POST for each message.
+    Webhook,
+    /// A Slack channel, through an incoming webhook kept as a credential.
+    Slack,
+    /// A Discord channel, through a webhook kept as a credential.
+    Discord,
+    /// A Telegram chat, through a bot token kept as a credential.
+    Telegram,
+    /// An email recipient, through a mail submission account kept as a credential.
+    Email,
+}
+
+impl ExternalDestinationKind {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Webhook => "webhook",
+            Self::Slack => "slack",
+            Self::Discord => "discord",
+            Self::Telegram => "telegram",
+            Self::Email => "email",
+        }
+    }
+}
+
+impl fmt::Display for ExternalDestinationKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// The credential one external destination sends with.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -257,6 +303,73 @@ pub struct DeliveryDestinationSecretSetResult {
     /// Section 25: the recipients of an external destination read what it delivers, and
     /// KalaReach's encrypted routing does not make those messages private.
     pub recipients_can_read: String,
+}
+
+/// Parameters of `delivery.destination.configure`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryDestinationConfigureParams {
+    /// The identifier the destination is configured under: 1 to 128 bytes with no control
+    /// character, and not a paired device's identifier. Configuring under one already in use
+    /// replaces that destination.
+    pub destination_id: String,
+    /// Which service it sends to.
+    pub kind: ExternalDestinationKind,
+    /// Where it sends, never a credential. A webhook's absolute HTTPS address; for Slack and
+    /// Discord the name of the channel the credential's webhook posts to; for Telegram the chat;
+    /// for email the recipient's address.
+    pub endpoint: String,
+    /// The header a webhook deduplicates by, when it does, such as `Idempotency-Key`. This host
+    /// sends its delivery identifier under it, so a repeat of an attempt whose outcome is unknown
+    /// is not a second message. Null for a destination that deduplicates by nothing, which is
+    /// never retried after an unknown outcome, and for every kind but a webhook.
+    pub idempotency_header: Nullable<String>,
+    /// What the owner calls the rule that sends to this destination. A label: it selects nothing.
+    pub rule_name: String,
+    /// The grant whose authority the content is intersected with: which sessions the destination
+    /// is told about, from when, and with which rights. It has to stand now, and a destination
+    /// under a grant that stops standing is told nothing.
+    pub grant_id: GrantId,
+}
+
+/// The result of `delivery.destination.configure`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryDestinationConfigureResult {
+    /// The identifier the destination is configured under.
+    pub destination_id: String,
+    /// Which service it sends to.
+    pub kind: ExternalDestinationKind,
+    /// Whether the destination is in service and sends from here on.
+    pub in_force: bool,
+    /// Who can read what this destination delivers, in a sentence a person is shown.
+    ///
+    /// Section 25: the recipients of an external destination read what it delivers, and
+    /// KalaReach's encrypted routing does not make those messages private.
+    pub recipients_can_read: String,
+}
+
+/// Parameters of `delivery.destination.remove`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryDestinationRemoveParams {
+    /// The identifier the destination is configured under: an external destination's, or a paired
+    /// device's, whose delivery then ends until its device registers a new authorisation.
+    pub destination_id: String,
+}
+
+/// The result of `delivery.destination.remove`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryDestinationRemoveResult {
+    /// The identifier the destination was configured under.
+    pub destination_id: String,
+    /// Whether a destination was configured under it.
+    pub found: bool,
+    /// How many queued notifications nothing had sent were taken back unsent.
+    pub revoked: U64,
+    /// How many notifications an earlier attempt had sent now have an outcome nobody can settle.
+    pub unresolved: U64,
 }
 
 #[cfg(test)]

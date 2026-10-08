@@ -18,7 +18,9 @@ use kr_transport::window::AcceptedDeadline;
 use crate::error::{ControllerError, Result};
 use crate::registry::Registry;
 
-use super::authority_changes::{destination_identifier, secret_params};
+use super::authority_changes::{
+    configure_params, destination_identifier, remove_params, secret_params, validate_configuration,
+};
 use super::{Controller, net, parse};
 
 impl Controller {
@@ -688,6 +690,33 @@ impl Controller {
                 destination_identifier(&params.destination_id)?;
                 crate::push::external::check_secret(&params.secret)
                     .map_err(ControllerError::InvalidArgument)?;
+            }
+            // Where notifications go is the environment's, not one session's. What a configuration
+            // asks is checked here, before the action is claimed, with refusals that repeat
+            // nothing of the request: an address can carry a token.
+            Method::DeliveryDestinationConfigure => {
+                if mutation.target.session_id.as_ref().is_some()
+                    || mutation.target.application_instance_id.is_present()
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "a notification destination belongs to this environment, not to one \
+                         session"
+                            .to_owned(),
+                    ));
+                }
+                validate_configuration(&configure_params(&mutation.params)?)?;
+            }
+            Method::DeliveryDestinationRemove => {
+                if mutation.target.session_id.as_ref().is_some()
+                    || mutation.target.application_instance_id.is_present()
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "a notification destination belongs to this environment, not to one \
+                         session"
+                            .to_owned(),
+                    ));
+                }
+                destination_identifier(&remove_params(&mutation.params)?.destination_id)?;
             }
             // Privacy mode belongs to the environment, not to a session.
             Method::PrivacySet => {

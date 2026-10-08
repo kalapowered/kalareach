@@ -199,6 +199,8 @@ impl Controller {
                 | Method::GrantRevoke
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
+                | Method::DeliveryDestinationConfigure
+                | Method::DeliveryDestinationRemove
                 | Method::DeliveryDestinationSecretSet
                 | Method::PrivacySet
                 | Method::SessionRename

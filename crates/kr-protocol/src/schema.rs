@@ -84,8 +84,10 @@ use crate::confirmation::{
     OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
 use crate::delivery::{
+    DeliveryDestinationConfigureParams, DeliveryDestinationConfigureResult,
+    DeliveryDestinationRemoveParams, DeliveryDestinationRemoveResult,
     DeliveryDestinationSecretSetParams, DeliveryDestinationSecretSetResult, DestinationSecret,
-    DestinationSecretKind, MailAccount, MailSecurity,
+    DestinationSecretKind, ExternalDestinationKind, MailAccount, MailSecurity,
 };
 use crate::describe::{
     DescriptionCompletion, DescriptionConfigureParams, DescriptionDownload,
@@ -778,6 +780,11 @@ pub fn protocol_schema() -> Value {
         "rendezvous_message" => RendezvousMessage,
         // External notification destinations: the credential one of them sends with, and the one
         // method that hands it to the host. Appended for the same reason.
+        "delivery_destination_configure_params" => DeliveryDestinationConfigureParams,
+        "delivery_destination_configure_result" => DeliveryDestinationConfigureResult,
+        "delivery_destination_remove_params" => DeliveryDestinationRemoveParams,
+        "delivery_destination_remove_result" => DeliveryDestinationRemoveResult,
+        "external_destination_kind" => ExternalDestinationKind,
         "delivery_destination_secret_set_params" => DeliveryDestinationSecretSetParams,
         "delivery_destination_secret_set_result" => DeliveryDestinationSecretSetResult,
         "destination_secret" => DestinationSecret,

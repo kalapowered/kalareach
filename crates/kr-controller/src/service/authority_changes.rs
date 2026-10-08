@@ -486,6 +486,12 @@ impl Controller {
                 self.delivery_destination_secret_set(mutation, carried)
                     .await
             }
+            Method::DeliveryDestinationConfigure => {
+                self.delivery_destination_configure(mutation, carried).await
+            }
+            Method::DeliveryDestinationRemove => {
+                self.delivery_destination_remove(mutation, carried).await
+            }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not an authority change this daemon serves",
                 method.as_str()
@@ -534,6 +540,95 @@ impl Controller {
             recipients_can_read: kr_delivery::destination::DestinationKind::for_credential(kind)
                 .who_can_read()
                 .to_owned(),
+        })
+    }
+
+    /// Creates or replaces an external notification destination.
+    ///
+    /// The owner's own act at this machine, on the local socket alone: where content goes, and
+    /// under which grant, decides who reads what a session says. The grant has to stand when the
+    /// destination is made, which is what section 25 means by a configured destination and an
+    /// explicit rule or grant; a destination whose grant stops standing is told nothing, as every
+    /// pass asks the grant again. A service that sends with a credential is configured only once
+    /// its credential is kept ([`Self::delivery_destination_secret_set`]).
+    ///
+    /// The admission is asked again under the registry lock, which is held across the write, so a
+    /// withdrawal that completes while this waited stops it.
+    async fn delivery_destination_configure(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params = configure_params(&mutation.params)?;
+        let destination_id = validate_configuration(&params)?;
+        let rule = kr_delivery::destination::DeliveryRule {
+            name: params.rule_name.clone(),
+            grant_id: Some(params.grant_id),
+        };
+        if self.delivery_runtime().recipient_scope(&rule).is_none() {
+            return Err(ControllerError::InvalidArgument(
+                "that grant does not stand: it was not found, has not been redeemed, has run out \
+                 or was revoked, or its device is no longer paired"
+                    .to_owned(),
+            ));
+        }
+        let kind = kr_delivery::destination::DestinationKind::for_external(params.kind);
+        let record = kr_delivery::destination::DestinationRecord {
+            id: destination_id,
+            destination: kr_delivery::destination::Destination::External(
+                kr_delivery::destination::ExternalDestination {
+                    kind,
+                    endpoint: params.endpoint,
+                    idempotency: params.idempotency_header.0.map_or(
+                        kr_delivery::destination::Idempotency::Unsupported,
+                        |field| kr_delivery::destination::Idempotency::Supported { field },
+                    ),
+                    credential: None,
+                },
+            ),
+            rule: Some(rule),
+            enabled: true,
+            configured_at_ms: kr_protocol::scalars::TimestampMs::new(self.settled_now_ms()),
+        };
+        let registry = self.registry.lock().await;
+        let admitted = || self.check_admission(&registry, &carried);
+        admitted()?;
+        if !self.delivery.configure_if(&record, &admitted)? {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the destination was not admitted".to_owned(),
+            });
+        }
+        drop(registry);
+        encode(&kr_protocol::delivery::DeliveryDestinationConfigureResult {
+            destination_id: record.id.to_string(),
+            kind: params.kind,
+            in_force: record.enabled,
+            recipients_can_read: kind.who_can_read().to_owned(),
+        })
+    }
+
+    /// Removes a notification destination, and what is kept for it.
+    ///
+    /// An external destination goes with its credential, and what was queued for it and not sent
+    /// is taken back. A paired device's destination is ended as unpairing ends it, without
+    /// unpairing the device: the authorisation behind it is owed a revocation, so the device's
+    /// installation issues another before it registers again.
+    async fn delivery_destination_remove(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params = remove_params(&mutation.params)?;
+        let destination_id = destination_identifier(&params.destination_id)?;
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        let removal = self.end_destination(&destination_id)?;
+        drop(registry);
+        encode(&kr_protocol::delivery::DeliveryDestinationRemoveResult {
+            destination_id: params.destination_id,
+            found: removal.found,
+            revoked: kr_protocol::scalars::U64::new(removal.revoked),
+            unresolved: kr_protocol::scalars::U64::new(removal.unresolved),
         })
     }
 
@@ -1074,6 +1169,14 @@ impl Controller {
         }
     }
 
+    /// Ends a device's push destination, as [`Self::end_push_destination`] does, and says so on
+    /// stderr when it cannot: unpairing and a start have nobody to tell.
+    pub(super) fn retire_push_destination(&self, device_id: kr_protocol::ids::DeviceId) {
+        if let Err(error) = self.end_push_destination(device_id) {
+            eprintln!("kr-controller: a device's push destination was not ended: {error}");
+        }
+    }
+
     /// Ends a device's push destination: the destination, the credential held for it and its item
     /// in the secret store, and owes the gateway a revocation of the authorisation behind it.
     ///
@@ -1083,12 +1186,22 @@ impl Controller {
     /// has taken it ([`crate::push::DeliveryModule::settle_revocations`]). The origin is read from
     /// the credential held, which is gone once this has run.
     ///
-    /// A device that has no destination has nothing to end, and ending one twice is ending it once.
-    pub(super) fn retire_push_destination(&self, device_id: kr_protocol::ids::DeviceId) {
+    /// A device that has no destination has nothing to end, and ending one twice is ending it
+    /// once.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the destination could not be read, the debt written down or the destination
+    /// removed. The destination then stays, so the next start or the next call finds it again.
+    fn end_push_destination(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+    ) -> Result<kr_delivery::journal::DestinationRemoval> {
+        let nothing = kr_delivery::journal::DestinationRemoval::default();
         let Ok(destination_id) =
             kr_delivery::destination::DestinationId::new(device_id.to_string())
         else {
-            return;
+            return Ok(nothing);
         };
         let now_ms = self.settled_now_ms();
         let credentials = std::sync::Arc::clone(self.delivery_runtime().credentials());
@@ -1100,35 +1213,38 @@ impl Controller {
                     operation: "read a delivery destination",
                     detail: error.to_string(),
                 })
-        });
-        let record = match found {
-            Ok(Some(record)) => record,
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!("kr-controller: a device's push destination could not be read: {error}");
-                return;
-            }
+        })?;
+        let Some(record) = found else {
+            return Ok(nothing);
         };
         let Some(push) = record.as_push() else {
-            return;
+            return Ok(nothing);
         };
-        // A destination already out of service, kept without a rule as the name of what it was
+        // A destination already out of service, kept without a rule as the name of what was
         // sent, was ended before: its revocation is owed or paid, and is not owed a second time.
         if !record.enabled && record.rule.is_none() {
-            return;
+            return Ok(nothing);
         }
         let sender_record_id = push.sender_record_id;
-        if let Err(error) = self.owe_revocation(sender_record_id, &credentials) {
-            // The destination stays, so the next start or the next revocation finds it again.
-            eprintln!("kr-controller: a push destination was not ended: {error}");
-            return;
-        }
-        if let Err(error) = self.delivery.remove(&destination_id, now_ms) {
-            eprintln!("kr-controller: a push destination could not be removed: {error}");
-            return;
-        }
+        self.owe_revocation(sender_record_id, &credentials)?;
+        let removal = self.delivery.remove(&destination_id, now_ms)?;
         self.retire_sender(sender_record_id, &credentials);
         self.delivery_runtime().sweep_revocations_soon();
+        Ok(removal)
+    }
+
+    /// Removes the destination configured under one identifier, whatever it is.
+    fn end_destination(
+        &self,
+        destination_id: &kr_delivery::destination::DestinationId,
+    ) -> Result<kr_delivery::journal::DestinationRemoval> {
+        if let Ok(device_id) = destination_id
+            .as_str()
+            .parse::<kr_protocol::ids::DeviceId>()
+        {
+            return self.end_push_destination(device_id);
+        }
+        self.delivery.remove(destination_id, self.settled_now_ms())
     }
 
     /// Ends the push destination of every device that is no longer paired, at a start.
@@ -1428,6 +1544,79 @@ pub(super) fn secret_params(
     params
         .to_typed()
         .map_err(|_| ControllerError::InvalidArgument(SECRET_PARAMS_REFUSAL.to_owned()))
+}
+
+/// The one refusal of parameters that do not read as `delivery.destination.configure`'s.
+const CONFIGURE_PARAMS_REFUSAL: &str = "delivery.destination.configure takes a destination_id, a \
+     kind (webhook, slack, discord, telegram or email), an endpoint, an idempotency_header or \
+     null, a rule_name and a grant_id";
+
+/// Reads the parameters of `delivery.destination.configure`.
+///
+/// An endpoint can carry a token, and a decoder's own account of what it could not read quotes
+/// what it was given, so every refusal here is one fixed sentence.
+pub(super) fn configure_params(
+    params: &ParamsValue,
+) -> Result<kr_protocol::delivery::DeliveryDestinationConfigureParams> {
+    params
+        .to_typed()
+        .map_err(|_| ControllerError::InvalidArgument(CONFIGURE_PARAMS_REFUSAL.to_owned()))
+}
+
+/// Reads the parameters of `delivery.destination.remove`.
+pub(super) fn remove_params(
+    params: &ParamsValue,
+) -> Result<kr_protocol::delivery::DeliveryDestinationRemoveParams> {
+    params.to_typed().map_err(|_| {
+        ControllerError::InvalidArgument(
+            "delivery.destination.remove takes a destination_id".to_owned(),
+        )
+    })
+}
+
+/// Checks what a configuration asks that does not depend on this host's records, and returns the
+/// identifier it names.
+///
+/// The identifier is bounded and is not a paired device's: that destination is made by the
+/// device's own registration, and a configuration under its identifier would take it over. The
+/// rule's name is a printable label, and the header a webhook deduplicates by is a header name.
+/// Every refusal repeats nothing of the request.
+pub(super) fn validate_configuration(
+    params: &kr_protocol::delivery::DeliveryDestinationConfigureParams,
+) -> Result<kr_delivery::destination::DestinationId> {
+    let destination_id = destination_identifier(&params.destination_id)?;
+    if params
+        .destination_id
+        .parse::<kr_protocol::ids::DeviceId>()
+        .is_ok()
+    {
+        return Err(ControllerError::InvalidArgument(
+            "a destination identifier of that shape belongs to a paired device, whose destination \
+             is made by the device's own registration"
+                .to_owned(),
+        ));
+    }
+    if params.rule_name.is_empty()
+        || params.rule_name.len() > 128
+        || params.rule_name.chars().any(char::is_control)
+    {
+        return Err(ControllerError::InvalidArgument(
+            "a rule's name is 1 to 128 bytes with no control characters".to_owned(),
+        ));
+    }
+    if let Some(header) = params.idempotency_header.as_ref()
+        && (header.is_empty()
+            || header.len() > 64
+            || !header
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    {
+        return Err(ControllerError::InvalidArgument(
+            "an idempotency header is a header name of letters, digits and hyphens, up to 64 bytes"
+                .to_owned(),
+        ));
+    }
+    Ok(destination_id)
 }
 
 /// Reads a notification destination's identifier out of a request.
