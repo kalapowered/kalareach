@@ -2039,8 +2039,7 @@ async fn removing_the_environments_task_leaves_its_running_worker_running() {
 /// only once its traps are in place. `orphan` is the same with its parent gone. `escaped` (Unix)
 /// calls `setsid` in a child of its own, so it leaves the terminal's session, and keeps its parent
 /// alive. `jobonly` (Windows) is made with a console of its own, so only the session's job holds
-/// it. `drifter`, which the test makes itself on a Linux host with a service manager, is not in
-/// this tree at all: see where it is made.
+/// it.
 const TREE: &str = r#"
 n() { p=$2; if [ -r "/proc/$p/winpid" ]; then p=$(cat "/proc/$p/winpid"); fi; printf '%s
 ' "$p" > "$1.pid"; }
@@ -2059,6 +2058,15 @@ case $(uname) in
     perl -e 'use POSIX qw(setsid); $SIG{HUP} = "IGNORE"; $SIG{TERM} = "IGNORE"; if (fork() == 0) { setsid() or die "setsid: $!"; open(F, ">escaped.pid"); print F $$; close F; exec "sleep", "603"; } sleep 600' &
     ;;
 esac
+"#;
+
+/// What the root shell goes on to do once the test says so, on a Linux host with a service manager:
+/// it makes `drifter`, which ignores hang-up and terminate, calls `setsid` and has its parent end
+/// at once, so it is in no list of the session's tree and the service's control group is all that
+/// holds it.
+const DRIFTER: &str = r#"
+while [ ! -e kr-go ]; do sleep 0.05; done
+perl -e 'use POSIX qw(setsid); $SIG{HUP} = "IGNORE"; $SIG{TERM} = "IGNORE"; exit 0 if fork(); setsid() or die "setsid: $!"; open(F, ">drifter.pid"); print F $$; close F; exec "sleep", "604";'
 "#;
 
 /// Everything the crash tests started, ended by identity when a test is over however it ended.
@@ -2124,6 +2132,14 @@ fn worker_of(host: &Host, session_id: SessionId) -> kr_protocol::identity::Proce
         .find(|worker| worker.session_id == session_id)
         .expect("a worker record")
         .process_identity
+}
+
+/// Stops the worker where it is, without ending it: it runs nothing more until it is killed.
+#[cfg(target_os = "linux")]
+fn hold_still(worker: &kr_protocol::identity::ProcessStartIdentity) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(worker.pid.get()).expect("a pid"))
+        .expect("a process number");
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stops it");
 }
 
 /// Kills the worker, the way a crash does: no chance to say anything.
@@ -2242,8 +2258,17 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
         Start::Service => Host::create().through_the_platform(),
     }
     .recording_launches();
+    let drifts = cfg!(target_os = "linux") && start == Start::Service;
     let script = host.temp.root().join("tree.sh");
-    std::fs::write(&script, TREE).expect("writes the tree");
+    std::fs::write(
+        &script,
+        if drifts {
+            format!("{TREE}{DRIFTER}")
+        } else {
+            TREE.to_owned()
+        },
+    )
+    .expect("writes the tree");
     let daemon = host.start().await;
     let client_first = host.client().await;
     let mut client = client_first;
@@ -2284,9 +2309,6 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
         .await;
         members.0.push(escaped);
     }
-    // Children of this test that are collected when it ends, so none is left a zombie.
-    #[cfg(target_os = "linux")]
-    let mut drifters: Vec<std::process::Child> = Vec::new();
     // The worker has recorded them: this is what the cleanup acts on.
     until("the worker to record its session's processes", || {
         let record = recorded_by(&host, session_id)?;
@@ -2296,53 +2318,38 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
             .then_some(())
     })
     .await;
+    let worker = worker_of(&host, session_id);
     // A process that is in no list of the session's tree and is in the service's control group.
-    // The test makes it as a child of its own, ignoring hang-up and terminate, and moves it into
-    // the group the worker recorded it ran in, as a process of the session that left the tree
-    // would be. It was never anything the worker could have seen, and it is checked below that the
-    // record does not name it, so only the group can end it.
+    // The worker is held still first, so that it can look at nothing and write nothing while the
+    // shell makes it: the record the worker leaves cannot name it, and only the group can end it.
     #[cfg(target_os = "linux")]
-    if start == Start::Service {
-        let record = recorded_by(&host, session_id).expect("the record");
-        let group = record
-            .cgroup
-            .clone()
-            .expect("the worker recorded its group");
-        let child = std::process::Command::new("/bin/sh")
-            .args(["-c", "trap '' HUP TERM; exec sleep 604"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("starts the drifter");
-        let pid = child.id();
-        // The process is the test's own child; it is ended by identity below and reaped here.
-        let drifter = until("the drifter to be described", || {
-            kr_ipc::identity::process_start_identity(pid).ok()
+    if drifts {
+        hold_still(&worker);
+        std::fs::write(host.temp.root().join("kr-go"), b"").expect("lets the shell go on");
+        let drifter = until("the drifter to write its number", || {
+            member_of(&host, "drifter")
         })
         .await;
         members.0.push(drifter.clone());
-        std::fs::write(
-            Path::new("/sys/fs/cgroup")
-                .join(group.trim_start_matches('/'))
-                .join("cgroup.procs"),
-            pid.to_string(),
-        )
-        .expect("moves the drifter into the service's control group");
-        let ran_in = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("its group");
+        let record = recorded_by(&host, session_id).expect("the record");
+        let group = record
+            .cgroup
+            .as_deref()
+            .expect("the worker recorded its group");
+        let ran_in = std::fs::read_to_string(format!("/proc/{}/cgroup", drifter.pid.get()))
+            .expect("its group");
         assert!(
-            ran_in.trim().ends_with(&group),
+            ran_in.trim().ends_with(group),
             "the drifter is in the service's control group: {ran_in} against {group}"
         );
         assert!(
             !record.processes.contains(&drifter),
-            "the record does not name it: {record:?}"
+            "the record does not name the drifter: {record:?}"
         );
-        drifters.push(child);
         named.push(("drifter", drifter));
     }
-
-    let worker = worker_of(&host, session_id);
+    #[cfg(not(target_os = "linux"))]
+    let _ = drifts;
     let descriptor = kr_ipc::descriptor::read(&host.paths(), session_id)
         .expect("reads the runtime directory")
         .expect("the session's descriptor is published");
@@ -2423,22 +2430,7 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
         1,
         "the crash started no second worker"
     );
-    // The record the dead worker left still does not name what only the service's group held.
-    #[cfg(target_os = "linux")]
-    if let Some((_, drifter)) = named.iter().find(|(name, _)| *name == "drifter")
-        && let Some(record) = recorded_by(&host, session_id)
-    {
-        assert!(
-            !record.processes.contains(drifter),
-            "the final record does not name the drifter either: {record:?}"
-        );
-    }
     drop(members);
-    #[cfg(target_os = "linux")]
-    for mut child in drifters {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
     drop(client);
     daemon.stop().await;
 }
