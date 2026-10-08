@@ -723,6 +723,12 @@ measurement. For each draft the longest possible state is included in the measur
 will never be made that would prevent a report from being made, and a draft that can be read can
 still be read when its session closes.
 
+The request that carries the offer to the upstream holds the grant's path, the file's size and its
+digest, and not the file's name. The receiver reads the file and checks it against the size and the
+digest before it answers. `accepted_by_agent` therefore means that the receiver of the typed request
+acknowledged it when the file the grant refers to was available to it. It doesn't mean that the
+agent used the file, or knows what it is.
+
 ## Previews
 
 Section 14 fixes four numbers and a format list: 40 megapixels of input, 256 MiB of decode memory, a

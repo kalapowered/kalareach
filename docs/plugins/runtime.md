@@ -605,6 +605,22 @@ uses a task to keep asking the daemon until it either records the report or refu
 that ends first is a closed session, and the closure fails every offer in flight, so nothing needs
 to survive the worker.
 
+When making this request upstream, the attachment is identified by its identifiers and by the grant
+that gives access to the actual file. These are the transfer identifier, the media type, the exact
+size of the file and the digest of its bytes, and the grant's path, expiry and environment. Note
+that the path is based solely on the ID of the transfer. The original file name is considered
+metadata and is never sent, so a name with spaces, quotes or non-ASCII letters, one that looks like
+a relative path, a WSL path or a Windows drive path, reaches the upstream as none of those. It is
+expected that any receiver of such a request would open the provided path and confirm that the file
+at this path matches the provided size and digest before acknowledging the request. If the file is
+not what the request says, the receiver refuses, and the offer fails with the draft and the upload
+kept for a retry.
+
+`accepted_by_agent` therefore records that the receiver of this typed request acknowledged it after
+the file named by the grant was available to it. It does not record that the agent used or
+understood the file. How the path becomes something a particular vendor's agent understands is the
+connector's contract with its bridge, and this host does not define it.
+
 ## The generation that ships with the host
 
 A fresh installation has no repository and may have no network. It still has to recognise an
