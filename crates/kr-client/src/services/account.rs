@@ -2152,9 +2152,9 @@ impl SignedInAccount {
     /// it is sent, so a service that cannot be reached is told again at the next recovery, and the
     /// number of revocations the service has still not acknowledged is returned.
     ///
-    /// The token is sent to the service at least once. When the queue cannot be written, or the lock
-    /// cannot be taken, or sending the queue fails, it is sent once more on its own, and the failure
-    /// is returned.
+    /// The token is sent to the service at least once. When the queue cannot be written or the lock
+    /// cannot be taken, it is sent on its own; when sending the queue fails, it is sent on its own
+    /// once more. The failure is returned.
     ///
     /// # Errors
     ///
@@ -2181,11 +2181,15 @@ impl SignedInAccount {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot keep the grant; nothing is kept then, and the queue
-    /// of revocations is put back as it was. A write that fails after the grant is in place counts
-    /// as kept. When the queue cannot be put back either, the grant that was replaced stays with
-    /// its own revocation queued: a send does not send an entry for the grant this device holds,
-    /// and the next recovery removes that grant and sends it.
+    /// Returns an error when the store cannot keep the grant. The queue of revocations is then put
+    /// back as it was found, but only where the store is known to hold the grant it replaced: a
+    /// write can fail after the new grant is in place, and when the store cannot then be read to
+    /// say which grant it holds, the queue is left as it stands, with the replaced grant's
+    /// revocation in it, because that is the one state in which no token is lost. A send never
+    /// sends the entry of the grant the store holds, and the next recovery removes a held grant
+    /// whose own revocation is queued, so the grant that was replaced is not ended while it is
+    /// still held. A write that fails after the grant is in place and is then seen to be there
+    /// counts as kept.
     pub async fn commit(&self, issued: IssuedGrant, nonce: &str) -> Result<()> {
         let replaced = {
             let _held = self.hold().await?;
@@ -2197,23 +2201,35 @@ impl SignedInAccount {
                 Some(_) => Some(self.read_pending()?),
                 None => None,
             };
-            if let Some(old) = &replaced {
-                self.queue(&old.grant_id, old.refresh_token.clone())?;
+            let put_back = |kept: &Option<StoredGrant>| {
+                // Only where the store is known to hold the grant this one replaced.
+                if let (Some(old), Some(kept), Some(before)) = (&replaced, kept, &before)
+                    && kept.grant_id == old.grant_id
+                {
+                    // If this fails too, the old grant and its own queued revocation are both
+                    // there, which a send does not send and the next recovery settles.
+                    let _ = self.write_pending(before);
+                }
+            };
+            if let Some(old) = &replaced
+                && let Err(error) = self.queue(&old.grant_id, old.refresh_token.clone())
+            {
+                // The grant write never started, so the old grant is the one held: a queue write
+                // can fail at its last step, after its contents are in place.
+                put_back(&replaced);
+                return Err(error);
             }
             if let Err(error) = self.write_grant(&grant) {
                 // A write can fail at its last step, after the grant is in place. What the store
                 // holds decides: a grant that landed is the commit, and the queue stays as it is.
-                let landed = matches!(
-                    self.read_grant(),
-                    Ok(Some(held)) if held.grant_id == grant.grant_id
-                );
-                if !landed {
-                    if let Some(before) = &before {
-                        // If this fails too, the old grant and its own queued revocation are both
-                        // there, which `send_pending` does not send and the next recovery settles.
-                        let _ = self.write_pending(before);
+                match self.read_grant() {
+                    Ok(Some(held)) if held.grant_id == grant.grant_id => {}
+                    Ok(kept) => {
+                        put_back(&kept);
+                        return Err(error);
                     }
-                    return Err(error);
+                    // The store cannot say what it holds: the queue stays as it stands.
+                    Err(_) => return Err(error),
                 }
             }
             self.ended.store(false, Ordering::SeqCst);
@@ -2336,8 +2352,8 @@ impl SignedInAccount {
         self.send_pending().await
     }
 
-    /// Sends every queued revocation and removes each one the service acknowledges, except the one
-    /// that names the grant this device still holds. Returns how many are still waiting.
+    /// Sends every queued revocation and removes each one the service acknowledges, except any that
+    /// name the grant this device still holds. Returns how many are still waiting.
     ///
     /// # Errors
     ///
@@ -2351,9 +2367,10 @@ impl SignedInAccount {
             )
         };
         for entry in entries {
-            // A grant this device still holds is not ended by a send: its own queued revocation
-            // means a sign-out stopped before it removed the grant, and recovery removes the grant
-            // first and sends the entry after.
+            // A grant this device still holds is not ended by a send. An entry for it is there
+            // because a sign-out stopped before it removed the grant, or because a commit could not
+            // give the queue back; recovery removes a held grant that has such an entry and then
+            // sends it.
             if kept.as_deref() == Some(entry.grant_id.as_str()) {
                 continue;
             }
