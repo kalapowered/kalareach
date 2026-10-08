@@ -50,8 +50,8 @@ const NAMES: [&str; 2] = ["current_exe", "_NSGetExecutablePath"];
 /// in the product uses. A host crate's feature that is for tests is named here.
 const TEST_FEATURES: [&str; 3] = ["testing", "fault-injection", "git-fixtures"];
 
-/// The features of the host's crates that are part of the product, as `(crate, feature)`: each
-/// adds code or a dependency that the product uses, and none is a seam for a test.
+/// The features of the host's crates that are not for tests, as `(crate, feature)`: each adds code
+/// or a dependency to the crate and none is a seam a test acts through.
 const PRODUCT_FEATURES: [(&str, &str); 2] = [("kr-client", "terminal"), ("kr-term", "conformance")];
 
 /// One token of a source, as far as this reading needs to tell them apart.
@@ -1108,13 +1108,26 @@ fn only_the_install_module_asks_where_its_program_is() {
     );
 }
 
-/// No feature that exists for tests is on in a program, and every feature of the host's crates is
-/// named as one for tests or as part of the product. The `testing` feature is the one whose items
-/// the reading above passes over as test code.
+/// No feature that exists for tests is on in a program built from the host's crates, and every
+/// feature of those crates is named as one for tests or as one that is not. The `testing` feature
+/// is the one whose items the reading above passes over as test code.
 #[test]
 fn no_feature_that_exists_for_tests_is_on_in_a_program() {
     let workspace = workspace();
     let metadata = cargo_metadata(&workspace);
+    // The control on the real tree: the guard reads the crates that have the seams, so a reading
+    // that recognised none of the host's crates cannot pass.
+    let has = |name: &str, feature: &str| {
+        metadata["packages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|package| package["name"] == name && package["features"].get(feature).is_some())
+    };
+    assert!(
+        has("kr-changeset", "fault-injection") && has("kr-project", "git-fixtures"),
+        "the workspace's metadata lists the features the guard is about"
+    );
     let turned_on = test_features_in_production(&metadata, &workspace);
     assert!(
         turned_on.is_empty(),
@@ -1749,12 +1762,20 @@ fn a_feature_for_tests_is_named_whatever_it_is_called_and_an_unnamed_one_is_foun
             serde_json::json!({ "default": [], "hooks": [], "terminal": [] }),
         ),
     ]});
-    assert_eq!(
-        test_features_in_production(&metadata, Path::new("/w")),
-        vec![
-            "a: the fault-injection feature of a is turned on by its default features",
-            "b: the git-fixtures feature of c is turned on by a normal or build dependency on c",
-        ]
+    let named = test_features_in_production(&metadata, Path::new("/w"));
+    let says = |named: &str, crate_name: &str, feature: &str, how: &str| {
+        named.starts_with(&format!("{crate_name}: "))
+            && named.contains(feature)
+            && named.contains(how)
+    };
+    assert_eq!(named.len(), 2, "{named:?}");
+    assert!(
+        says(&named[0], "a", "fault-injection", "default"),
+        "{named:?}"
+    );
+    assert!(
+        says(&named[1], "b", "git-fixtures", "dependency on c"),
+        "{named:?}"
     );
     assert_eq!(
         unclassified_features(&metadata, Path::new("/w")),

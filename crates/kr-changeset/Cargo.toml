@@ -23,8 +23,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }
-# The tests stop an apply where a crash would stop it. They get the seam from here, so that a plain
-# `cargo test` has it, and so that no build that is not a test build does.
+# The tests stop an apply where a crash would stop it and act while a capture reads a file. They get
+# the seams from here, so that a plain `cargo test` has them, and so that no build that is not a test
+# build does.
 kr-changeset = { path = ".", features = ["fault-injection"] }
 # The tests act in the seams the project service compiles only for them.
 kr-project = { workspace = true, features = ["git-fixtures"] }
@@ -44,9 +45,10 @@ rustix = { workspace = true, features = ["fs", "process"] }
 windows-sys.workspace = true
 
 [features]
-# The seam a test uses to stop an apply exactly where a crash would stop it, so the journal can be
-# read afterwards. No build enables it but a test build of this crate and of the crates whose tests
-# act in the seam; nothing in the service ever sets it.
+# The seams a test uses to stop an apply exactly where a crash would stop it, so the journal can be
+# read afterwards, and to act in the window between a capture's two readings of a file. No build
+# enables it but a test build of this crate and of the crates whose tests act in the seams; nothing
+# in the service ever sets it.
 fault-injection = []
 
 # The workspace forbids unsafe code, which a crate that removes a staged file through the handle it
