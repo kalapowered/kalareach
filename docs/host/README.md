@@ -2946,8 +2946,8 @@ worker ran in and the kernel read empty, or a job that needed no help.
 
 **Who waits for it.** The closure is recorded after the cleanup, so a read, a list, the barrier
 and a daemon that starts beside a crashed session wait for it: about five seconds when a recorded
-process ignores the request, two more after force, and longer when the service manager does not
-answer (the command is given the two seconds, and is then ended and given five to be collected).
+process ignores the request, and up to four more after force: two for the service manager's answer,
+which is not waited for past that, and two for the end that follows.
 A start runs every crashed session's cleanup before waiting for any of them. A list or a barrier
 that meets several crashed sessions one after another waits for each in turn.
 
