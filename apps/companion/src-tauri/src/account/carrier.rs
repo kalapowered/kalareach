@@ -18,7 +18,8 @@ use companion_platform::browser::{self, RawEvent, SessionEvent, SessionRequest};
 use kr_client::services::account::{Answer, Carrier as Delivery, PendingAuthorisation, Redirect};
 use tokio::sync::watch;
 
-use super::loopback::{BindError, Callback, Listener};
+#[cfg(desktop)]
+use kr_loopback::{BindError, Listener};
 
 /// A boxed future, so carriers stay usable behind a trait object.
 pub type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -52,7 +53,7 @@ pub enum Ending {
         /// What the checks made of it.
         answer: Answer,
         /// The browser's connection, on a desktop, for the page that says how it ended.
-        reply: Option<Callback>,
+        reply: Reply,
     },
     /// The person, or the application, ended the ceremony.
     Cancelled,
@@ -64,6 +65,26 @@ pub enum Ending {
     TimedOut,
     /// The browser could not be opened.
     BrowserFailed,
+}
+
+/// The browser's connection a desktop sign-in's closing page goes back on. A phone has none: its
+/// platform session closes itself.
+#[derive(Debug, Default)]
+pub struct Reply {
+    #[cfg(desktop)]
+    callback: Option<kr_loopback::Callback>,
+}
+
+impl Reply {
+    /// Writes the page that says how the sign-in ended, and closes the connection.
+    pub async fn finish(self, message: &str) {
+        #[cfg(desktop)]
+        if let Some(callback) = self.callback {
+            callback.finish(message).await;
+        }
+        #[cfg(not(desktop))]
+        let _ = message;
+    }
 }
 
 /// Opens an address in the system's browser.
@@ -115,12 +136,14 @@ async fn cancelled(mut cancel: watch::Receiver<bool>) {
 }
 
 /// The desktop's carrier: the default browser, and the loopback listener.
+#[cfg(desktop)]
 pub struct Loopback {
     browser: Arc<dyn Browser>,
     listen: Box<dyn Fn() -> Result<Listener, BindError> + Send + Sync>,
     wait: Duration,
 }
 
+#[cfg(desktop)]
 impl Loopback {
     /// The registered address, and `browser`.
     #[must_use]
@@ -147,6 +170,7 @@ impl Loopback {
     }
 }
 
+#[cfg(desktop)]
 impl Carrier for Loopback {
     fn plan(&self) -> Boxed<'_, Result<Plan, Unavailable>> {
         Box::pin(async {
@@ -185,23 +209,12 @@ impl Carrier for Loopback {
                 return Ending::BrowserFailed;
             }
             let waiting = async {
-                loop {
-                    let callback = listener.next().await;
-                    match pending.answer(&callback.url, Delivery::Continuing) {
-                        Answer::Dropped(fault) => {
-                            tracing::info!(
-                                ?fault,
-                                "a request to the loopback address was set aside"
-                            );
-                            callback.set_aside().await;
-                        }
-                        answer => {
-                            return Ending::Answered {
-                                answer,
-                                reply: Some(callback),
-                            };
-                        }
-                    }
+                let (answer, callback) = listener.answered(pending).await;
+                Ending::Answered {
+                    answer,
+                    reply: Reply {
+                        callback: Some(callback),
+                    },
                 }
             };
             tokio::select! {
@@ -275,7 +288,7 @@ pub async fn converse(
                         answer => {
                             return Ending::Answered {
                                 answer,
-                                reply: None,
+                                reply: Reply::default(),
                             };
                         }
                     },

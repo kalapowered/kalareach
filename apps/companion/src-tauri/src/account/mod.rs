@@ -12,7 +12,6 @@
 //! secure store under one lock, which every managed resource then asks for tokens.
 
 pub mod carrier;
-pub mod loopback;
 pub mod navigation;
 
 use std::future::Future;
@@ -325,9 +324,7 @@ impl Account {
                 self.set_phase(Phase::Finishing);
                 self.publish().await;
                 let outcome = self.finish(&grant).await;
-                if let Some(reply) = reply {
-                    reply.finish(page(outcome)).await;
-                }
+                reply.finish(page(outcome)).await;
                 outcome
             }
             Ending::Answered { answer, reply } => {
@@ -340,9 +337,7 @@ impl Account {
                         Outcome::NotForThisSignIn
                     }
                 });
-                if let Some(reply) = reply {
-                    reply.finish(page(outcome)).await;
-                }
+                reply.finish(page(outcome)).await;
                 outcome
             }
             Ending::Cancelled => Some(Outcome::Cancelled),
