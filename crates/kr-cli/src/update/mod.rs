@@ -45,7 +45,8 @@
 //! The record of the update under way is written before each step that changes what runs, so a
 //! run that stops part way leaves what the next needs to finish it or undo it. It is let go of
 //! only once every daemon the update stopped answers again: a daemon that does not start keeps it
-//! for the next run, which starts that daemon before anything else.
+//! for the next run, which settles it before anything else. That run starts the daemon again when
+//! the switch did not happen, and asks whether it answers when the switch did.
 
 #[cfg(unix)]
 mod formats;
@@ -121,9 +122,9 @@ pub const OLDEST_RECORD_FORMAT: u32 = 1;
 /// record's own indented form, with room to spare.
 const RECORD_LIMIT: u64 = 8 * 1024 * 1024;
 
-/// What a run that stopped part way tells a person to run: either command starts, before anything
-/// else, the daemons the one that stopped had stopped, and a rollback goes back from a release whose
-/// daemon does not start.
+/// What a run that stopped part way tells a person to run: either command settles what the one that
+/// stopped left, before anything else, and a rollback goes back from a release whose daemon does
+/// not start.
 #[cfg(unix)]
 const RUN_AGAIN: &str = "kr host update or kr host rollback";
 
@@ -1076,20 +1077,24 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         // staged and checked before anything is started, so that a daemon of the release that
         // failed, which may hold its environment and never answer, is not started again by every
         // run that would move the host off it.
+        let mut restarted = Vec::new();
         if let (Some(_), Some(failed)) = (left, record.update.clone()) {
             match start_recorded(&store, &failed, true).await {
-                Ok(_) => settle(&store, &mut record)?,
+                Ok(started) => {
+                    settle(&store, &mut record)?;
+                    restarted = started;
+                }
                 Err(still) => {
-                    let goes_back = older_than(&store, &current_manifest, &failed.source)
-                        .then_some(&failed.source);
-                    return Err(left_part_way(&still.said(), goes_back));
+                    let back = goes_back_to(&failed, &source);
+                    let goes_back = older_than(&store, &current_manifest, &back).then_some(&back);
+                    return Err(left_part_way(&still.said(), true, goes_back));
                 }
             }
         }
         return Ok(Updated {
             target: source.clone(),
             source,
-            restarted: Vec::new(),
+            restarted,
             removed: Vec::new(),
             carried: Vec::new(),
             unreached: Vec::new(),
@@ -1161,16 +1166,10 @@ pub async fn rollback(to: Option<&str>) -> Result<Updated> {
             ))
         })?,
         None => if failed {
-            // The last release whose daemon ran: the one a chain of failed updates began from, or
-            // the one the failed update began from.
-            record.update.as_ref().map(|update| {
-                update
-                    .abandoned
-                    .as_ref()
-                    .map(|failed| failed.source.clone())
-                    .filter(|earliest| *earliest != source)
-                    .unwrap_or_else(|| update.source.clone())
-            })
+            record
+                .update
+                .as_ref()
+                .map(|update| goes_back_to(update, &source))
         } else {
             record.previous.clone()
         }
@@ -1787,7 +1786,10 @@ async fn hand_over(
     let written = record.write(store);
     drop(held);
     drop(install);
-    let went_from = record.update.as_ref().map(|update| update.source.clone());
+    let went_back_to = record
+        .update
+        .as_ref()
+        .map(|update| goes_back_to(update, &target.release));
     let restarted = match record.update.as_ref() {
         Some(update) => start_recorded(store, update, true).await,
         None => Ok(Vec::new()),
@@ -1796,7 +1798,7 @@ async fn hand_over(
         // An update that does not start can be gone back from; a rollback goes back to a release
         // that is older than the one it left, and a daemon that does not start there is started by
         // an update, which is where a host goes from here.
-        let goes_back = match (&went_from, report.rolled_back) {
+        let goes_back = match (&went_back_to, report.rolled_back) {
             (Some(source), false) => shown!(
                 ", and kr host rollback goes back to {}",
                 crate::shown::release(source)
@@ -1805,7 +1807,7 @@ async fn hand_over(
         };
         CliError::Other(shown!(
             "this host's current release is {} now, and a control daemon the update stopped did \
-             not start from it: {}; the next kr host update starts it before anything else{}",
+             not start from it: {}; kr host update --archive of that release starts it again{}",
             crate::shown::release(&target.release),
             failed.said(),
             goes_back
@@ -1877,10 +1879,11 @@ async fn undo(store: &Store, record: &mut Record, ended_by: CliError) -> CliErro
             ended_by
         }
         Err(failed) => CliError::Other(shown!(
-            "{}. A control daemon the update stopped did not start again, and the next kr host \
-             update starts it before anything else: {}",
+            "{}. A control daemon the update stopped did not start again: {}; the next {} settles \
+             that before anything else",
             ended_by.said(),
-            failed.said()
+            failed.said(),
+            RUN_AGAIN
         )),
     }
 }
@@ -2237,27 +2240,54 @@ async fn recover(store: &Store, record: &mut Record) -> Result<Recovered> {
             forget_update(store, record);
             Ok(Recovered::Settled)
         }
-        Err(failed) => Err(left_part_way(&failed.said(), None)),
+        Err(failed) => Err(left_part_way(&failed.said(), false, None)),
     }
 }
 
 /// What a run says when an update an earlier run left is not settled: the daemon that does not start,
-/// what starts it, and, where the update went forward, what goes back.
+/// what starts it, and, where the switch happened and the update went forward, what goes back to
+/// `back_to`.
+///
+/// Where the switch did not happen, either command starts the daemon again from the release still
+/// current, before anything else. Where it did, only `kr host update --archive` of the release now
+/// current starts it: any other run asks, and starts none.
 #[cfg(unix)]
-fn left_part_way(why: &Shown, goes_back_to: Option<&ReleaseName>) -> CliError {
-    let back = match goes_back_to {
-        Some(source) => shown!(
-            ", while kr host rollback goes back to {}",
-            crate::shown::release(source)
-        ),
-        None => Shown::said(""),
+fn left_part_way(why: &Shown, switched: bool, back_to: Option<&ReleaseName>) -> CliError {
+    let how = if switched {
+        let back = match back_to {
+            Some(source) => shown!(
+                ", while kr host rollback goes back to {}",
+                crate::shown::release(source)
+            ),
+            None => Shown::said(""),
+        };
+        shown!(
+            "kr host update --archive of the release now current starts it again{}",
+            back
+        )
+    } else {
+        shown!("{} starts it again before anything else", RUN_AGAIN)
     };
     CliError::Other(shown!(
         "an update an earlier run left part way is not settled yet: a control daemon it stopped \
-         did not start again, and the next kr host update starts it before anything else{}: {}",
-        back,
+         did not start again, and {}: {}",
+        how,
         why.clone()
     ))
+}
+
+/// The release `kr host rollback` goes back to when none is named, for the failed update `update`
+/// when `current` is the release it made current: the last release whose daemon ran, which is the
+/// one a chain of failed updates began from, unless that is the release now current, and then the
+/// one `update` began from.
+#[cfg(unix)]
+fn goes_back_to(update: &Transaction, current: &ReleaseName) -> ReleaseName {
+    update
+        .abandoned
+        .as_ref()
+        .map(|failed| failed.source.clone())
+        .filter(|earliest| earliest != current)
+        .unwrap_or_else(|| update.source.clone())
 }
 
 /// Whether the release `other` is older than the current release, whose manifest is `current`.

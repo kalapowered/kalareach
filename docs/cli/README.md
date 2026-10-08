@@ -1698,15 +1698,16 @@ kr: the update to 0.3.0+9f1c2b3a4d5e waits: session 7 runs kr-worker/0.2.0+4254a
 ```
 
 A control daemon the update stopped that does not start again, from either release, makes it exit
-with 1 and name the daemon; the update stays recorded, and the next `kr host update` starts that
-daemon before anything else.
+with 1 and name the daemon; the update stays recorded. The next run starts it before anything else
+if the switch did not happen, and `kr host update --archive` of the release now current starts it
+if it did.
 
 An environment whose daemon has not run since an earlier schema step does not stop an update: the
 update brings its registry forward before it classes it, and says so. An environment that is no
 longer present, such as one whose container has been removed, is named by its recorded roots and
 skipped. See `docs/host/updates.md` for details.
 
-`kr host rollback [--to <release>]` goes back to an older release which is still available in the store. By default it rolls back to the release that the host was running on before the most recent time that the host switched to a new release. Alternatively the `--to` option can be used to select a specific release to roll back to. In the case where an update has been performed but the control daemon of the new release failed to start, the rollback target will be the release that the update was performed from. The roll-back process will hand each control daemon over as for an update. It does not move an existing session, and it exits with status 9, without switching, when a session runs a worker at a compatibility level the rolled-back release's control daemon does not speak. Prior to rolling back, all stores mentioned in the release being rolled back to are checked to see if they are available in a version that can be read by that release. If they are not, then no attempt is made to switch to the new release or to bring any stores forward, and the command will exit with exit status 1 having reported which stores could not be read by the release being rolled back to. See `docs/host/updates.md` for the rules that are used.
+`kr host rollback [--to <release>]` goes back to an older release which is still available in the store. By default it rolls back to the release that the host was running on before the most recent time that the host switched to a new release. Alternatively the `--to` option can be used to select a specific release to roll back to. In the case where an update has been performed but the control daemon of the new release failed to start, the rollback target will be the release that the update was performed from. After a chain of such updates, it is the release the first of them was performed from. The roll-back process will hand each control daemon over as for an update. It does not move an existing session, and it exits with status 9, without switching, when a session runs a worker at a compatibility level the rolled-back release's control daemon does not speak. Prior to rolling back, all stores mentioned in the release being rolled back to are checked to see if they are available in a version that can be read by that release. If they are not, then no attempt is made to switch to the new release or to bring any stores forward, and the command will exit with exit status 1 having reported which stores could not be read by the release being rolled back to. See `docs/host/updates.md` for the rules that are used.
 
 With `--json`, `kr host update` returns JSON with the keys `source`, `target`, `checked_only`
 (whether it only checked), `restarted` (the environments whose daemons it started again), `carried`
