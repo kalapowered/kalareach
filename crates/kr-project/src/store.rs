@@ -48,7 +48,7 @@ use crate::identity::{RecordedRepository, Revised};
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -77,6 +77,10 @@ pub struct ProjectRow {
     pub identity: RecordedRepository,
     /// The path it was created or adopted at, for a person to read.
     pub display_path: String,
+    /// Whether that path is the repository's working tree's top level, as opposed to a directory
+    /// below it, which an adoption may name. The creation or the adoption established it when the
+    /// repository was taken in; the directory at the path is then decided as exactly the tree.
+    pub path_is_top_level: bool,
     /// The remote it was cloned from, when it has one.
     pub remote: Option<RemoteSpecification>,
     /// When the record was written.
@@ -559,7 +563,8 @@ impl Store {
                      source_location_id    BLOB,
                      source_relative_path  TEXT,
                      git_dir_fs            BLOB,
-                     work_tree_fs          BLOB
+                     work_tree_fs          BLOB,
+                     path_is_top_level     INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE IF NOT EXISTS workspaces (
                      workspace_id          BLOB PRIMARY KEY,
@@ -738,19 +743,25 @@ impl Store {
             // authorised locations arrived, with the two location pairs a repository carries; an
             // earlier repository gains both pairs empty, which is what reachable through no
             // location means. Version 8 is where a staging path that is still there records why,
-            // when a removal of it stopped part way; an earlier row says nothing. It is a version
-            // of its own because a store already at 7 has neither column, and a store at the
-            // version this build reads is not migrated at all.
+            // when a removal of it stopped part way; an earlier row says nothing. Version 9 is where
+            // a repository records whether its path is its working tree's top level, which an
+            // adoption through a directory below the top level is not. Each is a version of its
+            // own because a store already at the version before has neither column, and a store at
+            // the version this build reads is not migrated at all.
             //
             // This arm serves a store written under any earlier version. Remove it, with
-            // `rebuild_retained_items`, `protect_recorded_reasons` and `protect_recorded_answers`,
-            // once no supported upgrade starts from a store written under a version below the one
-            // this build reads; a store older than the window is then refused like a newer one.
+            // `rebuild_retained_items`, `protect_recorded_reasons`, `protect_recorded_answers` and
+            // `record_top_level_paths`, once no supported upgrade starts from a store written
+            // under a version below the one this build reads; a store older than the window is
+            // then refused like a newer one.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
                 rebuild_retained_items(&transaction)?;
                 protect_recorded_reasons(&transaction)?;
                 protect_recorded_answers(&transaction)?;
+                if version < 9 {
+                    record_top_level_paths(&transaction)?;
+                }
                 transaction
                     .execute(
                         "UPDATE schema_version SET version = ?1",
@@ -2567,7 +2578,26 @@ const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, ori
      git_dir_device, git_dir_file_id, work_tree_device, work_tree_file_id, display_path, \
      remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms, \
      created_location_id, created_relative_path, source_location_id, source_relative_path, \
-     git_dir_fs, work_tree_fs";
+     git_dir_fs, work_tree_fs, path_is_top_level";
+
+/// Records, for each repository an earlier build recorded, that its path is its working tree's top
+/// level where the row itself says so.
+///
+/// A repository this host made was published at its path, so the directory there is the tree; one
+/// the owner adopted through a location was found by a descent that requires the named directory
+/// to hold the repository's own `.git`, which makes it the top level too. A repository adopted by
+/// a path alone says nothing of its path, and keeps the answer the added column starts with, that
+/// the path may be below the top level.
+fn record_top_level_paths(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute(
+            "UPDATE projects SET path_is_top_level = 1
+              WHERE origin IN ('initialised', 'cloned') OR created_location_id IS NOT NULL",
+            [],
+        )
+        .map_err(ProjectError::store)?;
+    Ok(())
+}
 
 /// Puts the free-text reasons a store already holds through the rule.
 fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
@@ -2796,6 +2826,14 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         // that no use has settled by then is refused, and recorded again.
         ("projects", "git_dir_fs", "BLOB"),
         ("projects", "work_tree_fs", "BLOB"),
+        // Whether the path a repository was recorded at is its working tree's top level.
+        // `record_top_level_paths` decides it for the rows an earlier build wrote, in the same
+        // transaction; it is removed with the rest of the upgrade arm that calls it.
+        (
+            "projects",
+            "path_is_top_level",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
         ("workspaces", "tree_fs", "BLOB"),
         ("workspaces", "staging_fs", "BLOB"),
         ("operations", "staging_fs", "BLOB"),
@@ -2990,9 +3028,9 @@ fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()>
                                    remote_url, remote_provider, remote_broker, created_at_ms,
                                    created_location_id, created_relative_path,
                                    source_location_id, source_relative_path, git_dir_fs,
-                                   work_tree_fs)
+                                   work_tree_fs, path_is_top_level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22)",
+                     ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 row.project_repository_id.get().as_bytes().to_vec(),
                 row.environment_id.get().as_bytes().to_vec(),
@@ -3024,6 +3062,7 @@ fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()>
                 row.source.as_ref().map(|named| named.relative_path.clone()),
                 row.identity.git_dir.filesystem,
                 row.identity.work_tree.filesystem,
+                row.path_is_top_level,
             ],
         )
         .map_err(ProjectError::store)?;
@@ -3451,6 +3490,7 @@ fn read_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
             ),
         },
         display_path: row.get(9)?,
+        path_is_top_level: row.get(22)?,
         remote,
         created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(15)?)),
         created_through: located_name(row, 16, 17)?,
@@ -4286,6 +4326,7 @@ mod tests {
                         work_tree: RecordedIdentity::from_parts(1, 3, Some(filesystem())),
                     },
                     display_path: "/tmp/done".to_owned(),
+                    path_is_top_level: true,
                     remote: None,
                     created_at_ms: TimestampMs::new(4_000),
                     created_through: None,
@@ -4958,6 +4999,99 @@ mod tests {
             })
             .expect("the table of locations exists");
         assert_eq!(locations, 0);
+        let version: i64 = store
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("the version reads");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_store_at_version_eight_records_which_projects_are_registered_at_their_top() {
+        // Version 8 recorded a project's path and nothing about whether it is the repository's top
+        // level. A repository this host made is at its top by construction, and one the owner
+        // adopted through a location was found by a descent that requires the named directory to
+        // hold the repository's `.git`, so those rows say so. One adopted by a path alone says
+        // nothing, and stays decided as it always was.
+        let directory = tempfile::tempdir().expect("a directory");
+        let journal = directory.path().join("eight.sqlite");
+        let eight = Connection::open(&journal).expect("the earlier store opens");
+        eight
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (8);
+                 CREATE TABLE projects (
+                     project_repository_id BLOB PRIMARY KEY,
+                     environment_id        BLOB NOT NULL,
+                     label                 TEXT NOT NULL,
+                     origin                TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     git_dir_device        INTEGER NOT NULL,
+                     git_dir_file_id       INTEGER NOT NULL,
+                     work_tree_device      INTEGER NOT NULL,
+                     work_tree_file_id     INTEGER NOT NULL,
+                     display_path          TEXT NOT NULL,
+                     remote_name           TEXT,
+                     remote_transport      TEXT,
+                     remote_url            TEXT,
+                     remote_provider       TEXT,
+                     remote_broker         TEXT,
+                     created_at_ms         INTEGER NOT NULL,
+                     created_location_id   BLOB,
+                     created_relative_path TEXT,
+                     source_location_id    BLOB,
+                     source_relative_path  TEXT,
+                     git_dir_fs            BLOB,
+                     work_tree_fs          BLOB
+                 );",
+            )
+            .expect("the version-8 shape is written");
+        for (id, origin, location) in [
+            (71_u8, "initialised", None),
+            (72, "cloned", None),
+            (73, "adopted", Some([9_u8; 16].to_vec())),
+            (74, "adopted", None),
+        ] {
+            eight
+                .execute(
+                    "INSERT INTO projects (project_repository_id, environment_id, label, origin,
+                                           state, git_dir_device, git_dir_file_id,
+                                           work_tree_device, work_tree_file_id, display_path,
+                                           created_at_ms, created_location_id,
+                                           created_relative_path)
+                     VALUES (?1, ?2, 'earlier', ?3, 'ready', 1, 2, 1, 3, '/tmp/earlier', 5, ?4,
+                             'earlier')",
+                    params![
+                        [id; 16].to_vec(),
+                        environment().get().as_bytes().to_vec(),
+                        origin,
+                        location
+                    ],
+                )
+                .expect("a repository an earlier build recorded");
+        }
+        drop(eight);
+        let store = Store::open(&journal, environment()).expect("this build opens it");
+        let at_top = |id: u8| -> bool {
+            store
+                .connection
+                .query_row(
+                    "SELECT path_is_top_level FROM projects WHERE project_repository_id = ?1",
+                    params![[id; 16].to_vec()],
+                    |row| row.get(0),
+                )
+                .expect("the column reads")
+        };
+        assert!(
+            at_top(71),
+            "a repository this host initialised is at its top"
+        );
+        assert!(at_top(72), "so is one it cloned");
+        assert!(at_top(73), "so is one adopted through a location");
+        assert!(
+            !at_top(74),
+            "one adopted by a path alone says nothing of it, and is decided as it was"
+        );
         let version: i64 = store
             .connection
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))

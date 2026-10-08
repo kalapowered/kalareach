@@ -1807,17 +1807,7 @@ fn a_directory_inside_a_published_project_is_not_read_as_the_project() {
         .service()
         .workspace_create(
             &actor(),
-            &WorkspaceCreateParams {
-                project_repository_id: project,
-                label: "preview".to_owned(),
-                kind: WorkspaceKind::SharedExisting,
-                isolation: Nullable(None),
-                policy: include_everything(),
-                base_revision: Nullable(None),
-                base_change_set_id: Nullable(None),
-                destination: Nullable(None),
-                preview_only: true,
-            },
+            &shared_preview(project),
             Some(&action("workspace.create", 138)),
         )
         .expect_err("a directory inside the project is not the project");
@@ -1825,6 +1815,58 @@ fn a_directory_inside_a_published_project_is_not_read_as_the_project() {
     assert!(
         !git_started_in(&started, &inside),
         "no Git invocation started in a directory inside the published project"
+    );
+}
+
+/// The request that previews a shared workspace of `project`, which opens the project's repository
+/// at its recorded path and creates nothing.
+#[cfg(unix)]
+fn shared_preview(project: ProjectRepositoryId) -> WorkspaceCreateParams {
+    WorkspaceCreateParams {
+        project_repository_id: project,
+        label: "preview".to_owned(),
+        kind: WorkspaceKind::SharedExisting,
+        isolation: Nullable(None),
+        policy: include_everything(),
+        base_revision: Nullable(None),
+        base_change_set_id: Nullable(None),
+        destination: Nullable(None),
+        preview_only: true,
+    }
+}
+
+/// A repository the owner adopted at its top level is decided as exactly its tree, as one this host
+/// published is: a path that leads to a directory inside it is not the project, and no Git
+/// invocation starts there. The record says the path is the top level because the adoption saw it
+/// was.
+#[cfg(unix)]
+#[test]
+fn a_directory_inside_an_adopted_project_registered_at_its_top_is_not_read_as_the_project() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = adopted_with_changes(&fixture, "adopted-inside");
+    let tree = fixture.work().join("adopted-inside");
+    let named = std::fs::canonicalize(&tree).expect("the project resolves");
+    let _ = git_started_in(&started, &named);
+    shared_workspace(&fixture, project, 141);
+    assert!(
+        git_started_in(&started, &named),
+        "Git is started in the adopted project"
+    );
+
+    let inside = made_a_link_into_what_was_there(&tree);
+    let refusal = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &shared_preview(project),
+            Some(&action("workspace.create", 142)),
+        )
+        .expect_err("a directory inside the project is not the project");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert!(
+        !git_started_in(&started, &inside),
+        "no Git invocation started in a directory inside the adopted project"
     );
 }
 

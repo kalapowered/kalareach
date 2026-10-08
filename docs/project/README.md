@@ -41,8 +41,8 @@ working tree.
   widening a grant that covers an existing one.
 * A linked worktree and a repository this host published are decided as exactly the recorded tree,
   never a directory inside it, and Git's search for the repository stops above the tree.
-* A repository the owner adopted may have been adopted through a directory below its top level, so
-  a directory inside the recorded tree is accepted for it.
+* A repository the owner adopted records whether its path is its top level. At the top level the
+  path is decided as exactly the tree; below it, a directory inside the recorded tree is accepted.
 * One rule checks every recorded directory: the inode names it, the recorded filesystem says
   where. One that reports an identity is refused when it differs; the same under another device
   number is accepted. A project's record takes the number when the project is opened, and a
@@ -784,12 +784,16 @@ data fields and the row's own identity are untouched, so a repeat of an action s
 answer. A recorded answer this build cannot decode is left alone rather than stopping the upgrade,
 and reading one refuses it: a store that will not open is a daemon that never serves.
 
+A repository's row records whether its path is its working tree's top level. An earlier row gets the
+answer from what it says: made here, or adopted through a location, means yes; adopted by a path
+alone means not known.
+
 | Table | What it holds |
 | --- | --- |
 | `operations` | One row per creation, keyed by the caller's action identifier: the create token. It records the authority the operation reached its directories through: the grant it was performed for, and the destination and source locations it named |
 | `operation_paths` | Every staging path an operation left behind or removed |
 | `workspace_progress` | Every path an inclusion will attempt, written as `planned` before it starts, then each outcome as it settles: `carried`, `removed`, `unapplied`, or `leftover` for a copy in progress nobody could take away |
-| `projects` | One row per repository, with both filesystem identities, the destination location it was created through and the source location the owner bound it to, each with the name beneath it |
+| `projects` | One row per repository, with both filesystem identities, whether its path is the working tree's top level, the destination location it was created through and the source location the owner bound it to, each with the name beneath it |
 | `workspaces` | One row per working copy, with its policy, its base, its tree's identity, and the location it was made through with the tree's name beneath it |
 | `authorised_locations` | One row per location the owner authorised: the grant it names, its environment, its purpose, its label, the path the owner named and whether it is active, dormant or withdrawn |
 | `workspace_sessions` | Which sessions are bound to a workspace, and which are still live |

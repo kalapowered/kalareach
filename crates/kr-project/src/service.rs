@@ -1066,6 +1066,7 @@ impl ProjectService {
             state: ProjectState::Ready,
             identity: opened.recorded()?,
             display_path: path.display().to_string(),
+            path_is_top_level: opened.path_is_top_level(),
             remote: row.remote.clone(),
             created_at_ms: self.clock.now_ms(),
             created_through: created_through(destination),
@@ -2190,6 +2191,7 @@ impl ProjectService {
             state: ProjectState::Ready,
             identity: opened.recorded()?,
             display_path: path.display().to_string(),
+            path_is_top_level: opened.path_is_top_level(),
             remote: plan.remote().cloned(),
             created_at_ms: self.clock.now_ms(),
             created_through: created_through(destination),
@@ -4215,16 +4217,20 @@ struct OpenedWorkspace {
 ///
 /// A project this host initialised or cloned was published at its path, so the directory there is
 /// its tree and nothing below it, and its own `.git` leads to its repository. A project the
-/// owner adopted may have been adopted through a directory below its top level, and keeps its Git
-/// directory wherever its configuration puts it: the record cannot say that its path is the top
-/// level, so the directory at the path may lie inside the recorded tree.
+/// owner adopted keeps its Git directory wherever its configuration puts it. Its record says
+/// whether its path is the top level: where it is, the directory at the path is the tree and
+/// nothing below it; where the adoption named a directory below the top level, the directory at
+/// the path may lie inside the recorded tree.
 fn project_tree(project: &ProjectRow) -> RecordedTree {
     let git_dir = project.identity.git_dir;
     RecordedTree {
         tree: project.identity.work_tree,
         git_dir: match project.origin {
             ProjectOrigin::Initialised | ProjectOrigin::Cloned => GitDirectory::AtTree(git_dir),
-            ProjectOrigin::Adopted => GitDirectory::Named(git_dir),
+            ProjectOrigin::Adopted => GitDirectory::Named {
+                recorded: git_dir,
+                path_is_top_level: project.path_is_top_level,
+            },
         },
     }
 }

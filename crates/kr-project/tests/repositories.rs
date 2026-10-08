@@ -444,7 +444,10 @@ fn open_recorded(
         path,
         RecordedTree {
             tree: recorded.work_tree,
-            git_dir: GitDirectory::Named(recorded.git_dir),
+            git_dir: GitDirectory::Named {
+                recorded: recorded.git_dir,
+                path_is_top_level: false,
+            },
         },
     )
     .map(|(opened, _)| opened)

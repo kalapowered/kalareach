@@ -97,11 +97,19 @@ pub struct RecordedTree {
 #[derive(Clone, Copy, Debug)]
 pub enum GitDirectory {
     /// A record names it, and the repository keeps it wherever its configuration puts it: a
-    /// checkout whose configuration sets `core.worktree` keeps it above its tree. A repository the
-    /// owner registered may have been registered through a directory below its top level, so the
-    /// directory at the recorded path is the tree or lies inside it, and Git's search for the
-    /// repository is not stopped above the tree.
-    Named(RecordedIdentity),
+    /// checkout whose configuration sets `core.worktree` keeps it above its tree, so Git's search
+    /// for the repository is not stopped above the tree. A repository the owner registered may
+    /// have been registered through a directory below its top level; the record says whether its
+    /// path is the top level, and where it is not, the directory at the recorded path is the tree
+    /// or lies inside it.
+    Named {
+        /// The record of the repository's Git directory.
+        recorded: RecordedIdentity,
+        /// Whether the record's path is the working tree's top level, which the registration
+        /// established when the repository was taken in: the directory at the path is then the
+        /// tree itself, never a directory inside it.
+        path_is_top_level: bool,
+    },
     /// A record names it, and this host made the tree at the record's path: a linked worktree, or
     /// a repository it published. The tree's own `.git`, a directory or a file that names the
     /// repository's Git directory, is how Git finds the repository, so the directory at the path
@@ -164,6 +172,20 @@ impl Decided {
 }
 
 impl GitDirectory {
+    /// Returns whether the directory at the record's path is the working tree itself, and never a
+    /// directory inside it.
+    const fn path_is_tree(self) -> bool {
+        matches!(
+            self,
+            Self::AtTree(_)
+                | Self::InsideTree { .. }
+                | Self::Named {
+                    path_is_top_level: true,
+                    ..
+                }
+        )
+    }
+
     /// Returns whether Git's search for the repository stops above the tree: the repository is
     /// found from the tree's own `.git` and nowhere else.
     const fn stops_above_tree(self) -> bool {
@@ -196,7 +218,7 @@ impl GitDirectory {
         shown: &Path,
     ) -> Result<GitDirOutcome> {
         match self {
-            Self::Named(recorded)
+            Self::Named { recorded, .. }
             | Self::AtTree(recorded)
             | Self::InsideTree {
                 recorded: Some(recorded),
@@ -288,10 +310,11 @@ impl OpenedRepository {
     ///
     /// The directory is opened and decided first, and Git starts in that object: a directory that
     /// took the place of the recorded tree, or a filesystem mounted over it, is refused before Git
-    /// is asked anything. For a repository the owner registered, possibly through a directory
-    /// below its top level, the directory at the path may lie inside the recorded tree
+    /// is asked anything. For a repository the owner registered through a directory below its top
+    /// level the directory at the path may lie inside the recorded tree
     /// ([`GitDirectory::Named`], `require_within`); for a tree this host made
-    /// ([`GitDirectory::AtTree`], [`GitDirectory::InsideTree`]) it is the tree itself, and for a
+    /// ([`GitDirectory::AtTree`], [`GitDirectory::InsideTree`]) and for one the owner registered
+    /// at its top level it is the tree itself, and for a
     /// repository made inside its tree the tree's own `.git` must also be a directory, and the
     /// recorded one where a record names it, before Git starts. Git then
     /// reports the top level of the repository it finds, and that top level is decided before its
@@ -338,17 +361,17 @@ impl OpenedRepository {
         let work_tree = AuthorisedDirectory::open_root(environment_id, path)?;
         let ceiling = match recorded {
             Some(recorded) => {
-                // A tree this host made is at its own place and nowhere below it, so the
-                // directory at its path is the tree itself. A directory inside the tree is what
-                // Git would start in when a link at the path names one, and a repository found
-                // there is not the one the record is for. A repository the owner registered may
-                // have been registered through a directory below its top level.
-                let within = match recorded.git_dir {
-                    GitDirectory::InsideTree { .. } | GitDirectory::AtTree(_) => {
-                        decide_tree_before_git(&work_tree, recorded.tree)?;
-                        work_tree.try_clone()?
-                    }
-                    GitDirectory::Named(_) => require_within(&work_tree, recorded.tree)?,
+                // A tree this host made is at its own place and nowhere below it, and so is a
+                // repository the owner registered at its top level, so the directory at the path
+                // is the tree itself. A directory inside the tree is what Git would start in when
+                // a link at the path names one, and a repository found there is not the one the
+                // record is for. A repository the owner registered through a directory below its
+                // top level keeps that directory's path.
+                let within = if recorded.git_dir.path_is_tree() {
+                    decide_tree_before_git(&work_tree, recorded.tree)?;
+                    work_tree.try_clone()?
+                } else {
+                    require_within(&work_tree, recorded.tree)?
                 };
                 recorded.git_dir.decide_before_git(&within)?;
                 recorded
@@ -549,6 +572,13 @@ impl OpenedRepository {
     #[must_use]
     pub const fn admission(&self) -> Option<&ReadAdmission> {
         self.admission.as_ref()
+    }
+
+    /// Returns whether the directory this repository was opened through is its working tree's top
+    /// level, as opposed to a directory below it.
+    #[must_use]
+    pub fn path_is_top_level(&self) -> bool {
+        self.work_tree.identity() == self.top.identity()
     }
 
     /// Returns both identities as the journal records them.
