@@ -1137,6 +1137,23 @@ impl Environment {
         .await
     }
 
+    /// The destinations the daemon lists, as the owner reads them at its local socket.
+    async fn listed(&self) -> Vec<kr_protocol::delivery::DeliveryDestinationSummary> {
+        let mut client = self.host.client().await;
+        let answer = client
+            .request(
+                Method::DeliveryDestinationList,
+                &kr_protocol::delivery::DeliveryDestinationListParams {},
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner reads the list");
+        answer
+            .to_typed::<kr_protocol::delivery::DeliveryDestinationListResult>()
+            .expect("a list")
+            .destinations
+    }
+
     /// The owner removes a destination at the daemon's local socket.
     async fn remove(
         &self,
@@ -3443,6 +3460,9 @@ fn with_secret(
 async fn a_webhook_the_owner_creates_is_told_of_the_next_question_and_not_after_it_is_removed() {
     const WORDS: &str = "Deploy the release to production?";
     const ENDPOINT: &str = "https://hooks.example.test/in/ops";
+    // A token in the address's query, which the daemon sends to and never lists.
+    const ENDPOINT_WITH_TOKEN: &str =
+        "https://hooks.example.test/in/ops?token=not-a-real-token#top";
     let environment = Environment::start().await;
     let phone = environment.phone().await;
     let grant = phone.record.grant.grant_id;
@@ -3453,7 +3473,12 @@ async fn a_webhook_the_owner_creates_is_told_of_the_next_question_and_not_after_
     assert!(environment.gateway.posted().is_empty());
 
     let created = environment
-        .configure(&webhook("ops", ENDPOINT, Some("Idempotency-Key"), grant))
+        .configure(&webhook(
+            "ops",
+            ENDPOINT_WITH_TOKEN,
+            Some("Idempotency-Key"),
+            grant,
+        ))
         .await
         .expect("the owner creates a webhook");
     assert!(created.in_force);
@@ -3472,14 +3497,23 @@ async fn a_webhook_the_owner_creates_is_told_of_the_next_question_and_not_after_
         record.rule.as_ref().and_then(|rule| rule.grant_id),
         Some(grant)
     );
+    // The list names the address without the query and the fragment, which can carry a token.
+    let ops = environment
+        .listed()
+        .await
+        .into_iter()
+        .find(|listed| listed.destination_id == "ops")
+        .expect("the webhook is listed");
+    assert_eq!(ops.endpoint.0.as_deref(), Some(ENDPOINT));
 
     environment._worker.ask("deploy-1", WORDS);
     until("the webhook being posted to", || {
         !environment.gateway.posted().is_empty()
     })
     .await;
+    // And the daemon posts to the address as it was given.
     let posted = environment.gateway.posted().remove(0);
-    assert_eq!(posted.url, ENDPOINT);
+    assert_eq!(posted.url, ENDPOINT_WITH_TOKEN);
     let text = posted.text();
     assert!(text.contains("waiting for an answer"), "{text}");
     assert!(
