@@ -13,6 +13,7 @@ use kr_protocol::session::ClosureReason;
 use kr_transport::window::ActionWindowIssuer;
 use tokio::sync::Mutex;
 
+use crate::backup::runtime::{RealTimer, Timer};
 use crate::desktop::power::Inhibitor;
 use crate::directory::Directory;
 use crate::error::{ControllerError, Result};
@@ -218,7 +219,7 @@ impl Controller {
     /// Returns an error when another daemon owns the environment, the registry cannot be opened,
     /// or the controller identity is missing.
     pub async fn start(setup: ControllerSetup) -> Result<Arc<Self>> {
-        Self::start_with(setup, Clocks::system()).await
+        Self::start_with(setup, Clocks::system(), Arc::new(RealTimer)).await
     }
 
     /// Starts the daemon on the clocks a test gives it, by the same path [`Self::start`] takes on
@@ -229,18 +230,44 @@ impl Controller {
     /// As [`Self::start`].
     #[cfg(feature = "testing")]
     pub async fn start_on_clocks(setup: ControllerSetup, clocks: Clocks) -> Result<Arc<Self>> {
-        Self::start_with(setup, clocks).await
+        Self::start_with(setup, clocks, Arc::new(RealTimer)).await
     }
 
-    async fn start_with(setup: ControllerSetup, clocks: Clocks) -> Result<Arc<Self>> {
-        Self::start_passing(setup, clocks, PassSchedule::every(DEBT_PASS_INTERVAL)).await
+    /// Starts the daemon with the wait between its backup passes in the hands of `timer`, which a
+    /// test releases when it has seen how long the daemon asked to wait.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    #[cfg(feature = "testing")]
+    pub async fn start_on_backup_timer(
+        setup: ControllerSetup,
+        timer: Arc<dyn Timer>,
+    ) -> Result<Arc<Self>> {
+        Self::start_with(setup, Clocks::system(), timer).await
     }
 
-    /// The one start, with the schedule its debt pass keeps.
+    async fn start_with(
+        setup: ControllerSetup,
+        clocks: Clocks,
+        timer: Arc<dyn Timer>,
+    ) -> Result<Arc<Self>> {
+        Self::start_passing(
+            setup,
+            clocks,
+            PassSchedule::every(DEBT_PASS_INTERVAL),
+            timer,
+        )
+        .await
+    }
+
+    /// The one start, with the schedule its debt pass keeps and the timer its backup carrier waits
+    /// by.
     pub(super) async fn start_passing(
         setup: ControllerSetup,
         clocks: Clocks,
         passes: PassSchedule,
+        timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
         let Clocks {
             continuous: clock,
@@ -569,6 +596,46 @@ impl Controller {
             net::pairing::HostPairingClock::new(&setup.boot_identity),
             net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
         ));
+        // The managed storage service this host uploads its backups to, when its configuration
+        // document selects one. Its clients are built here, from that document and from nothing a
+        // process inherited, and they sign as a writer key only this host holds, made the first
+        // time one is needed and loaded after that. Nothing runs yet: settling comes before the
+        // store is reconciled, and the carrier starts after it.
+        let backup_runtime = match started.storage.origin() {
+            None => None,
+            Some(origin) => {
+                let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
+                    ControllerError::NotConfigured(format!(
+                        "{} in this host's configuration document ({}) is not usable: {error}",
+                        kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+                        kr_protocol::hostinfo::configuration::FILE_NAME,
+                    ))
+                })?;
+                let writer = kr_crypto::store::load_or_create_backup_writer(
+                    &*secret_store,
+                    &net::device_key_scope(setup.environment_id),
+                )
+                .map_err(ControllerError::registry)?;
+                let tokens = Arc::new(
+                    kr_client::services::voice::AccountTokenFile::under(setup.paths.runtime_root())
+                        .for_origin(origin.as_str()),
+                );
+                let clients = crate::backup::runtime::managed_clients(
+                    &origin,
+                    Self::proxy_of(&started)?.as_ref(),
+                    &writer,
+                    &tokens,
+                )?;
+                Some(crate::backup::runtime::BackupRuntime::new(
+                    Arc::clone(&backup),
+                    &clients,
+                    writer,
+                    &origin,
+                    tokens,
+                    timer,
+                )?)
+            }
+        };
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
         let delivery = Arc::new(crate::push::DeliveryModule::open(
@@ -719,6 +786,7 @@ impl Controller {
             supervisor,
             plugin_runtime,
             backup,
+            backup_runtime,
             transfer,
             project,
             qualification: std::sync::RwLock::new(qualification),
@@ -901,6 +969,12 @@ impl Controller {
         // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // that left this host and was never answered is recorded as unknown rather than guessed at.
         {
+            // What an earlier run sent to the storage service and never saw answered is asked
+            // about first, for a few seconds at most, so that reconciliation finishes a generation
+            // the service holds rather than recording it as one this host cannot establish.
+            if let Some(runtime) = &controller.backup_runtime {
+                runtime.settle(crate::backup::runtime::SETTLE_BUDGET).await;
+            }
             let backup = Arc::clone(&controller.backup);
             let now_ms = kr_ipc::now_ms();
             tokio::task::spawn_blocking(move || backup.reconcile(now_ms))
@@ -908,6 +982,10 @@ impl Controller {
                 .map_err(|_| ControllerError::RegistryUnavailable {
                     detail: "the backup service could not be reconciled".to_owned(),
                 })??;
+            // And then the outbox is carried, for as long as the daemon runs.
+            if let Some(runtime) = &controller.backup_runtime {
+                runtime.run();
+            }
         }
         // Delivery the same way: what an earlier daemon left on the wire becomes an outcome
         // nobody knows, and what is no longer authorised is taken back, before a pass can claim

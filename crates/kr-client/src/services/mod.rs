@@ -1271,8 +1271,12 @@ pub struct ServiceClients {
     pub relay_leases: Option<std::sync::Arc<dyn RelayLeaseService>>,
     /// Push registration.
     pub push: Option<std::sync::Arc<dyn PushService>>,
-    /// Encrypted sync and backup.
+    /// Encrypted settings sync, which a device runs.
     pub sync_backup: Option<std::sync::Arc<dyn SyncBackupService>>,
+    /// Managed storage, which a host uploads its backups to.
+    pub storage: Option<std::sync::Arc<dyn StorageService>>,
+    /// The backup manifest, where a host publishes the generations it uploaded.
+    pub backup_manifest: Option<std::sync::Arc<dyn BackupManifestService>>,
     /// Managed inference: the voice broker, which is what this product meters inference through.
     pub managed_inference: Option<std::sync::Arc<dyn ManagedVoiceService>>,
 }
@@ -1299,7 +1303,11 @@ impl ServiceClients {
             ManagedService::AccountLogin => self.account.is_some(),
             ManagedService::RelayLeases => self.relay_leases.is_some(),
             ManagedService::Push => self.push.is_some(),
-            ManagedService::SyncBackup => self.sync_backup.is_some(),
+            ManagedService::SyncBackup => {
+                self.sync_backup.is_some()
+                    || self.storage.is_some()
+                    || self.backup_manifest.is_some()
+            }
             ManagedService::ManagedInference => self.managed_inference.is_some(),
         }
     }

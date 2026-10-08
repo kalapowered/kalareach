@@ -3170,12 +3170,61 @@ what lets the fence's cleanup finish. Nothing is sent before the store has recon
 privacy step this host could not take is outstanding, or while the storage service says backup
 storage is off, and a pass with no work asks the service nothing.
 
-### What it does not do
+### The carrier
 
-It serves no method. `storage.*` and `backup.manifest` are *service* methods, which this host calls
-rather than answers. The daemon does not start the uploader, and it holds no source for the account
-token that spends an account's storage beside the host's signature, so a running host sends nothing
-to a service.
+The daemon runs the uploader for as long as it lives when the configuration document names a
+`storage.origin`, and does nothing about storage when it names none. The origin is read once, when
+the daemon starts, so an edit applies at the next start, and `kr doctor` says so.
+
+At start the daemon makes the storage and backup manifest clients for that origin, through the proxy
+the document selects, and signs with a writer key only this host holds. The key is made the first
+time an origin is configured and loaded after that, in the same secret store as the host's device
+keys. An owner enrols its public half at the service as the writer of a collection, so the host
+publishes as a writer that owner chose and no other. The first thing the daemon does with the
+service is ask what became of any publication an earlier run sent and never saw answered
+(`Uploader::settle`), for five seconds at most, and then it reconciles its store and starts
+carrying the outbox. A service that does not say in time does not hold the start: reconciliation
+records the generation as unknown, as it does for a publication nothing could ask about.
+
+Requests that spend an account's storage carry the account token the operator imported with `kr
+account token import`, beside the writer's signature. The daemon reads the file for each request,
+so a token imported while it runs is used from then on. It sends nothing with a token that is
+absent, that was issued for another service, that lacks the `backup.write` scope or that the file
+says has expired, and while there is work and no usable token it looks at the file again every
+30 seconds. The token is an access token with no refresh, so an upload that outlasts it stops
+until the operator imports another. A host that signs in for itself needs a grant it can renew,
+which this carrier does not have.
+
+The carrier waits between passes as the service and the cause allow:
+
+| What stopped the pass | When the daemon asks again |
+| --- | --- |
+| Work arrived: a generation admitted, a writer enrolled, a fence released | At once, unless the service asked to be left alone |
+| The service is busy, unreachable or slow | After the longer of the delay it named and a jittered delay that doubles from 250 ms to 30 s; work that arrives meanwhile waits |
+| Only a person can clear it: backup storage is off, the account has no allowance, the writer is not enrolled | After five minutes, or when work or a writer arrives |
+| A privacy fence was raised | At once, whatever else it waits for, because the cleanup a fence owes ends work in flight |
+| Nothing is owed | When something changes |
+
+A pass ends at a refusal that names a delay: the service asked to be left alone, so it is not asked
+about the next attempt either. A refusal that names none may be about one attempt alone, an object
+the service already holds for example, and the pass goes on to the next.
+
+A part is 8 MiB and its answer begins only after the part has been sent, so storage exchanges
+are given 60 seconds to start answering and 90 in all, which is the time the slowest uplink the host
+supports needs to send one: about 1.1 Mbit/s. The carrier runs as a task of its own, so a service
+that never answers holds that task and not the daemon, and stopping the daemon ends the exchange
+in flight. A step in the middle of a store write finishes first.
+
+What it does not do: it produces no generation. Sealing one from the host's state, the schedule it
+is made on, the owner's confirmed enrolment of the writer and a restore are the host-backup work,
+which admits generations to the outbox this carries. It serves no method of its own: `storage.*`
+and `backup.manifest` are *service* methods, which this host calls rather than answers.
+
+`kr doctor` reports the service as the `managed-storage` check: whether the account token is usable,
+whether backup storage is on for the account, what the last pass did and why the service turned a
+request back, when it did. When no origin is configured the check is not applicable. The doctor asks the service
+about backup storage once itself, for five seconds at most, unless the daemon is waiting out a
+delay the service asked for or has no usable token, and then it shows the last answer.
 
 ## Privacy mode
 
