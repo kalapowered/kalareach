@@ -1086,12 +1086,24 @@ struct VoiceAllow {
     actions: Option<Vec<kr_protocol::voice::VoiceAction>>,
 }
 
+/// What allowing voice came to: the sentences the grant states, and what it could not carry. The
+/// device the grant is for is not in it.
+#[derive(Debug, Serialize)]
+pub struct VoiceAllowed {
+    /// What the grant permits, each action in the sentence that states it.
+    pub statement: kr_protocol::voice::VoiceGrantStatement,
+    /// The actions the person asked for that this device's own grant does not carry, so the grant
+    /// does not either.
+    pub not_held_by_device: kr_protocol::scalars::CanonicalSet<kr_protocol::voice::VoiceAction>,
+}
+
 /// Lets the person allow what a voice call on this device may do, for the host it is paired with.
 ///
 /// The grant is this device's own, so native code names the device: the page does not hold the
 /// identity the host gave it, and a grant for any other device is a host-management change that
 /// this application, a paired device, does not make. The answer states every action the grant
-/// permits and every one the device's own grant could not carry.
+/// permits and every one the device's own grant could not carry, and nothing else of what the host
+/// answered: the identity of the device stays here.
 #[tauri::command]
 pub async fn voice_allow(
     state: State<'_, AppState>,
@@ -1107,28 +1119,45 @@ pub async fn voice_allow(
                 .map_err(|_| CommandError::invalid("that is not a session identifier"))
         })
         .collect::<Result<Vec<kr_protocol::ids::SessionId>>>()?;
+    // One connection's identity, environment and session, so the grant cannot name a device of one
+    // host and be sent to another.
+    let (device_id, environment_id, session) = state.paired_snapshot()?;
     let typed = kr_protocol::voice::VoiceGrantParams {
-        device_id: state.paired_device_id()?,
+        device_id,
         session_ids: session_ids.into_iter().collect(),
         actions: kr_protocol::scalars::Nullable::from(
             allowed.actions.map(|actions| actions.into_iter().collect()),
         ),
     };
-    let target = subject.target(state.environment_id()?)?;
-    let session = state.session()?;
-    submitted(
-        session
-            .mutate(
-                Method::VoiceGrant,
-                target,
-                None,
-                &NoPreconditions {},
-                &typed,
-                MUTATION_TTL,
-            )
-            .await,
-    )
+    let target = subject.target(environment_id)?;
+    let settled = session
+        .mutate(
+            Method::VoiceGrant,
+            target,
+            None,
+            &NoPreconditions {},
+            &typed,
+            MUTATION_TTL,
+        )
+        .await;
+    match settled {
+        Ok(kr_client::Settled::Result(value)) => {
+            let granted: kr_protocol::voice::VoiceGrantResult = value
+                .to_typed()
+                .map_err(|error| CommandError::local_failure(error.to_string()))?;
+            Ok(Settled {
+                receipt: None,
+                action_id: None,
+                value: Some(encode(&VoiceAllowed {
+                    statement: granted.statement,
+                    not_held_by_device: granted.not_held_by_device,
+                })?),
+            })
+        }
+        other => submitted(other),
+    }
 }
+
 /// The request a delegation continues, when it carries the evidence a host asked for.
 ///
 /// `None` is a first submission, which is a new intent and takes a new identity.
