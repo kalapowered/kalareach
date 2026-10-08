@@ -712,6 +712,8 @@ impl Controller {
             | Method::GrantTransfer
             | Method::DeviceRevoke
             | Method::DevicePreviewKeyUpdate
+            | Method::DeliveryDestinationConfigure
+            | Method::DeliveryDestinationRemove
             | Method::DeliveryDestinationSecretSet => {
                 self.authority_change(
                     actor_id,

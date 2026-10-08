@@ -201,6 +201,8 @@ impl Controller {
                 | Method::GrantTransfer
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
+                | Method::DeliveryDestinationConfigure
+                | Method::DeliveryDestinationRemove
                 | Method::DeliveryDestinationSecretSet
                 | Method::PrivacySet
                 | Method::AccountSignIn
