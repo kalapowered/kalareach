@@ -751,6 +751,22 @@ impl CommandBackends {
                 "the answered vector is not the typed one with the added flags as one run"
                     .to_owned()
             })?;
+        // An integration that starts a backend serves a plain launch of the terminal and nothing
+        // else: the server is started with the arguments the package declares, so an option typed
+        // for the terminal, or a word that is another subcommand's name, would not reach it. The
+        // refusal names what was typed, and the invocation runs as typed.
+        if let Some(backend) = declared.backend.as_ref() {
+            if let Some(why) = backend.refuses(request.typed) {
+                return Err(format!("{why}, so this invocation runs as typed"));
+            }
+            // This worker does not start a backend yet. Admitting the launch would run the
+            // terminal against a gateway nothing has opened.
+            return Err(format!(
+                "{} declares a backend, and this worker does not run one yet, so this invocation \
+                 runs as typed",
+                connector.plugin_id()
+            ));
+        }
 
         let invocation = Invocation {
             typed: request.typed.to_vec(),

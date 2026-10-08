@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::PluginCapability;
 use crate::connector::{
-    ConnectorManifest, DecisionDestination, FieldPath, FieldSegment, Framing,
+    BrokerTransport, ConnectorManifest, DecisionDestination, FieldPath, FieldSegment, Framing,
     MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH, MethodClass,
     ResponseCorrelation, RouteDirection,
 };
@@ -1110,6 +1110,9 @@ fn check_manifest(
                 problem,
             ));
         }
+        if integration.backend.is_some() {
+            check_backend_table(connector, report);
+        }
     }
     // A launch probe runs the application's own executable with arguments the package chose, so it
     // has a capability of its own, and what it may declare is closed.
@@ -2144,6 +2147,118 @@ fn is_header_name(text: &str) -> bool {
         && text
             .chars()
             .all(|character| character.is_ascii_graphic() && character != ':')
+}
+
+/// Checks that the table a backend is read with is one the worker's gateway can read.
+///
+/// The gateway reads one JSON message per line over the backend's standard streams, takes a frame
+/// that names the method member for a request, and reads every member it needs at the top level of
+/// the frame. A table the SDK accepts for another purpose (a nested identifier path, ordered
+/// correlation, an event stream) is not one it reads, and the package says so here, where the
+/// publisher can fix it, rather than at the first launch.
+fn check_backend_table(connector: Option<&ConnectorManifest>, report: &mut Report) {
+    let Some(connector) = connector else {
+        report.push(Finding::at(
+            FindingCode::IntegrationInvalid,
+            MANIFEST_FILE,
+            "the integration declares a backend and the package ships no connector table, so \
+             there is nothing for the gateway to read",
+        ));
+        return;
+    };
+    let mut refuse = |detail: String| {
+        report.push(Finding::at(
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            detail,
+        ));
+    };
+    if connector.transport != BrokerTransport::Stdio {
+        refuse(format!(
+            "a backend is read over its standard streams, and the table's transport is {:?}",
+            connector.transport
+        ));
+    }
+    if !matches!(connector.framing, Framing::LineDelimitedJson { .. }) {
+        refuse(
+            "a backend's messages are one JSON document per line, and the table frames them \
+             another way"
+                .to_owned(),
+        );
+    }
+    let ResponseCorrelation::MatchingId { id_path } = &connector.response_correlation else {
+        refuse(
+            "a backend's responses repeat the request's identifier, and the table correlates \
+             them by order"
+                .to_owned(),
+        );
+        return;
+    };
+    let top_level = |path: &FieldPath, what: &str, refuse: &mut dyn FnMut(String)| {
+        if let [FieldSegment::Member { name }] = path.segments.as_slice() {
+            return Some(name.clone());
+        }
+        refuse(format!(
+            "the gateway reads {what} as one top-level member, and the table's path is {}",
+            dotted(path)
+        ));
+        None
+    };
+    let request_id = top_level(
+        &connector.request_id_path,
+        "a request's identifier",
+        &mut refuse,
+    );
+    let method = top_level(&connector.method_path, "a message's method", &mut refuse);
+    let response_id = top_level(id_path, "a response's identifier", &mut refuse);
+    if connector.methods.len() > kr_protocol::gateway::MAX_TABLE_METHODS {
+        refuse(format!(
+            "the gateway interprets at most {} methods, and the table classifies {}",
+            kr_protocol::gateway::MAX_TABLE_METHODS,
+            connector.methods.len()
+        ));
+    }
+    let Some(messages) = &connector.messages else {
+        refuse(
+            "a backend's table names the members a message is read by (messages), and this one \
+             names none"
+                .to_owned(),
+        );
+        return;
+    };
+    // The names the gateway tells a request, a response and its payload apart by. A request and a
+    // response may share their identifier member, as JSON-RPC's do; no other two may share a name.
+    let members = [
+        ("params", Some(messages.params.as_str())),
+        ("result", Some(messages.result.as_str())),
+        ("error", Some(messages.error.as_str())),
+        ("method", method.as_deref()),
+    ];
+    for (name, value) in &members[..3] {
+        if value.is_some_and(str::is_empty) {
+            refuse(format!("messages.{name} names no member"));
+        }
+    }
+    for (index, (first, first_name)) in members.iter().enumerate() {
+        for (second, second_name) in &members[index + 1..] {
+            if first_name.is_some() && first_name == second_name {
+                refuse(format!(
+                    "messages.{first} and {second} name the same member, {:?}",
+                    first_name.unwrap_or_default()
+                ));
+            }
+        }
+    }
+    for (identifier, which) in [(&request_id, "a request's"), (&response_id, "a response's")] {
+        for (name, value) in &members {
+            if identifier.as_deref().is_some() && identifier.as_deref() == *value {
+                refuse(format!(
+                    "{which} identifier member is also the {name} member, {:?}",
+                    value.unwrap_or_default()
+                ));
+            }
+        }
+    }
 }
 
 fn check_connector(connector: &ConnectorManifest, report: &mut Report) {

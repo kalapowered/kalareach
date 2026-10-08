@@ -1181,3 +1181,71 @@ async fn kr_req_12_07_a_bypassed_invocation_exports_nothing() {
         ))
         .expect_err("an invocation the worker refuses has nothing to export");
 }
+
+/// The session's entry for the Codex-shaped package: its command, and the flags it adds as it
+/// declares them, the gateway's address among them.
+fn codex_integration() -> CommandIntegration {
+    CommandIntegration {
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach/codex").expect("a plugin identifier"),
+        command: "codex".to_owned(),
+        flags: words(&["--remote", "{gateway}"]),
+        enabled: true,
+    }
+}
+
+/// KR-REQ-12.07: an integration that starts a backend serves a plain launch of the terminal and
+/// nothing else. A launch that types an option, or whose first word the package does not list,
+/// establishes nothing and says which element it refused; and a plain launch is refused too while
+/// this worker starts no backend, by a reason of its own, so the invocation runs as typed in each
+/// case and nothing is created. Control: a connector with no backend keeps the options a person
+/// typed.
+#[tokio::test]
+async fn kr_req_12_07_a_backend_integration_serves_a_plain_launch_and_names_what_it_refuses() {
+    let setup = Setup::shaped(
+        &fixture::Shape::codex_backend(),
+        &["bin", "codex"],
+        |config| config,
+    );
+    let integration = codex_integration();
+    let refused = |typed: &[&str]| {
+        let launch = invocation_adding(typed, &["--remote", "{gateway}"]);
+        setup
+            .backends
+            .establish(&request(&setup, &launch, &integration, 1))
+            .expect_err("no backend is established")
+    };
+    let why = refused(&["codex", "-c", "model=x"]);
+    assert!(why.contains("\"-c\" is an option"), "{why}");
+    assert!(why.ends_with("so this invocation runs as typed"), "{why}");
+    let why = refused(&["codex", "resume", "--last"]);
+    assert!(why.contains("\"--last\" is an option"), "{why}");
+    let why = refused(&["codex", "exec", "task"]);
+    assert!(
+        why.contains("\"exec\" is not a launch the gateway serves"),
+        "{why}"
+    );
+    let why = refused(&["codex", "fix the failing test"]);
+    assert!(why.contains("followed by \"resume\" or \"fork\""), "{why}");
+    // A plain launch passes the rule and meets the one thing left: no backend runs yet.
+    for typed in [
+        &["codex"][..],
+        &["codex", "resume"],
+        &["codex", "fork", "abc"],
+    ] {
+        let why = refused(typed);
+        assert!(why.contains("does not run one yet"), "{typed:?}: {why}");
+    }
+    assert!(
+        setup.established().is_empty(),
+        "a refusal creates nothing: {:?}",
+        setup.established()
+    );
+
+    // Control: Claude Code declares no backend, so its typed options do not refuse the launch.
+    let claude = Setup::new();
+    let typed = invocation(&["claude", "--resume"]);
+    claude
+        .backends
+        .establish(&request(&claude, &typed, &Setup::integration(), 1))
+        .expect("a connector with no backend is established with an option typed");
+}

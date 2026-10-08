@@ -1358,6 +1358,15 @@ export interface ConnectorManifest {
    * The manifest format version.
    */
   manifest_version: number
+  /**
+   * The members a message is read by beyond its identifier and method, for a table the
+   * worker's gateway reads.
+   *
+   * A table that declares a backend in its package's command integration states them. A table
+   * that does not leaves the member out, so a connector written before the member existed
+   * reads and hashes exactly as it did.
+   */
+  messages?: MessageMembers | null
   method_path: FieldPath2
   /**
    * What each method does.
@@ -1469,6 +1478,30 @@ export interface FieldPath1 {
    * The path segments, from the root of the message.
    */
   segments: FieldSegment[]
+}
+/**
+ * The top-level members a message is read by, beyond its identifier and its method.
+ *
+ * A table that the worker's gateway reads for a native terminal and the backend behind it names
+ * them here: the member a request carries its parameters in, the member a successful response
+ * carries its result in, and the member a failed response carries its error in. The gateway
+ * treats a frame that names the method member as a request, a frame that names exactly one of the
+ * result and error members as a response, and anything else as neither, so the three names and
+ * the identifier and method members all differ.
+ */
+export interface MessageMembers {
+  /**
+   * The member a failed response carries its error in.
+   */
+  error: string
+  /**
+   * The member a request carries its parameters in.
+   */
+  params: string
+  /**
+   * The member a successful response carries its result in.
+   */
+  result: string
 }
 /**
  * Where a message names its method.
@@ -3323,6 +3356,14 @@ export interface AttachmentContribution {
  */
 export interface CommandIntegration {
   /**
+   * The backend the worker starts for the integrated invocation, where the application's
+   * terminal speaks to a server.
+   *
+   * A package that declares none leaves the member out, so a manifest written before the
+   * member existed reads and hashes exactly as it did.
+   */
+  backend?: IntegrationBackend | null
+  /**
    * The command name a person types, with no directory.
    */
   command: string
@@ -3339,6 +3380,25 @@ export interface CommandIntegration {
    * The environment variables the integration sets for that invocation, in order.
    */
   variables: IntegrationVariable[]
+}
+/**
+ * The backend a command integration starts.
+ */
+export interface IntegrationBackend {
+  /**
+   * The arguments the application's own executable is started with to make the backend, in
+   * order, each one argument element. The executable is the one the shell resolved for the
+   * command; a package cannot name another.
+   */
+  arguments: string[]
+  /**
+   * The words that may follow the command name for a launch the backend is started for.
+   *
+   * A launch whose first word is absent, or one of these, and that types no option, is a plain
+   * launch of the terminal. Any other launch (a subcommand that is not a terminal, an option,
+   * a prompt) runs as typed, because the closed list is what the package qualified.
+   */
+  launching_words: string[]
 }
 /**
  * One environment variable a command integration sets.

@@ -444,6 +444,63 @@ fn the_doctor_reports_each_integration_and_its_resolution() {
     );
 }
 
+/// KR-REQ-07.45: the doctor says why an invocation runs as typed where the first hit on the search
+/// path is a script, whatever the platform, since the worker reads no identity for a script; and it
+/// says it of an integration that starts a backend, which this worker does not run yet. Control:
+/// a program found first has neither reason, and the mode it runs in is the bridge's.
+#[cfg(unix)]
+#[test]
+fn the_doctor_says_why_a_script_or_a_backend_runs_as_typed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let store = Store::new("script");
+    let bin = store.0.join("bin");
+    let program = executable(&bin, "claude");
+    let reading = Integrations::new().read(&[
+        store.admitted(&fixture::Shape::claude_code(), |_| {}),
+        store.admitted(&fixture::Shape::codex_backend(), |_| {}),
+    ]);
+    let on = enabled(&["claude-code", "codex"]);
+    let found = || {
+        report(Some(&reading), &[], &on, &able(vec![bin.clone()]))
+            .reports
+            .into_iter()
+            .map(|report| (report.plugin_id.clone(), report))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let reports = found();
+    assert_eq!(reports["kalareach/claude-code"].reason.0, None);
+    assert_eq!(
+        reports["kalareach/claude-code"].mode,
+        IntegrationMode::NativeBridge
+    );
+    let backend = &reports["kalareach/codex"];
+    assert!(
+        backend.reason.0.as_deref().is_some_and(
+            |reason| reason.contains("starts a backend, which this worker does not run yet")
+        ),
+        "{:?}",
+        backend.reason
+    );
+    assert_eq!(backend.mode, IntegrationMode::NativeTerminal);
+
+    // The same command found as a script: the reason names it, and the mode is the terminal's.
+    std::fs::write(&program, "#!/bin/sh\nexec true\n").expect("a script");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    let reports = found();
+    let script = &reports["kalareach/claude-code"];
+    assert!(
+        script
+            .reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.contains("a script or shim that no launcher starts")),
+        "{:?}",
+        script.reason
+    );
+    assert_eq!(script.mode, IntegrationMode::NativeTerminal);
+}
+
 /// KR-REQ-07.45: an integration the configuration turns on is reported as one a session created
 /// now cannot launch through where the platform establishes no backend or no launcher is
 /// installed, and its command then runs as typed.
@@ -767,6 +824,7 @@ fn many(store: &Store, prefix: &str, count: usize, flags: &[String]) -> Vec<Admi
                     launch_probe: None,
                     native_bridge: false,
                     component: false,
+                    gateway: false,
                 },
                 |_| {},
             )
