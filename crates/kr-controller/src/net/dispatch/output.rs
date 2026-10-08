@@ -177,8 +177,14 @@ pub(super) fn bounds_hold(
                 return false;
             }
             Stands::EndedOnTheContinuousClock => {
-                if matches!(held.snapshot().identity, BoundIdentity::Offline { .. }) {
-                    controller.lifetimes().owe_offline_time();
+                match held.snapshot().identity {
+                    BoundIdentity::Offline { .. } => controller.lifetimes().owe_offline_time(),
+                    // A share that ran out on the clock that cannot be wound back stays run out:
+                    // its end is owed to the grant store, which the host's record task writes.
+                    BoundIdentity::Share { grant_id } => {
+                        controller.lifetimes().owe_stored_expiry(grant_id);
+                    }
+                    BoundIdentity::Lease(_) | BoundIdentity::Unbounded => {}
                 }
                 return false;
             }

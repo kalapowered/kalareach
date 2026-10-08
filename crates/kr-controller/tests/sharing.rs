@@ -2582,6 +2582,92 @@ async fn a_stored_grants_effect_tests_both_of_its_deadlines() {
     an_expiring_grant_this_boot_never_anchored_is_refused_under_a_distrusted_clock().await;
 }
 
+/// KR-REQ-25.10: the admission a redemption is made under is asked inside the commit that
+/// activates the grant, after the wait for the store, and not before it. The redemption passes its
+/// early checks and is stopped before the store's transaction; the admission lapses while it
+/// waits, and nothing is activated. The control lets the redemption go with the admission standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redemption_is_admitted_inside_its_commit_and_not_before_the_wait_for_the_store() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for lapses in [true, false] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let now = kr_ipc::now_ms().get();
+        let controller = start_daemon_on(
+            &temp,
+            kr_controller::service::Clocks {
+                continuous: Arc::new(kr_transport::clock::ManualClock::new()),
+                wall: kr_controller::service::WallClock::from_fn(move || now),
+            },
+        )
+        .await;
+        let environment_id = controller.paths().environment_id();
+        let shared = controller
+            .sharing()
+            .share(
+                &ShareRequest {
+                    environment_id,
+                    issuer_device_id: DeviceId::new(environment_id.get()),
+                    recipient_device_id: device_id(0xf1),
+                    authority_revision: controller.policy().authority_revision(),
+                    now_ms: now,
+                    ..share(SessionRole::Viewer, 1)
+                },
+                || Ok(()),
+            )
+            .expect("the host shares a session");
+
+        let admitted = Arc::new(AtomicBool::new(true));
+        let (arrived, go) = controller.sharing().grants().pause_before_effect();
+        let redeeming = {
+            let controller = Arc::clone(&controller);
+            let admitted = Arc::clone(&admitted);
+            let invitation = shared.preview.invitation_id;
+            tokio::spawn(async move {
+                controller.sharing().redeem(
+                    invitation,
+                    device_id(0xf1),
+                    now + 1,
+                    || {
+                        if admitted.load(Ordering::SeqCst) {
+                            Ok(())
+                        } else {
+                            Err(kr_controller::error::ControllerError::WindowExpired {
+                                detail: "the window ran out while the store was busy".to_owned(),
+                            })
+                        }
+                    },
+                    None,
+                )
+            })
+        };
+        tokio::task::spawn_blocking(move || arrived.recv())
+            .await
+            .expect("the wait ends")
+            .expect("the redemption reaches the store");
+        if lapses {
+            admitted.store(false, Ordering::SeqCst);
+        }
+        go.send(()).expect("the redemption waits");
+        let outcome = redeeming.await.expect("the redemption ends");
+
+        let activated = controller
+            .sharing()
+            .grants()
+            .record(shared.grant.grant_id)
+            .expect("readable")
+            .expect("the grant")
+            .is_active();
+        if lapses {
+            outcome.expect_err("the admission lapsed while the redemption waited");
+            assert!(!activated, "nothing was activated");
+        } else {
+            outcome.expect("with the admission standing the redemption commits");
+            assert!(activated);
+        }
+    }
+}
+
 async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
 

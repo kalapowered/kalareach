@@ -657,10 +657,10 @@ async fn kr_req_10_50_a_share_is_written_only_for_a_screen_its_issuer_was_shown_
             }),
         })
     };
-    // What a worker that does not know the read answers, in the words it answers an unknown read.
+    // What a worker that does not list the read answers, as it answers any method it does not list.
     let earlier_build = Err(ProtocolError::new(
-        ErrorCode::InvalidArgument,
-        "session.screen.preview is not a read this worker serves",
+        ErrorCode::PermissionDenied,
+        kr_protocol::local::METHOD_NOT_REACHABLE,
     ));
     for (action, answer, refused) in [
         (0x72, screen(true), Some(ErrorCode::InvalidArgument)),
