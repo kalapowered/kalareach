@@ -525,6 +525,14 @@ impl WorkerService {
     /// is reported pending and nothing is asked for.
     #[must_use]
     pub fn with_plugin_runtime(mut self, request: crate::plugin_runtime::RuntimeRequest) -> Self {
+        // The same daemon, on the same endpoint, is asked about the drafts an attachment is
+        // offered from.
+        self.broker
+            .drafts()
+            .connect(crate::daemon_link::DaemonLink::new(
+                request.session_id,
+                request.rendezvous.clone(),
+            ));
         self.plugin_runtime = Some(request);
         self
     }
@@ -3704,7 +3712,25 @@ impl WorkerService {
     /// The preparation is bounded by what is left of the action's accepted deadline.
     async fn prepare(&self, pending: &PendingPreparation) -> Preparation {
         let within = pending.deadline.saturating_duration_since(self.clock.now());
-        self.broker.prepare(&pending.request, within).await
+        // The receipt is read once more immediately before an attachment is claimed: an action
+        // that was cancelled or fenced while its plan was prepared claims nothing.
+        let accepted = || {
+            let mut session = self.runtime.session();
+            session
+                .journal_mut()
+                .and_then(|journal| {
+                    journal
+                        .read(pending.caller.actor_id.clone(), pending.mutation.action_id)
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|receipt| {
+                    receipt.state == kr_protocol::receipt::ReceiptState::Accepted
+                })
+        };
+        self.broker
+            .prepare(&pending.request, within, &accepted)
+            .await
     }
 
     /// Finishes an accepted action whose effect has been prepared: the revalidation inside the
@@ -3906,8 +3932,15 @@ impl WorkerService {
         // is settled before the receipt is recorded and before the caller hears: at the deadline,
         // what `carry` was waiting for is dropped here, and an answer's claim goes with it.
         let deadline = tokio::time::Instant::now() + UPSTREAM_SUBMIT_DEADLINE;
-        let outcome = pending.handoff.carry(deadline).await;
+        let mut handoff = pending.handoff;
+        let claim = handoff.claim.take();
+        let outcome = handoff.carry(deadline).await;
         self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
+        // The offer is reported from what the receipt now says: applied is accepted, a refusal the
+        // upstream proved is a failure, and anything else is unknown.
+        if let Some(claim) = claim {
+            claim.report(reported_outcome(outcome.as_ref()));
+        }
         match outcome {
             Ok(value) => ControlFrame::Response(Response {
                 request_id: pending.request_id,
@@ -4493,6 +4526,14 @@ impl WorkerService {
             }
         }
 
+        // From here the agent may be sent what was prepared: an offer the control daemon claimed is
+        // reported as unknown, not as failed, if nothing says what became of it.
+        let mut prepared = prepared;
+        if let Some(Prepared::Upstream(handoff)) = prepared.as_mut()
+            && let Some(claim) = handoff.claim.as_mut()
+        {
+            claim.dispatched();
+        }
         let outcome = self.apply(&mut session, state, mutation, method, caller, prepared);
         // A launch that reached the reader has no outcome yet, so none is recorded: it is settled
         // when the reader answers, outside this boundary. An admitted upstream operation is the
@@ -5246,10 +5287,22 @@ impl WorkerService {
 
     /// Wraps one broker admission as the work that happens once the session boundary ends.
     fn handoff(&self, admitted: crate::broker::MutationAdmission, kind: UpstreamKind) -> Prepared {
+        self.handoff_claiming(admitted, kind, None)
+    }
+
+    /// The same, for an operation that carries an offer the control daemon claimed: the hold goes
+    /// with it, and what the operation comes to is what the offer is reported as.
+    fn handoff_claiming(
+        &self,
+        admitted: crate::broker::MutationAdmission,
+        kind: UpstreamKind,
+        claim: Option<crate::daemon_link::ClaimHold>,
+    ) -> Prepared {
         Prepared::Upstream(Box::new(UpstreamHandoff {
             broker: Arc::clone(&self.broker),
             admitted,
             kind,
+            claim,
         }))
     }
 
@@ -5484,12 +5537,18 @@ impl WorkerService {
                 {
                     let broker_caller = Self::broker_caller(caller);
                     let Some(prepared) = preparation else {
-                        let request =
-                            self.broker
-                                .prepare_request(&broker_caller, binding_id, &params)?;
+                        let request = self.broker.prepare_request(
+                            &broker_caller,
+                            mutation.action_id,
+                            binding_id,
+                            &params,
+                        )?;
                         return Ok(Some(Prepared::NeedsPreparation(Box::new(request))));
                     };
                     let effect = prepared.effect?;
+                    // Held through the admission and the validation: whatever refuses the action
+                    // from here on, dropping the claim reports the offer as one that was never made.
+                    let claim = prepared.claim;
                     let admitted = self.broker.admit_plugin_action(
                         &broker_caller,
                         binding_id,
@@ -5503,7 +5562,11 @@ impl WorkerService {
                         self.broker.abandon(&admitted);
                         return Err(error.into());
                     }
-                    return Ok(Some(self.handoff(admitted, UpstreamKind::PluginAction)));
+                    return Ok(Some(self.handoff_claiming(
+                        admitted,
+                        UpstreamKind::PluginAction,
+                        claim,
+                    )));
                 }
                 // The refusal this host makes for the rest, whatever the caller does. It is
                 // decided here, before the marker, so it is a rejection rather than an outcome
@@ -8608,6 +8671,53 @@ pub struct PendingPreparation {
     forwarded: bool,
 }
 
+/// What an attachment's offer came to, from what its action came to.
+///
+/// An action the upstream answered is an offer the agent's side acknowledged, with the request the
+/// answer names as the evidence. An action the upstream proved it refused is an offer that failed.
+/// Every other end, a frame that went in part, a reply that never came, a connection that ended, is
+/// an offer whose outcome nobody can establish.
+fn reported_outcome(
+    outcome: std::result::Result<&ParamsValue, &WorkerError>,
+) -> kr_protocol::insertion::ReportedOutcome {
+    use kr_protocol::insertion::ReportedOutcome;
+    match outcome {
+        Ok(value) => {
+            let settled = value
+                .to_typed::<kr_protocol::agent::PluginActionInvokeResult>()
+                .ok()
+                .and_then(|result| result.mutation.0);
+            match settled {
+                Some(mutation) => ReportedOutcome::AcceptedByAgent {
+                    provenance: mutation.provenance,
+                    evidence: format!(
+                        "upstream request {}, turn {}",
+                        mutation
+                            .upstream_request_id
+                            .as_ref()
+                            .map_or_else(|| "unnamed".to_owned(), ToString::to_string),
+                        mutation
+                            .turn_id
+                            .as_ref()
+                            .map_or_else(|| "none".to_owned(), ToString::to_string)
+                    ),
+                },
+                None => ReportedOutcome::Unknown {
+                    detail: "the upstream's answer could not be read".to_owned(),
+                },
+            }
+        }
+        Err(error @ WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused { .. })) => {
+            ReportedOutcome::Failed {
+                detail: error.to_string(),
+            }
+        }
+        Err(error) => ReportedOutcome::Unknown {
+            detail: error.to_string(),
+        },
+    }
+}
+
 /// How long an admitted operation has to reach its upstream.
 ///
 /// Section 11 makes a framing connection that cannot safely continue `UPSTREAM_UNAVAILABLE` rather
@@ -8665,6 +8775,8 @@ pub struct UpstreamHandoff {
     broker: Arc<crate::broker::Broker>,
     admitted: crate::broker::MutationAdmission,
     kind: UpstreamKind,
+    /// The offer an attachment action claimed, reported when the operation has an outcome.
+    claim: Option<crate::daemon_link::ClaimHold>,
 }
 
 impl UpstreamHandoff {

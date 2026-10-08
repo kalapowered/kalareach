@@ -477,6 +477,7 @@ impl BrokerState {
                 package.component.0.as_ref(),
                 manifest,
             ),
+            attachments: manifest.attachments.0.clone(),
         };
         let record = binding.record(now);
         self.stored(now, "binding a package", |ledger| {
