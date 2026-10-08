@@ -50,10 +50,11 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This
-# crate denies it instead and allows it in exactly seven modules, each of which says why:
+# crate denies it instead and allows it in exactly eight modules, each of which says why:
 # `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control lists),
 # `paths::account` (the system's account database, which a directory-service account is only in),
-# `identity::process_times` (a process's creation time and whether it has exited),
+# `identity::process_times` (a process's creation time, whether it has exited, and ending it),
+# `identity::macos_signal` (a process's version on macOS, and signalling a process by it),
 # `identity::boot_records` (the kernel's process list and its boot counter),
 # `floor::platform` (the shared mapping of the clock floor's file and the atomics on it, on each
 # platform) and `starter::windows` (the launch pipe, a process's facts and a child created
