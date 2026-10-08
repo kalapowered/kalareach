@@ -2388,6 +2388,108 @@ impl SyncBackupService for ForkServices {
     }
 }
 
+impl kr_client::services::StorageService for ForkServices {
+    fn status(&self) -> kr_client::services::ServiceFuture<'_, kr_client::services::StorageStatus> {
+        self.refuses("storage.status")
+    }
+
+    fn set_retention<'a>(
+        &'a self,
+        _change: &'a kr_client::services::RetentionChange,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::RetentionAnswer> {
+        self.refuses("storage.set_retention")
+    }
+
+    fn create_upload<'a>(
+        &'a self,
+        _upload: &'a kr_client::services::NewUpload,
+    ) -> kr_client::services::ServiceFuture<
+        'a,
+        kr_client::services::ArchiveAnswer<kr_client::services::UploadCreated>,
+    > {
+        self.refuses("storage.create_upload")
+    }
+
+    fn upload_part<'a>(
+        &'a self,
+        _upload_id: &'a kr_client::services::UploadId,
+        _part: kr_client::services::UploadPart<'a>,
+    ) -> kr_client::services::ServiceFuture<
+        'a,
+        kr_client::services::ArchiveAnswer<kr_client::services::PartStored>,
+    > {
+        self.refuses("storage.upload_part")
+    }
+
+    fn complete_upload<'a>(
+        &'a self,
+        _upload_id: &'a kr_client::services::UploadId,
+        _table: &'a kr_client::services::PartTable,
+    ) -> kr_client::services::ServiceFuture<
+        'a,
+        kr_client::services::ArchiveAnswer<kr_client::services::UploadCompleted>,
+    > {
+        self.refuses("storage.complete_upload")
+    }
+
+    fn abort_upload<'a>(
+        &'a self,
+        _upload_id: &'a kr_client::services::UploadId,
+    ) -> kr_client::services::ServiceFuture<
+        'a,
+        kr_client::services::ArchiveAnswer<kr_client::services::UploadAborted>,
+    > {
+        self.refuses("storage.abort_upload")
+    }
+
+    fn read_object(
+        &self,
+        _archive_id: kr_protocol::ids::ArchiveId,
+        _object_id: kr_protocol::ids::BackupObjectId,
+        _offset: u64,
+        _length: u64,
+    ) -> kr_client::services::ServiceFuture<'_, kr_client::services::ObjectRange> {
+        self.refuses("storage.read_object")
+    }
+
+    fn delete_object(
+        &self,
+        _archive_id: kr_protocol::ids::ArchiveId,
+        _object_id: kr_protocol::ids::BackupObjectId,
+    ) -> kr_client::services::ServiceFuture<'_, kr_client::services::ObjectDeleted> {
+        self.refuses("storage.delete_object")
+    }
+}
+
+impl kr_client::services::BackupManifestService for ForkServices {
+    fn enrol<'a>(
+        &'a self,
+        _record: &'a kr_protocol::archive::BackupWriterRecord,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::Enrolled> {
+        self.refuses("manifest.enrol")
+    }
+
+    fn publish<'a>(
+        &'a self,
+        _publication: &'a kr_protocol::archive::BackupGenerationPublication,
+    ) -> kr_client::services::ServiceFuture<
+        'a,
+        kr_client::services::ArchiveAnswer<kr_client::services::Published>,
+    > {
+        self.refuses("manifest.publish")
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _archive_id: kr_protocol::ids::ArchiveId,
+        _generation: Option<kr_protocol::ids::BackupGeneration>,
+        _checkpoint: Option<&'a kr_protocol::pairing::GenerationCheckpoint>,
+    ) -> kr_client::services::ServiceFuture<'a, Option<kr_client::services::FetchedGeneration>>
+    {
+        self.refuses("manifest.fetch")
+    }
+}
+
 impl kr_client::services::ManagedVoiceService for ForkServices {
     fn metadata(
         &self,
@@ -2417,8 +2519,8 @@ impl kr_client::services::ManagedVoiceService for ForkServices {
 
 /// KR-REQ-17.14: every managed service a client uses is a replaceable client, and what a client
 /// knows of its services explains availability and protects nothing. A fork puts its own client
-/// in each of the five places: account login, relay leases, push, sync and backup, and managed
-/// inference. Each call made through those places reaches the fork's client, and what the fork's
+/// in each of the places: account login, relay leases, push, sync and backup (settings sync,
+/// managed storage and the backup manifest), and managed inference. Each call made through those places reaches the fork's client, and what the fork's
 /// service decides, here that the allowance is spent, is what the caller is told, with nothing
 /// of this library's own between them. Availability says each service is configured and claims no
 /// entitlement, and a refusal from the service leaves it as it was: it explains, and the service
@@ -2431,8 +2533,8 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
         relay_leases: Some(Arc::clone(&fork) as _),
         push: Some(Arc::clone(&fork) as _),
         sync_backup: Some(Arc::clone(&fork) as _),
-        storage: None,
-        backup_manifest: None,
+        storage: Some(Arc::clone(&fork) as _),
+        backup_manifest: Some(Arc::clone(&fork) as _),
         managed_inference: Some(Arc::clone(&fork) as _),
     };
     let before = clients.availability();
@@ -2488,6 +2590,24 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
             .await
             .err(),
         clients
+            .storage
+            .as_ref()
+            .expect("the fork's storage client")
+            .status()
+            .await
+            .err(),
+        clients
+            .backup_manifest
+            .as_ref()
+            .expect("the fork's backup manifest client")
+            .fetch(
+                kr_protocol::ids::ArchiveId::new(Uuid::from_bytes([7; 16])),
+                None,
+                None,
+            )
+            .await
+            .err(),
+        clients
             .managed_inference
             .as_ref()
             .expect("the fork's inference client")
@@ -2502,6 +2622,8 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
             "relay.issue",
             "push.register",
             "sync.fetch",
+            "storage.status",
+            "manifest.fetch",
             "voice.metadata"
         ],
         "each call reached the fork's own client"

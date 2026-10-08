@@ -1,6 +1,235 @@
 {
+  "decoded": [
+    {
+      "outcome": "refused QuotaExceeded, Wait, after None",
+      "step": "status of a token the service did not issue"
+    },
+    {
+      "outcome": "backup Off, revision 0, retention RetentionPolicy { daily_snapshots: 30, tombstone_days: 7, provider_recovery_days: 30 }, stored StorageUsage { objects: 0, bytes: 0 }, tombstoned StorageUsage { objects: 0, bytes: 0 }, uploading StorageUsage { objects: 0, bytes: 0 }, reserved 0, allowance Some(67108864), limits StorageLimits { part_size_bytes: 8388608, max_object_bytes: 1073741824, max_parts: 128, max_read_bytes: 8388608, upload_lifetime_seconds: 3600, outstanding_uploads: 2 }",
+      "step": "status with the account"
+    },
+    {
+      "outcome": "Done(RetentionSet { changed: true, backup: On, retention: RetentionPolicy { daily_snapshots: 30, tombstone_days: 7, provider_recovery_days: 30 }, revision: 1 })",
+      "step": "turn backup storage on"
+    },
+    {
+      "outcome": "Stale { current: RetentionState { backup: On, retention: RetentionPolicy { daily_snapshots: 30, tombstone_days: 7, provider_recovery_days: 30 }, revision: 1 } }",
+      "step": "turn backup storage on against a revision it has left"
+    },
+    {
+      "outcome": "backup On, revision 1, retention RetentionPolicy { daily_snapshots: 30, tombstone_days: 7, provider_recovery_days: 30 }, stored StorageUsage { objects: 0, bytes: 0 }, tombstoned StorageUsage { objects: 0, bytes: 0 }, uploading StorageUsage { objects: 0, bytes: 0 }, reserved 0, allowance Some(67108864), limits StorageLimits { part_size_bytes: 8388608, max_object_bytes: 1073741824, max_parts: 128, max_read_bytes: 8388608, upload_lifetime_seconds: 3600, outstanding_uploads: 2 }",
+      "step": "status after the change"
+    },
+    {
+      "outcome": "created, parts PartTable { total_bytes: 1000, part_count: 1 }, reserved 1000, principal Account(..)",
+      "step": "create an upload"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "create it again while it is open"
+    },
+    {
+      "outcome": "Done(())",
+      "step": "send a part"
+    },
+    {
+      "outcome": "Done(())",
+      "step": "send it again"
+    },
+    {
+      "outcome": "Done(UploadCompleted { duplicate: false, archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), backup_generation: BackupGeneration(U64(1)), object: StoredObject { object_id: BackupObjectId(Uuid(72727272-7272-7272-7272-727272727272)), encrypted_len: 1000, .. }, committed_bytes: 1000, .. })",
+      "step": "complete the upload"
+    },
+    {
+      "outcome": "Done(UploadCompleted { duplicate: true, archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), backup_generation: BackupGeneration(U64(1)), object: StoredObject { object_id: BackupObjectId(Uuid(72727272-7272-7272-7272-727272727272)), encrypted_len: 1000, .. }, committed_bytes: 1000, .. })",
+      "step": "complete it again"
+    },
+    {
+      "outcome": "UploadGone",
+      "step": "complete an upload nobody created"
+    },
+    {
+      "outcome": "ObjectRange { offset: 0, length: 100 }",
+      "step": "read the object"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "read past its end"
+    },
+    {
+      "outcome": "created, parts PartTable { total_bytes: 1000, part_count: 1 }, reserved 1000, principal Account(..)",
+      "step": "create an upload to give up"
+    },
+    {
+      "outcome": "Done(UploadAborted { cleaned: true, released_bytes: Some(1000) })",
+      "step": "abandon it"
+    },
+    {
+      "outcome": "Done(UploadAborted { cleaned: true, released_bytes: Some(1000) })",
+      "step": "abandon it again"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "send a part to the abandoned upload"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "publish before any writer is enrolled"
+    },
+    {
+      "outcome": "Enrolled { changed: true, writer: WriterSummary { writer_revision: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 0, generations: [], bytes: 0, allowance_bytes: None } }",
+      "step": "enrol the writer"
+    },
+    {
+      "outcome": "Enrolled { changed: false, writer: WriterSummary { writer_revision: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 0, generations: [], bytes: 0, allowance_bytes: None } }",
+      "step": "enrol the same writer again"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(1)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 1, generations: [1], bytes: 845, allowance_bytes: None }, dropped: [] }",
+      "step": "publish a generation"
+    },
+    {
+      "outcome": "Published { duplicate: true, generation: GenerationSummary { backup_generation: BackupGeneration(U64(1)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 1, generations: [1], bytes: 845, allowance_bytes: None }, dropped: [] }",
+      "step": "publish it again"
+    },
+    {
+      "outcome": "Published { duplicate: true, generation: GenerationSummary { backup_generation: BackupGeneration(U64(1)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 1, generations: [1], bytes: 845, allowance_bytes: None }, dropped: [] }",
+      "step": "publish it again with no account"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "publish other content under a generation it holds"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(2)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 2, generations: [2, 1], bytes: 1690, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 2"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(4)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 4, generations: [4, 2, 1], bytes: 2535, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 4"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "publish a generation below one the collection has published"
+    },
+    {
+      "outcome": "held generation 4, CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 4, generations: [4, 2, 1], bytes: 2535, allowance_bytes: Some(67108864) }, writer WriterSummary { writer_revision: 1, .. }",
+      "step": "fetch the newest generation"
+    },
+    {
+      "outcome": "held generation 1, CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 4, generations: [4, 2, 1], bytes: 2535, allowance_bytes: Some(67108864) }, writer WriterSummary { writer_revision: 1, .. }",
+      "step": "fetch a generation that is held"
+    },
+    {
+      "outcome": "holds nothing to answer with",
+      "step": "fetch a generation that is not held"
+    },
+    {
+      "outcome": "holds nothing to answer with",
+      "step": "fetch an archive that is not held"
+    },
+    {
+      "outcome": "held generation 4, CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 4, generations: [4, 2, 1], bytes: 2535, allowance_bytes: Some(67108864) }, writer WriterSummary { writer_revision: 1, .. }",
+      "step": "fetch with the checkpoint the collection holds"
+    },
+    {
+      "outcome": "holds nothing to answer with",
+      "step": "fetch with a checkpoint newer than the collection"
+    },
+    {
+      "outcome": "holds nothing to answer with",
+      "step": "fetch with a checkpoint whose manifest differs"
+    },
+    {
+      "outcome": "holds nothing to answer with",
+      "step": "fetch a generation older than the checkpoint"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "fetch with a checkpoint about another archive"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(5)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 5, generations: [5, 4, 2, 1], bytes: 3380, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 5"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(6)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 6, generations: [6, 5, 4, 2, 1], bytes: 4225, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 6"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(7)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 7, generations: [7, 6, 5, 4, 2, 1], bytes: 5070, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 7"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(8)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 8, generations: [8, 7, 6, 5, 4, 2, 1], bytes: 5915, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 8"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(9)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 9, generations: [9, 8, 7, 6, 5, 4, 2, 1], bytes: 6760, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 9"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(10)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 10, generations: [10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 7605, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 10"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(11)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 11, generations: [11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 8450, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 11"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(12)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 12, generations: [12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 9295, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 12"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(13)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 13, generations: [13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 10140, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 13"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(14)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 14, generations: [14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 10985, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 14"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(15)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 15, generations: [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 11830, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 15"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(16)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 16, generations: [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 12675, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 16"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(17)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 17, generations: [17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 13520, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 17"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(18)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 18, generations: [18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2], bytes: 13520, allowance_bytes: None }, dropped: [1] }",
+      "step": "publish generation 18"
+    },
+    {
+      "outcome": "holds nothing to answer with",
+      "step": "fetch a generation the history has dropped"
+    },
+    {
+      "outcome": "ObjectDeleted { already: false, retained_bytes: 1000, retention: RetentionPolicy { daily_snapshots: 30, tombstone_days: 7, provider_recovery_days: 30 }, .. }",
+      "step": "delete the object"
+    },
+    {
+      "outcome": "ObjectDeleted { already: true, retained_bytes: 1000, retention: RetentionPolicy { daily_snapshots: 30, tombstone_days: 7, provider_recovery_days: 30 }, .. }",
+      "step": "delete it again"
+    },
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "delete an object that is not held"
+    }
+  ],
   "exchanges": [
     {
+      "body": {
+        "error": {
+          "code": "QUOTA_EXHAUSTED",
+          "message": "This installation has no backup storage. Sign this host in to an account whose plan includes backup storage, and try again."
+        },
+        "ok": false
+      },
       "path": "/api/storage/status",
       "shape": {
         "error": {
@@ -13,6 +242,42 @@
       "step": "status of a token the service did not issue"
     },
     {
+      "body": {
+        "data": {
+          "allowance_bytes": "67108864",
+          "backup": "off",
+          "limits": {
+            "max_object_bytes": "1073741824",
+            "max_parts": 128,
+            "max_read_bytes": "8388608",
+            "outstanding_uploads": 2,
+            "part_size_bytes": "8388608",
+            "upload_lifetime_seconds": 3600
+          },
+          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "retention": {
+            "daily_snapshots": 30,
+            "provider_recovery_days": 30,
+            "tombstone_days": 7
+          },
+          "retention_revision": "0",
+          "stored": {
+            "bytes": "0",
+            "objects": 0
+          },
+          "tombstoned": {
+            "bytes": "0",
+            "next_purge": null,
+            "objects": 0
+          },
+          "uploading": {
+            "bytes": "0",
+            "objects": 0,
+            "reserved_bytes": "0"
+          }
+        },
+        "ok": true
+      },
       "path": "/api/storage/status",
       "shape": {
         "data": {
@@ -54,6 +319,19 @@
       "step": "status with the account"
     },
     {
+      "body": {
+        "data": {
+          "backup": "on",
+          "retention": {
+            "daily_snapshots": 30,
+            "provider_recovery_days": 30,
+            "tombstone_days": 7
+          },
+          "revision": 1,
+          "state": "set"
+        },
+        "ok": true
+      },
       "path": "/api/storage/retention",
       "shape": {
         "data": {
@@ -72,6 +350,23 @@
       "step": "turn backup storage on"
     },
     {
+      "body": {
+        "error": {
+          "code": "CONFLICT",
+          "current": {
+            "backup": "on",
+            "retention": {
+              "daily_snapshots": 30,
+              "provider_recovery_days": 30,
+              "tombstone_days": 7
+            },
+            "revision": "1"
+          },
+          "message": "That change was decided against revision 0 and this retention is at 1, so nothing was changed. Show the retention this answer carries and decide again against its revision.",
+          "reason": "retention_changed"
+        },
+        "ok": false
+      },
       "path": "/api/storage/retention",
       "shape": {
         "error": {
@@ -94,6 +389,42 @@
       "step": "turn backup storage on against a revision it has left"
     },
     {
+      "body": {
+        "data": {
+          "allowance_bytes": "67108864",
+          "backup": "on",
+          "limits": {
+            "max_object_bytes": "1073741824",
+            "max_parts": 128,
+            "max_read_bytes": "8388608",
+            "outstanding_uploads": 2,
+            "part_size_bytes": "8388608",
+            "upload_lifetime_seconds": 3600
+          },
+          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "retention": {
+            "daily_snapshots": 30,
+            "provider_recovery_days": 30,
+            "tombstone_days": 7
+          },
+          "retention_revision": "1",
+          "stored": {
+            "bytes": "0",
+            "objects": 0
+          },
+          "tombstoned": {
+            "bytes": "0",
+            "next_purge": null,
+            "objects": 0
+          },
+          "uploading": {
+            "bytes": "0",
+            "objects": 0,
+            "reserved_bytes": "0"
+          }
+        },
+        "ok": true
+      },
       "path": "/api/storage/status",
       "shape": {
         "data": {
@@ -135,6 +466,30 @@
       "step": "status after the change"
     },
     {
+      "body": {
+        "data": {
+          "expires_at": "2026-10-08T13:17:47.149Z",
+          "layout": {
+            "final_part_bytes": "1000",
+            "part_count": 1,
+            "part_size_bytes": "8388608",
+            "total_bytes": "1000"
+          },
+          "limits": {
+            "max_object_bytes": "1073741824",
+            "max_parts": 128,
+            "max_read_bytes": "8388608",
+            "outstanding_uploads": 2,
+            "part_size_bytes": "8388608",
+            "upload_lifetime_seconds": 3600
+          },
+          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "reserved_bytes": "1000",
+          "state": "created",
+          "upload_id": "Yx76RIl0_bZeZVzDtfSBIBGpEppikj_645MM5GdEoO0"
+        },
+        "ok": true
+      },
       "path": "/api/storage/upload/create",
       "shape": {
         "data": {
@@ -164,6 +519,13 @@
       "step": "create an upload"
     },
     {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "That object of that archive is already being uploaded or already stored. Continue that upload, or delete the object first."
+        },
+        "ok": false
+      },
       "path": "/api/storage/upload/create",
       "shape": {
         "error": {
@@ -176,6 +538,16 @@
       "step": "create it again while it is open"
     },
     {
+      "body": {
+        "data": {
+          "bytes_stored": "1000",
+          "length_bytes": "1000",
+          "part_number": 1,
+          "parts_stored": 1,
+          "state": "stored"
+        },
+        "ok": true
+      },
       "path": "/api/storage/upload/part",
       "shape": {
         "data": {
@@ -191,6 +563,16 @@
       "step": "send a part"
     },
     {
+      "body": {
+        "data": {
+          "bytes_stored": "1000",
+          "length_bytes": "1000",
+          "part_number": 1,
+          "parts_stored": 1,
+          "state": "duplicate"
+        },
+        "ok": true
+      },
       "path": "/api/storage/upload/part",
       "shape": {
         "data": {
@@ -206,6 +588,23 @@
       "step": "send it again"
     },
     {
+      "body": {
+        "data": {
+          "archive_id": "71717171-7171-7171-7171-717171717171",
+          "backup_generation": "1",
+          "committed_bytes": "1000",
+          "object": {
+            "encrypted_len": "1000",
+            "encrypted_object_hash": "TkwpSzMfeiCZo3m-w0ufn8A9xGq0ZdmY9NaD2lNIfm0",
+            "object_id": "72727272-7272-7272-7272-727272727272"
+          },
+          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "size_bucket_bytes": "1024",
+          "state": "stored",
+          "stored_at": "2026-10-08T12:17:47.199Z"
+        },
+        "ok": true
+      },
       "path": "/api/storage/upload/complete",
       "shape": {
         "data": {
@@ -228,6 +627,23 @@
       "step": "complete the upload"
     },
     {
+      "body": {
+        "data": {
+          "archive_id": "71717171-7171-7171-7171-717171717171",
+          "backup_generation": "1",
+          "committed_bytes": "1000",
+          "object": {
+            "encrypted_len": "1000",
+            "encrypted_object_hash": "TkwpSzMfeiCZo3m-w0ufn8A9xGq0ZdmY9NaD2lNIfm0",
+            "object_id": "72727272-7272-7272-7272-727272727272"
+          },
+          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "size_bucket_bytes": "1024",
+          "state": "duplicate",
+          "stored_at": "2026-10-08T12:17:47.199Z"
+        },
+        "ok": true
+      },
       "path": "/api/storage/upload/complete",
       "shape": {
         "data": {
@@ -250,12 +666,41 @@
       "step": "complete it again"
     },
     {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "No such upload."
+        },
+        "ok": false
+      },
+      "path": "/api/storage/upload/complete",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "complete an upload nobody created"
+    },
+    {
+      "body": {
+        "content_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw=="
+      },
       "path": "/api/storage/object/read",
       "shape": "content",
       "status": 200,
       "step": "read the object"
     },
     {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "That object is 1000 bytes, so that offset is past its end."
+        },
+        "ok": false
+      },
       "path": "/api/storage/object/read",
       "shape": {
         "error": {
@@ -268,6 +713,123 @@
       "step": "read past its end"
     },
     {
+      "body": {
+        "data": {
+          "expires_at": "2026-10-08T13:17:47.250Z",
+          "layout": {
+            "final_part_bytes": "1000",
+            "part_count": 1,
+            "part_size_bytes": "8388608",
+            "total_bytes": "1000"
+          },
+          "limits": {
+            "max_object_bytes": "1073741824",
+            "max_parts": 128,
+            "max_read_bytes": "8388608",
+            "outstanding_uploads": 2,
+            "part_size_bytes": "8388608",
+            "upload_lifetime_seconds": 3600
+          },
+          "principal": "account:27235b41-3359-4e7d-9a5a-3c8e583f17c8",
+          "reserved_bytes": "1000",
+          "state": "created",
+          "upload_id": "eg97CjSCE55SRbQtM8bbQzHc_fr7JMy1DqAH5Z2z6ww"
+        },
+        "ok": true
+      },
+      "path": "/api/storage/upload/create",
+      "shape": {
+        "data": {
+          "expires_at": "string",
+          "layout": {
+            "final_part_bytes": "string",
+            "part_count": "number",
+            "part_size_bytes": "string",
+            "total_bytes": "string"
+          },
+          "limits": {
+            "max_object_bytes": "string",
+            "max_parts": "number",
+            "max_read_bytes": "string",
+            "outstanding_uploads": "number",
+            "part_size_bytes": "string",
+            "upload_lifetime_seconds": "number"
+          },
+          "principal": "string",
+          "reserved_bytes": "string",
+          "state": "created",
+          "upload_id": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "create an upload to give up"
+    },
+    {
+      "body": {
+        "data": {
+          "released_bytes": "1000",
+          "state": "cleaned"
+        },
+        "ok": true
+      },
+      "path": "/api/storage/upload/abort",
+      "shape": {
+        "data": {
+          "released_bytes": "string",
+          "state": "cleaned"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "abandon it"
+    },
+    {
+      "body": {
+        "data": {
+          "released_bytes": "1000",
+          "state": "cleaned"
+        },
+        "ok": true
+      },
+      "path": "/api/storage/upload/abort",
+      "shape": {
+        "data": {
+          "released_bytes": "string",
+          "state": "cleaned"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "abandon it again"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "This upload is closed."
+        },
+        "ok": false
+      },
+      "path": "/api/storage/upload/part",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "send a part to the abandoned upload"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "This collection has no enrolled writer."
+        },
+        "ok": false
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "error": {
@@ -280,6 +842,24 @@
       "step": "publish before any writer is enrolled"
     },
     {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "0",
+            "checkpoint_generation": "0",
+            "generations": []
+          },
+          "state": "enrolled",
+          "writer": {
+            "enrolled_at": "2026-10-08T12:17:47.338Z",
+            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "writer_revision": "1"
+          }
+        },
+        "ok": true
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "data": {
@@ -305,6 +885,24 @@
       "step": "enrol the writer"
     },
     {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "0",
+            "checkpoint_generation": "0",
+            "generations": []
+          },
+          "state": "unchanged",
+          "writer": {
+            "enrolled_at": "2026-10-08T12:17:47.338Z",
+            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "writer_revision": "1"
+          }
+        },
+        "ok": true
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "data": {
@@ -330,6 +928,29 @@
       "step": "enrol the same writer again"
     },
     {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "845",
+            "checkpoint_generation": "1",
+            "generations": [
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "1",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+            "published_at": "2026-10-08T12:17:47.346Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "data": {
@@ -360,6 +981,29 @@
       "step": "publish a generation"
     },
     {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "845",
+            "checkpoint_generation": "1",
+            "generations": [
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "1",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+            "published_at": "2026-10-08T12:17:47.346Z",
+            "recipients": 1
+          },
+          "state": "duplicate"
+        },
+        "ok": true
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "data": {
@@ -390,6 +1034,29 @@
       "step": "publish it again"
     },
     {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "845",
+            "checkpoint_generation": "1",
+            "generations": [
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "1",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+            "published_at": "2026-10-08T12:17:47.346Z",
+            "recipients": 1
+          },
+          "state": "duplicate"
+        },
+        "ok": true
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "data": {
@@ -417,9 +1084,211 @@
         "ok": true
       },
       "status": 200,
-      "step": "publish a generation with no account"
+      "step": "publish it again with no account"
     },
     {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "That generation has already been published with different content."
+        },
+        "ok": false
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "publish other content under a generation it holds"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "1690",
+            "checkpoint_generation": "2",
+            "generations": [
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "2",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "yG3hPx8n4k-igzYYEAqE6hp8JJ7nFZxhDDPNNwmNgI4",
+            "published_at": "2026-10-08T12:17:47.460Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 2"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "2535",
+            "checkpoint_generation": "4",
+            "generations": [
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "4",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+            "published_at": "2026-10-08T12:17:47.478Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 4"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "This collection has published that generation or a later one."
+        },
+        "ok": false
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "FORBIDDEN",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 403,
+      "step": "publish a generation below one the collection has published"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "67108864",
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "2535",
+            "checkpoint_generation": "4",
+            "generations": [
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "current_writer": {
+            "enrolled_at": "2026-10-08T12:17:47.338Z",
+            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "writer_revision": "1"
+          },
+          "publication": {
+            "payload": {
+              "descriptor": {
+                "archive_id": "71717171-7171-7171-7171-717171717171",
+                "backup_generation": "4",
+                "encrypted_manifest": {
+                  "encrypted_len": "1103",
+                  "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                  "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4"
+                },
+                "manifest_key_wraps": [
+                  {
+                    "ciphertext": "mvZ7uG116DcgEr1Q66rCOfcV0BL2LztkQC0nToYmOXjFGHWvJhCUQE9CGDr0KhR245mybxWdCsX7rDZDDtSIeAZx4VSeEagufo_NWEmGt5HPtsuUHFhHb0Q9SF0cQ-jiYduZmEnczGXEFwppdyJnJVKADj16yWOK-vuFQjBgYghWtNU9z4mIRsDmLzYGI0LTJ8xKS6TiFq3UcbrpKJDF8M578-cEpah3zQcJLoDfUXYogZ-S7xVX72BeOgilORfDFyE7V7YTTO2V27kaAxr_io-tw6pqwLJtcK2WZIEGCxfQPRKE80BMNmzUlDepSSL-uU2T3W7VUz53HM8YVhQa1FWd6EdeHrUSjUd6HeFPOXFqIBOM_q63aXQALXoP7FKSHa47y-R5jJtB_3poZoSrj2ajm9r608cv_Mc5wrQVKFhP3A",
+                    "context": {
+                      "archive_id": "71717171-7171-7171-7171-717171717171",
+                      "backup_generation": "4",
+                      "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                      "format": "kr-keywrap/1",
+                      "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4",
+                      "purpose": "manifest_key",
+                      "recipient_key_id": "vD-ajgN06LiLLrDydStZ1gjfwwc41NvPOxtPubcHeJQ",
+                      "sender_key_id": "Ij9HLtCCqTLKH7jrhVZgTSUVSeDf59VqMN2Z5hVEkCE"
+                    },
+                    "nonce": "YLkylc9KEpb4a6y8dNIt05lLGOZqvAIg"
+                  }
+                ],
+                "version": "1"
+              },
+              "published_at_ms": "2000",
+              "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts"
+            },
+            "signature": "mIbtPqu08Lf9inGVZI6aKKfOhfJW6uP7voQfsGD6PDg0ZlkPd5wnMK_B9QXuAWz2s1BcOWfqGlIUvqGAk6d-Dg"
+          },
+          "published_at": "2026-10-08T12:17:47.478Z"
+        },
+        "ok": true
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "data": {
@@ -478,6 +1347,126 @@
       "step": "fetch the newest generation"
     },
     {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "67108864",
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "2535",
+            "checkpoint_generation": "4",
+            "generations": [
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "current_writer": {
+            "enrolled_at": "2026-10-08T12:17:47.338Z",
+            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "writer_revision": "1"
+          },
+          "publication": {
+            "payload": {
+              "descriptor": {
+                "archive_id": "71717171-7171-7171-7171-717171717171",
+                "backup_generation": "1",
+                "encrypted_manifest": {
+                  "encrypted_len": "1103",
+                  "encrypted_object_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+                  "object_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+                },
+                "manifest_key_wraps": [
+                  {
+                    "ciphertext": "sgkhdaEbc5pbIoVGGV7kdnIUUFL24IUCm-gyjGoW-WC3ZzdsCP400cLIQitu7sf8fRLnEHKi18r_olG4ibU6908ATunhsKAPhxtpZQV2fCJ3YROhwjVpNbEf20FD7wXr4Bpelm82I7ww6xohUp8DLYEp0d9cCBGTfGouHohpCv6WvZ83lIcMeX7_FuIngCCxh_cVw1AHYUBD57vrDXhJlCWwLr00vVmIyLDfB9Hq55SqCuHTIq5_aTjcb0BGa5WAS1neqtkMzbBPtwBHoYuBQKnaaaseoVrOE-d82AnIr5Bd_2GTWeVkfLJ5YxCB9K3R-lRYrDB35Dw61rkWH7pFhPOgw82GfwTF_EYRCwXkS3jgD-TkTGIkZRx6f3gesob5l3k_ateII974xaycIoFP1bFQZahdSFeWz-8pAHBLgd4OqQ",
+                    "context": {
+                      "archive_id": "71717171-7171-7171-7171-717171717171",
+                      "backup_generation": "1",
+                      "encrypted_object_hash": "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+                      "format": "kr-keywrap/1",
+                      "object_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                      "purpose": "manifest_key",
+                      "recipient_key_id": "vD-ajgN06LiLLrDydStZ1gjfwwc41NvPOxtPubcHeJQ",
+                      "sender_key_id": "Ij9HLtCCqTLKH7jrhVZgTSUVSeDf59VqMN2Z5hVEkCE"
+                    },
+                    "nonce": "7pJKzEezjWGulch0JyOtSDgoBawWzPws"
+                  }
+                ],
+                "version": "1"
+              },
+              "published_at_ms": "2000",
+              "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts"
+            },
+            "signature": "EtG0A7IgNPwQDCD0xgBD0OQUf6mUDvzQW3Gy3VGZxJUm0p6rOXAbSj0RkVQ0__NtzsV493ejWrp8iqc_qse8CQ"
+          },
+          "published_at": "2026-10-08T12:17:47.346Z"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "string",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "current_writer": {
+            "enrolled_at": "string",
+            "writer_key_id": "string",
+            "writer_revision": "string"
+          },
+          "publication": {
+            "payload": {
+              "descriptor": {
+                "archive_id": "string",
+                "backup_generation": "string",
+                "encrypted_manifest": {
+                  "encrypted_len": "string",
+                  "encrypted_object_hash": "string",
+                  "object_id": "string"
+                },
+                "manifest_key_wraps": {
+                  "array": {
+                    "ciphertext": "string",
+                    "context": {
+                      "archive_id": "string",
+                      "backup_generation": "string",
+                      "encrypted_object_hash": "string",
+                      "format": "string",
+                      "object_id": "string",
+                      "purpose": "string",
+                      "recipient_key_id": "string",
+                      "sender_key_id": "string"
+                    },
+                    "nonce": "string"
+                  }
+                },
+                "version": "string"
+              },
+              "published_at_ms": "string",
+              "writer_key_id": "string"
+            },
+            "signature": "string"
+          },
+          "published_at": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fetch a generation that is held"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "No such generation."
+        },
+        "ok": false
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "error": {
@@ -490,6 +1479,13 @@
       "step": "fetch a generation that is not held"
     },
     {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "No such collection."
+        },
+        "ok": false
+      },
       "path": "/api/backup/manifest",
       "shape": {
         "error": {
@@ -502,6 +1498,1104 @@
       "step": "fetch an archive that is not held"
     },
     {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "67108864",
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "2535",
+            "checkpoint_generation": "4",
+            "generations": [
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "current_writer": {
+            "enrolled_at": "2026-10-08T12:17:47.338Z",
+            "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+            "writer_revision": "1"
+          },
+          "publication": {
+            "payload": {
+              "descriptor": {
+                "archive_id": "71717171-7171-7171-7171-717171717171",
+                "backup_generation": "4",
+                "encrypted_manifest": {
+                  "encrypted_len": "1103",
+                  "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                  "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4"
+                },
+                "manifest_key_wraps": [
+                  {
+                    "ciphertext": "mvZ7uG116DcgEr1Q66rCOfcV0BL2LztkQC0nToYmOXjFGHWvJhCUQE9CGDr0KhR245mybxWdCsX7rDZDDtSIeAZx4VSeEagufo_NWEmGt5HPtsuUHFhHb0Q9SF0cQ-jiYduZmEnczGXEFwppdyJnJVKADj16yWOK-vuFQjBgYghWtNU9z4mIRsDmLzYGI0LTJ8xKS6TiFq3UcbrpKJDF8M578-cEpah3zQcJLoDfUXYogZ-S7xVX72BeOgilORfDFyE7V7YTTO2V27kaAxr_io-tw6pqwLJtcK2WZIEGCxfQPRKE80BMNmzUlDepSSL-uU2T3W7VUz53HM8YVhQa1FWd6EdeHrUSjUd6HeFPOXFqIBOM_q63aXQALXoP7FKSHa47y-R5jJtB_3poZoSrj2ajm9r608cv_Mc5wrQVKFhP3A",
+                    "context": {
+                      "archive_id": "71717171-7171-7171-7171-717171717171",
+                      "backup_generation": "4",
+                      "encrypted_object_hash": "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+                      "format": "kr-keywrap/1",
+                      "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4",
+                      "purpose": "manifest_key",
+                      "recipient_key_id": "vD-ajgN06LiLLrDydStZ1gjfwwc41NvPOxtPubcHeJQ",
+                      "sender_key_id": "Ij9HLtCCqTLKH7jrhVZgTSUVSeDf59VqMN2Z5hVEkCE"
+                    },
+                    "nonce": "YLkylc9KEpb4a6y8dNIt05lLGOZqvAIg"
+                  }
+                ],
+                "version": "1"
+              },
+              "published_at_ms": "2000",
+              "writer_key_id": "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts"
+            },
+            "signature": "mIbtPqu08Lf9inGVZI6aKKfOhfJW6uP7voQfsGD6PDg0ZlkPd5wnMK_B9QXuAWz2s1BcOWfqGlIUvqGAk6d-Dg"
+          },
+          "published_at": "2026-10-08T12:17:47.478Z"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "string",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "current_writer": {
+            "enrolled_at": "string",
+            "writer_key_id": "string",
+            "writer_revision": "string"
+          },
+          "publication": {
+            "payload": {
+              "descriptor": {
+                "archive_id": "string",
+                "backup_generation": "string",
+                "encrypted_manifest": {
+                  "encrypted_len": "string",
+                  "encrypted_object_hash": "string",
+                  "object_id": "string"
+                },
+                "manifest_key_wraps": {
+                  "array": {
+                    "ciphertext": "string",
+                    "context": {
+                      "archive_id": "string",
+                      "backup_generation": "string",
+                      "encrypted_object_hash": "string",
+                      "format": "string",
+                      "object_id": "string",
+                      "purpose": "string",
+                      "recipient_key_id": "string",
+                      "sender_key_id": "string"
+                    },
+                    "nonce": "string"
+                  }
+                },
+                "version": "string"
+              },
+              "published_at_ms": "string",
+              "writer_key_id": "string"
+            },
+            "signature": "string"
+          },
+          "published_at": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fetch with the checkpoint the collection holds"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "This collection holds no generation as new as the checkpoint that was presented."
+        },
+        "ok": false
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fetch with a checkpoint newer than the collection"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "This collection holds a different manifest at the generation that checkpoint names."
+        },
+        "ok": false
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fetch with a checkpoint whose manifest differs"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "This collection holds a different manifest at the generation that checkpoint names."
+        },
+        "ok": false
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fetch a generation older than the checkpoint"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "That checkpoint is about another archive."
+        },
+        "ok": false
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "fetch with a checkpoint about another archive"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "3380",
+            "checkpoint_generation": "5",
+            "generations": [
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "5",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "6okyYNnklYIZixaBGAlTR--R9QrP86sJFQuYmWstWOc",
+            "published_at": "2026-10-08T12:17:47.548Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 5"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "4225",
+            "checkpoint_generation": "6",
+            "generations": [
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "6",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "ytF3Lcj9PQVOHAmIJUUknOL6zIuiSZjpOqqtylnhEos",
+            "published_at": "2026-10-08T12:17:47.561Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 6"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "5070",
+            "checkpoint_generation": "7",
+            "generations": [
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "7",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "6pPfgZD2hLIUL3iYX1EERwsQY7HQwrv-dkthGja8QqQ",
+            "published_at": "2026-10-08T12:17:47.582Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 7"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "5915",
+            "checkpoint_generation": "8",
+            "generations": [
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "8",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "xiM307NDKosl8erRCvfGEKA_bMmc2_ASeDDCT7sc1ho",
+            "published_at": "2026-10-08T12:17:47.609Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 8"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "6760",
+            "checkpoint_generation": "9",
+            "generations": [
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "9",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "1mTqnOwb-J6Plb8WOc3RSPhfyuLulWAgm9b6wUGhd8c",
+            "published_at": "2026-10-08T12:17:47.682Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 9"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "7605",
+            "checkpoint_generation": "10",
+            "generations": [
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "10",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "qkZO_uteMzA8Daqu-6O0FG5YEW54q27cWtpjuWDUCLo",
+            "published_at": "2026-10-08T12:17:47.701Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 10"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "8450",
+            "checkpoint_generation": "11",
+            "generations": [
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "11",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "skSJreJeMRGCAMm8eRvBEw8NsjEBbytDY364iH7Irxg",
+            "published_at": "2026-10-08T12:17:47.732Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 11"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "9295",
+            "checkpoint_generation": "12",
+            "generations": [
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "12",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "5S6kbAKg2n6GqfAP6p1gKYPyB13kvb3zNljkmk4UGFU",
+            "published_at": "2026-10-08T12:17:47.749Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 12"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "10140",
+            "checkpoint_generation": "13",
+            "generations": [
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "13",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "5BK6bywhVXddLfbUfccIA-yeEmmKax9Jqd1DrfygD6c",
+            "published_at": "2026-10-08T12:17:47.776Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 13"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "10985",
+            "checkpoint_generation": "14",
+            "generations": [
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "14",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "ZSTHowpxX9rN-FRYcOhu7mMyLCA51Th0H_cYNGl6iAA",
+            "published_at": "2026-10-08T12:17:47.792Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 14"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "11830",
+            "checkpoint_generation": "15",
+            "generations": [
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "15",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "S-_uBrUKmzKkt5g2DHbaVyMd4k97WiHcY4Ay5IS7cwg",
+            "published_at": "2026-10-08T12:17:47.804Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 15"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "12675",
+            "checkpoint_generation": "16",
+            "generations": [
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "16",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "jn4abRyKWrhN4uOVpu3ivlPdptqQkS3EKOpxQeefJQk",
+            "published_at": "2026-10-08T12:17:47.818Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 16"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "13520",
+            "checkpoint_generation": "17",
+            "generations": [
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "17",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "fQDofB10g-Mo7pYLd9lV3M0otKlek2GkMUs0x4N_yXQ",
+            "published_at": "2026-10-08T12:17:47.830Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 17"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "13520",
+            "checkpoint_generation": "18",
+            "generations": [
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2"
+            ]
+          },
+          "dropped": [
+            "1"
+          ],
+          "generation": {
+            "backup_generation": "18",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "Biya-AFv0uU_b1eztr2i6NHdoMbvDVyYwpSrrIQL1Yk",
+            "published_at": "2026-10-08T12:17:47.952Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": "string"
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 18"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "No such generation."
+        },
+        "ok": false
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fetch a generation the history has dropped"
+    },
+    {
+      "body": {
+        "data": {
+          "deleted_at": "2026-10-08T12:17:47.974Z",
+          "purge_after": "2026-10-15T12:17:47.974Z",
+          "retained_bytes": "1000",
+          "retention": {
+            "daily_snapshots": 30,
+            "provider_recovery_days": 30,
+            "tombstone_days": 7
+          },
+          "state": "tombstoned"
+        },
+        "ok": true
+      },
       "path": "/api/storage/object/delete",
       "shape": {
         "data": {
@@ -521,6 +2615,20 @@
       "step": "delete the object"
     },
     {
+      "body": {
+        "data": {
+          "deleted_at": "2026-10-08T12:17:47.974Z",
+          "purge_after": "2026-10-15T12:17:47.974Z",
+          "retained_bytes": "1000",
+          "retention": {
+            "daily_snapshots": 30,
+            "provider_recovery_days": 30,
+            "tombstone_days": 7
+          },
+          "state": "already_tombstoned"
+        },
+        "ok": true
+      },
       "path": "/api/storage/object/delete",
       "shape": {
         "data": {
@@ -540,6 +2648,13 @@
       "step": "delete it again"
     },
     {
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "No such stored object."
+        },
+        "ok": false
+      },
       "path": "/api/storage/object/delete",
       "shape": {
         "error": {
@@ -552,6 +2667,29 @@
       "step": "delete an object that is not held"
     }
   ],
+  "names": [
+    "8pAa8Jv23xRDlPTosx828NRveUJ4Sk2ocnKgi--z5pI",
+    "LtPUg2vjZAh24KM45QSHnW7lObXBAj-Rc_1N-bCxHts",
+    "A30vIW0PE6QyDq_Z_XV_SeMwpoFlLQ0q1xXmki89hRM",
+    "0X47Jlp4D78NNjNFUPRuic_NlGQOvxpGzjvUvKtAx5o",
+    "yG3hPx8n4k-igzYYEAqE6hp8JJ7nFZxhDDPNNwmNgI4",
+    "22s2gG6AaDZBSQbuUzJVJe32NtZq0S3lToqWVXClPm8",
+    "3nC5kIrSHmeH-MmeNg7iRnD7amXxAuZk0IMwn2ep4Kc",
+    "6okyYNnklYIZixaBGAlTR--R9QrP86sJFQuYmWstWOc",
+    "ytF3Lcj9PQVOHAmIJUUknOL6zIuiSZjpOqqtylnhEos",
+    "6pPfgZD2hLIUL3iYX1EERwsQY7HQwrv-dkthGja8QqQ",
+    "xiM307NDKosl8erRCvfGEKA_bMmc2_ASeDDCT7sc1ho",
+    "1mTqnOwb-J6Plb8WOc3RSPhfyuLulWAgm9b6wUGhd8c",
+    "qkZO_uteMzA8Daqu-6O0FG5YEW54q27cWtpjuWDUCLo",
+    "skSJreJeMRGCAMm8eRvBEw8NsjEBbytDY364iH7Irxg",
+    "5S6kbAKg2n6GqfAP6p1gKYPyB13kvb3zNljkmk4UGFU",
+    "5BK6bywhVXddLfbUfccIA-yeEmmKax9Jqd1DrfygD6c",
+    "ZSTHowpxX9rN-FRYcOhu7mMyLCA51Th0H_cYNGl6iAA",
+    "S-_uBrUKmzKkt5g2DHbaVyMd4k97WiHcY4Ay5IS7cwg",
+    "jn4abRyKWrhN4uOVpu3ivlPdptqQkS3EKOpxQeefJQk",
+    "fQDofB10g-Mo7pYLd9lV3M0otKlek2GkMUs0x4N_yXQ",
+    "Biya-AFv0uU_b1eztr2i6NHdoMbvDVyYwpSrrIQL1Yk"
+  ],
   "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
-  "web_commit": "91d71cba1"
+  "web_commit": "91d71cba101c010ccc811173834ce7109219bf55"
 }
