@@ -2521,13 +2521,16 @@ async fn a_survivor_of_a_crashed_session_tries_to_act_as_it() {
     // Written whole and then named, so a reader never meets it half written.
     std::fs::write(directory.join("survivor.out.part"), said.join("\n"))
         .expect("writes what came of it");
-    std::fs::rename(directory.join("survivor.out.part"), directory.join("survivor.out"))
-        .expect("names what came of it");
+    std::fs::rename(
+        directory.join("survivor.out.part"),
+        directory.join("survivor.out"),
+    )
+    .expect("names what came of it");
     // And stays, as a survivor does, until the test ends it.
     tokio::time::sleep(std::time::Duration::from_secs(600)).await;
 }
 
-/// D-1083's contract for a process that outlasts the cleanup: it is named in the closure by
+/// The contract for a process that outlasts the cleanup: it is named in the closure by
 /// identifier, start and where it ran, with incomplete coverage; the session's endpoint,
 /// descriptor and terminal are gone, so nothing it holds lets it act as the session; and no later
 /// session shares its identity.
