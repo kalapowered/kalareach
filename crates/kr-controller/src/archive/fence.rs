@@ -27,9 +27,11 @@
 //! it.
 //!
 //! **Coverage** is complete only for a boundary this pass confirmed: a control group it proved the
+//! **Coverage** is complete only for a boundary this pass confirmed: a control group it proved the
 //! worker ran in and read empty at the end, or a job that needed no help. Everywhere else it is
-//! incomplete, always on macOS and on a Linux host with no service manager, because a process that
-//! left the terminal's session was never recorded and is not found.
+//! incomplete, always on macOS and on a Linux host with no service manager, because a process the
+//! record does not name (one that began after its last write, or that left the session out of the
+//! worker's sight) is not found there.
 
 use std::time::{Duration, Instant};
 
@@ -237,18 +239,33 @@ impl ArchiveService {
         // What the manager then ends was forced, whether or not the worker had recorded it.
         let mut group_refused = None;
         if let Some(group) = group.as_mut() {
+            // Which recorded processes the manager's kill finds, asked before it is sent: one
+            // whose own stop was refused is among them, and so is one that was asked and is still
+            // there.
+            let standing: Vec<bool> = tracked
+                .iter()
+                .map(|process| {
+                    !matches!(process.state, Standing::Ended)
+                        && !matches!(
+                            kr_ipc::identity::process_state(&process.identity),
+                            kr_ipc::identity::ProcessState::Ended
+                        )
+                })
+                .collect();
             match group.force().await {
                 Forced::Nothing => {}
                 Forced::Killed => {
-                    for process in &mut tracked {
-                        if matches!(process.state, Standing::Pending) {
-                            process.forced = true;
-                        }
+                    for (process, standing) in tracked.iter_mut().zip(standing) {
+                        process.forced |= standing;
                     }
                 }
                 Forced::Refused(why) => group_refused = Some(why),
             }
         }
+        let manager = group_refused
+            .as_deref()
+            .map(|why| format!("; the service manager did not end the control group: {why}"))
+            .unwrap_or_default();
         let forced_until = Instant::now() + FORCED;
         loop {
             look(&mut tracked);
@@ -281,14 +298,15 @@ impl ArchiveService {
                     &process.identity,
                     &boundary,
                     group.as_ref(),
-                    &format!("is still running{refusal}"),
+                    &format!("is still running{refusal}{manager}"),
                 )),
                 kr_ipc::identity::ProcessState::Unknown { detail } => surviving.push(survivor(
                     &process.identity,
                     &boundary,
                     group.as_ref(),
                     &format!(
-                        "may still be running: this host cannot say whether it ended ({detail})"
+                        "may still be running: this host cannot say whether it ended \
+                         ({detail}){refusal}{manager}"
                     ),
                 )),
             }
@@ -298,10 +316,6 @@ impl ArchiveService {
             match group.holders().await {
                 Holders::None => boundary_confirmed = true,
                 Holders::Some(identities) => {
-                    let why = group_refused
-                        .as_deref()
-                        .map(|why| format!("; the service manager did not end it: {why}"))
-                        .unwrap_or_default();
                     for identity in identities {
                         if !surviving.iter().any(|resource| {
                             resource
@@ -312,12 +326,17 @@ impl ArchiveService {
                                 &identity,
                                 &boundary,
                                 Some(&*group),
-                                &format!("is still running{why}"),
+                                &format!("is still running{manager}"),
                             ));
                         }
                     }
                 }
-                Holders::Unreadable(why) => surviving.push(unestablished(why)),
+                Holders::Unreadable(why) => {
+                    surviving.push(unestablished(why));
+                    if !manager.is_empty() {
+                        surviving.push(unestablished(manager.trim_start_matches("; ").to_owned()));
+                    }
+                }
             }
         }
         // Windows: the job closed with the worker, and the claim holds only if nothing needed
@@ -335,11 +354,17 @@ impl ArchiveService {
                     .to_owned(),
             ));
         }
-        if !complete {
+        // What the platform's boundary cannot reach, said where it does not: a job holds the whole
+        // tree, so a Windows closure that is incomplete has named why.
+        if !complete && !cfg!(windows) {
             surviving.push(unestablished(
                 if group.is_some() {
                     "a process that moved itself to another service or scope is not found on this \
                      host"
+                } else if cfg!(target_os = "linux") {
+                    "a process that left the session after its parent had ended, a process the \
+                     worker started outside the session and a process that began after the last \
+                     record was written are not found on this host"
                 } else {
                     "a process that left the terminal's session, a process the worker started \
                      outside it and a process that began after the last record was written are \
