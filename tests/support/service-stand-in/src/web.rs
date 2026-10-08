@@ -1,30 +1,44 @@
 //! Managed storage and the backup manifest, answering as the managed service answers them.
 //!
-//! It checks what the service checks before it acts: the signature over the digest of the
-//! canonical body, the method the credential names, the installation the body names against the key
-//! that signed, and the account token beside the request. It keeps what the service keeps: whether
-//! backup storage is on and at which revision, who owns each archive, each upload's part table and
-//! parts, each stored object, and each collection's writer, checkpoint and publications. Its
-//! refusals are the service's codes, at the service's statuses, for the service's reasons.
+//! It checks what the service checks before it acts: that the request is addressed to this
+//! service's own origin, that it was signed inside the freshness window, the signature over the
+//! digest of the canonical body, the method the credential names, the installation the body names
+//! against the key that signed, and the account token beside the request, which proves an account
+//! only while it is live and carries the `backup.write` scope. It keeps what the service keeps:
+//! whether backup storage is on and at which revision, who owns each archive, each upload's part
+//! table and parts, each stored object, and each collection's writer, checkpoint and bounded
+//! history of publications. Its refusals are the service's codes, at the service's statuses, for
+//! the service's reasons.
 //!
-//! A test can also make the transport fail, before the service sees a request or after it acted
-//! on one, which is how an interrupted transfer and a lost answer are made, and it can have a stale
+//! A test can also make the service fail, before it sees a request, after it acted on one, by
+//! holding a request open without an answer, by answering a refusal of its own choosing without
+//! acting, or by failing the write of a part as storage does ([`Moment`]); and it can have a stale
 //! retention change refused as a service that did not yet answer it as a conflict did
 //! ([`StaleRefusal`]).
 
-#![allow(
-    dead_code,
-    reason = "each suite that includes this uses the part it needs"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use kr_client::error::ClientError;
 use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_protocol::archive::{
+    BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN, BackupGenerationPublication,
+    BackupWriterRecord, BackupWriterRecordPayload, MAX_ARCHIVE_DESCRIPTOR_LEN,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::service::{ServiceRequestSignature, canonical_body_digest, installation_id};
+use tokio::sync::watch;
+
+/// The origin the in-process service answers as.
+pub const IN_PROCESS_ORIGIN: &str = "https://reach.kala.to";
+
+/// The scope an account token needs for this service to read it as an account's proof.
+pub const BACKUP_WRITE_SCOPE: &str = "backup.write";
+
+/// The most generations one collection keeps; the oldest is dropped first.
+pub const MAX_GENERATIONS: usize = 16;
 
 /// The one account this web knows, and the token that proves it.
 pub const ACCOUNT: &str = "account-one";
@@ -47,6 +61,25 @@ pub enum Moment {
     ProofUnread,
     /// The request's body arrives cut short, so the service reads less than was sent.
     BodyCut,
+    /// The service holds the request open and answers nothing, until [`StorageWeb::release_held`]
+    /// lets the connection go. It acts on nothing.
+    Hold,
+    /// The service refuses the request as stated, without acting on it, as a service does that is
+    /// rate limiting, out of room or fenced for maintenance.
+    Refuse {
+        /// The HTTP status.
+        status: u16,
+        /// The service's error code.
+        code: &'static str,
+        /// The seconds the refusal asks the caller to wait, when it asks.
+        retry_after_seconds: Option<u64>,
+    },
+    /// Storage does not confirm the write of a part, so the service answers `INTERNAL` and closes
+    /// the upload, as it does when a part's write cannot be confirmed.
+    PartWriteFails,
+    /// The service has lost every upload it held, as one does whose uploads were cleaned up, and
+    /// then answers the request as it would.
+    UploadsLost,
 }
 
 /// How a retention change decided against a revision the record has left is refused.
@@ -90,7 +123,6 @@ struct Upload {
     object: String,
     generation: u64,
     total: u64,
-    declared: u64,
     hash: String,
     installation: String,
     account: Option<String>,
@@ -123,8 +155,18 @@ struct Collection {
     writer_key_id: String,
     writer_revision: u64,
     writer_digest: String,
+    /// The enrolment as the owner signed it, which a publication is held to.
+    enrolled: BackupWriterRecordPayload,
     checkpoint: u64,
     generations: BTreeMap<u64, (String, serde_json::Value)>,
+}
+
+/// What the service knows of one account token.
+#[derive(Clone, Debug)]
+struct Token {
+    account: String,
+    scopes: BTreeSet<String>,
+    live: bool,
 }
 
 /// Everything the service keeps.
@@ -141,23 +183,127 @@ struct State {
     next_upload: u32,
     collections: BTreeMap<String, Collection>,
     nonces: BTreeSet<String>,
+    tokens: BTreeMap<String, Token>,
+}
+
+/// What the service did with one request.
+#[derive(Debug)]
+pub enum Handled {
+    /// It answered.
+    Answer(ServiceHttpAnswer),
+    /// The connection was lost: the request never reached the service, or its answer was lost.
+    Lost,
+    /// The service holds the request open and answers nothing until it is released. The count is
+    /// the number of releases so far, which [`StorageWeb::held_until_released`] waits past.
+    Held(u64),
 }
 
 /// Managed storage and the backup manifest.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StorageWeb {
+    /// The origin this service answers as, which every request must name.
+    origin: String,
     state: Mutex<State>,
     arrived: Mutex<Vec<Arrived>>,
     faults: Mutex<Vec<Fault>>,
+    released: watch::Sender<u64>,
+    arrivals: watch::Sender<usize>,
+}
+
+impl Default for StorageWeb {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StorageWeb {
-    /// A service holding nothing, with backup storage off.
+    /// A service holding nothing, with backup storage off, answering as `https://reach.kala.to`
+    /// to requests handed to it in process.
     #[must_use]
     pub fn new() -> Self {
-        let web = Self::default();
-        web.state.lock().expect("the state").daily_snapshots = 30;
+        Self::at(IN_PROCESS_ORIGIN)
+    }
+
+    /// A service holding nothing, with backup storage off, answering as `origin`, which every
+    /// request it admits must name.
+    ///
+    /// It knows one account, [`ACCOUNT`], and one token for it, [`TOKEN`], issued with
+    /// [`BACKUP_WRITE_SCOPE`].
+    #[must_use]
+    pub fn at(origin: impl Into<String>) -> Self {
+        let web = Self {
+            origin: origin.into(),
+            state: Mutex::default(),
+            arrived: Mutex::default(),
+            faults: Mutex::default(),
+            released: watch::channel(0).0,
+            arrivals: watch::channel(0).0,
+        };
+        {
+            let mut state = web.state.lock().expect("the state");
+            state.daily_snapshots = 30;
+            state.tokens.insert(
+                TOKEN.to_owned(),
+                Token {
+                    account: ACCOUNT.to_owned(),
+                    scopes: BTreeSet::from([BACKUP_WRITE_SCOPE.to_owned()]),
+                    live: true,
+                },
+            );
+        }
         web
+    }
+
+    /// The origin this service answers as.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Issues `token` for `account`, with `scopes` and live. A token this service did not issue
+    /// proves no account.
+    pub fn issue_token(&self, token: &str, account: &str, scopes: &[&str]) {
+        self.state.lock().expect("the state").tokens.insert(
+            token.to_owned(),
+            Token {
+                account: account.to_owned(),
+                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                live: true,
+            },
+        );
+    }
+
+    /// `token` expires: from now on it proves no account.
+    pub fn expire_token(&self, token: &str) {
+        if let Some(held) = self.state.lock().expect("the state").tokens.get_mut(token) {
+            held.live = false;
+        }
+    }
+
+    /// Waits until `count` requests have been addressed to `path`, reaching the service or not.
+    pub async fn requests_reach(&self, path: &str, count: usize) {
+        let mut arrivals = self.arrivals.subscribe();
+        while self.requests_to(path) < count {
+            if arrivals.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Lets every connection a [`Moment::Hold`] is holding go without an answer.
+    pub fn release_held(&self) {
+        self.released.send_modify(|released| *released += 1);
+    }
+
+    /// Waits until [`Self::release_held`] has been called since `epoch`, the count a
+    /// [`Handled::Held`] carried.
+    pub async fn held_until_released(&self, epoch: u64) {
+        let mut released = self.released.subscribe();
+        while *released.borrow_and_update() == epoch {
+            if released.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// The `nth` request to `path` from now on fails at `moment`.
@@ -264,40 +410,18 @@ impl StorageWeb {
     }
 
     /// Answers one request as the service does, or fails as a test arranged.
-    fn take(
+    ///
+    /// `path` is where the request was addressed, without the origin; `document` is the signed
+    /// request; `token` is the bearer beside it, when there was one; `content` is the body of a
+    /// part.
+    #[must_use]
+    pub fn handle(
         &self,
-        url: &str,
-        document: Option<serde_json::Value>,
-        headers: &[(&str, &str)],
+        path: &str,
+        document: &serde_json::Value,
+        token: Option<&str>,
         content: Option<&[u8]>,
-    ) -> kr_client::Result<ServiceHttpAnswer> {
-        let path = url
-            .strip_prefix("https://reach.kala.to")
-            .expect("the gateway this suite addresses")
-            .to_owned();
-        let token = headers
-            .iter()
-            .find(|(name, _)| *name == "authorization")
-            .map(|(_, value)| {
-                value
-                    .strip_prefix("Bearer ")
-                    .expect("a bearer token")
-                    .to_owned()
-            });
-        let document = match document {
-            Some(document) => document,
-            None => {
-                let carried = headers
-                    .iter()
-                    .find(|(name, _)| *name == "kr-service-request")
-                    .expect("a part carries its signed request in a header")
-                    .1;
-                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(carried)
-                    .expect("unpadded base64url");
-                serde_json::from_slice(&bytes).expect("a signed request")
-            }
-        };
+    ) -> Handled {
         let moment = {
             let mut faults = self.faults.lock().expect("the faults");
             let mut met = None;
@@ -311,13 +435,18 @@ impl StorageWeb {
             met
         };
         let reached = moment != Some(Moment::Before);
-        self.arrived.lock().expect("what arrived").push(Arrived {
-            path: path.clone(),
-            body: document["body"].clone(),
-            token: token.clone(),
-            content: content.map(<[u8]>::to_vec),
-            reached,
-        });
+        let arrived = {
+            let mut arrived = self.arrived.lock().expect("what arrived");
+            arrived.push(Arrived {
+                path: path.to_owned(),
+                body: document["body"].clone(),
+                token: token.map(str::to_owned),
+                content: content.map(<[u8]>::to_vec),
+                reached,
+            });
+            arrived.len()
+        };
+        self.arrivals.send_replace(arrived);
         let token = if moment == Some(Moment::ProofUnread) {
             None
         } else {
@@ -328,20 +457,47 @@ impl StorageWeb {
         } else {
             content
         };
-        let lost = || {
-            Err(ClientError::Host(ProtocolError::new(
-                ErrorCode::UpstreamUnavailable,
-                "the connection dropped".to_owned(),
-            )))
-        };
-        if !reached {
-            return lost();
+        if moment == Some(Moment::UploadsLost) {
+            let mut state = self.state.lock().expect("the state");
+            state.uploads.clear();
+            state
+                .objects
+                .retain(|_, object| !matches!(object, Object::Uploading));
         }
-        let answer = self.answer(&path, &document, token.as_deref(), content);
+        match moment {
+            Some(Moment::Before) => return Handled::Lost,
+            Some(Moment::Hold) => return Handled::Held(*self.released.borrow()),
+            Some(Moment::Refuse {
+                status,
+                code,
+                retry_after_seconds,
+            }) => {
+                return Handled::Answer(refusal_after(
+                    status,
+                    code,
+                    "The service refuses that request for now.",
+                    retry_after_seconds,
+                ));
+            }
+            _ => {}
+        }
+        let answer = self.answer(
+            path,
+            document,
+            token,
+            content,
+            moment == Some(Moment::PartWriteFails),
+        );
         if moment == Some(Moment::After) {
-            return lost();
+            return Handled::Lost;
         }
-        Ok(answer)
+        Handled::Answer(answer)
+    }
+
+    /// Where a URL this service was addressed at is, without its origin.
+    fn path_of<'a>(&self, url: &'a str) -> &'a str {
+        url.strip_prefix(self.origin.as_str())
+            .expect("the origin this service answers as")
     }
 
     /// What the service answers one request that reached it.
@@ -351,6 +507,7 @@ impl StorageWeb {
         document: &serde_json::Value,
         token: Option<&str>,
         content: Option<&[u8]>,
+        part_write_fails: bool,
     ) -> ServiceHttpAnswer {
         let method = match path {
             "/api/storage/status" => "storage.status",
@@ -364,10 +521,31 @@ impl StorageWeb {
             "/api/backup/manifest" => "backup.manifest",
             other => panic!("no route at {other}"),
         };
-        let signature: ServiceRequestSignature =
-            serde_json::from_value(document["signature"].clone()).expect("a credential");
+        let Ok(signature) =
+            serde_json::from_value::<ServiceRequestSignature>(document["signature"].clone())
+        else {
+            return refusal(
+                401,
+                "UNAUTHENTICATED",
+                "That is not a signature this service can check.",
+            );
+        };
         let body = &document["body"];
         let digest = canonical_body_digest(body).expect("a canonical body");
+        if signature.payload.gateway_origin.as_str() != self.origin {
+            return refusal(
+                401,
+                "UNAUTHENTICATED",
+                "This request was signed for another gateway.",
+            );
+        }
+        if !signature.payload.is_fresh_at(now_ms()) {
+            return refusal(
+                401,
+                "UNAUTHENTICATED",
+                "A request is signed within 300 seconds of being made.",
+            );
+        }
         if signature.payload.body_digest != digest
             || signature.payload.method.as_str() != method
             || !verifies(&signature)
@@ -389,8 +567,15 @@ impl StorageWeb {
             );
         }
         let caller = installation_id(&signature.public_key).to_string();
+        let account = token.and_then(|token| {
+            state
+                .tokens
+                .get(token)
+                .filter(|held| held.live && held.scopes.contains(BACKUP_WRITE_SCOPE))
+                .map(|held| held.account.clone())
+        });
         if method == "backup.manifest" {
-            return manifest(&mut state, &signature, body, token);
+            return manifest(&mut state, &signature, body, account.is_some());
         }
         if body["installation_id"].as_str() != Some(caller.as_str()) {
             return refusal(
@@ -399,8 +584,8 @@ impl StorageWeb {
                 "That request names an installation other than the one whose key carried it.",
             );
         }
-        // The account half is proved only by the token this web issued for its one account.
-        let account = token.filter(|token| *token == TOKEN).map(|_| ACCOUNT);
+        // The account half is proved only by a live token this service issued with the scope.
+        let account = account.as_deref();
         let principal = account.map_or_else(
             || format!("installation:{caller}"),
             |account| format!("account:{account}"),
@@ -409,13 +594,46 @@ impl StorageWeb {
             "storage.status" => status(&state, &principal, account.is_some()),
             "storage.retention.set" => retention(&mut state, body, account.is_some()),
             "storage.upload.create" => create(&mut state, body, &caller, account, &principal),
-            "storage.upload.part" => part(&mut state, body, &caller, account, content),
+            "storage.upload.part" => part(
+                &mut state,
+                body,
+                &caller,
+                account,
+                content,
+                part_write_fails,
+            ),
             "storage.upload.complete" => complete(&mut state, body, &caller, account),
             "storage.upload.abort" => abort(&mut state, body, &caller, account),
             "storage.object.read" => read(&state, body, &principal),
             _ => delete(&mut state, body, &principal),
         }
     }
+}
+
+impl StorageWeb {
+    /// What an in-process transport answers for one handled request.
+    fn delivered(handled: Handled) -> kr_client::Result<ServiceHttpAnswer> {
+        match handled {
+            Handled::Answer(answer) => Ok(answer),
+            Handled::Lost | Handled::Held(_) => Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::UpstreamUnavailable,
+                "the connection dropped".to_owned(),
+            ))),
+        }
+    }
+}
+
+/// The bearer token a request carries, when it carries one.
+fn bearer(headers: &[(&str, &str)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| *name == "authorization")
+        .map(|(_, value)| {
+            value
+                .strip_prefix("Bearer ")
+                .expect("a bearer token")
+                .to_owned()
+        })
 }
 
 impl ServiceHttp for StorageWeb {
@@ -426,7 +644,13 @@ impl ServiceHttp for StorageWeb {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let document = serde_json::from_slice(body).expect("a signed request");
-        let answer = self.take(url, Some(document), headers, None);
+        let handled = self.handle(
+            self.path_of(url),
+            &document,
+            bearer(headers).as_deref(),
+            None,
+        );
+        let answer = Self::delivered(handled);
         Box::pin(async move { answer })
     }
 
@@ -436,9 +660,41 @@ impl ServiceHttp for StorageWeb {
         body: &'a [u8],
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
-        let answer = self.take(url, None, headers, Some(body));
+        let carried = headers
+            .iter()
+            .find(|(name, _)| *name == "kr-service-request")
+            .expect("a part carries its signed request in a header")
+            .1;
+        let document = document_of(carried);
+        let handled = self.handle(
+            self.path_of(url),
+            &document,
+            bearer(headers).as_deref(),
+            Some(body),
+        );
+        let answer = Self::delivered(handled);
         Box::pin(async move { answer })
     }
+}
+
+/// The signed request a part carries in its header, as unpadded base64url JSON.
+#[must_use]
+pub fn document_of(carried: &str) -> serde_json::Value {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(carried)
+        .expect("unpadded base64url");
+    serde_json::from_slice(&bytes).expect("a signed request")
+}
+
+/// The time on this machine's clock, in UTC milliseconds.
+fn now_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_millis(),
+    )
+    .expect("a time in range")
 }
 
 /// Whether the credential verifies under the key it names, in its signer's domain.
@@ -464,16 +720,32 @@ fn answered(data: serde_json::Value) -> ServiceHttpAnswer {
 }
 
 /// A refusal, in the service's envelope.
+#[must_use]
 pub fn refusal(status: u16, code: &str, message: &str) -> ServiceHttpAnswer {
+    refusal_after(status, code, message, None)
+}
+
+/// A refusal that asks the caller to wait `retry_after_seconds`, in the service's envelope.
+#[must_use]
+pub fn refusal_after(
+    status: u16,
+    code: &str,
+    message: &str,
+    retry_after_seconds: Option<u64>,
+) -> ServiceHttpAnswer {
+    let mut error = serde_json::json!({ "code": code, "message": message });
+    if let Some(seconds) = retry_after_seconds {
+        error["retryAfterSeconds"] = serde_json::json!(seconds);
+    }
     ServiceHttpAnswer {
         status,
-        body: serde_json::to_vec(&serde_json::json!({
-            "ok": false,
-            "error": { "code": code, "message": message },
-        }))
-        .expect("a refusal"),
+        body: serde_json::to_vec(&serde_json::json!({ "ok": false, "error": error }))
+            .expect("a refusal"),
     }
 }
+
+/// What a caller with no account proof is told about storage.
+const NO_ACCOUNT: &str = "This installation has no backup storage. Sign this host in to an account whose plan includes backup storage, and try again.";
 
 /// The retention the service publishes.
 fn retention_policy(daily_snapshots: u32) -> serde_json::Value {
@@ -517,7 +789,12 @@ fn identifier(value: &serde_json::Value) -> Option<String> {
 }
 
 fn status(state: &State, principal: &str, funded: bool) -> ServiceHttpAnswer {
-    let on = funded && state.backup_on;
+    // Answered before any store is read: an installation with no account proof has no storage to
+    // report.
+    if !funded {
+        return refusal(402, "QUOTA_EXHAUSTED", NO_ACCOUNT);
+    }
+    let on = state.backup_on;
     let owned = |wanted: &str| {
         state
             .objects
@@ -536,12 +813,12 @@ fn status(state: &State, principal: &str, funded: bool) -> ServiceHttpAnswer {
     answered(serde_json::json!({
         "principal": principal,
         "backup": if on { "on" } else { "off" },
-        "retention_revision": if funded { state.revision } else { 0 }.to_string(),
+        "retention_revision": state.revision.to_string(),
         "retention": retention_policy(state.daily_snapshots),
         "stored": { "objects": owned("stored"), "bytes": "0" },
         "tombstoned": { "objects": owned("tombstoned"), "bytes": "0", "next_purge": null },
         "uploading": { "objects": 0, "bytes": "0", "reserved_bytes": "0" },
-        "allowance_bytes": if funded { serde_json::json!("10737418240") } else { serde_json::Value::Null },
+        "allowance_bytes": "10737418240",
         "limits": limits(),
     }))
 }
@@ -731,7 +1008,6 @@ fn create(
             object,
             generation,
             total,
-            declared,
             hash,
             installation: caller.to_owned(),
             account: account.map(str::to_owned),
@@ -789,6 +1065,7 @@ fn part(
     caller: &str,
     account: Option<&str>,
     content: Option<&[u8]>,
+    write_fails: bool,
 ) -> ServiceHttpAnswer {
     let content = content.expect("a part's content");
     let (upload, _) = match reach(state, body, caller, account) {
@@ -866,6 +1143,16 @@ fn part(
             "That part does not hash to the digest it declared.",
         );
     }
+    if write_fails {
+        // What storage did with the write is not known, so the upload is closed rather than
+        // continued.
+        upload.state = UploadState::Cleaned;
+        return refusal(
+            500,
+            "INTERNAL",
+            "That part could not be confirmed, so the upload was closed. Store the object again.",
+        );
+    }
     upload
         .parts
         .insert(number, (length, sha.to_owned(), content.to_vec()));
@@ -932,6 +1219,13 @@ fn complete(
         .values()
         .flat_map(|(_, _, bytes)| bytes.iter().copied())
         .collect();
+    let stored_for = format!(
+        "account:{}",
+        upload
+            .account
+            .as_deref()
+            .expect("an upload an account funds")
+    );
     let answer = serde_json::json!({
         "state": "stored",
         "archive_id": upload.archive,
@@ -944,7 +1238,7 @@ fn complete(
         "size_bucket_bytes": upload.total.next_power_of_two().to_string(),
         "stored_at": "2026-09-25T17:00:00.000Z",
         "committed_bytes": upload.total.to_string(),
-        "principal": format!("account:{ACCOUNT}"),
+        "principal": stored_for.clone(),
     });
     upload.state = UploadState::Completed(answer.clone());
     let key = (upload.archive.clone(), upload.object.clone());
@@ -952,7 +1246,7 @@ fn complete(
         key,
         Object::Stored {
             bytes,
-            principal: format!("account:{ACCOUNT}"),
+            principal: stored_for,
         },
     );
     answered(answer)
@@ -1098,13 +1392,30 @@ fn digest_of(record: &serde_json::Value) -> String {
         .to_owned()
 }
 
+/// Whether `signature` verifies under the key that carried the request, in `domain`.
+fn record_verifies(
+    carrier: &kr_protocol::scalars::AuthorisationKey,
+    domain: &str,
+    input: Result<Vec<u8>, kr_cbor::CborError>,
+    signature: &kr_protocol::scalars::Signature64,
+) -> bool {
+    let Ok(input) = input else {
+        return false;
+    };
+    let Ok(transcript) = kr_crypto::sign::SigningTranscript::from_canonical_bytes(domain, input)
+    else {
+        return false;
+    };
+    kr_crypto::sign::verify(carrier, &transcript, signature).is_ok()
+}
+
 fn manifest(
     state: &mut State,
-    signature: &ServiceRequestSignature,
+    request: &ServiceRequestSignature,
     body: &serde_json::Value,
-    token: Option<&str>,
+    funded: bool,
 ) -> ServiceHttpAnswer {
-    let carried = key_id_of(&signature.public_key);
+    let carried = key_id_of(&request.public_key);
     let members = body.as_object().expect("a request");
     if members.len() != 1 {
         return refusal(
@@ -1115,20 +1426,25 @@ fn manifest(
     }
     if let Some(asked) = members.get("enrol") {
         let record = &asked["record"];
-        let Ok(parsed) =
-            serde_json::from_value::<kr_protocol::archive::BackupWriterRecord>(record.clone())
-        else {
+        let Ok(parsed) = serde_json::from_value::<BackupWriterRecord>(record.clone()) else {
             return refusal(
                 400,
                 "INVALID_REQUEST",
                 "An enrolment carries the owner's signed writer record.",
             );
         };
-        if key_id_of_record(&parsed.payload.owner_key_id) != carried {
+        if key_id_of_record(&parsed.payload.owner_key_id) != carried
+            || !record_verifies(
+                &request.public_key,
+                BACKUP_WRITER_DOMAIN,
+                parsed.payload.signing_input(),
+                &parsed.signature,
+            )
+        {
             return refusal(
                 403,
                 "FORBIDDEN",
-                "That record names a key other than the one that carried the request.",
+                "That record is not signed by the key that carried the request.",
             );
         }
         let archive = parsed.payload.archive_id.to_string();
@@ -1144,6 +1460,7 @@ fn manifest(
                         writer_key_id: writer,
                         writer_revision: revision,
                         writer_digest: digest,
+                        enrolled: parsed.payload.clone(),
                         checkpoint: 0,
                         generations: BTreeMap::new(),
                     },
@@ -1169,6 +1486,7 @@ fn manifest(
                 collection.writer_key_id = writer;
                 collection.writer_revision = revision;
                 collection.writer_digest = digest;
+                collection.enrolled = parsed.payload.clone();
                 true
             }
         };
@@ -1176,25 +1494,40 @@ fn manifest(
         return answered(serde_json::json!({
             "state": if changed { "enrolled" } else { "unchanged" },
             "writer": writer_summary(collection),
-            "collection": collection_summary(&archive, collection),
+            "collection": collection_summary(&archive, collection, None),
         }));
     }
     if let Some(asked) = members.get("publish") {
         let publication = &asked["publication"];
-        let Ok(parsed) = serde_json::from_value::<kr_protocol::archive::BackupGenerationPublication>(
-            publication.clone(),
-        ) else {
+        let Ok(parsed) = serde_json::from_value::<BackupGenerationPublication>(publication.clone())
+        else {
             return refusal(
                 400,
                 "INVALID_REQUEST",
                 "A publication carries the writer's signed generation publication.",
             );
         };
-        if key_id_of_record(&parsed.payload.writer_key_id) != carried {
+        // Every rule the protocol states for a descriptor, before anything is held: an invalid
+        // descriptor fails before allocation.
+        let descriptor_len = kr_cbor::to_canonical_value(&parsed.payload.descriptor)
+            .map_or(MAX_ARCHIVE_DESCRIPTOR_LEN + 1, |value| {
+                kr_cbor::encode(&value).len()
+            });
+        if let Err(refused) = parsed.payload.descriptor.validate(descriptor_len) {
+            return refusal(400, "INVALID_REQUEST", &refused.to_string());
+        }
+        if key_id_of_record(&parsed.payload.writer_key_id) != carried
+            || !record_verifies(
+                &request.public_key,
+                BACKUP_PUBLICATION_DOMAIN,
+                parsed.payload.signing_input(),
+                &parsed.signature,
+            )
+        {
             return refusal(
                 403,
                 "FORBIDDEN",
-                "That record names a key other than the one that carried the request.",
+                "That record is not signed by the key that carried the request.",
             );
         }
         let archive = parsed.payload.descriptor.archive_id.to_string();
@@ -1214,6 +1547,9 @@ fn manifest(
                 "FORBIDDEN",
                 "That writer is not the one this collection enrolled.",
             );
+        }
+        if let Err(refused) = parsed.check_structure(descriptor_len, &collection.enrolled) {
+            return refusal(400, "INVALID_REQUEST", &refused.to_string());
         }
         let generation = parsed.payload.descriptor.backup_generation.get();
         let digest = digest_of(publication);
@@ -1237,18 +1573,24 @@ fn manifest(
         };
         // Only a publication about to be stored reaches the ledger, which is where an account's
         // proof is needed: a duplicate holds nothing.
-        if !duplicate && token != Some(TOKEN) {
-            return refusal(
-                402,
-                "QUOTA_EXHAUSTED",
-                "This installation has no backup storage. Sign this host in to an account whose plan includes backup storage, and try again.",
-            );
+        if !duplicate && !funded {
+            return refusal(402, "QUOTA_EXHAUSTED", NO_ACCOUNT);
         }
+        let mut dropped = Vec::new();
         if !duplicate {
             collection
                 .generations
                 .insert(generation, (digest, publication.clone()));
             collection.checkpoint = generation;
+            while collection.generations.len() > MAX_GENERATIONS {
+                let oldest = *collection
+                    .generations
+                    .keys()
+                    .next()
+                    .expect("a generation to drop");
+                collection.generations.remove(&oldest);
+                dropped.push(oldest.to_string());
+            }
         }
         let hash = serde_json::to_value(
             parsed
@@ -1264,12 +1606,12 @@ fn manifest(
             "generation": {
                 "backup_generation": generation.to_string(),
                 "encrypted_manifest_hash": hash,
-                "descriptor_bytes": "512",
+                "descriptor_bytes": descriptor_len.to_string(),
                 "recipients": parsed.payload.descriptor.manifest_key_wraps.len(),
                 "published_at": "2026-09-25T17:00:00.000Z",
             },
-            "collection": collection_summary(&archive, collection),
-            "dropped": [],
+            "collection": collection_summary(&archive, collection, None),
+            "dropped": dropped,
         }));
     }
     let asked = &members["fetch"];
@@ -1283,6 +1625,17 @@ fn manifest(
         serde_json::Value::Null => collection.generations.keys().next_back().copied(),
         named => counter(named),
     };
+    // A caller that holds a verified checkpoint is not answered with anything older: a service
+    // that cannot meet it says what it holds instead.
+    if let Some(held) = counter(&asked["checkpoint"]["backup_generation"])
+        && collection.checkpoint < held
+    {
+        return refusal(
+            409,
+            "CONFLICT",
+            "This collection holds an older generation than the checkpoint names.",
+        );
+    }
     let Some((generation, (_, publication))) =
         wanted.and_then(|wanted| collection.generations.get_key_value(&wanted))
     else {
@@ -1292,7 +1645,7 @@ fn manifest(
     answered(serde_json::json!({
         "publication": publication,
         "published_at": "2026-09-25T17:00:00.000Z",
-        "collection": collection_summary(&archive, collection),
+        "collection": collection_summary(&archive, collection, Some("10737418240")),
         "current_writer": writer_summary(collection),
     }))
 }
@@ -1314,7 +1667,13 @@ fn writer_summary(collection: &Collection) -> serde_json::Value {
     })
 }
 
-fn collection_summary(archive: &str, collection: &Collection) -> serde_json::Value {
+/// What one collection holds now, with the allowance the caller's storage has when the answer
+/// states it: a fetch reads the ledger for it, and an enrolment or a publication does not.
+fn collection_summary(
+    archive: &str,
+    collection: &Collection,
+    allowance: Option<&str>,
+) -> serde_json::Value {
     serde_json::json!({
         "archive_id": archive,
         "checkpoint_generation": collection.checkpoint.to_string(),
@@ -1325,6 +1684,6 @@ fn collection_summary(archive: &str, collection: &Collection) -> serde_json::Val
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
         "bytes": "512",
-        "allowance_bytes": null,
+        "allowance_bytes": allowance,
     })
 }

@@ -2,12 +2,9 @@
 //! kit.
 //!
 //! Section 20 ¶9 and ¶10, and section 24's rule that privacy mode disables backup production.
-//! Nothing here talks to a real service: `support/storage_web.rs` answers for managed storage and
+//! Nothing here talks to a real service: `kr-service-stand-in` answers for managed storage and
 //! the backup manifest as the service does, and the owner's sync service holding the recovery
 //! bundle is scripted below.
-
-#[path = "support/storage_web.rs"]
-mod storage_web;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -46,7 +43,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs, U64, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use storage_web::{StorageWeb, TOKEN};
+use kr_service_stand_in::{StorageWeb, TOKEN};
 
 const ORIGIN: &str = "https://reach.kala.to";
 const LOCATOR: &str = "c4d2e6f8-settings-bundle";

@@ -1,0 +1,26 @@
+[package]
+name = "kr-service-stand-in"
+description = "A stand-in for the managed storage and backup manifest services, answering as their contract states, in process and over a loopback socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The signed request travels in a header beside a storage part, as unpadded base64url.
+base64.workspace = true
+# The digest of a part's content and of a signed record.
+kr-cbor.workspace = true
+# The client types the stand-in answers in, and the transport trait it is a replacement for.
+kr-client.workspace = true
+# Verifying the signatures the service verifies.
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+serde_json.workspace = true
+# The loopback listener, and the pause a held request waits in.
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
+
+[lints]
+workspace = true

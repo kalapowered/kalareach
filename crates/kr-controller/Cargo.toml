@@ -110,6 +110,9 @@ kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 # The bundle a test seeds a catalogue from is made of files of its own, trusting what the test names.
 kr-plugin-catalogue = { workspace = true, features = ["testing"] }
+# The managed storage and backup manifest services, on a loopback socket, for the daemon's carrier
+# of its backup outbox to talk to.
+kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
 kr-term.workspace = true
 kr-transfer.workspace = true
 # The connector packages a test publishes and installs are the worker's own test packages, so the

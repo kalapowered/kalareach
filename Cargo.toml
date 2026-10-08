@@ -41,6 +41,7 @@ members = [
     "tests/integration/privacy",
     "tests/integration/sync",
     "tests/perf",
+    "tests/support/service-stand-in",
 ]
 
 [workspace.package]

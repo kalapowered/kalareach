@@ -81,6 +81,8 @@ rcgen.workspace = true
 # A test host answers with a result type of the test's own, which publishes its schema like any
 # protocol message so the client can read it.
 schemars.workspace = true
+# The managed storage and backup manifest services, answering as their contract states.
+kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
 # The draft store writes to a caller-supplied directory, so its tests supply a disposable one.
 tempfile.workspace = true
 # The loopback server listens and reads, which the library itself has no need to do, and a test

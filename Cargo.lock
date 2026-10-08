@@ -4289,6 +4289,7 @@ dependencies = [
  "kr-pairing",
  "kr-plugin-sdk",
  "kr-protocol",
+ "kr-service-stand-in",
  "kr-term",
  "kr-transport",
  "kr-width",
@@ -4356,6 +4357,7 @@ dependencies = [
  "kr-plugin-service",
  "kr-project",
  "kr-protocol",
+ "kr-service-stand-in",
  "kr-shell-integration",
  "kr-term",
  "kr-transfer",
@@ -4796,6 +4798,19 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "zeroize",
+]
+
+[[package]]
+name = "kr-service-stand-in"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kr-cbor",
+ "kr-client",
+ "kr-crypto",
+ "kr-protocol",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
