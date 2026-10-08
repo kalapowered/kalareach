@@ -34,6 +34,9 @@ use crate::service::net::lifetimes::{Anchored, GrantStanding};
 
 use super::RemoteConnection;
 
+/// How long a connection waits for a grant to end before it looks at the grants again.
+const GRANT_WATCH: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Where a grant a request is decided under comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Held {
@@ -119,11 +122,14 @@ impl RemoteConnection {
     /// The grant this connection acts under, once `acting` has opened its link to `session_id`.
     ///
     /// Taken under the lock that guards the link, so two requests that open it at once do not fix
-    /// two grants.
+    /// two grants. A share is registered with the host as the grant this connection acts under, so
+    /// that revoking it reaches this connection and no other, and it is read again once registered:
+    /// a revocation that landed before the registration found nothing to reach, and this finds it.
     ///
     /// # Errors
     ///
-    /// Refuses a grant other than the one already fixed for the session.
+    /// Refuses a grant other than the one already fixed for the session, and a share that has been
+    /// revoked or whose connection has been withdrawn.
     pub(super) fn fix(
         &self,
         session_id: SessionId,
@@ -134,16 +140,104 @@ impl RemoteConnection {
             Some((fixed_session, fixed_grant))
                 if fixed_session != session_id || fixed_grant != acting.grant.grant_id =>
             {
-                Err(ProtocolError::new(
+                return Err(ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "this connection acts for this session under another grant; open another \
                      connection to act under the one named",
-                ))
+                ));
             }
-            Some(_) => Ok(()),
-            None => {
-                *fixed = Some((session_id, acting.grant.grant_id));
-                Ok(())
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        if acting.held == Held::Share {
+            let record = self.share_record(acting.grant.grant_id)?;
+            if !self
+                .controller
+                .note_acting(self.connection_id, acting.grant.grant_id)
+            {
+                return Err(not_held());
+            }
+            if record.revoked_at_ms.is_some() {
+                return Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this grant has been revoked",
+                ));
+            }
+            *self
+                .fixed_bound
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(self.share_bound(&record)?);
+        }
+        *fixed = Some((session_id, acting.grant.grant_id));
+        drop(fixed);
+        self.acting_changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Resolves once a grant this connection stands on has ended: the pairing grant that lets the
+    /// device in, or the share it acts under for its session.
+    ///
+    /// A connection that sends nothing is served nothing after its grant ends, because the
+    /// connection ends with it. The share's end is a time bound of its own, so ending it writes
+    /// nothing on the device's record; the pairing grant's end is written down as it is wherever
+    /// it is found. A revocation does not wait for this: it fences the connections acting under
+    /// the grants it withdrew when it takes effect.
+    pub(in crate::service::net) async fn grant_ended(&self) {
+        loop {
+            // Asked for before the grants are looked at, so a share fixed while they are looked at
+            // is not missed.
+            let changed = self.acting_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.grant_is_current() {
+                return;
+            }
+            let share = self
+                .fixed_bound
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(share) = &share
+                && !super::output::bounds_hold(
+                    &self.controller,
+                    std::slice::from_ref(share),
+                    crate::grants::policy::HeldBound::stands_at,
+                )
+            {
+                return;
+            }
+            let now = self.controller.clock.now();
+            let settled = self.controller.settled_utc_now();
+            let until_utc = |end: Option<u64>| {
+                end.map(|end| std::time::Duration::from_millis(end.saturating_sub(settled)))
+            };
+            let soonest = [
+                self.authority
+                    .grant_deadline
+                    .map(|deadline| deadline.saturating_duration_since(now)),
+                until_utc(self.authority.grant_expires_at_ms),
+                share.as_ref().and_then(|share| {
+                    share
+                        .continuous_deadline()
+                        .map(|deadline| deadline.saturating_duration_since(now))
+                }),
+                share
+                    .as_ref()
+                    .and_then(|share| until_utc(share.utc_deadline_ms())),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            match soonest {
+                // A clock can step forward and end a grant sooner than the time it has left, so
+                // the wait is bounded and the grants are looked at again.
+                Some(left) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(left.min(GRANT_WATCH)) => {}
+                        () = &mut changed => {}
+                    }
+                }
+                None => changed.await,
             }
         }
     }
