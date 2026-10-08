@@ -5,63 +5,26 @@
 //! channel's own connection) and drives the channel's end of that connection: the frames the
 //! forwarder relays go in, and what this host writes comes back out.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use kr_protocol::broker::{BrokerGrant, BrokerGrants, IntegrationMode};
+use kr_protocol::broker::{BrokerGrant, BrokerGrants};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{GatewayMode, NativeFraming, PendingResource, PendingState};
-use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-use kr_protocol::ids::{
-    ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, PendingResourceId,
-    PublisherId, SessionId,
-};
+use kr_protocol::ids::{ActorId, AgentBindingRevision, PendingResourceId, PublisherId};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
-use kr_worker::broker::bridge::{AdmittedBridge, BridgeProcess, BridgeStream, BridgeSurface};
-use kr_worker::broker::channels::{ChannelEnd, ChannelLaunch, serve};
-use kr_worker::broker::connectors::{InstalledConnector, decoding_trust, fixture};
-use kr_worker::broker::{
-    Broker, BrokerTransport, Credential, Framing, ManagedProcess, TransportHandle,
+use kr_worker::broker::Broker;
+use kr_worker::broker::channel_fixture::{
+    Channel, PERMISSION_REQUEST, Package, binding, channel_process, instance, launched, register,
+    session,
 };
+use kr_worker::broker::channels::ChannelEnd;
+use kr_worker::broker::connectors::{InstalledConnector, decoding_trust, fixture};
 use kr_worker::persistence::JournalHealth;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 mod common;
 
 use common::LIVENESS_DEADLINE;
-
-/// The Claude Code method a relayed tool approval arrives as.
-const PERMISSION_REQUEST: &str = "notifications/claude/channel/permission_request";
-
-fn session() -> SessionId {
-    SessionId::new(Uuid::from_bytes([1; 16]))
-}
-
-fn instance(number: u8) -> ApplicationInstanceId {
-    ApplicationInstanceId::new(Uuid::from_bytes([number; 16]))
-}
-
-/// The application the launch registered for one instance.
-fn launched(number: u8) -> ProcessStartIdentity {
-    ProcessStartIdentity::new(
-        1_000 + u64::from(number),
-        ProcessStartSource::MacosProcBsdInfo,
-        900,
-    )
-}
-
-/// A channel server's own process.
-fn channel_process(number: u8) -> ProcessStartIdentity {
-    ProcessStartIdentity::new(
-        2_000 + u64::from(number),
-        ProcessStartSource::MacosProcBsdInfo,
-        901,
-    )
-}
-
-fn binding(number: u8) -> BrokerBindingId {
-    BrokerBindingId::new(Uuid::from_bytes([100 + number; 16]))
-}
 
 /// A declarative package installed beside the channel's, which pins its own tables.
 fn installed() -> kr_worker::broker::PackageIdentity {
@@ -69,195 +32,6 @@ fn installed() -> kr_worker::broker::PackageIdentity {
         plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         package_digest: Digest256::from_bytes([5; 32]),
-    }
-}
-
-/// Registers one launched instance on a broker, as the command backend's launch does.
-fn register(broker: &Broker, number: u8) {
-    let managed = ManagedProcess::new(
-        instance(number),
-        launched(number),
-        TransportHandle {
-            transport: BrokerTransport::PrivateSocket,
-            application_instance_id: instance(number),
-            executable_digest: Digest256::from_bytes([3; 32]),
-            process: launched(number),
-        },
-        Credential::from_bytes([9; 32]),
-        false,
-        TimestampMs::new(1),
-    );
-    broker
-        .register_instance(
-            instance(number),
-            IntegrationMode::NativeBridge,
-            None,
-            Some(managed),
-        )
-        .expect("the launched instance is registered");
-}
-
-/// The Claude Code connector, read from a package laid out as the store extracts one.
-struct Package {
-    root: PathBuf,
-    connector: Arc<InstalledConnector>,
-}
-
-impl Package {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("kr-channels-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(&root).expect("the store's directory");
-        let source = fixture::claude_code_package(&root, Path::new(fixture::FORWARDER))
-            .expect("the package is written");
-        let connector =
-            Arc::new(InstalledConnector::read(source).expect("the installed package reads"));
-        Self { root, connector }
-    }
-
-    /// What a channel of one instance is served with.
-    fn launch(&self, broker: &Arc<Broker>, number: u8, version: Option<&str>) -> ChannelLaunch {
-        ChannelLaunch {
-            broker: Arc::clone(broker),
-            application_instance_id: instance(number),
-            connector: Arc::clone(&self.connector),
-            version: version.map(str::to_owned),
-            site: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([7; 16])),
-            os_user: "person".to_owned(),
-            views: None,
-        }
-    }
-
-    /// Binds the connector's package to one instance the way the installation's binder will: the
-    /// approval interpreter, with the trust its grants give.
-    fn bind(&self, broker: &Broker, number: u8) {
-        broker
-            .bind_descriptor(
-                binding(number),
-                instance(number),
-                self.connector.plugin_id(),
-                PublisherId::new("kalareach").expect("valid"),
-                self.connector.package_digest(),
-                BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-                decoding_trust(&self.connector, TimestampMs::new(1)),
-                TimestampMs::new(1),
-            )
-            .expect("the package is bound");
-    }
-}
-
-impl Drop for Package {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-/// One channel being served, and the channel server's end of its connection.
-struct Channel {
-    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
-    writes: Option<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-    served: tokio::task::JoinHandle<ChannelEnd>,
-    /// Ends the channel as the backend's retirement does, when sent or dropped.
-    retire: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl Channel {
-    /// Hands one admitted channel, started by `starter`, to the consumer.
-    fn open(launch: ChannelLaunch, number: u8, starter: ProcessStartIdentity) -> Self {
-        Self::open_with(launch, number, starter, 64 * 1024)
-    }
-
-    /// The same, over a connection that holds at most `buffer` bytes each way unread.
-    fn open_with(
-        launch: ChannelLaunch,
-        number: u8,
-        starter: ProcessStartIdentity,
-        buffer: usize,
-    ) -> Self {
-        let (ours, theirs) = tokio::io::duplex(buffer);
-        let (reader, writer) = tokio::io::split(theirs);
-        let admitted = AdmittedBridge {
-            surface: BridgeSurface::Channel,
-            process: BridgeProcess {
-                identity: channel_process(number),
-                starter: Some(starter),
-                started: None,
-            },
-            stream: BridgeStream::new(
-                Box::new(reader),
-                Box::new(writer),
-                Vec::new(),
-                Framing::new(NativeFraming::JsonLines),
-            ),
-        };
-        let (retire, retired) = tokio::sync::oneshot::channel::<()>();
-        let served = tokio::spawn(serve(launch, admitted, async move {
-            let _ = retired.await;
-        }));
-        let (ours_reader, ours_writer) = tokio::io::split(ours);
-        Self {
-            lines: tokio::io::BufReader::new(ours_reader).lines(),
-            writes: Some(ours_writer),
-            served,
-            retire: Some(retire),
-        }
-    }
-
-    /// Relays one tool approval, as the forwarder does.
-    async fn relay(&mut self, request_id: &str) {
-        let frame = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": PERMISSION_REQUEST,
-            "params": {
-                "request_id": request_id,
-                "tool_name": "Bash",
-                "description": "List the files here",
-                "input_preview": "ls -la",
-            },
-        });
-        self.send(&frame).await;
-    }
-
-    async fn send(&mut self, frame: &serde_json::Value) {
-        let writes = self.writes.as_mut().expect("the channel's end is open");
-        writes
-            .write_all(format!("{frame}\n").as_bytes())
-            .await
-            .expect("the frame is written");
-        writes.flush().await.expect("the frame is flushed");
-    }
-
-    /// Closes the channel server's end, as the forwarder does when Claude Code closes it.
-    async fn close(&mut self) {
-        if let Some(mut writes) = self.writes.take() {
-            let _ = writes.shutdown().await;
-        }
-    }
-
-    /// Reads the next line this host wrote, or `None` when it closed its direction.
-    async fn next(&mut self) -> Option<serde_json::Value> {
-        let line = tokio::time::timeout(LIVENESS_DEADLINE, self.lines.next_line())
-            .await
-            .expect("the channel says something or closes in time")
-            .expect("the channel reads")?;
-        Some(serde_json::from_str(&line).expect("a frame is JSON"))
-    }
-
-    /// Waits for the consumer to end while the channel server's end stays open, and says how it
-    /// did.
-    async fn ended_while_open(&mut self) -> ChannelEnd {
-        tokio::time::timeout(LIVENESS_DEADLINE, &mut self.served)
-            .await
-            .expect("the consumer ends in time")
-            .expect("the consumer's task joins")
-    }
-
-    /// Waits for the consumer to end, and says how it did.
-    async fn ended(self) -> ChannelEnd {
-        let _retire = self.retire;
-        tokio::time::timeout(LIVENESS_DEADLINE, self.served)
-            .await
-            .expect("the consumer ends in time")
-            .expect("the consumer's task joins")
     }
 }
 
@@ -601,6 +375,185 @@ async fn kr_req_12_18_a_closed_channel_settles_what_it_relayed() {
         panic!("the channel was served");
     };
     assert_eq!(settled, 2);
+}
+
+/// A broker whose ledger is the file at `path`, and the session journal over the same file that the
+/// attention store reads a session's sources from.
+fn broker_over_a_journal(path: &Path) -> (Arc<Broker>, kr_worker::journal::Journal) {
+    let journal = kr_worker::journal::Journal::open(path).expect("the journal opens");
+    let broker = Arc::new(
+        Broker::open(Some(path), session(), JournalHealth::shared()).expect("the broker opens"),
+    );
+    (broker, journal)
+}
+
+/// The approvals the attention store reads past `after`, from the journal.
+fn approvals_after(
+    journal: &kr_worker::journal::Journal,
+    after: u64,
+) -> kr_protocol::attention::AttentionApprovalSlice {
+    kr_worker::attention_source::page(
+        journal,
+        &kr_protocol::attention::AttentionSourcesRequest {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            questions_after: kr_protocol::scalars::U64::ZERO,
+            approvals_after: kr_protocol::scalars::U64::new(after),
+            host_events_after: kr_protocol::scalars::U64::ZERO,
+            max_records: kr_protocol::scalars::U64::new(64),
+            wait_ms: kr_protocol::scalars::U64::ZERO,
+            fingerprint_key: kr_protocol::scalars::SecretBytes32::from_bytes([1; 32]),
+            recorded_generation: Nullable::null(),
+        },
+        0,
+        usize::MAX,
+    )
+    .expect("a page")
+    .approvals
+}
+
+/// KR-REQ-25.01: what the broker records for a relayed approval is carried to the attention source,
+/// in one numbering with every other record of the broker, and the transition that interpreted it
+/// is the one that says so. A request nothing interprets (no binding of the connector's package)
+/// is recorded and carried, and is never an approval; an answer, a closed channel and every
+/// transition after the interpretation are carried as the end or the progress of what it was.
+#[tokio::test]
+async fn kr_req_25_01_an_approval_reaches_the_attention_source_from_its_interpretation_to_its_end()
+{
+    let directory = tempfile::tempdir().expect("a directory");
+    let (broker, journal) = broker_over_a_journal(&directory.path().join("journal.sqlite3"));
+    let package = Package::new();
+    register(&broker, 2);
+    package.bind(&broker, 2);
+    // The control: an instance with no binding of the package, whose relayed request nothing
+    // gives a meaning.
+    register(&broker, 3);
+    let launch = |number: u8| package.launch(&broker, number, Some(fixture::QUALIFIED_VERSION));
+    let mut bound = Channel::open(launch(2), 2, launched(2));
+    let mut unbound = Channel::open(launch(3), 3, launched(3));
+
+    bound.relay("abcde").await;
+    unbound.relay("fghij").await;
+    eventually(
+        "the bound approval is interpreted and the other recorded",
+        || {
+            relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+                && relayed(&broker, 3, "fghij").is_some()
+        },
+    )
+    .await;
+    let approval = relayed(&broker, 2, "abcde").expect("recorded").resource_id;
+    let request = relayed(&broker, 3, "fghij").expect("recorded").resource_id;
+
+    let first = approvals_after(&journal, 0);
+    let numbers: Vec<u64> = first
+        .records
+        .iter()
+        .map(|record| record.sequence.get())
+        .collect();
+    assert_eq!(
+        numbers,
+        (1..=first.head.get()).collect::<Vec<_>>(),
+        "one numbering, with no hole"
+    );
+    let of = |slice: &kr_protocol::attention::AttentionApprovalSlice, id: PendingResourceId| {
+        slice
+            .records
+            .iter()
+            .filter(|record| record.resource_id == id)
+            .map(|record| (record.state, record.approval, record.interpreted))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        of(&first, approval),
+        vec![
+            (PendingState::Pending, false, false),
+            (PendingState::Pending, true, true)
+        ],
+        "recorded, then interpreted: only the second is an approval's raise"
+    );
+    assert_eq!(
+        of(&first, request),
+        vec![(PendingState::Pending, false, false)],
+        "a request nothing interprets is carried and is no approval"
+    );
+
+    // The answer goes out, and everything after the interpretation is the approval's progress.
+    let seen = first.head.get();
+    broker
+        .agent_approval_respond(
+            &caller(),
+            &respond(2, &relayed(&broker, 2, "abcde").expect("recorded"), "allow"),
+            TimestampMs::new(5),
+        )
+        .await
+        .expect("the answer is admitted and carried");
+    assert!(
+        bound.next().await.is_some(),
+        "the verdict reaches the channel"
+    );
+    // The closed channel cancels what it relayed and nothing answered.
+    unbound.close().await;
+    eventually("the unanswered request is cancelled", || {
+        settled_as(&broker, request) == Some(PendingState::Cancelled)
+    })
+    .await;
+    let rest = approvals_after(&journal, seen);
+    let approval_later = of(&rest, approval);
+    assert!(
+        approval_later
+            .iter()
+            .all(|(_, approval, interpreted)| *approval && !interpreted),
+        "nothing after the interpretation interprets it again: {approval_later:?}"
+    );
+    assert_eq!(
+        approval_later.last().map(|(state, _, _)| *state),
+        Some(PendingState::Resolved),
+        "its end is carried"
+    );
+    assert_eq!(
+        of(&rest, request),
+        vec![(PendingState::Cancelled, false, false)],
+        "the end of a request that was no approval is carried as no approval's"
+    );
+    // And a cursor at the head reads nothing more.
+    assert!(
+        approvals_after(&journal, rest.head.get())
+            .records
+            .is_empty()
+    );
+
+    bound.close().await;
+    assert!(matches!(bound.ended().await, ChannelEnd::Ended { .. }));
+    assert!(matches!(unbound.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-25.01: whoever follows a session's approvals is woken by each transition the broker
+/// commits, on the connection that writes it, so that a held request for the session's sources
+/// answers at once. The signal is subscribed to before the approval is relayed, so a commit that
+/// lands before the wait begins is still seen.
+#[tokio::test]
+async fn kr_req_25_01_a_relayed_approval_wakes_whoever_follows_the_approvals() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (broker, _journal) = broker_over_a_journal(&directory.path().join("journal.sqlite3"));
+    let changes = Arc::new(tokio::sync::Notify::new());
+    broker.attach_attention_changes(Arc::clone(&changes));
+    register(&broker, 2);
+    let package = Package::new();
+    package.bind(&broker, 2);
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+
+    let mut woken = std::pin::pin!(changes.notified());
+    woken.as_mut().enable();
+    channel.relay("abcde").await;
+    tokio::time::timeout(LIVENESS_DEADLINE, woken)
+        .await
+        .expect("the relayed approval's commit wakes the follower");
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
 
 /// KR-REQ-12.18: a channel closed while the gateway is fenced, one closed while it recovers and one
