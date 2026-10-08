@@ -87,6 +87,8 @@ pub(super) struct Holding {
     silent_on_inspect: bool,
     /// How many connections the daemon has opened to the worker.
     connections: usize,
+    /// The answer to `session.screen.preview`; a worker given none answers as one that cannot.
+    screen: Option<Result<kr_protocol::sharing::SessionScreenPreviewResult, ProtocolError>>,
     /// Every request the daemon made on its own link, in order.
     asked: Vec<Request>,
     /// Every read the daemon forwarded for a device, in order.
@@ -247,6 +249,10 @@ fn reply(holding: &Mutex<Holding>, session_id: SessionId, frame: ControlFrame) -
                 }
                 Some(Method::AgentApprovalInspect) => held.record(&request),
                 Some(Method::QuestionRead) => held.questions(&request),
+                Some(Method::SessionScreenPreview) => match held.screen.clone() {
+                    Some(answer) => answer.map(|screen| encoded(&screen)),
+                    None => Err(refused()),
+                },
                 _ => Err(refused()),
             };
             Reply::Frame(response(request.request_id, outcome))
@@ -629,6 +635,76 @@ fn invitation_written(world: &fake::Silent, action: u8) -> bool {
         .invitation(invitation_id)
         .expect("the invitations read")
         .is_some()
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-10.50: the screen the issuer is shown
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-10.50: a share that includes the live screen is written only for a screen its issuer was
+/// shown whole. A screen the worker had to cut, and a worker of an earlier build that cannot show
+/// a screen at all, write no grant and no invitation; a screen shown whole is written, with the
+/// lines the issuer was shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_share_is_written_only_for_a_screen_its_issuer_was_shown_whole() {
+    use kr_protocol::sharing::{LiveScreenPreview, SessionScreenPreviewResult};
+
+    let screen = |truncated| {
+        Ok(SessionScreenPreviewResult {
+            screen: Nullable::some(LiveScreenPreview {
+                lines: vec!["$ make test".to_owned()],
+                truncated,
+            }),
+        })
+    };
+    let earlier_build = Err(ProtocolError::new(
+        ErrorCode::UnsupportedCapability,
+        "this worker has no such method",
+    ));
+    for (action, answer, refused) in [
+        (0x72, screen(true), Some(ErrorCode::InvalidArgument)),
+        (0x73, earlier_build, Some(ErrorCode::UnsupportedCapability)),
+        (0x74, screen(false), None),
+    ] {
+        let (world, holding) = world(
+            Holding {
+                screen: Some(answer),
+                ..Holding::default()
+            },
+            holds_question_reads(),
+        )
+        .await;
+        let mutation = share(
+            world.environment_id,
+            world.session_id,
+            action,
+            RoleSelection {
+                include_live_screen: true,
+                ..RoleSelection::plain(SessionRole::Viewer)
+            },
+        );
+        let answered = shared(&world, &mutation).await;
+        if refused.is_none() {
+            let result = result_of(answered);
+            assert_eq!(
+                result
+                    .preview
+                    .live_screen
+                    .0
+                    .expect("the issuer was shown the screen")
+                    .lines,
+                vec!["$ make test".to_owned()]
+            );
+            assert_eq!(grants_written(&world), 1);
+        } else {
+            let refusal = refusal_of(answered);
+            assert_eq!(Some(refusal.code), refused, "{refusal:?}");
+            assert_eq!(grants_written(&world), 0, "no grant is written");
+            assert!(!invitation_written(&world, action), "and no invitation");
+        }
+        drop(holding);
+        world.serving.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
