@@ -175,7 +175,7 @@ export function VoiceGrantStep({
                   <input
                     type="checkbox"
                     checked={chosen.has(choice.id)}
-                    disabled={granted !== null}
+                    disabled={busy || granted !== null}
                     onChange={(event) => {
                       setChosen((before) => {
                         const next = new Set(before)
@@ -195,7 +195,7 @@ export function VoiceGrantStep({
 
       {granted === null || allowedIds === null ? null : (
         <div className="kr-voice__panel" role="status" data-testid="voice-grant-result">
-          <p className="kr-voice__note">
+          <p className="kr-voice__note" id={`${id}-result`}>
             {`Allowed, except ${granted.not_held_by_device
               .map((action) => action.replace(/_/g, ' '))
               .join(', ')}: this phone’s own access to the host does not include ${
@@ -204,6 +204,7 @@ export function VoiceGrantStep({
           </p>
           <button
             ref={continueButton}
+            aria-describedby={`${id}-result`}
             type="button"
             className="kr-voice__start"
             data-testid="voice-grant-continue"
