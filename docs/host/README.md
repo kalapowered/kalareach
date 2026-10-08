@@ -3876,26 +3876,27 @@ clock taken at or after the time the owner made it agrees with it: each is behin
 carried forward by the continuous clock, by no more than five seconds and the rate allowance. The
 readings include the one the worker takes after it loads the confirmation and every other reading
 its time contract takes of its wall clock, whether a look, a checkpoint or the settling of a
-deadline takes it. A reading is lower than another when its wall time less the continuous time
-credited since the boot is lower, and the worker keeps the readings that are lower than every later
-one, so a confirmation that the daemon publishes late is judged against what the clock read in the
-meantime, and a clock that reads right again by the next look does not take a reading back. To keep
-few, it lets one reading stand for another whose level is within a second of it, at the lower level
-and the later time, which can refuse a confirmation by up to a second that the readings it took
-would not have refused. It keeps at most sixteen, lets the oldest go past that, and refuses a
-confirmation made at or before the time of the oldest it let go. Neither accepts a confirmation that
-a reading refused, and the next action of the owner, published without delay, follows. A worker that
-restarts begins its readings again. The worker must also have found no rollback against a reading it
-proved at or after the time the owner spoke. That reading is its mark carried forward by the
-continuous clock or, when the worker has no mark, the checkpoint it began with. An owner who
-corrects a clock that ran ahead of the truth is followed all the same, because the worker proved
-that clock before the owner spoke. The worker then trusts its clock again, whether it had distrusted
-it or not, keeps its expiration tombstones and writes its new mark down. From then on the owner is
-why it trusts its clock, so its time service stopping does not take that back. A worker follows each
-confirmation once. A confirmation that fails either condition is spent without being followed, and a
-worker that still trusted its clock then distrusts it, as the daemon's record would. A step forward
-is not held against it. A pause between the daemon's two clock readings can ask more of the worker's
-clock than the owner's word did, and fails in the same direction.
+deadline takes it. A reading's level is its wall time less the time the continuous clock has counted
+since the boot, less the rate allowance of that time, and one reading is lower than another when its
+level is. The worker keeps the readings that are lower than every later one, so a confirmation that
+the daemon publishes late is judged against what the clock read in the meantime, and a clock that
+reads right again by the next look does not take a reading back. To keep few, it lets one reading
+stand for another whose level is within a second of it, at the lower level and the later time, which
+can refuse a confirmation by up to a second that the readings it took would not have refused. It
+keeps at most sixteen, lets the oldest go past that, and refuses a confirmation made at or before
+the time of the latest it let go. Neither accepts a confirmation that a reading refused, and the
+next action of the owner, published without delay, follows. A worker that restarts begins its
+readings again. The worker must also have found no rollback against a reading it proved at or after
+the time the owner spoke. That reading is its mark carried forward by the continuous clock or, when
+the worker has no mark, the checkpoint it began with. An owner who corrects a clock that ran ahead
+of the truth is followed all the same, because the worker proved that clock before the owner spoke.
+The worker then trusts its clock again, whether it had distrusted it or not, keeps its expiration
+tombstones and writes its new mark down. From then on the owner is why it trusts its clock, so its
+time service stopping does not take that back. A worker follows each confirmation once. A
+confirmation that fails either condition is spent without being followed, and a worker that still
+trusted its clock then distrusts it, as the daemon's record would. A step forward is not held
+against it. A pause between the daemon's two clock readings can ask more of the worker's clock than
+the owner's word did, and fails in the same direction.
 
 The same rule holds for a rollback the worker found. The worker also holds the rollback against
 every confirmation made at or before the last time it proved its clock before the rollback, whatever
