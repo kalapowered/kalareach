@@ -575,9 +575,11 @@ of the offer, because it keeps at most 256 reports waiting for the daemon.
 The preparation runs in a fixed order: read, ask, compare, claim.
 
 1. The worker reads what the draft holds and checks it against the package's declaration. The draft
-   is open and is for this application instance. The attachment is bound to it as a `recorded` typed
-   submission, at the attempt the worker read. The number of attachments, the size, the media type
-   (exact, or by a `type/*` family) and the destination are what the package declares.
+   is for this application instance, the attachment is bound to it, and its size, media type (exact,
+   or by a `type/*` family) and destination are what the package declares. What the control daemon
+   owns it decides when it claims the binding: that the draft is open, that the binding is
+   `recorded` and is a typed submission, and that the draft holds no more attachments than the
+   package accepts.
 2. The component is asked for its plan.
 3. The plan is compared with the invocation: it must offer the attachment that the invocation names,
    and no other.
