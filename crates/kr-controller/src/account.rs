@@ -147,6 +147,10 @@ struct Inner {
     call_open: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
     /// True while the account is being changed: a request for a token waits until it has been.
     changing: tokio::sync::watch::Sender<bool>,
+    /// How many requests for a token are waiting for a change to end, for a test to know that one has
+    /// reached the gate.
+    #[cfg(feature = "testing")]
+    waiting: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testing")]
     loopback: Mutex<Option<std::net::SocketAddr>>,
 }
@@ -221,6 +225,8 @@ impl HostAccount {
                 call_open: std::sync::OnceLock::new(),
                 changing: tokio::sync::watch::channel(false).0,
                 #[cfg(feature = "testing")]
+                waiting: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(feature = "testing")]
                 loopback: Mutex::new(None),
             }),
         };
@@ -247,6 +253,14 @@ impl HostAccount {
     #[cfg(feature = "testing")]
     pub fn listen_on(&self, address: std::net::SocketAddr) {
         *self.inner.loopback.lock().expect("the test address") = Some(address);
+    }
+
+    /// How many requests for a token are waiting for a change of the account to end, for a test that
+    /// holds the change and needs to know a request has reached it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn token_requests_waiting(&self) -> usize {
+        self.inner.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Keeps a sign-in the service issued, as a finished browser sign-in would, for a test that
@@ -694,6 +708,29 @@ async fn ended(cancel: &mut watch::Receiver<bool>) {
     }
 }
 
+/// A request for a token that is waiting for a change of the account to end, counted for a test.
+#[cfg(feature = "testing")]
+struct Waiting<'a>(&'a Inner);
+
+#[cfg(feature = "testing")]
+impl<'a> Waiting<'a> {
+    fn of(inner: &'a Inner) -> Self {
+        inner
+            .waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(inner)
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0
+            .waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The token source a managed call presents.
 struct HostTokens {
     inner: Arc<Inner>,
@@ -720,6 +757,8 @@ impl AccountTokenSource for HostTokens {
             // While the account is being changed a request waits for the change to end, so that a
             // call that starts then is made under the account the change leaves and not under one
             // that is about to go.
+            #[cfg(feature = "testing")]
+            let _waiting = Waiting::of(&self.inner);
             let _ = self
                 .inner
                 .changing
