@@ -13,10 +13,10 @@ use kr_protocol::session::ClosureReason;
 use kr_transport::window::ActionWindowIssuer;
 use tokio::sync::Mutex;
 
-use crate::backup::quiet::{RealTimer, Timer};
 use crate::desktop::power::Inhibitor;
 use crate::directory::Directory;
 use crate::error::{ControllerError, Result};
+use crate::quiet::{RealTimer, Timer};
 use crate::registry::{LaunchPhase, Registry};
 use crate::singleton::SingletonLock;
 use crate::supervision::{JobRetirement, WorkerSupervisor};
@@ -233,14 +233,15 @@ impl Controller {
         Self::start_with(setup, clocks, Arc::new(RealTimer)).await
     }
 
-    /// Starts the daemon with the wait between its backup passes in the hands of `timer`, which a
-    /// test releases when it has seen how long the daemon asked to wait.
+    /// Starts the daemon with the waits between the passes of its backup and authority-feed
+    /// carriers in the hands of `timer`, which a test releases when it has seen how long the
+    /// daemon asked to wait.
     ///
     /// # Errors
     ///
     /// As [`Self::start`].
     #[cfg(feature = "testing")]
-    pub async fn start_on_backup_timer(
+    pub async fn start_on_timer(
         setup: ControllerSetup,
         timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
@@ -261,8 +262,7 @@ impl Controller {
         .await
     }
 
-    /// The one start, with the schedule its debt pass keeps and the timer its backup carrier waits
-    /// by.
+    /// The one start, with the schedule its debt pass keeps and the timer its carriers wait by.
     pub(super) async fn start_passing(
         setup: ControllerSetup,
         clocks: Clocks,

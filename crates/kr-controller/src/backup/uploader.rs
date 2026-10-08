@@ -140,12 +140,12 @@ use kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
 use kr_worker::privacy::PrivacyGeneration;
 
 use crate::backup::BackupService;
-use crate::backup::quiet::{Owed, Quiet};
 use crate::backup::store::{
     Attempt, AttemptStatus, GenerationRecord, ObjectRecord, PrivacyStatus, Production, Publication,
     Remote, Step, UploadRecord,
 };
 use crate::error::{ControllerError, Result};
+use crate::quiet::{Owed, Quiet};
 
 /// The name every attempt this uploader carries is dispatched to.
 ///
@@ -421,7 +421,7 @@ pub struct Hold {
     /// The code the refusal or the failure carried.
     pub code: ErrorCode,
     /// How long the service asked to be left alone, when it said. [`Quiet`] holds it to
-    /// [`crate::backup::quiet::LONGEST_DELAY`] when it records it.
+    /// [`crate::quiet::LONGEST_DELAY`] when it records it.
     pub retry_after: Option<Duration>,
 }
 
