@@ -98,7 +98,7 @@
         },
         {
           "const": "call_open",
-          "description": "A managed voice call was open, and a call closes under the account it started under.",
+          "description": "A managed voice call was open, and a call closes under the account it started under. The\naccount did not change: a code that had not been spent was left unspent, and one that had\nis revoked.",
           "type": "string"
         }
       ]
@@ -148,7 +148,7 @@
               "type": "null"
             }
           ],
-          "description": "Why this host does not sign in or present its account: its configuration names no voice\nbroker, names another service than the account service, or the host could not set up how to\nreach the account service. A grant the host already keeps still shows in `state`, and\n`account.sign_out` ends it, whatever the broker is."
+          "description": "Why this host does not sign in or present its account: its configuration names no voice\nbroker, names another service than the account service, or the host could not set up how to\nreach the account service. For the first two, a grant the host already keeps still shows in\n`state`, and `account.sign_out` ends it, whatever the broker is; for the third the host\nreaches no account service, shows `signed_out` and refuses to sign out."
         }
       },
       "required": [
