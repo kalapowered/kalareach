@@ -91,23 +91,28 @@ Then it asks the gateway two questions, outside every lock it holds. The first i
 about a notification that does not exist, under the bearer the device handed over. The gateway
 checks the bearer first, so a success says the bearer belongs to an active authorisation that has
 not expired. The second is the opening of a renewal, signed with the host's own key. The gateway
-hands out a nonce only for an authorisation that names that key, so a success says the gateway holds
-the authorisation and that this host is the one it names. Nothing is renewed, because the gateway
-renews only in the last week of a credential's life and in the hour after a renewal.
+hands out a nonce for a record that names that key, whatever state the record is in, so a success
+says the gateway holds a record under that identifier for this host. Nothing is renewed, because the
+gateway renews only in the last week of a credential's life and in the hour after a renewal or a
+re-issue.
 
 Only the gateway's own answers count. A 200 whose envelope says it succeeded, names its `data`
-(nothing, or an acknowledgement) and names no error confirms the bearer. The gateway's own
-`UNAUTHENTICATED` and `FORBIDDEN` refusals are final for that credential. A bare status, a missing
-route, a success with no `data` and any answer that is not the gateway's say nothing either way, and
-the device is told it may try again.
+(nothing, or an acknowledgement) and names no error confirms the bearer, and so does a nonce in an
+envelope of the same kind. The gateway's own `UNAUTHENTICATED` to the first question and `FORBIDDEN`
+to the second are final for that credential. A bare status, a missing route, a success with no
+`data` or with an error beside it, and any answer that is not the gateway's say nothing either way,
+and the device is told it may try again.
 
 Both questions come out of the gateway's allowances for this host, so the host rations them. One
 device may have a credential confirmed three times in a burst and then six times an hour. The status
 question comes out of the sweep's share of the status allowance. The nonce comes out of the sixty
 requests an hour that the gateway takes from this host for renewing and revoking together, where
 every renewal and every revocation takes two, so all devices together may ask for six nonces in a
-burst and six an hour, and only for a bearer that passed the first question. A device over either
-limit is told to wait (`RATE_LIMITED`) and the gateway is not asked.
+burst and six an hour, and only for a bearer that passed the first question. A device over any of
+the three limits is told to wait (`RATE_LIMITED`), and the gateway is not asked the question that
+limit covers: a host that has spent its nonces has still asked the status question first.
+A registration that replaces an authorisation also owes the gateway a revocation, which is two
+requests more, outside these limits.
 
 ### What neither question shows
 
@@ -124,16 +129,16 @@ under the first device's destination. While that destination names it the other 
 register it, and when the destination is replaced or its device unpaired the host asks the gateway
 to revoke it.
 
-It needs the other device's identifier, which is 128 random bits that no host method returns, so
-only a leak of it makes the attack possible. The fix is not in the host alone. The gateway's answer
+It needs the other device's identifier, a 128-bit UUID its installation chose that no host method
+returns, so only a leak of it makes the attack possible. The fix is not in the host alone. The gateway's answer
 to the first question has to name the sender record a bearer was issued for, and the host then
 refuses a registration whose claimed record differs. Until the gateway says it, the host cannot
 tell the two apart.
 
 A bearer for another authorisation is found at the first delivery, which the gateway refuses. The
 host's renewal repairs that only for the same installation, and only in the last week of the
-credential's life or in the hour after a renewal. Otherwise the device's installation has to obtain
-a new authorisation and register again.
+credential's life or in the hour after a renewal or a re-issue. Otherwise the device's installation
+has to obtain a new authorisation and register again.
 
 ### Keeping the credential
 
@@ -156,12 +161,13 @@ loads the item, and a daemon that stopped for it would deliver to nobody.
 
 The gateway keeps one bearer for an authorisation. A renewal replaces it, and so does an issue by
 the device's installation, and the host learns of the first from the gateway's answer and of the
-second from the device. The two can be in flight together and arrive in either order, so the host
-counts its own changes to what it holds for each authorisation, and a change that began before
-another landed does not replace what that one stored. It does not decide by the revision or the
-issue time in the credential, which are the device's word. The later change to land is the newer by
-the host's own order. When that was the retired bearer, the next delivery is refused and the
-gateway's recovery hour renews again.
+second from the device. The two can be in flight together and arrive in either order, and the order
+they arrive in says nothing of the order the gateway made them in. The gateway stamps each
+credential with its own clock, so the host keeps whichever of two credentials was issued later: a
+registration leaves a newer renewal in place, and a renewal that comes back late leaves a newer
+registration in place. The issue time on a credential a device hands over is the device's word, but
+a device that lies about it can keep a retired bearer for its own destination and nothing else, and
+a credential issued in the future is refused before it is kept.
 
 A rejected token takes the destination out of service, and the next start removes its stored
 credential. After the host's first renewal the phone's copy of the bearer is dead too, so the phone
@@ -171,9 +177,15 @@ A renewal the gateway refuses or does not answer is asked for again after five m
 doubling to an hour. A credential's expiry is the device's word, and one that says it is due while
 the gateway holds a longer life is refused at every ask. Each ask is two requests of the gateway's
 sixty. Asked at every round of questions it would cost twenty-four requests an hour for as long as
-the credential lasts; with the wait it costs eight in the first hour and two an hour after that. A
-notification that needs the credential waits the same way, and a new credential from the device
-ends the wait.
+the credential lasts; with the wait it costs eight in the first hour and two an hour after that.
+A new bearer from the device ends the wait, because it opens the hour after an issue in which the
+gateway renews again. The same bearer handed over again does not.
+
+A renewal that fails does not hold a notification back while the bearer held still works. The
+gateway has not refused it, and it works until its expiry, so the notification is sent under it and
+the host goes on asking for the renewal after its wait. A bearer the gateway refused, and one past
+its expiry, are renewed first: nothing presents them until they are, and a credential past its
+expiry is asked about at every attempt, wait or no wait.
 
 ### Unpairing
 
