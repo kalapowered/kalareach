@@ -2334,6 +2334,9 @@ impl Store {
                 ],
             )
             .map_err(TransferError::store)?;
+        // A draft that targets a session which has already ended would be orphaned by the next pass
+        // over the ended sessions, and nothing can be offered from it: it is not made.
+        refuse_ended_session(&transaction, row.draft_id, None, None)?;
         record_event(
             &transaction,
             "draft.created",

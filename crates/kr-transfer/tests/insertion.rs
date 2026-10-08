@@ -15,8 +15,10 @@ use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AttachmentContribution, AttachmentHandle, DraftCreateParams,
     DraftRecord, DraftState, DraftUpdateParams, InsertionMethod, InsertionState,
+    UNUSED_ATTACHMENT_LIFETIME,
 };
-use kr_transfer::service::Admission;
+use kr_transfer::service::{Action, Admission, AdmissionHook};
+use kr_transfer::{RetainEverything, TransferError};
 use support::{BOOT_NOW_MS, Harness, pattern};
 
 fn session() -> SessionId {
@@ -268,7 +270,7 @@ fn a_claim_marks_the_binding_inserting_for_its_owner_and_a_repeat_by_the_owner_i
             action_id: action(32),
             ..harness.begin_of(session(), created.draft_id, handle.transfer_id, owner)
         },
-        BOOT_NOW_MS,
+        &|| BOOT_NOW_MS,
     );
     assert_eq!(
         rival.expect_err("another owner").code(),
@@ -289,7 +291,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
         InsertionMethod::TypedSubmission,
     );
     let good = harness.begin_of(session(), created.draft_id, handle.transfer_id, action(41));
-    let refused = |begin: &InsertionBegin, boot: u64, why: &str| {
+    let refused = |begin: &InsertionBegin, boot: &dyn Fn() -> u64, why: &str| {
         let refusal = harness
             .service
             .insertion_begin(&harness.actor, session(), begin, boot)
@@ -306,7 +308,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
             attempt: U64::new(7),
             ..good.clone()
         },
-        BOOT_NOW_MS,
+        &|| BOOT_NOW_MS,
         "an attempt the binding is not at",
     );
     refused(
@@ -314,12 +316,12 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
             max_count: U64::new(0),
             ..good.clone()
         },
-        BOOT_NOW_MS,
+        &|| BOOT_NOW_MS,
         "more attachments than the operation accepts",
     );
     refused(
         &good,
-        good.deadline_boot_ms.get(),
+        &|| good.deadline_boot_ms.get(),
         "a deadline that has passed",
     );
 
@@ -343,7 +345,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
         .expect("records the failure");
     refused(
         &harness.begin_of(session(), created.draft_id, second.transfer_id, action(43)),
-        BOOT_NOW_MS,
+        &|| BOOT_NOW_MS,
         "a binding that failed and has not been bound again",
     );
 
@@ -379,7 +381,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
                 by_composer.1.transfer_id,
                 action(44),
             ),
-            BOOT_NOW_MS,
+            &|| BOOT_NOW_MS,
         )
         .expect_err("a binding a worker does not offer");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -390,7 +392,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
         .expect("ends the session");
     let late = harness
         .service
-        .insertion_begin(&harness.actor, session(), &begin, BOOT_NOW_MS)
+        .insertion_begin(&harness.actor, session(), &begin, &|| BOOT_NOW_MS)
         .expect_err("a draft whose session has ended");
     assert_eq!(
         late.code(),
@@ -578,7 +580,7 @@ fn an_unknown_offer_is_offered_again_as_a_new_attempt() {
                 action_id: action(62),
                 ..first_begin.clone()
             },
-            BOOT_NOW_MS,
+            &|| BOOT_NOW_MS,
         )
         .expect_err("an unknown offer is not claimed again as it stands");
     assert_eq!(refused.code(), ErrorCode::DraftConflict);
@@ -740,7 +742,7 @@ fn the_room_for_the_report_of_every_offer_in_flight_is_kept() {
     );
     let refused = harness
         .service
-        .insertion_begin(&harness.actor, session(), &second_begin, BOOT_NOW_MS)
+        .insertion_begin(&harness.actor, session(), &second_begin, &|| BOOT_NOW_MS)
         .expect_err("a claim that leaves no room for its report");
     assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
     assert_eq!(
@@ -947,4 +949,369 @@ fn no_claim_is_made_while_the_journal_holds_sessions_of_an_earlier_build() {
     harness
         .claim(session(), created.draft_id, handle.transfer_id, action(95))
         .expect("the claim is made once the journal is settled");
+}
+
+/// The claim a worker of `worker` makes of the one binding a draft holds at its first attempt, built
+/// by hand because the draft may be one a worker cannot read the facts of.
+fn first_claim(draft: &DraftRecord, handle: &AttachmentHandle, number: u8) -> InsertionBegin {
+    InsertionBegin {
+        action_id: action(number),
+        draft_id: draft.draft_id,
+        transfer_id: handle.transfer_id,
+        attempt: U64::new(0),
+        max_count: U64::new(4),
+        deadline_boot_ms: U64::new(BOOT_NOW_MS + 60_000),
+    }
+}
+
+/// KR-REQ-24.09: the claim itself, and not only the read before it, is refused for a draft that is
+/// not the worker's (another session's, one that targets no session, one a prompt sent) and for an
+/// attachment whose file is gone, and the draft is as it was.
+#[test]
+fn a_claim_is_refused_for_a_draft_that_is_not_the_workers_and_for_a_file_that_is_gone() {
+    let harness = Harness::create();
+    let other = SessionId::new(Uuid::from_bytes([7; 16]));
+    let claim = |worker: SessionId, draft: &DraftRecord, handle: &AttachmentHandle, number: u8| {
+        harness.service.insertion_begin(
+            &harness.actor,
+            worker,
+            &first_claim(draft, handle, number),
+            &|| BOOT_NOW_MS,
+        )
+    };
+
+    let own = draft_for(&harness, Some(session()));
+    let (own, own_handle) = bind(&harness, &own, "own.png", InsertionMethod::TypedSubmission);
+    let free = draft_for(&harness, None);
+    let (free, free_handle) = bind(
+        &harness,
+        &free,
+        "free.png",
+        InsertionMethod::TypedSubmission,
+    );
+    let sent = draft_for(&harness, None);
+    let (sent, sent_handle) = bind(
+        &harness,
+        &sent,
+        "sent.png",
+        InsertionMethod::TypedSubmission,
+    );
+    harness
+        .service
+        .record_prompt(&harness.actor, sent.draft_id, session(), &Admission::none())
+        .expect("a prompt sends the draft to the session");
+    let gone = draft_for(&harness, Some(session()));
+    let (gone, gone_handle) = bind(
+        &harness,
+        &gone,
+        "gone.png",
+        InsertionMethod::TypedSubmission,
+    );
+
+    let error = claim(other, &own, &own_handle, 51).expect_err("another session's worker");
+    assert!(
+        matches!(error, TransferError::UnknownDraft { .. }),
+        "{error:?}"
+    );
+    for (what, draft, handle, number) in [
+        ("a draft that targets no session", &free, &free_handle, 52),
+        ("a draft a prompt sent", &sent, &sent_handle, 53),
+    ] {
+        let error = claim(session(), draft, handle, number).expect_err(what);
+        assert_eq!(error.code(), ErrorCode::DraftConflict, "{what}: {error:?}");
+    }
+    for (draft, handle) in [
+        (&own, &own_handle),
+        (&free, &free_handle),
+        (&sent, &sent_handle),
+    ] {
+        let after = read(&harness, draft.draft_id);
+        assert_eq!(
+            after.revision, draft.revision,
+            "a refused claim moved nothing"
+        );
+        assert_eq!(
+            state_of(&after, handle.transfer_id),
+            InsertionState::Recorded
+        );
+    }
+
+    // The control: the worker of the session claims its own draft.
+    claim(session(), &own, &own_handle, 54).expect("the session's own draft");
+
+    // An attachment nothing submitted expires after seven days and leaves its binding `recorded`
+    // with no file behind it: the claim would send the receiver to nothing.
+    harness
+        .clock
+        .set(support::START_MS + UNUSED_ATTACHMENT_LIFETIME.get() + 1);
+    let sweep = harness
+        .service
+        .sweep(&RetainEverything)
+        .expect("runs a sweep");
+    assert!(sweep.expired_attachments >= 1, "{sweep:?}");
+    assert_eq!(
+        state_of(&read(&harness, gone.draft_id), gone_handle.transfer_id),
+        InsertionState::Recorded,
+        "the binding is as it was"
+    );
+    let error = claim(session(), &gone, &gone_handle, 55).expect_err("a file that is gone");
+    assert_eq!(error.code(), ErrorCode::DraftConflict, "{error:?}");
+}
+
+/// KR-REQ-24.09: only the worker of the session settles an offer, and a report that repeats what was
+/// recorded is no exception: another session's worker is told nothing of the draft, and once the
+/// session has ended the repeat is refused as the session's end, as every other report is.
+#[test]
+fn a_report_is_taken_only_from_the_sessions_worker_and_a_repeat_is_no_exception() {
+    let harness = Harness::create();
+    let other = SessionId::new(Uuid::from_bytes([7; 16]));
+    let created = draft_for(&harness, Some(session()));
+    let (current, taken) = bind(
+        &harness,
+        &created,
+        "taken.png",
+        InsertionMethod::TypedSubmission,
+    );
+    let (_, pending) = bind(
+        &harness,
+        &current,
+        "pending.png",
+        InsertionMethod::TypedSubmission,
+    );
+    let owner = action(71);
+    let pending_owner = action(72);
+    harness
+        .claim(session(), created.draft_id, taken.transfer_id, owner)
+        .expect("claims the first binding");
+    harness
+        .claim(
+            session(),
+            created.draft_id,
+            pending.transfer_id,
+            pending_owner,
+        )
+        .expect("claims the second binding");
+    let taken_begin = harness.begin_of(session(), created.draft_id, taken.transfer_id, owner);
+    let pending_begin = harness.begin_of(
+        session(),
+        created.draft_id,
+        pending.transfer_id,
+        pending_owner,
+    );
+    harness
+        .report(session(), &taken_begin, accepted("the agent's own part"))
+        .expect("the worker reports the first offer");
+
+    // A report that settles nothing yet, from the worker of another session.
+    let error = harness
+        .report(other, &pending_begin, failed("not mine to say"))
+        .expect_err("another session's worker");
+    assert!(
+        matches!(error, TransferError::UnknownDraft { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        state_of(&read(&harness, created.draft_id), pending.transfer_id),
+        InsertionState::Inserting
+    );
+
+    // The repeat of what was recorded: answered for the session's worker, and not for another's.
+    let repeated = harness
+        .report(session(), &taken_begin, accepted("the agent's own part"))
+        .expect("the same report again");
+    assert_eq!(repeated, InsertionState::AcceptedByAgent);
+    let error = harness
+        .report(other, &taken_begin, accepted("the agent's own part"))
+        .expect_err("another session's worker repeating it");
+    assert!(
+        matches!(error, TransferError::UnknownDraft { .. }),
+        "{error:?}"
+    );
+
+    // And once the session has ended, the repeat is refused like any report.
+    harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([session()]))
+        .expect("ends the session");
+    let error = harness
+        .report(session(), &taken_begin, accepted("the agent's own part"))
+        .expect_err("the session has ended");
+    assert_eq!(error.code(), ErrorCode::SessionClosed, "{error:?}");
+}
+
+/// KR-REQ-24.09: a session that ends fails the offers of a draft that was only sent to it, and does
+/// not orphan that draft, because it never targeted the session; a draft that targets it is.
+#[test]
+fn a_draft_only_sent_to_a_session_that_ends_has_its_offer_failed_and_stays_open() {
+    let harness = Harness::create();
+    let sent = draft_for(&harness, None);
+    let (sent, handle) = bind(
+        &harness,
+        &sent,
+        "sent.png",
+        InsertionMethod::TypedSubmission,
+    );
+    harness
+        .service
+        .record_prompt(&harness.actor, sent.draft_id, session(), &Admission::none())
+        .expect("a prompt sends the draft to the session");
+    let targeting = draft_for(&harness, Some(session()));
+    let before = read(&harness, sent.draft_id);
+
+    harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([session()]))
+        .expect("ends the session");
+
+    let after = read(&harness, sent.draft_id);
+    assert_eq!(state_of(&after, handle.transfer_id), InsertionState::Failed);
+    assert_eq!(
+        after.state,
+        DraftState::Open,
+        "it never targeted the session"
+    );
+    assert_eq!(
+        after.revision.get(),
+        before.revision.get() + 1,
+        "one revision"
+    );
+    assert_eq!(
+        read(&harness, targeting.draft_id).state,
+        DraftState::Orphaned,
+        "the control: a draft that targets it is orphaned"
+    );
+}
+
+/// KR-REQ-24.09: a draft is not made for a session that has already ended, which nothing could be
+/// offered from and which the next pass over the ended sessions would orphan.
+#[test]
+fn a_draft_is_not_made_for_a_session_that_has_ended() {
+    let harness = Harness::create();
+    harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([session()]))
+        .expect("ends the session");
+    let error = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session()),
+                application_instance_id: Nullable::null(),
+                text: "for a session that is gone".to_owned(),
+            },
+            None,
+        )
+        .expect_err("a session that has ended");
+    assert_eq!(error.code(), ErrorCode::SessionClosed, "{error:?}");
+}
+
+/// An admission that holds the store: it says it has arrived inside the service's lock and waits
+/// there until the test lets it go.
+struct HoldsTheStore {
+    arrived: std::sync::mpsc::SyncSender<()>,
+    go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl AdmissionHook for HoldsTheStore {
+    fn ask(&self) -> Result<(), kr_protocol::error::ProtocolError> {
+        Ok(())
+    }
+
+    fn run(&self, commit: &mut dyn FnMut()) -> Result<(), kr_protocol::error::ProtocolError> {
+        let _ = self.arrived.send(());
+        let _ = self
+            .go
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        commit();
+        Ok(())
+    }
+}
+
+/// KR-REQ-24.09: a claim that waited for the store is judged by the time it commits at, not by the
+/// time it was asked at. The worker gives up on a claim at its deadline and reports the offer failed
+/// a moment after; a claim that read the clock before it waited for the store, and committed after
+/// the deadline, would meet that report first (a binding no claim has been made for) and then leave
+/// the binding `inserting` for good. Here another write holds the store while the clock passes the
+/// claim's deadline, and the claim, which asked before the deadline, is refused when it gets the
+/// store.
+#[test]
+fn a_claim_that_waits_for_the_store_past_its_deadline_is_refused() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let harness = Harness::create();
+    let created = draft_for(&harness, Some(session()));
+    let (created, handle) = bind(
+        &harness,
+        &created,
+        "late.png",
+        InsertionMethod::TypedSubmission,
+    );
+    let holder = draft_for(&harness, None);
+    let mut begin = harness.begin_of(session(), created.draft_id, handle.transfer_id, action(61));
+    begin.deadline_boot_ms = U64::new(BOOT_NOW_MS + 10);
+
+    let (arrived, held) = std::sync::mpsc::sync_channel(1);
+    let (release, go) = std::sync::mpsc::sync_channel(1);
+    let hook = std::sync::Arc::new(HoldsTheStore {
+        arrived,
+        go: std::sync::Mutex::new(go),
+    });
+    let holding = Action {
+        actor_id: harness.actor.clone(),
+        action_id: kr_ipc::new_uuid(),
+        method: "draft.update".to_owned(),
+        payload_digest: support::digest(b"holds the store"),
+        admission: Admission::new(hook as std::sync::Arc<dyn AdmissionHook>),
+    };
+    // The boot clock, which the claim reads where it decides, and says when it has.
+    let boot = AtomicU64::new(BOOT_NOW_MS);
+    let (asked, reading) = std::sync::mpsc::channel::<()>();
+    let clock = || {
+        let _ = asked.send(());
+        boot.load(Ordering::SeqCst)
+    };
+
+    let claimed = std::thread::scope(|scope| {
+        let update = scope.spawn(|| {
+            harness.service.draft_update(
+                &harness.actor,
+                &DraftUpdateParams {
+                    draft_id: holder.draft_id,
+                    expected_revision: holder.revision,
+                    text: "holds the store".to_owned(),
+                },
+                Some(&holding),
+            )
+        });
+        held.recv().expect("the update holds the store");
+        let claim = scope.spawn(|| {
+            harness
+                .service
+                .insertion_begin(&harness.actor, session(), &begin, &clock)
+        });
+        // A claim that reads its clock before it waits for the store does so now, with the clock
+        // before its deadline; one that reads it with the store in hand cannot until the store is
+        // let go. The wait only gives the first the chance to show itself: what decides the case
+        // is the answer below, whichever way this ends.
+        let _ = reading.recv_timeout(std::time::Duration::from_millis(300));
+        boot.store(BOOT_NOW_MS + 11, Ordering::SeqCst);
+        release.send(()).expect("lets the store go");
+        update
+            .join()
+            .expect("the update ends")
+            .expect("the update is committed");
+        claim.join().expect("the claim ends")
+    });
+
+    let error = claimed.expect_err("the claim's deadline passed while it waited for the store");
+    assert_eq!(error.code(), ErrorCode::DraftConflict, "{error:?}");
+    assert_eq!(
+        state_of(&read(&harness, created.draft_id), handle.transfer_id),
+        InsertionState::Recorded,
+        "nothing was claimed"
+    );
 }

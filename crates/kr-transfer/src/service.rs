@@ -2342,7 +2342,7 @@ impl TransferService {
         actor: &ActorId,
         session_id: SessionId,
         begin: &InsertionBegin,
-        boot_now_ms: u64,
+        boot_clock: &dyn Fn() -> u64,
     ) -> Result<InsertionClaim> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
@@ -2378,7 +2378,10 @@ impl TransferService {
                  offered to an agent until they have ended",
             ));
         }
-        if boot_now_ms >= begin.deadline_boot_ms.get() {
+        // Read now, with the store held: a claim that waited for the store is judged by the time it
+        // commits at, so one that commits after its deadline cannot, and the report of an action
+        // that gave up at the deadline never meets a claim that commits after it.
+        if boot_clock() >= begin.deadline_boot_ms.get() {
             return Err(TransferError::DraftConflict {
                 detail: "the deadline of the action this claim is for has passed".to_owned(),
             });
@@ -2424,6 +2427,18 @@ impl TransferService {
         let upload = store
             .upload(begin.transfer_id)?
             .ok_or_else(|| unknown(begin.transfer_id))?;
+        // The grant is over the staged file, which exists while the attachment is published. An
+        // attachment that expired unused has no file left, and a claim would send the receiver to
+        // nothing.
+        if upload.state != UploadState::Published {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "{} is {} and not published, so there is no file to offer",
+                    begin.transfer_id,
+                    upload.state.as_str()
+                ),
+            });
+        }
         let grant = self.read_grant_for(&handle_of(&upload)?, existing.insertion_method, now)?;
         let claimed = BindingRow {
             state: InsertionState::Inserting,
@@ -2499,6 +2514,19 @@ impl TransferService {
                 TransferError::invalid(format!("{} is not bound to this draft", report.transfer_id))
             })?;
         let existing = bindings[position].clone();
+        // A report for a session that has ended cannot change what that end decided, whoever makes
+        // it, and an exact repeat of one is no exception: it is said before anything is answered
+        // as it stands.
+        if store.session_has_ended(report.draft_id, report.transfer_id)? {
+            return Err(TransferError::SessionEnded);
+        }
+        // Only the worker of the session the draft targets settles an offer from it, and is told
+        // anything of one, a repeat included.
+        if row.session_id != Some(session_id) {
+            return Err(TransferError::UnknownDraft {
+                draft: report.draft_id.to_string(),
+            });
+        }
         let (state, evidence, detail) = match &report.outcome {
             ReportedOutcome::AcceptedByAgent {
                 provenance,
@@ -2542,17 +2570,6 @@ impl TransferService {
             && existing.failure_detail == detail
         {
             return Ok(existing.state);
-        }
-        // A report for a session that has ended cannot change what that end decided, whoever makes
-        // it.
-        if store.session_has_ended(report.draft_id, report.transfer_id)? {
-            return Err(TransferError::SessionEnded);
-        }
-        // Only the worker of the session the draft targets settles an offer from it.
-        if row.session_id != Some(session_id) {
-            return Err(TransferError::UnknownDraft {
-                draft: report.draft_id.to_string(),
-            });
         }
         if !claimed {
             return Err(TransferError::DraftConflict {
