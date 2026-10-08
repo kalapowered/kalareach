@@ -3,8 +3,9 @@
 //!
 //! The owner creates a destination with `delivery.destination.configure`: which service, where it
 //! sends, whether it deduplicates by an identifier, and the grant whose authority the content is
-//! intersected with. `delivery.destination.remove` takes one away. A paired device is a
-//! destination too, but it is made by the device's own registration, never by these two.
+//! intersected with. `delivery.destination.remove` takes one away, and `delivery.destination.list`
+//! says which are in service. A paired device is a destination too, but it is made by the device's
+//! own registration, never by these two.
 //!
 //! Section 25 documents Slack, Discord, Telegram and email delivery beside webhooks, and each of
 //! those four sends through a credential. A Slack or Discord incoming-webhook address is itself a
@@ -25,7 +26,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::Zeroize as _;
 
 use crate::ids::GrantId;
-use crate::scalars::{Nullable, U64};
+use crate::scalars::{Nullable, TimestampMs, U64};
 
 /// The longest part of a credential, in bytes.
 pub const MAX_SECRET_TEXT_LEN: usize = 4096;
@@ -374,6 +375,68 @@ pub struct DeliveryDestinationRemoveResult {
     /// How many attempts were on the wire when the destination was removed. Each finishes and
     /// reports its answer, and the destination may still receive that message.
     pub fenced: U64,
+}
+
+/// Parameters of `delivery.destination.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryDestinationListParams {}
+
+/// The kinds of destination this host delivers to: the five an owner configures and a paired
+/// device's own, made by the device's registration.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryDestinationKind {
+    /// A paired device, through the push gateway.
+    Push,
+    /// An HTTPS endpoint the owner named.
+    Webhook,
+    /// A Slack channel.
+    Slack,
+    /// A Discord channel.
+    Discord,
+    /// A Telegram chat.
+    Telegram,
+    /// An email recipient.
+    Email,
+}
+
+/// One destination this host delivers to, as `delivery.destination.list` says it. It never carries
+/// a credential, and says only whether one is kept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryDestinationSummary {
+    /// The identifier the destination is configured under; a paired device's destination is
+    /// named by the device's identifier.
+    pub destination_id: String,
+    /// Which service it sends to.
+    pub kind: DeliveryDestinationKind,
+    /// Where an owner's destination sends, as it was configured. Null for a paired device's, which
+    /// the push gateway reaches.
+    pub endpoint: Nullable<String>,
+    /// The header a webhook deduplicates by. Null when it deduplicates by nothing, and for every
+    /// kind but a webhook.
+    pub idempotency_header: Nullable<String>,
+    /// What the rule that sends to this destination is called.
+    pub rule_name: String,
+    /// The grant whose authority the content is intersected with.
+    pub grant_id: Nullable<GrantId>,
+    /// Whether the destination is in service. A destination the gateway rejected the token of is
+    /// not, and stays listed until it is removed or its device registers again.
+    pub in_force: bool,
+    /// When it was configured, in UTC milliseconds.
+    pub configured_at_ms: TimestampMs,
+}
+
+/// The result of `delivery.destination.list`: the destinations that have a rule, by identifier.
+/// One that was removed is not listed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryDestinationListResult {
+    /// The destinations, ordered by identifier.
+    pub destinations: Vec<DeliveryDestinationSummary>,
 }
 
 #[cfg(test)]
