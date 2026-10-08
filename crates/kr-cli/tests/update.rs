@@ -6430,6 +6430,7 @@ async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_tha
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
     let scratch = host.scratch("archives");
+    let mut last = Value::Null;
     for (release, name) in [
         (&two, "two.tar.gz"),
         (&three, "three.tar.gz"),
@@ -6445,7 +6446,15 @@ async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_tha
             "--json",
         ]);
         assert_eq!(output.status.code(), Some(1), "{said}");
+        last = said;
     }
+    assert!(
+        last["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("kr host rollback goes back to {}", one.name())),
+        "the failure names the release a rollback goes back to: {last}"
+    );
     assert_eq!(starts_in(&log), 3);
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
