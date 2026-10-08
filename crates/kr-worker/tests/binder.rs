@@ -1851,10 +1851,10 @@ fn kr_req_11_13_rows_go_with_the_process_that_held_them_and_with_a_native_exit()
 
 /// Section 5: a package that ships a component binds for its declarative parts, whose actions it
 /// registers and whose rich admissions it makes, and the worker's report on its admissions says
-/// the component's capabilities are temporarily unavailable, and why. The same package with no
+/// what this host does with the component, and what it does not. The same package with no
 /// component is reported for nothing.
 #[test]
-fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_reports_the_component_unavailable()
+fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_reports_what_is_done_with_the_component()
  {
     let reported = |worker: &Worker, package: Digest256| {
         worker
@@ -1899,8 +1899,7 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
     let details = reported(&worker, source.package_digest);
     assert_eq!(details.len(), 1, "{details:?}");
     assert!(
-        details[0].contains("component's capabilities are temporarily unavailable")
-            && details[0].contains("the plugin runtime is not running on this host"),
+        details[0].contains("calls none of its component's exports beyond registering it"),
         "{}",
         details[0]
     );

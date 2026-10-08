@@ -473,6 +473,10 @@ impl BrokerState {
                 .payload(kr_plugin_sdk::plugin::PayloadRole::Connector)
                 .map(|payload| Digest256::from_bytes(*payload.digest.as_bytes())),
             revocation_disabled: false,
+            component: crate::broker::component::bound_component(
+                package.component.0.as_ref(),
+                manifest,
+            ),
         };
         let record = binding.record(now);
         self.stored(now, "binding a package", |ledger| {
@@ -493,6 +497,8 @@ impl BrokerState {
             refused.iter().map(ToString::to_string).collect(),
         );
         self.bindings.insert(binding_id, binding);
+        self.component_states.remove(&binding_id);
+        self.component_changes.notify_one();
         self.settle_owed_rows(now);
         Ok(refused)
     }
@@ -585,6 +591,8 @@ impl BrokerState {
         self.apply_release_states(now);
         self.close_ended(now);
         self.bind_the_unbound(now);
+        // A revocation, a disabling or an ending changes which components are wanted.
+        self.component_changes.notify_one();
     }
 
     /// Brings every live binding made from admissions to the state of the release it holds.
@@ -780,6 +788,8 @@ impl BrokerState {
             if let Some(binding) = self.bindings.remove(&binding_id) {
                 self.owed_rows.insert(binding_id);
                 self.revoked_settled(&binding.plugin_id, binding_id);
+                self.component_states.remove(&binding_id);
+                self.component_changes.notify_one();
             }
         }
         self.settle_owed_rows(now);

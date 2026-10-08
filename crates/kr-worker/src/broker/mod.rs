@@ -22,6 +22,7 @@
 //! | [`agents`] | Which launched agent a process belongs to, and its binding, for the question ledger |
 //! | [`arbitration`] | Pending resources, one resolution each, and what a reconnect does |
 //! | [`capability`] | The per-installation capability map and the probes behind it |
+//! | [`component`] | The components the bindings' packages ship, and where each stands in the plugin runtime |
 //! | [`endpoint`] | The bound local socket, and who the kernel says connected to it |
 //! | [`error`] | The broker's refusals, each mapped to a stable protocol code |
 //! | [`gateway`] | The core-declarative forwarding path, the closed rich table and reverse calls |
@@ -57,6 +58,7 @@ pub mod capability;
 pub mod catalogue;
 pub mod channels;
 pub mod commands;
+pub mod component;
 pub mod connectors;
 pub mod duplex;
 pub mod endpoint;
@@ -76,8 +78,9 @@ pub mod tokens;
 pub mod volatile;
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use kr_protocol::admission::ComponentState;
 use kr_protocol::agent::AgentBindingState;
 use kr_protocol::broker::{
     ActionName, ActionProvenance, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants,
@@ -260,6 +263,8 @@ pub struct Binding {
     /// True while its rich capabilities are disabled because the release it holds was revoked,
     /// which a revocation that no longer stands lifts; a fault's disabling it does not.
     pub revocation_disabled: bool,
+    /// The component its package ships, as the admissions named it when the binding was made.
+    pub component: Option<component::BoundComponent>,
 }
 
 impl Binding {
@@ -797,6 +802,10 @@ struct BrokerState {
     revoked: BTreeMap<PluginId, std::collections::BTreeSet<BrokerBindingId>>,
     /// Why each admitted package's declared actions were refused, by package hash.
     action_refusals: BTreeMap<Digest256, Vec<String>>,
+    /// Where the plugin runtime has each binding's component, as its link last reported.
+    component_states: BTreeMap<BrokerBindingId, (ComponentState, Option<String>)>,
+    /// Woken when the set of bindings the plugin runtime is wanted for may have changed.
+    component_changes: Arc<tokio::sync::Notify>,
 }
 
 /// The tables one installation was qualified with, as the installation pinned them.
@@ -964,6 +973,8 @@ impl Broker {
                 notices: Vec::new(),
                 revoked: BTreeMap::new(),
                 action_refusals: BTreeMap::new(),
+                component_states: BTreeMap::new(),
+                component_changes: Arc::new(tokio::sync::Notify::new()),
             }),
             notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
@@ -1512,6 +1523,7 @@ impl Broker {
             executable: None,
             connector_digest: None,
             revocation_disabled: false,
+            component: None,
         };
         let record = binding.record(now);
         state.stored(now, "binding a component", |ledger| {
@@ -1527,7 +1539,8 @@ impl Broker {
     /// descriptor is not a release this host's catalogue installed, and is not reported.
     #[must_use]
     pub fn live_bindings(&self) -> Vec<kr_protocol::admission::LiveBinding> {
-        self.state()
+        let state = self.state();
+        state
             .bindings
             .values()
             .filter_map(|binding| {
@@ -1539,7 +1552,10 @@ impl Broker {
                         application_instance_id: binding.application_instance_id,
                         release: release.clone(),
                         ending: binding.ending,
-                        component: Nullable::null(),
+                        component: Nullable(component::report_of(
+                            binding,
+                            state.component_states.get(&binding.binding_id),
+                        )),
                     })
             })
             .collect()
@@ -1639,10 +1655,15 @@ impl Broker {
     /// disabling is the fault's from here, whatever disabled the binding before: a revocation that
     /// stops standing, or a policy that only warns, lifts nothing a fault did.
     pub fn disable_rich(&self, binding_id: BrokerBindingId, reason: impl Into<String>) {
-        if let Some(binding) = self.state().bindings.get_mut(&binding_id) {
-            binding.rich_disabled = Some(reason.into());
-            binding.revocation_disabled = false;
-        }
+        let mut state = self.state();
+        let Some(binding) = state.bindings.get_mut(&binding_id) else {
+            return;
+        };
+        binding.rich_disabled = Some(reason.into());
+        binding.revocation_disabled = false;
+        let changes = Arc::clone(&state.component_changes);
+        drop(state);
+        changes.notify_one();
     }
 
     /// Returns true when this instance has bindings and every one of them is rich-disabled.

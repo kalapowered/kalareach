@@ -24,6 +24,7 @@
 //! | [`privacy`] | Privacy mode: the generation, the four things it asks of every subsystem, and what it keeps |
 //! | [`persistence`] | The durability contract: commit points, per-store declarations, the journal-fault seam, the outbox, retention and migrations |
 //! | [`ownership`] | Which processes a session owns, and how much of that the host can account for |
+//! | [`plugin_runtime`] | The link that registers the bindings' components with the plugin runtime, and asks the control daemon for it when one is wanted |
 //! | [`projection`] | The canonical grid, the filtered stream and the presentation a terminal is served |
 //! | [`render`] | Turning a side-effect-free restoration into terminal bytes |
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
@@ -55,6 +56,7 @@ pub mod lifecycle;
 pub mod output;
 pub mod ownership;
 pub mod persistence;
+pub mod plugin_runtime;
 pub mod privacy;
 pub mod projection;
 pub mod pty;

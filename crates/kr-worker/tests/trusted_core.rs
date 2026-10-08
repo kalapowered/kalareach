@@ -262,6 +262,12 @@ fn neither_process_serving_a_shell_links_a_wasm_engine_or_a_model_runtime() {
             linked.contains("kr-protocol"),
             "the walk reached {process}'s own dependencies"
         );
+        // Both reach the plugin runtime through its engine-free link, so the walk that finds no
+        // engine is a walk that includes the link.
+        assert!(
+            linked.contains("kr-plugin-service"),
+            "{process} reaches the plugin runtime through kr-plugin-service"
+        );
         let found = hosts_or_engines(&linked);
         assert!(
             found.is_empty(),

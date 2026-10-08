@@ -4942,6 +4942,7 @@ dependencies = [
  "kr-flush",
  "kr-ipc",
  "kr-plugin-sdk",
+ "kr-plugin-service",
  "kr-protocol",
  "kr-shell-integration",
  "kr-term",
