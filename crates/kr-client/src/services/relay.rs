@@ -148,6 +148,27 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
             ))
         })
     }
+
+    /// Reads a document and returns what came back.
+    ///
+    /// One managed-service read has no body: what a call is doing, asked of the service that holds
+    /// it. An implementation sends a `GET` with `headers` and treats them and the answer exactly as
+    /// [`Self::post_json`] does.
+    ///
+    /// A transport that only posts keeps this default. It sends nothing and says so, so a caller
+    /// that needed a read is told this transport cannot make one.
+    fn get_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async {
+            Err(ClientError::refusal(
+                ErrorCode::UnsupportedCapability,
+                Shown::said("this transport only posts, so nothing was sent"),
+            ))
+        })
+    }
 }
 
 /// What an HTTP exchange returned.

@@ -141,6 +141,11 @@ impl Authority {
         }
     }
 
+    /// The moments grants were revoked at, in order.
+    fn revocations(&self) -> Vec<u64> {
+        self.store.lock().expect("the store").revoked_at_ms.clone()
+    }
+
     /// Makes the host refuse one read of a grant with `refusal`, or none with `None`.
     fn refuse(&self, refusing: Option<(Seam, kr_protocol::error::ProtocolError)>) {
         *self.refusing.lock().expect("the refusal") = refusing;
@@ -647,6 +652,17 @@ enum Answer {
     RateChanged,
 }
 
+/// What a fake provider says when it is asked whether it still holds a call open.
+#[derive(Clone, Copy, Debug)]
+enum ServiceHolds {
+    /// The call is open at the service.
+    Open,
+    /// The service has no such call open: it ended it.
+    Over,
+    /// The service cannot be asked.
+    Unreachable,
+}
+
 /// A stand-in for the managed broker. It makes no network call.
 #[derive(Debug)]
 struct ManagedFake {
@@ -659,6 +675,10 @@ struct ManagedFake {
     terms_unreachable: Mutex<bool>,
     /// Whether closing a call fails, as it does when the service cannot be reached.
     close_unreachable: Mutex<bool>,
+    /// What the service says when asked whether it still holds a call open.
+    holds: Mutex<ServiceHolds>,
+    /// The calls the service was asked about, in order.
+    asked: Mutex<Vec<String>>,
     /// Held creations, for a test that needs one start to still be waiting while another arrives.
     ///
     /// A real creation takes as long as a network round trip, and the window this opens is that
@@ -676,6 +696,8 @@ impl ManagedFake {
             versions: Mutex::new(Vec::new()),
             terms_unreachable: Mutex::new(false),
             close_unreachable: Mutex::new(false),
+            holds: Mutex::new(ServiceHolds::Open),
+            asked: Mutex::new(Vec::new()),
             holding: tokio::sync::Semaphore::new(0),
             held: Mutex::new(false),
         }
@@ -684,6 +706,16 @@ impl ManagedFake {
     /// Makes every close fail, as one does when the service cannot be reached.
     fn cannot_close(&self) {
         *self.close_unreachable.lock().expect("the switch") = true;
+    }
+
+    /// Sets what the service says when asked whether it still holds a call open.
+    fn answers_holds(&self, holds: ServiceHolds) {
+        *self.holds.lock().expect("the switch") = holds;
+    }
+
+    /// The calls the service was asked about.
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().expect("what was asked").clone()
     }
 
     /// Makes every creation wait until [`ManagedFake::release`] lets one through.
@@ -769,6 +801,26 @@ fn running_call(name: &str) -> VoiceSession {
 }
 
 impl ManagedVoiceService for ManagedFake {
+    fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool> {
+        self.asked
+            .lock()
+            .expect("what was asked")
+            .push(call_id.to_owned());
+        let holds = *self.holds.lock().expect("the switch");
+        Box::pin(async move {
+            match holds {
+                ServiceHolds::Open => Ok(true),
+                ServiceHolds::Over => Ok(false),
+                ServiceHolds::Unreachable => Err(kr_client::error::ClientError::Host(
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                        "the managed service did not answer".to_owned(),
+                    ),
+                )),
+            }
+        })
+    }
+
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         let unreachable = *self.terms_unreachable.lock().expect("the switch");
         Box::pin(async move {
@@ -880,6 +932,11 @@ impl ManagedVoiceService for OwnBackend {
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         // Not the managed service: it quotes no managed rate and publishes no managed terms.
         Box::pin(async move { Ok(None) })
+    }
+
+    fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {
+        // Nothing here can say, so the call is held open until its own deadline.
+        Box::pin(async move { Ok(true) })
     }
 
     fn provider(&self) -> String {
@@ -1957,6 +2014,88 @@ async fn stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told() 
         .await
         .expect_err("it is over");
     assert_eq!(error.reason(), Some(VoiceRefusal::UnknownVoiceSession));
+}
+
+/// KR-REQ-15.02 and 15.17: a call whose device went silent is over at its own deadline, whatever
+/// the service can be asked. Until then it is open, and the host ends its record as a stop would:
+/// the grant is revoked, and the service is told so it can finalise the call.
+#[tokio::test]
+async fn a_call_is_over_at_its_deadline_without_its_device() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    // Started at 10 000 for 600 seconds.
+    let deadline = 610_000;
+
+    assert!(fixture.coordinator.calls_open(deadline - 1));
+    fixture.broker.answers_holds(ServiceHolds::Unreachable);
+    assert_eq!(
+        fixture
+            .coordinator
+            .end_calls_that_are_over(deadline - 1)
+            .await,
+        0,
+        "a service that cannot be asked leaves the call open"
+    );
+    assert!(fixture.coordinator.calls_open(deadline - 1));
+    assert_eq!(fixture.coordinator.live_sessions(), 1);
+
+    assert!(
+        !fixture.coordinator.calls_open(deadline),
+        "a call at its deadline is not open"
+    );
+    assert_eq!(
+        fixture.coordinator.end_calls_that_are_over(deadline).await,
+        1
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+    assert!(
+        !fixture.coordinator.calls_open(deadline),
+        "its close has been told"
+    );
+
+    // The device's own stop, arriving late, finds nothing left to stop.
+    let error = fixture
+        .coordinator
+        .stop(
+            device(PHONE),
+            &VoiceStopParams { voice_session_id },
+            deadline + 1_000,
+        )
+        .await
+        .expect_err("it is over");
+    assert_eq!(error.reason(), Some(VoiceRefusal::UnknownVoiceSession));
+    assert_eq!(
+        fixture.broker.closed().len(),
+        1,
+        "the service was told once"
+    );
+}
+
+/// KR-REQ-15.02 and 15.17: a call the managed service no longer holds open is over before its
+/// deadline. The host asks the service about the call it created, ends its record as a stop would,
+/// and a call the service still holds is left alone.
+#[tokio::test]
+async fn a_call_the_service_ended_is_over_before_its_deadline() {
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+    let revoked_before = fixture.authority.revocations();
+
+    assert_eq!(fixture.coordinator.end_calls_that_are_over(20_000).await, 0);
+    assert_eq!(fixture.broker.asked(), vec!["call-managed".to_owned()]);
+    assert!(fixture.coordinator.calls_open(20_000));
+    assert_eq!(fixture.authority.revocations(), revoked_before);
+
+    fixture.broker.answers_holds(ServiceHolds::Over);
+    assert_eq!(fixture.coordinator.end_calls_that_are_over(21_000).await, 1);
+    assert!(!fixture.coordinator.calls_open(21_000));
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(
+        fixture.authority.revocations(),
+        [revoked_before, vec![21_000]].concat(),
+        "the call's grant was revoked when the host found the call over"
+    );
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
 }
 
 /// KR-REQ-15.02: a voice session is not a shell session. Stopping one names the terminal sessions
