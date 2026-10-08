@@ -11,26 +11,32 @@
 //!
 //! * **Work arrives or becomes possible** (a generation admitted, a writer enrolled, a fence
 //!   released): at once, unless the service asked to be left alone, and then when it said.
-//! * **A privacy fence is raised**: at once, whatever else it waits for. The cleanup a fence owes
-//!   ends the work in flight, and it must not wait out a delay the service asked for.
+//! * **A privacy fence is raised**: at once, whatever else it waits for and whatever account token
+//!   the host holds. The cleanup a fence owes ends the work in flight, and it must not wait out a
+//!   delay the service asked for. A delay stays owed after a fence: it is asked for again when the
+//!   fence is lifted.
 //! * **The service is busy, unavailable or slow**: after the longer of the delay it named and a
-//!   jittered, doubling delay of 250 ms to 30 s.
+//!   jittered, doubling delay of 250 ms to 30 s. A delay the service names holds every question
+//!   to it, the one `kr doctor` asks and the one the host asks when it starts as well as a pass.
 //! * **Only a person can clear the cause** (backup storage off, no backup allowance, a writer
 //!   nobody enrolled, no usable account token): after five minutes, or when work or a writer
 //!   arrives. The host's own account token is checked first and every 30 seconds, because
-//!   importing one only writes a file, and no request leaves the host without a usable one.
+//!   importing one only writes a file, and no request that carries the token leaves the host
+//!   without a usable one. Requests that carry no token are not held back by that check: the host
+//!   settles what an earlier run sent, and ends work in flight under a fence, whatever the token.
 //! * **Nothing is owed**: when something changes.
 //!
 //! # Where it runs
 //!
 //! On a task of its own on the daemon's reactor, so a service that never answers holds one task and
-//! stopping the daemon ends the exchange in flight. The uploader hands the disk work it does
-//! between exchanges to a thread the reactor can spare.
+//! stopping the daemon ends the exchange in flight. The uploader reaches the backup store only
+//! through a handle that hands the thread's other tasks to another thread while it blocks, so a
+//! slow disk holds one request's turn and not the reactor.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::voice::AccountTokenFile;
@@ -44,7 +50,7 @@ use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
-use kr_protocol::scalars::{AuthorisationKey, Signature64};
+use kr_protocol::scalars::{AuthorisationKey, KeyId, Signature64};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_transport::config::ProxyUrl;
 use kr_transport::reconnect::Backoff;
@@ -136,7 +142,7 @@ impl ServiceSigner for WriterSigner {
     }
 }
 
-/// What this host holds for the account token it presents.
+/// What this host holds for the account token it presents, as the doctor words it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokenState {
     /// Nothing has been imported.
@@ -147,7 +153,7 @@ enum TokenState {
     Expired,
     /// The imported token was not issued with the scope backup storage needs.
     WithoutScope,
-    /// The token is usable now, and stops being accepted at the time shown, when it says.
+    /// The token is usable now.
     Usable,
 }
 
@@ -163,12 +169,16 @@ impl TokenState {
     }
 }
 
-/// Reads the token file as the transport will, without sending anything.
-fn token_state(tokens: &AccountTokenFile, origin: &str) -> TokenState {
+/// Reads the token file as the doctor describes it, without sending anything: what state it is in,
+/// and when it stops being accepted, if it says.
+///
+/// Whether a request may carry the token is decided by asking the [`AccountTokenSource`], which is
+/// what the clients ask. This only says why, and it is read for no other purpose.
+fn describe_token(tokens: &AccountTokenFile, origin: &str) -> (TokenState, Option<u64>) {
     let Ok(stored) = tokens.stored() else {
-        return TokenState::Absent;
+        return (TokenState::Absent, None);
     };
-    if stored.origin != origin {
+    let state = if stored.origin != origin {
         TokenState::OtherService
     } else if stored
         .expires_at_ms
@@ -179,21 +189,26 @@ fn token_state(tokens: &AccountTokenFile, origin: &str) -> TokenState {
         TokenState::WithoutScope
     } else {
         TokenState::Usable
-    }
+    };
+    (state, stored.expires_at_ms)
 }
 
 /// What the carrier knows of the service, for `kr doctor`.
+///
+/// Three facts that are kept apart because each is cleared by something different: what the
+/// service said about backup storage, whether the last question to it was turned back, and what
+/// held back the work of the last pass. A status that reads well does not answer a publication that
+/// was refused, and a pass that moved nothing does not answer a question that was.
 #[derive(Debug, Default)]
 struct Observed {
     /// The last answer the service gave to a status read.
     status: Option<StorageStatus>,
-    /// Why the last status read, or the last pass, was turned back by the service.
-    hold: Option<Hold>,
+    /// Why the last status read was turned back by the service, when it was.
+    status_refusal: Option<Hold>,
+    /// What held back the work of the last pass, when something did.
+    pass_hold: Option<Hold>,
     /// What the last pass did.
     last_pass: Option<LastPass>,
-    /// Whether the carrier is waiting out a delay the service asked for, in which case nothing is
-    /// sent until it ends.
-    in_delay: bool,
     /// Whether the carrier found work and no usable account token the last time it looked.
     token_blocked: bool,
 }
@@ -212,6 +227,8 @@ enum Wait {
     Signals,
     /// For `duration`, or until a fence is raised, or, when `wakeable`, until work arrives.
     Timed { duration: Duration, wakeable: bool },
+    /// For the delay the service asked for, or until a fence is raised, which leaves it owed.
+    Owed(Duration),
 }
 
 /// The clients a host with a storage service builds, and the key it signs them with.
@@ -262,11 +279,17 @@ pub fn managed_clients(
 struct Shared {
     /// Where the carrier asks `kr doctor`'s own status question, apart from the uploader's.
     storage: Arc<dyn StorageService>,
-    tokens: Arc<AccountTokenFile>,
+    /// What decides whether a request may carry an account: the same source the clients ask.
+    account: Arc<dyn AccountTokenSource>,
+    /// The imported token's file, read only to say what is wrong with it.
+    token_file: Arc<AccountTokenFile>,
     origin: String,
-    writer_public: AuthorisationKey,
+    writer_key_id: KeyId,
     signals: Arc<BackupSignals>,
     observed: Mutex<Observed>,
+    /// When the service said it may be asked again, if it asked for a delay that has not passed.
+    /// Every question to the service waits for it, whoever asks, except the ones a fence owes.
+    owed: Mutex<Option<Instant>>,
     /// How many passes have finished, for whatever waits on one.
     passes: tokio::sync::watch::Sender<u64>,
 }
@@ -274,6 +297,52 @@ struct Shared {
 impl Shared {
     fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
         self.observed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn owed(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.owed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records that the service asked to be left alone for `delay`.
+    fn owe(&self, delay: Duration) {
+        let until = Instant::now() + delay;
+        let mut owed = self.owed();
+        *owed = Some(owed.map_or(until, |earlier| earlier.max(until)));
+    }
+
+    /// What is left of the delay the service asked for, when some is.
+    fn owed_for(&self) -> Option<Duration> {
+        let until = (*self.owed())?;
+        until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Whether a request may carry the host's account token now.
+    async fn token_usable(&self) -> bool {
+        self.account.token(BACKUP_WRITE_SCOPE).await.is_ok()
+    }
+
+    /// What to wait on after the service held work back.
+    fn after(&self, hold: Hold, backoff: &mut Backoff) -> Wait {
+        match hold.retry_after {
+            Some(delay) => {
+                self.owe(delay);
+                Wait::Owed(if hold.needs_a_person() {
+                    delay
+                } else {
+                    backoff.next_delay().max(delay)
+                })
+            }
+            None if hold.needs_a_person() => Wait::Timed {
+                duration: OPERATOR_CEILING,
+                wakeable: true,
+            },
+            None => Wait::Timed {
+                duration: backoff.next_delay(),
+                wakeable: false,
+            },
+        }
     }
 
     /// Notes what a pass found, and says what to wait on.
@@ -290,8 +359,16 @@ impl Shared {
             let mut observed = self.observed();
             if let Some(status) = &report.status {
                 observed.status = Some(status.clone());
+                observed.status_refusal = None;
             }
-            observed.hold = report.hold;
+            if matches!(report.idle, Some(Idle::Unavailable { .. })) {
+                // The pass asked the service about backup storage and was turned back, so it did
+                // no work, and the work it held back earlier is not what to say now.
+                observed.status_refusal = report.hold;
+                observed.pass_hold = None;
+            } else {
+                observed.pass_hold = report.hold;
+            }
             observed.last_pass = Some(LastPass {
                 steps: report.steps.len() as u64,
                 idle: match &report.idle {
@@ -308,19 +385,7 @@ impl Shared {
             backoff.reset();
         }
         if let Some(hold) = report.hold {
-            return if hold.needs_a_person() {
-                Wait::Timed {
-                    duration: OPERATOR_CEILING,
-                    wakeable: true,
-                }
-            } else {
-                Wait::Timed {
-                    duration: backoff
-                        .next_delay()
-                        .max(hold.retry_after.unwrap_or(Duration::ZERO)),
-                    wakeable: false,
-                }
-            };
+            return self.after(hold, backoff);
         }
         match report.idle {
             Some(Idle::BackupOff) => Wait::Timed {
@@ -362,12 +427,24 @@ impl Shared {
                 duration,
                 wakeable: false,
             } => {
-                self.observed().in_delay = true;
                 tokio::select! {
                     () = timer.sleep(duration) => {}
                     () = signals.fence.notified() => {}
                 }
-                self.observed().in_delay = false;
+            }
+            Wait::Owed(duration) => {
+                let asked = *self.owed();
+                tokio::select! {
+                    () = timer.sleep(duration) => {
+                        // What was asked for has passed, unless the service asked for more while
+                        // this waited.
+                        let mut owed = self.owed();
+                        if *owed == asked {
+                            *owed = None;
+                        }
+                    }
+                    () = signals.fence.notified() => {}
+                }
             }
         }
     }
@@ -379,23 +456,54 @@ impl Shared {
         backup: &BackupService,
         backoff: &mut Backoff,
     ) -> Wait {
-        if token_state(&self.tokens, &self.origin) != TokenState::Usable {
-            // Nothing leaves this host without a usable token. With nothing to carry there is
-            // nothing to check for either, and work arriving is what looks again.
-            let nothing_to_carry = backup.outbox().is_ok_and(|outbox| outbox.is_empty());
-            self.observed().token_blocked = !nothing_to_carry;
-            return if nothing_to_carry {
-                Wait::Signals
-            } else {
-                Wait::Timed {
-                    duration: TOKEN_CHECK,
-                    wakeable: true,
-                }
-            };
+        let (fenced, nothing_to_carry) = on_disk(|| {
+            let fenced = backup
+                .privacy_status()
+                .is_ok_and(|privacy| privacy.inhibited_at().is_some());
+            (
+                fenced,
+                backup.outbox().is_ok_and(|outbox| outbox.is_empty()),
+            )
+        });
+        // A fence is answered whatever the service asked and whatever token the host holds: ending
+        // work in flight is what the host owes, and a request that cannot be signed in is not sent.
+        if !fenced {
+            if let Some(left) = self.owed_for() {
+                return Wait::Owed(left);
+            }
+            if !self.token_usable().await {
+                // Nothing that carries the token leaves this host without a usable one. With
+                // nothing to carry there is nothing to check for either, and work arriving is
+                // what looks again.
+                self.observed().token_blocked = !nothing_to_carry;
+                return if nothing_to_carry {
+                    Wait::Signals
+                } else {
+                    Wait::Timed {
+                        duration: TOKEN_CHECK,
+                        wakeable: true,
+                    }
+                };
+            }
         }
         self.observed().token_blocked = false;
         match uploader.pass(kr_ipc::now_ms()).await {
-            Ok(report) => self.absorb(&report, backoff),
+            Ok(report) => {
+                let wait = self.absorb(&report, backoff);
+                // A refusal only a person can mend, met by a host whose token has stopped being
+                // usable since the check, is the token to wait for and not a five-minute wait.
+                if !fenced
+                    && report.hold.is_some_and(|hold| hold.needs_a_person())
+                    && !self.token_usable().await
+                {
+                    self.observed().token_blocked = true;
+                    return Wait::Timed {
+                        duration: TOKEN_CHECK,
+                        wakeable: true,
+                    };
+                }
+                wait
+            }
             Err(error) => {
                 eprintln!("kr-controller: the backup pass could not use its store: {error}");
                 Wait::Timed {
@@ -406,17 +514,32 @@ impl Shared {
         }
     }
 
-    /// Asks the service what it says about backup storage and notes the answer.
-    async fn read_status(&self, storage: &dyn StorageService) {
-        match storage.status().await {
+    /// Asks the service what it says about backup storage and notes the answer. A refusal is
+    /// returned, and any delay in it is owed to every question that follows.
+    async fn read_status(&self) -> Option<Hold> {
+        match self.storage.status().await {
             Ok(status) => {
                 let mut observed = self.observed();
                 observed.status = Some(status);
-                observed.hold = None;
+                observed.status_refusal = None;
+                None
             }
-            Err(error) => self.observed().hold = Some(Hold::of(&error)),
+            Err(error) => {
+                let hold = Hold::of(&error);
+                self.observed().status_refusal = Some(hold);
+                if let Some(delay) = hold.retry_after {
+                    self.owe(delay);
+                }
+                Some(hold)
+            }
         }
     }
+}
+
+/// Runs `access`, which blocks on the disk, without holding a thread the reactor runs other tasks
+/// on.
+fn on_disk<T>(access: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(access)
 }
 
 /// The carrier of one host's backup outbox.
@@ -424,6 +547,7 @@ pub struct BackupRuntime {
     shared: Arc<Shared>,
     backup: Arc<BackupService>,
     timer: Arc<dyn Timer>,
+    writer_public: AuthorisationKey,
     /// The uploader, until the task takes it.
     uploader: Mutex<Option<Uploader>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -433,7 +557,7 @@ impl std::fmt::Debug for BackupRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BackupRuntime")
-            .field("writer_public_key", &self.shared.writer_public)
+            .field("writer_public_key", &self.writer_public)
             .finish_non_exhaustive()
     }
 }
@@ -464,11 +588,13 @@ impl BackupRuntime {
         let writer_public = *writer.public();
         let shared = Arc::new(Shared {
             storage: Arc::clone(storage),
-            tokens,
+            account: Arc::clone(&tokens) as Arc<dyn AccountTokenSource>,
+            token_file: tokens,
             origin: origin.as_str().to_owned(),
-            writer_public,
+            writer_key_id: writer.key_id(),
             signals: backup.signals(),
             observed: Mutex::default(),
+            owed: Mutex::default(),
             passes: tokio::sync::watch::channel(0).0,
         });
         let uploader = Uploader::new(
@@ -482,6 +608,7 @@ impl BackupRuntime {
             shared,
             backup,
             timer,
+            writer_public,
             uploader: Mutex::new(Some(uploader)),
             task: Mutex::new(None),
         })
@@ -490,15 +617,16 @@ impl BackupRuntime {
     /// The public half of the key this host publishes as, which an owner enrols at the service as
     /// the writer of a collection.
     #[must_use]
-    pub fn writer_public_key(&self) -> AuthorisationKey {
-        self.shared.writer_public
+    pub const fn writer_public_key(&self) -> AuthorisationKey {
+        self.writer_public
     }
 
     /// Records the publications an earlier run sent that the service holds, giving the service
     /// `budget` to say, before the store is reconciled.
     ///
-    /// A service that does not say in time is left for the first pass, and reconciliation records
-    /// the publication as one this host cannot establish in the meantime.
+    /// A fetch carries no account token, so this does not wait for one. A service that does not
+    /// say in time is left for the first pass, and reconciliation records the publication as one
+    /// this host cannot establish in the meantime.
     pub async fn settle(&self, budget: Duration) {
         let taken = self
             .uploader
@@ -508,21 +636,19 @@ impl BackupRuntime {
         let Some(mut uploader) = taken else {
             return;
         };
-        if token_state(&self.shared.tokens, &self.shared.origin) == TokenState::Usable {
-            let now = kr_ipc::now_ms();
-            match tokio::time::timeout(budget, uploader.settle(now)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    eprintln!(
-                        "kr-controller: backup could not settle what an earlier run sent: {error}"
-                    );
-                }
-                Err(_) => eprintln!(
-                    "kr-controller: the storage service did not say what became of an earlier \
-                     publication in time, so reconciliation records it as one this host cannot \
-                     establish"
-                ),
+        let now = kr_ipc::now_ms();
+        match tokio::time::timeout(budget, uploader.settle(now)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                eprintln!(
+                    "kr-controller: backup could not settle what an earlier run sent: {error}"
+                );
             }
+            Err(_) => eprintln!(
+                "kr-controller: the storage service did not say what became of an earlier \
+                 publication in time, so reconciliation records it as one this host cannot \
+                 establish"
+            ),
         }
         *self.uploader.lock().unwrap_or_else(PoisonError::into_inner) = Some(uploader);
     }
@@ -560,32 +686,48 @@ impl BackupRuntime {
 
     /// What `kr doctor` says of the storage service.
     ///
-    /// It asks the service about backup storage, once and for a few seconds, unless the carrier is
-    /// waiting out a delay the service asked for or has no usable token, in which case nothing is
-    /// sent and the last answer stands.
+    /// It asks the service about backup storage, once and for a few seconds, unless the service
+    /// asked to be left alone or the host has no usable token, in which case nothing is sent and
+    /// the last answer stands.
     pub async fn doctor_check(&self) -> DoctorCheck {
-        let token = token_state(&self.shared.tokens, &self.shared.origin);
-        let delayed = self.shared.observed().in_delay;
-        if token == TokenState::Usable && !delayed {
-            let _ = tokio::time::timeout(
-                DOCTOR_STATUS_READ,
-                self.shared.read_status(&*self.shared.storage),
-            )
-            .await;
+        let usable = self.shared.token_usable().await;
+        if usable && self.shared.owed_for().is_none() {
+            let _ = tokio::time::timeout(DOCTOR_STATUS_READ, self.shared.read_status()).await;
             // A token that has become usable since the carrier looked and found none is a reason
             // to look again.
             if self.shared.observed().token_blocked {
                 self.wake();
             }
         }
+        let (state, expires_at_ms) = describe_token(&self.shared.token_file, &self.shared.origin);
+        let state = if usable { TokenState::Usable } else { state };
         let observed = self.shared.observed();
-        let mut detail = Sentence::new().stated(token.words()).stated("; ");
-        detail = match (&observed.status, observed.hold) {
+        let writer = self.shared.writer_key_id;
+
+        let mut detail = Sentence::new().stated(state.words());
+        if let Some(left) = expires_at_ms
+            .filter(|_| state == TokenState::Usable)
+            .map(|at| at.saturating_sub(kr_ipc::now_ms().get()) / 1000)
+        {
+            detail = detail
+                .stated(", accepted for another ")
+                .number(left)
+                .stated(" seconds");
+        }
+        detail = detail.stated("; ");
+        detail = match (&observed.status, observed.status_refusal) {
             (Some(status), _) if status.backup == BackupState::On => {
-                detail.stated("backup storage is on for the account")
+                let detail = detail.stated("backup storage is on for the account");
+                match status.allowance_bytes {
+                    Some(bytes) => detail
+                        .stated(", which has an allowance of ")
+                        .number(bytes)
+                        .stated(" bytes"),
+                    None => detail,
+                }
             }
             (Some(_), _) => detail.stated("backup storage is off for the account"),
-            (None, Some(hold)) => detail.stated(hold_words(hold)),
+            (None, Some(hold)) => hold_sentence(detail, hold, writer),
             (None, None) => detail.stated("the service has not been asked yet"),
         };
         if let Some(pass) = observed.last_pass {
@@ -597,15 +739,46 @@ impl BackupRuntime {
                 detail = detail.stated(" and stopped because ").stated(idle);
             }
         }
-        if let Some(hold) = observed.hold.filter(|_| observed.status.is_some()) {
-            detail = detail.stated("; ").stated(hold_words(hold));
+        if observed.status.is_some()
+            && let Some(hold) = observed.status_refusal
+        {
+            detail = hold_sentence(
+                detail.stated("; the last question to the service was turned back: "),
+                hold,
+                writer,
+            );
         }
-        let well = token == TokenState::Usable
-            && observed
-                .status
-                .as_ref()
-                .is_some_and(|status| status.backup == BackupState::On)
-            && observed.hold.is_none();
+        if let Some(hold) = observed.pass_hold {
+            detail = hold_sentence(
+                detail.stated("; the last pass was held back: "),
+                hold,
+                writer,
+            );
+        }
+        let backup_on = observed
+            .status
+            .as_ref()
+            .is_some_and(|status| status.backup == BackupState::On);
+        let well = state == TokenState::Usable
+            && backup_on
+            && observed.status_refusal.is_none()
+            && observed.pass_hold.is_none();
+        let remedy = if well {
+            None
+        } else if state != TokenState::Usable {
+            Some(
+                "Import an account token with the backup.write scope with `kr account token \
+                 import`.",
+            )
+        } else {
+            match (observed.pass_hold.or(observed.status_refusal), backup_on) {
+                (Some(hold), _) => Some(remedy_for(hold)),
+                (None, false) if observed.status.is_some() => {
+                    Some("Turn backup storage on for the account.")
+                }
+                _ => Some("Run `kr doctor` again once the host has asked the service."),
+            }
+        };
         DoctorCheck::new(
             "managed-storage",
             "This host reaches its managed storage service",
@@ -615,11 +788,7 @@ impl BackupRuntime {
                 DoctorStatus::Warning
             },
             detail,
-            (!well).then_some(
-                "Import an account token with the backup.write scope with `kr account token \
-                 import`, turn backup storage on for the account, and have the account's owner \
-                 enrol this host's writer key.",
-            ),
+            remedy,
         )
     }
 
@@ -660,29 +829,63 @@ async fn drive(
     timer: Arc<dyn Timer>,
 ) {
     let mut backoff = Backoff::default();
-    if token_state(&shared.tokens, &shared.origin) == TokenState::Usable {
-        shared.read_status(&*shared.storage).await;
+    // The first question to the service is the host's own, made as it starts. What the service says
+    // to it binds the carrier like any other answer: a delay it names is waited out before the
+    // first pass, and a refusal only a person can mend is waited for as one.
+    let mut next = None;
+    if shared.token_usable().await
+        && let Some(hold) = shared.read_status().await
+    {
+        next = Some(shared.after(hold, &mut backoff));
     }
     loop {
-        let wait = shared.carry(&mut uploader, &backup, &mut backoff).await;
+        let wait = match next.take() {
+            Some(wait) => wait,
+            None => shared.carry(&mut uploader, &backup, &mut backoff).await,
+        };
         shared.passes.send_modify(|passes| *passes += 1);
         shared.wait(wait, &*timer).await;
     }
 }
 
-/// What a hold says, in words this build wrote.
-const fn hold_words(hold: Hold) -> &'static str {
+/// Says what a hold is, in words this build wrote. The writer's key identifier is named where the
+/// remedy is to enrol it.
+fn hold_sentence(detail: Sentence, hold: Hold, writer: KeyId) -> Sentence {
     match hold.code {
         ErrorCode::QuotaExceeded => {
-            "the service reports no backup allowance for the account, or no account"
+            detail.stated("the service reports no backup allowance for the account, or no account")
+        }
+        ErrorCode::PermissionDenied => detail
+            .stated(
+                "the service refused a request as not permitted, which is what it answers when \
+                 nobody has enrolled this host's writer key (its identifier starts ",
+            )
+            .hexadecimal(u64::from_be_bytes(
+                writer.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+            ))
+            .stated(") or when the account may not do this"),
+        ErrorCode::HostNotConfigured => {
+            detail.stated("the service is not configured for backup storage")
+        }
+        ErrorCode::RateLimited | ErrorCode::ServiceCapacity | ErrorCode::UpstreamUnavailable => {
+            detail.stated("the service is busy or unreachable, and this host asks again")
+        }
+        _ => detail.stated("the service turned a request back"),
+    }
+}
+
+/// What a person does about a hold.
+const fn remedy_for(hold: Hold) -> &'static str {
+    match hold.code {
+        ErrorCode::QuotaExceeded => {
+            "Sign the host in to an account with a backup allowance, or raise the allowance."
         }
         ErrorCode::PermissionDenied => {
-            "the service refused this host: its writer is not enrolled, or the account may not do this"
+            "Have the account's owner enrol this host's writer key as a backup writer."
         }
-        ErrorCode::HostNotConfigured => "the service is not configured for backup storage",
-        ErrorCode::RateLimited | ErrorCode::ServiceCapacity | ErrorCode::UpstreamUnavailable => {
-            "the service is busy or unreachable, and this host asks again"
+        ErrorCode::HostNotConfigured => {
+            "Tell the service's operator that backup storage is not configured."
         }
-        _ => "the service turned a request back",
+        _ => "This host asks again by itself. Check that the service is reachable.",
     }
 }

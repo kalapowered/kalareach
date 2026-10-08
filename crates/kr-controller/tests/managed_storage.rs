@@ -10,7 +10,6 @@
 //! The daemon waits between two passes on a timer the test holds, so what these tests decide on is
 //! how long the daemon asked to wait and not how long a wait took.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -25,7 +24,7 @@ use kr_client::services::{
     managed_response_limits,
 };
 use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK, Timer};
-use kr_controller::backup::store::{Production, Remote};
+use kr_controller::backup::store::{AttemptStatus, Production, Remote};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::backup::{
@@ -71,12 +70,23 @@ async fn within<T>(what: &str, work: impl Future<Output = T>) -> T {
 /// The wait between two passes, held by the test.
 ///
 /// Each wait the daemon asks for is recorded with its length and goes on only when the test
-/// releases it, or at once in automatic mode.
+/// releases it, or at once once the test lets the timer run by itself. A timer that runs by itself
+/// releases the waits it already holds as well, because the daemon may have asked for one the test
+/// has not looked at.
 #[derive(Debug, Default)]
 struct HeldTimer {
     automatic: AtomicBool,
-    waits: Mutex<VecDeque<(Duration, Arc<Notify>)>>,
+    waits: Mutex<Vec<Held>>,
     asked: Notify,
+}
+
+/// One wait the daemon asked for.
+#[derive(Debug)]
+struct Held {
+    duration: Duration,
+    release: Arc<Notify>,
+    /// Whether the test has taken it from [`HeldTimer::next_wait`].
+    taken: bool,
 }
 
 impl Timer for HeldTimer {
@@ -85,10 +95,11 @@ impl Timer for HeldTimer {
             return Box::pin(tokio::task::yield_now());
         }
         let release = Arc::new(Notify::new());
-        self.waits
-            .lock()
-            .expect("the waits")
-            .push_back((duration, Arc::clone(&release)));
+        self.waits.lock().expect("the waits").push(Held {
+            duration,
+            release: Arc::clone(&release),
+            taken: false,
+        });
         self.asked.notify_one();
         Box::pin(async move { release.notified().await })
     }
@@ -105,14 +116,40 @@ impl HeldTimer {
         Arc::new(Self::default())
     }
 
-    /// The next wait the daemon asked for, with the means to let it end.
+    /// The next wait the daemon asked for that the test has not looked at, with the means to let
+    /// it end.
     async fn next_wait(&self) -> (Duration, Arc<Notify>) {
         loop {
             let asked = self.asked.notified();
-            if let Some(wait) = self.waits.lock().expect("the waits").pop_front() {
-                return wait;
+            if let Some(held) = self
+                .waits
+                .lock()
+                .expect("the waits")
+                .iter_mut()
+                .find(|held| !held.taken)
+            {
+                held.taken = true;
+                return (held.duration, Arc::clone(&held.release));
             }
             asked.await;
+        }
+    }
+
+    /// Every wait the daemon has asked for so far.
+    fn asked_for(&self) -> Vec<Duration> {
+        self.waits
+            .lock()
+            .expect("the waits")
+            .iter()
+            .map(|held| held.duration)
+            .collect()
+    }
+
+    /// Lets every wait, those held and those to come, end at once.
+    fn run_by_itself(&self) {
+        self.automatic.store(true, Ordering::SeqCst);
+        for held in self.waits.lock().expect("the waits").iter() {
+            held.release.notify_one();
         }
     }
 }
@@ -169,6 +206,9 @@ struct Arrangement {
     backup_on: bool,
     /// Whether the configuration document selects the service.
     selects_the_service: bool,
+    /// How the service meets the daemon's first question about backup storage, when it does not
+    /// simply answer it.
+    first_status: Option<Moment>,
 }
 
 impl Arrangement {
@@ -177,6 +217,7 @@ impl Arrangement {
         enrolled: true,
         backup_on: true,
         selects_the_service: true,
+        first_status: None,
     };
 }
 
@@ -224,6 +265,9 @@ impl Rig {
         let host = kr_ipc::testing::TempHost::create();
         let served = serve().await;
         served.web().set_backup(arrangement.backup_on);
+        if let Some(moment) = arrangement.first_status {
+            served.web().fail(STATUS, 1, moment);
+        }
         if arrangement.selects_the_service {
             write_document(&host, Some(served.origin()));
         }
@@ -264,7 +308,12 @@ impl Rig {
         );
         let manifest =
             ManagedBackupManifestService::new(origin, http, Arc::clone(&self.owner) as _);
-        let record = enrolment(&self.owner.key, &self.writer, archive_id(), 1);
+        let writer = self
+            .controller
+            .backup_runtime()
+            .expect("a carrier")
+            .writer_public_key();
+        let record = enrolment(&self.owner.key, writer, archive_id(), 1);
         manifest
             .enrol(&record)
             .await
@@ -328,6 +377,45 @@ impl Rig {
             .find(|check| check.id() == "managed-storage")
             .expect("the storage check is reported");
         (check.status, check.detail().to_owned())
+    }
+
+    /// Whether every backup attempt the daemon holds has ended.
+    fn every_attempt_ended(&self) -> bool {
+        self.controller
+            .backup()
+            .attempts()
+            .expect("the store reads")
+            .iter()
+            .all(|attempt| attempt.status == AttemptStatus::Terminal)
+    }
+
+    /// Turns privacy mode on or off, through the daemon's local socket as a person does.
+    async fn set_privacy(&self, enabled: bool) -> bool {
+        let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        client
+            .mutate(
+                Method::PrivacySet,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.host.environment_id()),
+                &PrivacySetParams { enabled },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .is_ok()
+    }
+
+    /// Turns privacy mode on and waits until the daemon has ended the work it had in hand, which is
+    /// what a fence owes. It is a point of the daemon's own order to decide after: whatever it did
+    /// about work that arrived before the fence has been done by then.
+    async fn fence(&self) {
+        assert!(self.set_privacy(true).await, "privacy mode is turned on");
+        self.until(
+            "the fence ended the work in hand",
+            Self::every_attempt_ended,
+        )
+        .await;
     }
 
     /// Stops the daemon as its process ending would, and keeps the host tree.
@@ -469,15 +557,18 @@ fn daemon_writer(host: &kr_ipc::testing::TempHost) -> AuthorisationKeyPair {
 /// The owner's signed enrolment of `writer` as the writer of `archive`'s collection.
 fn enrolment(
     owner: &AuthorisationKeyPair,
-    writer: &AuthorisationKeyPair,
+    writer: AuthorisationKey,
     archive: ArchiveId,
     revision: u64,
 ) -> BackupWriterRecord {
     let payload = BackupWriterRecordPayload {
         archive_id: archive,
         writer: TrustedWriter {
-            writer_key_id: writer.key_id(),
-            signing_key: *writer.public(),
+            writer_key_id: kr_crypto::keys::key_id(
+                kr_protocol::pairing::KeyPurpose::Authorisation,
+                writer.as_bytes(),
+            ),
+            signing_key: writer,
             enrolled_at_ms: TimestampMs::new(1_000),
         },
         writer_revision: BackupWriterRevision::new(revision),
@@ -648,7 +739,7 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
         AtMost(Duration),
         Exactly(Duration),
     }
-    let cases: [(&str, &str, Moment, Expect); 5] = [
+    let cases: [(&str, &str, Moment, Expect); 4] = [
         (
             "rate limited, asking for a second",
             CREATE,
@@ -689,16 +780,6 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
             },
             Expect::Exactly(OPERATOR_CEILING),
         ),
-        (
-            "the account proves nothing",
-            STATUS,
-            Moment::Refuse {
-                status: 402,
-                code: "QUOTA_EXHAUSTED",
-                retry_after_seconds: None,
-            },
-            Expect::Exactly(OPERATOR_CEILING),
-        ),
     ];
     for (name, path, refusal, expect) in cases {
         let timer = HeldTimer::held();
@@ -709,27 +790,50 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
         web.fail(path, 1, refusal);
         rig.admit(1, &[(1, plaintext(2048))]);
 
-        let (waited, release) = within(name, timer.next_wait()).await;
+        let (waited, _) = within(name, timer.next_wait()).await;
+        let a_persons = matches!(expect, Expect::Exactly(_));
         match expect {
             Expect::AtLeast(least) => assert!(waited >= least, "{name}: asked for {waited:?}"),
             Expect::AtMost(most) => assert!(waited <= most, "{name}: asked for {waited:?}"),
             Expect::Exactly(exactly) => assert_eq!(waited, exactly, "{name}"),
         }
-        assert!(
-            !rig.published(1),
-            "{name}: nothing was published while the daemon waited"
-        );
+        // A wait that a person's action ends is also ended by new work, which asks again at once,
+        // so only a wait that holds the service off is one in which nothing can be published.
+        if !a_persons {
+            assert!(
+                !rig.published(1),
+                "{name}: nothing was published while the daemon waited"
+            );
+        }
 
         // When the wait ends the daemon asks again, the service answers, and the generation goes.
-        timer.automatic.store(true, Ordering::SeqCst);
-        release.notify_one();
+        timer.run_by_itself();
         rig.until("generation 1 is published", |rig| rig.published(1))
             .await;
     }
 }
 
+/// An account the service no longer knows is a thing only a person can mend, so the daemon waits for
+/// one, and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_the_service_turns_away_is_waited_for_as_a_person() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    web.expire_token(TOKEN);
+    rig.admit(1, &[(1, plaintext(2048))]);
+
+    let (waited, _) = within("the account is turned away", timer.next_wait()).await;
+    assert_eq!(waited, OPERATOR_CEILING);
+    assert!(!rig.published(1));
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+}
+
 /// While the service asks to be left alone, nothing is sent: work that arrives in the meantime
-/// waits for the timer. A privacy fence does not wait for it.
+/// waits for the timer. A privacy fence does not wait for it, and does not end the service's
+/// request either: the delay is still owed when the fence is lifted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn work_that_arrives_while_the_service_asked_for_quiet_waits_and_a_fence_does_not() {
     let timer = HeldTimer::held();
@@ -746,53 +850,140 @@ async fn work_that_arrives_while_the_service_asked_for_quiet_waits_and_a_fence_d
         },
     );
     rig.admit(1, &[(1, plaintext(2048))]);
-    let (waited, release) = within("the five minutes", timer.next_wait()).await;
+    let (waited, _) = within("the five minutes", timer.next_wait()).await;
     assert!(waited >= Duration::from_secs(300));
     let before = web.arrived().len();
 
-    // More work is no reason to ask the service before it said.
+    // More work is no reason to ask the service before it said. The daemon is asked to look, then a
+    // fence is raised and answered, and only then is it known what the daemon did about the work.
     rig.admit(2, &[(3, plaintext(2048))]);
     rig.controller.backup_runtime().expect("a carrier").wake();
+    rig.fence().await;
     assert_eq!(
         web.arrived().len(),
         before,
-        "nothing was sent while the service asked for quiet"
+        "nothing was sent while the service asked for quiet, and the fence sent nothing"
     );
+    assert!(web.generations(&archive_id().to_string()).is_empty());
 
-    // A privacy fence is answered at once: the cleanup it owes ends the work in flight.
-    let mut passes = rig.controller.backup_runtime().expect("a carrier").passes();
-    let mut client = LocalClient::connect(&rig.client_endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("connects");
-    let set = client
-        .mutate(
-            Method::PrivacySet,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget::environment(rig.host.environment_id()),
-            &PrivacySetParams { enabled: true },
-        )
-        .await
-        .expect("the call reaches the daemon");
-    assert!(set.is_ok(), "privacy mode is turned on: {set:?}");
-    drop(release);
-    // The daemon looks again because of the fence, with the timer still held.
-    within("the fence is answered", async {
-        passes.changed().await.expect("the carrier is running");
-    })
-    .await;
+    // The fence is lifted. What the service asked for is still owed.
+    assert!(rig.set_privacy(false).await, "privacy mode is turned off");
+    let (owed, _) = within("the rest of the five minutes", timer.next_wait()).await;
     assert!(
-        web.generations(&archive_id().to_string()).is_empty(),
-        "nothing was published under the fence"
+        owed > Duration::from_secs(240) && owed <= Duration::from_secs(300),
+        "the daemon owes what is left of the service's five minutes, and asked for {owed:?}"
     );
+    assert_eq!(web.arrived().len(), before, "and still sent nothing");
+}
+
+/// A service that asks to be left alone when the daemon starts, or when `kr doctor` asks, is left
+/// alone by the carrier as well: the delay it named holds every question to it, whichever of them
+/// asked first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delay_named_to_the_start_or_to_the_doctor_holds_the_carrier_too() {
+    let busy = Moment::Refuse {
+        status: 503,
+        code: "SERVICE_UNAVAILABLE",
+        retry_after_seconds: Some(600),
+    };
+
+    // At the start: the first question is turned back with a delay, so the carrier waits it out
+    // before it asks again, with work queued or not.
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            first_status: Some(busy),
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    let web = Arc::clone(rig.served.web());
+    let (waited, _) = tokio::select! {
+        waited = within("the delay is waited out", timer.next_wait()) => waited,
+        () = web.requests_reach(STATUS, 2) => panic!("the service was asked inside its delay"),
+    };
+    assert!(waited >= Duration::from_secs(600), "{waited:?}");
+    rig.admit(1, &[(1, plaintext(2048))]);
+    rig.controller.backup_runtime().expect("a carrier").wake();
+    rig.fence().await;
+    assert_eq!(
+        web.requests_to(STATUS),
+        1,
+        "nothing more was asked inside the delay"
+    );
+    drop(rig);
+
+    // At the doctor: the carrier is idle, a doctor read is turned back with a delay, and the work
+    // that arrives afterwards is held by it.
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    web.fail(STATUS, 1, busy);
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    assert_eq!(web.requests_to(STATUS), 2);
+    rig.admit(1, &[(1, plaintext(2048))]);
+    let (waited, _) = tokio::select! {
+        waited = within("the delay is waited out", timer.next_wait()) => waited,
+        () = web.requests_reach(STATUS, 3) => panic!("the service was asked inside its delay"),
+    };
+    assert!(
+        waited > Duration::from_secs(540) && waited <= Duration::from_secs(600),
+        "{waited:?}"
+    );
+    rig.fence().await;
+    assert_eq!(web.requests_to(STATUS), 2);
+}
+
+/// A refusal that only a person can mend does not hide a delay the service asked for in the same
+/// pass: the daemon leaves the service alone for as long as it asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_a_person_must_mend_does_not_hide_the_delay_the_service_asked_for() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            enrolled: false,
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    let web = Arc::clone(rig.served.web());
+    // The publication is refused because nobody enrolled the writer; the question the daemon asks
+    // next, what the service holds, is turned back with a delay.
+    web.fail(
+        MANIFEST,
+        2,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(600),
+        },
+    );
+    rig.admit(1, &[(1, plaintext(2048))]);
+    let (waited, _) = within("the publication is refused", timer.next_wait()).await;
+    assert!(
+        waited >= Duration::from_secs(600),
+        "the service asked for ten minutes and the daemon waited {waited:?}"
+    );
+    rig.fence().await;
 }
 
 /// A service that answers `NOT_FOUND` to a part has lost the upload: the daemon forgets it and
-/// creates the object again. One that answers `FORBIDDEN` to a part has closed it: the daemon
-/// abandons it and creates it again. Neither needs a person.
+/// creates the object again. One that answers `FORBIDDEN` to a part has closed it, and so has one
+/// whose storage did not confirm the write of a part: the daemon abandons the upload and creates it
+/// again. None of them needs a person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upload_the_service_lost_or_closed_is_made_again() {
     for (name, moment, aborts) in [
         ("the service holds none of it", Moment::UploadsLost, 0),
+        (
+            "storage did not confirm the write of the part, so the service closed the upload",
+            Moment::PartWriteFails,
+            1,
+        ),
         (
             "the service refused the part as not permitted",
             Moment::Refuse {
@@ -840,7 +1031,7 @@ async fn a_deleted_collection_stops_the_attempt() {
 }
 
 /// A writer the owner has not enrolled is refused its publication every time, and the daemon asks
-/// again only when a person can have acted.
+/// again only when a person can have acted. It says what is wrong while it waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_writer_nobody_enrolled_is_asked_for_again_only_as_a_person_can_act() {
     let timer = HeldTimer::held();
@@ -852,29 +1043,39 @@ async fn a_writer_nobody_enrolled_is_asked_for_again_only_as_a_person_can_act() 
         Arc::clone(&timer),
     )
     .await;
-    let web = Arc::clone(rig.served.web());
     rig.admit(1, &[(1, plaintext(2048))]);
 
-    let (waited, release) = within("the publication is refused", timer.next_wait()).await;
+    let (waited, _) = within("the publication is refused", timer.next_wait()).await;
     assert_eq!(waited, OPERATOR_CEILING);
-    let publications = |web: &kr_service_stand_in::StorageWeb| {
-        web.arrived()
-            .iter()
-            .filter(|request| request.body.get("publish").is_some())
-            .count()
-    };
+    assert!(!rig.published(1));
+
+    // The service says backup storage is on, and the doctor still does not say all is well: the
+    // publication was refused, and the writer is the thing to enrol.
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    assert!(detail.contains("enrolled"), "{detail}");
+    let (status_again, _) = rig.storage_check().await;
     assert_eq!(
-        publications(&web),
-        1,
-        "the publication went once, and was refused"
+        status_again,
+        DoctorStatus::Warning,
+        "a second look at the service does not clear what the last pass met"
     );
 
     // The owner enrols the writer, and the next look at the service publishes.
     rig.owner_enrols_the_writer().await;
-    timer.automatic.store(true, Ordering::SeqCst);
-    release.notify_one();
+    timer.run_by_itself();
     rig.until("generation 1 is published", |rig| rig.published(1))
         .await;
+    assert!(
+        timer
+            .asked_for()
+            .iter()
+            .all(|waited| *waited == OPERATOR_CEILING),
+        "every wait before the enrolment was the one a person is waited for: {:?}",
+        timer.asked_for()
+    );
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Ok, "{detail}");
 }
 
 /// No request carrying an account leaves the host with a token that is not usable, and one that is
@@ -897,7 +1098,11 @@ async fn a_token_that_is_not_usable_never_leaves_the_host() {
         )
         .await;
         rig.admit(1, &[(1, plaintext(2048))]);
-        let (waited, _release) = within("the token is looked at again", timer.next_wait()).await;
+        let web = Arc::clone(rig.served.web());
+        let (waited, _release) = tokio::select! {
+            waited = within("the token is looked at again", timer.next_wait()) => waited,
+            () = web.requests_reach(STATUS, 1) => panic!("{token:?}: the host asked the service"),
+        };
         assert_eq!(waited, TOKEN_CHECK, "{token:?}");
         let sent: Vec<_> = rig
             .served
@@ -1033,6 +1238,11 @@ async fn a_service_that_does_not_say_what_became_of_a_publication_does_not_hold_
     served.web().fail(MANIFEST, 1, Moment::Hold);
 
     let (controller, _, _serving) = start_daemon(&host, HeldTimer::held()).await;
+    assert_eq!(
+        served.web().requests_to(MANIFEST),
+        3,
+        "the enrolment, the publication and the question the start asked about it"
+    );
     let record = controller
         .backup()
         .generation(archive_id(), BackupGeneration::new(1))
@@ -1042,6 +1252,101 @@ async fn a_service_that_does_not_say_what_became_of_a_publication_does_not_hold_
         record.remote,
         Remote::Unknown,
         "the daemon started while the service had not said"
+    );
+}
+
+/// A publication left unanswered when the daemon stopped, which the service holds, is found when the
+/// daemon starts and the generation ends complete, whatever account token the host holds then: the
+/// question carries no token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_finds_the_publication_the_service_holds_whatever_its_token_is() {
+    for token in [Token::Usable, Token::Expired] {
+        let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+        let web = Arc::clone(rig.served.web());
+        // The publication reaches the service and its answer is lost. The question the daemon asks
+        // next, what the service holds, is held, so the daemon stops with the publication
+        // unanswered.
+        web.fail(MANIFEST, 1, Moment::After);
+        web.fail(MANIFEST, 2, Moment::Hold);
+        rig.admit(1, &[(1, plaintext(2048))]);
+        within(
+            "the daemon asks what the service holds",
+            web.requests_reach(MANIFEST, 3),
+        )
+        .await;
+        assert_eq!(web.generations(&archive_id().to_string()), vec![1]);
+        let (host, served, _) = rig.stop().await;
+        served.web().release_held();
+        write_token(&host, token, served.origin());
+        let before = served.web().arrived().len();
+
+        let (controller, _, _serving) = start_daemon(&host, HeldTimer::held()).await;
+        let record = controller
+            .backup()
+            .generation(archive_id(), BackupGeneration::new(1))
+            .expect("the store reads")
+            .expect("the generation");
+        assert_eq!(
+            (record.production, record.remote),
+            (Production::Complete, Remote::Published),
+            "{token:?}: the start found the publication the service holds"
+        );
+        let arrived = served.web().arrived();
+        assert!(
+            arrived[before..]
+                .iter()
+                .filter(|request| request.path == MANIFEST)
+                .all(|request| request.token.is_none()),
+            "{token:?}: the question about the publication carries no account token"
+        );
+        assert_eq!(
+            arrived
+                .iter()
+                .filter(|request| request.body.get("publish").is_some())
+                .count(),
+            1,
+            "{token:?}: the publication was sent once and not again"
+        );
+    }
+}
+
+/// Privacy mode ends the work in hand and can be turned off again, whatever account token the host
+/// holds when the fence comes: ending an upload sends nothing that needs one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cleanup_privacy_mode_owes_ends_the_work_in_hand_whatever_the_token_is() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    // The upload is created, and the service turns its first part back and asks to be left alone.
+    web.fail(
+        PART,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(600),
+        },
+    );
+    rig.admit(1, &[(1, plaintext(2048))]);
+    let (waited, _) = within("the part is turned back", timer.next_wait()).await;
+    assert!(waited >= Duration::from_secs(600), "{waited:?}");
+
+    // The token the host holds stops being usable, and then privacy mode is turned on.
+    write_token(&rig.host, Token::Expired, rig.served.origin());
+    rig.fence().await;
+    assert!(
+        web.arrived()
+            .iter()
+            .filter(|request| request.path != STATUS)
+            .all(|request| request.token.as_deref() == Some(TOKEN) || request.token.is_none()),
+        "nothing left the host with a token it could not use"
+    );
+
+    // Nothing is left owed, so privacy mode turns off.
+    assert!(
+        rig.set_privacy(false).await,
+        "privacy mode is turned off once its cleanup is done"
     );
 }
 
@@ -1063,6 +1368,118 @@ async fn a_host_that_selects_no_storage_service_contacts_none() {
     assert!(rig.served.web().arrived().is_empty());
 }
 
+/// A daemon this test started from its own copy of the program, killed when the guard goes.
+#[cfg(unix)]
+struct Daemon(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if let Ok(pid) = i32::try_from(child.id())
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        let _ = child.wait();
+    }
+}
+
+/// The daemon a person runs, started from a copy of the program on the internal disk with a storage
+/// service in its configuration document and an account token on its disk, asks that service about
+/// backup storage as it starts and says so in `kr doctor`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_a_person_runs_reaches_the_storage_service_it_selects() {
+    use std::path::Path;
+
+    let host = kr_ipc::testing::TempHost::create();
+    let served = serve().await;
+    served.web().set_backup(true);
+    write_document(&host, Some(served.origin()));
+    write_token(&host, Token::Usable, served.origin());
+    let program = host.root().join("kr-controller");
+    kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-controller")), &program);
+    let log_path = host.root().join("daemon.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("opens the daemon's log");
+    let _daemon = Daemon(Some(
+        std::process::Command::new(&program)
+            // On the internal disk, never the checkout: a copied program is a new one to the
+            // operating system's privacy rules.
+            .current_dir(host.root())
+            .arg("--runtime-dir")
+            .arg(host.root().join("r"))
+            .arg("--state-dir")
+            .arg(host.root().join("s"))
+            .arg("--worker")
+            .arg(host.root().join("no-such-worker"))
+            .arg("--secret-store")
+            .arg("file")
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("duplicates the log"))
+            .stderr(log)
+            .spawn()
+            .expect("the daemon starts"),
+    ));
+
+    let endpoint = host
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = within("the daemon answers", async {
+        loop {
+            if let Ok(client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
+            {
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    within(
+        "the daemon's first question about backup storage",
+        served.web().requests_reach(STATUS, 1),
+    )
+    .await;
+    let result: HostDoctorResult = client
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("host.doctor is served on the local socket")
+        .to_typed()
+        .expect("a result of the declared shape");
+    let check = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "managed-storage")
+        .unwrap_or_else(|| {
+            panic!(
+                "the storage check is reported; the daemon's log says: {}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            )
+        });
+    assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail());
+    assert!(
+        check.detail().contains("backup storage is on"),
+        "{}",
+        check.detail()
+    );
+    assert!(
+        served
+            .web()
+            .arrived()
+            .iter()
+            .all(|request| request.token.as_deref().is_none_or(|token| token == TOKEN)),
+        "only the token the operator imported left the host"
+    );
+}
+
 /// An account token, as a source hands it over.
 #[derive(Debug)]
 struct Bearer(String);
@@ -1081,23 +1498,25 @@ impl kr_client::services::account::AccountTokenSource for Bearer {
 ///
 /// This is the check that the stand-in is not what makes the others pass: the same daemon, with
 /// the same writer key and the same transport, against the service the web repository serves. It
-/// runs only when it is told which Worker to ask and holds the account tokens that Worker's
-/// development sign-in wrote, so an ordinary run of this workspace sends nothing anywhere:
+/// is ignored unless it is asked for, and then it needs the Worker to ask and the account tokens
+/// that Worker's development sign-in wrote, so an ordinary run of this workspace sends nothing
+/// anywhere:
 ///
 /// ```text
 /// node infra/scripts/testing/local-restore.mjs start   --state <dir> --name first --port <port>
 /// node infra/scripts/testing/local-restore.mjs sign-in --state <dir> --name first --tokens <file>
 /// KR_DEPLOYED_ORIGIN=http://127.0.0.1:<port> KR_BACKUP_TOKENS=<file> \
-///   cargo test -p kr-controller --test managed_storage a_daemon_publishes_to_a_local_worker
+///   cargo test -p kr-controller --test managed_storage a_daemon_publishes_to_a_local_worker \
+///   -- --ignored
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs only against a Worker on this machine named by KR_DEPLOYED_ORIGIN and KR_BACKUP_TOKENS"]
 async fn a_daemon_publishes_to_a_local_worker() {
     let (Some(origin), Some(tokens)) = (
         std::env::var("KR_DEPLOYED_ORIGIN").ok(),
         std::env::var_os("KR_BACKUP_TOKENS"),
     ) else {
-        eprintln!("skipping: nothing names a Worker, so nothing was sent anywhere");
-        return;
+        panic!("KR_DEPLOYED_ORIGIN and KR_BACKUP_TOKENS name the Worker to ask");
     };
     let tokens: serde_json::Value =
         serde_json::from_slice(&std::fs::read(tokens).expect("the tokens file")).expect("tokens");
@@ -1156,7 +1575,15 @@ async fn a_daemon_publishes_to_a_local_worker() {
     }
     let manifest = ManagedBackupManifestService::new(gateway, http, Arc::clone(&owner) as _);
     manifest
-        .enrol(&enrolment(&owner.key, &writer, archive, 1))
+        .enrol(&enrolment(
+            &owner.key,
+            controller
+                .backup_runtime()
+                .expect("a carrier")
+                .writer_public_key(),
+            archive,
+            1,
+        ))
         .await
         .expect("the Worker enrols the writer");
 
