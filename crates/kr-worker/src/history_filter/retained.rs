@@ -237,6 +237,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::WorkflowRun
         | Method::HostUpdateHandover
         | Method::HostClockEstablish
+        | Method::AccountSignIn
         | Method::DescriptionConfigure
         | Method::DescriptionDownload => Environment,
         _ => Unclassified,
