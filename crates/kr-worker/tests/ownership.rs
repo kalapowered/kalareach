@@ -298,6 +298,71 @@ fn kr_req_07_60_a_process_adopted_while_the_observation_runs_is_found() {
     tree.end();
 }
 
+/// KR-REQ-07.66: a child is the session's only if the process it was listed under is the process
+/// that was recorded after the child was read. A parent that ends while its child is being read
+/// leaves nothing proving whose child the reading was, so that batch is not taken.
+///
+/// The parent is killed, and collected by its own parent, right after the child's reading; the
+/// child had called `setsid`, so nothing else ties it to the session once the parent is gone. The
+/// control is the child before: it is the parent's own, and in the tree, while the parent lives.
+#[test]
+fn kr_req_07_66_the_children_of_a_parent_that_ended_while_they_were_read_are_not_taken() {
+    let _turn = turn();
+    let mut tree = Tree::start(
+        r#"sh -c 'sh -c '\''setsid sleep 60 & echo "a child that left the session $!" >> "$KR_TREE"; echo "its parent $$" >> "$KR_TREE"; exec sleep 60'\'' & wait' &"#,
+        2,
+    );
+    let child = tree.pid("a child that left the session");
+
+    // The control: while the parent lives, the child below it is found.
+    let seen = tree.seen();
+    assert!(
+        seen.contains(&child),
+        "the child of a live parent is found: {seen:?}"
+    );
+    tree.end();
+
+    // The same tree, observed for the first time with the parent ending after the child's reading.
+    let mut tree = Tree::start(
+        r#"sh -c 'sh -c '\''setsid sleep 60 & echo "a child that left the session $!" >> "$KR_TREE"; echo "its parent $$" >> "$KR_TREE"; exec sleep 60'\'' & wait' &"#,
+        2,
+    );
+    let child = tree.pid("a child that left the session");
+    let parent_now = tree.pid("its parent");
+    let mut ended = false;
+    kr_ipc::identity::after_each_read(
+        move |pid, file| {
+            if ended || pid != child || file != "stat" {
+                return;
+            }
+            ended = true;
+            if let Some(parent) = i32::try_from(parent_now)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(parent, rustix::process::Signal::KILL);
+            }
+            let deadline = Instant::now() + LIVENESS;
+            while Path::new(&format!("/proc/{parent_now}")).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        },
+        || tree.session.observe_owned(),
+    );
+    assert!(
+        !Path::new(&format!("/proc/{parent_now}")).exists(),
+        "the parent ended and was collected during the observation"
+    );
+    let recorded = tree.recorded();
+    assert!(
+        !recorded.contains(&child),
+        "a child read under a parent that ended before the reading was confirmed is not taken: \
+         {recorded:?}"
+    );
+
+    tree.end();
+}
+
 /// KR-REQ-07.60: a process left in the session after the root shell has ended and been collected
 /// is still found. The session keeps the root shell's identifier while anything is in it, and the
 /// terminal no longer names the session once the root shell has gone.
