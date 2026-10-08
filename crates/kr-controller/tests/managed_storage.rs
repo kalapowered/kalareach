@@ -877,41 +877,55 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
     }
 }
 
-/// Backup storage was off when the doctor last asked, and a later question was turned back: the
-/// doctor says the later fact and its remedy, and not that backup storage is off.
+/// A pass was held back by a fault that passes by itself, and then a question to the service is
+/// turned back with something only a person can mend: whether the answer in hand says storage is on
+/// or off, the doctor tells the person what to mend and not that the host asks again by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_status_turned_back_after_an_off_answer_is_not_told_as_backup_being_off() {
+async fn a_status_turned_back_after_an_earlier_hold_is_told_for_what_a_person_must_mend() {
     let timer = HeldTimer::held();
-    let rig = Rig::start(
-        Arrangement {
-            backup_on: false,
-            ..Arrangement::NORMAL
-        },
-        Arc::clone(&timer),
-    )
-    .await;
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
     let web = Arc::clone(rig.served.web());
     within("the first status read", web.requests_reach(STATUS, 1)).await;
-    let (status, detail) = rig.storage_check().await;
-    assert_eq!(status, DoctorStatus::Warning, "{detail}");
-    assert!(detail.contains("backup storage is off"), "{detail}");
-    let remedy = rig.storage_remedy().await;
-    assert!(remedy.contains("Turn backup storage on"), "{remedy}");
-
+    // A pass is held back by a fault of the service's own, which the host asks again about.
     web.fail(
-        STATUS,
+        CREATE,
         1,
         Moment::Refuse {
-            status: 402,
-            code: "QUOTA_EXHAUSTED",
+            status: 500,
+            code: "INTERNAL",
             retry_after_seconds: None,
         },
     );
+    rig.admit(1, &[(1, plaintext(2048))]);
+    within("the pass is held back", timer.next_wait()).await;
     let remedy = rig.storage_remedy().await;
-    assert!(
-        remedy.contains("allowance"),
-        "the newer refusal has its own remedy: {remedy}"
-    );
+    assert!(remedy.contains("asks again by itself"), "{remedy}");
+
+    // The answer in hand says storage is on, and a later question is turned back for a cause only a
+    // person can mend.
+    let turned_back = || {
+        web.fail(
+            STATUS,
+            1,
+            Moment::Refuse {
+                status: 402,
+                code: "QUOTA_EXHAUSTED",
+                retry_after_seconds: None,
+            },
+        );
+    };
+    turned_back();
+    let remedy = rig.storage_remedy().await;
+    assert!(remedy.contains("allowance"), "{remedy}");
+
+    // The answer in hand says storage is off: that is the remedy until a later question is turned
+    // back, and then the later fact decides.
+    web.set_backup(false);
+    let remedy = rig.storage_remedy().await;
+    assert!(remedy.contains("Turn backup storage on"), "{remedy}");
+    turned_back();
+    let remedy = rig.storage_remedy().await;
+    assert!(remedy.contains("allowance"), "{remedy}");
 }
 
 /// An account the service no longer knows is a thing only a person can mend, so the daemon waits for

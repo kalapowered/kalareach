@@ -793,7 +793,11 @@ impl BackupRuntime {
             let held = if observed.status.is_some() && !backup_on {
                 observed.status_refusal
             } else {
-                observed.pass_hold.or(observed.status_refusal)
+                match (observed.pass_hold, observed.status_refusal) {
+                    // What only a person can mend outranks what passes by itself.
+                    (Some(pass), Some(refusal)) => Some(pass.and(refusal)),
+                    (pass, refusal) => pass.or(refusal),
+                }
             };
             match held {
                 Some(hold) => Some(remedy_for(hold)),

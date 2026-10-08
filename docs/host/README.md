@@ -3214,8 +3214,8 @@ not the first question about backup storage, not the status read `kr doctor` mak
 next request of a pass that was running when the delay arrived. That pass ends and says where it
 stopped. A fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A
 host under a fence is not held back by a delay at all, because its clients cannot tell cleanup from
-other work; only the question about an earlier publication still stops at a delay, as it does
-outside a fence. One request escapes the rule: the client repeats a request that is safe to repeat once,
+other work; only the question about an earlier publication and the status read `kr doctor` makes
+still stop at a delay, as they do outside a fence. One request escapes the rule: the client repeats a request that is safe to repeat once,
 by itself, after a short delay of ten seconds or less, and that repeat does not look at the record
 again. A
 refusal only a person can clear that names a delay is waited for as long as the longer of the delay
