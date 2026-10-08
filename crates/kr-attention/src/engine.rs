@@ -1293,6 +1293,26 @@ impl Engine {
             EventKind::HostContactRestored => {
                 self.resolve(AttentionRule::HostContactLost, &Subject::host())
             }
+            EventKind::AuthorityFeedRemoved => self.raise(
+                raise(
+                    AttentionRule::AuthorityFeedRemoved,
+                    Subject::authority_feed(),
+                    None,
+                    // The host's own sentence about its own feed: nothing any session produced.
+                    Text::Host(clip_summary(
+                        "the authority feed this host reads removed it, so it learns no \
+                         revocation from it; organisation leases and grants under a bounded \
+                         offline policy are refused until the owner acts at the host",
+                    )),
+                    AttentionRouting::OwnerPolicy,
+                ),
+                reading,
+                mode,
+            ),
+            EventKind::AuthorityFeedLeft => self.resolve(
+                AttentionRule::AuthorityFeedRemoved,
+                &Subject::authority_feed(),
+            ),
             EventKind::ApplicationNotice { session_id, notice } => {
                 // An identifier is the application's own grouping, and the notice is keyed on it.
                 // Without one, two notices that say the same thing are one condition, and what

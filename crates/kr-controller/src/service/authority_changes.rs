@@ -307,14 +307,11 @@ impl Controller {
             if record.revoked_at_ms.is_some() && !params.include_revoked {
                 continue;
             }
-            let acknowledged = self.authority_feed().last_acknowledgement(record.device_id);
             devices.push(kr_protocol::sharing::DeviceSummary {
                 device_id: record.device_id,
                 display_name: record.device_name.as_str().to_owned(),
                 grant_id: record.grant.grant_id,
                 paired_at_ms: record.paired_at_ms,
-                acknowledged_revision: kr_protocol::scalars::Nullable(acknowledged),
-                acknowledged_at_ms: kr_protocol::scalars::Nullable::null(),
                 revoked: record.revoked_at_ms.is_some(),
                 keys: kr_protocol::scalars::Nullable(record.public_keys()),
                 manages_host: record
@@ -329,6 +326,7 @@ impl Controller {
             authority_revision,
             feed_synchronised_at_ms: status.last_synchronised_at_ms,
             feed_stale: status.stale,
+            feed_removed: status.removed_at_ms.0.is_some(),
         })
     }
 

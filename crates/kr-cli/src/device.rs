@@ -62,7 +62,11 @@ async fn list(paths: &HostPaths, arguments: &DeviceListArguments, json: bool) ->
     output::say(&shown!(
         "authority revision {}{}",
         listed.authority_revision,
-        if listed.feed_stale {
+        if listed.feed_removed {
+            "; the revocation feed was removed, so this host learns no revocation from it, and \
+             organisation leases and grants under a bounded offline policy are refused until the \
+             owner acts at the host"
+        } else if listed.feed_stale {
             "; the revocation feed is unreachable, so what is shown may be stale"
         } else {
             ""
@@ -173,11 +177,6 @@ fn list_document(listed: &DeviceListResult) -> Document {
                         )
                         .with("grant_id", closed(&device.grant_id))
                         .with("paired_at_ms", closed(&device.paired_at_ms))
-                        .with(
-                            "acknowledged_revision",
-                            closed(&device.acknowledged_revision),
-                        )
-                        .with("acknowledged_at_ms", closed(&device.acknowledged_at_ms))
                         .with("revoked", device.revoked)
                         .with("keys", closed(&device.keys))
                         .with("manages_host", device.manages_host)
@@ -190,6 +189,7 @@ fn list_document(listed: &DeviceListResult) -> Document {
             closed(&listed.feed_synchronised_at_ms),
         )
         .with("feed_stale", listed.feed_stale)
+        .with("feed_removed", listed.feed_removed)
         .with("ok", true)
 }
 
@@ -421,16 +421,11 @@ fn line(device: &DeviceSummary) -> Line {
     } else {
         "paired"
     };
-    let acknowledged = device.acknowledged_revision.as_ref().map_or_else(
-        || Shown::said("no acknowledgement yet"),
-        |revision| shown!("acknowledged revision {}", *revision),
-    );
     stdout_line!(
-        "{}  {} {}  {}",
+        "{}  {} {}",
         device.device_id,
         left(8, &standing),
-        Asked::text(Request::Devices, &device.display_name),
-        acknowledged
+        Asked::text(Request::Devices, &device.display_name)
     )
 }
 

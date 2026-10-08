@@ -11,7 +11,7 @@ use kr_attention::{
     Attention, Claimant, Content, DeviceScope, HostReading, Liveness, Origin, Outcome, Viewer,
 };
 use kr_protocol::attention::{
-    AttentionAutomationSubject, AttentionItem, AttentionItemRevision, AttentionKey,
+    AttentionAutomationSubject, AttentionItem, AttentionItemRevision, AttentionKey, AttentionLevel,
     AttentionReadParams, AttentionRule, AttentionSource, DEDUPLICATION_WINDOW_MS, IDLE_REMINDER_MS,
     QuietHours, ReviewSubject,
 };
@@ -1116,6 +1116,72 @@ fn the_workflow_journal_s_numbering_has_holes_that_are_not_gaps() {
     let left = owner_inbox(&attention);
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].automation, Nullable::some(chain));
+}
+
+/// A host whose authority feed removed it raises one urgent item of the environment's own, which the
+/// owner and a device that manages the host see and a device that only views a session does not;
+/// the same answer repeated is the same item; and the host reading another feed ends it. The
+/// source numbers a notice by the moment it was recorded, so the distance between two is not a gap.
+#[test]
+fn a_removed_authority_feed_raises_one_item_until_the_host_reads_another() {
+    let mut attention = engine();
+    let removed = |at: u64| {
+        SourceEvent::new(
+            EventCursor::new(AttentionSource::Authority, at),
+            TimestampMs::new(NOON + at),
+            EventKind::AuthorityFeedRemoved,
+        )
+    };
+    let outcomes = attention
+        .apply(&removed(1_700_000_000_000), reading(0))
+        .expect("the store records the decision");
+    assert_eq!(raised(&outcomes), vec![AttentionRule::AuthorityFeedRemoved]);
+    attention
+        .apply(&removed(1_700_000_000_000), reading(1_000))
+        .expect("the same answer again");
+    assert!(
+        attention
+            .gaps()
+            .expect("the store is this owner's")
+            .is_empty(),
+        "a notice numbered by its moment leaves no range retention took"
+    );
+
+    let items = owner_inbox(&attention);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].rule, AttentionRule::AuthorityFeedRemoved);
+    assert_eq!(items[0].level, AttentionLevel::Urgent);
+    assert!(items[0].trusted);
+    assert!(items[0].session_id.0.is_none());
+    assert!(items[0].summary.is_present());
+
+    let scope = |host_manage: bool| DeviceScope {
+        grant_id: GrantId::new(Uuid::from_bytes([1; 16])),
+        session_view: true,
+        automation_manage: false,
+        host_manage,
+        admits_session: &|_| true,
+    };
+    let managing = attention
+        .inbox(&actor("device:phone"), &Viewer::Device(scope(true)), true)
+        .expect("a device's view");
+    assert_eq!(managing.len(), 1, "a device that manages the host is told");
+    let viewing = attention
+        .inbox(&actor("device:phone"), &Viewer::Device(scope(false)), true)
+        .expect("a device's view");
+    assert!(viewing.is_empty(), "a device that only views is not");
+
+    let outcomes = attention
+        .apply(
+            &SourceEvent::new(
+                EventCursor::new(AttentionSource::Authority, 1_700_000_005_000),
+                TimestampMs::new(NOON + 5_000),
+                EventKind::AuthorityFeedLeft,
+            ),
+            reading(2_000),
+        )
+        .expect("the store records the decision");
+    assert!(matches!(outcomes.as_slice(), [Outcome::Resolved { .. }]));
 }
 
 /// KR-REQ-24.11: a source whose record of this store's position ran ahead of the store is recovered

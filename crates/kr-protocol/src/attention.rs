@@ -183,6 +183,8 @@ wire_enum! {
             "An application asked for a notification. Untrusted, and never an approval.";
         AutomationPaused => "attention.automation_paused",
             "A workflow revision or a causal chain was paused by one of its own limits.";
+        AuthorityFeedRemoved => "attention.authority_feed_removed",
+            "The authority feed this host reads removed it, so it learns no revocation from it.";
     }
 }
 
@@ -225,6 +227,7 @@ wire_enum! {
         HostEvents => "host_events", "Terminal side effects with no attachment to go to.";
         Semantic => "semantic", "The session's own semantic events.";
         Automation => "automation", "The environment's workflow journal and the alerts it keeps.";
+        Authority => "authority", "The host's own record of the authority feed it reads.";
     }
 }
 
@@ -1170,9 +1173,9 @@ mod tests {
             assert_eq!(AttentionRule::from_wire(rule.as_str()), Some(*rule));
             assert!(rule.as_str().starts_with("attention."));
         }
-        // Section 25's eight, and the one its automation paragraph and section 17's workflow
-        // limits add.
-        assert_eq!(AttentionRule::ALL.len(), 9);
+        // Section 25's eight, the one its automation paragraph and section 17's workflow limits
+        // add, and the one that tells the owner a host's authority feed was removed.
+        assert_eq!(AttentionRule::ALL.len(), 10);
     }
 
     #[test]

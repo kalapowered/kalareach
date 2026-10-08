@@ -5307,7 +5307,7 @@ export interface AttentionGap {
   /**
    * Which source the range belongs to.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation' | 'authority'
   /**
    * The first sequence that is present again, or null when nothing after the range can be read.
    *
@@ -5447,6 +5447,7 @@ export interface AttentionItem {
     | 'attention.host_contact_lost'
     | 'attention.application_notice'
     | 'attention.automation_paused'
+    | 'attention.authority_feed_removed'
   /**
    * The session it belongs to, when it belongs to one.
    */
@@ -5457,7 +5458,7 @@ export interface AttentionItem {
    * It is what a gap is weighed against: a range that retention took from this source is a
    * range that could have resolved this item, and a range taken from another source is not.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation' | 'authority'
   /**
    * One line naming the subject, when this caller may be served it.
    *
@@ -5674,7 +5675,7 @@ export interface AttentionRecordRef {
   /**
    * Its source: the question ledger or the host events.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation' | 'authority'
 }
 /**
  * One record's text, as the session serves it now.
@@ -5687,7 +5688,7 @@ export interface AttentionRecordText {
   /**
    * Its source.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation' | 'authority'
   /**
    * Its text, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], or null when the session does not serve
    * it now or no longer holds the record.
@@ -5850,6 +5851,10 @@ export interface AuthorityFeedStatus {
    * The last successful synchronisation, when there has been one.
    */
   last_synchronised_at_ms: TimestampMs | null
+  /**
+   * When the feed answered that this host was removed from it, when it did.
+   */
+  removed_at_ms: TimestampMs | null
   /**
    * True when the feed could not be reached, so what is shown is stale.
    */
@@ -11592,6 +11597,15 @@ export interface DeviceListResult {
    */
   devices: DeviceSummary[]
   /**
+   * True when the feed answered that this host was removed from it.
+   *
+   * The host then learns no revocation from the feed again. The default non-expiring owner
+   * grants stay usable; organisation leases and grants under a bounded offline-validity policy
+   * are refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last
+   * time the feed answered before that.
+   */
+  feed_removed: boolean
+  /**
    * True when the feed is unreachable, so the revocation status shown is stale.
    */
   feed_stale: boolean
@@ -11602,19 +11616,8 @@ export interface DeviceListResult {
 }
 /**
  * One paired device as `device.list` reports it.
- *
- * Section 10 puts each host's last acknowledgement in the device list, because an offline host
- * cannot apply a revocation it has not received and the person has to be able to see that.
  */
 export interface DeviceSummary {
-  /**
-   * When that acknowledgement arrived.
-   */
-  acknowledged_at_ms: TimestampMs | null
-  /**
-   * The last authority revision this device acknowledged.
-   */
-  acknowledged_revision: AuthorityRevision | null
   /**
    * One paired device.
    */
