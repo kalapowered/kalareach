@@ -54,8 +54,8 @@ them; nothing in the protocol depends on the defaults.
 | unfinished upload | 24 hours | `UNFINISHED_UPLOAD_LIFETIME` |
 | unused attachment | 7 days | `UNUSED_ATTACHMENT_LIFETIME` |
 | download snapshot | 24 hours | `DOWNLOAD_SNAPSHOT_LIFETIME` |
-| one reply | 768 KiB encoded | `MAX_TRANSFER_RESULT_BYTES`, checked on `draft.create`, `draft.update`, `agent.draft.add_attachment`, the insertion outcome and the draft read, before each commits |
-| one insertion detail | 4096 characters | `MAX_INSERTION_DETAIL_LEN`, on the evidence or the reason an adapter reports |
+| one reply | 768 KiB encoded | `MAX_TRANSFER_RESULT_BYTES`, checked on `draft.create`, `draft.update`, `agent.draft.add_attachment`, the claim and the report of an insertion and the draft read, before each commits |
+| one insertion report | 512 bytes | `MAX_INSERTION_REPORT_BYTES`, on the evidence or the reason a worker reports; a longer text is cut at a character boundary |
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
 submission is recorded rather than inferred from age. The host records it for each prompt that names
@@ -208,6 +208,12 @@ migrations. Every state change commits together with the outbox row that announc
 | `grants` | narrow read grants over one attachment each |
 | `actions` | retained mutation outcomes, keyed by actor and action identifier |
 | `events`, `cursors` | the outbox and its consumers' positions |
+
+The journal is at schema version 5. The step from version 4 adds the two columns that record who
+claimed a binding and the read grant of that claim. An older build that doesn't know about the
+`inserting` and `unknown` states will refuse to accept a version-5 journal. A journal that still
+holds sessions of an earlier build keeps its older version until they are settled. It has the
+columns all the same, and no claim is made in it.
 
 The order the rows are written in is what makes a resume possible.
 
@@ -615,18 +621,30 @@ caller with a committed effect and no receipt, which is the one outcome an actio
 to avoid.
 
 `agent.draft.add_attachment` binds a completed handle to a draft and records that the adapter was
-asked. The binding starts at `recorded`, which says exactly that and no more. It reaches
-`accepted_by_agent` only when an adapter reports the upstream part or native draft binding, and
-nothing else sets it. A failure records `failed` with its reason and keeps both the draft and the
-published attachment, so a retry has something to retry with. When a session's closure is recorded,
-every binding that is still `recorded` becomes `failed` if its draft targets that session or was
-sent to it, or if its upload belongs to the session. The failure carries no reason text, and the
-draft takes a revision. From then on `SESSION_CLOSED` refuses a binding, the record of a new prompt
-or an adapter's report for a draft of that session, and a binding of an upload that belongs to it;
-an exact repeat of a prompt the worker can answer still gets its receipt. The write is queued after
-the registry records the closure, and the refusal starts when that write commits. A daemon that
-stopped before it acted on a closure does so at its next start, before it serves a transfer, and
-the hourly sweep does it again for a write that failed.
+asked. A binding has five possible states. `recorded` means that the adapter was asked, exactly that
+and no more. `inserting` means that a session's worker claimed this binding to offer it to the
+agent, and hasn't yet reported back. `accepted_by_agent` means that a session's worker has reported
+the upstream's acknowledgement of that offer, and includes evidence for this. This state is only
+achievable in this way. `failed` means the offer was refused or never made, and the reason is
+recorded when there is one. `unknown` means the offer may have reached the agent and no answer came
+back. The `failed` and `unknown` states are designed to allow re-attempts: in these cases, both the
+draft and the published attachment are left in place, and attempting to bind the attachment to the
+draft again is treated as a new attempt.
+
+When a session is recorded as closed, each binding which is in the `recorded` or `inserting` state,
+and whose draft targets the session or was sent to it, or whose upload belongs to the session, will
+be transitioned to the `failed` state, without reason text. In addition, all drafts targeting the
+session will be marked as `orphaned`. Orphaned drafts are not purged, but nothing will be offered
+from them. A draft that was only sent to the session, or that holds an upload of it, has its
+bindings failed and is not orphaned. A draft takes one revision for the whole closure. Bindings in
+the `accepted_by_agent` or `unknown` state will not be modified, because the first is evidence and
+the second is not known. From then on `SESSION_CLOSED` refuses a binding, the record of a new prompt
+or a worker's report for a draft of that session, and a binding of an upload that belongs to it.
+Receipts will however still be generated for exact re-prompts that the worker can answer. The write
+is queued after the registry records the closure, and the refusal starts when that write commits. If
+the daemon is stopped before it has had a chance to act on the session being closed, it will do so
+when next started, before serving any transfer. It will also be attempted as part of the hourly
+sweep if it has not succeeded.
 
 The attachment and the draft must belong to the same principal, and to the same session where both
 name one. An attachment bound to one session would otherwise be retained against that session while
@@ -654,7 +672,55 @@ Section 12 allows three insertion methods and no others:
 The two that need a readable path get an `AttachmentReadGrant`: one file, read only, one purpose,
 fifteen minutes. The staged file is inside the environment's state directory and outside every
 repository, which is what keeps an upload from becoming a file in a working tree. No sandbox is
-widened and no file is placed in a repository. A typed submission needs no path and is given none.
+widened and no file is placed in a repository. A typed submission needs no path when it is bound
+and is given none; the claim of an offer to an agent issues a grant over the one file, as
+described below.
+
+### Offering an attachment to an agent
+
+A session's worker offers an attachment to its agent in three steps. At each step the worker asks
+the daemon a question on the daemon's rendezvous endpoint. The daemon answers the question only for
+the process recorded as the worker for the session. The worker includes the name of the actor for
+which the action is to be performed. The transfer service looks for the draft among that actor's
+drafts.
+
+The worker first asks what a draft holds. The daemon answers with the revision, state, session,
+application instance and a list of each binding's attempt, state, media type, size, digest and
+destination. The daemon does not include the draft's text or the attachment's file name. If the
+draft is not among the drafts of the actor or if the draft's session is not the same as the worker's
+session, the daemon answers that the draft is unknown. If the draft targets no session or if the
+draft has been sent to a session by a prompt, the daemon reports a conflict.
+
+The worker then claims a binding for an attempt, stating the maximum number of attachments for the
+operation and the action's deadline on the boot clock. In a single transaction the transfer service
+checks that the draft is open, its session is the session being acted on, it has not been sent by a
+prompt, the binding's state is `recorded` and its attempt is the same as that specified by the
+worker, the binding's insertion method is a typed submission, the number of attachments to the draft
+does not exceed the maximum for the operation, and the deadline is not past. Additionally the
+transfer service checks that the draft will fit into a reply containing the longest possible report
+for each offer in flight. If the checks pass, the transfer service sets the binding's state to
+`inserting` for the owner, which is the actor and the action together, issues a read grant over the
+one file, and increments the draft's revision. The same claim by the same owner at the same attempt
+returns the same claim and grant, so a reply that was lost leaves nothing behind. The transfer
+service does not accept a claim as long as there are sessions in the journal that were created by an
+earlier build.
+
+Last, the worker reports that the attachment was `accepted_by_agent`, providing provenance and
+evidence, or that it `failed`, providing a reason, or that the attachment was `unknown`, providing a
+reason. The transfer service accepts the report only from the owner of the claim, only at the
+claim's attempt, and only if the binding's state is `inserting`. Bytes written into the terminal are
+not evidence, so it refuses a report of acceptance with that provenance. It truncates the evidence
+or reason to 512 bytes at a character boundary, and it revokes the claim's grant. A report repeated
+unchanged returns the state that was recorded. The service refuses a report, whether from the owner
+or another process, with a reason of `SESSION_CLOSED`, if the session has been closed.
+
+As long as a binding is `inserting` no prompt may mention the draft, and the draft's attachment may
+not be bound again. Once a binding is `accepted_by_agent` the attachment may not be bound again. To
+ensure that a reply can always be sent, the longest possible reply is measured before each mutation
+is committed. For each binding that is `inserting` the longest possible evidence is included in the
+measurement. For each draft the longest possible state is included in the measurement. Thus, a claim
+will never be made that would prevent a report from being made, and a draft that can be read can
+still be read when its session closes.
 
 ## Previews
 
