@@ -603,6 +603,11 @@ pub fn named() -> Vec<Named> {
             "a temporary file an interrupted write left; nothing reads it",
         ),
         leaf(
+            StoreScope::StateRoot,
+            ".shell-entries.json.kalareach-lock",
+            "the lock `kr shell install` and `kr shell remove` hold on the record of the startup files they changed; empty",
+        ),
+        leaf(
             StoreScope::Environment,
             "environment",
             "the environment's identity, written once as text and never changed",

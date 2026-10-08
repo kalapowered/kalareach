@@ -1438,7 +1438,8 @@ fn hexadecimal_units(text: &str, digits: usize) -> Option<Vec<u32>> {
 /// How long a startup write waits for another one to finish before it gives up.
 const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A lock beside one startup file, held for a whole read-rebuild-write.
+/// A lock beside one startup file, or beside the saved terminal preference, held for a whole
+/// read-rebuild-write.
 ///
 /// This is what closes the window between the check before the rename and the rename itself, for
 /// the writer that window was about: another `kr` process installing or removing the same entry.
@@ -1526,19 +1527,20 @@ impl FileLock {
         path: &Path,
         patience: std::time::Duration,
     ) -> std::io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use rustix::fs::{Mode, OFlags};
 
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(
-                (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW)
-                    .bits()
-                    .try_into()
-                    .unwrap_or(0),
+        let file = std::fs::File::from(
+            rustix::fs::open(
+                &lock,
+                OFlags::WRONLY
+                    | OFlags::CREATE
+                    | OFlags::NONBLOCK
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
             )
-            .open(&lock)?;
+            .map_err(std::io::Error::from)?,
+        );
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

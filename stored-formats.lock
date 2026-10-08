@@ -654,6 +654,14 @@
     },
     {
       "scope": "state_root",
+      "path": ".shell-entries.json.kalareach-lock",
+      "reason": "the lock `kr shell install` and `kr shell remove` hold on the record of the startup files they changed; empty",
+      "children": [],
+      "opaque": false,
+      "databases": false
+    },
+    {
+      "scope": "state_root",
       "path": "entry-locks",
       "reason": "the locks that keep two writers of one startup file apart; empty files",
       "children": [],
