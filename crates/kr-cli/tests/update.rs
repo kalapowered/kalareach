@@ -306,6 +306,9 @@ fn release_stores() -> Vec<ReleaseStore> {
 struct Assembled {
     manifest: ReleaseManifest,
     root: String,
+    /// Programs of the release written from these bytes in place of the workspace's own, by the name
+    /// they have in `bin/`.
+    written: Vec<(String, Vec<u8>)>,
 }
 
 impl Assembled {
@@ -361,6 +364,7 @@ impl Assembled {
                 files,
             },
             root: root.to_owned(),
+            written: Vec::new(),
         }
     }
 
@@ -398,6 +402,63 @@ impl Assembled {
         self
     }
 
+    /// This release with the executable `name` in `bin/` written from `contents`, listed in the
+    /// manifest by its digest: its own program in place of the workspace's, or one more.
+    fn with_program(mut self, name: &str, contents: &[u8]) -> Self {
+        let path = ReleasePath::new(format!("bin/{name}")).expect("a path");
+        self.manifest.files.retain(|file| file.path != path);
+        self.manifest.files.push(ReleaseFile {
+            path,
+            length: U64::new(contents.len() as u64),
+            sha256: Digest256::from_bytes(kr_cbor::sha256(contents)),
+            mode: FileMode::Executable,
+        });
+        self.written.retain(|(known, _)| known != name);
+        self.written.push((name.to_owned(), contents.to_vec()));
+        self
+    }
+
+    /// The bytes of the workspace's own program `name`.
+    fn program_bytes(name: &str) -> Vec<u8> {
+        let (_, copied, _, _) = programs()
+            .iter()
+            .find(|(known, ..)| *known == name)
+            .expect("a program of the workspace");
+        std::fs::read(copied).expect("the program")
+    }
+
+    /// This release's control daemon as a program that records each start in `log` and ends with
+    /// status 1, apart from `--version`, which it answers like any program of a release, so that a
+    /// release whose daemon cannot start can be installed and switched to.
+    fn whose_daemon_cannot_start(self, log: &Path) -> Self {
+        self.with_program(
+            "kr-controller",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo kr-controller; exit 0;; esac\n\
+                 echo started >> '{}'\nexit 1\n",
+                log.display()
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// This release as one whose daemon cannot start where its state directory is `broken`'s, and
+    /// is the workspace's own daemon, kept beside as `kr-controller-real`, everywhere else.
+    fn whose_daemon_cannot_start_in(self, broken: &Path, log: &Path) -> Self {
+        self.with_program("kr-controller-real", &Self::program_bytes("kr-controller"))
+            .with_program(
+                "kr-controller",
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --version) echo kr-controller; exit 0;; esac\n\
+                     case \"$*\" in *'{broken}'*) echo started >> '{log}'; exit 1;; esac\n\
+                     exec \"$(dirname \"$0\")/kr-controller-real\" \"$@\"\n",
+                    broken = broken.display(),
+                    log = log.display()
+                )
+                .as_bytes(),
+            )
+    }
+
     /// This release with `name` listed as a file that is not a program: its bytes are in the tree
     /// and in the manifest, so every file check passes, and the manifest does not say it runs.
     fn with_data(mut self, name: &str) -> Self {
@@ -418,9 +479,19 @@ impl Assembled {
         std::fs::create_dir_all(directory.join("bin")).expect("the release's bin");
         for (name, copied, _, _) in programs() {
             // A release assembled without a program lists none and carries none.
-            if self.manifest.file(&format!("bin/{name}")).is_some() {
+            if self.manifest.file(&format!("bin/{name}")).is_some()
+                && !self.written.iter().any(|(known, _)| known == name)
+            {
                 clone_file(copied, &directory.join("bin").join(name));
             }
+        }
+        for (name, contents) in &self.written {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let file = directory.join("bin").join(name);
+            std::fs::write(&file, contents).expect("a program written for the release");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
         }
         let write = |path: &str, contents: &[u8]| {
             let file = directory.join(path);
@@ -1428,6 +1499,27 @@ impl Host {
             },
         });
         std::fs::write(self.store.record(), record.to_string()).expect("the record");
+    }
+
+    /// Replaces the store's record with `record`, as a run that stopped part way left it.
+    fn write_record(&self, record: &Value) {
+        std::fs::write(self.store.record(), record.to_string()).expect("the record");
+    }
+
+    /// The restart of this host's daemon an update records, as a released build recorded it: how it
+    /// is started again, with the arguments it was started with and none of its variables.
+    fn restart(&self) -> Value {
+        serde_json::json!({
+            "environment": self.tree.environment_id(),
+            "runtime_root": self.tree.paths().runtime_root(),
+            "state_root": self.tree.paths().state_root(),
+            "start": {
+                "arguments": {
+                    "arguments": self.daemon_arguments(),
+                    "working_directory": self.tree.root(),
+                }
+            },
+        })
     }
 
     /// Installs a first release with the unpacked release's own `kr`, and starts its programs once.
@@ -5973,6 +6065,539 @@ async fn a_pipe_where_the_saved_terminal_preference_belongs_does_not_hold_kr() {
 }
 
 /* -------------------------------------------------------------------------------------------- */
+/* Going back from an update whose daemon did not start                                          */
+/* -------------------------------------------------------------------------------------------- */
+
+/// How many times a release whose daemon cannot start was started, by the lines it wrote in `log`.
+fn starts_in(log: &Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
+}
+
+/// KR-REQ-26.10: `kr host rollback` goes back from an update that switched and whose daemon did not
+/// start, which is the case a rollback exists for: it does not start the daemon of the release that
+/// failed again, it goes to the release the update began from and starts the daemon from there, and
+/// a registry the failed release never opened is not brought forward on the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_rescues_an_update_whose_daemon_did_not_start() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the update's daemon cannot start: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(host.record()["update"]["state"], "switched");
+    assert_eq!(starts_in(&log), 1, "the update tried the daemon once");
+    // An environment whose daemon has not run since an earlier schema: a rollback leaves its
+    // registry as it is, and still classes it.
+    let idle = Idle::new(&host.store).shaped_as(6);
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["source"], two.name().as_str(), "{said}");
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(said["carried"], serde_json::json!([]), "{said}");
+    assert_eq!(idle.version(), 6, "the registry was not brought forward");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon serves again, from the release the update began from"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+    assert_eq!(
+        starts_in(&log),
+        1,
+        "the daemon of the release that failed was not started again"
+    );
+}
+
+/// KR-REQ-26.10: a rescue is held to the same rule as any switch: a store the older release cannot read
+/// as it is refuses it, naming the store, and the failed update stays recorded for an update to a
+/// release that fixes it, or for the rescue once the store has been put right.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescue_the_older_release_cannot_read_the_stores_for_is_refused_and_the_failed_update_stays()
+ {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    // The failed release's daemon migrated a store before it ended, as far as the older release can
+    // tell: the transfer journal is below the lowest version the older release reads.
+    let journal = kr_transfer::staging::StagingArea::store_path(&host.tree.environment());
+    let set = |version: i64| {
+        rusqlite::Connection::open(&journal)
+            .expect("opens")
+            .execute("UPDATE schema_version SET version = ?1", [version])
+            .expect("a version");
+    };
+    set(1);
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("transfers") && message.contains("schema version 1"),
+        "the store is named: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.record()["update"]["state"],
+        "switched",
+        "the failed update is still recorded"
+    );
+    assert_eq!(
+        starts_in(&log),
+        1,
+        "and the daemon that failed was not started again"
+    );
+
+    // The store put right, the same command goes back.
+    set(kr_transfer::store::SCHEMA_VERSION);
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+}
+
+/// KR-REQ-26.10: an update goes on past a failed one, so that a person whose update left a daemon
+/// that does not start can update to a release that fixes it: the daemon is started from the new
+/// release, the release that failed is the previous one, and nothing is left recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_goes_on_past_a_failed_one() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
+    let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let scratch = host.scratch("archives");
+    let archive_two = scratch.join("two.tar.gz");
+    two.archive(&archive_two);
+    let archive_three = scratch.join("three.tar.gz");
+    three.archive(&archive_three);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive_two.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive_three.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], three.name().as_str(), "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", three.name()),
+        "the daemon the failed update stopped is started from the release that fixes it"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.10: an update that failed in one of two environments is rescued in both: the daemon
+/// that runs is handed over, as an update hands one over, and the one that does not is started from the
+/// older release, from what the failed update recorded of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let controller_state = host.tree.paths().state_root().to_path_buf();
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
+        .whose_daemon_cannot_start_in(&controller_state, &log);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let second = Second::start(&controller).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(
+        second.build().await,
+        format!("kr-controller/{}", two.name()),
+        "the second environment's daemon started from the new release"
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon that did not start is started from the older release"
+    );
+    assert_eq!(
+        second.build().await,
+        format!("kr-controller/{}", one.name()),
+        "and the one that ran was handed over and started from it"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+    assert_eq!(starts_in(&log), 1, "the failed daemon was tried once");
+}
+
+/// KR-REQ-26.10: a rescue that stopped after its switch is finished by the next run, which starts the
+/// daemons it and the update it went on past owed, from the older release, and settles it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescue_that_stopped_after_its_switch_is_finished_by_the_next_run() {
+    let host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    host.put(&two);
+    // The rescue from two back to one switched, and stopped before it started the daemon the update
+    // to two had stopped: the record states the rescue, that update it went on past, and no daemon
+    // running.
+    host.write_record(&serde_json::json!({
+        "format": 2,
+        "previous": null,
+        "staged": two.name().as_str(),
+        "update": {
+            "source": two.name().as_str(),
+            "target": one.name().as_str(),
+            "state": "handing_over",
+            "restarts": [],
+            "abandoned": {
+                "source": one.name().as_str(),
+                "target": two.name().as_str(),
+                "restarts": [host.restart()],
+            },
+        },
+    }));
+    let archive = host.scratch("archives").join("one.tar.gz");
+    one.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon owed is started from the release current names"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.10: a rescue that stopped before its switch is the failed update again: the next
+/// rollback goes back to the release that update began from, which is not the release before it, and
+/// the daemon is started from there; of an environment both the rescue and that update recorded, the
+/// rescue's record, which is the newer, is the one that is started.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescue_that_stopped_before_its_switch_is_the_failed_update_again() {
+    let host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    host.put(&two);
+    host.switch(two.name());
+    // The failed update recorded the daemon so that it cannot be started; the rescue, which stopped
+    // after it recorded the daemon of its own, recorded it so that it can.
+    let mut unstartable = host.restart();
+    unstartable["start"]["arguments"]["arguments"] = serde_json::json!(["--no-such-argument"]);
+    host.write_record(&serde_json::json!({
+        "format": 2,
+        "previous": null,
+        "staged": two.name().as_str(),
+        "update": {
+            "source": two.name().as_str(),
+            "target": one.name().as_str(),
+            "state": "handing_over",
+            "restarts": [host.restart()],
+            "abandoned": {
+                "source": one.name().as_str(),
+                "target": two.name().as_str(),
+                "restarts": [unstartable],
+            },
+        },
+    }));
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon is started from the release the failed update began from, as the newer record says"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.10: the root a failed update recorded is kept by the rescue that goes back past it, even
+/// when the root file of the failed release is gone: the host never trusts an older root than the one
+/// it recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescue_keeps_the_root_the_failed_update_recorded() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let rotated = channel_root_naming(2, &keys().root, &keys().next_targets, &[&keys().root]);
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::new(
+        "0.2.0+bbbbbbbbbbbb",
+        2,
+        CompatibilityLevel::of(PACKAGE_VERSION),
+        &rotated,
+    )
+    .whose_daemon_cannot_start(&log);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(
+        host.record()["update"]["trusted_root"]["signed"]["version"],
+        2,
+        "the failed update recorded the root it was to settle on: {}",
+        host.record()
+    );
+    // The root file of the release that failed is gone.
+    let share = host.store.release_directory(two.name()).join("share");
+    std::fs::set_permissions(&share, std::fs::Permissions::from_mode(0o755)).expect("opened");
+    let root_file = share.join("update-root.json");
+    std::fs::set_permissions(&root_file, std::fs::Permissions::from_mode(0o644)).expect("opened");
+    std::fs::remove_file(&root_file).expect("removed");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.record()["trusted_root"]["signed"]["version"],
+        2,
+        "the rescue settled on the root the failed update recorded: {}",
+        host.record()
+    );
+}
+
+/// KR-REQ-26.10: a rollback names the process that holds an environment, and starts nothing of the
+/// release that failed: a daemon of it that holds the environment and answers nothing is the person's
+/// to stop, as every daemon the updater did not stop is, and once it is stopped the same command goes
+/// back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_nothing() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
+    host.install(&one);
+    host.put(&two);
+    host.record_a_switched_update(&one, &two);
+    // A daemon of the release that failed that holds the environment and listens to nothing: this
+    // process stands in for it.
+    let holding = kr_controller::singleton::SingletonLock::acquire(
+        &host.tree.environment().singleton_lock(),
+        host.tree.environment_id(),
+    )
+    .expect("holds the environment");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("kill {}", std::process::id())),
+        "the process that holds the environment is named: {said}"
+    );
+    assert_eq!(
+        starts_in(&log),
+        0,
+        "nothing of the release that failed was started"
+    );
+    assert_eq!(host.record()["update"]["state"], "switched");
+
+    drop(holding);
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    assert_eq!(starts_in(&log), 0);
+}
+
+/// KR-REQ-26.10: a Linux daemon that read its document under a configuration home of its own, in an
+/// update whose daemon did not start, is checked by the rescue where it read it: the failed update
+/// recorded the directory when the daemon made way, and nothing runs to say it now.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescue_checks_the_document_the_abandoned_daemon_read() {
+    let (mut host, one, document) =
+        a_daemon_that_finds_its_document_under_its_own_configuration_home().await;
+    let log = host.tree.root().join("starts.log");
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    // The updater has other variables than the daemon, so that nothing but the record knows where
+    // the daemon's document is.
+    let other_home = host.scratch("updater-home");
+    let (output, said) = host.kr_json_with(
+        &[("HOME", other_home.as_os_str())],
+        &[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 99}"#).expect("a document");
+
+    let (output, said) = host.kr_json_with(
+        &[("HOME", other_home.as_os_str())],
+        &["host", "rollback", "--json"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&document.display().to_string()),
+        "the document the daemon read is named: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 1}"#).expect("a document");
+    let (output, said) = host.kr_json_with(
+        &[("HOME", other_home.as_os_str())],
+        &["host", "rollback", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+}
+
+/* -------------------------------------------------------------------------------------------- */
 /* The variables a daemon started again keeps                                                    */
 /* -------------------------------------------------------------------------------------------- */
 
@@ -6212,7 +6837,7 @@ async fn a_document_a_daemon_reads_under_its_own_configuration_home_is_checked()
     let update = || host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
 
     // The daemon's document is at a version the release cannot read.
-    std::fs::write(&document, br#"{"version": 99}"#).expect("a document");
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 99}"#).expect("a document");
     let (output, said) = update();
     assert_eq!(
         output.status.code(),
@@ -6236,9 +6861,9 @@ async fn a_document_a_daemon_reads_under_its_own_configuration_home_is_checked()
 
     // The daemon's document is one the release reads, and the document where this command's
     // environment puts it is not: that one is refused too.
-    std::fs::write(&document, br#"{"version": 1}"#).expect("a document");
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 1}"#).expect("a document");
     let beside = host.tree.environment().state_dir().join("config.json");
-    std::fs::write(&beside, br#"{"version": 99}"#).expect("a document");
+    kr_ipc::paths::write_owner_only_file(&beside, br#"{"version": 99}"#).expect("a document");
     let (output, said) = update();
     assert_eq!(output.status.code(), Some(1), "{said}");
     assert!(
@@ -6273,9 +6898,9 @@ async fn a_daemon_is_started_again_as_its_own_document_chose() {
     let (host, _one, document) =
         a_daemon_that_finds_its_document_under_its_own_configuration_home().await;
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
-    std::fs::write(&document, br#"{"version": 1}"#).expect("a document");
-    std::fs::write(
-        host.tree.environment().state_dir().join("config.json"),
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 1}"#).expect("a document");
+    kr_ipc::paths::write_owner_only_file(
+        &host.tree.environment().state_dir().join("config.json"),
         br#"{"version": 1, "revision": 1, "startup": {"controller": "service"}}"#,
     )
     .expect("a document that chooses the service start");

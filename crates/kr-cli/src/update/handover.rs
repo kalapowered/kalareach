@@ -243,7 +243,7 @@ fn refusal(environment: &Environment, said: Shown) -> CliError {
 /// that hold it while they start.
 ///
 /// This is the only way an update or an install takes the lock: it never waits without a bound.
-/// `command` is the one to run again, `install` or `update`, when the wait runs out.
+/// `command` is what to run again, as a person types it, when the wait runs out.
 ///
 /// # Errors
 ///
@@ -264,8 +264,7 @@ pub async fn install_lock(
             Ok(None) => {
                 return Err(CliError::UpdateDeferred(shown!(
                     "a control daemon of the store at {} is starting and has held its start lock \
-                     for more than {} seconds; run kr host {} again once it has started or \
-                     stopped",
+                     for more than {} seconds; run {} again once it has started or stopped",
                     Shown::root(store.root()),
                     within.as_secs(),
                     command
@@ -288,7 +287,7 @@ pub async fn install_lock(
 /// Returns the refusal of [`install_lock`], and the failure to take the environment's lock for any
 /// reason but a holder.
 pub async fn held(store: &Store, environment: &Environment, within: Duration) -> Result<bool> {
-    let _install = install_lock(store, within, "update").await?;
+    let _install = install_lock(store, within, super::RUN_AGAIN).await?;
     match SingletonLock::hold(
         &environment.paths.singleton_lock(),
         environment.environment_id,
@@ -426,10 +425,15 @@ pub async fn hold(
                 )));
             }
             Err(kr_controller::ControllerError::AlreadyRunning { .. }) => {
+                let holder = match SingletonLock::holder(&path).ok().flatten() {
+                    Some(pid) => shown!("; it is process {}, and `kill {}` stops it", pid, pid),
+                    None => Shown::said(""),
+                };
                 return Err(CliError::UpdateDeferred(shown!(
                     "a control daemon holds environment {}, and it was not listening when the \
-                     update asked each daemon to make way",
-                    environment.environment_id
+                     update asked each daemon to make way{}",
+                    environment.environment_id,
+                    holder
                 )));
             }
             Err(error) => {
@@ -515,42 +519,47 @@ pub(super) fn holder_said(
     match holder {
         None => shown!(
             "the control daemon of environment {} went away while the update waited for it; run \
-             kr host update again",
-            environment_id
+             {} again",
+            environment_id,
+            super::RUN_AGAIN
         ),
         Some((_, Some(answers_as))) if answers_as.as_str() == expected_build => shown!(
-            "the control daemon of environment {} now answers as a daemon of {}; run kr host \
-             update again",
+            "the control daemon of environment {} now answers as a daemon of {}; run {} again",
             environment_id,
-            crate::shown::release(expected)
+            crate::shown::release(expected),
+            super::RUN_AGAIN
         ),
         Some((Some(pid), Some(answers_as))) => shown!(
             "the control daemon of environment {} (process {}) answers as {}, not as a daemon of \
-             {}; stop it with `kill {}` and run kr host update again",
+             {}; stop it with `kill {}` and run {} again",
             environment_id,
             pid,
             crate::shown::build_name(answers_as),
             crate::shown::release(expected),
-            pid
+            pid,
+            super::RUN_AGAIN
         ),
         Some((None, Some(answers_as))) => shown!(
             "the control daemon of environment {} answers as {}, not as a daemon of {}; stop it \
-             and run kr host update again",
+             and run {} again",
             environment_id,
             crate::shown::build_name(answers_as),
-            crate::shown::release(expected)
+            crate::shown::release(expected),
+            super::RUN_AGAIN
         ),
         Some((Some(pid), None)) => shown!(
             "the control daemon of environment {} (process {}) is still running and does not \
-             answer; stop it with `kill {}` and run kr host update again",
+             answer; stop it with `kill {}` and run {} again",
             environment_id,
             pid,
-            pid
+            pid,
+            super::RUN_AGAIN
         ),
         Some((None, None)) => shown!(
             "the control daemon of environment {} is still running and does not answer; stop it \
-             and run kr host update again",
-            environment_id
+             and run {} again",
+            environment_id,
+            super::RUN_AGAIN
         ),
     }
 }

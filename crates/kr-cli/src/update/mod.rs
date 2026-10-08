@@ -121,6 +121,11 @@ pub const OLDEST_RECORD_FORMAT: u32 = 1;
 /// record's own indented form, with room to spare.
 const RECORD_LIMIT: u64 = 8 * 1024 * 1024;
 
+/// What a run that stopped part way tells a person to run: either command starts, before anything
+/// else, the daemons the one that stopped had stopped, and a rollback goes back from a release whose
+/// daemon does not start.
+const RUN_AGAIN: &str = "kr host update or kr host rollback";
+
 /// The store's record, `install.json`: what an update needs that the store's directories do not
 /// say. Which release is current is `current` itself, never this.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -164,9 +169,102 @@ pub struct Transaction {
     /// then cannot lower the trust the host holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_root: Option<tough::schema::Signed<tough::schema::Root>>,
+    /// The update that happened and whose daemons did not all start again, which this one went on
+    /// past: a rollback to the release it began from, or an update to a release that fixes it.
+    /// It is kept until this one switches, so that nothing this one does before then can lose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<Abandoned>,
 }
 
 kr_client::debug_as_name!(Transaction);
+
+/// An update that happened, `current` having named its target, and whose recorded daemons did not
+/// all start from it.
+///
+/// One record however many updates failed in turn: a transaction that goes on past another that
+/// carried one of its own takes the daemons of both and the newer root of the two, so what is
+/// owed is one list and the record is never a tree.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Abandoned {
+    /// The release the failed update began from.
+    pub source: ReleaseName,
+    /// The release it made current.
+    pub target: ReleaseName,
+    /// The daemons that are owed a start, as the newest record of each says.
+    pub restarts: Vec<Restart>,
+    /// The update channel root the failed update was to settle on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_root: Option<tough::schema::Signed<tough::schema::Root>>,
+}
+
+kr_client::debug_as_name!(Abandoned);
+
+/// `newer` and then each of `older` for an environment `newer` has none for: a daemon recorded
+/// more recently is the one to start.
+fn merged(newer: Vec<Restart>, older: Vec<Restart>) -> Vec<Restart> {
+    let mut restarts = newer;
+    for restart in older {
+        if !restarts
+            .iter()
+            .any(|known| known.environment == restart.environment)
+        {
+            restarts.push(restart);
+        }
+    }
+    restarts
+}
+
+/// Whichever of two roots is of the higher version, the first when they are of one.
+fn newer_root(
+    first: Option<tough::schema::Signed<tough::schema::Root>>,
+    second: Option<tough::schema::Signed<tough::schema::Root>>,
+) -> Option<tough::schema::Signed<tough::schema::Root>> {
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            if second.signed.version > first.signed.version {
+                Some(second)
+            } else {
+                Some(first)
+            }
+        }
+        (first, second) => first.or(second),
+    }
+}
+
+impl Transaction {
+    /// This update, failed, as what it owes: its daemons and its root together with those of the
+    /// failed update it went on past, if it did.
+    fn abandon(self) -> Abandoned {
+        let (restarts, trusted_root) = match self.abandoned {
+            Some(earlier) => (
+                merged(self.restarts, earlier.restarts),
+                newer_root(self.trusted_root, earlier.trusted_root),
+            ),
+            None => (self.restarts, self.trusted_root),
+        };
+        Abandoned {
+            source: self.source,
+            target: self.target,
+            restarts,
+            trusted_root,
+        }
+    }
+}
+
+impl Abandoned {
+    /// The update again, in the state of one whose switch happened, owing its daemons and those in
+    /// `newer`, which are the more recent record of any environment they share.
+    fn into_update(self, newer: Vec<Restart>) -> Transaction {
+        Transaction {
+            source: self.source,
+            target: self.target,
+            state: TransactionState::Switched,
+            restarts: merged(newer, self.restarts),
+            trusted_root: self.trusted_root,
+            abandoned: None,
+        }
+    }
+}
 
 impl Transaction {
     /// The directories the daemons it recorded read their configuration documents in, by
@@ -760,7 +858,8 @@ async fn stage_tree(
     release::seal(&staged, &manifest)?;
     // Published and made current under the install lock: a control daemon of the release started
     // in between waits for `current` to name it.
-    let install = handover::install_lock(store, handover::INSTALL_LOCK_WAIT, "install").await?;
+    let install =
+        handover::install_lock(store, handover::INSTALL_LOCK_WAIT, "kr host install").await?;
     release::admit(&staged, store, &manifest.release)?;
     store
         .switch(&manifest.release, update_lock, &install)
@@ -921,9 +1020,14 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
     ensure_current(&store, &source)?;
     let mut record = Record::read(&store)?;
     // An update an earlier run left part way is settled first. It never switches `current`, so
-    // this kr is still the current release's afterwards.
+    // this kr is still the current release's afterwards. One that happened and whose daemons do
+    // not start stays recorded, and an update to another release goes on past it.
+    let mut left = None;
     if !check && record.update.is_some() {
-        recover(&store, &mut record).await?;
+        match recover(&store, &mut record, Recovery::Start).await? {
+            Recovered::Settled => {}
+            Recovered::Failed(why) => left = Some(why),
+        }
     }
     let current_manifest = installed_manifest(&store, &source)?;
     let trusted = trusted_root(&store, &record, &source)?;
@@ -940,6 +1044,11 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
     let _ = remove_staging(&staging);
     let target = staged?;
     if target.release == source {
+        // The release that is current is not an update to go on past a failed one with: the daemons
+        // it left unstarted are still owed.
+        if let (Some(why), Some(failed)) = (left, record.update.as_ref()) {
+            return Err(left_part_way(&why, &failed.source));
+        }
         return Ok(Updated {
             target: source.clone(),
             source,
@@ -998,9 +1107,17 @@ pub async fn rollback(to: Option<&str>) -> Result<Updated> {
         })?;
     ensure_current(&store, &source)?;
     let mut record = Record::read(&store)?;
-    if record.update.is_some() {
-        recover(&store, &mut record).await?;
-    }
+    // An update that happened and whose daemons do not start is what a rollback is for: it goes
+    // back to the release that update began from, and starts the daemons from there. Nothing of the
+    // release that failed is started on the way, which would leave a daemon of it holding the
+    // environment for the rollback to find.
+    let failed = match record.update {
+        Some(_) => matches!(
+            recover(&store, &mut record, Recovery::Ask).await?,
+            Recovered::Failed(_)
+        ),
+        None => false,
+    };
     let target = match to {
         Some(name) => ReleaseName::new(name).map_err(|_| {
             CliError::Usage(Shown::said(
@@ -1009,7 +1126,12 @@ pub async fn rollback(to: Option<&str>) -> Result<Updated> {
                  this host's",
             ))
         })?,
-        None => record.previous.clone().ok_or_else(|| {
+        None => if failed {
+            record.update.as_ref().map(|update| update.source.clone())
+        } else {
+            record.previous.clone()
+        }
+        .ok_or_else(|| {
             CliError::Usage(Shown::said(
                 "this host records no release it was on before its last switch, so there is none \
                  to go back to by default: name one with --to; kr host versions lists the releases \
@@ -1229,6 +1351,9 @@ async fn proceed(
         state: TransactionState::Prepared,
         restarts: Vec::new(),
         trusted_root: trusted,
+        // What stands recorded now is an update that happened and left daemons unstarted, or
+        // nothing: this one goes on past it.
+        abandoned: record.update.take().map(Transaction::abandon),
     });
     record.write(store)?;
     hand_over(
@@ -1398,7 +1523,17 @@ async fn hand_over(
     // has been decided. A daemon that is starting holds it, shared, so it is waited for, and only
     // for a bound; a daemon that never finishes starting then costs the update no more than a wait,
     // since nothing has been stopped and each daemon prepared resumes.
-    let install = match handover::install_lock(store, handover::INSTALL_LOCK_WAIT, "update").await {
+    let install = match handover::install_lock(
+        store,
+        handover::INSTALL_LOCK_WAIT,
+        if report.rolled_back {
+            "kr host rollback"
+        } else {
+            "kr host update"
+        },
+    )
+    .await
+    {
         Ok(install) => install,
         Err(error) => {
             for (environment, daemon) in prepared {
@@ -1598,12 +1733,18 @@ async fn hand_over(
     let written = record.write(store);
     drop(held);
     drop(install);
-    let restarted = start_recorded(store, record).await.map_err(|failed| {
+    let restarted = match record.update.as_ref() {
+        Some(update) => start_recorded(store, update, true).await,
+        None => Ok(Vec::new()),
+    }
+    .map_err(|failed| {
         CliError::Other(shown!(
             "this host's current release is {} now, and a control daemon the update stopped did \
-             not start from it: {}; the next kr host update starts it before anything else",
+             not start from it: {}; {} starts it before anything else, and kr host rollback goes \
+             back to the release before",
             crate::shown::release(&target.release),
-            failed.said()
+            failed.said(),
+            "kr host update"
         ))
     })?;
     written?;
@@ -1660,27 +1801,37 @@ fn every_environment<'a>(
 /// else, and what is returned says so.
 #[cfg(unix)]
 async fn undo(store: &Store, record: &mut Record, ended_by: CliError) -> CliError {
-    match start_recorded(store, record).await {
+    // The daemons this update stopped, and not those of a failed update it went on past: they are
+    // started by the switch this update makes, from the release it makes current.
+    let started = match record.update.as_ref() {
+        Some(update) => start_recorded(store, update, false).await,
+        None => Ok(Vec::new()),
+    };
+    match started {
         Ok(_) => {
             forget_update(store, record);
             ended_by
         }
         Err(failed) => CliError::Other(shown!(
-            "{}. A control daemon the update stopped did not start again, and the next kr host \
-             update starts it before anything else: {}",
+            "{}. A control daemon the update stopped did not start again, and the next {} starts \
+             it before anything else: {}",
             ended_by.said(),
+            RUN_AGAIN,
             failed.said()
         )),
     }
 }
 
-/// Starts every daemon the update under way recorded, from whatever `current` names now, and waits
-/// for each to answer as a daemon of it.
+/// Starts every daemon `update` recorded, from whatever `current` names now, and waits for each to
+/// answer as a daemon of it. With `with_abandoned`, so are those of the failed update it went on
+/// past, for each environment `update` recorded no daemon of: that is when `current` names the
+/// release `update` made current, which is where they are owed their start.
 #[cfg(unix)]
-async fn start_recorded(store: &Store, record: &Record) -> Result<Vec<EnvironmentId>> {
-    let Some(update) = &record.update else {
-        return Ok(Vec::new());
-    };
+async fn start_recorded(
+    store: &Store,
+    update: &Transaction,
+    with_abandoned: bool,
+) -> Result<Vec<EnvironmentId>> {
     let current = store
         .current()
         .map_err(|error| CliError::Other(said(&error)))?
@@ -1690,9 +1841,22 @@ async fn start_recorded(store: &Store, record: &Record) -> Result<Vec<Environmen
                 Shown::root(store.root())
             ))
         })?;
+    let owed: Vec<&Restart> = match update.abandoned.as_ref().filter(|_| with_abandoned) {
+        Some(failed) => update
+            .restarts
+            .iter()
+            .chain(failed.restarts.iter().filter(|restart| {
+                !update
+                    .restarts
+                    .iter()
+                    .any(|own| own.environment == restart.environment)
+            }))
+            .collect(),
+        None => update.restarts.iter().collect(),
+    };
     let mut started = Vec::new();
     let mut failed = None;
-    for restart in &update.restarts {
+    for restart in owed {
         match start_one(store, restart, &current, &update.target).await {
             Ok(()) => started.push(restart.environment),
             Err(error) => failed = failed.or(Some(error)),
@@ -1804,10 +1968,17 @@ async fn unanswered_by(
     }
 }
 
-/// Forgets the update under way, keeping what it staged.
+/// Ends the update under way without its having switched, keeping what it staged.
+///
+/// An update that went on past a failed one leaves that one recorded again, owing what it owed and
+/// the daemons this one stopped and has started again, which are the more recent record of any it
+/// shares with it; otherwise nothing is left recorded.
 #[cfg(unix)]
 fn forget_update(store: &Store, record: &mut Record) {
-    record.update = None;
+    record.update = record.update.take().and_then(|ended| {
+        let restarts = ended.restarts;
+        ended.abandoned.map(|failed| failed.into_update(restarts))
+    });
     let _ = record.write(store);
 }
 
@@ -1830,6 +2001,23 @@ fn trusted_after(
 ) -> Result<Option<release::ChannelRoot>> {
     let mut roots = Vec::new();
     if let Some(kept) = record.trusted_root.clone() {
+        roots.push((None, release::ChannelRoot::kept(kept)?));
+    }
+    // The roots an update that is still recorded was to settle on, or that a failed one was: this
+    // host trusts the newest of them all the same, so a switch that goes on past it cannot lower
+    // what it recorded.
+    let pending = record.update.iter().flat_map(|update| {
+        [
+            update.trusted_root.clone(),
+            update
+                .abandoned
+                .as_ref()
+                .and_then(|failed| failed.trusted_root.clone()),
+        ]
+        .into_iter()
+        .flatten()
+    });
+    for kept in pending {
         roots.push((None, release::ChannelRoot::kept(kept)?));
     }
     for release in [source, target] {
@@ -1944,37 +2132,137 @@ fn restart_of(
     })
 }
 
+/// What an update an earlier run left part way came to.
+#[cfg(unix)]
+enum Recovered {
+    /// It is settled, or it never switched and has been ended: nothing is left recorded.
+    Settled,
+    /// It switched, `current` names its target, and a daemon it stopped does not answer from it. It
+    /// stays recorded, owing that daemon, for an update to another release or a rollback to go on
+    /// past.
+    Failed(Shown),
+}
+
+/// Whether the daemons of an update left part way are started again.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    /// They are, from whatever `current` names.
+    Start,
+    /// Those of an update that switched are asked whether they answer from `current`, and none is
+    /// started: a rollback goes back from the release `current` names, and starts each from the
+    /// release it goes back to.
+    Ask,
+}
+
 /// Settles an update an earlier run left part way, by what `current` actually names. The caller
 /// holds the update lock, so `current` does not change meanwhile.
 ///
-/// Naming the source, the switch never happened: every daemon the update recorded is started
-/// again from the source, and the target stays staged. Naming the target, the switch happened:
-/// every recorded daemon that is not running is started from the target, and one that is running
-/// and does not answer as the target's is named with how to stop it. Once every one answers the
-/// update is forgotten, and a switch back to the source is an update of its own; while any does
-/// not, the record keeps the update for the next run.
+/// A rescue that never switched, a rollback or update that went on past a failed update and was
+/// left before its own switch, is that failed update again, owing its daemons and those the rescue
+/// had stopped. Then, `current` naming the source, the switch never happened: every daemon the
+/// update recorded is started again from the source, and the target stays staged. Naming the
+/// target, the switch happened: every recorded daemon that is not running is started from the
+/// target, and one that runs and does not answer as the target's is named with how to stop it.
+/// Once every one answers the update is settled; while any does not, the record keeps the update
+/// and [`Recovered::Failed`] says why, for a run that can go on past it to go on.
+///
+/// # Errors
+///
+/// Returns the failure to write the record, and, for an update that never switched, a daemon that
+/// does not start again from the release still current: nothing can be gone back to then.
 #[cfg(unix)]
-async fn recover(store: &Store, record: &mut Record) -> Result<()> {
-    let Some(update) = record.update.clone() else {
-        return Ok(());
+async fn recover(store: &Store, record: &mut Record, how: Recovery) -> Result<Recovered> {
+    let Some(mut update) = record.update.clone() else {
+        return Ok(Recovered::Settled);
     };
     let current = store
         .current()
         .map_err(|error| CliError::Other(said(&error)))?;
-    start_recorded(store, record).await.map_err(|failed| {
-        CliError::Other(shown!(
-            "an update an earlier run left part way is not settled yet: a control daemon it \
-             stopped did not start again, and the next kr host update starts it before anything \
-             else: {}",
-            failed.said()
-        ))
-    })?;
-    if current.as_ref() == Some(&update.target) {
-        settle(store, record)
-    } else {
-        forget_update(store, record);
-        Ok(())
+    if update.abandoned.is_some() && current.as_ref() != Some(&update.target) {
+        let restarts = std::mem::take(&mut update.restarts);
+        if let Some(failed) = update.abandoned.take() {
+            update = failed.into_update(restarts);
+        }
+        record.update = Some(update.clone());
+        record.write(store)?;
     }
+    let switched = current.as_ref() == Some(&update.target);
+    if how == Recovery::Ask && switched && update.abandoned.is_none() {
+        return match answering(store, &update).await {
+            Ok(()) => settle(store, record).map(|()| Recovered::Settled),
+            Err(why) => Ok(Recovered::Failed(why)),
+        };
+    }
+    match start_recorded(store, &update, switched).await {
+        Ok(_) if switched => settle(store, record).map(|()| Recovered::Settled),
+        Ok(_) => {
+            forget_update(store, record);
+            Ok(Recovered::Settled)
+        }
+        Err(failed) if switched => Ok(Recovered::Failed(failed.said())),
+        Err(failed) => Err(left_part_way(&failed.said(), &update.source)),
+    }
+}
+
+/// What a run says when an update an earlier run left is not settled: the daemon that does not start,
+/// what starts it, and what goes back.
+#[cfg(unix)]
+fn left_part_way(why: &Shown, source: &ReleaseName) -> CliError {
+    CliError::Other(shown!(
+        "an update an earlier run left part way is not settled yet: a control daemon it stopped \
+         did not start again, and the next {} starts it before anything else, or kr host rollback \
+         goes back to {}: {}",
+        RUN_AGAIN,
+        crate::shown::release(source),
+        why.clone()
+    ))
+}
+
+/// Asks whether each daemon `update` recorded, and each of a failed update it went on past, answers
+/// as a daemon of `current`, and says which does not.
+#[cfg(unix)]
+async fn answering(store: &Store, update: &Transaction) -> std::result::Result<(), Shown> {
+    let current = store
+        .current()
+        .ok()
+        .flatten()
+        .ok_or_else(|| Shown::said("the store names no current release"))?;
+    let expected = format!("kr-controller/{current}");
+    let every = update.restarts.iter().chain(
+        update
+            .abandoned
+            .iter()
+            .flat_map(|failed| failed.restarts.iter()),
+    );
+    for restart in every {
+        let host = kr_ipc::paths::HostPaths::new(&restart.runtime_root, &restart.state_root)
+            .map_err(|error| shown!("{}", Shown::ipc(&error)))?;
+        let environment = inventory::Environment {
+            environment_id: restart.environment,
+            paths: host.environment(restart.environment),
+            host,
+        };
+        match handover::answers_as_now(&environment).await {
+            Some(build) if build.as_str() == expected => {}
+            Some(build) => {
+                return Err(shown!(
+                    "the control daemon of environment {} answers as {}, not as a daemon of {}",
+                    restart.environment,
+                    crate::shown::build_name(&build),
+                    crate::shown::release(&current)
+                ));
+            }
+            None => {
+                return Err(shown!(
+                    "no control daemon of {} answers for environment {}",
+                    crate::shown::release(&current),
+                    restart.environment
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Removes every release nothing needs: not the current one, not the previous one, not one staged
@@ -2088,6 +2376,7 @@ mod tests {
             target: release("0.2.0+bbbbbbbbbbbb"),
             state: TransactionState::Prepared,
             trusted_root: None,
+            abandoned: None,
             restarts: vec![Restart {
                 environment: environment.environment_id,
                 runtime_root: "/runtime".to_owned(),
@@ -2380,7 +2669,7 @@ mod tests {
                 .contains("is starting and has held its start lock"),
             "{refused}"
         );
-        let refused = handover::install_lock(&store, bound, "install")
+        let refused = handover::install_lock(&store, bound, "kr host install")
             .await
             .expect_err("nor is the lock taken");
         assert_eq!(refused.exit_code(), 9, "{refused}");
@@ -2394,7 +2683,7 @@ mod tests {
         );
         // The control: once the daemon has started, the lock is taken at once.
         drop(starting);
-        handover::install_lock(&store, bound, "update")
+        handover::install_lock(&store, bound, "kr host update")
             .await
             .expect("the lock is free");
     }
