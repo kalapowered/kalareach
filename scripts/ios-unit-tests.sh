@@ -16,8 +16,12 @@
 # fetch the Swift packages the project pins. Those are fetched at the versions the project's
 # `Package.resolved` records and never resolved again, so the run leaves the file as it found it.
 #
-# The simulator is the newest iPhone the scheme can use with the selected Xcode (DEVELOPER_DIR names
-# another). One that this script boots is shut down when it ends, and the build's files are removed.
+# The tests are built with the newest Xcode that is installed under a versioned name
+# (`/Applications/Xcode_<version>.app`, as a hosted runner has them), by its own version and build
+# number, because the default Xcode of such a runner is older than the Swift the tests need. A
+# machine with one Xcode uses it, and DEVELOPER_DIR names another. The simulator is the newest
+# iPhone the scheme can use with that Xcode. One that this script boots is shut down when it ends,
+# and the build's files are removed.
 
 set -euo pipefail
 
@@ -37,7 +41,7 @@ while [ $# -gt 0 ]; do
             break
             ;;
         -h|--help)
-            sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 2
             ;;
         *)
@@ -51,6 +55,38 @@ done
 for tool in xcodebuild xcrun python3; do
     command -v "$tool" > /dev/null 2>&1 || { echo "ios-unit-tests: $tool is needed and is not on the path" >&2; exit 2; }
 done
+
+if [ -z "${DEVELOPER_DIR:-}" ]; then
+    newest="$(python3 -I - <<'PYTHON'
+import glob
+import os
+import re
+import subprocess
+
+best = None
+for application in glob.glob("/Applications/Xcode_*.app"):
+    # A hosted runner names each Xcode by version and links other names to the same one.
+    if os.path.islink(application) or not re.fullmatch(r"/Applications/Xcode_[0-9.]+\.app", application):
+        continue
+    developer = application + "/Contents/Developer"
+    try:
+        said = subprocess.run([developer + "/usr/bin/xcodebuild", "-version"], capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        continue
+    found = re.match(r"Xcode ([0-9.]+)\s+Build version (\S+)", " ".join(said.split()))
+    if not found:
+        continue
+    key = (tuple(int(part) for part in found.group(1).split(".")), found.group(2))
+    if best is None or key > best[0]:
+        best = (key, developer)
+if best:
+    print(best[1])
+PYTHON
+)"
+    if [ -n "$newest" ]; then
+        export DEVELOPER_DIR="$newest"
+    fi
+fi
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/kr-ios-tests.XXXXXX")"
 booted_here=""
