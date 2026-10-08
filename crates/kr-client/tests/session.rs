@@ -2394,6 +2394,13 @@ impl kr_client::services::ManagedVoiceService for ForkServices {
         self.refuses("voice.metadata")
     }
 
+    fn call_is_open<'a>(
+        &'a self,
+        _call_id: &'a str,
+    ) -> kr_client::services::ServiceFuture<'a, bool> {
+        self.refuses("voice.call_is_open")
+    }
+
     fn provider(&self) -> String {
         "the fork's own".to_owned()
     }

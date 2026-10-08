@@ -151,6 +151,11 @@ impl ManagedVoiceService for OfflineProvider {
         Box::pin(async move { Ok(None) })
     }
 
+    fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {
+        // Nothing here can say, so the call is held open until its own deadline.
+        Box::pin(async move { Ok(true) })
+    }
+
     fn provider(&self) -> String {
         "the offline provider".to_owned()
     }
