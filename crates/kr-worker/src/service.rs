@@ -206,6 +206,10 @@ pub struct WorkerService {
     /// begun to wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     held_attention_requests: std::sync::atomic::AtomicU64,
+    /// The newest broker record the page read at the latest wait had, whether or not the page
+    /// carried it. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    held_attention_approvals_head: std::sync::atomic::AtomicU64,
     /// The session's side of the privacy fence around its attention text: the transition in
     /// progress, the statements that tell the control daemon about it, and the leases of the text
     /// this worker has answered with.
@@ -409,6 +413,16 @@ impl WorkerService {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The newest broker record the page read at the latest wait had: a record that a request
+    /// found, and did not answer for, is behind this number, so a test that waits for it to reach
+    /// a record knows the worker has read that record and held the request on it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn held_attention_approvals_head(&self) -> u64 {
+        self.held_attention_approvals_head
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Builds a service for one session.
     ///
     /// # Errors
@@ -496,6 +510,8 @@ impl WorkerService {
             journal_changes,
             #[cfg(feature = "testing")]
             held_attention_requests: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            held_attention_approvals_head: std::sync::atomic::AtomicU64::new(0),
             attention_fence,
             description_facts,
             broker,
@@ -2644,10 +2660,11 @@ impl WorkerService {
     /// Reads one page, holding the request while there is nothing to answer with.
     ///
     /// It answers at once when a question or a host event is past its cursor, when an approval's
-    /// transition is (a broker transition of any other request waits to go with the next page),
-    /// when the session's privacy generation has moved since the request arrived or is past the
-    /// generation the request says the daemon has recorded, and when the request's bound runs
-    /// out. Every subscription is taken before each read, so a commit between the read and the
+    /// transition is, or when the page ends before the broker's newest record, so that an
+    /// approval's transition behind a full page is read at once and not at the bound (a broker
+    /// transition of any other request waits to go with the next page), when the session's privacy
+    /// generation has moved since the request arrived or is past the generation the request says
+    /// the daemon has recorded, and when the request's bound runs out. Every subscription is taken before each read, so a commit between the read and the
     /// wait wakes the wait rather than falling between them. A request a newer one replaced
     /// answers nothing: the replacement is checked before every read and before the answer is
     /// handed over, and it wins a wait that something else ends at the same moment.
@@ -2685,9 +2702,17 @@ impl WorkerService {
             let started = *generation.get_or_insert(page.privacy_generation.0);
             // A broker transition that is no approval's waits for the next page rather than costing
             // the daemon a commit of its own: it is read with the approval that follows it, or
-            // when the request's bound runs out.
+            // when the request's bound runs out. A page that stops short of the broker's newest
+            // record cannot say whether an approval's transition is behind it, so it is answered,
+            // and the daemon reads the rest at once.
+            let approvals_continue = page
+                .approvals
+                .records
+                .last()
+                .is_some_and(|last| last.sequence.get() < page.approvals.head.get());
             let answer = !page.questions.records.is_empty()
                 || page.approvals.records.iter().any(|record| record.approval)
+                || approvals_continue
                 || !page.host_events.records.is_empty()
                 || page.privacy_generation.0 != started
                 || crate::attention_fence::behind(
@@ -2715,8 +2740,14 @@ impl WorkerService {
                 return Some(ControlFrame::AttentionSourcePage(Box::new(page)));
             }
             #[cfg(feature = "testing")]
-            self.held_attention_requests
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            {
+                self.held_attention_approvals_head.store(
+                    page.approvals.head.get(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                self.held_attention_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             tokio::select! {
                 biased;
                 _ = &mut *cancelled => return None,
