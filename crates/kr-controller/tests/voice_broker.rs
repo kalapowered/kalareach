@@ -1737,13 +1737,22 @@ async fn a_start_that_meets_an_account_being_changed_is_made_under_the_account_i
         let params = start_params(session_id, &prepared);
         let start = try_mutate(&session, host.environment_id, Method::VoiceStart, &params);
         let release = async {
-            // The start has registered, and is asking for its token while the gate is up.
-            while !host.controller().voice().coordinator().calls_open() {
-                tokio::task::yield_now().await;
-            }
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-            }
+            // The start is waiting for its token while the gate is up: a condition of the daemon,
+            // not a time. Nothing has reached the broker for it.
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while host.controller().host_account().token_requests_waiting() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the start's request for a token waits for the change to end");
+            assert!(
+                broker
+                    .seen()
+                    .iter()
+                    .all(|request| !request.path.starts_with("/api/voice/sessions")),
+                "nothing reached the broker while the account was being changed"
+            );
             identity.release();
         };
         let (started, ()) = tokio::join!(start, release);
