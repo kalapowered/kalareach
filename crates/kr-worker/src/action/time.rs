@@ -1395,10 +1395,10 @@ impl TimeContract {
     /// or after a restart, and the clock reading right again by the second reading of the look
     /// does not change that. One made after that time clears it if the readings since agree with
     /// it, except that a worker that restarted on a distrusted record answers only to a
-    /// confirmation made after it restarted. An owner who corrects a clock that ran ahead of the truth is followed all the same: the
-    /// worker's mark was proved before the owner spoke, and the owner's word is what the clock
-    /// agrees with since. A restatement answers to the worker's mark whatever its age, since it
-    /// adds nothing to what the worker knows, and never lowers it.
+    /// confirmation made after it restarted. An owner who corrects a clock that ran ahead of the
+    /// truth is followed all the same: the worker's mark was proved before the owner spoke, and
+    /// the owner's word is what the clock agrees with since. A restatement answers to the worker's
+    /// mark whatever its age, since it adds nothing to what the worker knows, and never lowers it.
     ///
     /// A confirmation the worker cannot follow is spent all the same, because one a worker met and
     /// could not follow is not one it follows when the clock next reads right: the owner has said
@@ -1635,8 +1635,8 @@ mod tests {
     /// KR-REQ-09.18: past its capacity a worker lets its oldest reading go, and refuses a
     /// confirmation made at or before the time of the one it let go, whatever the readings it kept
     /// say; one made after it is judged by the readings kept, exactly. The readings here rise by
-    /// two seconds of level each, so none replaces or merges another, and every one agrees with a
-    /// confirmation made between the first two.
+    /// two seconds of level each, so none replaces or merges another, and every one kept agrees
+    /// with a confirmation made after the first.
     #[test]
     fn a_confirmation_made_before_the_oldest_reading_let_go_is_refused_and_a_later_one_is_judged() {
         let confirmation = |boot_ms: u64| Establishment {
