@@ -50,7 +50,9 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use kr_protocol::identity::ProcessStartIdentity;
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, HANDLE,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
@@ -60,8 +62,8 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
 
 /// How many process identifiers one query asks the job for before it asks again with more room.
@@ -70,6 +72,19 @@ const FIRST_QUERY_CAPACITY: usize = 64;
 /// The most a query will ever ask for, so a job with a runaway number of processes cannot make
 /// this allocate without bound.
 const MAX_QUERY_CAPACITY: usize = 16 * 1024;
+
+/// What asking a job about one process identifier came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberReading {
+    /// The process holding the identifier is in the job, and this is its identity: its creation
+    /// time was read through the same open handle the job was asked about.
+    Held(ProcessStartIdentity),
+    /// No process holds the identifier, or the one that does is not in the job. An identifier
+    /// listed by a job and held by a process outside it is a stranger that took the number.
+    NotHeld,
+    /// The process could not be asked about, for the reason given.
+    Unreadable(String),
+}
 
 /// A job object this worker owns, holding one session's processes.
 #[derive(Debug)]
@@ -292,6 +307,16 @@ impl SessionJob {
         self.job.holds(process.as_raw_handle().cast())
     }
 
+    /// Reads the process holding `pid` as a member of this job, or says it is not one.
+    ///
+    /// The job is asked about the process through a handle, and the process's creation time is read
+    /// through that same handle, so the identity returned is the identity of a process the job
+    /// holds and not of whatever holds the number a moment later.
+    #[must_use]
+    pub fn member(&self, pid: u32) -> MemberReading {
+        self.job.member(pid)
+    }
+
     /// Returns whether this job still permits a child to break away from it.
     ///
     /// Read back from the operating system rather than from what was asked for, because what the
@@ -506,6 +531,12 @@ impl AgentJob {
         self.job.kills_on_close()
     }
 
+    /// Reads the process holding `pid` as a member of this job, or says it is not one.
+    #[must_use]
+    pub fn member(&self, pid: u32) -> MemberReading {
+        self.job.member(pid)
+    }
+
     /// Returns the identifiers of every process the job currently holds: the agent while it runs,
     /// and every process it started that is still running.
     ///
@@ -646,6 +677,77 @@ impl Job {
 
     /// Returns the identifiers of every process the job currently holds, asking again with more
     /// room while the answer is partial.
+    fn member(&self, pid: u32) -> MemberReading {
+        // SAFETY: the rights and the identifier are values; the call returns a handle this process
+        // owns, or null.
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() {
+            let error = std::io::Error::last_os_error();
+            return if error
+                .raw_os_error()
+                .and_then(|code| u32::try_from(code).ok())
+                == Some(ERROR_INVALID_PARAMETER)
+            {
+                MemberReading::NotHeld
+            } else {
+                MemberReading::Unreadable(format!("pid {pid} could not be opened: {error}"))
+            };
+        }
+        // SAFETY: the call reported a handle this process owns and nothing else holds.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        match self.holds(process.as_raw_handle().cast()) {
+            Ok(true) => {}
+            Ok(false) => return MemberReading::NotHeld,
+            Err(error) => {
+                return MemberReading::Unreadable(format!(
+                    "whether the job holds pid {pid} could not be read: {error}"
+                ));
+            }
+        }
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: the handle is open for the call with the right it needs, and each pointer is to
+        // a live local of the structure the call writes.
+        let read = unsafe {
+            GetProcessTimes(
+                process.as_raw_handle().cast(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if read == 0 {
+            return MemberReading::Unreadable(format!(
+                "the creation time of pid {pid} could not be read: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let created =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        // The wall clock in the unit a creation time is read in, which the reading is checked
+        // against for plausibility.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos() / 100).unwrap_or(u64::MAX)
+            })
+            .saturating_add(116_444_736_000_000_000);
+        match kr_ipc::identity::windows_answer(
+            pid,
+            kr_ipc::identity::WindowsReading::Created(created),
+            now,
+        ) {
+            kr_ipc::identity::ProcessQuery::Present(identity) => MemberReading::Held(identity),
+            kr_ipc::identity::ProcessQuery::Gone => MemberReading::NotHeld,
+            kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+                MemberReading::Unreadable(error.to_string())
+            }
+        }
+    }
+
     fn process_ids(&self) -> std::io::Result<Vec<u32>> {
         let mut capacity = FIRST_QUERY_CAPACITY;
         loop {
