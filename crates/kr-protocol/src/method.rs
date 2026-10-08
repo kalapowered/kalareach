@@ -407,7 +407,8 @@ methods! {
           Telegram or email, with where it sends, whether it deduplicates by an identifier, and \
           the grant whose authority the content is intersected with. The grant has to stand, a \
           paired device's identifier is not one a destination takes, and a service that sends \
-          with a credential needs one kept first with delivery.destination.secret.set.";
+          with a credential is configured with it in the request, or with one kept earlier \
+          with delivery.destination.secret.set.";
 
     DeliveryDestinationRemove = "delivery.destination.remove", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
@@ -425,7 +426,8 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "List the notification destinations that have a rule: a paired device's and the ones \
           the owner configured, each with where it sends, the grant it is told under and whether \
-          it is in force. A removed destination is not listed. It never carries a credential.";
+          it is in force. A removed destination is not listed. It never carries a credential, and a webhook's \
+          address is given without its query and fragment.";
 
     DeliveryDestinationSecretSet = "delivery.destination.secret.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],

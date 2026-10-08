@@ -218,7 +218,7 @@ async fn a_webhook_is_configured_listed_and_removed_through_the_daemon() {
         "--kind",
         "webhook",
         "--endpoint",
-        "https://hooks.example.test/in/ops",
+        "https://hooks.example.test/in/ops?token=not-a-real-token#top",
         "--grant",
         &grant,
         "--rule-name",
@@ -238,6 +238,13 @@ async fn a_webhook_is_configured_listed_and_removed_through_the_daemon() {
     let record = host.destination("ops").expect("the daemon holds it");
     assert!(record.enabled);
     assert_eq!(
+        record
+            .as_external()
+            .map(|external| external.endpoint.as_str()),
+        Some("https://hooks.example.test/in/ops?token=not-a-real-token#top"),
+        "the daemon sends to the address as it was given"
+    );
+    assert_eq!(
         record.rule.as_ref().map(|rule| rule.name.as_str()),
         Some("tell the team")
     );
@@ -248,7 +255,9 @@ async fn a_webhook_is_configured_listed_and_removed_through_the_daemon() {
     let destination = &destinations[0];
     assert_eq!(destination["destination_id"], "ops");
     assert_eq!(destination["kind"], "webhook");
+    // The address is listed without the query and fragment, which can carry a token.
     assert_eq!(destination["endpoint"], "https://hooks.example.test/in/ops");
+    assert!(!listed.to_string().contains("not-a-real-token"), "{listed}");
     assert_eq!(destination["idempotency_header"], "Idempotency-Key");
     assert_eq!(destination["rule_name"], "tell the team");
     assert_eq!(destination["grant_id"], grant);
@@ -259,6 +268,7 @@ async fn a_webhook_is_configured_listed_and_removed_through_the_daemon() {
         shown.contains("ops") && shown.contains("https://hooks.example.test/in/ops"),
         "{shown}"
     );
+    assert!(!shown.contains("not-a-real-token"), "{shown}");
 
     let removed = host.done(&["destination", "remove", "ops"]);
     assert_eq!(removed["found"], Value::Bool(true));

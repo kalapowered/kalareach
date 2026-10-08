@@ -2026,11 +2026,23 @@ impl Moved {
     }
 }
 
+/// The daemon's watch over paired devices looks every fifty milliseconds, and the test waits until
+/// it has looked `looks` more times.
+async fn until_the_watch_has_looked(environment: &Environment, looks: u64) {
+    let controller = Arc::clone(environment.controller());
+    let first = controller.device_watch_looks();
+    until("the watch over paired devices looking again", || {
+        controller.device_watch_looks() >= first + looks
+    })
+    .await;
+}
+
 /// KR-REQ-16.10: a device nothing is delivered to is still found when its grant runs out. A
 /// destination the provider rejected the token of is out of service and keeps its rule, its
-/// credential and the authorisation behind it, and the watch over the paired devices asks where its
-/// device's grant stands: the control is the same destination before the grant ran out, which the
-/// watch leaves as it is.
+/// credential and the authorisation behind it, and the daemon's own watch over the paired devices,
+/// on its timer, asks where its device's grant stands. Nothing here calls the watch: the control
+/// is the same destination while the grant stands, which the watch has looked at twice and left
+/// as it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_watch_over_paired_devices_ends_the_destination_nothing_is_delivered_to() {
     let (moved, clocks) = Moved::new();
@@ -2055,44 +2067,43 @@ async fn the_watch_over_paired_devices_ends_the_destination_nothing_is_delivered
         .disable(&rejected)
         .expect("the provider rejects the token");
 
-    let watch = || {
-        environment
-            .controller()
-            .recover_push_destinations()
-            .expect("the watch")
-    };
-    assert_eq!(watch(), 0, "the control: the grant stands");
+    environment
+        .controller()
+        .watch_devices_every(Duration::from_millis(50));
+    until_the_watch_has_looked(&environment, 2).await;
     assert!(
         environment
             .destination(phone.device_id())
             .is_some_and(|record| !record.enabled && record.rule.is_some()),
-        "out of service, with its rule"
+        "the control: out of service, with its rule, while the grant stands"
     );
     assert!(credentials.held(sender).is_some());
 
     moved.past_the_grant();
-    assert_eq!(watch(), 1, "the watch finds the grant has run out");
-    assert!(
+    until("the watch ending the destination", || {
         environment
             .destination(phone.device_id())
-            .is_none_or(|record| !record.enabled && record.rule.is_none()),
-        "the destination is ended"
-    );
-    assert!(credentials.held(sender).is_none());
+            .is_none_or(|record| !record.enabled && record.rule.is_none())
+    })
+    .await;
+    until("the credential being given up", || {
+        credentials.held(sender).is_none()
+    })
+    .await;
     assert!(
         owed(&environment)
             .iter()
             .any(|debt| debt.sender_record_id == sender),
         "the authorisation is owed a revocation"
     );
-    assert_eq!(watch(), 0, "and ending it again is ending it once");
 }
 
-/// KR-REQ-16.10: an ending that failed is tried again. The expiry is on record by then, so nothing
-/// writes it a second time to start the ending; the watch finds the device unpaired and the
-/// destination still there. Here the delivery journal refuses the revocation the host owes the
-/// gateway, so the ending stops before anything is removed, and the watch ends it once the journal
-/// takes the debt.
+/// KR-REQ-16.10: an ending that failed is tried again by the daemon's own watch. The expiry is on
+/// record by then, so nothing writes it a second time to start the ending. Here the delivery
+/// journal refuses the revocation the host owes the gateway, so the ending stops before anything is
+/// removed and the watch looks again, several times, and leaves the destination as it was; once the
+/// journal takes the debt the watch ends the destination on its next look. Nothing here calls the
+/// watch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_ending_that_failed_when_the_grant_ran_out_is_tried_again() {
     let (moved, clocks) = Moved::new();
@@ -2128,9 +2139,12 @@ async fn an_ending_that_failed_when_the_grant_ran_out_is_tried_again() {
         )
         .expect("plants the fault");
 
+    environment
+        .controller()
+        .watch_devices_every(Duration::from_millis(50));
     moved.past_the_grant();
-    // The expiry is found and written down, which starts the ending, which the journal refuses.
-    environment._worker.ask("deploy-1", "Deploy the release?");
+    // The watch finds the expiry and writes it down, which starts the ending, which the journal
+    // refuses.
     until("the expiry being on record", || {
         environment
             .controller()
@@ -2141,14 +2155,9 @@ async fn an_ending_that_failed_when_the_grant_ran_out_is_tried_again() {
             .is_some_and(|record| record.expired_at_ms.is_some())
     })
     .await;
-    // Looked at while the journal refuses the debt: nothing was removed, and nothing was ended.
-    assert_eq!(
-        environment
-            .controller()
-            .recover_push_destinations()
-            .expect("the watch"),
-        0
-    );
+    // The watch looks again while the journal refuses the debt: nothing is removed and nothing is
+    // ended, however often it tries.
+    until_the_watch_has_looked(&environment, 3).await;
     assert!(
         environment
             .destination(phone.device_id())
@@ -2160,17 +2169,16 @@ async fn an_ending_that_failed_when_the_grant_ran_out_is_tried_again() {
     journal
         .execute_batch("DROP TRIGGER refuse_the_debt;")
         .expect("removes the fault");
-    // The watch's own pass, or this one, ends it.
-    environment
-        .controller()
-        .recover_push_destinations()
-        .expect("the watch");
-    assert!(
+    until("the watch ending the destination", || {
         environment
             .destination(phone.device_id())
             .is_none_or(|record| !record.enabled && record.rule.is_none())
-    );
-    assert!(credentials.held(sender).is_none());
+    })
+    .await;
+    until("the credential being given up", || {
+        credentials.held(sender).is_none()
+    })
+    .await;
     assert!(
         owed(&environment)
             .iter()
@@ -4062,6 +4070,12 @@ async fn removing_a_paired_devices_destination_ends_its_delivery_and_leaves_it_p
     // again.
     environment._worker.ask("deploy-1", "Deploy the release?");
     until_the_questions_are_settled(&environment, 1).await;
+    assert!(
+        environment
+            .deliveries_to(&phone.device_id().to_string())
+            .is_empty(),
+        "nothing was produced for the device"
+    );
     assert!(environment.gateway.delivered().is_empty());
     let refused = phone
         .register(&environment, &credential)
@@ -4105,6 +4119,12 @@ async fn a_renewal_that_fails_leaves_a_bearer_past_its_expiry_unpresented() {
         .register(&environment, &credential)
         .await
         .expect("the credential is registered");
+    // The registration's own confirmation opened a renewal at the gateway. The gateway refuses
+    // from here on, before the bearer expires, so no round of questions can renew it meanwhile.
+    let before = environment.gateway.answers_on(RENEW_ROUTE).len();
+    environment
+        .gateway
+        .answer_route_with(RENEW_ROUTE, Some((503, "unavailable")));
     environment
         .controller()
         .delivery_runtime()
@@ -4113,12 +4133,6 @@ async fn a_renewal_that_fails_leaves_a_bearer_past_its_expiry_unpresented() {
             expires_at_ms: TimestampMs::new(now() - 1_000),
             ..credential.clone()
         });
-
-    // The registration's own confirmation opened a renewal at the gateway.
-    let before = environment.gateway.answers_on(RENEW_ROUTE).len();
-    environment
-        .gateway
-        .answer_route_with(RENEW_ROUTE, Some((503, "unavailable")));
     environment._worker.ask("deploy-1", "Deploy the release?");
     let waiting = |wait: &str| {
         environment
