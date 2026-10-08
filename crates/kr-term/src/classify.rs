@@ -664,6 +664,16 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
     }
 }
 
+/// Whether an operating system command draws the screen rather than describes it.
+///
+/// The palette and the dynamic colours change what the screen looks like. Every other command
+/// forwarded to a terminal tells whoever reads it something the screen's text does not: a title,
+/// the target of a link, a working directory, a shell's marks, a terminal's own metadata.
+#[must_use]
+pub const fn osc_draws_the_screen(selector: Option<u32>) -> bool {
+    matches!(selector, Some(4 | 10..=19 | 104 | 110..=119))
+}
+
 /// The device-control rows of the table.
 #[must_use]
 pub fn classify_dcs(params: &[CsiParam], intermediates: &[u8], final_byte: u8) -> SequenceClass {
