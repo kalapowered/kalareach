@@ -1112,6 +1112,38 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
     assert!(done.revoked.revoked.contains(&owner.grant.grant_id));
 }
 
+/// KR-REQ-25.10: a preview that was cut shows the issuer less than the recipient will read, so
+/// nothing is shared for it: the share is refused and no grant or invitation is written.
+#[test]
+fn a_screen_that_was_cut_is_not_shared() {
+    use kr_protocol::sharing::LiveScreenPreview;
+
+    let service = SharingService::in_memory(device_id(0xf1)).expect("a sharing service");
+    let selection = RoleSelection {
+        include_live_screen: true,
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+    let request = ShareRequest {
+        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+        selection,
+        live_screen: Some(LiveScreenPreview {
+            lines: vec!["the first lines of a longer screen".to_owned()],
+            truncated: true,
+        }),
+        ..share(SessionRole::Viewer, 1)
+    };
+    service
+        .preview(&request)
+        .expect_err("a cut screen is not a preview of what is shared");
+    service
+        .share(&request, || Ok(()))
+        .expect_err("and nothing is issued for it");
+    assert!(
+        service.grants().records().expect("readable").is_empty(),
+        "no grant is written"
+    );
+}
+
 #[test]
 fn the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys() {
     use kr_protocol::sharing::LiveScreenPreview;
