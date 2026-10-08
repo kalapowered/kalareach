@@ -162,6 +162,13 @@ impl StatusBudget {
         *theoretical = from.saturating_add(self.interval_ms);
         true
     }
+
+    /// Gives back one question [`Self::take`] took, which was not put.
+    pub fn give_back(&self) {
+        if let Ok(mut theoretical) = self.theoretical_ms.lock() {
+            *theoretical = theoretical.saturating_sub(self.interval_ms);
+        }
+    }
 }
 
 /// The gateway this host asks about its own deliveries.
@@ -275,6 +282,10 @@ impl GatewayStatus {
 impl DeliveryStatus for GatewayStatus {
     fn reserve(&self, steady_ms: u64) -> bool {
         self.budget.take(steady_ms)
+    }
+
+    fn release(&self) {
+        self.budget.give_back();
     }
 
     fn status(
