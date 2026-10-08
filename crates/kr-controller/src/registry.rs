@@ -1244,7 +1244,9 @@ impl Registry {
     ///
     /// The version also stands for the move of the host's clock record out of the attention
     /// store's `attention-time.cbor`: a daemon takes that file into this table once, when it
-    /// starts, after the registry records 8, and removes it.
+    /// starts, after the registry records 8, and removes it. And it stands for the method
+    /// `host.clock.establish`, which a recorded pairing action may now name: a release that reads
+    /// 7 refuses a row that does.
     ///
     /// This migration goes in the first release after every install has opened the registry at
     /// this version: nothing before it is installed anywhere it has to be read from again.

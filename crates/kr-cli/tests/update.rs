@@ -6412,7 +6412,8 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
 
 /// KR-REQ-26.10: after three updates that each left a daemon that does not start, a rollback goes back to
 /// the last release whose daemon ran, which is the release the first of them began from and not the
-/// release before the current one, and starts none of the daemons that failed: each was tried once.
+/// release before the current one, and starts none of the daemons that failed: each was tried once by
+/// its own update, and once more by an archive of the release now current, which names that release too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_that_ran() {
     let mut host = Host::bare();
@@ -6448,14 +6449,33 @@ async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_tha
         assert_eq!(output.status.code(), Some(1), "{said}");
         last = said;
     }
-    assert!(
-        last["message"]
+    let names_one = |said: &Value| {
+        said["message"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("kr host rollback goes back to {}", one.name())),
+            .contains(&format!("kr host rollback goes back to {}", one.name()))
+    };
+    assert!(
+        names_one(&last),
         "the failure names the release a rollback goes back to: {last}"
     );
     assert_eq!(starts_in(&log), 3);
+
+    // An archive of the release now current, whose daemon still cannot start, names it too, and
+    // tries the daemons the chain owes once.
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &scratch.join("four.tar.gz").display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        names_one(&said),
+        "an archive of the current release names it too: {said}"
+    );
+    assert_eq!(starts_in(&log), 4);
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(
@@ -6470,9 +6490,59 @@ async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_tha
     );
     assert_eq!(
         starts_in(&log),
-        3,
-        "none of the daemons that failed was started again"
+        4,
+        "none of the daemons that failed was started again by the rollback"
     );
+}
+
+/// KR-REQ-26.10: a failed update does not name a release a rollback would refuse. A rollback to
+/// release two whose daemon did not start, and then an update to release three that fails, leave a
+/// rollback without `--to` nowhere to go: the release it would take, four, is newer than three.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_update_does_not_name_a_release_a_rollback_would_refuse() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let held = host.tree.root().join("held");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
+        .whose_daemon_cannot_start_while(&held, &log);
+    let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3).whose_daemon_cannot_start(&log);
+    let four = Assembled::at_this_level("0.4.0+dddddddddddd", 4);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let scratch = host.scratch("archives");
+    let update = |release: &Assembled, name: &str| {
+        let archive = scratch.join(name);
+        release.archive(&archive);
+        host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ])
+    };
+    for (release, name) in [(&two, "two.tar.gz"), (&four, "four.tar.gz")] {
+        let (output, said) = update(release, name);
+        assert!(output.status.success(), "{said}");
+    }
+    // The rollback to two fails: its daemon cannot start.
+    std::fs::write(&held, b"").expect("the daemon is held");
+    let (output, said) = host.kr_json(&["host", "rollback", "--to", two.name().as_str(), "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    // The update to three fails in its turn.
+    let (output, said) = update(&three, "three.tar.gz");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        !said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("kr host rollback goes back to"),
+        "the release a rollback would take, four, is newer than three: {said}"
+    );
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(output.status.code(), Some(2), "{said}");
 }
 
 /// KR-REQ-26.10: a rollback goes on past a rescue whose own daemon did not start, to an older release,
@@ -6625,8 +6695,9 @@ async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
 }
 
 /// KR-REQ-26.10: a rescue the stores refuse, whose undo cannot start again the daemon it stopped,
-/// leaves the failed update recorded and nothing switched. The next rescue, once that daemon can start
-/// and the stores are right, goes back to the older release and starts both daemons from it.
+/// leaves the failed update recorded and nothing switched. The next rescue, once the stores are right,
+/// goes back to the older release and starts both daemons from it, while the daemon of the release
+/// that failed stays unable to start.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_whose_undo_cannot_start_the_daemon_again_is_finished_by_the_next_rescue() {
     let mut host = Host::bare();

@@ -1698,9 +1698,10 @@ kr: the update to 0.3.0+9f1c2b3a4d5e waits: session 7 runs kr-worker/0.2.0+4254a
 ```
 
 A control daemon the update stopped that does not start again, from either release, makes it exit
-with 1 and name the daemon; the update stays recorded. The next run starts it before anything else
-if the switch did not happen, and `kr host update --archive` of the release now current starts it
-if it did.
+with 1 and name the daemon; the update stays recorded. If the update did not switch and went on
+past no earlier failed one, the next run starts the daemon from the release still current.
+Otherwise `kr host update --archive` of the release now current starts it, and any other run asks
+whether it answers.
 
 An environment whose daemon has not run since an earlier schema step does not stop an update: the
 update brings its registry forward before it classes it, and says so. An environment that is no

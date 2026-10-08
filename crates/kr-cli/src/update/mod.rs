@@ -46,7 +46,8 @@
 //! run that stops part way leaves what the next needs to finish it or undo it. It is let go of
 //! only once every daemon the update stopped answers again: a daemon that does not start keeps it
 //! for the next run, which settles it before anything else. That run starts the daemon again when
-//! the switch did not happen, and asks whether it answers when the switch did.
+//! the update is a plain one that never switched. Otherwise the switch happened, or the update
+//! went on past one that had, and the run asks whether the daemon answers.
 
 #[cfg(unix)]
 mod formats;
@@ -1085,7 +1086,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
                     restarted = started;
                 }
                 Err(still) => {
-                    let back = goes_back_to(&failed, &source);
+                    let back = goes_back_to(&failed);
                     let goes_back = older_than(&store, &current_manifest, &back).then_some(&back);
                     return Err(left_part_way(&still.said(), true, goes_back));
                 }
@@ -1166,10 +1167,7 @@ pub async fn rollback(to: Option<&str>) -> Result<Updated> {
             ))
         })?,
         None => if failed {
-            record
-                .update
-                .as_ref()
-                .map(|update| goes_back_to(update, &source))
+            record.update.as_ref().map(goes_back_to)
         } else {
             record.previous.clone()
         }
@@ -1777,9 +1775,10 @@ async fn hand_over(
         return Err(undo(store, record, CliError::Other(said(&error))).await);
     }
     // From here the switch has happened. The update is settled only once every daemon it stopped
-    // answers as a daemon of the target; until then the record keeps it, and the next run starts
-    // what did not start. A record that cannot say it switched is read right all the same: the
-    // next run goes by what `current` names.
+    // answers as a daemon of the target; until then the record keeps it, and the next run asks
+    // whether each answers, while `kr host update --archive` of the target starts the ones that do
+    // not. A record that cannot say it switched is read right all the same: the next run goes by
+    // what `current` names.
     if let Some(update) = record.update.as_mut() {
         update.state = TransactionState::Switched;
     }
@@ -1789,21 +1788,23 @@ async fn hand_over(
     let went_back_to = record
         .update
         .as_ref()
-        .map(|update| goes_back_to(update, &target.release));
+        .map(goes_back_to)
+        .filter(|back| older_than(store, target, back));
     let restarted = match record.update.as_ref() {
         Some(update) => start_recorded(store, update, true).await,
         None => Ok(Vec::new()),
     }
     .map_err(|failed| {
-        // An update that does not start can be gone back from; a rollback goes back to a release
-        // that is older than the one it left, and a daemon that does not start there is started by
-        // an update, which is where a host goes from here.
-        let goes_back = match (&went_back_to, report.rolled_back) {
-            (Some(source), false) => shown!(
+        // A rollback takes only a release older than the current one, so a release it would
+        // refuse is not named: a daemon that does not start from the older release a rollback went
+        // back to is started by `kr host update --archive` of it, which is where a host goes from
+        // there.
+        let goes_back = match &went_back_to {
+            Some(source) => shown!(
                 ", and kr host rollback goes back to {}",
                 crate::shown::release(source)
             ),
-            _ => Shown::said(""),
+            None => Shown::said(""),
         };
         CliError::Other(shown!(
             "this host's current release is {} now, and a control daemon the update stopped did \
@@ -1863,8 +1864,10 @@ fn every_environment<'a>(
 /// returns what ended the update, `ended_by`.
 ///
 /// The update is forgotten, what it staged staying staged, only once every one of those daemons
-/// answers. Until then the record keeps it, the next run starts what did not start before anything
-/// else, and what is returned says so.
+/// answers. Until then the record keeps it, and what is returned says so. The next run settles it
+/// by what `current` names ([`recover`]): an update that went on past no failed one starts what
+/// did not start, before anything else; one that did is that failed update again, whose daemons are
+/// owed, and a run asks whether they answer.
 #[cfg(unix)]
 async fn undo(store: &Store, record: &mut Record, ended_by: CliError) -> CliError {
     // The daemons this update stopped, and not those of a failed update it went on past: they are
@@ -2276,17 +2279,18 @@ fn left_part_way(why: &Shown, switched: bool, back_to: Option<&ReleaseName>) -> 
     ))
 }
 
-/// The release `kr host rollback` goes back to when none is named, for the failed update `update`
-/// when `current` is the release it made current: the last release whose daemon ran, which is the
-/// one a chain of failed updates began from, unless that is the release now current, and then the
-/// one `update` began from.
+/// The release `kr host rollback` goes back to when none is named, for the failed update `update`,
+/// whose target is the release now current: the last release whose daemon ran, which is the one a
+/// chain of failed updates began from, unless that is the release now current, and then the one
+/// `update` began from. It is a release a rollback takes only when it is older than the current
+/// one.
 #[cfg(unix)]
-fn goes_back_to(update: &Transaction, current: &ReleaseName) -> ReleaseName {
+fn goes_back_to(update: &Transaction) -> ReleaseName {
     update
         .abandoned
         .as_ref()
         .map(|failed| failed.source.clone())
-        .filter(|earliest| earliest != current)
+        .filter(|earliest| *earliest != update.target)
         .unwrap_or_else(|| update.source.clone())
 }
 
