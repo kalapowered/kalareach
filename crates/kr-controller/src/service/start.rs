@@ -924,8 +924,8 @@ impl Controller {
     /// `network.proxy_url` as this daemon read it when it started, or `None` when it named none.
     ///
     /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
-    /// delivery and the plugin catalogue never go through two different proxies, and an edit
-    /// applies to all of them at the next start.
+    /// delivery, the managed voice broker and the plugin catalogue never go through two different
+    /// proxies, and an edit applies to all of them at the next start.
     ///
     /// # Errors
     ///
