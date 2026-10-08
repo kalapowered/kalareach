@@ -23,7 +23,7 @@ use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs};
 
 use super::a_share_that_names_a_current_decision::{
     Holding, device_read, holding_grant, holds_question_reads, question, question_id, refused,
-    world,
+    serving, world,
 };
 use crate::grants::GrantRecord;
 use crate::service::a_close_a_worker_never_answers as fake;
@@ -476,6 +476,121 @@ async fn kr_req_25_10_a_share_that_ran_out_does_not_end_the_devices_own_grant() 
             })
         ),
         "{own:?}"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-25.10: a share that runs out under a live subscription ends that subscription: the next
+/// batch is not written, and the connection that carried it ends. It writes nothing on the device's
+/// record, which is paired under a grant of its own, so the device is served under that grant on a
+/// new connection straight away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_share_that_runs_out_under_a_subscription_ends_it_and_the_device_stays_paired()
+ {
+    use std::sync::atomic::Ordering;
+
+    let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+    let holding = std::sync::Arc::new(std::sync::Mutex::new(Holding::default()));
+    let world = fake::fake_world_on(
+        Some(clocks),
+        serving(std::sync::Arc::clone(&holding), holds_question_reads()),
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    let device = paired(&world.controller, 26, SessionSelector::None);
+    let now = wall.load(Ordering::SeqCst);
+    // The share includes the live screen, which is what a subscription needs, and ends a minute on.
+    let (mut grant, _) = crate::service::net::tests::granted(
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(now + 60_000),
+        },
+        world.controller.policy().authority_revision(),
+    );
+    grant.issuer_device_id = world.controller.sharing().host_device_id();
+    grant.recipient_device_id = device.device_id;
+    grant.session_selector = SessionSelector::These {
+        session_ids: [world.session_id].into_iter().collect(),
+    };
+    grant.history.include_live_screen = true;
+    world
+        .controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: grant.clone(),
+                session_id: Some(world.session_id),
+                issued_at_ms: now,
+                activated_at_ms: Some(now),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the share is written");
+    let connection = super::RemoteConnection::for_test(&world.controller, device.clone());
+
+    // A forwarded read opens the connection's link to the session under the share.
+    let opened = connection
+        .read(&device_read(1, Method::QuestionRead, &questions_of(&world)))
+        .await;
+    assert!(
+        matches!(
+            &opened,
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{opened:?}"
+    );
+    let batch =
+        kr_protocol::envelope::ControlFrame::Event(kr_protocol::envelope::ControlEvent::Keepalive);
+    assert!(
+        connection.relay(&batch).await,
+        "a batch goes while the share holds"
+    );
+
+    // The share ends on both clocks.
+    wall.store(now + 120_000, Ordering::SeqCst);
+    continuous.advance(std::time::Duration::from_secs(120));
+    // The serving loop ends the connection when a batch is not written.
+    assert!(
+        !connection.relay(&batch).await,
+        "no batch goes once the share has run out"
+    );
+    let record = world
+        .controller
+        .devices()
+        .record_for_device(device.device_id)
+        .expect("readable")
+        .expect("present");
+    assert_eq!(
+        record.expired_at_ms, None,
+        "a share running out is not the device's grant running out"
+    );
+
+    // The device is served under its own grant on a new connection.
+    let again = super::RemoteConnection::for_test(&world.controller, device);
+    let listed = again
+        .read(&device_read(
+            2,
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: false,
+            },
+        ))
+        .await;
+    assert!(
+        matches!(
+            &listed,
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{listed:?}"
     );
     world.serving.abort();
 }
