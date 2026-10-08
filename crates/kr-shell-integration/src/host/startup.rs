@@ -1162,7 +1162,9 @@ const ENTRY_RECORD_LIMIT: u64 = 1024 * 1024;
 ///
 /// Remove the reading of a record that states no format, and the stamping in
 /// [`EntryRecord::hold`], once no supported upgrade starts from one written before the format was
-/// recorded.
+/// recorded. A release that removes the reading reads no record at version 0, so its
+/// `migrates_from` for this record is 1 and a switch to it is refused while an unstamped record is
+/// left; a release before it therefore has `kr` stamp every record it finds.
 pub const ENTRY_RECORD_VERSION: u32 = 1;
 
 /// The startup files `kr shell install` has put an entry in, for each shell.
@@ -1451,7 +1453,7 @@ const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 /// still has that save replaced, and closing that would need the platform to offer a comparison
 /// and a rename in one step.
 #[derive(Debug)]
-struct FileLock {
+pub(crate) struct FileLock {
     /// The lock file this guard is about.
     path: PathBuf,
     /// The open file the operating system's lock is on, released when this guard drops it.
@@ -1506,15 +1508,44 @@ impl FileLock {
         Self::acquire(Self::beside(path)?, path)
     }
 
-    /// Takes the lock held at `lock` on behalf of the file `path`.
+    /// Takes the lock held at `lock` on behalf of the file `path`, waiting for a holder that is
+    /// still working for as long as [`LOCK_PATIENCE`].
     #[cfg(unix)]
     fn acquire(lock: PathBuf, path: &Path) -> std::io::Result<Self> {
+        Self::acquire_within(lock, path, LOCK_PATIENCE)
+    }
+
+    /// Takes the lock held at `lock` on behalf of the file `path`, waiting for a holder that is
+    /// still working for as long as `patience`.
+    ///
+    /// The lock file is opened without waiting and without following a link, and must be a regular
+    /// file: a pipe where a lock belongs is refused, not waited on.
+    #[cfg(unix)]
+    pub(crate) fn acquire_within(
+        lock: PathBuf,
+        path: &Path,
+        patience: std::time::Duration,
+    ) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(
+                (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW)
+                    .bits()
+                    .try_into()
+                    .unwrap_or(0),
+            )
             .open(&lock)?;
-        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", lock.display()),
+            ));
+        }
+        let deadline = std::time::Instant::now() + patience;
         loop {
             match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => {
@@ -1554,9 +1585,21 @@ impl FileLock {
         Self::acquire(Self::beside(path)?, path)
     }
 
-    /// Takes the lock held at `lock` on behalf of the file `path`.
+    /// Takes the lock held at `lock` on behalf of the file `path`, waiting for a holder that is
+    /// still working for as long as [`LOCK_PATIENCE`].
     #[cfg(not(unix))]
     fn acquire(lock: PathBuf, path: &Path) -> std::io::Result<Self> {
+        Self::acquire_within(lock, path, LOCK_PATIENCE)
+    }
+
+    /// Takes the lock held at `lock` on behalf of the file `path`, waiting for a holder that is
+    /// still working for as long as `patience`.
+    #[cfg(not(unix))]
+    pub(crate) fn acquire_within(
+        lock: PathBuf,
+        path: &Path,
+        patience: std::time::Duration,
+    ) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// What Windows says when another handle holds the file.
@@ -1564,7 +1607,7 @@ impl FileLock {
         /// What it says when a region of it is locked.
         const ERROR_LOCK_VIOLATION: i32 = 33;
 
-        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+        let deadline = std::time::Instant::now() + patience;
         loop {
             match std::fs::OpenOptions::new()
                 .write(true)

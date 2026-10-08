@@ -144,35 +144,79 @@ pub fn preference_document(id: &str) -> String {
         .to_string()
 }
 
+/// The file that serialises the changes of the saved preference, beside it.
+pub const PREFERENCE_LOCK_FILE: &str = "terminal.lock";
+
+/// How long a change of the saved preference waits for another that is under way.
+const PREFERENCE_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The hold on the saved preference for one change, released when it drops.
+#[derive(Debug)]
+pub struct PreferenceHold {
+    _lock: super::startup::FileLock,
+}
+
+/// Holds the saved preference of an environment for one change: the `kr host terminal` that sets
+/// or clears it, and the stamp that writes its format, take this in turn, so that neither writes
+/// over what the other has just written.
+///
+/// # Errors
+///
+/// Returns the failure to open the lock, which must be a regular file, or a timeout when another
+/// change held it throughout.
+pub fn hold_preference(state_dir: &std::path::Path) -> std::io::Result<PreferenceHold> {
+    hold_preference_within(state_dir, PREFERENCE_LOCK_PATIENCE)
+}
+
+/// [`hold_preference`] waiting for as long as `patience`.
+fn hold_preference_within(
+    state_dir: &std::path::Path,
+    patience: std::time::Duration,
+) -> std::io::Result<PreferenceHold> {
+    super::startup::FileLock::acquire_within(
+        state_dir.join(PREFERENCE_LOCK_FILE),
+        &state_dir.join(PREFERENCE_FILE),
+        patience,
+    )
+    .map(|lock| PreferenceHold { _lock: lock })
+}
+
 /// Writes the saved terminal preference again with its format stated, where the file is a document
 /// this build reads that states none, or states `0`: it was written before the format was
-/// recorded. A file this build does not read, and one that states a format, is left as it is.
+/// recorded. A file this build does not read, one that states a format, and one that cannot be held
+/// for the change is left as it is.
 ///
-/// The file is read as a regular file of its own size, once to decide and once more just before it
-/// is written, and left alone if it changed between: `kr host terminal` writes it without a lock,
-/// so a choice made in the moment between that second read and the write is the one thing this
-/// cannot keep.
+/// The change is made while the preference is held, and the document is read again under the hold,
+/// so a choice made by `kr host terminal` before it is the one that is stamped.
 ///
 /// Remove it, with the reading of a document that states no format, once no supported upgrade
 /// starts from one written before the format was recorded.
 pub fn stamp_preference(state_dir: &std::path::Path) {
+    stamp_preference_within(state_dir, PREFERENCE_LOCK_PATIENCE);
+}
+
+/// [`stamp_preference`] waiting for as long as `patience` for a change that is under way.
+fn stamp_preference_within(state_dir: &std::path::Path, patience: std::time::Duration) {
     let file = state_dir.join(PREFERENCE_FILE);
     let read = || kr_ipc::paths::read_owner_only_file(&file, PREFERENCE_MAX_LEN);
-    let Ok(Some(bytes)) = read() else {
-        return;
-    };
-    let unstamped =
-        serde_json::from_slice::<std::collections::BTreeMap<String, serde_json::Value>>(&bytes)
+    let states_none = |bytes: &[u8]| {
+        serde_json::from_slice::<std::collections::BTreeMap<String, serde_json::Value>>(bytes)
             .is_ok_and(|members| {
                 members
                     .get(PREFERENCE_VERSION_KEY)
                     .is_none_or(|stated| stated.as_u64() == Some(0))
-            });
-    if !unstamped {
+            })
+    };
+    // Nothing is held for the common case, a preference that is stamped or not there.
+    if !matches!(read(), Ok(Some(bytes)) if states_none(&bytes)) {
         return;
     }
-    if let Some(chosen) = parse_preference(&bytes)
-        && read().is_ok_and(|again| again.as_deref() == Some(bytes.as_slice()))
+    let Ok(_held) = hold_preference_within(state_dir, patience) else {
+        return;
+    };
+    if let Ok(Some(bytes)) = read()
+        && states_none(&bytes)
+        && let Some(chosen) = parse_preference(&bytes)
     {
         let _ =
             kr_ipc::paths::write_owner_only_file(&file, preference_document(&chosen).as_bytes());
@@ -713,6 +757,57 @@ mod tests {
                 "the pipe is neither waited for nor replaced"
             );
         }
+    }
+
+    /// The stamp and a change of the preference take the same hold, in turn: while a change is under
+    /// way the stamp leaves the file as it is, and what the change wrote is what the file holds when
+    /// it lets go. A pipe where the lock belongs is refused and not waited on.
+    #[cfg(unix)]
+    #[test]
+    fn the_stamp_leaves_the_file_while_a_change_holds_it_and_a_pipe_is_no_lock() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join(PREFERENCE_FILE);
+        let patience = std::time::Duration::from_millis(50);
+        let older = br#"{"terminal": "iterm2"}"#;
+        kr_ipc::paths::write_owner_only_file(&file, older).expect("an older preference");
+        // A change is under way: the stamp waits out its patience and does not write.
+        let held = hold_preference(directory.path()).expect("held");
+        stamp_preference_within(directory.path(), patience);
+        assert_eq!(
+            std::fs::read(&file).expect("reads"),
+            older,
+            "the stamp does not write while a change is under way"
+        );
+        assert!(
+            hold_preference_within(directory.path(), patience).is_err(),
+            "and a second change waits out its patience and is refused"
+        );
+        // The change writes its choice and lets go; the file holds the choice.
+        kr_ipc::paths::write_owner_only_file(&file, preference_document("kitty").as_bytes())
+            .expect("a choice");
+        drop(held);
+        stamp_preference_within(directory.path(), patience);
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("reads"),
+            preference_document("kitty"),
+            "the choice made under the hold is what the file holds"
+        );
+        // With nothing holding it, an older document is stamped.
+        kr_ipc::paths::write_owner_only_file(&file, older).expect("an older preference");
+        stamp_preference_within(directory.path(), patience);
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("reads"),
+            preference_document("iterm2"),
+        );
+
+        // A pipe where the lock belongs is no lock: it is refused at once.
+        let other = tempfile::tempdir().expect("a directory");
+        let made = std::process::Command::new("mkfifo")
+            .arg(other.path().join(PREFERENCE_LOCK_FILE))
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a named pipe where the lock would be");
+        assert!(hold_preference_within(other.path(), patience).is_err());
     }
 
     #[test]

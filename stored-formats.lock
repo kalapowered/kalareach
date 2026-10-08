@@ -622,6 +622,14 @@
     },
     {
       "scope": "environment",
+      "path": "terminal.lock",
+      "reason": "the lock on the saved terminal preference; empty",
+      "children": [],
+      "opaque": false,
+      "databases": false
+    },
+    {
+      "scope": "environment",
       "path": "terminfo",
       "reason": "terminal descriptions compiled from the build's own, written again when absent",
       "children": [],

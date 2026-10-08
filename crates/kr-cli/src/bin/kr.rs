@@ -855,6 +855,27 @@ async fn run(cli: Cli) -> Result<Completion> {
                     .state_dir()
                     .join(kr_shell_integration::host::terminal::PREFERENCE_FILE);
                 let available = kr_shell_integration::host::terminal::detect();
+                // A change of the saved preference is made while the preference is held, as the
+                // daemon's stamping of its format is. An environment whose state directory is not
+                // there yet has no preference to clear, and none is held.
+                let _held = ((terminal.clear || terminal.set.is_some())
+                    && environment.paths.state_dir().is_dir())
+                .then(|| {
+                    kr_shell_integration::host::terminal::hold_preference(
+                        environment.paths.state_dir(),
+                    )
+                })
+                .transpose()
+                .map_err(|error| {
+                    CliError::Other(shown!(
+                        "could not hold {}: {}",
+                        Shown::within(
+                            environment.paths.state_dir(),
+                            kr_shell_integration::host::terminal::PREFERENCE_LOCK_FILE
+                        ),
+                        Shown::io(&error)
+                    ))
+                })?;
                 if terminal.clear {
                     // Removing the file is the whole of it: with no preference, detection decides.
                     match std::fs::remove_file(&file) {

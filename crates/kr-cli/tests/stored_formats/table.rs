@@ -649,6 +649,11 @@ pub fn named() -> Vec<Named> {
         ),
         leaf(
             StoreScope::Environment,
+            "terminal.lock",
+            "the lock on the saved terminal preference; empty",
+        ),
+        leaf(
+            StoreScope::Environment,
             "power.json",
             "a document the sleep setting used to live in; nothing reads it",
         ),
