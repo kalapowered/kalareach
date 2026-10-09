@@ -233,6 +233,8 @@ impl Rig {
     }
 
     /// Seals one generation as the daemon's writer would, and admits it to the daemon's outbox.
+    /// The first generation also enrols the daemon's writer for the archive, which wakes the
+    /// carrier once and the admission a second time.
     fn admit(&self, generation: u64, objects: &[(u8, Vec<u8>)]) {
         admit(
             &self.controller,
@@ -241,6 +243,45 @@ impl Rig {
             archive_id(),
             generation,
             objects,
+        );
+    }
+
+    /// Enrols the daemon's writer for the archive, and returns once the carrier has looked at it
+    /// and is idle again. What is admitted after that wakes the carrier once, and a carrier that
+    /// is looking at the work the admission brought is not woken a second time by anything.
+    async fn enrol_the_writer_and_let_the_carrier_settle(&self) {
+        let runtime = self.controller.backup_runtime().expect("a carrier");
+        // Nothing has woken the carrier since it began, so once the pass it began with has ended
+        // it is idle, and the pass the enrolment wakes is the next one.
+        let mut passes = runtime.passes();
+        within("the pass the carrier began with", async {
+            while *passes.borrow_and_update() < 1 {
+                passes.changed().await.expect("the carrier is running");
+            }
+        })
+        .await;
+        self.controller
+            .backup()
+            .enrol_writer(self.writer.key_id(), archive_id(), kr_ipc::now_ms())
+            .expect("the daemon enrols its own writer for the archive");
+        within("the pass the enrolment woke", async {
+            while *passes.borrow_and_update() < 2 {
+                passes.changed().await.expect("the carrier is running");
+            }
+        })
+        .await;
+    }
+
+    /// Admits a generation to an archive the daemon's writer is already enrolled for.
+    fn admit_to_an_enrolled_archive(&self, generation: u64, objects: &[(u8, Vec<u8>)]) {
+        seal_and_admit(
+            &self.controller,
+            &self.writer,
+            (&self.sender, &self.device),
+            archive_id(),
+            generation,
+            objects,
+            false,
         );
     }
 
@@ -507,14 +548,36 @@ fn enrolment(
     BackupWriterRecord { payload, signature }
 }
 
-/// Seals one generation as `writer` would, and admits it to the daemon's outbox.
+/// Seals one generation as `writer` would, and admits it to the daemon's outbox. The first
+/// generation enrols the writer for the archive first.
 fn admit(
+    controller: &Controller,
+    writer: &AuthorisationKeyPair,
+    sealing: (&StoredEnvelopeKeyPair, &StoredEnvelopeKeyPair),
+    archive: ArchiveId,
+    generation: u64,
+    objects: &[(u8, Vec<u8>)],
+) {
+    seal_and_admit(
+        controller,
+        writer,
+        sealing,
+        archive,
+        generation,
+        objects,
+        generation == 1,
+    );
+}
+
+/// Seals one generation as `writer` would and admits it, enrolling the writer first when asked.
+fn seal_and_admit(
     controller: &Controller,
     writer: &AuthorisationKeyPair,
     (sender, device): (&StoredEnvelopeKeyPair, &StoredEnvelopeKeyPair),
     archive: ArchiveId,
     generation: u64,
     objects: &[(u8, Vec<u8>)],
+    enrolling: bool,
 ) {
     let staged: Vec<StagedObject> = objects
         .iter()
@@ -551,7 +614,7 @@ fn admit(
     .expect("a sealed archive");
     let backup = controller.backup();
     let now = kr_ipc::now_ms();
-    if generation == 1 {
+    if enrolling {
         backup
             .enrol_writer(writer.key_id(), archive, now)
             .expect("the daemon enrols its own writer for the archive");
@@ -1386,6 +1449,12 @@ async fn a_woken_carrier_waits_only_for_what_is_left_of_a_delay() {
     let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
     let web = Arc::clone(rig.served.web());
     within("the first status read", web.requests_reach(STATUS, 1)).await;
+    // The enrolment and the admission each wake the carrier. If the second came while the first
+    // wake's pass was looking at the work, the carrier would look again at once, inside the delay
+    // and before the clock below has moved, and ask for the whole delay a second time; it would
+    // then wait that out without listening for work, and the wake this test is about would have
+    // nothing to wake. So the enrolment's pass ends before the work is admitted.
+    rig.enrol_the_writer_and_let_the_carrier_settle().await;
     // Something only a person can mend, and a delay longer than the five minutes a person is given.
     web.fail(
         CREATE,
@@ -1396,7 +1465,7 @@ async fn a_woken_carrier_waits_only_for_what_is_left_of_a_delay() {
             retry_after_seconds: Some(600),
         },
     );
-    rig.admit(1, &[(1, plaintext(2048))]);
+    rig.admit_to_an_enrolled_archive(1, &[(1, plaintext(2048))]);
     let (waited, _) = within("the refusal", timer.next_wait()).await;
     assert_eq!(waited, Duration::from_secs(600));
 
@@ -1404,17 +1473,7 @@ async fn a_woken_carrier_waits_only_for_what_is_left_of_a_delay() {
     // asked to be left alone, and waits the rest.
     timer.advance(Duration::from_secs(100));
     rig.admit(2, &[(3, plaintext(2048))]);
-    // A pass the first admission woke may have asked for the whole delay before the clock moved:
-    // that wait was asked for at the earlier reading and is not the one this test is about.
-    let left = within("the rest of the delay", async {
-        loop {
-            let (asked, _) = timer.next_wait().await;
-            if asked < Duration::from_secs(600) {
-                break asked;
-            }
-        }
-    })
-    .await;
+    let (left, _) = within("the rest of the delay", timer.next_wait()).await;
     assert_eq!(left, Duration::from_secs(500));
     assert!(!rig.published(1));
 }
