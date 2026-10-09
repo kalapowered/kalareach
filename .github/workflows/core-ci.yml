@@ -489,7 +489,7 @@ jobs:
 
       - name: Close the route to libsodium's download host
         run: |
-          Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "0.0.0.0 download.libsodium.org"
+          Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n0.0.0.0 download.libsodium.org"
           ipconfig /flushdns | Out-Null
           # The resolver answers a name that the hosts file sends to 0.0.0.0 with "no data", and
           # an answer of 0.0.0.0 would close the route as well. Any other address leaves it open.
