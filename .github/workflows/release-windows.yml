@@ -159,6 +159,12 @@ jobs:
           rustc --version
           cargo --version
 
+      # libsodium's prebuilt libraries come from files this places, not from a download in the
+      # middle of the compile. The crate's build script checks both against libsodium's public key,
+      # as it does for a download.
+      - name: Place libsodium's archives
+        uses: ./.github/actions/libsodium-archive
+
       # What this release is, settled before anything is built, and on a tag held to the tag. A host
       # tag is `host/v<version>+<first twelve characters of the commit>`, so it names both the
       # version the archive carries and the commit it came from; a tag that names either of them
