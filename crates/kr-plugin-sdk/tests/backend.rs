@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend with a table the gateway reads is accepted and round-trips; a table it cannot read, a missing `messages`, colliding member names, a declaration with no table, and a table with more methods than the gateway interprets are each named |
+//! | KR-REQ-12.07 | a backend with a table the gateway reads is accepted and round-trips; a table it cannot read (its transport named as the table writes it, ordered correlation without ending the rest of the check), a missing `messages`, colliding member names, an empty table, a wire name it cannot hold, a declaration with no table, and a table with more methods than the gateway interprets are each named; every stored package that is not an invalid fixture reads and writes back as it was |
 
 use std::path::Path;
 
@@ -154,21 +154,23 @@ fn kr_req_12_07_a_package_written_before_the_backend_reads_and_writes_as_before(
     ] {
         for (path, name) in files_named(&root.join(directory), &[MANIFEST_FILE, CONNECTOR_FILE]) {
             let bytes = std::fs::read(&path).expect("the document reads");
-            let original: serde_json::Value = match serde_json::from_slice(&bytes) {
-                Ok(value) => value,
-                // An invalid fixture is invalid on purpose; only the documents that read count.
-                Err(_) => continue,
-            };
+            // A fixture under `invalid` is invalid on purpose; every other document has to read.
+            if path
+                .components()
+                .any(|component| component.as_os_str() == "invalid")
+            {
+                continue;
+            }
+            let original: serde_json::Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|error| panic!("{} is JSON: {error}", path.display()));
             let again = if name == MANIFEST_FILE {
-                let Ok(typed) = serde_json::from_slice::<PluginManifest>(&bytes) else {
-                    continue;
-                };
+                let typed = serde_json::from_slice::<PluginManifest>(&bytes)
+                    .unwrap_or_else(|error| panic!("{} reads: {error}", path.display()));
                 manifests += 1;
                 serde_json::to_value(typed)
             } else {
-                let Ok(typed) = serde_json::from_slice::<ConnectorManifest>(&bytes) else {
-                    continue;
-                };
+                let typed = serde_json::from_slice::<ConnectorManifest>(&bytes)
+                    .unwrap_or_else(|error| panic!("{} reads: {error}", path.display()));
                 tables += 1;
                 serde_json::to_value(typed)
             }
@@ -189,8 +191,8 @@ fn kr_req_12_07_a_package_written_before_the_backend_reads_and_writes_as_before(
             );
         }
     }
-    assert!(manifests >= 15, "only {manifests} manifests were read");
-    assert!(tables >= 10, "only {tables} tables were read");
+    assert!(manifests >= 30, "only {manifests} manifests were read");
+    assert!(tables >= 17, "only {tables} tables were read");
     // A declaration that sets none of the new members writes none of them.
     let mut plain = declaration();
     plain.backend = None;
@@ -228,7 +230,7 @@ fn kr_req_12_07_a_table_the_gateway_cannot_read_is_named_for_what_it_is() {
     refused(
         &table,
         FindingCode::ConnectorTableInvalid,
-        "standard streams",
+        "the table's transport is \"loopback_http\"",
     );
 
     let mut table = gateway_table();
@@ -245,6 +247,16 @@ fn kr_req_12_07_a_table_the_gateway_cannot_read_is_named_for_what_it_is() {
     let mut table = gateway_table();
     table.response_correlation = ResponseCorrelation::Ordered {};
     refused(&table, FindingCode::ConnectorTableInvalid, "by order");
+    // Correlation by order is one finding among the others, not the end of the check: the rest of
+    // the table is read, so a publisher fixes every finding in one pass.
+    table.messages = None;
+    let report = validate_with(&table, Some(declaration()), true);
+    let detail = detail_of(&report, FindingCode::ConnectorTableInvalid);
+    assert!(
+        detail.contains("by order") && detail.contains("names none"),
+        "{:?}",
+        report.findings
+    );
 
     let mut table = gateway_table();
     table.request_id_path = members(&["params", "id"]);
