@@ -69,7 +69,7 @@ fn read_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 
 /// The file's bytes, when it is a regular file of at most one control frame. The limit is put on
 /// the read of the file that was opened, so a file that grows after it was looked at is still cut.
-/// A link is followed here: the platform gives no way to refuse one that this program uses.
+/// A link is followed here: this program does not refuse one on this platform.
 #[cfg(not(unix))]
 fn read_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
