@@ -119,8 +119,8 @@ impl RemoteConnection {
     /// Decides one mutation of this device's, under the grant it acts under.
     ///
     /// A delegation acts under the share it delegates from, which its parameters name, and a
-    /// revocation of one acts under the share its device delegated the revoked grant from, which
-    /// no parameter names: the grants say. Every other mutation acts under the grant it names in
+    /// revocation of one acts under the nearest live share its device holds above the revoked
+    /// grant, which no parameter names: the grants say. Every other mutation acts under the grant it names in
     /// its envelope, or the one the session selects ([`Self::ask_naming`]).
     pub(super) fn ask_mutation(
         &self,

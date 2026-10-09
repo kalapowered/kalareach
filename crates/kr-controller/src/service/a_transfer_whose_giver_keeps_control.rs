@@ -199,3 +199,82 @@ async fn the_grant_above_is_found_however_long_the_chain_below_it() {
         "refused for the grant above: {refused}"
     );
 }
+
+/// KR-REQ-18.03: a chain that cannot be walked to its top is not one with no grant held above, so a
+/// transfer from the end of it is refused rather than described. The grant in the middle of the
+/// chain is gone from the store, which no host does, and the giving device holds a share above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_with_a_missing_link_is_not_one_without_a_grant_above() {
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
+    let giver = paired(&controller, 1, None).device_id;
+    let taker = paired_with_all_keys(&controller);
+    let share = owner_share(&controller, session_id, giver);
+    let now_ms = kr_ipc::now_ms().get();
+
+    let mut parent = share.clone();
+    let mut chain = Vec::new();
+    for link in 0_u8..2 {
+        let child = kr_protocol::grant::Grant {
+            grant_id: GrantId::new(Uuid::from_bytes([0x40 + link; 16])),
+            parent_grant_id: Nullable::some(parent.grant_id),
+            issuer_device_id: parent.recipient_device_id,
+            recipient_device_id: if link == 1 {
+                giver
+            } else {
+                DeviceId::new(Uuid::from_bytes([0x50; 16]))
+            },
+            ..parent.clone()
+        };
+        controller
+            .sharing()
+            .grants()
+            .issue(
+                &crate::grants::GrantRecord {
+                    grant: child.clone(),
+                    session_id: Some(session_id),
+                    issued_at_ms: now_ms,
+                    activated_at_ms: Some(now_ms),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the chain is written");
+        chain.push(child.clone());
+        parent = child;
+    }
+    let describe = || {
+        controller.transfer_plan(
+            &actor_id,
+            &GrantTransferParams {
+                session_id,
+                from_grant_id: chain[1].grant_id,
+                to_device_id: taker,
+            },
+            ActionId::new(Uuid::from_bytes([9; 16])),
+        )
+    };
+    assert!(
+        describe()
+            .expect_err("the giving device holds the share at the top")
+            .to_string()
+            .contains("keep control"),
+        "with the chain whole, the share above is found"
+    );
+
+    // The middle of the chain is removed from the store.
+    super::one_barrier_for_every_restriction::beside(&temp)
+        .execute(
+            "DELETE FROM grants WHERE grant_id = ?1",
+            [chain[0].grant_id.get().as_bytes().as_slice()],
+        )
+        .expect("the row is removed");
+    let refused =
+        describe().expect_err("a chain that cannot be walked is not one with nothing above");
+    assert!(
+        refused.to_string().contains("does not hold"),
+        "refused for the missing link, not described: {refused}"
+    );
+}

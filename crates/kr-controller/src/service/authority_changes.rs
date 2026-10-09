@@ -129,8 +129,9 @@ impl Controller {
     /// revocation, whose answer waits for any fence it still owes.
     ///
     /// A grant and the invitation that carries it take identities derived from the actor and the
-    /// action and are written in one commit, so finding them is finding what this action wrote, and the answer is
-    /// rebuilt from what was written rather than proposed again. Nothing else outside a revocation
+    /// action and are written in one commit, so finding them is finding what this action wrote, and
+    /// the answer is rebuilt from what was written rather than proposed again. Nothing else outside a
+    /// revocation
     /// names the action that changed it: a device's record can hold the key a registration asked
     /// for because another action registered the same key, a destination's credential says nothing
     /// about which request set it, and a voice change is not an authority change.
@@ -810,7 +811,8 @@ impl Controller {
     /// # Errors
     ///
     /// Returns a storage error when a record cannot be read, and a refusal when the records name
-    /// each other as parents, which no host writes.
+    /// each other as parents or a grant names a parent the host does not hold, which no host
+    /// writes: a chain that cannot be walked to its top is not one with no ancestor held.
     pub(crate) fn delegating_ancestor(
         &self,
         device_id: kr_protocol::ids::DeviceId,
@@ -828,7 +830,9 @@ impl Controller {
                 });
             }
             let Some(parent) = grants.record(parent_id)? else {
-                return Ok(None);
+                return Err(ControllerError::PermissionDenied {
+                    detail: "a grant of this host names a parent that it does not hold".to_owned(),
+                });
             };
             if parent.grant.recipient_device_id == device_id
                 && parent.is_active()
@@ -957,7 +961,9 @@ impl Controller {
     ///
     /// Returns [`ControllerError::PermissionDenied`] for a grant this host does not hold or that
     /// carries no control to transfer, for a device that is not paired with all four of its keys
-    /// held, and for a plan that hands over more than the grant carries.
+    /// held, for a giving device that holds a grant the given-up one was delegated from, for a chain
+    /// of grants that cannot be walked to its top, and for a plan that hands over more than the
+    /// grant carries; and a storage error when a record cannot be read.
     pub(crate) fn transfer_plan(
         &self,
         actor_id: &ActorId,

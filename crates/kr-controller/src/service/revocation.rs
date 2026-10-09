@@ -11,7 +11,9 @@ use super::{Controller, net};
 ///
 /// It is a function of the actor that made the revocation and of nothing else, so no path that
 /// answers a revocation (the first answer, a repeat, a retry of an unfinished claim) can answer a
-/// device as it answers the owner.
+/// device as it answers the owner. It covers `grant.revoke`, the one revocation a device makes;
+/// `device.revoke` and `grant.transfer` are served to the owner at this machine alone, and are
+/// answered as the owner's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Audience {
     /// The owner at this machine: every worker the host holds.
@@ -24,12 +26,15 @@ pub enum Audience {
 
 impl Audience {
     /// The audience of an answer to `actor_id`.
+    ///
+    /// The owner is the caller at this machine, over its own socket. Anything this host cannot
+    /// recognise as that peer is answered as a device, because that is the answer that withholds.
     #[must_use]
     pub fn of(actor_id: &kr_protocol::ids::ActorId) -> Self {
-        if kr_transport::listener::is_device_principal(actor_id) {
-            Self::Device
-        } else {
+        if super::routes::is_owners_own_socket(actor_id) {
             Self::Host
+        } else {
+            Self::Device
         }
     }
 }
@@ -398,7 +403,14 @@ impl Controller {
     /// revocation that finds it already revoked, and withdraws nothing, is told of the same
     /// workers, and a barrier still pending for them is still read as pending. A delegation
     /// narrows what it is made from, so what the grant covers covers what descends from it. A
-    /// grant over every session is held by a device that reaches every session.
+    /// share and a transfer's replacement name their sessions, so a device does not revoke a grant
+    /// over every session; were one named, the device would hold a share over every session
+    /// above it, and is told of them all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when a device is asked about no grant, which is no answer a device is
+    /// given, and a storage error when the grant cannot be read.
     fn barrier_for(
         &self,
         audience: Audience,
@@ -408,12 +420,13 @@ impl Controller {
         if audience == Audience::Host {
             return Ok(barrier);
         }
+        let Some(named) = named else {
+            return Err(crate::error::ControllerError::PermissionDenied {
+                detail: "a device is told of the workers of the grant it revokes".to_owned(),
+            });
+        };
         let mut covered = std::collections::BTreeSet::new();
-        if let Some(record) = named
-            .map(|grant_id| self.sharing.grants().record(grant_id))
-            .transpose()?
-            .flatten()
-        {
+        if let Some(record) = self.sharing.grants().record(named)? {
             match record.grant.session_selector {
                 kr_protocol::grant::SessionSelector::Any => return Ok(barrier),
                 kr_protocol::grant::SessionSelector::These { session_ids } => {

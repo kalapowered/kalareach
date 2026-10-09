@@ -307,4 +307,34 @@ async fn a_device_that_revokes_through_the_daemon_is_told_of_its_own_sessions_on
     let revoked: RevocationResult = answer.to_typed().expect("decodes");
     assert!(revoked.revoked_grants.contains(&delegated.grant.grant_id));
     assert_eq!(sessions(&revoked), vec![ours]);
+
+    // The same action sent again is answered with the same answer, from the record.
+    let again = controller
+        .authority_change(
+            &actor_id,
+            super::authority_changes::AuthorityCaller::Device(holder),
+            &mutation,
+            Method::GrantRevoke,
+            carried,
+        )
+        .await
+        .expect("a repeat of the action is answered");
+    assert_eq!(
+        again.to_typed::<RevocationResult>().expect("decodes"),
+        revoked
+    );
+}
+
+/// An answer goes to the owner's view only to the caller at this machine over its own socket, and
+/// to anyone the host cannot recognise as that caller in a device's: the answer that withholds.
+#[test]
+fn only_the_owners_own_socket_is_answered_as_the_owner() {
+    let owner = ActorId::new("local:501").expect("a principal");
+    let device = kr_transport::listener::device_principal(&DeviceId::new(
+        kr_protocol::scalars::Uuid::from_bytes([3; 16]),
+    ));
+    let unknown = ActorId::new("service:backup").expect("a principal");
+    assert_eq!(Audience::of(&owner), Audience::Host);
+    assert_eq!(Audience::of(&device), Audience::Device);
+    assert_eq!(Audience::of(&unknown), Audience::Device);
 }
