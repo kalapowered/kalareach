@@ -310,23 +310,35 @@ pub fn is_outside_in_a_daemon_scope(path: &str, unit: Option<&str>) -> bool {
     })
 }
 
-/// Whether a process has left the session it was recorded in for a control daemon's own scope: it
-/// leads a session of its own other than `session`, and its control group is a daemon's scope
-/// outside `unit`.
+/// Whether the recorded process `identity` has left the session it was recorded in for a control
+/// daemon's own scope: it is still that process, it leads a session of its own other than
+/// `session`, and its control group is a daemon's scope outside `unit`.
 ///
 /// A control daemon that a command of the session starts calls `setsid` before it can be in its
 /// scope, so it always leads a session when it is in one. What this reads is a statement about the
 /// scope's name, which any process of the account can give its own scope; it decides that a process
 /// is not stopped with the session, and the closure names what it skipped.
 #[must_use]
-pub fn left_for_a_daemon(pid: u32, session: u32, unit: Option<&str>) -> bool {
+pub fn left_for_a_daemon(
+    identity: &ProcessStartIdentity,
+    session: u32,
+    unit: Option<&str>,
+) -> bool {
+    let Ok(pid) = u32::try_from(identity.pid.get()) else {
+        return false;
+    };
     let Some(path) = control_group_of(pid) else {
         return false;
     };
     if !is_outside_in_a_daemon_scope(&path, unit) {
         return false;
     }
-    pid != session && process_lineage(pid).is_ok_and(|lineage| lineage.session == Some(pid))
+    // Read after the control group, and the process has to be the recorded one: a number that
+    // passed to another process in between is not a process that left.
+    pid != session
+        && process_lineage(pid).is_ok_and(|lineage| {
+            lineage.identity.start_value == identity.start_value && lineage.session == Some(pid)
+        })
 }
 
 /// Reads this process's own start identity.
@@ -1413,6 +1425,25 @@ mod platform {
     mod tests {
         use super::{Held, after_a_missing_entry, decide, parse_start_ticks};
         use crate::identity::{ProcessQuery, ProcessState};
+
+        /// What the kernel says about numbers, read for real: a process of another account, or any
+        /// process this account may signal, is held by somebody; the number of a child that has
+        /// been collected is held by nobody.
+        #[test]
+        fn the_kernel_says_whether_a_number_is_held_when_proc_shows_nothing() {
+            use super::held;
+
+            assert_eq!(held(1), Held::Somebody, "the first process is somebody's");
+            assert_eq!(held(std::process::id()), Held::Somebody);
+            let mut child = std::process::Command::new("true").spawn().expect("a child");
+            let number = child.id();
+            child.wait().expect("collects it");
+            assert_eq!(
+                held(number),
+                Held::Nobody,
+                "a collected child's number is nobody's"
+            );
+        }
 
         /// A `/proc` entry that is missing is a process that has gone only when the kernel says
         /// nobody holds the number. Where somebody does, and `/proc` shows nothing (a mount that
