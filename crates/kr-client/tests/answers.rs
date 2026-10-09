@@ -897,13 +897,20 @@ async fn keeping_an_answer_does_not_replace_one_it_cannot_read() {
     assert_eq!(drafts.drafts().expect("reads"), vec![new]);
 }
 
-/// KR-REQ-26.10: the lock a write of a kept answer holds is opened without following a link or
-/// waiting on a pipe. A link or a pipe at the lock's name refuses the write, which writes nothing and
-/// does not hang, and a link's target is not created.
-#[cfg(unix)]
-#[tokio::test]
-async fn keeping_an_answer_refuses_a_lock_that_is_a_link_or_a_pipe() {
-    let (directory, drafts) = store();
+/// A symbolic link at `link` to `target`, where the platform lets this user make one.
+fn link(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+/// A draft to keep, and the permit to keep it with as a client outside a store has one.
+fn something_to_keep() -> (AnswerDraft, kr_ipc::install::Writers) {
     let asked = question(9);
     let draft = AnswerDraft {
         version: ANSWER_FORMAT,
@@ -919,15 +926,26 @@ async fn keeping_an_answer_refuses_a_lock_that_is_a_link_or_a_pipe() {
         &mut || {},
     )
     .expect("a client outside a store holds nothing");
+    (draft, writers)
+}
+
+/// KR-REQ-26.10: the lock a write of a kept answer holds is opened without following a link. A link
+/// at the lock's name refuses the write, which writes nothing, and its target is not created.
+#[tokio::test]
+async fn keeping_an_answer_refuses_a_lock_that_is_a_link() {
+    let (directory, drafts) = store();
+    let (draft, writers) = something_to_keep();
     let permit = writers
         .permit(&kr_client::answers::WRITTEN)
         .expect("permitted");
     let lock = directory.path().join("answers").join("answers.lock");
     let _ = std::fs::remove_file(&lock);
-
-    // A link where the lock belongs: its target is not created, and nothing is kept.
     let target_of_the_link = directory.path().join("somebody-elses");
-    std::os::unix::fs::symlink(&target_of_the_link, &lock).expect("plants a link");
+    if let Err(error) = link(&target_of_the_link, &lock) {
+        // Windows lets an account make a link only when it holds the privilege to.
+        eprintln!("skipped: this account cannot make a symbolic link here: {error}");
+        return;
+    }
     let error = drafts
         .keep(&draft, &permit)
         .expect_err("a link is not a lock");
@@ -937,9 +955,20 @@ async fn keeping_an_answer_refuses_a_lock_that_is_a_link_or_a_pipe() {
     );
     assert!(!target_of_the_link.exists(), "the link was not followed");
     assert!(drafts.drafts().expect("reads").is_empty());
+}
 
-    // A pipe where the lock belongs: refused at once, not waited on.
-    std::fs::remove_file(&lock).expect("removed");
+/// KR-REQ-26.10: the lock a write of a kept answer holds is opened without waiting for a writer. A
+/// pipe at the lock's name refuses the write at once, which writes nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn keeping_an_answer_refuses_a_lock_that_is_a_pipe() {
+    let (directory, drafts) = store();
+    let (draft, writers) = something_to_keep();
+    let permit = writers
+        .permit(&kr_client::answers::WRITTEN)
+        .expect("permitted");
+    let lock = directory.path().join("answers").join("answers.lock");
+    let _ = std::fs::remove_file(&lock);
     let made = std::process::Command::new("mkfifo")
         .arg(&lock)
         .status()
@@ -974,26 +1003,23 @@ async fn listing_the_kept_answers_refuses_a_pipe_or_a_link_under_an_answer_name(
         .status()
         .expect("mkfifo runs");
     assert!(made.success(), "a pipe is made");
-    let listing = std::thread::spawn({
+    let (ended, listed) = std::sync::mpsc::channel();
+    std::thread::spawn({
         let answers = answers.clone();
         move || {
-            AnswerDrafts::open(&answers)
-                .expect("the store opens")
-                .drafts()
+            let _ = ended.send(
+                AnswerDrafts::open(&answers)
+                    .expect("the store opens")
+                    .drafts(),
+            );
         }
     });
-    let started = std::time::Instant::now();
-    while !listing.is_finished() {
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(60),
-            "the listing waits on the pipe"
-        );
-        std::thread::yield_now();
-    }
-    let error = listing
-        .join()
-        .expect("the listing ends")
-        .expect_err("a pipe is not an answer");
+    // The listing ends, or the test says it waits on the pipe. The thread of a listing that waits is
+    // left behind with the process.
+    let listing = listed
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the listing waits on the pipe");
+    let error = listing.expect_err("a pipe is not an answer");
     assert!(matches!(error, AnswerError::Unreadable { .. }), "{error}");
     std::fs::remove_file(&piped).expect("removed");
 

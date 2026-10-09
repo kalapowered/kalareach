@@ -2596,19 +2596,35 @@ pub fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Opens the lock file at `path`, creating it when it is not there.
+/// Opens the lock file at `path`, creating it when it is not there, without following a link, and
+/// checks that the handle it opened is a regular file.
+///
+/// A symbolic link or a junction under the name is opened as the link itself and refused by its
+/// attributes, so the open creates nothing at its target.
 ///
 /// # Errors
 ///
-/// Returns the failure to open it.
+/// Returns the failure to open it, or [`std::io::ErrorKind::InvalidInput`] when it is a link or not
+/// a regular file.
 #[cfg(not(unix))]
 pub fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    Ok(file)
 }
 
 /// Reads a small file this user owns, without following a link or waiting for a writer.
