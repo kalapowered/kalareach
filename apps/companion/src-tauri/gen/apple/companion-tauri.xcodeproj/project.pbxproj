@@ -74,6 +74,7 @@
 		D083E29944EC99532644A8F4 /* ProbeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A99D51E204CF08E48F0D7 /* ProbeSupport.swift */; };
 		D1FD9FFA3E55CF47F92920CB /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2DF4188C16A66634654971D /* WebKit.framework */; };
 		D26D8A0C5A3E07A571DCCEBE /* PushStartup.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD790CB946E32C30357728DA /* PushStartup.swift */; };
+		D3BEB4761364D8941269F4A8 /* VoiceNegotiationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFC594B5DA6E0C5A34887789 /* VoiceNegotiationTests.swift */; };
 		D9307F59A90D5E21D42C2F80 /* AccessibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FA0661DE9CBA7B70694F5B0 /* AccessibilityTests.swift */; };
 		DB64188BC1D07E2AE680A656 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 1D6186CC73C61118431242D5 /* WebRTC */; };
 		DE6062C82CFE63F3867BEC4B /* VoiceCaptureStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A6B16292DE3C43BE1E61AFB /* VoiceCaptureStateTests.swift */; };
@@ -208,6 +209,7 @@
 		C3579CCF6F90E0C62DBEB619 /* LifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LifecycleTests.swift; sourceTree = "<group>"; };
 		C64D4F0C05D1651BEE197024 /* target.rs */ = {isa = PBXFileReference; path = target.rs; sourceTree = "<group>"; };
 		C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		CFC594B5DA6E0C5A34887789 /* VoiceNegotiationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceNegotiationTests.swift; sourceTree = "<group>"; };
 		D2F94BCB7283BE2B071B831A /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		D5BA8B3F99FC67438FEBDEFB /* FirebaseConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirebaseConfiguration.swift; sourceTree = "<group>"; };
 		D607C597A5761B168642D0EB /* VoiceCall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCall.swift; sourceTree = "<group>"; };
@@ -487,6 +489,7 @@
 				80501AE28B92D372CBA6A15F /* PushRegistrationTests.swift */,
 				7A6B16292DE3C43BE1E61AFB /* VoiceCaptureStateTests.swift */,
 				0FEF54BF56555825E7EE8283 /* VoiceCeremonyTests.swift */,
+				CFC594B5DA6E0C5A34887789 /* VoiceNegotiationTests.swift */,
 			);
 			name = Tests;
 			path = ../../../native/ios/Tests;
@@ -806,6 +809,7 @@
 				DE6062C82CFE63F3867BEC4B /* VoiceCaptureStateTests.swift in Sources */,
 				0D98162CEC30F1D818006E25 /* VoiceCeremony.swift in Sources */,
 				FDA8FF66AE6776BACE0F6391 /* VoiceCeremonyTests.swift in Sources */,
+				D3BEB4761364D8941269F4A8 /* VoiceNegotiationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

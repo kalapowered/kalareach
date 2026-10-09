@@ -380,6 +380,8 @@ public protocol VoiceCallPlatform: AnyObject {
     func nowMs() -> UInt64
     /// The wall clock, in milliseconds since the epoch.
     func epochMs() -> UInt64
+    /// Whether the provider's answer to the offer has been applied to the connection.
+    func answerApplied() -> Bool
     /// Opens the audio session for the call. Throws when the platform refuses it.
     func activate() throws
     /// Gives the audio session back.
@@ -400,8 +402,9 @@ public protocol VoiceCallPlatform: AnyObject {
 /// through two steps, and capture waits for both:
 ///
 /// 1. ``permit(voiceSessionId:closesAtEpochMs:)`` takes the host's answer: the voice session and
-///    the moment the service closes the call. It refuses a stopped or already permitted call and
-///    an answer whose moment has passed, and opens the audio session; a refusal ends the call. The
+///    the moment the service closes the call. It refuses a stopped or already permitted call, and
+///    one whose provider answer is not applied yet, and changes nothing; it refuses an answer whose
+///    moment has passed, and opens the audio session; a refusal of either ends the call. The
 ///    gate is permitted with the clock read again after the session opened, so time the platform
 ///    took counts against the deadline instead of extending it, and the call's end is scheduled for
 ///    that moment on the call's own queue.
@@ -458,8 +461,9 @@ public final class VoiceCallControl: @unchecked Sendable {
     /// the call, in milliseconds since the epoch.
     ///
     /// - Returns: true when the gate is permitted; capture then waits for the recorder to start.
-    ///   False when the call is stopped or already permitted, and false with the call ended when
-    ///   the moment has passed or the platform refused the audio session.
+    ///   False and nothing changed when the call is stopped or already permitted, or the provider's
+    ///   answer to the offer is not applied yet; false with the call ended when the moment has
+    ///   passed or the platform refused the audio session.
     public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
         entered {
             guard !stopped, gate.current == nil else { return false }

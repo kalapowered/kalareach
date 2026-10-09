@@ -296,9 +296,12 @@ final class VoiceCallControlTests: XCTestCase {
         var timers: [(id: Int, atMs: UInt64, task: () -> Void)] = []
         var nextTimer = 0
         var shown: [VoiceCaptureState] = []
+        /// Whether the provider's answer has been applied to the connection.
+        var answered = true
 
         func nowMs() -> UInt64 { now }
         func epochMs() -> UInt64 { epochAtStart + now }
+        func answerApplied() -> Bool { answered }
 
         func activate() throws {
             whileOpening()
@@ -339,6 +342,26 @@ final class VoiceCallControlTests: XCTestCase {
         XCTAssertTrue(control.permit(voiceSessionId: "voice-session-1", closesAtEpochMs: platform.closesIn(seconds)))
         control.recorder(running: true)
         return (control, platform, switches)
+    }
+
+    /// KR-REQ-15.34: the host's answer to a start does not open the microphone until the provider's
+    /// answer to the offer has been applied to the connection. The refusal changes nothing: the call
+    /// is not ended, no session is opened, and the same answer is taken once the provider's is.
+    func testAHostAnswerIsNotTakenBeforeTheProvidersAnswerIsApplied() {
+        let platform = Platform()
+        platform.answered = false
+        let switches = Switches()
+        let control = VoiceCallControl(platform: platform, switches: switches)
+        let closes = platform.closesIn(60)
+
+        XCTAssertFalse(control.permit(voiceSessionId: "voice-session-1", closesAtEpochMs: closes))
+        XCTAssertFalse(control.isStopped, "a permit that came too early does not end the call")
+        XCTAssertFalse(platform.sessionOpen, "and opens no audio session")
+        XCTAssertEqual(platform.ends, 0)
+
+        platform.answered = true
+        XCTAssertTrue(control.permit(voiceSessionId: "voice-session-1", closesAtEpochMs: closes))
+        XCTAssertTrue(platform.sessionOpen)
     }
 
     /// KR-REQ-15.34: every switch starts off, and nothing but a permitted call turns one on.
@@ -676,6 +699,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
         var now: UInt64 = 1_000
         func nowMs() -> UInt64 { now }
         func epochMs() -> UInt64 { 1_700_000_000_000 + now }
+        func answerApplied() -> Bool { true }
         func activate() throws {}
         func deactivate() {}
         func schedule(atMs _: UInt64, _: @escaping () -> Void) -> () -> Void { {} }

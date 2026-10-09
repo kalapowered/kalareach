@@ -1,0 +1,183 @@
+//
+//  What a call offers the provider, and what it hears back, against a peer in this process.
+//
+//  The peer answers an offer the way the provider's side does: it applies the offer, answers with
+//  its own candidates, and reads the channel the offer names. Nothing here goes near a network
+//  beyond this machine's own interfaces, a broker, or the microphone.
+//
+
+import Foundation
+import WebRTC
+import XCTest
+
+/// What a call told the application, kept for the test to read.
+private final class Told: VoiceCallObserver {
+    private let lock = NSLock()
+    private var kept: [Data] = []
+    let event = XCTestExpectation(description: "the provider's event reached the application")
+
+    var events: [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return kept
+    }
+
+    func voiceCall(_: VoiceCall, connectionChanged _: RTCPeerConnectionState) {}
+
+    func voiceCall(_: VoiceCall, receivedProviderEvent data: Data) {
+        lock.lock()
+        kept.append(data)
+        lock.unlock()
+        event.fulfill()
+    }
+
+    func voiceCallReceivedFirstAudio(_: VoiceCall) {}
+}
+
+/// A peer in this process that answers an offer and reads the channel the offer names.
+private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelegate {
+    private let factory = RTCPeerConnectionFactory()
+    private let connection: RTCPeerConnection
+    private let lock = NSLock()
+    private var gatheringDone: CheckedContinuation<Void, Never>?
+    private var gathered = false
+    private var channel: RTCDataChannel?
+
+    /// Fulfilled when the channel the offer names is open at this end.
+    let channelOpen = XCTestExpectation(description: "the channel the offer names opened at the peer")
+
+    /// The label of that channel, once it has arrived.
+    var channelLabel: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return channel?.label
+    }
+
+    override init() {
+        let configuration = RTCConfiguration()
+        configuration.sdpSemantics = .unifiedPlan
+        // Once, so that the gathering reports itself done and the answer carries every candidate.
+        configuration.continualGatheringPolicy = .gatherOnce
+        connection = factory.peerConnection(
+            with: configuration,
+            constraints: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+            delegate: nil
+        )!
+        super.init()
+        connection.delegate = self
+    }
+
+    deinit { connection.close() }
+
+    /// Applies `offer` and answers it, with the candidates this peer gathered.
+    func answer(_ offer: String) async throws -> String {
+        try await connection.setRemoteDescription(RTCSessionDescription(type: .offer, sdp: offer))
+        let answer = try await connection.answer(for: RTCMediaConstraints(
+            mandatoryConstraints: [kRTCMediaConstraintsOfferToReceiveAudio: kRTCMediaConstraintsValueTrue],
+            optionalConstraints: nil
+        ))
+        try await connection.setLocalDescription(answer)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if gathered {
+                lock.unlock()
+                done.resume()
+            } else {
+                gatheringDone = done
+                lock.unlock()
+            }
+        }
+        return connection.localDescription?.sdp ?? answer.sdp
+    }
+
+    /// Sends `text` on the channel the offer named.
+    func send(_ text: String) {
+        lock.lock()
+        let open = channel
+        lock.unlock()
+        _ = open?.sendData(RTCDataBuffer(data: Data(text.utf8), isBinary: false))
+    }
+
+    func peerConnection(_: RTCPeerConnection, didChange state: RTCIceGatheringState) {
+        guard state == .complete else { return }
+        lock.lock()
+        gathered = true
+        let waiting = gatheringDone
+        gatheringDone = nil
+        lock.unlock()
+        waiting?.resume()
+    }
+
+    func peerConnection(_: RTCPeerConnection, didOpen opened: RTCDataChannel) {
+        lock.lock()
+        channel = opened
+        lock.unlock()
+        opened.delegate = self
+        if opened.readyState == .open { channelOpen.fulfill() }
+    }
+
+    func dataChannelDidChangeState(_ changed: RTCDataChannel) {
+        if changed.readyState == .open { channelOpen.fulfill() }
+    }
+
+    func dataChannel(_: RTCDataChannel, didReceiveMessageWith _: RTCDataBuffer) {}
+
+    func peerConnectionShouldNegotiate(_: RTCPeerConnection) {}
+    func peerConnection(_: RTCPeerConnection, didChange _: RTCSignalingState) {}
+    func peerConnection(_: RTCPeerConnection, didAdd _: RTCMediaStream) {}
+    func peerConnection(_: RTCPeerConnection, didRemove _: RTCMediaStream) {}
+    func peerConnection(_: RTCPeerConnection, didChange _: RTCIceConnectionState) {}
+    func peerConnection(_: RTCPeerConnection, didGenerate _: RTCIceCandidate) {}
+    func peerConnection(_: RTCPeerConnection, didRemove _: [RTCIceCandidate]) {}
+}
+
+final class VoiceNegotiationTests: XCTestCase {
+    /// How long the two ends are given to connect before the test calls it a failure. It bounds a
+    /// wait that ends as soon as the connection does.
+    private static let connectWithin: TimeInterval = 120
+
+    /// A call and a peer that have exchanged an offer and an answer.
+    private func negotiated(
+        observer: VoiceCallObserver
+    ) async throws -> (VoiceCall, AnsweringPeer, String) {
+        let call = try VoiceCall(observer: observer)
+        let offer = try await call.offer()
+        let peer = AnsweringPeer()
+        let answer = try await peer.answer(offer)
+        try await call.accept(answerSdp: answer)
+        return (call, peer, offer)
+    }
+
+    /// KR-REQ-15.10: the call creates the provider's events channel before it makes the offer, so
+    /// the offer names it and the provider has one to write to.
+    func testTheOfferNamesTheProvidersEventChannel() async throws {
+        let told = Told()
+        let (call, peer, offer) = try await negotiated(observer: told)
+        defer { call.stop() }
+
+        XCTAssertTrue(offer.contains("m=application"), "the offer holds a data channel section")
+        await fulfillment(of: [peer.channelOpen], timeout: Self.connectWithin)
+        XCTAssertEqual(peer.channelLabel, "oai-events")
+    }
+
+    /// KR-REQ-15.10: what the provider writes on that channel reaches the application as bytes.
+    func testAnEventTheProviderWritesReachesTheApplication() async throws {
+        let told = Told()
+        let (call, peer, _) = try await negotiated(observer: told)
+        defer { call.stop() }
+
+        await fulfillment(of: [peer.channelOpen], timeout: Self.connectWithin)
+        peer.send("{\"type\":\"session.created\"}")
+        await fulfillment(of: [told.event], timeout: Self.connectWithin)
+        XCTAssertEqual(told.events, [Data("{\"type\":\"session.created\"}".utf8)])
+    }
+
+    /// KR-REQ-15.03: the offer carries the candidates this device had gathered by the time it was
+    /// made, because the provider is answered once and the candidates that come later are not sent.
+    func testTheOfferCarriesTheCandidatesGatheredSoFar() async throws {
+        let call = try VoiceCall(observer: Told())
+        defer { call.stop() }
+        let offer = try await call.offer()
+        XCTAssertTrue(offer.contains("a=candidate:"), "the offer names at least one address to reach")
+    }
+}
