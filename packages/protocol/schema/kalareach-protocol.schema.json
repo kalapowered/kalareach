@@ -18826,78 +18826,6 @@
       ],
       "type": "object"
     },
-    "MembershipPresentParams": {
-      "additionalProperties": false,
-      "description": "The parameters of `membership.present`.",
-      "properties": {
-        "authority": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PolicyAuthority"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The organisation's chain, when it has moved since the host last accepted one. A chain\nthat is not newer changes nothing, and the lease beside it is still judged against the\nkeys the host already holds."
-        },
-        "lease": {
-          "$ref": "#/$defs/MembershipLease",
-          "description": "The lease the organisation signed for this device. The device the lease names is the one\nthat presents it: a host refuses a lease that names another device's key."
-        }
-      },
-      "required": [
-        "lease",
-        "authority"
-      ],
-      "type": "object"
-    },
-    "MembershipPresentResult": {
-      "additionalProperties": false,
-      "description": "The result of `membership.present`.",
-      "properties": {
-        "account_id": {
-          "$ref": "#/$defs/AccountId",
-          "description": "The member account it names."
-        },
-        "exclusive": {
-          "description": "Whether this host is exclusively organisation-managed.",
-          "type": "boolean"
-        },
-        "exclusive_ended_at_terminal_ms": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimestampMs"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The last time exclusive management was turned off at this host's terminal, or null when it\nnever was. A member's client carries it to the organisation with its next lease request."
-        },
-        "expires_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it stops being usable, in UTC milliseconds."
-        },
-        "key_revision": {
-          "$ref": "#/$defs/PolicyKeyRevision",
-          "description": "The key revision that signed it."
-        },
-        "organisation_id": {
-          "$ref": "#/$defs/OrganisationId",
-          "description": "The organisation the lease speaks for."
-        }
-      },
-      "required": [
-        "organisation_id",
-        "account_id",
-        "key_revision",
-        "expires_at_ms",
-        "exclusive",
-        "exclusive_ended_at_terminal_ms"
-      ],
-      "type": "object"
-    },
     "MeteringRole": {
       "description": "A forwarding boundary inside one relay instance.\n\nA payload crosses two boundaries at a relay: it is read from the sending connection and it is\nwritten to the receiving one. They are not the same event. A payload counted as it arrives may\nstill be fenced by a revocation, dropped for a full queue or lost to a closing connection before\nit is delivered, so which boundary counts decides what the payer pays for.",
       "oneOf": [
@@ -19013,7 +18941,7 @@
         },
         {
           "const": "organisation.list",
-          "description": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and the times it was turned off at this host's terminal.",
+          "description": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
           "type": "string"
         },
         {
@@ -21058,39 +20986,6 @@
         }
       ]
     },
-    "OrganisationChangeMarker": {
-      "description": "What the claim of an organisation change keeps while its answer is still to be built from the\nfence the change owes.\n\nA withdrawal and making a host exclusively organisation-managed restrict work already\nadmitted, so each writes its policy row and this marker in one transaction and answers from the\nbarrier that follows. The marker is what lets a repeat of the action tell a change that\ncommitted from one that never began.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "`organisation.withdraw` committed for this organisation.",
-          "properties": {
-            "withdrawn": {
-              "additionalProperties": false,
-              "properties": {
-                "organisation_id": {
-                  "$ref": "#/$defs/OrganisationId",
-                  "description": "The organisation the host left."
-                }
-              },
-              "required": [
-                "organisation_id"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "withdrawn"
-          ],
-          "type": "object"
-        },
-        {
-          "const": "exclusive_on",
-          "description": "`organisation.exclusive.set` committed with `exclusive` true.",
-          "type": "string"
-        }
-      ]
-    },
     "OrganisationEnrolParams": {
       "additionalProperties": false,
       "description": "The parameters of `organisation.enrol`.",
@@ -21178,51 +21073,6 @@
         "accepted_head",
         "enrolment_revision",
         "members"
-      ],
-      "type": "object"
-    },
-    "OrganisationExclusiveSetParams": {
-      "additionalProperties": false,
-      "description": "The parameters of `organisation.exclusive.set`.",
-      "properties": {
-        "exclusive": {
-          "description": "True to make this host exclusively organisation-managed, false to end that.",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "exclusive"
-      ],
-      "type": "object"
-    },
-    "OrganisationExclusiveSetResult": {
-      "additionalProperties": false,
-      "description": "The result of `organisation.exclusive.set`.",
-      "properties": {
-        "authority_revision": {
-          "$ref": "#/$defs/AuthorityRevision",
-          "description": "The authority revision in force when the change was answered."
-        },
-        "barrier": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RevocationBarrier"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The per-worker completion of the fence that making a host exclusive owes, because it\nrestricts work already admitted. Null when the change was to end exclusive management,\nwhich restricts nothing."
-        },
-        "exclusive": {
-          "description": "Whether the host is exclusively organisation-managed now.",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "exclusive",
-        "authority_revision",
-        "barrier"
       ],
       "type": "object"
     },
@@ -21486,20 +21336,6 @@
       "required": [
         "organisation_id",
         "policy_revision"
-      ],
-      "type": "object"
-    },
-    "OrganisationWithdrawParams": {
-      "additionalProperties": false,
-      "description": "The parameters of `organisation.withdraw`. The answer is a [`RevocationResult`].",
-      "properties": {
-        "organisation_id": {
-          "$ref": "#/$defs/OrganisationId",
-          "description": "The organisation to leave."
-        }
-      },
-      "required": [
-        "organisation_id"
       ],
       "type": "object"
     },
@@ -39467,12 +39303,6 @@
     "membership_lease": {
       "$ref": "#/$defs/MembershipLease"
     },
-    "membership_present_params": {
-      "$ref": "#/$defs/MembershipPresentParams"
-    },
-    "membership_present_result": {
-      "$ref": "#/$defs/MembershipPresentResult"
-    },
     "method_entry": {
       "$ref": "#/$defs/MethodEntry"
     },
@@ -39506,9 +39336,6 @@
     "operation_record": {
       "$ref": "#/$defs/OperationRecord"
     },
-    "organisation_change_marker": {
-      "$ref": "#/$defs/OrganisationChangeMarker"
-    },
     "organisation_enrol_params": {
       "$ref": "#/$defs/OrganisationEnrolParams"
     },
@@ -39517,12 +39344,6 @@
     },
     "organisation_enrolment_view": {
       "$ref": "#/$defs/OrganisationEnrolmentView"
-    },
-    "organisation_exclusive_set_params": {
-      "$ref": "#/$defs/OrganisationExclusiveSetParams"
-    },
-    "organisation_exclusive_set_result": {
-      "$ref": "#/$defs/OrganisationExclusiveSetResult"
     },
     "organisation_lease_view": {
       "$ref": "#/$defs/OrganisationLeaseView"
@@ -39538,9 +39359,6 @@
     },
     "organisation_policy": {
       "$ref": "#/$defs/OrganisationPolicy"
-    },
-    "organisation_withdraw_params": {
-      "$ref": "#/$defs/OrganisationWithdrawParams"
     },
     "output_event": {
       "$ref": "#/$defs/OutputEvent"

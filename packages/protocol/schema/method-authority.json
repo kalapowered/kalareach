@@ -550,7 +550,7 @@
       "resource_selectors": [
         "host"
       ],
-      "summary": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and the times it was turned off at this host's terminal.",
+      "summary": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
       "version": 1
     },
     {

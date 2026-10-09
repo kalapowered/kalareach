@@ -35,7 +35,7 @@ links to its document.
 | `machine.merge` | write | `local_ipc`, `paired_device` | Take this environment's part in merging its machine group into another, against the group and revision the owner saw. A merge of independent environments is one such step on each of them. | [Host: Machine groups](../host/README.md) |
 | `machine.split` | write | `local_ipc`, `paired_device` | Move this environment into a fresh machine group of its own, against the group and revision the owner saw. | [Host: Machine groups](../host/README.md) |
 | `organisation.enrol` | write | `local_ipc` | Opt this host into an organisation's policy and pin the chain of keys that signs it, on an owner confirmation that names exactly that chain's root and the key signing now. | [Host: Organisation policy](../host/README.md) |
-| `organisation.list` | read | `local_ipc`, `paired_device` | The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and the times it was turned off at this host's terminal. | [Host: Organisation policy](../host/README.md) |
+| `organisation.list` | read | `local_ipc`, `paired_device` | The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it. | [Host: Organisation policy](../host/README.md) |
 
 ## Pairing
 
