@@ -3722,14 +3722,12 @@ impl Inside {
         };
         until_there("the second kr new to end", || status.exists().then_some(()));
         // The second kr new waits for its daemon no longer than its own start bound, which the
-        // test cannot lengthen. Where the daemon is held until the first worker has recorded it, a
-        // worker slow to record it ends the command here, and the message says so rather than leave
-        // it to look like a defect.
+        // test cannot lengthen. Where the daemon is held until the first worker has recorded it,
+        // that wait includes the recording. A command that ends on the bound ends the case here,
+        // and the message names the bound rather than leave it to look like a defect.
         assert!(
             !text_of("err").contains("did not answer within"),
-            "precondition: the second kr new gave up waiting for its daemon within its start \
-             bound (where the daemon is held, the first worker took longer than that to record \
-             it): {}",
+            "precondition: the second kr new gave up waiting for its daemon at its start bound: {}",
             text_of("err")
         );
         assert_eq!(
@@ -3973,8 +3971,7 @@ fn a_daemon_started_from_inside_a_session_outlives_it(recorded: bool, end: End) 
         assert_eq!(
             closure.ownership_coverage,
             kr_protocol::session::OwnershipCoverage::Complete,
-            "the service's control group was read empty, and the daemon was never in it \
-             to be counted: {closure:?}"
+            "the service's control group was read empty, and the daemon had left it: {closure:?}"
         );
     }
 }
