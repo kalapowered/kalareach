@@ -2,9 +2,9 @@ name: Place libsodium's archives
 description: >-
   Restores or fetches the signed archives that libsodium-sys-stable's build script reads on
   Windows, and points the build at them with SODIUM_DIST_DIR, so that compiling the workspace
-  downloads nothing. The archives are cached under a key that names the crate's version, and the
-  job saves them with its own cache-save step once the build has checked their signatures. The
-  script this runs says what is placed and why.
+  downloads nothing. The archives are cached under a key that names the crate's version. The job
+  saves them with its own cache-save step, and only after a build that ran the crate's build
+  script, which checks their signatures. The script this runs says what is placed and why.
 
 outputs:
   cache-hit:
@@ -24,7 +24,8 @@ runs:
       id: name
       shell: bash
       run: |
-        echo "key=$(bash scripts/place-libsodium-archive.sh --key)" >> "$GITHUB_OUTPUT"
+        key="$(bash scripts/place-libsodium-archive.sh --key)"
+        echo "key=$key" >> "$GITHUB_OUTPUT"
         echo "path=$RUNNER_TEMP/libsodium-archive" >> "$GITHUB_OUTPUT"
 
     - name: Restore
