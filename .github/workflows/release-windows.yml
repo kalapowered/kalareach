@@ -159,16 +159,6 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: release-windows-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-
       # What this release is, settled before anything is built, and on a tag held to the tag. A host
       # tag is `host/v<version>+<first twelve characters of the commit>`, so it names both the
       # version the archive carries and the commit it came from; a tag that names either of them

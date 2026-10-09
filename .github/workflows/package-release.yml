@@ -58,16 +58,6 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-
       - name: Pack the packages
         run: bash scripts/release-packages.sh --output "$RUNNER_TEMP/packages" --tag "$GITHUB_REF_NAME"
 
