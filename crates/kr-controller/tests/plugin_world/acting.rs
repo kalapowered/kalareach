@@ -97,18 +97,31 @@ pub enum Upstream {
     /// With a success, once the test lets it go.
     Holds(Arc<tokio::sync::Notify>),
     /// With a success once it has opened the file the frame's attachment names and found in it the
-    /// size and the digest the frame says, as a receiver that is to acknowledge an attachment
-    /// does, and with an error that proves nothing was done otherwise.
+    /// size and the digest the frame says, under a grant that has not expired and is for this
+    /// environment, as a receiver that is to acknowledge an attachment does, and with an error that
+    /// proves nothing was done otherwise.
     Reads,
 }
 
-/// Whether the frame names a file the receiver can read, and the file holds what the frame says.
-fn the_file_is_as_framed(line: &str) -> bool {
+/// Whether the frame names a file the receiver can read, under a grant that has not expired and is
+/// valid in `environment`, and the file holds what the frame says.
+fn the_file_is_as_framed(line: &str, environment: &str) -> bool {
     let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
     };
     let attachment = &frame["params"]["attachment"];
-    let Some(path) = attachment["read_grant"]["path"].as_str() else {
+    let grant = &attachment["read_grant"];
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    if grant["environment_id"].as_str() != Some(environment)
+        || !grant["expires_at_ms"]
+            .as_u64()
+            .is_some_and(|expires| u128::from(expires) > now_ms)
+    {
+        return false;
+    }
+    let Some(path) = grant["path"].as_str() else {
         return false;
     };
     let Ok(bytes) = std::fs::read(path) else {
@@ -265,6 +278,7 @@ impl Acting {
             there,
             Arc::clone(&written),
             Arc::clone(&upstream),
+            hosted.environment_id.to_string(),
         ));
         let driving = tokio::spawn(writes);
         // The owner reads the upstream's answers, which is what a mutation's receipt waits for.
@@ -582,6 +596,7 @@ pub async fn scripted_upstream(
     stream: tokio::net::UnixStream,
     written: Written,
     behaviour: Arc<Mutex<Upstream>>,
+    environment: String,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     let (reader, mut writer) = tokio::io::split(stream);
@@ -590,7 +605,7 @@ pub async fn scripted_upstream(
         let id = serde_json::from_str::<serde_json::Value>(&line)
             .ok()
             .and_then(|frame| frame.get("id").cloned());
-        let readable = the_file_is_as_framed(&line);
+        let readable = the_file_is_as_framed(&line, &environment);
         written.lock().expect("not poisoned").push(line);
         let Some(id) = id else {
             continue;
