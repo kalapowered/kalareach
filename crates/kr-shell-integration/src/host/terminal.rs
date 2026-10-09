@@ -192,11 +192,12 @@ pub enum SaveRefused {
     /// or an update is switching releases.
     #[error("{0}")]
     Barred(#[source] kr_ipc::install::WriteRefused),
-    /// The file there is a document of a later format, or one this build does not read, and is
-    /// left as it is; `kr host terminal --clear` removes it.
+    /// The file there is a document of a later format, one this build does not read, or a regular
+    /// file that cannot be read (readable by others, or larger than a preference is), and is left as
+    /// it is; `kr host terminal --clear` removes it.
     #[error("the saved preference is a document this build does not read")]
     NotOurs,
-    /// The file there could not be read, or the preference could not be written.
+    /// The preference could not be written.
     #[error("{0}")]
     Store(#[source] kr_ipc::IpcError),
 }
@@ -840,6 +841,8 @@ mod tests {
             br#"{"version": 1}"#.to_vec(),
             b"{}".to_vec(),
             b"not a document".to_vec(),
+            // A regular file the host cannot read as its own: larger than a preference is.
+            vec![b' '; usize::try_from(PREFERENCE_MAX_LEN).expect("a small bound") + 1],
         ] {
             kr_ipc::paths::write_owner_only_file(&file, &unreadable).expect("planted");
             assert!(
@@ -863,6 +866,20 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(&file).expect("reads"),
                 preference_document("kitty")
+            );
+        }
+        // A regular file that others can read is not one this host wrote: left as it is.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let readable_by_others = preference_document("iterm2");
+            std::fs::write(&file, &readable_by_others).expect("planted");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+                .expect("widened");
+            assert!(matches!(save(), Err(SaveRefused::NotOurs)));
+            assert_eq!(
+                std::fs::read_to_string(&file).expect("reads"),
+                readable_by_others,
+                "left as it is"
             );
         }
         // A pipe is not opened, and the name is replaced.

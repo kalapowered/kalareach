@@ -784,7 +784,8 @@ What the command says of the answer is what its attempt established, step by ste
 send it, that the worker did not take it, or that whether the worker took it is not known, which it
 never calls unsent. A reply that is not a message is the worker's own answer rather than a lost
 connection, so it is shown as a refusal that says the answer's fate is not known, and nothing is
-kept. An answer that can be neither taken nor kept is reported as both, with exit status 1. A worker
+kept. An answer that can be neither taken nor kept is reported as both, with exit status 1, or 9 when an
+update of this host held the writers' lock for the whole wait. A worker
 that replied that it took the answer took it: when that reply cannot be read, or the copy kept on
 this device cannot be removed afterwards, the command says the worker took the answer and exits with
 1, and the next `kr question drafts` retires any copy still kept. When the store on this device
@@ -869,7 +870,7 @@ bound to the session this process is running in. Outside a session every tool an
 | 6 | The command needed a terminal, or the terminal could not be changed |
 | 7 | No terminal application could be opened |
 | 8 | The host refused the request |
-| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, a release an earlier install or update left in the store is held by a running program, or a command that writes a stored record holds the writers' lock for more than thirty seconds. Nothing was replaced, and whatever the update stopped runs again. A command that waits that long for an update's switch exits with 9 as well, and does not make the write it waited for |
+| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, a release an earlier install or update left in the store is held by a running program, or a command that writes a stored record holds the writers' lock for more than thirty seconds. Nothing was replaced, and whatever the update stopped runs again. A command that waits that long for an update's switch or for the install lock it holds exits with 9 as well, and does not make the write it waited for |
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the

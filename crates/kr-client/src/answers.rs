@@ -217,8 +217,8 @@ pub enum Answered {
     Sent(Box<QuestionResolveResult>),
     /// The host did not confirm that it took the answer: it could not be reached, or the connection
     /// ended with the outcome unknown. The caller keeps the answer on this device
-    /// ([`AnswerDrafts::keep`]), which is a write of a stored record and is made under the leave to
-    /// write it.
+    /// ([`AnswerDrafts::keep`]), which is a write of a stored record made under the leave to write
+    /// it and can be refused, so the answer is not kept until that returns.
     Unconfirmed(AnswerDraft),
 }
 
@@ -450,7 +450,7 @@ impl AnswerDrafts {
             fault: IoFault::from(error),
         };
         let lock_path = self.directory.join(LOCK_NAME);
-        let _lock = self.lock(&lock_path).map_err(|error| AnswerError::Store {
+        let _lock = Self::lock(&lock_path).map_err(|error| AnswerError::Store {
             path: stored(&lock_path),
             fault: IoFault::from(error),
         })?;
@@ -527,20 +527,17 @@ impl AnswerDrafts {
     /// Takes the store's lock for a write, at `path`, waiting [`LOCK_PATIENCE`] for another that is
     /// under way. Closing the file releases it.
     ///
-    /// Only a regular file is opened, owner-only: a link planted at the lock's name would have the
-    /// open create its target, and a pipe would hold the open for ever.
-    fn lock(&self, path: &Path) -> std::io::Result<std::fs::File> {
-        if std::fs::symlink_metadata(path).is_ok_and(|about| !about.file_type().is_file()) {
-            return Err(std::io::Error::other("the lock is not a regular file"));
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options.open(path)?;
+    /// The lock file is opened without following a link and without waiting for a writer, and the
+    /// handle must be a regular file: a link planted at the lock's name would have the open create
+    /// its target, and a pipe would hold the open for ever.
+    fn lock(path: &Path) -> std::io::Result<std::fs::File> {
+        let file = kr_ipc::paths::open_lock_file(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                std::io::Error::other(Shown::said("the lock is not a regular file"))
+            } else {
+                error
+            }
+        })?;
         let deadline = Instant::now() + LOCK_PATIENCE;
         loop {
             match file.try_lock() {
@@ -599,10 +596,17 @@ fn replaceable(path: &Path) -> Result<()> {
 /// The path is one a listing found, so a failure names it whole only when its name is one this
 /// store writes: whatever else is in the directory was put there by something else.
 fn read_draft(path: &Path) -> Result<AnswerDraft> {
-    let bytes = std::fs::read(path).map_err(|error| AnswerError::Store {
-        path: stored(path),
-        fault: IoFault::from(error),
-    })?;
+    // One handle, opened without following a link or waiting for a writer, and owner-only: a pipe
+    // or a link under an answer's name is refused here and does not hold a listing open.
+    let bytes = kr_ipc::paths::read_owner_only_file(path, KEPT_LIMIT)
+        .map_err(|error| AnswerError::Unreadable {
+            path: stored(path),
+            detail: Shown::ipc(&error),
+        })?
+        .ok_or_else(|| AnswerError::Store {
+            path: stored(path),
+            fault: IoFault::from(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        })?;
     let draft: AnswerDraft = kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
         .map_err(|error| AnswerError::Unreadable {
             path: stored(path),
