@@ -1167,7 +1167,7 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when the records cannot be read.
     pub fn recorded_roots(&self) -> Result<Vec<RecordedRoots>> {
-        self.read_roots(ROOT_RECORD)
+        self.read_roots(ROOT_RECORD, false)
     }
 
     /// Every pair of roots a command of this store has registered, in record order. A command's
@@ -1178,13 +1178,23 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when the records cannot be read.
     pub fn registered_roots(&self) -> Result<Vec<RecordedRoots>> {
-        self.read_roots(REGISTERED_RECORD)
+        self.read_roots(REGISTERED_RECORD, true)
     }
 
-    fn read_roots(&self, extension: &str) -> Result<Vec<RecordedRoots>> {
+    /// The pairs of roots the records of `extension` hold. A record that names none is skipped, as a
+    /// control daemon's always has been, unless `strict`: a command's registration that names no
+    /// roots hides a root an update must look at, and is an error that names the record.
+    fn read_roots(&self, extension: &str, strict: bool) -> Result<Vec<RecordedRoots>> {
         let mut recorded = Vec::new();
         for (path, contents) in self.read_records(extension)? {
             let Some(split) = contents.iter().position(|byte| *byte == 0) else {
+                if strict {
+                    return Err(InstallError::io(
+                        "read",
+                        &path,
+                        std::io::Error::other("it names no runtime root and state root"),
+                    ));
+                }
                 continue;
             };
             recorded.push(RecordedRoots {
@@ -1205,11 +1215,15 @@ impl Store {
     pub fn recorded_documents(&self) -> Result<Vec<RecordedDocument>> {
         let mut recorded = Vec::new();
         for (path, contents) in self.read_records(DOCUMENT_RECORD)? {
+            // A record of a document that names no environment and path hides a document an update
+            // must look at: it is an error that names the record.
+            let malformed =
+                |why: &'static str| InstallError::io("read", &path, std::io::Error::other(why));
             let Some(split) = contents.iter().position(|byte| *byte == 0) else {
-                continue;
+                return Err(malformed("it names no environment and path"));
             };
             let Ok(environment) = String::from_utf8_lossy(&contents[..split]).parse() else {
-                continue;
+                return Err(malformed("it names no environment"));
             };
             recorded.push(RecordedDocument {
                 environment,
