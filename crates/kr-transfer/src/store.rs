@@ -2301,7 +2301,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    /// Returns [`TransferError::SessionEnded`] when the draft targets a session that has ended, and
+    /// [`TransferError::StoreUnavailable`] when the write fails.
     pub fn insert_draft(
         &mut self,
         row: &DraftRow,

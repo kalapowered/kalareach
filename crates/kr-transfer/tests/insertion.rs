@@ -19,7 +19,7 @@ use kr_protocol::transfer::{
 };
 use kr_transfer::service::{Action, Admission, AdmissionHook};
 use kr_transfer::{RetainEverything, TransferError};
-use support::{BOOT_NOW_MS, Harness, pattern};
+use support::{BOOT_NOW_MS, FixedBootClock, Harness, pattern};
 
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([9; 16]))
@@ -270,7 +270,7 @@ fn a_claim_marks_the_binding_inserting_for_its_owner_and_a_repeat_by_the_owner_i
             action_id: action(32),
             ..harness.begin_of(session(), created.draft_id, handle.transfer_id, owner)
         },
-        &|| BOOT_NOW_MS,
+        &FixedBootClock(BOOT_NOW_MS),
     );
     assert_eq!(
         rival.expect_err("another owner").code(),
@@ -291,7 +291,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
         InsertionMethod::TypedSubmission,
     );
     let good = harness.begin_of(session(), created.draft_id, handle.transfer_id, action(41));
-    let refused = |begin: &InsertionBegin, boot: &dyn Fn() -> u64, why: &str| {
+    let refused = |begin: &InsertionBegin, boot: &dyn kr_ipc::clock::SharedClock, why: &str| {
         let refusal = harness
             .service
             .insertion_begin(&harness.actor, session(), begin, boot)
@@ -308,7 +308,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
             attempt: U64::new(7),
             ..good.clone()
         },
-        &|| BOOT_NOW_MS,
+        &FixedBootClock(BOOT_NOW_MS),
         "an attempt the binding is not at",
     );
     refused(
@@ -316,12 +316,12 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
             max_count: U64::new(0),
             ..good.clone()
         },
-        &|| BOOT_NOW_MS,
+        &FixedBootClock(BOOT_NOW_MS),
         "more attachments than the operation accepts",
     );
     refused(
         &good,
-        &|| good.deadline_boot_ms.get(),
+        &FixedBootClock(good.deadline_boot_ms.get()),
         "a deadline that has passed",
     );
 
@@ -345,7 +345,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
         .expect("records the failure");
     refused(
         &harness.begin_of(session(), created.draft_id, second.transfer_id, action(43)),
-        &|| BOOT_NOW_MS,
+        &FixedBootClock(BOOT_NOW_MS),
         "a binding that failed and has not been bound again",
     );
 
@@ -381,7 +381,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
                 by_composer.1.transfer_id,
                 action(44),
             ),
-            &|| BOOT_NOW_MS,
+            &FixedBootClock(BOOT_NOW_MS),
         )
         .expect_err("a binding a worker does not offer");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -392,7 +392,12 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
         .expect("ends the session");
     let late = harness
         .service
-        .insertion_begin(&harness.actor, session(), &begin, &|| BOOT_NOW_MS)
+        .insertion_begin(
+            &harness.actor,
+            session(),
+            &begin,
+            &FixedBootClock(BOOT_NOW_MS),
+        )
         .expect_err("a draft whose session has ended");
     assert_eq!(
         late.code(),
@@ -580,7 +585,7 @@ fn an_unknown_offer_is_offered_again_as_a_new_attempt() {
                 action_id: action(62),
                 ..first_begin.clone()
             },
-            &|| BOOT_NOW_MS,
+            &FixedBootClock(BOOT_NOW_MS),
         )
         .expect_err("an unknown offer is not claimed again as it stands");
     assert_eq!(refused.code(), ErrorCode::DraftConflict);
@@ -742,7 +747,12 @@ fn the_room_for_the_report_of_every_offer_in_flight_is_kept() {
     );
     let refused = harness
         .service
-        .insertion_begin(&harness.actor, session(), &second_begin, &|| BOOT_NOW_MS)
+        .insertion_begin(
+            &harness.actor,
+            session(),
+            &second_begin,
+            &FixedBootClock(BOOT_NOW_MS),
+        )
         .expect_err("a claim that leaves no room for its report");
     assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
     assert_eq!(
@@ -951,8 +961,8 @@ fn no_claim_is_made_while_the_journal_holds_sessions_of_an_earlier_build() {
         .expect("the claim is made once the journal is settled");
 }
 
-/// The claim a worker of `worker` makes of the one binding a draft holds at its first attempt, built
-/// by hand because the draft may be one a worker cannot read the facts of.
+/// The claim a worker makes of the one binding a draft holds at its first attempt, built by hand
+/// because the draft may be one a worker cannot read the facts of.
 fn first_claim(draft: &DraftRecord, handle: &AttachmentHandle, number: u8) -> InsertionBegin {
     InsertionBegin {
         action_id: action(number),
@@ -976,7 +986,7 @@ fn a_claim_is_refused_for_a_draft_that_is_not_the_workers_and_for_a_file_that_is
             &harness.actor,
             worker,
             &first_claim(draft, handle, number),
-            &|| BOOT_NOW_MS,
+            &FixedBootClock(BOOT_NOW_MS),
         )
     };
 
@@ -989,7 +999,7 @@ fn a_claim_is_refused_for_a_draft_that_is_not_the_workers_and_for_a_file_that_is
         "free.png",
         InsertionMethod::TypedSubmission,
     );
-    let sent = draft_for(&harness, None);
+    let sent = draft_for(&harness, Some(session()));
     let (sent, sent_handle) = bind(
         &harness,
         &sent,
@@ -1232,6 +1242,24 @@ impl AdmissionHook for HoldsTheStore {
     }
 }
 
+/// A boot clock a test moves, and which says when it is read.
+#[derive(Debug)]
+struct WatchedClock {
+    now: std::sync::atomic::AtomicU64,
+    asked: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+}
+
+impl kr_ipc::clock::SharedClock for WatchedClock {
+    fn boot_elapsed_ms(&self) -> u64 {
+        let _ = self
+            .asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(());
+        self.now.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// KR-REQ-24.09: a claim that waited for the store is judged by the time it commits at, not by the
 /// time it was asked at. The worker gives up on a claim at its deadline and reports the offer failed
 /// a moment after; a claim that read the clock before it waited for the store, and committed after
@@ -1241,7 +1269,7 @@ impl AdmissionHook for HoldsTheStore {
 /// store.
 #[test]
 fn a_claim_that_waits_for_the_store_past_its_deadline_is_refused() {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     let harness = Harness::create();
     let created = draft_for(&harness, Some(session()));
     let (created, handle) = bind(
@@ -1268,11 +1296,10 @@ fn a_claim_that_waits_for_the_store_past_its_deadline_is_refused() {
         admission: Admission::new(hook as std::sync::Arc<dyn AdmissionHook>),
     };
     // The boot clock, which the claim reads where it decides, and says when it has.
-    let boot = AtomicU64::new(BOOT_NOW_MS);
     let (asked, reading) = std::sync::mpsc::channel::<()>();
-    let clock = || {
-        let _ = asked.send(());
-        boot.load(Ordering::SeqCst)
+    let clock = WatchedClock {
+        now: std::sync::atomic::AtomicU64::new(BOOT_NOW_MS),
+        asked: std::sync::Mutex::new(asked),
     };
 
     let claimed = std::thread::scope(|scope| {
@@ -1287,7 +1314,8 @@ fn a_claim_that_waits_for_the_store_past_its_deadline_is_refused() {
                 Some(&holding),
             )
         });
-        held.recv().expect("the update holds the store");
+        held.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the update holds the store");
         let claim = scope.spawn(|| {
             harness
                 .service
@@ -1298,7 +1326,7 @@ fn a_claim_that_waits_for_the_store_past_its_deadline_is_refused() {
         // let go. The wait only gives the first the chance to show itself: what decides the case
         // is the answer below, whichever way this ends.
         let _ = reading.recv_timeout(std::time::Duration::from_millis(300));
-        boot.store(BOOT_NOW_MS + 11, Ordering::SeqCst);
+        clock.now.store(BOOT_NOW_MS + 11, Ordering::SeqCst);
         release.send(()).expect("lets the store go");
         update
             .join()
