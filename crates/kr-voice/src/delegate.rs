@@ -2125,10 +2125,17 @@ pub fn narrower_history(
 /// provider's transcript wrote, so they are content and never authority: the grant is what permits
 /// the effect, and this confirmation is the extra thing section 15 ¶13 asks for on top of it.
 ///
-/// A contraction of "not" refuses by its form: a word with "n't" in it, whichever mark the
-/// transcript writes for the apostrophe, is a refusal ("won't", "shan't", "wouldn't've"). A
-/// transcript that leaves the apostrophe out writes "wont", and the refusing words hold the forms
-/// that are then written (a closed list, which a form such as "want" cannot be told from).
+/// A contraction of "not" refuses by its form: "n", one mark that is not a letter, a digit or a
+/// space, and "t" at the end of the word ("won't", "shan't", "wouldn't've", and the same with any
+/// other mark for the apostrophe). A contraction written with no mark at all is refused only for
+/// the spellings in the refusing words, which hold the usual ones.
+///
+/// **What this check is not.** It is a closed vocabulary: an agreeing word and no refusing word. It
+/// reads no question and no refusal in other words ("are you sure", "hold off"), and no list can,
+/// because the words of a refusal are not a closed set. It is the second line behind the grant, and
+/// no speech reaches it today: the host's grammar holds no request that needs a spoken
+/// destination. The part that lets speech name a destination replaces this check with one that
+/// accepts a whole utterance of a closed form, as the grammar does for a request.
 fn is_clear_affirmative(spoken: &str) -> bool {
     /// Words that agree.
     const AGREEING: &[&str] = &[
@@ -2192,31 +2199,55 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "nevermind",
     ];
 
-    // A transcript writes the apostrophe straight, curly, modified or as an accent; each is one
-    // mark here, and part of its word.
+    let spoken = spoken.to_lowercase();
+    if has_negative_contraction(&spoken) {
+        return false;
+    }
+    // A transcript writes the apostrophe straight, curly, modified or as an accent; each is part of
+    // its word, and none is part of the spelling the lists hold.
     let mut words = spoken
         .split(|character: char| !(character.is_alphanumeric() || is_apostrophe(character)))
         .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
+        .map(|word| {
+            word.chars()
+                .filter(|each| !is_apostrophe(*each))
+                .collect::<String>()
+        })
         .peekable();
     if words.peek().is_none() {
         return false;
     }
     let mut agrees = false;
     for word in words {
-        let bare: String = word
-            .chars()
-            .filter(|character| !is_apostrophe(*character))
-            .collect();
-        let negated = word.replace(is_apostrophe, "'").contains("n't");
-        if negated || REFUSING.contains(&bare.as_str()) {
+        if REFUSING.contains(&word.as_str()) {
             return false;
         }
-        if AGREEING.contains(&bare.as_str()) {
+        if AGREEING.contains(&word.as_str()) {
             agrees = true;
         }
     }
     agrees
+}
+
+/// Whether `text` holds a word that ends in "n", one mark and "t": the form of a contraction of
+/// "not", whatever the mark. A mark between two letters of a longer word ("n" and "t" with a letter
+/// after) is not the form.
+fn has_negative_contraction(text: &str) -> bool {
+    let characters: Vec<char> = text.chars().collect();
+    characters.windows(3).enumerate().any(|(start, window)| {
+        let [letter, mark, last] = window else {
+            return false;
+        };
+        *letter == 'n'
+            && *last == 't'
+            && !mark.is_alphanumeric()
+            && !mark.is_whitespace()
+            && start > 0
+            && characters[start - 1].is_alphabetic()
+            && characters
+                .get(start + 3)
+                .is_none_or(|after| !after.is_alphanumeric())
+    })
 }
 
 /// Whether `character` is a mark a transcript writes for an apostrophe.
@@ -2326,6 +2357,10 @@ mod tests {
             "she mayn't, but send",
             "I can't've sent it, so send",
             "I usedn't send it",
+            "I won\u{201b}t send it",
+            "don?t send it",
+            "I can\u{2019}t\u{2019}ve sent it, so send",
+            "I usedn\u{ff07}t send it",
         ] {
             assert!(!is_clear_affirmative(refusal), "{refusal:?}");
         }
