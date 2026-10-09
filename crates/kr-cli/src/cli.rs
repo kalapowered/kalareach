@@ -98,6 +98,9 @@ pub enum Command {
     /// Turn this environment's privacy mode on or off, or show where it stands.
     #[command(subcommand)]
     Privacy(PrivacyCommand),
+    /// Enrol this host in an organisation's policy, or show what it holds for each.
+    #[command(subcommand)]
+    Organisation(OrganisationCommand),
 }
 
 /// The environment one command acts in.
@@ -524,6 +527,30 @@ pub struct PrivacyArguments {
     pub selector: EnvironmentSelector,
 }
 
+/// One `kr organisation` operation.
+#[derive(Subcommand)]
+pub enum OrganisationCommand {
+    /// Opt this host into an organisation's policy and pin the keys that sign it.
+    ///
+    /// The organisation's chain of policy-signing keys is read from a file a member exported from
+    /// the organisation's service. This host verifies the whole chain before it asks anybody,
+    /// and an owner device confirms exactly the first key and the key signing now.
+    Enrol(OrganisationEnrolArguments),
+    /// Show the organisations this host is enrolled in, the devices bound to their members, and
+    /// whether exclusive management is on.
+    List(PrivacyArguments),
+}
+
+/// `kr organisation enrol`.
+#[derive(Args)]
+pub struct OrganisationEnrolArguments {
+    /// The file holding the organisation's published policy-signing chain, as JSON.
+    pub chain: std::path::PathBuf,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
 /// One `kr plugin` operation.
 #[derive(Subcommand)]
 pub enum PluginCommand {
@@ -702,6 +729,10 @@ pub struct PairInviteArguments {
     /// The rendezvous origin a code is reserved at, instead of this host's default.
     #[arg(long)]
     pub origin: Option<String>,
+    /// Require membership of an organisation this host is enrolled in, by its identifier, so the
+    /// device's access answers to the organisation's lease for it.
+    #[arg(long, value_name = "ORGANISATION", conflicts_with = "owner")]
+    pub organisation: Option<String>,
     /// The environment to act in. Without it, this installation's own.
     #[arg(long)]
     pub environment: Option<String>,

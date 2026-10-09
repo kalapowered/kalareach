@@ -231,6 +231,32 @@ impl fmt::Display for VerificationValue {
 
 impl Plain for VerificationValue {}
 
+/// The identifier of a key, in lower-case hexadecimal.
+///
+/// It is made of digits and the letters a to f, so it is as plain as a number is. A key's
+/// identifier is how an administrator reads a policy-signing key out to the person enrolling.
+pub struct KeyIdentifier(String);
+
+/// Returns a key's identifier as hexadecimal digits.
+#[must_use]
+pub fn key_identifier(identifier: &kr_protocol::scalars::KeyId) -> KeyIdentifier {
+    KeyIdentifier(
+        identifier
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+impl fmt::Display for KeyIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Plain for KeyIdentifier {}
+
 /// A build identifier, as a refusal names it.
 pub struct BuildName(String);
 

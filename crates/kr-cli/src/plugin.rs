@@ -222,6 +222,7 @@ async fn install(paths: &HostPaths, arguments: &PluginInstallArguments, json: bo
                 Method::PluginInstall,
                 &params,
                 json,
+                say_what_is_asked,
             )
             .await?;
             (installed, Some(challenge))
@@ -364,12 +365,13 @@ async fn wait_for_an_owner_device<T>(
 /// Nothing here signs anything: an owner device answers with its own key, on its own screen, and
 /// the host spends that answer once. What the request does is the host's own, so a request that
 /// the host refuses for another reason ends the wait with that refusal.
-async fn confirmed_on_an_owner_device<P, T>(
+pub(crate) async fn confirmed_on_an_owner_device<P, T>(
     daemon: &mut Daemon,
     subject: ConfirmationSubject,
     method: Method,
     params: &P,
     json: bool,
+    say_what_is_asked: fn(&ConfirmationDisplay),
 ) -> Result<(T, kr_protocol::pairing::OwnerConfirmationRequest)>
 where
     P: serde::Serialize + ?Sized,
@@ -668,6 +670,7 @@ async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: b
         Method::CatalogueAdd,
         &params,
         json,
+        say_what_is_asked,
     )
     .await?;
     if json {

@@ -40,11 +40,12 @@ worker directly for what a session owns.
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
 | `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
+| `kr organisation [enrol/list]` | — | Enrol this host in an organisation's policy, or show what it holds for each organisation |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
 
-The commands from `kr project` to `kr privacy` act in this installation's own environment, or in the
+The commands from `kr project` to `kr organisation` act in this installation's own environment, or in the
 one `--environment <id>` names. Each is a client of one method the control daemon serves, and
 the daemon decides every refusal. A command that removes or revokes something names it by its
 identifier, never by a label or a number.
@@ -1243,6 +1244,7 @@ section 10's pairing; the new device runs its own side, in the companion applica
 | --- | --- |
 | `kr pair invite --owner` | Issue an invitation for an owner device: every right over this host, until it is revoked |
 | `kr pair invite --view [MINUTES]` | Issue an invitation for a device that may view sessions, for the minutes given (60 by default) |
+| `kr pair invite --view [MINUTES] --organisation <id>` | Issue that invitation for a member of an organisation this host is enrolled in, so the device's access answers to the organisation's lease |
 | `kr pair confirm <invitation>` | Approve the device that answered, once it shows its verification value |
 | `kr pair cancel <invitation> [--deny]` | Withdraw the invitation, or deny the device that answered it |
 | `kr pair status <invitation>` | Show where the invitation has reached, and the device that answered it |
@@ -1649,6 +1651,40 @@ with whether this host holds any way to ask for its removal. It changes nothing.
 whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
 `docs/host/README.md` has what each step does and what privacy mode does not reach.
 
+## `kr organisation`
+
+A host can opt into an organisation's policy. `docs/host/README.md` has what that means for the
+host; this is the owner's side of it.
+
+```sh
+kr organisation enrol chain.json     # pin the keys that sign an organisation's policy
+kr organisation list                 # what this host holds for each organisation
+```
+
+`kr organisation enrol` reads the organisation's published policy-signing chain from a JSON file
+that a member exported from the organisation's service; this host does not call that service.
+The file may be no larger than a control frame carries. The host verifies the whole chain before it
+asks anyone: a chain that does not verify is refused with nothing asked or changed, and so is a
+host that distrusts its clock. Then `kr` says that an owner device has to confirm, and what that
+device is asked to trust, and asks the host again every second until the confirmation arrives or
+the challenge runs out after two minutes, as `kr pair invite` does. An owner device is shown the
+organisation, its first key and the key signing now, and confirms exactly those. A host with no
+owner device refuses at once and names `kr pair invite --owner`: an enrolment is not confirmed at
+the host's own terminal. `--json` returns the organisation, the enrolment revision, the highest key
+revision accepted and the identifier of the first key.
+
+`kr organisation list` is read-only and also served to a paired device that manages the host. It
+reports each enrolment with the identifier of its first key, the key rotation is followed from, the
+highest key revision accepted and the enrolment revision that a grant requiring the organisation
+names; the devices bound to member accounts and the lease last recorded for each; whether the host
+is exclusively organisation-managed and whether it trusts its clock; and each time exclusive
+management was turned off. A member's account name is written as the organisation signed it.
+
+`kr pair invite --view --organisation <id>` fills in the requirement from the enrolment, so the
+invitation proposes access that the host can answer for. The host refuses a proposal that requires
+an organisation it is not enrolled in, names another enrolment revision, or carries a right above
+what an owner of an organisation may hold.
+
 ## `kr host import-journals`
 
 A session's journal is brought forward to this build's schema by whatever opens it, but only from
@@ -1932,6 +1968,15 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 
 `kr pair confirm --json` returns `ok`, `invitation_id`, `device_id`, `grant_id`, `device_name` and
 `platform`.
+
+`kr organisation enrol --json` returns `ok`, `organisation_id`, `enrolment_revision`,
+`accepted_head` and `root_key_id`, the identifier of the organisation's first key in hexadecimal.
+`kr organisation list --json` returns `ok`, `exclusive`, `clock_trusted`, `enrolments` and
+`exclusive_events`. Each enrolment has `organisation_id`, `root_key_id`, `anchor_revision`,
+`anchor_key_id`, `accepted_head`, `enrolment_revision` and `members`; a member has `device_id`,
+`account_id`, `device_key_id`, `bound_at_ms` and, when the host recorded one, `lease` with
+`issued_at_ms` and `expires_at_ms`. Each event has `sequence`, `at_ms`, `channel` and
+`organisation_ids`.
 
 `kr project`, `kr workspace`, `kr changeset`, `kr diff`, `kr device` and `kr plugin` print the
 host's answer in the shape it sent it, with `ok` beside it: each value of the protocol's own

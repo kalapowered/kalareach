@@ -58,6 +58,7 @@ pub mod error;
 pub mod export;
 pub mod import;
 pub mod machine;
+pub mod organisation;
 pub mod output;
 pub mod pair;
 pub mod platform;

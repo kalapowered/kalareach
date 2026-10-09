@@ -74,6 +74,8 @@ pub enum Request {
     /// What session descriptions offer on this host: the model's name, where its files come from
     /// and why a fetch failed: `kr host descriptions`.
     Descriptions,
+    /// The member accounts an organisation's leases name: `kr organisation`.
+    Organisations,
 }
 
 /// Content the person asked to read.
@@ -653,6 +655,8 @@ impl claim::Claimed for kr_protocol::project::ContentClass {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetId {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetVersion {}
 impl claim::Claimed for kr_protocol::ids::EnvironmentId {}
+impl claim::Claimed for kr_protocol::ids::OrganisationId {}
+impl claim::Claimed for kr_protocol::ids::PolicyKeyRevision {}
 impl claim::Claimed for kr_protocol::ids::MaterialisationId {}
 impl claim::Claimed for kr_protocol::ids::ProjectRepositoryId {}
 impl claim::Claimed for kr_protocol::ids::RepositoryGeneration {}
