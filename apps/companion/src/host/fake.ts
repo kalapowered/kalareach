@@ -52,13 +52,16 @@ import type {
   ImportedImage,
   KeyAction,
   KeypadCode,
+  KitSaved,
   OwnerView,
   PairingView,
   PasteView,
+  RecoveryView,
   ReviewOutcome,
   Settled,
   SettingsPane,
   SetupIdentity,
+  SyncServiceView,
   TerminalControl,
   TerminalGrid,
   TerminalInput,
@@ -200,10 +203,30 @@ export interface FakeAccount {
   failSignOut(): void
 }
 
+/**
+ * Recovery, as the backend reports it: where it stands and what stops the next step, and what the
+ * page asked for. The seed, the locator and the kit's text are native code's, so nothing here holds
+ * them.
+ */
+export interface FakeRecovery {
+  /** How many times the page asked to turn recovery on. */
+  readonly turnedOn: number
+  /** How many times the page asked to settle a write that was not answered. */
+  readonly settled: number
+  /** How many times the page signed in again for recovery. */
+  readonly signedInForRecovery: number
+  /** The destinations the page asked to have the kit written to. */
+  readonly kitsSaved: readonly string[]
+  /** Sets where recovery stands, as the backend would report it. */
+  set(view: Partial<Omit<RecoveryView, 'sync_service'>>): void
+}
+
 /** What the fake host can be told to do before a test drives the interface. */
 export interface FakeHostControls {
   /** The account. */
   readonly account: FakeAccount
+  /** Recovery. */
+  readonly recovery: FakeRecovery
   /** Pushes one event to every subscriber. */
   emit(event: HostEvent): void
   /**
@@ -610,6 +633,18 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     pendingSignIn = null
     settle?.(view)
   }
+
+  let syncService: SyncServiceView = {
+    origin: 'https://reach.kala.to',
+    host: 'reach.kala.to',
+    is_default: true
+  }
+  let recovery: Omit<RecoveryView, 'sync_service'> = { state: 'off', kept_at: null, blocker: null }
+  let recoveryTurnOns = 0
+  let recoverySettles = 0
+  let recoverySignIns = 0
+  const kitsSaved: string[] = []
+  const recoveryView = (): RecoveryView => ({ sync_service: syncService, ...recovery })
 
   const requireConnection = () => {
     if (!connected) {
@@ -1472,6 +1507,16 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         }
       })
     },
+    accountSignInForRecovery: () => {
+      recoverySignIns += 1
+      setAccount({ state: 'browser_open' })
+      return new Promise<AccountView>((resolve) => {
+        pendingSignIn = (view) => {
+          setAccount(view)
+          resolve(view)
+        }
+      })
+    },
     accountSignInCancel: () => {
       settleSignIn({ state: 'signed_out', outcome: 'cancelled' })
       return Promise.resolve()
@@ -1493,11 +1538,61 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         : Promise.resolve(accountUsage),
     onAccount: (listener) => register(accountListeners, listener),
 
+    syncServiceView: () => Promise.resolve(syncService),
+    syncServiceSet: (origin) => {
+      const trimmed = origin.trim().replace(/\/$/, '')
+      if (!/^(https:\/\/[a-z0-9.-]+|http:\/\/(127\.0\.0\.1|localhost))(:[0-9]+)?$/.test(trimmed)) {
+        refuse(
+          'INVALID_ARGUMENT',
+          'The sync service setting needs an https origin such as https://sync.example.'
+        )
+      }
+      const host = trimmed.slice(trimmed.indexOf('://') + 3)
+      syncService = { origin: trimmed, host, is_default: trimmed === 'https://reach.kala.to' }
+      return Promise.resolve(syncService)
+    },
+    recoveryView: () => Promise.resolve(recoveryView()),
+    recoveryTurnOn: () => {
+      recoveryTurnOns += 1
+      if (recovery.blocker !== null) {
+        refuse('PERMISSION_DENIED', 'Recovery cannot be turned on yet.')
+      }
+      recovery = { ...recovery, state: 'on', kept_at: syncService.host }
+      return Promise.resolve(recoveryView())
+    },
+    recoverySettle: () => {
+      recoverySettles += 1
+      recovery = { ...recovery, state: recovery.kept_at === null ? 'unfinished' : 'on' }
+      return Promise.resolve(recoveryView())
+    },
+    recoverySaveKit: (path): Promise<KitSaved> => {
+      if (recovery.state !== 'on') {
+        refuse('PERMISSION_DENIED', 'Recovery is not on, so there is no kit.')
+      }
+      kitsSaved.push(path)
+      return Promise.resolve({ path })
+    },
+
     subscribe: (listener) => register(listeners, listener),
     onFilesDropped: (listener) => register(dropListeners, listener)
   }
 
   const controls: FakeHostControls = {
+    recovery: {
+      get turnedOn() {
+        return recoveryTurnOns
+      },
+      get settled() {
+        return recoverySettles
+      },
+      get signedInForRecovery() {
+        return recoverySignIns
+      },
+      kitsSaved,
+      set(view) {
+        recovery = { ...recovery, ...view }
+      }
+    },
     account: {
       get signIns() {
         return signIns

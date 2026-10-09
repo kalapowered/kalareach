@@ -211,6 +211,51 @@ export interface PairingOrigin {
   readonly is_default: boolean
 }
 
+/* ---- Sync service and recovery -------------------------------------------------------------------
+ *
+ * The sync service is a choice of its own: the managed service until the person picks another. Recovery
+ * keeps an encrypted bundle on it, with the account's sign-in beside this device's signature, and
+ * a kit the person keeps. The seed, the locator and the token stay in native code: the page is
+ * told where recovery stands and what stops the next step, and a kit is written by native code to
+ * a destination the platform's save dialog returned.
+ */
+
+/** The sync service this computer is set to use. */
+export interface SyncServiceView {
+  readonly origin: string
+  readonly host: string
+  readonly is_default: boolean
+}
+
+/** Where recovery stands on this computer. */
+export type RecoveryState = 'off' | 'unfinished' | 'on' | 'unsettled'
+
+/** What stops the next step of recovery, and so what the person is asked to mend. */
+export type RecoveryBlocker =
+  | { readonly reason: 'signed_out' }
+  | { readonly reason: 'needs_sign_in' }
+  | {
+      readonly reason: 'wrong_service'
+      /** The sync service the setting names. */
+      readonly sync_service: string
+      /** The service the account is signed in to. */
+      readonly account: string
+    }
+
+/** Everything the recovery section shows. */
+export interface RecoveryView {
+  readonly sync_service: SyncServiceView
+  readonly state: RecoveryState
+  /** The host of the service the bundle is kept at, once recovery has been turned on. */
+  readonly kept_at: string | null
+  readonly blocker: RecoveryBlocker | null
+}
+
+/** Where a recovery kit was written. */
+export interface KitSaved {
+  readonly path: string
+}
+
 /** Which of the outcomes a person is told apart an attempt ended with. */
 export type FailureKind =
   | 'malformed'
@@ -845,6 +890,12 @@ export interface HostPort {
    */
   accountSignIn(): Promise<AccountView>
 
+  /**
+   * Signs this device in again, asking for the right to write the account's backup storage as
+   * well, which keeping a recovery bundle takes. Settles when the attempt ends.
+   */
+  accountSignInForRecovery(): Promise<AccountView>
+
   /** Ends the sign-in that is waiting for the browser. */
   accountSignInCancel(): Promise<void>
 
@@ -860,6 +911,23 @@ export interface HostPort {
    * reaches it.
    */
   onAccount(listener: (view: AccountView) => void): Promise<() => void>
+
+  /** The sync service this computer is set to use. */
+  syncServiceView(): Promise<SyncServiceView>
+  /** Chooses another sync service. The page names an origin, and nothing else. */
+  syncServiceSet(origin: string): Promise<SyncServiceView>
+
+  /** Where recovery stands, and what stops the next step. Nothing is sent to any service. */
+  recoveryView(): Promise<RecoveryView>
+  /** Makes the recovery seed in native code and puts the first bundle at the sync service. */
+  recoveryTurnOn(): Promise<RecoveryView>
+  /** Ends a write to the recovery bundle that was not answered, so the next one can go. */
+  recoverySettle(): Promise<RecoveryView>
+  /**
+   * Writes the recovery kit to `path`, which must be one `chooseExportPath` returned. Native code
+   * writes it; nothing the kit holds reaches the page.
+   */
+  recoverySaveKit(path: string): Promise<KitSaved>
 
   /**
    * Tells `listener` each event the host publishes. Resolves, with the function that stops it,

@@ -31,6 +31,7 @@ import {
   type AccountView,
   type UsageView
 } from '../model/account'
+import { SyncPanel } from './SyncPanel'
 import { Button, Card } from './ui'
 
 /** The account, read from the backend and kept current. */
@@ -140,9 +141,11 @@ export function useAccount(port: HostPort): AccountHandle {
 /** The account panel. */
 export function AccountPanel({
   account,
+  port,
   surface
 }: {
   readonly account: AccountHandle
+  readonly port: HostPort
   readonly surface: Surface
 }): ReactNode {
   const { view, usage } = account
@@ -237,6 +240,8 @@ export function AccountPanel({
           onRetry={account.readUsage}
         />
       ) : null}
+
+      <SyncPanel port={port} account={view} surface={surface} />
 
       <p className="account-section-title">Working without an account</p>
       <Card>
