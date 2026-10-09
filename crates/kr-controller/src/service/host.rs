@@ -559,10 +559,7 @@ impl Controller {
     #[cfg(target_os = "linux")]
     fn control_group_check(&self) -> Option<DoctorCheck> {
         let service = crate::supervision::host_started_service_of(std::process::id())?;
-        use crate::supervision::WorkerSupervisor as _;
-
-        let detached =
-            self.supervisor.describe() == crate::supervision::DetachedSupervisor::new().describe();
+        let detached = self.supervisor.describe() == crate::supervision::DETACHED_DESCRIPTION;
         let mut found = Sentence::new()
             .stated("this daemon runs in the control group of the service of ")
             .stated(if service.worker {

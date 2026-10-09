@@ -1113,8 +1113,8 @@ pub struct HostStartedService {
 /// The process replaces itself by `systemd-run --user --scope`, which makes the scope for its own
 /// process and then runs the daemon in that same process: the number, the parent, the session, the
 /// working directory and the first three descriptors stay what they were, so the command that
-/// started the daemon still holds the right child. The release hold is taken again by the new image
-/// as every start takes it. The daemon's arguments are passed as they are, `--own-session`
+/// started the daemon still holds the right child. The daemon has taken no release hold yet, and
+/// the new image takes it as every start does. The daemon's arguments are passed as they are, `--own-session`
 /// included, because an update restarts a daemon with the arguments it was started with; the new
 /// image does not run this again, since it then leads its session and is in a scope.
 ///
@@ -1232,6 +1232,10 @@ fn program_on_the_path(name: &str) -> Option<PathBuf> {
 #[derive(Debug, Default)]
 pub struct DetachedSupervisor;
 
+/// What the detached supervisor says it is: the text `kr doctor` prints, and the one thing that
+/// tells the doctor this daemon starts its workers as detached processes.
+pub const DETACHED_DESCRIPTION: &str = "a detached process in a session or process group of its own, reparented when this daemon exits";
+
 impl DetachedSupervisor {
     /// Builds the supervisor.
     #[must_use]
@@ -1256,7 +1260,7 @@ impl WorkerSupervisor for DetachedSupervisor {
     }
 
     fn describe(&self) -> &'static str {
-        "a detached process in a session or process group of its own, reparented when this daemon exits"
+        DETACHED_DESCRIPTION
     }
 }
 
