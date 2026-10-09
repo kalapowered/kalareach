@@ -146,10 +146,17 @@ impl ArchiveService {
             .unwrap_or_else(|_| Recorded::Unusable("reading the record did not finish".to_owned()));
         let mut surviving = Vec::new();
         let mut tracked: Vec<Tracked> = Vec::new();
+        // Recorded processes that have left the session for a control daemon's own scope: not the
+        // session's to stop, and named at the end apart from what it owned.
+        let mut left: Vec<ProcessStartIdentity> = Vec::new();
         let mut record: Option<OwnedRecord> = None;
         match recorded {
             Recorded::Usable(usable) => {
                 for identity in &usable.processes {
+                    if left_for_a_daemon(identity, &usable.root, usable.cgroup.as_deref()) {
+                        left.push(identity.clone());
+                        continue;
+                    }
                     tracked.push(Tracked {
                         identity: identity.clone(),
                         forced: false,
@@ -367,6 +374,24 @@ impl ArchiveService {
                     .to_owned(),
             ));
         }
+        // What was left for a control daemon's scope was never the session's, so it has no part in
+        // the claim above; the closure still says it was there and was not stopped.
+        for identity in &left {
+            if !matches!(
+                kr_ipc::identity::process_state(identity),
+                kr_ipc::identity::ProcessState::Ended
+            ) {
+                surviving.push(SurvivingResource {
+                    kind: kr_worker::ownership::LEFT_FOR_A_DAEMON.to_owned(),
+                    detail: format!(
+                        "process {} (started {}) left this session in a scope named for a control \
+                         daemon and was not stopped",
+                        identity.pid.get(),
+                        identity.start_value.get()
+                    ),
+                });
+            }
+        }
         // What the platform's boundary cannot reach, said where it does not: a job holds the whole
         // tree, so a Windows closure that is incomplete has named why.
         if !complete && !cfg!(windows) {
@@ -397,6 +422,29 @@ impl ArchiveService {
                 OwnershipCoverage::Incomplete
             },
         }
+    }
+}
+
+/// Whether a recorded process has left the session for a control daemon's own scope: it leads a
+/// session other than the root's and is in a scope named for a daemon outside the worker's own
+/// service. Read now, after the identity is the recorded one, and only on a platform with control
+/// groups.
+fn left_for_a_daemon(
+    identity: &ProcessStartIdentity,
+    root: &ProcessStartIdentity,
+    unit: Option<&str>,
+) -> bool {
+    match (
+        u32::try_from(identity.pid.get()),
+        u32::try_from(root.pid.get()),
+    ) {
+        (Ok(pid), Ok(session)) => {
+            matches!(
+                kr_ipc::identity::process_state(identity),
+                kr_ipc::identity::ProcessState::Running
+            ) && kr_ipc::identity::left_for_a_daemon(pid, session, unit)
+        }
+        _ => false,
     }
 }
 

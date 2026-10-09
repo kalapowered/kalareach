@@ -189,10 +189,18 @@ pub fn own_cgroup() -> Option<String> {
     }
 }
 
+/// The kind a closure gives a recorded process it did not stop because the process had left the
+/// session for a control daemon's own scope.
+pub const LEFT_FOR_A_DAEMON: &str = "left_for_a_daemon";
+
 #[derive(Clone, Debug)]
 struct Recorded {
     identity: ProcessStartIdentity,
     forced: bool,
+    /// Whether the process was read in a control daemon's own scope, outside this session's
+    /// service, at an observation. Kept once read, because the process can end before the closure
+    /// and then cannot be read again; it says the process was never the session's to stop.
+    left: bool,
 }
 
 /// The key one process is recorded under: what the operating system called it, and when it started.
@@ -220,6 +228,7 @@ impl OwnedProcesses {
             Recorded {
                 identity: root,
                 forced: false,
+                left: false,
             },
         );
         owned
@@ -233,7 +242,12 @@ impl OwnedProcesses {
         OwnedRecord {
             boot: self.boot.clone(),
             root: self.root.clone(),
-            processes: self.live.values().cloned().collect(),
+            processes: self
+                .live
+                .values()
+                .filter(|identity| !self.in_a_daemons_scope(identity))
+                .cloned()
+                .collect(),
             cgroup: self.cgroup.clone(),
             boundary: self.boundary.describe(),
             limits: self.unestablished(),
@@ -242,13 +256,35 @@ impl OwnedProcesses {
 
     /// Notes processes found in the boundary, each already tied to the boundary by the reading
     /// that gave its start, and forgets those the kernel now says have ended.
+    ///
+    /// A process that has left the session for a control daemon's own scope is noted as having
+    /// left, and is not among the processes the session stops: a control daemon a command of the
+    /// session started is the daemon of another environment, which the session did not start for
+    /// itself.
     fn take(&mut self, found: impl IntoIterator<Item = ProcessStartIdentity>) {
         for identity in found {
-            self.live.insert(key(&identity), identity.clone());
+            let left = self.in_a_daemons_scope(&identity);
+            if !left {
+                self.live.insert(key(&identity), identity.clone());
+            }
             self.seen.entry(key(&identity)).or_insert(Recorded {
                 identity,
                 forced: false,
+                left,
             });
+        }
+        // One that was recorded before it moved is read again, and left behind from here on.
+        let moved: Vec<(u64, u64)> = self
+            .live
+            .iter()
+            .filter(|(_, identity)| self.in_a_daemons_scope(identity))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in moved {
+            self.live.remove(&key);
+            if let Some(recorded) = self.seen.get_mut(&key) {
+                recorded.left = true;
+            }
         }
         self.live.retain(|_, identity| {
             !matches!(
@@ -256,6 +292,26 @@ impl OwnedProcesses {
                 kr_ipc::identity::ProcessState::Ended
             )
         });
+    }
+
+    /// Whether a process is, now, in a control daemon's own scope outside this session's service,
+    /// leading a session of its own: not one of the session's, whatever it was recorded as.
+    fn in_a_daemons_scope(&self, identity: &ProcessStartIdentity) -> bool {
+        match (
+            u32::try_from(identity.pid.get()),
+            u32::try_from(self.root.pid.get()),
+        ) {
+            (Ok(pid), Ok(session)) => {
+                kr_ipc::identity::left_for_a_daemon(pid, session, self.cgroup.as_deref())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a recorded process is no longer one of the session's: it was read in a control
+    /// daemon's scope when it was last observed, or is in one now.
+    fn has_left(&self, recorded: &Recorded) -> bool {
+        recorded.left || self.in_a_daemons_scope(&recorded.identity)
     }
 
     /// Returns the boundary this session's ownership rests on.
@@ -616,11 +672,19 @@ impl OwnedProcesses {
     /// are exactly the ones no longer running by the time the record is written, and the record
     /// would then say every one of them stopped when it was asked.
     pub fn note_forced_now(&mut self) {
-        for recorded in self.seen.values_mut() {
-            if matches!(
-                kr_ipc::identity::process_state(&recorded.identity),
-                kr_ipc::identity::ProcessState::Running
-            ) {
+        let left: Vec<(u64, u64)> = self
+            .seen
+            .iter()
+            .filter(|(_, recorded)| self.has_left(recorded))
+            .map(|(key, _)| *key)
+            .collect();
+        for (key, recorded) in &mut self.seen {
+            if !left.contains(key)
+                && matches!(
+                    kr_ipc::identity::process_state(&recorded.identity),
+                    kr_ipc::identity::ProcessState::Running
+                )
+            {
                 recorded.forced = true;
             }
         }
@@ -632,10 +696,12 @@ impl OwnedProcesses {
         self.seen
             .values()
             .filter(|recorded| {
-                matches!(
-                    kr_ipc::identity::process_state(&recorded.identity),
-                    kr_ipc::identity::ProcessState::Ended
-                )
+                // One read in a control daemon's scope ended without the session ending it.
+                !recorded.left
+                    && matches!(
+                        kr_ipc::identity::process_state(&recorded.identity),
+                        kr_ipc::identity::ProcessState::Ended
+                    )
             })
             .map(|recorded| TerminatedProcess {
                 identity: recorded.identity.clone(),
@@ -647,7 +713,11 @@ impl OwnedProcesses {
             .collect()
     }
 
-    /// Returns the processes that are still running, or that the kernel will not describe.
+    /// Returns the processes of the session that are still running, or that the kernel will not
+    /// describe.
+    ///
+    /// A process that has left the session for a control daemon's own scope is not among them: it
+    /// is not stopped, and the closure names it apart.
     #[must_use]
     pub fn surviving(&self) -> Vec<ProcessStartIdentity> {
         self.seen
@@ -656,7 +726,7 @@ impl OwnedProcesses {
                 !matches!(
                     kr_ipc::identity::process_state(&recorded.identity),
                     kr_ipc::identity::ProcessState::Ended
-                )
+                ) && !self.has_left(recorded)
             })
             .map(|recorded| recorded.identity.clone())
             .collect()
@@ -686,7 +756,23 @@ impl OwnedProcesses {
         self.seen
             .values()
             .filter_map(|recorded| {
-                match kr_ipc::identity::process_state(&recorded.identity) {
+                let state = kr_ipc::identity::process_state(&recorded.identity);
+                if matches!(state, kr_ipc::identity::ProcessState::Ended) {
+                    return None;
+                }
+                // Not the session's, and not counted against what the closure accounts for: named
+                // so that a reader sees what was left running and why.
+                if self.has_left(recorded) {
+                    return Some(SurvivingResource {
+                        kind: LEFT_FOR_A_DAEMON.to_owned(),
+                        detail: format!(
+                            "process {} (started {}) left this session in a scope named for a \
+                             control daemon and was not stopped",
+                            recorded.identity.pid, recorded.identity.start_value
+                        ),
+                    });
+                }
+                match state {
                     kr_ipc::identity::ProcessState::Ended => None,
                     kr_ipc::identity::ProcessState::Running => Some(SurvivingResource {
                         kind: "process".to_owned(),
@@ -1181,6 +1267,7 @@ mod tests {
             Recorded {
                 identity: recorded.clone(),
                 forced: false,
+                left: false,
             },
         );
         request_stop(&owned);
@@ -1212,6 +1299,7 @@ mod tests {
             Recorded {
                 identity: second.clone(),
                 forced: false,
+                left: false,
             },
         );
         assert_eq!(owned.seen.len(), 2, "the record holds both");
