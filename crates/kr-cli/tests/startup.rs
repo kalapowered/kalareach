@@ -13,8 +13,9 @@
 //! where none has ever run, and `kr doctor` reports it with the document it came from.
 //! KR-REQ-07.13: with the start selected, neither the command that selects it nor the `kr new`
 //! that starts the daemon runs a service-manager, lingering or privilege tool, the daemon it starts
-//! runs nothing but read-only queries of the service manager, and nothing is written in the home
-//! they are given. KR-REQ-08.02: `kr status` on a session the started daemon holds reports each
+//! runs nothing but read-only queries of the service manager (and, when it is started inside a
+//! service this host started, the one transient scope it moves itself into), and nothing is written
+//! in the home they are given. KR-REQ-08.02: `kr status` on a session the started daemon holds reports each
 //! terminal attachment's presentation and the reason for it.
 //!
 //! The installation is laid out the way a package lays it out: `kr`, its restoration guard, the
@@ -814,11 +815,14 @@ fn every_path_under(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     found
 }
 
-/// One call a recording tool recorded.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One call a recording tool saw.
+#[derive(Debug)]
 struct Recorded {
     /// The process that made the call.
     caller: u32,
+    /// The process that ran the tool. It is the caller's child, unless the caller replaced itself
+    /// with the tool, which keeps its number.
+    pid: u32,
     /// That process's name, as the listing of processes gives it.
     name: String,
     /// The tool.
@@ -828,11 +832,16 @@ struct Recorded {
 }
 
 /// Places the recording tools in `tools`: each records the call it was given and the process that
-/// made it in `calls`, and fails the way a host with no service manager and no privilege tool
-/// would.
-fn recording_tools(tools: &Path, calls: &Path) {
+/// made it in `calls`. A tool fails the way a host with no service manager and no privilege tool
+/// would, unless `passes` names the tools that go on to run the real one.
+fn recording_tools(tools: &Path, calls: &Path, passes: &[&str]) {
     std::fs::create_dir_all(tools).expect("a directory for the recording tools");
     for tool in RECORDING_TOOLS {
+        let ending = if passes.contains(&tool) {
+            format!("exec /usr/bin/{tool} \"$@\"\n")
+        } else {
+            "exit 1\n".to_owned()
+        };
         // Written aside as text and placed by a process of its own, so that no child another test
         // starts meanwhile holds a tool open for writing when the daemon starts it.
         let text = tools.join(format!("{tool}.text"));
@@ -841,11 +850,11 @@ fn recording_tools(tools: &Path, calls: &Path) {
             format!(
                 "#!/bin/sh\n\
                  {{\n\
-                 \x20 printf '%s\\t%s\\t%s' \"$PPID\" \"$(ps -o comm= -p \"$PPID\" 2>/dev/null)\" '{tool}'\n\
+                 \x20 printf '%s\\t%s\\t%s\\t%s' \"$PPID\" \"$$\" \"$(ps -o comm= -p \"$PPID\" 2>/dev/null)\" '{tool}'\n\
                  \x20 for argument in \"$@\"; do printf '\\t%s' \"$argument\"; done\n\
                  \x20 printf '\\n'\n\
                  }} >> '{}'\n\
-                 exit 1\n",
+                 {ending}",
                 calls.display()
             ),
         )
@@ -861,14 +870,19 @@ fn recorded_calls(calls: &Path) -> Vec<Recorded> {
         .lines()
         .map(|line| {
             let mut fields = line.split('\t');
-            let caller = fields
-                .next()
-                .and_then(|field| field.trim().parse().ok())
-                .unwrap_or_else(|| panic!("a recorded call names its caller: {line}"));
+            let mut number = |what: &str| -> u32 {
+                fields
+                    .next()
+                    .and_then(|field| field.trim().parse().ok())
+                    .unwrap_or_else(|| panic!("a recorded call names its {what}: {line}"))
+            };
+            let caller = number("caller");
+            let pid = number("process");
             let name = fields.next().unwrap_or_default().trim().to_owned();
             let tool = fields.next().unwrap_or_default().to_owned();
             Recorded {
                 caller,
+                pid,
                 name,
                 tool,
                 arguments: fields.map(str::to_owned).collect(),
@@ -877,14 +891,31 @@ fn recorded_calls(calls: &Path) -> Vec<Recorded> {
         .collect()
 }
 
+/// What a daemon the standalone start ran may ask the service manager beyond the read-only
+/// queries.
+#[derive(Clone, Copy, Default)]
+struct Allowance<'a> {
+    /// The daemon's own program, when it was started inside a service this host started: it may
+    /// move itself into one transient scope by running that program there.
+    scope_for: Option<&'a Path>,
+    /// The worker program a daemon of this installation launches as a transient service, as one
+    /// does where a service manager answers.
+    workers: Option<&'a Path>,
+}
+
 /// Whether one recorded call is one the standalone start may make.
 ///
-/// Only the daemon `kr` started may make one, and only in one of the exact read-only forms a
-/// daemon asks the platform's service manager with: `systemctl --user show`, `loginctl show-user`
-/// or `show-session`, and `launchctl print`. A call `kr` itself makes, a call from anything else,
-/// and every other form of every tool is refused, with what it was.
-fn allowed(call: &Recorded, daemons: &[u32]) -> Result<(), String> {
-    if !daemons.contains(&call.caller) {
+/// Only the daemon `kr` started may make one, whether it ran the tool as a child or replaced itself
+/// with the tool, and only in one of the exact forms a daemon asks the platform's service manager
+/// with: the read-only queries `systemctl --user show`, `systemd-run --version`, `loginctl
+/// show-user` or `show-session`, and `launchctl print`; and, as `allowance` says, the daemon itself
+/// running `systemd-run --user --scope --quiet --collect [--expand-environment=no]
+/// --unit=kr-daemon-<id> -- <its program> <its arguments>`, which installs nothing, persists
+/// nothing and takes no privilege, and the transient service of a worker of the one program a
+/// session is started with. A call `kr` itself makes, a call from anything else, and every other
+/// form of every tool is refused, with what it was.
+fn allowed(call: &Recorded, daemons: &[u32], allowance: Allowance<'_>) -> Result<(), String> {
+    if !daemons.contains(&call.caller) && !daemons.contains(&call.pid) {
         return Err(format!(
             "{} (process {}), which is not the daemon kr started, ran {} {:?}",
             call.name, call.caller, call.tool, call.arguments
@@ -894,14 +925,50 @@ fn allowed(call: &Recorded, daemons: &[u32]) -> Result<(), String> {
     let query = matches!(
         (call.tool.as_str(), arguments.as_slice()),
         ("systemctl", ["--user", "show", ..])
+            | ("systemd-run", ["--version"])
             | ("loginctl", ["show-user" | "show-session", ..])
             | ("launchctl", ["print", ..])
     );
-    if query {
+    let own_scope = call.tool == "systemd-run"
+        && daemons.contains(&call.pid)
+        && allowance.scope_for.is_some_and(|program| {
+            let ["--user", "--scope", "--quiet", "--collect", rest @ ..] = arguments.as_slice()
+            else {
+                return false;
+            };
+            let rest = match rest {
+                ["--expand-environment=no", more @ ..] => more,
+                other => other,
+            };
+            matches!(
+                rest,
+                [unit, "--", started, started_with @ ..]
+                    if unit.starts_with("--unit=kr-daemon-")
+                        && Path::new(started) == program
+                        && started_with.contains(&"--own-session")
+            )
+        });
+    let worker = call.tool == "systemd-run"
+        && allowance.workers.is_some_and(|program| {
+            let ["--user", unit, "--collect", ..] = arguments.as_slice() else {
+                return false;
+            };
+            let Some(reservation) = unit.strip_prefix("--unit=kr-worker-") else {
+                return false;
+            };
+            arguments
+                .iter()
+                .position(|argument| Path::new(argument) == program)
+                .is_some_and(|at| {
+                    arguments.get(at + 1) == Some(&"--reservation")
+                        && arguments.get(at + 2) == Some(&reservation)
+                })
+        });
+    if query || own_scope || worker {
         Ok(())
     } else {
         Err(format!(
-            "the daemon ran {} {:?}, which is not a read-only query",
+            "the daemon ran {} {:?}, which is not among the calls it may make",
             call.tool, call.arguments
         ))
     }
@@ -1097,7 +1164,7 @@ fn selecting_and_using_the_standalone_start_installs_nothing_and_seeks_no_privil
     let host = Standalone::create();
     let calls = host.tree.root().join("tool-calls");
     let tools = host.tree.root().join("tools");
-    recording_tools(&tools, &calls);
+    recording_tools(&tools, &calls, &[]);
     let path = format!("{}:/usr/bin:/bin", tools.display());
     // The recording tools record: one run through the same `PATH` is found, and then forgotten.
     let checked = spawning(|| {
@@ -1154,7 +1221,7 @@ fn selecting_and_using_the_standalone_start_installs_nothing_and_seeks_no_privil
     let daemons = host.launched();
     let recorded = recorded_calls(&calls);
     for call in &recorded {
-        if let Err(refused) = allowed(call, &daemons) {
+        if let Err(refused) = allowed(call, &daemons, Allowance::default()) {
             panic!("{refused}; everything recorded: {recorded:?}");
         }
     }
@@ -1183,13 +1250,15 @@ fn selecting_and_using_the_standalone_start_installs_nothing_and_seeks_no_privil
 }
 
 /// KR-REQ-07.13: the allow-list refuses every call that would install, enable, start or obtain
-/// anything, from the daemon as from anybody else, and admits the read-only queries and nothing
-/// more.
+/// anything, from the daemon as from anybody else, and admits the read-only queries and, for a
+/// daemon started inside a service this host started, the one transient scope it moves itself
+/// into, and nothing more.
 #[test]
 fn the_allow_list_refuses_every_mutating_or_privileged_call() {
     let daemon = 4242;
-    let call = |caller: u32, tool: &str, arguments: &[&str]| Recorded {
+    let call = |caller: u32, pid: u32, tool: &str, arguments: &[&str]| Recorded {
         caller,
+        pid,
         name: "kr-controller".to_owned(),
         tool: tool.to_owned(),
         arguments: arguments
@@ -1197,35 +1266,72 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
             .map(|argument| (*argument).to_owned())
             .collect(),
     };
-    for (tool, arguments) in [
-        ("sudo", &["true"][..]),
-        ("doas", &["true"][..]),
-        ("pkexec", &["true"][..]),
-        ("runuser", &["-u", "somebody", "true"][..]),
-        ("systemctl", &["--user", "enable", "kalareach.service"][..]),
-        (
-            "systemctl",
-            &["--user", "link", "/tmp/kalareach.service"][..],
-        ),
-        ("systemctl", &["--user", "start", "kalareach.service"][..]),
-        ("systemctl", &["show", "--property=Version"][..]),
-        (
-            "systemd-run",
-            &["--user", "--unit", "kalareach", "true"][..],
-        ),
-        ("loginctl", &["enable-linger"][..]),
-        ("loginctl", &["enable-linger", "somebody"][..]),
-        (
-            "launchctl",
-            &["bootstrap", "gui/501", "/tmp/kalareach.plist"][..],
-        ),
-        ("launchctl", &["load", "/tmp/kalareach.plist"][..]),
-        ("launchctl", &["enable", "gui/501/kalareach"][..]),
-    ] {
-        assert!(
-            allowed(&call(daemon, tool, arguments), &[daemon]).is_err(),
-            "{tool} {arguments:?} is refused"
-        );
+    let program = Path::new("/opt/kr/kr-controller");
+    let scope = |unit: &'static str, started: &'static str, last: &'static str| {
+        [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            unit,
+            "--",
+            started,
+            "--secret-store",
+            last,
+        ]
+    };
+    let worker_program = Path::new("/opt/kr/kr-worker");
+    let inside = Allowance {
+        scope_for: Some(program),
+        workers: None,
+    };
+    let everything = Allowance {
+        scope_for: Some(program),
+        workers: Some(worker_program),
+    };
+    for allowance in [Allowance::default(), inside, everything] {
+        for (tool, arguments) in [
+            ("sudo", &["true"][..]),
+            ("doas", &["true"][..]),
+            ("pkexec", &["true"][..]),
+            ("runuser", &["-u", "somebody", "true"][..]),
+            ("systemctl", &["--user", "enable", "kalareach.service"][..]),
+            (
+                "systemctl",
+                &["--user", "link", "/tmp/kalareach.service"][..],
+            ),
+            ("systemctl", &["--user", "start", "kalareach.service"][..]),
+            ("systemctl", &["show", "--property=Version"][..]),
+            (
+                "systemd-run",
+                &["--user", "--unit", "kalareach", "true"][..],
+            ),
+            ("systemd-run", &["--version", "--user"][..]),
+            // A transient service, which the manager keeps, is not the scope the daemon asks for.
+            (
+                "systemd-run",
+                &[
+                    "--user",
+                    "--collect",
+                    "--unit=kr-daemon-0123",
+                    "--",
+                    "/opt/kr/kr-controller",
+                ][..],
+            ),
+            ("loginctl", &["enable-linger"][..]),
+            ("loginctl", &["enable-linger", "somebody"][..]),
+            (
+                "launchctl",
+                &["bootstrap", "gui/501", "/tmp/kalareach.plist"][..],
+            ),
+            ("launchctl", &["load", "/tmp/kalareach.plist"][..]),
+            ("launchctl", &["enable", "gui/501/kalareach"][..]),
+        ] {
+            assert!(
+                allowed(&call(daemon, daemon, tool, arguments), &[daemon], allowance).is_err(),
+                "{tool} {arguments:?} is refused"
+            );
+        }
     }
     for (tool, arguments) in [
         (
@@ -1237,13 +1343,164 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
         ("launchctl", &["print", "gui/501"][..]),
     ] {
         assert_eq!(
-            allowed(&call(daemon, tool, arguments), &[daemon]),
+            allowed(
+                &call(daemon, daemon, tool, arguments),
+                &[daemon],
+                Allowance::default()
+            ),
             Ok(()),
             "{tool} {arguments:?} is a read-only query"
         );
         assert!(
-            allowed(&call(daemon + 1, tool, arguments), &[daemon]).is_err(),
+            allowed(
+                &call(daemon + 1, daemon + 1, tool, arguments),
+                &[daemon],
+                Allowance::default()
+            )
+            .is_err(),
             "and made by anything but the daemon, it is refused: {tool} {arguments:?}"
+        );
+    }
+
+    // The one scope: only by a daemon started inside a service, only by the daemon itself, only
+    // for its own program with its own arguments, and only under a daemon's name.
+    let mut good = scope(
+        "--unit=kr-daemon-0123",
+        "/opt/kr/kr-controller",
+        "--own-session",
+    )
+    .map(str::to_owned)
+    .to_vec();
+    let own_scope = |caller: u32, pid: u32, arguments: &[String], allowance: Allowance<'_>| {
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        allowed(
+            &call(caller, pid, "systemd-run", &arguments),
+            &[daemon],
+            allowance,
+        )
+    };
+    assert!(
+        own_scope(1, daemon, &good, Allowance::default()).is_err(),
+        "a daemon started anywhere else asks for no scope"
+    );
+    assert_eq!(
+        own_scope(1, daemon, &good, inside),
+        Ok(()),
+        "a daemon started inside a service moves itself into a scope of its own, having replaced \
+         itself with the tool, so that the tool keeps its number"
+    );
+    assert!(
+        own_scope(daemon, daemon + 1, &good, inside).is_err(),
+        "and kr, or a child of the daemon, asks for none: the tool is not the daemon"
+    );
+    for (what, changed) in [
+        (
+            "another name",
+            scope("--unit=other", "/opt/kr/kr-controller", "--own-session"),
+        ),
+        (
+            "another program",
+            scope("--unit=kr-daemon-0123", "/bin/sh", "--own-session"),
+        ),
+        (
+            "no start of a daemon of its own",
+            scope("--unit=kr-daemon-0123", "/opt/kr/kr-controller", "--other"),
+        ),
+    ] {
+        assert!(
+            own_scope(1, daemon, &changed.map(str::to_owned).to_vec(), inside).is_err(),
+            "a scope under {what} is refused"
+        );
+    }
+    good.truncate(6);
+    assert!(
+        own_scope(1, daemon, &good, inside).is_err(),
+        "and a scope that runs nothing"
+    );
+
+    // The version it reads, and the flag that stops expansion, are the daemon's own; the flag is
+    // only ever the one form.
+    assert_eq!(
+        allowed(
+            &call(daemon + 1, daemon, "systemd-run", &["--version"]),
+            &[daemon],
+            Allowance::default()
+        ),
+        Ok(()),
+        "the daemon reads the version of the tool it runs"
+    );
+    let mut expanding = scope(
+        "--unit=kr-daemon-0123",
+        "/opt/kr/kr-controller",
+        "--own-session",
+    )
+    .map(str::to_owned)
+    .to_vec();
+    expanding.insert(4, "--expand-environment=no".to_owned());
+    assert_eq!(
+        own_scope(1, daemon, &expanding, inside),
+        Ok(()),
+        "from systemd 258 the scope carries the one flag that stops expansion"
+    );
+    expanding[4] = "--expand-environment=yes".to_owned();
+    assert!(
+        own_scope(1, daemon, &expanding, inside).is_err(),
+        "and no other form of it"
+    );
+
+    // A worker's transient service is the supervisor's, only where the daemon has a manager, and
+    // only for the worker program a daemon of the installation launches.
+    let worker = |program: &'static str, reservation: &'static str| {
+        [
+            "--user",
+            "--unit=kr-worker-0123",
+            "--collect",
+            "-p",
+            "Type=exec",
+            "--quiet",
+            program,
+            "--reservation",
+            reservation,
+        ]
+    };
+    assert!(
+        allowed(
+            &call(
+                1,
+                daemon,
+                "systemd-run",
+                &worker("/opt/kr/kr-worker", "0123")
+            ),
+            &[daemon],
+            inside
+        )
+        .is_err()
+    );
+    assert_eq!(
+        allowed(
+            &call(
+                daemon,
+                daemon + 1,
+                "systemd-run",
+                &worker("/opt/kr/kr-worker", "0123")
+            ),
+            &[daemon],
+            everything
+        ),
+        Ok(())
+    );
+    for (what, arguments) in [
+        ("another program", worker("/bin/sh", "0123")),
+        ("another reservation", worker("/opt/kr/kr-worker", "4567")),
+    ] {
+        assert!(
+            allowed(
+                &call(daemon, daemon, "systemd-run", &arguments),
+                &[daemon],
+                everything
+            )
+            .is_err(),
+            "a service under a worker's name that runs {what} is refused"
         );
     }
 }
@@ -1804,18 +2061,29 @@ fn service_installation() -> &'static Path {
             let name = source.file_name().expect("the binary has a name");
             kr_ipc::testing::place_and_start_once(source, &directory.join(name), &["--version"]);
         }
-        kr_ipc::testing::place_and_start_once(
-            &worker,
-            &directory.join("kr-worker"),
-            &["--version"],
-        );
-        let daemon = directory.join(DAEMON_UNDER_TEST);
+        // The daemon and the worker are side by side, where a release keeps them, and the daemon is
+        // under its own name: what the worker takes for the daemon of its installation is the file
+        // beside it.
+        let real = directory.join("daemon");
+        std::fs::create_dir(&real).expect("a directory for the daemon and its worker");
+        kr_ipc::testing::place_and_start_once(&worker, &real.join("kr-worker"), &["--version"]);
+        let daemon = real.join("kr-controller");
         kr_ipc::testing::place_and_start_once(&controller, &daemon, &["--version"]);
+        // What `kr` starts: a script that hands over, with `exec`, to the daemon. A test that sets
+        // the hold variable has the daemon wait, as a process of the command that started it,
+        // until the file `go` is in the directory it names; it records its number there first, and
+        // the number stays the daemon's.
         let source = directory.join("kr-controller.sh");
         std::fs::write(
             &source,
             format!(
-                "#!/bin/sh\nexec '{}' --secret-store file \"$@\"\n",
+                "#!/bin/sh\n\
+                 if [ -n \"$KR_TEST_HOLD_DIR\" ]; then\n\
+                 \x20 echo $$ > \"$KR_TEST_HOLD_DIR/daemon.pid.tmp\"\n\
+                 \x20 mv \"$KR_TEST_HOLD_DIR/daemon.pid.tmp\" \"$KR_TEST_HOLD_DIR/daemon.pid\"\n\
+                 \x20 while [ ! -e \"$KR_TEST_HOLD_DIR/go\" ]; do sleep 0.05; done\n\
+                 fi\n\
+                 exec '{}' --secret-store file \"$@\"\n",
                 daemon.display()
             ),
         )
@@ -3064,5 +3332,807 @@ fn clearing_leaves_a_definition_changed_since_kr_wrote_it() {
         std::fs::read(host.definition()).expect("the definition"),
         changed,
         "and it is still as it was"
+    );
+}
+
+/// Ends a process by its identity when the test is over, however it ended.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct EndedWithTheTest(Option<kr_protocol::identity::ProcessStartIdentity>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for EndedWithTheTest {
+    fn drop(&mut self) {
+        if let Some(identity) = self.0.take() {
+            let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
+        }
+    }
+}
+
+/// The leaf of a process's control group, as the kernel names it.
+#[cfg(target_os = "linux")]
+fn control_group_of(pid: u32) -> String {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .expect("reads the process's control group");
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .and_then(|path| path.rsplit('/').next())
+        .expect("a unified control group")
+        .to_owned()
+}
+
+/// Polls `check` until it gives something, for at most [`LIVENESS_DEADLINE`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn until_there<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let begun = Instant::now();
+    loop {
+        if let Some(found) = check() {
+            return found;
+        }
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How the second environment's commands and daemon are set up.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Default)]
+struct Setup<'a> {
+    /// A directory of recording tools they find first on their `PATH`.
+    tools: Option<&'a Path>,
+    /// Whether they cannot reach the test's user manager.
+    #[cfg(target_os = "linux")]
+    no_manager: bool,
+    /// Whether the daemon waits, as a process of the command that started it, until the test lets
+    /// it go.
+    hold: bool,
+    /// Whether the session's root shell waits for the test before it runs the second `kr new`.
+    gate: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'a> Setup<'a> {
+    #[cfg(target_os = "linux")]
+    fn recorded_by(tools: &'a Path) -> Self {
+        Self {
+            tools: Some(tools),
+            ..Self::default()
+        }
+    }
+
+    fn held() -> Self {
+        Self {
+            hold: true,
+            ..Self::default()
+        }
+    }
+
+    fn gated() -> Self {
+        Self {
+            gate: true,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn without_a_manager(mut self) -> Self {
+        self.no_manager = true;
+        self
+    }
+}
+
+/// A second environment, with the standalone start chosen, whose daemon `kr new` starts.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Second {
+    tree: teardown::Tree,
+    /// Where a held daemon records its number and is let go.
+    hold: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Second {
+    fn create(host: &ServiceHost) -> Self {
+        let tree = teardown::Tree::create();
+        kr_ipc::paths::write_owner_only_file(
+            &tree.environment().state_dir().join("config.json"),
+            br#"{"version": 1, "revision": 1, "startup": {"controller": "standalone"}}"#,
+        )
+        .expect("writes the second environment's configuration document");
+        let hold = host.tree.root().join("hold");
+        std::fs::create_dir_all(&hold).expect("a directory for the hold");
+        Self { tree, hold }
+    }
+
+    /// The whole environment its commands run in.
+    fn variables(&self, host: &ServiceHost, setup: Setup<'_>) -> Vec<(String, String)> {
+        let mut path = "/usr/bin:/bin".to_owned();
+        if let Some(tools) = setup.tools {
+            path = format!("{}:{path}", tools.display());
+        }
+        let mut variables = vec![
+            ("PATH".to_owned(), path),
+            ("HOME".to_owned(), host.home.display().to_string()),
+            (
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE.to_owned(),
+                self.tree.paths().runtime_root().display().to_string(),
+            ),
+            (
+                kr_ipc::paths::STATE_DIR_VARIABLE.to_owned(),
+                self.tree.paths().state_root().display().to_string(),
+            ),
+        ];
+        #[cfg(target_os = "linux")]
+        if !setup.no_manager {
+            variables.push((
+                "XDG_RUNTIME_DIR".to_owned(),
+                host.manager.runtime.display().to_string(),
+            ));
+        }
+        if setup.hold {
+            variables.push((
+                "KR_TEST_HOLD_DIR".to_owned(),
+                self.hold.display().to_string(),
+            ));
+        }
+        variables
+    }
+
+    /// The second environment's `kr`, run by the test itself.
+    #[cfg(target_os = "linux")]
+    fn kr(&self, host: &ServiceHost, setup: Setup<'_>, arguments: &[&str]) -> Command {
+        let mut command = Command::new(service_installation().join("kr"));
+        command
+            .args(arguments)
+            .env_clear()
+            .envs(self.variables(host, setup))
+            .current_dir(service_installation())
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// The process the environment's lock names as its daemon, once there is one.
+    fn daemon(&self) -> Option<u32> {
+        kr_controller::singleton::SingletonLock::holder(&self.tree.environment().singleton_lock())
+            .ok()
+            .flatten()
+    }
+}
+
+/// A session of the host's first environment whose root shell runs `kr new` for the second one: the
+/// second environment's daemon starts from inside the first worker's job.
+///
+/// The root shell is a script that runs that `kr new` in the background and then is an ordinary
+/// shell. While the daemon is held it prints, so that the worker observes its session often.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Inside {
+    session_id: SessionId,
+    #[cfg(target_os = "linux")]
+    created: Value,
+    second: Second,
+    said: PathBuf,
+}
+
+/// The second environment's daemon, started.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Started {
+    daemon: kr_protocol::identity::ProcessStartIdentity,
+    /// The process the second `kr new` said it started.
+    #[cfg(target_os = "linux")]
+    reported: Option<u32>,
+    /// What the second `kr new` said on its standard error.
+    #[cfg(target_os = "linux")]
+    said: String,
+    _ended: EndedWithTheTest,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Inside {
+    /// Creates the session. Its shell runs the second `kr new` meanwhile.
+    fn begin(host: &ServiceHost, second: Second, setup: Setup<'_>) -> Self {
+        let said = host.tree.root().join("inner-new");
+        let shell = host.tree.root().join("session-shell");
+        let text = host.tree.root().join("session-shell.text");
+        let environment: String = second
+            .variables(host, setup)
+            .iter()
+            .map(|(name, value)| format!("{name}='{value}' "))
+            .collect();
+        let waiting = if setup.hold {
+            format!(
+                "while [ ! -e '{}/go' ]; do echo .; sleep 0.2; done\n",
+                second.hold.display()
+            )
+        } else {
+            String::new()
+        };
+        let gate = if setup.gate {
+            format!(
+                "while [ ! -e '{}/start' ]; do sleep 0.05; done\n",
+                second.hold.display()
+            )
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\n\
+                 {gate}\
+                 ( env -i {environment}'{kr}' new --invisible --headless --cwd '{cwd}' \
+                 --shell /bin/sh --startup interactive \
+                 < /dev/null > '{said}.out' 2> '{said}.err'; \
+                 echo $? > '{said}.tmp' && mv '{said}.tmp' '{said}.status' ) &\n\
+                 {waiting}\
+                 exec /bin/sh \"$@\"\n",
+                kr = service_installation().join("kr").display(),
+                cwd = second.tree.root().display(),
+                said = said.display(),
+            ),
+        )
+        .expect("writes the session's root shell");
+        kr_ipc::testing::place_program(&text, &shell);
+
+        let output = start(host.kr(&[
+            "--json",
+            "new",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &host.tree.root().display().to_string(),
+            "--shell",
+            &shell.display().to_string(),
+            "--startup",
+            "interactive",
+        ]))
+        .finish("kr new");
+        let created = document(&output, "kr new");
+        assert!(
+            output.status.success(),
+            "kr new created its session: {created}; it said {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let session_id: SessionId = created["session_id"]
+            .as_str()
+            .expect("a session identifier")
+            .parse()
+            .expect("parses");
+        Self {
+            session_id,
+            #[cfg(target_os = "linux")]
+            created,
+            second,
+            said,
+        }
+    }
+
+    /// The number of the held daemon, once it has recorded it.
+    fn daemon_in_hold(&self) -> u32 {
+        until_there("the held daemon to record its number", || {
+            std::fs::read_to_string(self.second.hold.join("daemon.pid"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+    }
+
+    /// What the first worker has recorded of its session's processes, read as the control daemon
+    /// reads it.
+    fn recorded(&self, host: &ServiceHost) -> Option<kr_worker::ownership::OwnedRecord> {
+        let journal = kr_worker::journal::Journal::open_read_only(
+            host.tree.environment().journal_database(self.session_id),
+        )
+        .ok()?;
+        journal.read_owned(self.session_id).ok().flatten()
+    }
+
+    /// Waits until the first worker's record of its session's processes names `pid`.
+    fn wait_until_recorded(&self, host: &ServiceHost, pid: u32) {
+        until_there("the first worker to record the held daemon", || {
+            self.recorded(host)?
+                .processes
+                .iter()
+                .any(|process| process.pid.get() == u64::from(pid))
+                .then_some(())
+        });
+    }
+
+    /// Lets the session's root shell run the second `kr new`.
+    fn start(&self) {
+        std::fs::write(self.second.hold.join("start"), b"").expect("lets the shell start");
+    }
+
+    /// Lets the held daemon go on.
+    fn release(&self) {
+        std::fs::write(self.second.hold.join("go"), b"").expect("lets the daemon go");
+    }
+
+    /// Waits for the second `kr new` to end and the second daemon to answer.
+    fn finish(&self) -> Started {
+        let status = self.said.with_extension("status");
+        let text_of = |extension: &str| {
+            std::fs::read_to_string(self.said.with_extension(extension)).unwrap_or_default()
+        };
+        until_there("the second kr new to end", || status.exists().then_some(()));
+        assert_eq!(
+            text_of("status").trim(),
+            "0",
+            "the second environment's kr new succeeded: {}; it said {}",
+            text_of("out"),
+            text_of("err")
+        );
+        let daemon = self.second.daemon().expect("the lock names the daemon");
+        let daemon =
+            kr_ipc::identity::process_start_identity(daemon).expect("the daemon's identity");
+        let ended = EndedWithTheTest(Some(daemon.clone()));
+        assert!(
+            answers(&self.second.tree.environment()),
+            "the second environment's daemon answers"
+        );
+        #[cfg(target_os = "linux")]
+        let said = text_of("err");
+        // "kr: started the control daemon for environment <id> (process <pid>) under the ..."
+        #[cfg(target_os = "linux")]
+        let reported = said
+            .split_once("(process ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(pid, _)| pid.parse().ok());
+        Started {
+            daemon,
+            #[cfg(target_os = "linux")]
+            reported,
+            #[cfg(target_os = "linux")]
+            said,
+            _ended: ended,
+        }
+    }
+
+    /// The worker of the session.
+    fn worker(&self, host: &ServiceHost) -> kr_protocol::identity::ProcessStartIdentity {
+        let registry = kr_controller::registry::Registry::open(
+            host.tree.environment().registry_database(),
+            host.tree.environment_id(),
+        )
+        .expect("opens the first environment's registry");
+        registry
+            .workers()
+            .expect("reads the worker records")
+            .into_iter()
+            .find(|worker| worker.session_id == self.session_id)
+            .expect("the session's worker record")
+            .process_identity
+    }
+
+    /// Waits until the first daemon has closed the session, and returns its closure.
+    fn wait_until_closed(&self, host: &ServiceHost) -> kr_protocol::session::ClosureRecord {
+        until_there("the session to be closed", || {
+            let listed: SessionListResult = host.ask(
+                Method::SessionList,
+                &SessionListParams {
+                    environment_id: Nullable::some(host.tree.environment_id()),
+                    include_closed: true,
+                },
+            );
+            listed
+                .sessions
+                .into_iter()
+                .find(|summary| {
+                    summary.session_id == self.session_id
+                        && summary.state == kr_protocol::session::SessionState::Closed
+                })
+                .and_then(|summary| summary.closure.0)
+        })
+    }
+}
+
+/// How the session of a daemon that was started inside it ends.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum End {
+    /// The worker is killed, having been stopped first so that it observes nothing more: the first
+    /// daemon's cleanup works from what the worker last recorded.
+    Crash,
+    /// The session is closed: the worker observes its session once more as it closes.
+    #[cfg(target_os = "linux")]
+    Close,
+}
+
+/// A daemon `kr new` starts from inside a session is still running, and still answers, once that
+/// session has ended, however it ended.
+///
+/// With `recorded` the daemon is held, as a process of the session, until the first worker has
+/// recorded it: what the worker records stands for a process of another environment, which the
+/// session did not start for itself. Without it the worker is stopped before the second `kr new`
+/// runs, so it records nothing more; the daemon is a process of the session's job and nothing else
+/// ties it to the session.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_daemon_started_from_inside_a_session_outlives_it(recorded: bool, end: End) {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let setup = if recorded {
+        Setup::held()
+    } else {
+        Setup::gated()
+    };
+    let inside = Inside::begin(&host, Second::create(&host), setup);
+    let held = recorded.then(|| inside.daemon_in_hold());
+    if let Some(held) = held {
+        inside.wait_until_recorded(&host, held);
+    }
+    let worker = inside.worker(&host);
+    #[cfg(target_os = "linux")]
+    let service = control_group_of(u32::try_from(worker.pid.get()).expect("a process identifier"));
+    if matches!(end, End::Crash) {
+        // From here the worker observes nothing, so what its record names is what it names now:
+        // the stop is waited for, not assumed from the signal having been sent.
+        assert_eq!(
+            kr_ipc::identity::process_state(&worker),
+            ProcessState::Running
+        );
+        stop_the_worker(&worker);
+    }
+    if recorded {
+        inside.release();
+    } else {
+        inside.start();
+    }
+    let started = inside.finish();
+    if let Some(held) = held {
+        assert_eq!(
+            started.daemon.pid.get(),
+            u64::from(held),
+            "the held process is the daemon"
+        );
+    }
+    // What the worker has recorded when the session ends: the daemon if it was held until
+    // recorded, and not if the worker was stopped before the daemon was started.
+    if matches!(end, End::Crash) {
+        let record = inside.recorded(&host).expect("the worker's record");
+        assert_eq!(
+            record.processes.contains(&started.daemon),
+            recorded,
+            "the worker's record names the daemon exactly when it was held until recorded: \
+             {record:?}"
+        );
+    }
+    match end {
+        End::Crash => assert!(
+            matches!(
+                kr_ipc::identity::stop_process(&worker, kr_ipc::identity::Stop::Kill),
+                kr_ipc::identity::Stopped::Signalled
+            ),
+            "the worker is killed"
+        ),
+        #[cfg(target_os = "linux")]
+        End::Close => host.close(&inside.created),
+    }
+    let closure = inside.wait_until_closed(&host);
+    // On Linux the manager drops a service once nothing is left in it, so its being gone is the
+    // cleanup being over, whether the service held the daemon or not.
+    #[cfg(target_os = "linux")]
+    until_there("the manager to drop the session's service", || {
+        let shown = bounded(
+            host.manager
+                .systemctl(&["show", "--property=LoadState", "--value", &service]),
+            STREAMS_DEADLINE,
+        )
+        .expect("asks the manager");
+        (String::from_utf8_lossy(&shown.stdout).trim() == "not-found").then_some(())
+    });
+    assert_eq!(
+        kr_ipc::identity::process_state(&started.daemon),
+        ProcessState::Running,
+        "the second environment's daemon is still running once the first session is over"
+    );
+    assert!(
+        answers(&inside.second.tree.environment()),
+        "and still answers"
+    );
+    // The closure does not count the daemon among the session's processes, ended or surviving.
+    let pid = started.daemon.pid.get();
+    assert!(
+        closure
+            .terminated
+            .iter()
+            .all(|process| process.identity.pid.get() != pid),
+        "the closure does not say it ended the daemon: {closure:?}"
+    );
+    assert!(
+        closure
+            .surviving
+            .iter()
+            .all(|resource| resource.kind != "process"
+                || !resource.detail.contains(&format!("process {pid} "))),
+        "and does not name it a survivor of the session: {closure:?}"
+    );
+    // A daemon the worker had recorded is named for what it is: not the session's, and left
+    // running. One it never recorded is not mentioned.
+    assert_eq!(
+        closure
+            .surviving
+            .iter()
+            .filter(|resource| resource.kind == "external"
+                && resource.detail.contains(&format!("process {pid} ")))
+            .count(),
+        usize::from(recorded),
+        "{closure:?}"
+    );
+    #[cfg(target_os = "linux")]
+    if matches!(end, End::Crash) {
+        assert_eq!(
+            closure.ownership_coverage,
+            kr_protocol::session::OwnershipCoverage::Complete,
+            "the service's control group was read empty, and the daemon was never in it \
+             to be counted: {closure:?}"
+        );
+    }
+}
+
+/// Stops the worker where it is, without ending it, and waits until it runs nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_the_worker(worker: &kr_protocol::identity::ProcessStartIdentity) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(worker.pid.get()).expect("a pid"))
+        .expect("a process number");
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stops it");
+    until_there("the worker to stop", || {
+        #[cfg(target_os = "linux")]
+        {
+            // Every thread of the worker is stopped, not only the one the signal found first.
+            let threads = std::fs::read_dir(format!("/proc/{}/task", worker.pid.get())).ok()?;
+            threads
+                .flatten()
+                .all(|thread| {
+                    std::fs::read_to_string(thread.path().join("stat"))
+                        .ok()
+                        .and_then(|stat| {
+                            stat.rsplit_once(')').and_then(|(_, rest)| {
+                                rest.split_whitespace().next().map(str::to_owned)
+                            })
+                        })
+                        .is_some_and(|state| state == "T" || state == "t")
+                })
+                .then_some(())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let state = spawning(|| {
+                Command::new("/bin/ps")
+                    .args(["-o", "state=", "-p", &worker.pid.get().to_string()])
+                    .output()
+            })
+            .ok()?;
+            String::from_utf8_lossy(&state.stdout)
+                .trim()
+                .starts_with('T')
+                .then_some(())
+        }
+    });
+}
+
+/// KR-REQ-07.12, KR-REQ-07.66: a control daemon that `kr new` starts from inside a session, which
+/// the session's worker has not recorded, is not ended by the crash of that worker.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_daemon_started_from_inside_a_session_outlives_the_crash_of_its_worker() {
+    a_daemon_started_from_inside_a_session_outlives_it(false, End::Crash);
+}
+
+/// KR-REQ-07.12, KR-REQ-07.66: a control daemon that `kr new` starts from inside a session, and
+/// that the worker has recorded among the session's processes, is not ended by the crash of that
+/// worker.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_the_worker_recorded_outlives_the_crash_of_its_worker() {
+    a_daemon_started_from_inside_a_session_outlives_it(true, End::Crash);
+}
+
+/// KR-REQ-07.12, KR-REQ-07.66: a control daemon that `kr new` starts from inside a session, and
+/// that the worker has recorded among the session's processes, is not ended when the session is
+/// closed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_the_worker_recorded_outlives_the_close_of_its_session() {
+    a_daemon_started_from_inside_a_session_outlives_it(true, End::Close);
+}
+
+/// KR-REQ-07.12, KR-REQ-07.13: a daemon `kr new` starts from inside a service this host started
+/// asks the user's service manager for one transient scope, for itself, and for nothing else in
+/// starting; it is the same process `kr new` started, now in a control group of its own.
+///
+/// The second environment's commands find recording tools first on their `PATH`, which record the
+/// call and go on to the real tool. Every call the daemon made is on the allow-list for a daemon
+/// started inside a service that has a manager, the scope is the first of its calls to `systemd-run`
+/// and is made by the daemon's own process, and the process `kr new` says it started is the one the
+/// environment's lock names and the one that answers.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_started_inside_a_service_asks_for_one_scope_and_is_the_process_kr_started() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let calls = host.tree.root().join("tool-calls");
+    let tools = host.tree.root().join("tools");
+    recording_tools(&tools, &calls, &["systemctl", "systemd-run", "loginctl"]);
+    let setup = Setup::recorded_by(&tools);
+    let inside = Inside::begin(&host, Second::create(&host), setup);
+    let started = inside.finish();
+
+    let daemon = u32::try_from(started.daemon.pid.get()).expect("a pid");
+    assert_eq!(
+        started.reported,
+        Some(daemon),
+        "kr new says it started the process that serves the environment: {}",
+        started.said
+    );
+    let program = service_installation().join("daemon").join("kr-controller");
+    let worker_program = service_installation().join("daemon").join("kr-worker");
+    let recorded = recorded_calls(&calls);
+    for call in &recorded {
+        let allowance = Allowance {
+            scope_for: Some(&program),
+            workers: Some(&worker_program),
+        };
+        if let Err(refused) = allowed(call, &[daemon], allowance) {
+            panic!("{refused}; everything recorded: {recorded:?}");
+        }
+    }
+    // What the daemon starts, apart from the version it reads of the tool it runs: the scope is
+    // the first, it is the only one, and the daemon's own process asks for it.
+    let launches: Vec<&Recorded> = recorded
+        .iter()
+        .filter(|call| call.tool == "systemd-run" && call.arguments != ["--version"])
+        .collect();
+    let scopes: Vec<&&Recorded> = launches
+        .iter()
+        .filter(|call| call.arguments.iter().any(|argument| argument == "--scope"))
+        .collect();
+    assert_eq!(scopes.len(), 1, "one scope was asked for: {recorded:?}");
+    assert_eq!(scopes[0].pid, daemon, "by the daemon's own process");
+    assert!(
+        std::ptr::eq(*scopes[0], launches[0]),
+        "before anything else was started: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().any(|call| call.tool == "systemctl"
+            && call
+                .arguments
+                .iter()
+                .any(|argument| argument == "--property=ControlGroup")),
+        "after asking the manager about the service it is in: {recorded:?}"
+    );
+    let group = control_group_of(daemon);
+    assert!(
+        group.starts_with("kr-daemon-") && group.ends_with(".scope"),
+        "the daemon runs in the scope: {group}"
+    );
+    // A daemon in a scope of its own has nothing to say about where it runs.
+    let output = start(inside.second.kr(&host, setup, &["--json", "doctor"])).finish("kr doctor");
+    let report = document(&output, "kr doctor");
+    assert!(
+        report["doctor"]["checks"]
+            .as_array()
+            .is_some_and(|checks| checks
+                .iter()
+                .all(|check| check["id"] != "daemon-control-group")),
+        "the doctor names no control group: {report}"
+    );
+}
+
+/// KR-REQ-07.12, KR-REQ-07.13, KR-REQ-26.13: where the user's service manager does not answer, a
+/// daemon `kr new` starts from inside a service this host started starts as it always did, in that
+/// service's control group, and `kr doctor` says so.
+///
+/// The second environment's commands cannot reach a manager, so the real tools fail as they do on
+/// a host without one. The daemon asks, is refused, asks for no scope and stays where it started.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_that_cannot_leave_the_service_it_started_in_is_named_by_the_doctor() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let calls = host.tree.root().join("tool-calls");
+    let tools = host.tree.root().join("tools");
+    recording_tools(&tools, &calls, &["systemctl", "systemd-run", "loginctl"]);
+    let second = Second::create(&host);
+    let setup = Setup::recorded_by(&tools).without_a_manager();
+    let inside = Inside::begin(&host, second, setup);
+    let started = inside.finish();
+
+    let daemon = u32::try_from(started.daemon.pid.get()).expect("a pid");
+    let program = service_installation().join("daemon").join("kr-controller");
+    let recorded = recorded_calls(&calls);
+    for call in &recorded {
+        let allowance = Allowance {
+            scope_for: Some(&program),
+            workers: None,
+        };
+        if let Err(refused) = allowed(call, &[daemon], allowance) {
+            panic!("{refused}; everything recorded: {recorded:?}");
+        }
+    }
+    assert!(
+        recorded.iter().all(|call| call.tool != "systemd-run"),
+        "a manager that does not answer is asked for nothing: {recorded:?}"
+    );
+    let group = control_group_of(daemon);
+    assert!(
+        group.starts_with("kr-worker-"),
+        "the daemon stays in the service it started in: {group}"
+    );
+
+    let output = start(inside.second.kr(&host, setup, &["--json", "doctor"])).finish("kr doctor");
+    let report = document(&output, "kr doctor");
+    let check = report["doctor"]["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["id"] == "daemon-control-group")
+        })
+        .unwrap_or_else(|| panic!("the doctor names the daemon's control group: {report}"));
+    assert_eq!(check["status"], "warning", "{check}");
+}
+
+/// KR-REQ-07.12, KR-REQ-07.13: a daemon `kr new` starts anywhere but inside a service this host
+/// started asks for no scope: the rule takes it only from there.
+///
+/// The recording tools go on to the real ones and a manager answers, so a daemon that took a scope
+/// wherever a manager answers would be seen taking it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_started_outside_a_service_asks_for_no_scope() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let calls = host.tree.root().join("tool-calls");
+    let tools = host.tree.root().join("tools");
+    recording_tools(&tools, &calls, &["systemctl", "systemd-run", "loginctl"]);
+    let second = Second::create(&host);
+    let setup = Setup::recorded_by(&tools);
+    let cwd = second.tree.root().display().to_string();
+    let output = start(second.kr(
+        &host,
+        setup,
+        &[
+            "--json",
+            "new",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &cwd,
+            "--shell",
+            "/bin/sh",
+            "--startup",
+            "interactive",
+        ],
+    ))
+    .finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    let daemon = second.daemon().expect("the lock names the daemon");
+    let _ended = EndedWithTheTest(Some(
+        kr_ipc::identity::process_start_identity(daemon).expect("the daemon's identity"),
+    ));
+    let worker_program = service_installation().join("daemon").join("kr-worker");
+    let recorded = recorded_calls(&calls);
+    for call in &recorded {
+        let allowance = Allowance {
+            scope_for: None,
+            workers: Some(&worker_program),
+        };
+        if let Err(refused) = allowed(call, &[daemon], allowance) {
+            panic!("{refused}; everything recorded: {recorded:?}");
+        }
+    }
+    assert!(
+        !control_group_of(daemon).starts_with("kr-daemon-"),
+        "and the daemon is not in a scope of its own"
     );
 }
