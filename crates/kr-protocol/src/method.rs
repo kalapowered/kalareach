@@ -540,7 +540,7 @@ methods! {
     doc: "Paired devices, their key purposes and each host's last authority acknowledgement.";
 
     DeviceRevoke = "device.revoke", Devices,
-    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
     selectors: [Device, Grant],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,

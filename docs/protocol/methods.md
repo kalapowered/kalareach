@@ -51,7 +51,7 @@ links to its document.
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
 | `device.list` | read | `local_ipc`, `paired_device` | Paired devices, their key purposes and each host's last authority acknowledgement. |  |
-| `device.revoke` | write | `local_ipc`, `paired_device` | Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer. |  |
+| `device.revoke` | write | `local_ipc` | Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer. |  |
 | `device.preview_key.update` | write | `paired_device` | Rotate this device's own notification-preview key through its paired proof. | [Delivery: What travels, and what does not](../delivery/README.md) |
 | `device.keys.complete` | write | `paired_device` | Declare this device's own four public keys once, signed by the authorisation key its pairing recorded, so the host keeps every key it binds. |  |
 

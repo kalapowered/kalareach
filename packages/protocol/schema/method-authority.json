@@ -714,8 +714,7 @@
       "history_filter": "not_applicable",
       "idempotency": "action_deduplicated",
       "ingress": [
-        "local_ipc",
-        "paired_device"
+        "local_ipc"
       ],
       "method": "device.revoke",
       "name": "device.revoke",
