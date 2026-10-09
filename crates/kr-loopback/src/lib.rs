@@ -462,6 +462,40 @@ mod tests {
         );
     }
 
+    /// A person who signs in again soon after an attempt ended asks for the same port. Once the
+    /// browser's connection has been answered and has closed in the ordinary way, the server
+    /// first and the browser after reading to the end, and the listener is gone, the port binds
+    /// again at once. Windows keeps a port from an exclusive bind until the connections it
+    /// accepted are no longer active, so this is the case that platform can fail.
+    #[tokio::test]
+    async fn a_port_whose_answered_connection_has_closed_binds_again_at_once() {
+        let listener = Listener::open_at("127.0.0.1:0".parse().expect("an address"), "127.0.0.1:0")
+            .expect("a listener");
+        let address = listener.local_address();
+        let host = format!("127.0.0.1:{}", address.port());
+        let asking = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.expect("a connection");
+            let request =
+                format!("GET /oauth/callback?code=a&state=b HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("a request");
+            let mut page = String::new();
+            stream
+                .read_to_string(&mut page)
+                .await
+                .expect("the connection ends in the ordinary way, after the whole page");
+            page
+        });
+        let callback = listener.next().await;
+        callback.finish("You are signed in to KalaReach.").await;
+        let page = asking.await.expect("a task");
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        drop(listener);
+        Listener::open_at(address, "127.0.0.1:0").expect("the port binds again at once");
+    }
+
     /// This machine's address on the network, where it has one: the source address a datagram to
     /// a documentation address would leave from. Nothing is sent.
     fn outward_address() -> Option<std::net::IpAddr> {
