@@ -67,10 +67,10 @@ pub fn known() -> Vec<Known> {
         pinned,
     };
 
-    let words = |store, name, words: Vec<String>, pinned| Known {
+    let words = |store, name, words: Vec<String>, anchor, pinned| Known {
         store,
         name,
-        is: KnownIs::Words(words),
+        is: KnownIs::Words(words, anchor),
         pinned,
     };
     let literal = |words: &[&str]| {
@@ -227,7 +227,8 @@ pub fn known() -> Vec<Known> {
             "delivery",
             "push suppression reasons",
             literal(&["burst", "sustained"]),
-            "de82eba869b9dbf098a23a0a921d19ed77c21cbc7d4d563d1ca93d0085cc52a8",
+            Some("crates/kr-delivery/src/journal.rs"),
+            "0e643099a89e0e8682d6499e4804d7f24b3c95823c410f44d08ac6000a0e9c8b",
         ),
         words(
             "delivery",
@@ -236,6 +237,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|source| source.as_str().to_owned())
                 .collect(),
+            None,
             "e59eb540e3a179fa14b6a3c0c3e55665967ad3a9d4a4be710fb096e3adf97ab2",
         ),
         words(
@@ -245,6 +247,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|state| state.as_str().to_owned())
                 .collect(),
+            None,
             "e12dd6b5cb95d82e6e30bc54b206ad3fea8f00076b827fe76a64a5e7338d21b7",
         ),
         words(
@@ -254,6 +257,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|kind| kind.as_str().to_owned())
                 .collect(),
+            None,
             "3123a85b676f90000801236159af1bbc579cb2d26f772618f5a946dae158c050",
         ),
         words(
@@ -263,6 +267,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|next| next.as_str().to_owned())
                 .collect(),
+            None,
             "dc39b51d2095b584734fb1a33503909b1bace98db1606d43d273163b64b52305",
         ),
         // The attention store: the words it matches stored text against.
@@ -275,25 +280,29 @@ pub fn known() -> Vec<Known> {
                 "windows_process_creation_time",
                 "windows_process_start_seconds",
             ]),
-            "15d202f8f72fe6e3a3183e0454462e53a19ae06445785daa887695fb7b361cc9",
+            Some("crates/kr-attention/src/store.rs"),
+            "68800b25fce7a9c5b5c6f0f1198dd0b201f86abae7544708556500140236cfcd",
         ),
         words(
             "attention",
             "review subject kinds",
             literal(&["turn", "change_set"]),
-            "b34a38aa076f20a913ec857d821cfb6f4ff9a75f9e2c3cc462faaf30cabab7de",
+            Some("crates/kr-attention/src/store.rs"),
+            "33d39425d0745a1163cf6991835686b321b0e41667fe9585e2caf25f7ed6eeb6",
         ),
         words(
             "attention",
             "text kinds",
             literal(&["host", "record"]),
-            "db5e9656329786e081f32a0daf648491c53b7d87bed7d8a49ec5437e68b1ae0b",
+            Some("crates/kr-attention/src/store.rs"),
+            "aaa2de43a1c54f7fb5d9ab9da825dfcaf92ba293500b7b9da06448a5e6d2177d",
         ),
         words(
             "attention",
             "automation subject kinds",
             literal(&["workflow", "chain"]),
-            "b166c0fbd1c39270bdf0c9397d28df767d53363579008941ac96c9bc461c1f91",
+            Some("crates/kr-attention/src/store.rs"),
+            "097faff90054685829b78895c15ef1312c563096dfe9e5758b9aa862c281ec3a",
         ),
         words(
             "attention",
@@ -302,6 +311,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|word| word.as_str().to_owned())
                 .collect(),
+            None,
             "519c73683ee26b59fd65693a407c92add1673c029b372a0f55d6ab5d779ffcca",
         ),
         words(
@@ -311,6 +321,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|word| word.as_str().to_owned())
                 .collect(),
+            None,
             "a94a1c95f39f0a6395f5eaf7256efe68c942f806129f494c7d0b6bb3c87c03fd",
         ),
         words(
@@ -320,6 +331,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|word| word.as_str().to_owned())
                 .collect(),
+            None,
             "b48e4399501817c47f5b4c88c6b07705a7dd39c94f91be5bf0b193e495514bef",
         ),
         words(
@@ -329,6 +341,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|word| word.as_str().to_owned())
                 .collect(),
+            None,
             "09ebe720c0e2dd869bf8de29a9da7d3baf6c8e6cdf1bb4949a77808cdfc95855",
         ),
         words(
@@ -338,6 +351,7 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|word| word.as_str().to_owned())
                 .collect(),
+            None,
             "791ebfa23cf9f7cc8a70383a61166c41b573460ea570d2178bc3a333f387ee25",
         ),
         words(
@@ -347,7 +361,102 @@ pub fn known() -> Vec<Known> {
                 .iter()
                 .map(|word| word.as_str().to_owned())
                 .collect(),
+            None,
             "61c6654c47ba6b0a774eb233be4c99d8aeec089608bc720e6deb1fd33a17eb9c",
+        ),
+        words(
+            "attention",
+            "origin words",
+            literal(&["environment"]),
+            Some("crates/kr-attention/src/store.rs"),
+            "ec8be9268cae84494a7b8dc38475e5022b70f371f30f117f0e5a8042d999b400",
+        ),
+        // The registry's columns of words, and the consumed reasons it stores by their protocol
+        // names.
+        words(
+            "registry",
+            "process start sources",
+            literal(&[
+                "linux_proc_stat",
+                "macos_proc_bsd_info",
+                "windows_process_creation_time",
+                "windows_process_start_seconds",
+            ]),
+            Some("crates/kr-controller/src/registry.rs"),
+            "1c750df45ee66474ba06ec09d82f6ca4a32c707b6ab982a416bece8b7c269612",
+        ),
+        words(
+            "registry",
+            "invitation states",
+            literal(&["open", "locked", "committed", "consumed"]),
+            Some("crates/kr-controller/src/net/invitations.rs"),
+            "6573daf2c77d49cda9010577555ddec0339061ca4d3d6510647a85802bd7755a",
+        ),
+        words(
+            "registry",
+            "host owner kinds",
+            literal(&["migrated", "first_owner"]),
+            Some("crates/kr-controller/src/net/invitations.rs"),
+            "b17bedb24eeb4e5cbbc2f8478172cc20354a04d8684c87f7c525e75f752363de",
+        ),
+        known_protocol::<pairing::PairingConsumedReason>(
+            "registry",
+            "PairingConsumedReason",
+            "8e47614af034efad7f29d0c65b13daad3f150bbe2d59cda4034dfe69dbfad33c",
+        ),
+        words(
+            "catalogue",
+            "repository kinds",
+            literal(&["official", "vendor", "community", "local", "mirror"]),
+            Some("crates/kr-plugin-catalogue/src/db.rs"),
+            "89e6b075dbf4abc5af6e7207d669efa9866caaa3794c043accbf3c2784b819b3",
+        ),
+        words(
+            "transfers",
+            "snapshot states",
+            literal(&["reserving", "open", "failed", "expired", "released"]),
+            Some("crates/kr-transfer/src/store.rs"),
+            "a10daafcc946e723fa6ec5ff7591462273af4a7035b62186a8487b5900c2bbdc",
+        ),
+        // The delivery journal's queued external message: the document and the words in it.
+        source(
+            "delivery",
+            "StoredMessage",
+            "crates/kr-controller/src/push/client.rs",
+            "c8bfa256400551e27e55fae73643fb75e1b0950986ba66af56ee12dea9094b97",
+        ),
+        source(
+            "delivery",
+            "StoredInterval",
+            "crates/kr-controller/src/push/client.rs",
+            "14747dd6a7c6ca6f67e5d2a1d29b6f41750cba354750ec6b57ecefc7b7a16fdf",
+        ),
+        words(
+            "delivery",
+            "queued message keys",
+            literal(&[
+                "alert",
+                "body",
+                "delivery_id",
+                "interval",
+                "from_ms",
+                "to_ms",
+                "resources",
+                "withheld",
+            ]),
+            Some("crates/kr-delivery/src/producer.rs"),
+            "dba448ea8bdc6ebb7ccc73c996b729e90ad85bcc030142dc32a784a254caa040",
+        ),
+        words(
+            "delivery",
+            "withheld reasons",
+            literal(&[
+                "outside_history_scope",
+                "resource_not_granted",
+                "no_production_time",
+            ]),
+            Some("crates/kr-delivery/src/external.rs"),
+            "62680564c22d0fd60e41adcc09777ce8252aaf834095fe5491c63e20a54368ca",
         ),
         // The environment's presence record.
         known_protocol::<identity::EnvironmentPresence>(
@@ -369,6 +478,14 @@ pub fn known() -> Vec<Known> {
             "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
         ),
     ]
+}
+
+/// The known types that no source item holds: a type a store keeps in a column of words, and the
+/// document that is the root of a stored value. A known line for one is not stale for want of a
+/// holder.
+#[must_use]
+pub fn kept_without_a_holder() -> Vec<&'static str> {
+    vec!["PairingConsumedReason", "StoredMessage"]
 }
 
 /// The type of the answer the registry keeps for each method that has it kept, by the type's name:

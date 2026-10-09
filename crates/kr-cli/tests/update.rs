@@ -10077,10 +10077,11 @@ fn no_type_a_store_keeps_is_undeclared() {
         "a type a store keeps is neither declared nor known:\n{}",
         undeclared.join("\n")
     );
-    let answers: Vec<&str> = stored_formats::table::retained_answers()
+    let mut answers: Vec<&str> = stored_formats::table::retained_answers()
         .iter()
         .map(|(_, answer)| *answer)
         .collect();
+    answers.extend(stored_formats::table::kept_without_a_holder());
     let changed = stored_formats::known_that_changed(&table, &known, &answers)
         .expect("the known types are read");
     assert!(changed.is_empty(), "{}", changed.join("\n"));
@@ -10133,10 +10134,11 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
         .find(|line| line.name == "EventKey")
         .expect("listed")
         .pinned = "0000";
-    let answers: Vec<&str> = stored_formats::table::retained_answers()
+    let mut answers: Vec<&str> = stored_formats::table::retained_answers()
         .iter()
         .map(|(_, answer)| *answer)
         .collect();
+    answers.extend(stored_formats::table::kept_without_a_holder());
     let found = stored_formats::known_that_changed(&table, &moved, &answers).expect("read");
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].starts_with("EventKey "), "{found:?}");
@@ -10225,12 +10227,13 @@ fn a_held_type_is_followed_to_the_file_that_defines_it_and_what_cannot_be_follow
     );
     write(
         "crates/kr-a/src/lib.rs",
-        "pub mod holder;\npub mod one;\npub mod two;\npub use one::Notice as Renamed;\n",
+        "pub mod holder;\npub mod one;\npub mod strings;\npub mod two;\npub use one::Notice as Renamed;\n",
     );
     write(
         "crates/kr-a/src/one.rs",
-        "pub struct Notice {}\npub struct Plain {}\n",
+        "pub struct Notice {}\npub struct Plain {}\npub struct Notice2 {}\n",
     );
+    write("crates/kr-a/src/strings.rs", "pub struct String {}\n");
     write("crates/kr-a/src/two.rs", "pub struct Notice {}\n");
     write(
         "crates/kr-a/src/holder.rs",
@@ -10240,6 +10243,8 @@ use crate::two::Notice as Other;
 use kr_protocol::ids::SessionId;
 use other_crate::schema::Signed;
 use super::one::*;
+use crate::strings::*;
+use crate::one::Notice as notice;
 
 pub struct Holds {
     a: Notice,
@@ -10273,10 +10278,27 @@ pub struct Unbound {
 pub struct Twice {
     a: u8,
 }
+pub enum Twice {
+    A,
+}
 mod inner {
-    pub struct Twice {
-        b: u8,
+    use crate::two::Notice;
+
+    pub struct Inside {
+        a: Notice,
     }
+}
+
+pub struct Lower {
+    a: notice,
+}
+
+pub struct Glob {
+    a: Notice2,
+}
+
+pub struct Shadow {
+    a: String,
 }
 
 pub struct Made {
@@ -10324,6 +10346,32 @@ pub struct Made {
             .all(|held| !matches!(&held.origin, Origin::Defined(file) if file.ends_with("lib.rs"))),
         "a re-export is followed to the file that defines the type: {held:?}"
     );
+    // A name brought in under a lowercase name, a type a glob brings in, and a `String` of the
+    // workspace's own are each followed to their file, and the last is not the standard library's.
+    let lower = workspace
+        .held_by("crates/kr-a/src/holder.rs", "Lower")
+        .expect("a lowercase rename is followed");
+    assert_eq!(lower, vec![notice("one.rs")]);
+    let glob = workspace
+        .held_by("crates/kr-a/src/holder.rs", "Glob")
+        .expect("a glob is followed");
+    assert_eq!(
+        glob,
+        vec![Type {
+            origin: in_a("one.rs"),
+            name: "Notice2".to_owned()
+        }]
+    );
+    let shadow = workspace
+        .held_by("crates/kr-a/src/holder.rs", "Shadow")
+        .expect("a String of the workspace's own is followed");
+    assert_eq!(
+        shadow,
+        vec![Type {
+            origin: in_a("strings.rs"),
+            name: "String".to_owned()
+        }]
+    );
     let variants = workspace
         .held_by("crates/kr-a/src/holder.rs", "Variants")
         .expect("the fields of a variant are followed");
@@ -10334,6 +10382,7 @@ pub struct Made {
         ("Aliased", "alias"),
         ("Unbound", "neither defined"),
         ("Twice", "exactly once"),
+        ("Inside", "exactly once"),
         ("Made", "macro"),
     ] {
         let problems = workspace

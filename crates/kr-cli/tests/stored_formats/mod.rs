@@ -785,8 +785,11 @@ pub enum KnownIs {
     Protocol(Value, &'static str),
     /// A type of the source, by file; its fields' types are checked as a declared one's are.
     Source(&'static str),
-    /// Words the code matches stored text against by hand.
-    Words(Vec<String>),
+    /// Words the code matches stored text against by hand, and the source file where the code
+    /// that writes and reads them is, when the words are not taken from the code itself: the digest
+    /// holds how many times each word occurs in that file as a quoted literal, so a word changed
+    /// where the code writes it, or read where the code reads it, moves the digest.
+    Words(Vec<String>, Option<&'static str>),
     /// A type of a dependency, by the crate's name: it is what the crate's locked version is.
     Crate(&'static str),
 }
@@ -801,7 +804,16 @@ impl Known {
         let basis = match &self.is {
             KnownIs::Protocol(schema, _) => normalise_schema(schema),
             KnownIs::Source(file) => json!(definition(file, self.name)?),
-            KnownIs::Words(words) => json!(words),
+            KnownIs::Words(words, None) => json!(words),
+            KnownIs::Words(words, Some(file)) => {
+                let text = std::fs::read_to_string(repository().join(file))
+                    .map_err(|error| format!("{file}: {error}"))?;
+                let occurrences: Vec<usize> = words
+                    .iter()
+                    .map(|word| text.matches(&format!("\"{word}\"")).count())
+                    .collect();
+                json!({ "words": words, "file": file, "occurrences": occurrences })
+            }
             KnownIs::Crate(name) => json!({ "crate": name, "locked": locked_version(name)? }),
         };
         Ok(hex(&kr_cbor::sha256(canonical(&basis).as_bytes())))
@@ -819,7 +831,7 @@ impl Known {
                 origin: resolve::Origin::External((*name).to_owned()),
                 name: self.name.to_owned(),
             }),
-            KnownIs::Words(_) => None,
+            KnownIs::Words(..) => None,
         })
     }
 }
@@ -1007,7 +1019,8 @@ pub fn undeclared_in(stores: &[Store], known: &[Known]) -> Result<Vec<String>, S
 
 /// Each known type whose pinned digest is not the digest it has now, each that its store declares
 /// (its line is to be deleted), each that no store keeps, and each that nothing its store keeps holds
-/// any more and that is not the answer of a method `answers` names.
+/// any more and that is not named in `stored_elsewhere`: the answers of the methods the registry
+/// keeps, and the known types that no source item holds, as a column of words or a root document.
 ///
 /// # Errors
 ///
@@ -1015,7 +1028,7 @@ pub fn undeclared_in(stores: &[Store], known: &[Known]) -> Result<Vec<String>, S
 pub fn known_that_changed(
     stores: &[Store],
     known: &[Known],
-    answers: &[&str],
+    stored_elsewhere: &[&str],
 ) -> Result<Vec<String>, String> {
     let workspace = resolve::Workspace::at(repository())?;
     let mut found = Vec::new();
@@ -1056,7 +1069,7 @@ pub fn known_that_changed(
             let Some(identity) = line.identity(&workspace)? else {
                 continue;
             };
-            if !held.contains(&identity) && !answers.contains(&line.name) {
+            if !held.contains(&identity) && !stored_elsewhere.contains(&line.name) {
                 found.push(format!(
                     "{} is listed as known for the store {} and nothing the store keeps holds it any more: delete the line",
                     line.name, line.store
