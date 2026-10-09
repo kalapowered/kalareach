@@ -1249,17 +1249,24 @@ impl WorkerSupervisor for DetachedSupervisor {
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
-        self.spawn(launch, &[])
+        self.spawn(launch, &[], Leads::ItsOwnGroup)
     }
 
     fn describe(&self) -> &'static str {
-        "a detached process in its own group, reparented to init when this daemon exits"
+        "a detached process in a session or process group of its own, reparented when this daemon exits"
     }
 }
 
 impl DetachedSupervisor {
     /// Starts one process, with whatever login-session environment its launch carries.
-    fn spawn(&self, launch: &ServiceLaunch, desktop: &[(String, String)]) -> LaunchOutcome {
+    fn spawn(
+        &self,
+        launch: &ServiceLaunch,
+        desktop: &[(String, String)],
+        leads: Leads,
+    ) -> LaunchOutcome {
+        #[cfg(not(unix))]
+        let _ = leads;
         #[cfg(unix)]
         let started =
             open_diagnostics(&launch.jobs_directory, &launch.label).and_then(|diagnostics| {
@@ -1269,6 +1276,7 @@ impl DetachedSupervisor {
                     &launch.working_directory,
                     desktop,
                     diagnostics,
+                    leads,
                 )
             });
         #[cfg(not(unix))]
@@ -1286,6 +1294,22 @@ impl DetachedSupervisor {
             },
         }
     }
+}
+
+/// What a detached process leads once it has started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leads {
+    /// A process group, made for it at its start, in the session of the daemon that started it.
+    ///
+    /// For a service that makes no session of its own: it is outside the daemon's kill tree by
+    /// being outside its process group, and that is all that separates it.
+    ItsOwnGroup,
+    /// A session, which it makes for itself as the first thing it does.
+    ///
+    /// A worker calls `setsid`, which fails for a process that leads a process group, so it is not
+    /// made a group leader here. Until its first lines have run it is in the daemon's group and
+    /// session; then it leaves both, and with them the daemon's terminal.
+    ItsOwnSession,
 }
 
 /// Opens the diagnostics file of the job labelled `label` for a detached process to write its
@@ -1340,17 +1364,22 @@ fn detached_command(
     working_directory: &Path,
     desktop: &[(String, String)],
     diagnostics: std::fs::File,
+    leads: Leads,
 ) -> Result<u32> {
     use std::os::unix::process::CommandExt as _;
 
-    // The worker gets its own process group here, and makes itself a session leader as soon as it
-    // starts, which is what actually leaves this daemon's session and controlling terminal. Doing
-    // the second half in the worker keeps it out of the child-setup path, where the only way to
-    // call `setsid` is one this codebase does not allow. It is reparented to init when this daemon
-    // exits. This is the fallback for a host with no service manager to ask; where one exists,
-    // that manager owns the worker.
+    // A worker is not made a process group leader here: it makes itself the leader of a session as
+    // the first thing it does, which a group leader cannot do, and that leaves this daemon's
+    // session and controlling terminal. Doing it in the worker keeps it out of the child-setup
+    // path, where the only way to call `setsid` is one this codebase does not allow. A service that
+    // makes no session of its own, the plugin runtime, is given a process group of its own instead,
+    // which is what keeps it out of this daemon's kill tree. Either is reparented when this daemon
+    // exits, to init or to the nearest process that adopts orphans. This is the fallback for a host
+    // with no service manager to ask; where one exists, that manager owns the process.
     let mut command = std::process::Command::new(program);
-    command.process_group(0);
+    if leads == Leads::ItsOwnGroup {
+        command.process_group(0);
+    }
     command.args(arguments);
     // Never the daemon's own directory: the worker outlives this daemon, so a directory inherited
     // from it would be held open by a process nothing can see the parentage of.
