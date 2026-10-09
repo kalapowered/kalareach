@@ -18,8 +18,11 @@
 use kr_pairing::confirm::{ConfirmationExpectation, ConfirmationLedger, HostEnrolment};
 use kr_pairing::platform::{BootIdentity, PairingClock};
 use kr_protocol::ids::DeviceId;
-use kr_protocol::pairing::{OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction};
-use kr_protocol::scalars::{AuthorisationKey, Digest256};
+use kr_protocol::pairing::{
+    DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction,
+};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256};
 
 use crate::error::{ControllerError, Result};
 
@@ -143,6 +146,24 @@ impl ConfirmedAction {
     }
 }
 
+/// The exact action an owner's confirmation has to cover.
+///
+/// The caller builds it from what it is about to do, never from the challenge it was handed: the
+/// action's class, the digest of the whole effect, the keys the effect sends authority to when it
+/// names a device, and the rights it grants. A challenge that differs in any of the four is not an
+/// answer to it.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactAction<'a> {
+    /// The class of action.
+    pub action: SensitiveAction,
+    /// The digest of the exact effect.
+    pub digest: Digest256,
+    /// The keys the effect sends authority to, when it names a device.
+    pub destination: Option<&'a DevicePublicKeys>,
+    /// The rights the effect grants.
+    pub rights: &'a CanonicalSet<ActionRight>,
+}
+
 /// Where a sensitive action's owner confirmation is checked.
 ///
 /// The catalogue's two confirmed methods reach the ceremony through this rather than through the
@@ -157,8 +178,7 @@ pub trait OwnerConfirmations: Send + Sync {
     /// when the proof does not answer it.
     fn accept(
         &self,
-        action: SensitiveAction,
-        action_digest: Digest256,
+        what: &ExactAction<'_>,
         proof: &OwnerConfirmationProof,
     ) -> Result<ConfirmedAction>;
 
@@ -174,15 +194,11 @@ pub trait OwnerConfirmations: Send + Sync {
     ///
     /// Returns `OWNER_CONFIRMATION_REQUIRED` while no answered challenge equals this action, so a
     /// caller can ask again until the challenge's deadline.
-    fn accept_recorded(
-        &self,
-        action: SensitiveAction,
-        action_digest: Digest256,
-    ) -> Result<ConfirmedAction>;
+    fn accept_recorded(&self, what: &ExactAction<'_>) -> Result<ConfirmedAction>;
 
     /// The host a confirmation accepted here is about.
     fn host_device_id(&self) -> DeviceId;
 
     /// The clock this host measures a confirmation's remaining lifetime on.
-    fn clock(&self) -> &dyn PairingClock;
+    fn clock(&self) -> &(dyn PairingClock + Sync);
 }

@@ -4746,9 +4746,25 @@ grant it carries with `grant.revoke`, which settles the invitation as withdrawn 
 so cancelling is a complete answer rather than a note beside live authority.
 
 **Transfer of control is not a delegation.** The transferring device does not keep what it hands
-over: the recipient receives an active grant over the session named in the plan, and the
-transferring device's grant is revoked with its descendants, both in one commit. It changes who
-holds authority, so it takes the owner's confirmation every time.
+over. The recipient receives an active grant over the session named in the plan, which keeps the
+issuer and the parent of the grant it replaces and ends no later than that grant does on the
+continuous clock, and the transferring device's grant is revoked with its descendants, both in one
+commit. It changes who holds authority, so it takes the owner's confirmation every time, and only
+the person at this machine asks for it: `grant.transfer` is served on local IPC alone, and a paired
+device that asks for the confirmation or for the transfer is refused.
+
+The host describes the transfer from its own records. `owner.confirmation.request` names the
+session, the grant given up, the receiving device and the identifier of the action that will make
+the transfer, and the host answers with a challenge for a plan that holds the two devices and their
+names, the receiving device's keys, the identity of the grant that will be written, and everything
+that grant carries. That identity comes from the action, so a confirmation is for one action and no
+other, and it has to be asked for before the action is sent: a transfer sent first is refused and
+the refusal is kept for its action. An owner device builds the plan's digest again from what it is
+shown and signs it with the receiving device's keys and the rights it is given beside it.
+`grant.transfer` then spends the answer recorded for exactly that plan, once. A receiving device
+that is not paired with all four of its keys held, a grant that is not the transferring device's or
+carries no `session.share`, and a plan that hands over more than the grant carries are each refused
+before the answer is spent. A repeat of the action is answered as it was and spends nothing.
 
 The confirmation is accepted against an expectation built from what the caller states this host is:
 its device identity, its endpoint, the recipient's public keys, the rights the plan hands over and a
@@ -4756,8 +4772,9 @@ digest covering the whole plan. A challenge that supplied its own answers to tho
 it. The signer and the outstanding-challenge ledger are the caller's too, so the acceptance is only
 as strong as the caller's own enrolment record. What comes out of that acceptance is evidence bound
 to the host it was accepted for, to the boot it was accepted in, and to the ceremony's own monotonic
-deadline, and the transfer checks all three before it does anything. A confirmation accepted for
-another host, in an earlier boot, or past its lifetime authorises nothing.
+deadline, and the transfer checks all three before it does anything and again where it writes. A
+confirmation accepted for another host, in an earlier boot, or past its lifetime authorises
+nothing.
 
 The transfer hands over no more than the transferring grant carries, and it advances the revision
 and fences like any other revocation.

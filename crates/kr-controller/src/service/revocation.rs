@@ -7,32 +7,6 @@ use crate::error::Result;
 use super::barrier::{OwnBarrier, Reach};
 use super::{Controller, net};
 
-/// The clock the owner-confirmation ceremony reads, which is this daemon's own.
-///
-/// The monotonic reading and the boot identity are what a confirmation's deadline is measured on,
-/// so a wall clock that moves cannot lengthen one.
-#[derive(Debug)]
-struct PairingTime;
-
-impl kr_pairing::platform::PairingClock for PairingTime {
-    fn monotonic_ms(&self) -> u64 {
-        kr_ipc::clock::SharedClock::boot_elapsed_ms(&kr_ipc::clock::SystemSharedClock)
-    }
-
-    fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
-        // The daemon's own boot value, hashed to the fixed width this clock's identity uses. Two
-        // boots differ here whenever they differ there, which is the whole of what it is for.
-        let value = kr_ipc::identity::boot_identity()
-            .map(|identity| identity.value.as_slice().to_vec())
-            .unwrap_or_default();
-        kr_pairing::platform::BootIdentity(kr_cbor::sha256(&value))
-    }
-
-    fn wall_clock_ms(&self) -> u64 {
-        kr_ipc::now_ms().get()
-    }
-}
-
 impl Controller {
     /// Revokes a grant, its descendants, and everything they were being used for.
     ///
@@ -257,13 +231,20 @@ impl Controller {
     /// revocation for the device that gave it up: the revision advances, the connections admitted
     /// under the old authority are fenced, and the answer carries the per-worker completion status.
     ///
+    /// `clock` is the one the owner's confirmation was measured on. `carried` is the admission of
+    /// the mutation performing the transfer, which is asked again inside the transaction that
+    /// writes, and `claim` is that mutation's hold, as for [`Self::revoke_grant`].
+    ///
     /// # Errors
     ///
     /// Returns an error when the transfer is refused or the registry cannot be written.
     pub async fn transfer_control(
         &self,
-        plan: &crate::sharing::TransferPlan,
-        confirmation: &crate::sharing::ConfirmedTransfer,
+        plan: &kr_protocol::confirmation::TransferControlPlan,
+        confirmation: &crate::sharing::ConfirmedAction,
+        clock: &(dyn kr_pairing::platform::PairingClock + Sync),
+        carried: Option<&crate::authority::AdmittedMutation>,
+        claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<(
         crate::sharing::ControlTransfer,
         kr_protocol::sharing::RevocationResult,
@@ -272,10 +253,26 @@ impl Controller {
         // again at the moment it writes, and a lapse it finds there is owed its record, which is
         // written before the refusal goes back.
         let now_ms = self.settled_now_ms();
-        let revision = self.policy().authority_revision();
-        let transfer =
-            self.sharing
-                .transfer_control(plan, confirmation, &PairingTime, revision, now_ms);
+        let write = crate::sharing::TransferWrite {
+            authority_revision: self.policy().authority_revision(),
+            now_ms,
+            claim,
+        };
+        // The admission is checked under the registry lock, which is held across the write and
+        // dropped before the fence, which takes it again.
+        let transfer = match carried {
+            Some(carried) => {
+                let registry = self.registry.lock().await;
+                self.check_admission(&registry, carried)?;
+                self.sharing
+                    .transfer_control(plan, confirmation, clock, write, || {
+                        self.check_admission(&registry, carried)
+                    })
+            }
+            None => self
+                .sharing
+                .transfer_control(plan, confirmation, clock, write, || Ok(())),
+        };
         self.settle_floor();
         let transfer = transfer?;
         let own = self.publish_debts(&Self::under_the_grants(

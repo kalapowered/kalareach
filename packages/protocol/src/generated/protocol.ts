@@ -2150,6 +2150,8 @@ export interface KalaReachProtocol {
   grant_redeem_result?: GrantRedeemResult
   grant_revoke_params?: GrantRevokeParams
   grant_summary?: GrantSummary
+  grant_transfer_params?: GrantTransferParams
+  grant_transfer_result?: GrantTransferResult
   hello_reply?: HelloReply
   history_page_params?: HistoryPageParams
   history_page_result?: HistoryPageResult
@@ -2435,9 +2437,9 @@ export interface KalaReachProtocol {
   review_state?: ReviewState1
   review_subject?: ReviewSubject
   revocation_acknowledgement?: RevocationAcknowledgement
-  revocation_barrier?: RevocationBarrier
+  revocation_barrier?: RevocationBarrier1
   revocation_request?: RevocationRequest
-  revocation_result?: RevocationResult
+  revocation_result?: RevocationResult1
   rich_method_table?: RichMethodTable
   role_selection?: RoleSelection1
   root_command_accepted_params?: RootCommandAcceptedParams
@@ -14654,6 +14656,199 @@ export interface GrantRevokeParams {
   grant_id: string
 }
 /**
+ * Parameters of `grant.transfer`.
+ *
+ * The owner's confirmation is not carried here. It is asked for beforehand, through
+ * `owner.confirmation.request` naming the same parameters and the identifier of the action that
+ * will spend it, and answered on an owner device; `grant.transfer` spends that answer, once.
+ */
+export interface GrantTransferParams {
+  /**
+   * One host-issued authority object.
+   */
+  from_grant_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * One paired device.
+   */
+  to_device_id: string
+}
+/**
+ * The result of `grant.transfer`.
+ */
+export interface GrantTransferResult {
+  replacement: Grant4
+  revoked: RevocationResult
+}
+/**
+ * The grant the receiving device now holds, active from the moment of the transfer.
+ */
+export interface Grant4 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  history: HistoryScope1
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one was delegated from. Revoking a parent revokes its descendants.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * One paired device.
+   */
+  recipient_device_id: string
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * What revoking the transferring device's grant did, with the per-worker barrier.
+ */
+export interface RevocationResult {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  barrier: RevocationBarrier
+  /**
+   * The grants it revoked, the named one and its descendants, in identity order, cut to what
+   * one answer carries. `revoked_grants_total` says how many there were.
+   */
+  revoked_grants: GrantId[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revoked_grants_total: string
+}
+/**
+ * The per-worker completion status.
+ */
+export interface RevocationBarrier {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * One entry per affected worker, in session order, cut to what one answer carries.
+   *
+   * A cut takes the workers whose barrier has not held before any that has, and always keeps
+   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
+   * when it holds on the whole. `workers_total` says how many there were.
+   */
+  workers: WorkerBarrier[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workers_total: string
+}
+/**
+ * One worker's half of a revocation barrier.
+ */
+export interface WorkerBarrier {
+  /**
+   * The revision the worker has installed, when it has installed one.
+   */
+  acknowledged_revision: AuthorityRevision | null
+  /**
+   * Why this worker's barrier has not held, or what is still outstanding about one that has.
+   */
+  detail: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  names_pending: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_actions: string
+  /**
+   * The actions whose dispatch transition had already won the serial race, in identity order
+   * (action, then actor), cut to what one answer carries. `possibly_executed_total` says how
+   * many there were.
+   *
+   * Each one's receipt state says how much is known about what it did; the list is
+   * not only the uncertain ones.
+   */
+  possibly_executed: PossiblyExecutedAction[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  possibly_executed_total: string
+  /**
+   * The undispatched intents the fence rejected, in identity order (actor, then action), cut to
+   * what one answer carries. `rejected_actions_total` says how many there were.
+   */
+  rejected_actions: FencedAction[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  rejected_actions_total: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * What this worker's barrier has reached.
+   */
+  state: 'acknowledged' | 'ended' | 'pending'
+}
+/**
  * The host's complete `hello` selection.
  *
  * It echoes the client nonce as well as carrying its own, so the transcript binds one exact
@@ -16155,6 +16350,7 @@ export interface MethodEntry {
     | 'grant.revoke'
     | 'grant.list'
     | 'grant.redeem'
+    | 'grant.transfer'
     | 'push.installation.register'
     | 'push.sender.issue'
     | 'push.sender.renew'
@@ -16705,6 +16901,9 @@ export interface PendingConfirmation {
       }
     | 'establish_clock'
     | {
+        transfer_control: TransferControlPlan
+      }
+    | {
         catalogue_add: {
           budgets: CatalogueBudgets4
           /**
@@ -16976,6 +17175,153 @@ export interface ProposedGrant1 {
     | 'none'
 }
 /**
+ * Handing a session's control to another device, as the owner is asked to confirm it.
+ *
+ * Every member of what is written is a member of this plan, and the digest covers the whole of it:
+ * the grant given up, the device it is taken from and the device and keys it goes to, the
+ * identity of the grant written, and every right, history bound, lifetime, selector and
+ * organisation requirement the receiving device holds. A confirmation obtained for one transfer
+ * authorises no other. The host writes the grant [`Self::replacement`] builds, so what is written
+ * is what was confirmed; an owner device builds the digest again from what it is shown.
+ */
+export interface TransferControlPlan {
+  /**
+   * The rights handed over.
+   */
+  actions: ActionRight[]
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The environments the new grant covers, as the given-up one's.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When the new grant stops, as the given-up one's.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  /**
+   * One paired device.
+   */
+  from_device_id: string
+  /**
+   * What that device calls itself. Display text, never authority.
+   */
+  from_device_name: string
+  history: HistoryScope4
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * One host-issued authority object.
+   */
+  new_grant_id: string
+  /**
+   * The organisation membership the new grant requires, as the given-up one's.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant the given-up one was delegated from, which the new grant is delegated from too.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * One host-issued authority object.
+   */
+  source_grant_id: string
+  /**
+   * One paired device.
+   */
+  to_device_id: string
+  /**
+   * What that device calls itself. Display text, never authority.
+   */
+  to_device_name: string
+  /**
+   * The revision of those keys.
+   */
+  to_key_revision: string
+  to_keys: DevicePublicKeys7
+}
+/**
+ * How far back a grant may see, and which current resources it names explicitly.
+ *
+ * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
+ * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
+ * voice context. A later snapshot or a freshly generated summary never makes older underlying
+ * content newly authorised.
+ */
+export interface HistoryScope4 {
+  /**
+   * Whether the currently visible screen is included. This exception never grants inactive
+   * screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * The earliest content this grant may see. Null means no retained history at all.
+   */
+  lower_bound_ms: TimestampMs | null
+  /**
+   * Current approvals named explicitly, on the same terms, each by the identity of the one
+   * resource the broker arbitrates for it.
+   *
+   * An upstream's own request identifier does not pick out one request: two connections both
+   * call their first request `1`. A resource identity names exactly one.
+   */
+  named_approvals: PendingResourceId[]
+  /**
+   * Current questions named explicitly, even when they were created before the lower bound.
+   */
+  named_questions: QuestionId[]
+}
+/**
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
+ */
+export interface DevicePublicKeys7 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
  * The budgets its syncs and its cache run inside.
  */
 export interface CatalogueBudgets4 {
@@ -17171,6 +17517,9 @@ export interface OwnerConfirmationRequestParams {
       }
     | 'establish_clock'
     | {
+        transfer_control: TransferControlSubject
+      }
+    | {
         described: DescribedAction
       }
 }
@@ -17278,6 +17627,37 @@ export interface PluginInstallParams {
    * The release.
    */
   version: string
+}
+/**
+ * A transfer of control that an owner confirmation is asked for: the parameters of the
+ * `grant.transfer` that will spend it, and the action that will.
+ *
+ * The grant the receiving device is given takes its identity from the action, so the plan the
+ * owner confirms names it, and a confirmation is for one action and no other.
+ */
+export interface TransferControlSubject {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  params: GrantTransferParams1
+}
+/**
+ * What the `grant.transfer` names.
+ */
+export interface GrantTransferParams1 {
+  /**
+   * One host-issued authority object.
+   */
+  from_grant_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * One paired device.
+   */
+  to_device_id: string
 }
 /**
  * The result of `owner.confirmation.request`.
@@ -23579,101 +23959,6 @@ export interface RevocationAcknowledgement {
  * waiting for a lease timer is not completion, because a paused worker could already be inside a
  * dispatch transition, so nothing here treats the absence of an answer as an answer.
  */
-export interface RevocationBarrier {
-  /**
-   * The host's ordered authority revision. Only the host issues its own revisions.
-   */
-  authority_revision: string
-  /**
-   * One entry per affected worker, in session order, cut to what one answer carries.
-   *
-   * A cut takes the workers whose barrier has not held before any that has, and always keeps
-   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
-   * when it holds on the whole. `workers_total` says how many there were.
-   */
-  workers: WorkerBarrier[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  workers_total: string
-}
-/**
- * One worker's half of a revocation barrier.
- */
-export interface WorkerBarrier {
-  /**
-   * The revision the worker has installed, when it has installed one.
-   */
-  acknowledged_revision: AuthorityRevision | null
-  /**
-   * Why this worker's barrier has not held, or what is still outstanding about one that has.
-   */
-  detail: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  names_pending: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  omitted_actions: string
-  /**
-   * The actions whose dispatch transition had already won the serial race, in identity order
-   * (action, then actor), cut to what one answer carries. `possibly_executed_total` says how
-   * many there were.
-   *
-   * Each one's receipt state says how much is known about what it did; the list is
-   * not only the uncertain ones.
-   */
-  possibly_executed: PossiblyExecutedAction[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  possibly_executed_total: string
-  /**
-   * The undispatched intents the fence rejected, in identity order (actor, then action), cut to
-   * what one answer carries. `rejected_actions_total` says how many there were.
-   */
-  rejected_actions: FencedAction[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  rejected_actions_total: string
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * What this worker's barrier has reached.
-   */
-  state: 'acknowledged' | 'ended' | 'pending'
-}
-/**
- * The result of `grant.revoke` and `device.revoke`.
- *
- * A revocation is not complete when the host records it. It is complete for a worker once that
- * worker has acknowledged the revision and fenced the undispatched actions it affects, or once
- * the worker is confirmed ended, so the barrier travels with the answer.
- */
-export interface RevocationResult {
-  /**
-   * The host's ordered authority revision. Only the host issues its own revisions.
-   */
-  authority_revision: string
-  barrier: RevocationBarrier1
-  /**
-   * The grants it revoked, the named one and its descendants, in identity order, cut to what
-   * one answer carries. `revoked_grants_total` says how many there were.
-   */
-  revoked_grants: GrantId[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  revoked_grants_total: string
-}
-/**
- * The per-worker completion status.
- */
 export interface RevocationBarrier1 {
   /**
    * The host's ordered authority revision. Only the host issues its own revisions.
@@ -23691,6 +23976,29 @@ export interface RevocationBarrier1 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   workers_total: string
+}
+/**
+ * The result of `grant.revoke` and `device.revoke`.
+ *
+ * A revocation is not complete when the host records it. It is complete for a worker once that
+ * worker has acknowledged the revision and fenced the undispatched actions it affects, or once
+ * the worker is confirmed ended, so the barrier travels with the answer.
+ */
+export interface RevocationResult1 {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  barrier: RevocationBarrier
+  /**
+   * The grants it revoked, the named one and its descendants, in identity order, cut to what
+   * one answer carries. `revoked_grants_total` says how many there were.
+   */
+  revoked_grants: GrantId[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revoked_grants_total: string
 }
 /**
  * The closed, versioned method table for rich actions.
@@ -24718,6 +25026,7 @@ export interface ServiceRequestPayload {
     | 'grant.revoke'
     | 'grant.list'
     | 'grant.redeem'
+    | 'grant.transfer'
     | 'push.installation.register'
     | 'push.sender.issue'
     | 'push.sender.renew'
@@ -25593,7 +25902,7 @@ export interface SessionRenameResult {
  * Parameters of `session.screen.preview`.
  */
 export interface SessionScreenPreviewParams {
-  history: HistoryScope4
+  history: HistoryScope5
   /**
    * One KalaReach terminal session.
    */
@@ -25607,7 +25916,7 @@ export interface SessionScreenPreviewParams {
  * voice context. A later snapshot or a freshly generated summary never makes older underlying
  * content newly authorised.
  */
-export interface HistoryScope4 {
+export interface HistoryScope5 {
   /**
    * Whether the currently visible screen is included. This exception never grants inactive
    * screen buffers, scrollback or the backing transcript.
@@ -25801,7 +26110,7 @@ export interface ClientBundle {
    * The candidate's iroh endpoint identity.
    */
   endpoint_id: string
-  keys: DevicePublicKeys7
+  keys: DevicePublicKeys8
   /**
    * The candidate's platform.
    */
@@ -25813,7 +26122,7 @@ export interface ClientBundle {
  * An authenticated pairing exchange binds these public keys and their explicit purposes to one
  * device record.
  */
-export interface DevicePublicKeys7 {
+export interface DevicePublicKeys8 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -25869,7 +26178,7 @@ export interface HostBundle {
    * The invitation this bundle answers.
    */
   invitation_id: string
-  keys: DevicePublicKeys8
+  keys: DevicePublicKeys9
   network_config: NetworkConfig
   proposed_grant: ProposedGrant6
 }
@@ -25879,7 +26188,7 @@ export interface HostBundle {
  * An authenticated pairing exchange binds these public keys and their explicit purposes to one
  * device record.
  */
-export interface DevicePublicKeys8 {
+export interface DevicePublicKeys9 {
   /**
    * The Ed25519 authorisation key.
    */

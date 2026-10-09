@@ -213,6 +213,12 @@ A session shared with an already paired device reaches it as an invitation, and 
 it with `grant.redeem` over its own connection. Redeeming activates the grant the invitation
 carries, once, for the device the invitation names, and for nobody else.
 
+Control of a session moves to another paired device with `grant.transfer`, and only the person at
+this machine asks for it. The host describes the transfer, an owner device checks it and signs it,
+and `grant.transfer` spends that answer once. The receiving device is given an active grant over the
+session, with the issuer, parent, history and lifetime of the grant it replaces, and the giving
+device's grant is revoked together with everything delegated from it, in one commit.
+
 A remote owner publishes a signed revocation **request**, which carries no host revision: only the
 target host issues ordered authority revisions, and a device that could name one would be assigning
 itself a place in the host's order. A host rejects a revision record that does not follow the one it
@@ -382,8 +388,10 @@ view of one session is handed a permanent view of every session. A bounded sessi
 a persistent enlargement however wide it is.
 
 Transfer of control is separate, because it changes who holds authority rather than adding to what
-somebody has. The digest an owner confirms for a transfer covers the whole plan: the session, both
-devices, both grants and every action handed over. A confirmation obtained for one transfer
-therefore authorises no other. The evidence that acceptance produces is bound to the host it was
-accepted for, to the boot it was accepted in, and to the ceremony's monotonic deadline, and the
-transfer checks all three.
+somebody has. The digest an owner confirms for a transfer covers the whole plan: the session, the
+grant given up, both devices with the receiving device's keys, the identity of the grant that is
+written, and every right, selector, history bound, lifetime and organisation requirement that grant
+carries. A confirmation obtained for one transfer therefore authorises no other, and it names the
+action that will spend it, since that action decides the new grant's identity. The evidence that
+acceptance produces is bound to the host it was accepted for, to the boot it was accepted in, and to
+the ceremony's monotonic deadline, and the transfer checks all three.

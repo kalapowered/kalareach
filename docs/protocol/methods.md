@@ -271,6 +271,7 @@ links to its document.
 | `grant.revoke` | write | `local_ipc`, `paired_device` | Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier. |  |
 | `grant.list` | read | `local_ipc`, `paired_device` | List grants this issuer may see, with their revisions and expiry. |  |
 | `grant.redeem` | write | `paired_device` | Redeem a session invitation, once, and activate the grant it carries. Only the device the invitation names redeems it, and a withdrawn, expired or already redeemed invitation activates nothing. The answer is the grant and carries no session text. | [Pairing: Grants](../pairing/README.md) |
+| `grant.transfer` | write | `local_ipc` | Hand a session's control to another paired device: the receiving device is given an active grant over the session and the transferring device's grant is revoked with its descendants, in one commit. The person at this machine asks for it, and it spends the owner confirmation an owner device recorded for exactly this transfer, once. | [Pairing: Grants](../pairing/README.md) |
 
 ## Services
 

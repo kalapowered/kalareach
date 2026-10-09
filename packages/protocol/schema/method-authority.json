@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 164,
+  "method_count": 165,
   "methods": [
     {
       "capability": "none",
@@ -4296,6 +4296,46 @@
         "grant"
       ],
       "summary": "Redeem a session invitation, once, and activate the grant it carries. Only the device the invitation names redeems it, and a withdrawn, expired or already redeemed invitation activates nothing. The answer is the grant and carries no session text.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "required": {
+          "capability_id": "grant.parent",
+          "revision": "authority_revision"
+        }
+      },
+      "confirmation": "always",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "sharing",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "grant.transfer",
+      "name": "grant.transfer",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.share"
+            }
+          },
+          "when": "always"
+        },
+        {
+          "authority": "issuer_delegation",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "grant",
+        "device"
+      ],
+      "summary": "Hand a session's control to another paired device: the receiving device is given an active grant over the session and the transferring device's grant is revoked with its descendants, in one commit. The person at this machine asks for it, and it spends the owner confirmation an owner device recorded for exactly this transfer, once.",
       "version": 1
     },
     {

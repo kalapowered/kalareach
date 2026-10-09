@@ -207,9 +207,9 @@ use crate::sharing::{
     DeviceListParams, DeviceListResult, DevicePreviewKeyUpdateParams, DevicePreviewKeyUpdateResult,
     DeviceRevokeParams, DeviceSummary, GrantCreateParams, GrantCreateResult, GrantListParams,
     GrantListResult, GrantRedeemParams, GrantRedeemResult, GrantRevokeParams, GrantSummary,
-    InvitationPreview, LiveScreenPreview, NamedApprovalPreview, NamedQuestionPreview,
-    OfflineValidityPolicy, RevocationResult, RoleSelection, SessionScreenPreviewParams,
-    SessionScreenPreviewResult,
+    GrantTransferParams, GrantTransferResult, InvitationPreview, LiveScreenPreview,
+    NamedApprovalPreview, NamedQuestionPreview, OfflineValidityPolicy, RevocationResult,
+    RoleSelection, SessionScreenPreviewParams, SessionScreenPreviewResult,
 };
 use crate::skill::{
     AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult, AgentToolsStatusResult,
@@ -428,6 +428,8 @@ pub fn protocol_schema() -> Value {
         "grant_redeem_params" => GrantRedeemParams,
         "grant_redeem_result" => GrantRedeemResult,
         "grant_revoke_params" => GrantRevokeParams,
+        "grant_transfer_params" => GrantTransferParams,
+        "grant_transfer_result" => GrantTransferResult,
         "grant_summary" => GrantSummary,
         "invitation_preview" => InvitationPreview,
         "live_screen_preview" => LiveScreenPreview,

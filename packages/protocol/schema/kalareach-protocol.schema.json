@@ -8138,6 +8138,19 @@
         },
         {
           "additionalProperties": false,
+          "description": "Handing a session's control to another device.",
+          "properties": {
+            "transfer_control": {
+              "$ref": "#/$defs/TransferControlPlan"
+            }
+          },
+          "required": [
+            "transfer_control"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Adopting this repository's trust root.",
           "properties": {
             "catalogue_add": {
@@ -8418,6 +8431,19 @@
           "const": "establish_clock",
           "description": "Establishing this host's clock again after it was found to have gone backwards.",
           "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Handing a session's control to another device, as this exact `grant.transfer` would.\n\nThe host resolves the grant, both devices and the receiving device's keys from its own\nrecords, so what an owner device shows and signs is what the transfer then writes. Only the\nperson at this machine asks for it: a paired device that asks is refused.",
+          "properties": {
+            "transfer_control": {
+              "$ref": "#/$defs/TransferControlSubject"
+            }
+          },
+          "required": [
+            "transfer_control"
+          ],
+          "type": "object"
         },
         {
           "additionalProperties": false,
@@ -15356,6 +15382,49 @@
       ],
       "type": "object"
     },
+    "GrantTransferParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `grant.transfer`.\n\nThe owner's confirmation is not carried here. It is asked for beforehand, through\n`owner.confirmation.request` naming the same parameters and the identifier of the action that\nwill spend it, and answered on an owner device; `grant.transfer` spends that answer, once.",
+      "properties": {
+        "from_grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant the transferring device holds, which is revoked with its descendants."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose control moves."
+        },
+        "to_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The paired device that receives the control."
+        }
+      },
+      "required": [
+        "session_id",
+        "from_grant_id",
+        "to_device_id"
+      ],
+      "type": "object"
+    },
+    "GrantTransferResult": {
+      "additionalProperties": false,
+      "description": "The result of `grant.transfer`.",
+      "properties": {
+        "replacement": {
+          "$ref": "#/$defs/Grant",
+          "description": "The grant the receiving device now holds, active from the moment of the transfer."
+        },
+        "revoked": {
+          "$ref": "#/$defs/RevocationResult",
+          "description": "What revoking the transferring device's grant did, with the per-worker barrier."
+        }
+      },
+      "required": [
+        "replacement",
+        "revoked"
+      ],
+      "type": "object"
+    },
     "HandoverStep": {
       "description": "One step of `host.update.handover`.\n\nA handover is an attempt: `prepare` begins one and answers its identity, and only a `stop` that\nnames that identity stops the daemon. An attempt ends at its first `stop` or `resume`, when its\nhold lapses, or when a later `prepare` begins another; nothing can act on an attempt that has\nended, so a `stop` that arrives late, after the update it belonged to gave up, ends nothing.",
       "oneOf": [
@@ -19401,6 +19470,11 @@
         {
           "const": "grant.redeem",
           "description": "Redeem a session invitation, once, and activate the grant it carries. Only the device the invitation names redeems it, and a withdrawn, expired or already redeemed invitation activates nothing. The answer is the grant and carries no session text.",
+          "type": "string"
+        },
+        {
+          "const": "grant.transfer",
+          "description": "Hand a session's control to another paired device: the receiving device is given an active grant over the session and the transferring device's grant is revoked with its descendants, in one commit. The person at this machine asks for it, and it spends the owner confirmation an owner device recorded for exactly this transfer, once.",
           "type": "string"
         },
         {
@@ -33975,6 +34049,137 @@
       ],
       "type": "object"
     },
+    "TransferControlPlan": {
+      "additionalProperties": false,
+      "description": "Handing a session's control to another device, as the owner is asked to confirm it.\n\nEvery member of what is written is a member of this plan, and the digest covers the whole of it:\nthe grant given up, the device it is taken from and the device and keys it goes to, the\nidentity of the grant written, and every right, history bound, lifetime, selector and\norganisation requirement the receiving device holds. A confirmation obtained for one transfer\nauthorises no other. The host writes the grant [`Self::replacement`] builds, so what is written\nis what was confirmed; an owner device builds the digest again from what it is shown.",
+      "properties": {
+        "actions": {
+          "description": "The rights handed over.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the grants belong to."
+        },
+        "environment_selector": {
+          "$ref": "#/$defs/EnvironmentSelector",
+          "description": "The environments the new grant covers, as the given-up one's."
+        },
+        "expiry": {
+          "$ref": "#/$defs/GrantExpiry",
+          "description": "When the new grant stops, as the given-up one's."
+        },
+        "from_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device that gives up its control."
+        },
+        "from_device_name": {
+          "$ref": "#/$defs/DeviceName",
+          "description": "What that device calls itself. Display text, never authority."
+        },
+        "history": {
+          "$ref": "#/$defs/HistoryScope",
+          "description": "How far back the new grant sees, as the given-up one's."
+        },
+        "issuer_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device that issued the given-up grant, which issues the new one."
+        },
+        "new_grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant that is written."
+        },
+        "organisation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OrganisationRequirement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The organisation membership the new grant requires, as the given-up one's."
+        },
+        "parent_grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant the given-up one was delegated from, which the new grant is delegated from too."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose control moves."
+        },
+        "source_grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant that is given up, with the grants delegated from it."
+        },
+        "to_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device that receives it."
+        },
+        "to_device_name": {
+          "$ref": "#/$defs/DeviceName",
+          "description": "What that device calls itself. Display text, never authority."
+        },
+        "to_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision",
+          "description": "The revision of those keys."
+        },
+        "to_keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "The keys the receiving device is paired with."
+        }
+      },
+      "required": [
+        "environment_id",
+        "session_id",
+        "source_grant_id",
+        "parent_grant_id",
+        "issuer_device_id",
+        "from_device_id",
+        "from_device_name",
+        "to_device_id",
+        "to_device_name",
+        "to_keys",
+        "to_key_revision",
+        "new_grant_id",
+        "environment_selector",
+        "actions",
+        "history",
+        "expiry",
+        "organisation"
+      ],
+      "type": "object"
+    },
+    "TransferControlSubject": {
+      "additionalProperties": false,
+      "description": "A transfer of control that an owner confirmation is asked for: the parameters of the\n`grant.transfer` that will spend it, and the action that will.\n\nThe grant the receiving device is given takes its identity from the action, so the plan the\nowner confirms names it, and a confirmation is for one action and no other.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The identifier of the action that will transfer."
+        },
+        "params": {
+          "$ref": "#/$defs/GrantTransferParams",
+          "description": "What the `grant.transfer` names."
+        }
+      },
+      "required": [
+        "params",
+        "action_id"
+      ],
+      "type": "object"
+    },
     "TransferId": {
       "description": "One upload or download transfer.",
       "format": "uuid",
@@ -38584,6 +38789,12 @@
     },
     "grant_summary": {
       "$ref": "#/$defs/GrantSummary"
+    },
+    "grant_transfer_params": {
+      "$ref": "#/$defs/GrantTransferParams"
+    },
+    "grant_transfer_result": {
+      "$ref": "#/$defs/GrantTransferResult"
     },
     "hello_reply": {
       "$ref": "#/$defs/HelloReply"

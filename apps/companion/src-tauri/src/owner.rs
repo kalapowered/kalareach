@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, FIELD_CHARS, Listed, OwnerConfirmations, ReviewOutcome,
-    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown_host, shows_value,
+    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown, shown_host,
+    shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::confirmation::{CatalogueTrustPlan, NATIVE_BRIDGE_NOTICE, PluginInstallPlan};
@@ -450,6 +451,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         Subject::EstablishClock => "Trust this host's clock again",
         Subject::CatalogueAdd(_) => "Trust a plugin repository",
         Subject::PluginInstall(_) => "Install a plugin",
+        Subject::TransferControl(_) => "Hand control of a session to another device",
         Subject::Described(described) => match described.action {
             SensitiveAction::EnlargeGrant => "Widen what devices may do",
             SensitiveAction::TrustRepositoryRoot => "Trust a plugin repository",
@@ -522,6 +524,18 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
                 },
             })
         }
+        Subject::TransferControl(plan) => Some(Particulars {
+            facts: vec![
+                exact("Session", plan.session_id.to_string()),
+                words(
+                    "From",
+                    shown(plan.from_device_name.as_str(), HOST_NAME_CHARS),
+                ),
+                words("To", shown(plan.to_device_name.as_str(), HOST_NAME_CHARS)),
+            ],
+            notice: None,
+            statement: None,
+        }),
         _ => Some(Particulars {
             facts: Vec::new(),
             notice: None,
@@ -886,6 +900,69 @@ mod tests {
         assert_eq!(view.notice, None);
         assert_eq!(view.statement, None);
         assert_eq!(view.value, None);
+    }
+
+    /// KR-REQ-18.03: a transfer of control is listed with the sentence the platform's dialog will
+    /// say and, one fact to a line, the session and the two devices, so the person who confirms it
+    /// sees which session goes from which device to which.
+    #[test]
+    fn a_transfer_of_control_is_listed_with_its_session_and_both_devices() {
+        use kr_protocol::confirmation::TransferControlPlan;
+        use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope};
+        use kr_protocol::ids::{GrantId, SessionId};
+        use kr_protocol::rights::ActionRight;
+
+        let keys = DeviceKeys::generate().expect("keys").public_keys();
+        let plan = TransferControlPlan {
+            environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([8; 16])),
+            session_id: SessionId::new(Uuid::from_bytes([0xab; 16])),
+            source_grant_id: GrantId::new(Uuid::from_bytes([11; 16])),
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: DeviceId::new(Uuid::from_bytes([3; 16])),
+            from_device_id: DeviceId::new(Uuid::from_bytes([12; 16])),
+            from_device_name: DeviceName::new("Laptop").expect("a name"),
+            to_device_id: DeviceId::new(Uuid::from_bytes([13; 16])),
+            to_device_name: DeviceName::new("Pixel 8").expect("a name"),
+            to_keys: keys,
+            to_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            new_grant_id: GrantId::new(Uuid::from_bytes([14; 16])),
+            environment_selector: EnvironmentSelector::Any,
+            actions: [ActionRight::SessionView, ActionRight::SessionShare]
+                .into_iter()
+                .collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(NOW + 3_600_000),
+            },
+            organisation: Nullable::null(),
+        };
+        let listed = listed_subject(
+            Subject::TransferControl(Box::new(plan)),
+            SensitiveAction::ChangeHostAuthority,
+        );
+        let view = describe("a reference", "studio", &listed, NOW);
+        assert!(view.checkable);
+        assert_eq!(view.title, "Hand control of a session to another device");
+        assert_eq!(
+            view.detail.as_deref(),
+            Some(
+                "Hand control of session abababab on studio from Laptop to Pixel 8, who may share \
+                 sessions with others and view sessions for 60 minutes."
+            )
+        );
+        assert_eq!(
+            view.facts,
+            vec![
+                fact("Session", &Uuid::from_bytes([0xab; 16]).to_string(), true),
+                fact("From", "Laptop", false),
+                fact("To", "Pixel 8", false),
+            ]
+        );
     }
 
     /// KR-REQ-11.42: an installation of a release with a native bridge carries the host's own

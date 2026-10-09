@@ -16,9 +16,10 @@
 use std::sync::Arc;
 
 use kr_pairing::confirm::HostEnrolment;
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::confirmation::{
     ConfirmationSubject, HostClockEstablishParams, OwnerConfirmationCompleteParams,
-    OwnerConfirmationPendingParams, OwnerConfirmationRequestParams,
+    OwnerConfirmationPendingParams, OwnerConfirmationRequestParams, TransferControlPlan,
 };
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::ids::{AuthorityRevision, ConnectionId};
@@ -272,6 +273,34 @@ impl Controller {
                     .await;
                 }
                 let pairing = self.pairing_service()?;
+                // A transfer of control is described by the daemon, from the grant and the two
+                // devices it holds, and only the person at this machine asks for it: an owner
+                // device answers a challenge, it does not open one for control of a session.
+                if let ConfirmationSubject::TransferControl(subject) = &params.subject {
+                    if caller.device.is_some() || caller.ingress != ActorIngress::LocalIpc {
+                        return Err(ControllerError::PermissionDenied {
+                            detail: "the person at this machine asks for the confirmation of a \
+                                     transfer of control"
+                                .to_owned(),
+                        });
+                    }
+                    let plan =
+                        self.transfer_plan(&caller.actor_id, &subject.params, subject.action_id)?;
+                    let resolved = super::owner::Resolved {
+                        action: TransferControlPlan::sensitive_action(),
+                        digest: plan
+                            .action_digest()
+                            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+                        destination: Some(plan.to_keys),
+                        rights: plan.actions.clone(),
+                        display: plan.display(),
+                        bootstrap: false,
+                    };
+                    return blocking(move || {
+                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
+                    })
+                    .await;
+                }
                 // A repository's root and an installation are described by the catalogue, from
                 // the exact request and the records it holds, and the pairing service issues the
                 // challenge for what it resolved.
