@@ -193,6 +193,110 @@ const PROGRAM_NAMES: [&str; 7] = [
     "kr-plugin-host",
 ];
 
+/// The root of this checkout.
+fn repository() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The crate whose sources a program is built from, by the program's name.
+fn crate_of(program: &str) -> &str {
+    match program {
+        "kr-describe-inference" => "kr-describe-model",
+        other => other,
+    }
+}
+
+/// Why `program`, built into a target directory, is not one built from the checkout at `repository`
+/// as it is now, or `None` when it is.
+///
+/// Cargo writes beside every program a file that lists each source it was built from. A program
+/// older than any of them was built before the tree changed, as one left in a target directory by an
+/// earlier run is, and a program whose list names the crate's sources in another checkout was built
+/// there: both would be assembled into a release and started, and would write and read what this tree
+/// does not. This is Cargo's own rule for a stale build, applied before the suite relies on the
+/// program. It does not see a program copied over a fresh one with a later time, or a build with
+/// other features.
+fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Option<String> {
+    let listing = program.with_file_name(format!("{name}.d"));
+    let text = match std::fs::read_to_string(&listing) {
+        Ok(text) => text,
+        Err(error) => {
+            return Some(format!("{} cannot be read: {error}", listing.display()));
+        }
+    };
+    let built = match std::fs::metadata(program).and_then(|about| about.modified()) {
+        Ok(built) => built,
+        Err(error) => return Some(format!("its time cannot be read: {error}")),
+    };
+    // Makefile syntax: the program, a colon, then each source, a space escaped with a backslash.
+    let Some((_, after)) = text.split_once(": ") else {
+        return Some(format!("{} is not a dependency file", listing.display()));
+    };
+    let mut sources: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut characters = after.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&' ') => {
+                current.push(' ');
+                characters.next();
+            }
+            '\\' if characters.peek() == Some(&'\n') => {
+                characters.next();
+                if !current.is_empty() {
+                    sources.push(std::mem::take(&mut current));
+                }
+            }
+            ' ' | '\n' => {
+                if !current.is_empty() {
+                    sources.push(std::mem::take(&mut current));
+                }
+            }
+            other => current.push(other),
+        }
+    }
+    if !current.is_empty() {
+        sources.push(current);
+    }
+    let own = format!("crates/{}/src/", crate_of(name));
+    let here = repository.join(&own);
+    let here = std::fs::canonicalize(&here).unwrap_or(here);
+    let mut found = false;
+    for source in &sources {
+        let path = Path::new(source);
+        // A file a crate includes from outside its sources is named through `..` from inside them;
+        // it is read as the path it comes to, and is one of the crate's sources only if that is.
+        let mut named = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    named.pop();
+                }
+                other => named.push(other),
+            }
+        }
+        if named.to_string_lossy().contains(&own) {
+            let there = std::fs::canonicalize(&named).unwrap_or(named);
+            if !there.starts_with(&here) {
+                return Some(format!("it was built from the sources at {source}"));
+            }
+            found = true;
+        }
+        if let Ok(modified) = std::fs::metadata(path).and_then(|about| about.modified())
+            && modified > built
+        {
+            return Some(format!("{source} has changed since it was built"));
+        }
+    }
+    (!found).then(|| {
+        format!(
+            "{} lists none of the sources of {}",
+            listing.display(),
+            crate_of(name)
+        )
+    })
+}
+
 /// The programs this workspace built, beside this test or where Cargo says, each by its name with
 /// its digest.
 ///
@@ -219,6 +323,14 @@ fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
                  --bin kr-describe-inference`",
                 candidate.display()
             );
+            if let Some(why) = built_from_another_tree(&candidate, name, &repository()) {
+                panic!(
+                    "{} was not built from this tree: {why}; build the programs again with `cargo \
+                     build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host` and \
+                     `cargo build --locked -p kr-describe-model --bin kr-describe-inference`",
+                    candidate.display()
+                );
+            }
             candidate
         };
         let sources = PROGRAM_NAMES.map(|name| {
@@ -289,6 +401,96 @@ fn module_tree() -> [(&'static str, &'static str); 2] {
         ),
         ("shells/zsh/package/kr-shell-identity.json", "{}\n"),
     ]
+}
+
+/// A program that is older than a source it was built from, one built from another checkout's sources,
+/// and one with no list of its sources are each refused by name, and a program newer than every source
+/// it lists is not. This is the check the suite makes before it assembles a release from the daemons
+/// found in a target directory: one left there by an earlier run wrote a wrong digest into the lock on
+/// the box, and passed every other check.
+#[test]
+fn a_program_not_built_from_this_tree_is_refused() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let repository = directory.path().join("tree");
+    let own = repository.join("crates/kr-controller/src/bin");
+    std::fs::create_dir_all(&own).expect("the crate");
+    let source = own.join("kr-controller.rs");
+    std::fs::write(&source, "fn main() {}").expect("a source");
+    let other_tree = directory
+        .path()
+        .join("another/crates/kr-controller/src/bin/kr-controller.rs");
+    std::fs::create_dir_all(other_tree.parent().expect("a directory")).expect("another tree");
+    std::fs::write(&other_tree, "fn main() {}").expect("a source");
+    let target = directory.path().join("target");
+    std::fs::create_dir_all(&target).expect("the target directory");
+    let program = target.join("kr-controller");
+    let listing = |lists: &[&Path]| {
+        let sources: Vec<String> = lists
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        std::fs::write(
+            target.join("kr-controller.d"),
+            format!("{}: {}\n", program.display(), sources.join(" ")),
+        )
+        .expect("a list of sources");
+    };
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let set_time = |path: &Path, when: std::time::SystemTime| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("opens")
+            .set_modified(when)
+            .expect("sets the time");
+    };
+
+    // The control: a program built after its sources.
+    std::fs::write(&program, "built").expect("a program");
+    set_time(&source, long_ago);
+    listing(&[&source]);
+    assert_eq!(
+        built_from_another_tree(&program, "kr-controller", &repository),
+        None
+    );
+
+    // A file the crate includes from outside its sources, named through `..` as an included skill
+    // text is, is not another checkout's source.
+    let included = repository.join("skills/contact.md");
+    std::fs::create_dir_all(included.parent().expect("a directory")).expect("the skills");
+    std::fs::write(&included, "text").expect("a file the crate includes");
+    set_time(&included, long_ago);
+    let through_parents = repository.join("crates/kr-controller/src/../../../skills/contact.md");
+    listing(&[&source, &through_parents]);
+    assert_eq!(
+        built_from_another_tree(&program, "kr-controller", &repository),
+        None
+    );
+    listing(&[&source]);
+
+    // A source changed since it was built.
+    set_time(
+        &source,
+        std::time::SystemTime::now() + Duration::from_secs(60),
+    );
+    let why = built_from_another_tree(&program, "kr-controller", &repository)
+        .expect("a stale program is refused");
+    assert!(why.contains("has changed since it was built"), "{why}");
+    set_time(&source, long_ago);
+
+    // Built from the sources of another checkout.
+    listing(&[&other_tree]);
+    let why = built_from_another_tree(&program, "kr-controller", &repository)
+        .expect("another checkout's build is refused");
+    assert!(why.contains("another/crates/kr-controller"), "{why}");
+
+    // No list of its sources, and a list that names none of its crate's.
+    std::fs::remove_file(target.join("kr-controller.d")).expect("removes the list");
+    assert!(built_from_another_tree(&program, "kr-controller", &repository).is_some());
+    listing(&[]);
+    let why = built_from_another_tree(&program, "kr-controller", &repository)
+        .expect("a list of nothing is refused");
+    assert!(why.contains("lists none of the sources"), "{why}");
 }
 
 /// The stores a release assembled here declares it reads: every store this build declares, at the
