@@ -1654,36 +1654,41 @@ whose grant carries `host.manage` reads the same report; no device can turn priv
 ## `kr organisation`
 
 A host can opt into an organisation's policy. `docs/host/README.md` has what that means for the
-host; this is the owner's side of it.
+host; this is about the owner's side of it.
 
 ```sh
 kr organisation enrol chain.json     # pin the keys that sign an organisation's policy
 kr organisation list                 # what this host holds for each organisation
 ```
 
-`kr organisation enrol` reads the organisation's published policy-signing chain from a JSON file
-that a member exported from the organisation's service; this host does not call that service.
-The file may be no larger than a control frame carries. The host verifies the whole chain before it
-asks anyone: a chain that does not verify is refused with nothing asked or changed, and so is a
-host that distrusts its clock. Then `kr` says that an owner device has to confirm, and what that
-device is asked to trust, and asks the host again every second until the confirmation arrives or
-the challenge runs out after two minutes, as `kr pair invite` does. An owner device is shown the
-organisation, its first key and the key signing now, and confirms exactly those. A host with no
-owner device refuses at once and names `kr pair invite --owner`: an enrolment is not confirmed at
-the host's own terminal. `--json` returns the organisation, the enrolment revision, the highest key
-revision accepted and the identifier of the first key.
+`kr organisation enrol` reads the organisation's policy-signing chain from a JSON file that a member
+exported from the organisation's service. The host does not contact the service. The file must be a
+regular file, not a link or a pipe, and no bigger than a control frame. The host verifies the whole
+chain before asking anyone. It refuses a chain that does not verify, and a host that distrusts its
+clock, with nothing asked or changed. An owner device has to confirm the enrolment: `kr` says so,
+says what that device is asked to trust, and asks the host again every second until the confirmation
+arrives or the challenge times out after two minutes, as `kr pair invite` does. The owner device is
+shown the organisation and, for its first key and the key signing now, the whole key identifier, the
+revision and the moment it took over signing, and confirms exactly those. `kr` prints the same
+identifiers and moments, so a person can compare them with what the organisation's administrator
+reads out. If there is no owner device, `kr` refuses at once and names `kr pair invite --owner`: an
+enrolment is not confirmed at the host's own terminal. With `--json`, the command returns the
+organisation, the enrolment revision, the highest key revision accepted and the identifier of the
+first key.
 
-`kr organisation list` is read-only and also served to a paired device that manages the host. It
-reports each enrolment with the identifier of its first key, the key rotation is followed from, the
-highest key revision accepted and the enrolment revision that a grant requiring the organisation
-names; the devices bound to member accounts and the lease last recorded for each; whether the host
-is exclusively organisation-managed and whether it trusts its clock; and each time exclusive
-management was turned off. A member's account name is written as the organisation signed it.
+`kr organisation list` is read-only. The host serves the same report to a paired device that manages
+it. For each organisation the host is enrolled in, it shows the identifier of its first key, the key
+rotation is followed from, the highest key revision accepted and the enrolment revision that a grant
+requiring the organisation names. It shows the devices bound to member accounts of that
+organisation, and the lease last recorded for each. It also shows whether the host is exclusively
+organisation-managed, and whether it trusts its clock. It shows each time exclusive management was
+turned off. A member's account name is shown as the organisation signed it.
 
-`kr pair invite --view --organisation <id>` fills in the requirement from the enrolment, so the
-invitation proposes access that the host can answer for. The host refuses a proposal that requires
-an organisation it is not enrolled in, names another enrolment revision, or carries a right above
-what an owner of an organisation may hold.
+`kr pair invite --view --organisation <id>` fills in the requirement from the host's enrolment in
+that organisation. The host refuses a proposal that requires an organisation it is not enrolled in,
+names another enrolment revision, or carries a right above what an owner of an organisation may
+hold. The owner device that is asked to confirm the invitation is shown the organisation and the
+enrolment revision.
 
 ## `kr host import-journals`
 

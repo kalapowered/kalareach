@@ -2574,46 +2574,57 @@ revalidated immediately before the effect, and that is where they are.
 
 ## Organisation policy
 
-A host can opt into an organisation's policy. Section 17 of the specification gives the whole
-arrangement: the organisation signs a membership lease for each member's device, the host checks
-the lease against a key it pinned when it enrolled, and the lease lasts at most fifteen minutes. The
-host fetches nothing from the organisation's service and does not need it to be reachable; what it
-holds is the chain of policy-signing keys it verified when it enrolled, and the rotations it has
-followed since.
+Hosts can opt in to an organisation's policy. Section 17 of the specification gives the whole
+arrangement: the organisation signs a membership lease for each member's device. The host checks
+that the lease is signed by the organisation, using a pinned key from when it enrolled. Membership
+leases are only valid for up to 15 minutes and a host never needs to fetch anything from an
+organisation's service. Instead it holds the chain of policy-signing keys it verified when it
+enrolled, and the rotations it has followed since.
 
 ### Enrolling
 
-`organisation.enrol` pins an organisation's chain. It is served on the local socket only, needs
-`host.manage`, and always needs a fresh owner confirmation (`kr organisation enrol <chain-file>`
-takes the chain a member exported from the organisation's service). The host verifies the whole
-chain before it shows an owner anything: the chain's structure, the first link under its own key,
-every later link under the key of the revision it follows, and the head under the key of the last
-link, current at the host's reading of UTC. A host that distrusts its clock, or whose clock floor
-is owed its record, refuses, because a head is current only against a clock the host trusts. A host
-already enrolled in the organisation refuses too: it has to withdraw first.
+`organisation.enrol` pins an organisation's chain of keys. It is only available on the local socket
+and requires the `host.manage` right. It always requires a fresh confirmation from an owner. `kr
+organisation enrol <chain-file>` takes the chain a member exported from the organisation's service.
+When it is asked to enrol, the host must validate the chain it is given. The chain must be well
+formed, with the first link signed by its own key and each later link signed by the key of the
+revision it follows. The head must be signed by the key of the last link, and must be current at the
+host's reading of UTC. A host that distrusts its clock, or whose clock floor is owed its record,
+refuses, because a head is current only against a clock the host trusts. A host already enrolled in
+the organisation refuses too: it has to withdraw first.
 
-What the owner confirms is the organisation, its first key and the key signing now, each with the
-moment it took over signing. An owner device is shown the keys themselves and builds the digest
-again from them, so the confirmation covers exactly that chain. If the organisation rotates before
-the host acts, the key signing now is another key, the digest is another digest, and the owner
-confirms again. The confirmation is spent, and written to the acceptance record, before the host
-changes its policy, so a stop between the two wastes the confirmation and enrols nothing.
+If the host validates the chain, it presents the request to an owner device for confirmation. The
+device is shown the organisation, its first key and the key signing now, each with its revision and
+the moment it took over signing. For each key it is shown the identifier, the hash an administrator
+reads out. The owner device builds the digest again from the keys the host sends, so the
+confirmation covers exactly that chain. Note that a host does not request the most up-to-date chain
+from an organisation when enrolling. As a result it is possible to enrol with a chain whose head is
+still current after the organisation has rotated elsewhere. However, because each chain has a
+distinct digest, an owner device confirming a chain with a different key signing now would be
+confirming a different chain, which needs its own confirmation. The confirmation is spent, and
+written to the acceptance record, before the host changes its policy, so a stop between the two
+wastes the confirmation and enrols nothing. Similarly, the host judges the head's currency and its
+trust in its clock again inside the transaction that writes the enrolment, so a head that runs out
+while the host waits for its store is not enrolled.
 
-The host keeps the first key as the organisation's identity and the key signing now as its anchor.
-It writes the enrolment in the same transaction as the action's answer, so a repeat of the action
-is answered from the record and a host never holds an enrolment with no answer to give. The
-authority revision in force when it enrolled is the enrolment's revision: a grant that requires the
-organisation names that revision in `policy_revision`, and a grant that names another is not
-honoured. `pair.invite` refuses a proposed grant that requires an organisation the host is not
-enrolled in, names another revision, or carries a right above what the owner role may hold, so an
-invitation cannot be issued for access that nothing could use. `kr pair invite --organisation
-<id>` fills the requirement in.
+The host records the first key in the chain as the identity of the organisation, and the key signing
+now as its anchor. It records the enrolment in the same transaction as the response to the enrol
+action. As a result, a host never holds an enrolment without an answer to give, and a repeat of the
+enrol action is answered from the record. The authority revision in force when the host enrols is
+the enrolment's revision. Any grant that requires the organisation names that revision in
+`policy_revision`, and the host does not honour a grant that names another. Similarly, `pair.invite`
+refuses a proposed grant that requires an organisation the host is not enrolled in, names another
+revision, or carries a right above what the organisation's owner role may hold, so an invitation
+cannot be issued for access that nothing could use. The owner device that confirms such an
+invitation, or a device being added under such a grant, is told which organisation and which
+enrolment revision the grant names. `kr pair invite --organisation <id>` fills the requirement in.
 
-`organisation.list`, served at both doors to a device that manages the host, reports each
-enrolment with the first key's identifier, the anchor's revision and identifier, the highest key
-revision accepted and the enrolment revision, the devices bound to member accounts with the lease
-the host last recorded for each, whether exclusive management is on, whether the host trusts its
-clock, and every time exclusive management was turned off.
+`organisation.list`, served at both doors to a device that manages the host, lists the organisations
+the host is enrolled in. For each it reports the identifier of its first key, the anchor's revision
+and identifier, the highest key revision the host has accepted, the enrolment revision, and the
+devices bound to member accounts with the lease the host last recorded for each. It also reports
+whether exclusive management is on, whether the host trusts its clock, and every time exclusive
+management was turned off.
 
 ## What the host owes the transport
 
