@@ -3077,7 +3077,7 @@ tree, the processes that are on the terminal of the session are recorded instead
 says that this leaves out a process that left the terminal's session. When the worker is started in
 an environment where processes cannot be controlled by any other means than by the process number,
 no hang up signal or kill signal is sent to a process by that number, neither at the worker's own
-close nor in the cleanup after a crash. Such processes are only described at the end of the session.
+close nor in the cleanup after a crash. Such processes are described at the end of the session.
 When reading the cgroup of a service, processes that were not recorded by the worker but are ended
 by the service manager with a kill command are described together with the other processes as
 forced ended.
@@ -3095,7 +3095,7 @@ otherwise it won't mention anything about it.
 
 Until it moves, and if it doesn't move at all, two things can end the daemon together with the
 session. When the service ends, it will end all the processes in the service, whether they are
-recorded there or not. The cleanup by recorded identity will end the daemon if the worker of the
+recorded there or not. The cleanup for the recorded identity will end the daemon if the worker of the
 session has recorded it: after a crash, the cleanup of the first environment's daemon; at a close,
 the worker itself. On Linux, the worker will record the process as long as it is a descendant of the
 root shell of the session, which is during the whole run of a command that starts a daemon. On
