@@ -13,10 +13,14 @@ use std::path::PathBuf;
 
 use kr_client::shown;
 use kr_client::shown::Shown;
+use kr_ipc::install::{Permit, Written};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::hostinfo::configuration::{self, Change};
 
 use crate::error::{CliError, Result};
+
+/// The configuration document, as a release's manifest lists it and at the version this build writes.
+pub const WRITTEN: Written = Written::new("configuration", configuration::VERSION);
 
 /// Returns where this environment's configuration document is.
 #[must_use]
@@ -61,13 +65,16 @@ pub fn validate(paths: &EnvironmentPaths, change: &Change) -> Result<()> {
 ///
 /// Validate, then check the revision again at the last moment, then write. A document at a version
 /// this build does not know, or one another writer moved while this edit was being prepared, is
-/// refused with nothing written.
+/// refused with nothing written. `permit` is the release's leave to write the document at the
+/// version this build writes it ([`WRITTEN`]), asked for under the writers' lock.
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Usage`] when the edit is refused, and [`CliError::Ipc`] when the
-/// environment's directories cannot be made or checked, or the document cannot be written.
-pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
+/// Returns [`CliError::Usage`] when the edit is refused, [`CliError::Other`] when the permit is for
+/// another record, and [`CliError::Ipc`] when the environment's directories cannot be made or
+/// checked, or the document cannot be written.
+pub fn apply(paths: &EnvironmentPaths, change: &Change, permit: &Permit<'_>) -> Result<u64> {
+    permit.require(&WRITTEN)?;
     // An edit is a first use of the environment as much as a daemon's start is: on a host where no
     // daemon has run yet, the state directory the lock lives in does not exist. It is made here,
     // owner-only and checked, exactly as a daemon makes it.

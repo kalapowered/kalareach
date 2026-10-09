@@ -77,6 +77,7 @@ use std::time::{Duration, Instant};
 
 use kr_client::shown;
 use kr_client::shown::Shown;
+use kr_ipc::install::{Permit, Written};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::EnvironmentId;
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,12 @@ pub const LOCK_FILE: &str = "controller-service.lock";
 
 /// The version of the record this build writes and reads.
 pub const RECORD_VERSION: u32 = 1;
+
+/// The record, as a release's manifest lists it and at the version this build writes it.
+pub const WRITTEN: Written = Written {
+    store: "controller-service",
+    version: RECORD_VERSION,
+};
 
 /// The largest record, or definition, this build reads: far more than it ever writes.
 const READ_LIMIT: u64 = 64 * 1024;
@@ -827,14 +834,20 @@ fn applied_drop_ins(said: Shown, drop_ins: &[PathBuf]) -> Line {
 ///
 /// Nothing is written over a definition kr did not write or one changed since it did, and neither
 /// the command nor the manager starts the daemon here. The caller holds the environment's service
-/// lock, which is why it is asked for.
+/// lock, which is why it is asked for. `permit` is the release's leave to write the record at the
+/// version this build writes it ([`WRITTEN`]), asked for before anything is changed.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::Usage`] when this host has no service manager to write for, and when a
 /// definition kr may not replace is where this one belongs, both with nothing written; and what
 /// failed otherwise, with what was written left recorded for `--clear`.
-pub fn install(environment: &EnvironmentPaths, _held: &Lock) -> Result<Installed> {
+pub fn install(
+    environment: &EnvironmentPaths,
+    _held: &Lock,
+    permit: &Permit<'_>,
+) -> Result<Installed> {
+    permit.require(&WRITTEN)?;
     platform::available()?;
     let domain = platform::domain_for(environment)?;
     let expected = Definition::write_for(environment, domain)?;

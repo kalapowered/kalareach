@@ -899,9 +899,11 @@ async fn stage_tree(
     // in between waits for `current` to name it.
     let install =
         handover::install_lock(store, handover::INSTALL_LOCK_WAIT, "kr host install").await?;
+    let writers =
+        handover::writers_lock(store, handover::WRITERS_LOCK_WAIT, "kr host install").await?;
     release::admit(&staged, store, &manifest.release)?;
     store
-        .switch(&manifest.release, update_lock, &install)
+        .switch(&manifest.release, update_lock, &install, &writers)
         .map_err(|error| CliError::Other(said(&error)))?;
     Ok((manifest.release, root.is_some()))
 }
@@ -1518,6 +1520,17 @@ fn deferred(
     ))
 }
 
+/// What an update holds from its check of the stores until it has switched `current`: every
+/// environment's lock, the install lock and the writers' lock. They are let go together, and before
+/// anything is undone, so that the undo, which may start a service, takes none of the locks a
+/// command takes while this holds one.
+#[cfg(unix)]
+struct Holds {
+    _environments: Vec<kr_controller::singleton::SingletonLock>,
+    install: kr_ipc::install::StoreLock,
+    writers: kr_ipc::install::ExclusiveWriters,
+}
+
 /// Hands every daemon over, brings the registry of each environment no daemon has run in forward,
 /// classes every registry, switches `current` and starts each daemon of the target; or, when
 /// anything holds the update, starts again what it stopped and waits. What it carries and finds
@@ -1575,17 +1588,12 @@ async fn hand_over(
     // has been decided. A daemon that is starting holds it, shared, so it is waited for, and only
     // for a bound; a daemon that never finishes starting then costs the update no more than a wait,
     // since nothing has been stopped and each daemon prepared resumes.
-    let install = match handover::install_lock(
-        store,
-        handover::INSTALL_LOCK_WAIT,
-        if report.rolled_back {
-            "kr host rollback"
-        } else {
-            "kr host update"
-        },
-    )
-    .await
-    {
+    let command = if report.rolled_back {
+        "kr host rollback"
+    } else {
+        "kr host update"
+    };
+    let install = match handover::install_lock(store, handover::INSTALL_LOCK_WAIT, command).await {
         Ok(install) => install,
         Err(error) => {
             // The holder of an environment whose daemon answered is a daemon that makes way and
@@ -1717,23 +1725,55 @@ async fn hand_over(
         drop(install);
         return Err(undo(store, record, error).await);
     }
+    // A daemon that holds an environment holds the update: nothing is checked or carried while one
+    // does.
+    if let Some(held_by) = holding {
+        drop(held);
+        drop(install);
+        return Err(undo(store, record, deferred(target, held_by, report.rolled_back)).await);
+    }
+    // The writers' lock, after every environment's lock and before the stores are checked, and held
+    // until `current` has been switched and the switch recorded: a command that writes a stored
+    // record either wrote before the check, which sees it, or waits for the switch and is then judged
+    // by the release `current` names. A command is waited for only for a bound; if one holds the lock
+    // longer, nothing has been changed, and every daemon the update stopped is started again.
+    let writers = match handover::writers_lock(store, handover::WRITERS_LOCK_WAIT, command).await {
+        Ok(writers) => writers,
+        Err(error) => {
+            drop(held);
+            drop(install);
+            return Err(undo(store, record, error).await);
+        }
+    };
+    let holds = Holds {
+        _environments: held,
+        install,
+        writers,
+    };
     // Every store the target lists, read where the target's manifest says it is, before anything is
     // brought forward: a switch the target cannot read the stores for is refused with nothing
     // changed, and every daemon it stopped is started again.
-    if holding.is_none() {
+    {
         let published = record
             .update
             .as_ref()
             .map(Transaction::published_directories)
             .unwrap_or_default();
-        let refusals = formats::check(target, store, &every, &published, !report.rolled_back);
+        let refusals = formats::check(
+            target,
+            store,
+            &every,
+            &published,
+            !report.rolled_back,
+            &holds.writers,
+        );
         if !refusals.is_empty() {
-            drop(held);
-            drop(install);
+            drop(holds);
             return Err(undo(store, record, formats::refusal(target, &refusals)).await);
         }
     }
-    if holding.is_none() {
+    let mut holding: Option<Shown> = None;
+    {
         for environment in &every {
             // Every daemon has stopped and every environment's lock and the install lock are held:
             // an environment whose daemon did not run since an earlier schema step is brought to the
@@ -1750,8 +1790,7 @@ async fn hand_over(
                     }),
                     Ok(None) => {}
                     Err(error) => {
-                        drop(held);
-                        drop(install);
+                        drop(holds);
                         return Err(undo(store, record, error).await);
                     }
                 }
@@ -1769,21 +1808,18 @@ async fn hand_over(
                     }
                 }
                 Err(error) => {
-                    drop(held);
-                    drop(install);
+                    drop(holds);
                     return Err(undo(store, record, error).await);
                 }
             }
         }
     }
     if let Some(held_by) = holding {
-        drop(held);
-        drop(install);
+        drop(holds);
         return Err(undo(store, record, deferred(target, held_by, report.rolled_back)).await);
     }
-    if let Err(error) = store.switch(&target.release, update_lock, &install) {
-        drop(held);
-        drop(install);
+    if let Err(error) = store.switch(&target.release, update_lock, &holds.install, &holds.writers) {
+        drop(holds);
         return Err(undo(store, record, CliError::Other(said(&error))).await);
     }
     // From here the switch has happened. The update is settled only once every daemon it stopped
@@ -1795,8 +1831,7 @@ async fn hand_over(
         update.state = TransactionState::Switched;
     }
     let written = record.write(store);
-    drop(held);
-    drop(install);
+    drop(holds);
     let went_back_to = record
         .update
         .as_ref()

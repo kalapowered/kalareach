@@ -50,6 +50,10 @@ pub const DAEMON_START: Duration = Duration::from_secs(60);
 /// How long the install lock is waited for, which a control daemon holds, shared, while it starts.
 pub const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(30);
 
+/// How long the writers' lock is waited for, which a command holds, shared, while it writes a stored
+/// record.
+pub const WRITERS_LOCK_WAIT: Duration = Duration::from_secs(kr_ipc::install::WRITERS_WAIT_SECONDS);
+
 /// A daemon that has prepared to make way: its gate is closed for an attempt, and the connection
 /// it answered on.
 pub struct Prepared {
@@ -265,6 +269,43 @@ pub async fn install_lock(
                 return Err(CliError::UpdateDeferred(shown!(
                     "a control daemon of the store at {} is starting and has held its start lock \
                      for more than {} seconds; run {} again once it has started or stopped",
+                    Shown::root(store.root()),
+                    within.as_secs(),
+                    command
+                )));
+            }
+            Err(error) => return Err(CliError::Other(super::said(&error))),
+        }
+    }
+}
+
+/// Takes the store's writers' lock, exclusively, waiting up to `within` for the commands that hold it
+/// while they write a stored record.
+///
+/// An update holds it from before it checks the stores until it has switched `current`, so that a
+/// command cannot write a record between the two. Like the install lock, it is never waited for
+/// without a bound. `command` is what to run again, as a person types it, when the wait runs out.
+///
+/// # Errors
+///
+/// Returns a refusal saying a command is writing a record when `within` has passed, and the failure
+/// to take the lock for any other reason.
+pub async fn writers_lock(
+    store: &Store,
+    within: Duration,
+    command: &'static str,
+) -> Result<kr_ipc::install::ExclusiveWriters> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match store.try_lock_writers() {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(None) => {
+                return Err(CliError::UpdateDeferred(shown!(
+                    "a kr command that writes a stored record of the store at {} has held the \
+                     writers' lock for more than {} seconds; run {} again once it has finished",
                     Shown::root(store.root()),
                     within.as_secs(),
                     command

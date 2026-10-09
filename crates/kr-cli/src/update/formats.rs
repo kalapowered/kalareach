@@ -143,7 +143,8 @@ pub fn unlookable(target: &ReleaseManifest) -> Vec<Refusal> {
 /// `published` are the directories the daemons said they read their configuration documents in,
 /// by environment: each is looked at beside the places this command's own environment gives.
 /// `carries` is whether the switch brings a registry that is behind forward before the target meets
-/// it, which an update does and a rollback does not.
+/// it, which an update does and a rollback does not. `_writers` is the writers' lock, held
+/// exclusively: no command writes a stored record between this look and the switch that follows it.
 #[must_use]
 pub fn check(
     target: &ReleaseManifest,
@@ -151,6 +152,7 @@ pub fn check(
     environments: &[&Environment],
     published: &[(EnvironmentId, PathBuf)],
     carries: bool,
+    _writers: &kr_ipc::install::ExclusiveWriters,
 ) -> Vec<Refusal> {
     let mut refusals = unlookable(target);
     for listed in &target.stores {

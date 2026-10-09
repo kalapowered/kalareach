@@ -671,6 +671,24 @@ fn places() -> &'static (Mutex<usize>, std::sync::Condvar) {
     &PLACES
 }
 
+/// The locks an update holds when it switches, held by a test that stands in for the update.
+struct StandingIn<'a> {
+    host: &'a Host,
+    update: kr_ipc::install::StoreLock,
+    install: kr_ipc::install::StoreLock,
+    writers: kr_ipc::install::ExclusiveWriters,
+}
+
+impl StandingIn<'_> {
+    /// Makes a release current under the three locks.
+    fn switch(&self, name: &ReleaseName) {
+        self.host
+            .store
+            .switch(name, &self.update, &self.install, &self.writers)
+            .expect("switches");
+    }
+}
+
 /// A stand-in for an agent that a session's shell started: a process that runs until the test lets go
 /// of the pipe it reads.
 struct Agent {
@@ -1043,6 +1061,12 @@ impl Host {
 
     /// Makes a release current, under the locks every switch is made under.
     fn switch(&self, name: &ReleaseName) {
+        self.stand_in_for_the_updater().switch(name);
+    }
+
+    /// Takes the locks an update holds when it switches: the update lock, the install lock and the
+    /// writers' lock.
+    fn stand_in_for_the_updater(&self) -> StandingIn<'_> {
         let update = self
             .store
             .try_lock_update()
@@ -1053,9 +1077,17 @@ impl Host {
             .try_lock_install()
             .expect("the install lock")
             .expect("nothing starts a daemon");
-        self.store
-            .switch(name, &update, &install)
-            .expect("switches");
+        let writers = self
+            .store
+            .try_lock_writers()
+            .expect("the writers' lock")
+            .expect("no command is writing");
+        StandingIn {
+            host: self,
+            update,
+            install,
+            writers,
+        }
     }
 
     /// A program of a release, by its path in the store.
@@ -5456,13 +5488,18 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
 
     // The owner's choice, written by this build as it writes one.
     let environment = host.tree.environment();
+    let writers = kr_cli::barrier::hold().expect("a test outside a store holds nothing");
+    let permit = kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)
+        .expect("permitted");
     kr_cli::doctor::configuration::apply(
         &environment,
         &kr_protocol::hostinfo::configuration::Change::SleepInhibition(
             kr_protocol::desktop::SleepInhibitionSetting::MainsOnly,
         ),
+        &permit,
     )
     .expect("the owner's choice");
+    drop(writers);
     let document = kr_cli::doctor::configuration::document_path(&environment);
     let written = std::fs::read(&document).expect("the document");
 
@@ -8423,10 +8460,10 @@ async fn a_command_that_waited_through_a_switch_is_judged_by_the_release_switche
     host.put(&two);
     let document = host.configuration_document();
 
-    let update = host.hold_writers_as_an_update();
+    let update = host.stand_in_for_the_updater();
     let writing = host.write_the_configuration();
     assert!(writing.waits_for_an_update(), "the command waits");
-    host.switch(two.name());
+    update.switch(two.name());
     drop(update);
     let (code, said) = writing.finish();
     assert_eq!(

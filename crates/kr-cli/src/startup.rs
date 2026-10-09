@@ -37,6 +37,7 @@ use std::time::Duration;
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
+use kr_ipc::install::Permit;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::hostinfo::configuration::{Change, ControllerStartup, DocumentState};
 use kr_protocol::local::LocalClientKind;
@@ -311,6 +312,14 @@ fn changed(environment: &EnvironmentPaths, startup: Option<ControllerStartup>) -
              daemon",
         )));
     }
+    // The writers' lock before anything else, and the permit for each record this change writes
+    // before any is: a release `current` names that reads either at another version than this kr
+    // writes it refuses the change with the definition, the record and the document as they were.
+    let writers = crate::barrier::hold()?;
+    let configuration = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)?;
+    let service = (startup == Some(ControllerStartup::Service))
+        .then(|| crate::barrier::permit(&writers, &service_manager::WRITTEN))
+        .transpose()?;
     let change = Change::ControllerStartup(startup);
     // Refused before anything else is touched, so a document this build must not rewrite
     // leaves the service manager's definition as it was too.
@@ -322,27 +331,44 @@ fn changed(environment: &EnvironmentPaths, startup: Option<ControllerStartup>) -
     // written, so no other change or start request sees one without the other. The document's
     // own lock is taken inside, after this one, as everywhere.
     let held = service_manager::lock(environment)?;
-    let changed = changed_under(environment, startup, &change, &held)?;
+    let changed = changed_under(
+        environment,
+        startup,
+        &change,
+        &held,
+        (&configuration, service.as_ref()),
+    )?;
     drop(held);
+    drop(writers);
     Ok(changed)
 }
 
 /// Brings the service manager's definition in line with `startup`, then writes the document.
+///
+/// `permits` are the leave to write the document, and the leave to write the service record, which
+/// is asked for only when the service start is chosen.
 #[cfg(unix)]
 fn changed_under(
     environment: &EnvironmentPaths,
     startup: Option<ControllerStartup>,
     change: &Change,
     held: &service_manager::Lock,
+    permits: (&Permit<'_>, Option<&Permit<'_>>),
 ) -> Result<Changed> {
+    let (configuration, service) = permits;
     let mut changed = Changed::default();
     if startup == Some(ControllerStartup::Service) {
-        changed.notes = service_manager::install(environment, held)?.notes;
+        let service = service.ok_or_else(|| {
+            CliError::Other(Shown::said(
+                "nothing was written: no permit was asked for the service record",
+            ))
+        })?;
+        changed.notes = service_manager::install(environment, held, service)?.notes;
     } else {
         changed.removal = service_manager::remove(environment, held)?;
         changed.notes.append(&mut changed.removal.notes);
     }
-    crate::doctor::configuration::apply(environment, change)?;
+    crate::doctor::configuration::apply(environment, change, configuration)?;
     Ok(changed)
 }
 
@@ -354,9 +380,10 @@ fn changed_under(
     startup: Option<ControllerStartup>,
     change: &Change,
     _held: &service_manager::Lock,
+    permits: (&Permit<'_>, Option<&Permit<'_>>),
 ) -> Result<Changed> {
     Ok(Changed {
-        task: Some(windows::change(environment, startup, change)?),
+        task: Some(windows::change(environment, startup, change, permits.0)?),
         ..Changed::default()
     })
 }
@@ -1152,11 +1179,16 @@ impl Log {
 /// that is not the prior one is written back as an edit, under the document's own lock, and read
 /// again.
 #[cfg(any(windows, test))]
-fn restore_choice(environment: &EnvironmentPaths, prior: Option<ControllerStartup>) -> Shown {
+fn restore_choice(
+    environment: &EnvironmentPaths,
+    prior: Option<ControllerStartup>,
+    permit: &Permit<'_>,
+) -> Shown {
     if Chosen::read(environment).controller == prior {
         return Shown::said("startup.controller is as it was");
     }
-    let _ = crate::doctor::configuration::apply(environment, &Change::ControllerStartup(prior));
+    let _ =
+        crate::doctor::configuration::apply(environment, &Change::ControllerStartup(prior), permit);
     if Chosen::read(environment).controller == prior {
         Shown::said("startup.controller was written back as it was")
     } else {
@@ -1511,6 +1543,7 @@ mod windows {
     use kr_controller::supervision::windows::{
         Registration, Standing, TaskChange, TaskDefinition, TaskError,
     };
+    use kr_ipc::install::Permit;
     use kr_ipc::paths::EnvironmentPaths;
     use kr_ipc::starter::Withdrawal;
     use kr_protocol::hostinfo::configuration::{Change, ControllerStartup};
@@ -1597,6 +1630,7 @@ mod windows {
         environment: &EnvironmentPaths,
         startup: Option<ControllerStartup>,
         change: &Change,
+        permit: &Permit<'_>,
     ) -> Result<TaskChanged> {
         let program = super::daemon_program()?;
         let definition = definition(environment, &program)?;
@@ -1628,12 +1662,12 @@ mod windows {
             }
         };
         let prior = super::Chosen::read(environment).controller;
-        if let Err(error) = crate::doctor::configuration::apply(environment, change) {
+        if let Err(error) = crate::doctor::configuration::apply(environment, change, permit) {
             return Err(put_back(
                 environment,
                 &registration,
                 &changed.change,
-                prior,
+                (prior, permit),
                 &error,
             ));
         }
@@ -1663,11 +1697,11 @@ mod windows {
         environment: &EnvironmentPaths,
         registration: &Registration<'_>,
         change: &TaskChange,
-        prior: Option<ControllerStartup>,
+        (prior, permit): (Option<ControllerStartup>, &Permit<'_>),
         error: &CliError,
     ) -> CliError {
         let environment_id = environment.environment_id();
-        let choice = super::restore_choice(environment, prior);
+        let choice = super::restore_choice(environment, prior, permit);
         match registration.undo(change) {
             Ok(()) => CliError::Usage(shown!(
                 "{}; the scheduled task {} is as it was, and {}",
@@ -2628,28 +2662,33 @@ mod tests {
     fn a_choice_a_failed_write_published_is_written_back() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
+        let writers = crate::barrier::hold().expect("a program outside a store holds nothing");
+        let permit = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)
+            .expect("permitted");
         assert_eq!(
-            restore_choice(&environment, None).as_str(),
+            restore_choice(&environment, None, &permit).as_str(),
             "startup.controller is as it was"
         );
         // What a write that renamed its file into place and then failed leaves.
         crate::doctor::configuration::apply(
             &environment,
             &Change::ControllerStartup(Some(ControllerStartup::Standalone)),
+            &permit,
         )
         .expect("the new choice is published");
         assert_eq!(
-            restore_choice(&environment, None).as_str(),
+            restore_choice(&environment, None, &permit).as_str(),
             "startup.controller was written back as it was"
         );
         assert_eq!(Chosen::read(&environment).controller, None);
         crate::doctor::configuration::apply(
             &environment,
             &Change::ControllerStartup(Some(ControllerStartup::Service)),
+            &permit,
         )
         .expect("another choice is published");
         assert_eq!(
-            restore_choice(&environment, Some(ControllerStartup::Standalone)).as_str(),
+            restore_choice(&environment, Some(ControllerStartup::Standalone), &permit).as_str(),
             "startup.controller was written back as it was"
         );
         assert_eq!(
