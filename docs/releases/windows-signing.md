@@ -74,8 +74,8 @@ host installed from the archive cannot run agent hooks or plugins. The workflow 
 workspace package metadata that these are all the binaries those six crates declare (except for the
 model description test stub and the benchmark using real weights, which aren't included in the
 release). They are then copied, by specific name, from the `target\release` directory to the staging
-directory. It's important to copy them by specific name, as otherwise the copy might get binaries
-that those crates build and a release does not ship.
+directory. It's important to copy them by specific name, so that the list alone decides what the
+archive holds and an executable that is missing stops the copy by its name.
 
 The included prebuilt libsodium is built to use the static C runtime, and the Rust MSVC targets use
 the dynamic C runtime. Including both in the same executable causes issues with the two different
