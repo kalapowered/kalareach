@@ -340,7 +340,7 @@ fn kr_req_07_66_the_children_of_a_parent_that_ended_while_they_were_read_are_not
     // in, and the child's own session is another once `setsid` has run.
     let root = tree.root();
     let deadline = Instant::now() + LIVENESS;
-    while session_of(child) == Some(root) {
+    while !session_of(child).is_some_and(|session| session != root) {
         assert!(
             Instant::now() < deadline,
             "the child leaves the session it was started in"
