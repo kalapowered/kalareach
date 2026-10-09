@@ -1913,7 +1913,8 @@ impl TransferService {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::WrongEnvironment`] for another environment, or
+    /// Returns [`TransferError::WrongEnvironment`] for another environment,
+    /// [`TransferError::SessionEnded`] when the draft targets a session that has ended, or
     /// [`TransferError::StoreUnavailable`] when the write fails.
     pub fn draft_create(
         &self,
@@ -2321,11 +2322,12 @@ impl TransferService {
     /// Claims one binding for an offer to the agent, and issues the read grant over its file.
     ///
     /// One transaction: the draft is open, targets the worker's session and has not been sent by a
-    /// prompt; the binding is at the attempt the worker read and is `recorded`; the draft holds no
-    /// more attachments than the operation accepts; and the draft, as the claim leaves it and with
-    /// the longest report of every offer in flight added, still fits the reply that carries it.
-    /// The binding becomes `inserting` for the offer's owner, the grant is written, and the draft
-    /// takes one revision. A repeat by the owner of a claim that stands is answered with the same
+    /// prompt; the binding is at the attempt the worker read and is `recorded`; its attachment is
+    /// published, so there is a file to offer; the draft holds no more attachments than the
+    /// operation accepts; the claim's deadline has not passed, read once the store is held; and the
+    /// draft, as the claim leaves it and with the longest report of every offer in flight added,
+    /// still fits the reply that carries it. The binding becomes `inserting` for the offer's owner,
+    /// the grant is written, and the draft takes one revision. A repeat by the owner of a claim that stands is answered with the same
     /// claim and the same grant, so a reply that was lost leaves nothing behind.
     ///
     /// The claim is refused while the journal still holds sessions of earlier builds
@@ -2342,7 +2344,7 @@ impl TransferService {
         actor: &ActorId,
         session_id: SessionId,
         begin: &InsertionBegin,
-        boot_clock: &dyn Fn() -> u64,
+        boot_clock: &dyn kr_ipc::clock::SharedClock,
     ) -> Result<InsertionClaim> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
@@ -2378,10 +2380,12 @@ impl TransferService {
                  offered to an agent until they have ended",
             ));
         }
-        // Read now, with the store held: a claim that waited for the store is judged by the time it
-        // commits at, so one that commits after its deadline cannot, and the report of an action
-        // that gave up at the deadline never meets a claim that commits after it.
-        if boot_clock() >= begin.deadline_boot_ms.get() {
+        // Read now, with the store held, and before the grant is prepared and the commit made: a
+        // claim that waited for the store is judged by the time it got it. The report of an action
+        // that gave up at the deadline is made after the deadline and needs the store as well, so
+        // it either follows this claim, which then settles, or comes first, and this claim finds
+        // the deadline passed and is refused.
+        if boot_clock.boot_elapsed_ms() >= begin.deadline_boot_ms.get() {
             return Err(TransferError::DraftConflict {
                 detail: "the deadline of the action this claim is for has passed".to_owned(),
             });
@@ -2504,16 +2508,6 @@ impl TransferService {
         let mut store = self.locked()?;
         let row = draft_of(&store, report.draft_id, actor)?;
         self.check_environment(row.environment_id)?;
-        let owner = owner_of(actor, report.action_id);
-        let attempt = attempt_of(report.attempt)?;
-        let bindings = store.bindings(report.draft_id)?;
-        let position = bindings
-            .iter()
-            .position(|binding| binding.transfer_id == report.transfer_id)
-            .ok_or_else(|| {
-                TransferError::invalid(format!("{} is not bound to this draft", report.transfer_id))
-            })?;
-        let existing = bindings[position].clone();
         // A report for a session that has ended cannot change what that end decided, whoever makes
         // it, and an exact repeat of one is no exception: it is said before anything is answered
         // as it stands.
@@ -2527,6 +2521,16 @@ impl TransferService {
                 draft: report.draft_id.to_string(),
             });
         }
+        let owner = owner_of(actor, report.action_id);
+        let attempt = attempt_of(report.attempt)?;
+        let bindings = store.bindings(report.draft_id)?;
+        let position = bindings
+            .iter()
+            .position(|binding| binding.transfer_id == report.transfer_id)
+            .ok_or_else(|| {
+                TransferError::invalid(format!("{} is not bound to this draft", report.transfer_id))
+            })?;
+        let existing = bindings[position].clone();
         let (state, evidence, detail) = match &report.outcome {
             ReportedOutcome::AcceptedByAgent {
                 provenance,

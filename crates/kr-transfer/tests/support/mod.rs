@@ -64,6 +64,16 @@ pub const START_MS: u64 = 1_700_000_000_000;
 /// The machine's boot clock as a claim is made at, in milliseconds.
 pub const BOOT_NOW_MS: u64 = 1_000;
 
+/// A boot clock that reads one moment.
+#[derive(Debug)]
+pub struct FixedBootClock(pub u64);
+
+impl kr_ipc::clock::SharedClock for FixedBootClock {
+    fn boot_elapsed_ms(&self) -> u64 {
+        self.0
+    }
+}
+
 /// One environment's transfer service, its clock and its host tree.
 pub struct Harness {
     /// The disposable host tree. Dropped last, so it outlives the service.
@@ -259,7 +269,7 @@ impl Harness {
             &self.actor,
             session,
             &self.begin_of(session, draft_id, transfer_id, action),
-            &|| BOOT_NOW_MS,
+            &FixedBootClock(BOOT_NOW_MS),
         )
     }
 
