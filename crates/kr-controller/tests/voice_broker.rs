@@ -2680,7 +2680,7 @@ async fn a_host_that_names_no_service_refuses_to_sign_in() {
     assert_eq!(report.state, AccountState::SignedOut);
     assert_eq!(
         report.unavailable.as_ref(),
-        Some(&SignInUnavailable::NoBroker)
+        Some(&SignInUnavailable::NoManagedService)
     );
     host.stop().await;
 }

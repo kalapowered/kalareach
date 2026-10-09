@@ -1,11 +1,12 @@
 //! The host's own sign-in to the managed account service.
 //!
-//! Managed voice spends an account's balance, so the host presents an account token of its own. A
-//! person at the host signs it in with `kr account sign-in`, which asks the control daemon over its
-//! local socket: the daemon listens on the loopback address the desktop client is registered with
-//! and keeps the grant that comes of the person's browser sign-in in the host's secret store.
-//! `account.status` reads where that stands, and says the address the person opens.
-//! `account.sign_out` removes the grant and asks the service to end it.
+//! Managed voice spends an account's balance and managed storage keeps an account's backups, so the
+//! host presents an account token of its own. A person at the host signs it in with `kr account
+//! sign-in`, which asks the control daemon over its local socket: the daemon listens on the
+//! loopback address the desktop client is registered with and keeps the grant that comes of the
+//! person's browser sign-in in the host's secret store. `account.status` reads where that stands,
+//! and says the address the person opens. `account.sign_out` removes the grant and asks the service
+//! to end it.
 //!
 //! The methods are served on the local socket alone. A grant on a host decides whose balance a
 //! phone's call spends, so no paired device starts, ends or reads it.
@@ -63,14 +64,15 @@ pub struct AccountStatusParams {}
 #[serde(deny_unknown_fields)]
 pub struct AccountReport {
     /// The account service this host keeps its account for, which is also where its token is
-    /// presented when its voice broker is that service. Null when the host could not set up how to
-    /// reach it, and `unavailable` says why.
+    /// presented when its voice broker is that service or it selects that service for storage.
+    /// Null when the host could not set up how to reach it, and `unavailable` says why.
     pub service: Nullable<String>,
-    /// Why this host does not sign in or present its account: its configuration names no voice
-    /// broker, names another service than the account service, or the host could not set up how to
-    /// reach the account service. For the first two, a grant the host already keeps still shows in
-    /// `state`, and `account.sign_out` ends it, whatever the broker is; for the third the host
-    /// reaches no account service, shows `signed_out` and refuses to sign out.
+    /// Why this host does not sign in or present its account: its configuration selects no storage
+    /// service and names no voice broker, selects none and names a broker that is another service
+    /// than the account service, or the host could not set up how to reach the account service. For
+    /// the first two, a grant the host already keeps still shows in `state`, and `account.sign_out`
+    /// ends it, whatever the broker is; for the third the host reaches no account service, shows
+    /// `signed_out` and refuses to sign out.
     pub unavailable: Nullable<SignInUnavailable>,
     /// The account this host is signed in as, or what stands in its way.
     pub state: AccountState,
@@ -97,9 +99,10 @@ impl fmt::Debug for AccountReport {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SignInUnavailable {
-    /// The host's configuration names no voice broker.
-    NoBroker,
-    /// The voice broker it names is another service than the account service the host signs in at.
+    /// The host's configuration names neither a voice broker nor a storage service.
+    NoManagedService,
+    /// The host selects no storage service, and the voice broker it names is another service than
+    /// the account service the host signs in at.
     BrokerIsAnotherService,
     /// The host could not set up how to reach the account service the way its configuration says.
     NotUsable,
