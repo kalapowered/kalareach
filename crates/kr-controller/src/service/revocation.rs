@@ -7,6 +7,17 @@ use crate::error::Result;
 use super::barrier::{OwnBarrier, Reach};
 use super::{Controller, net};
 
+/// Who the answer to a revocation is written for, and so how much of the host's barrier it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Audience {
+    /// The owner at this machine: every worker the host holds.
+    Host,
+    /// A paired device: the workers of the sessions the revoked grants cover. The barrier is
+    /// host-wide, and a worker's session, and what its fence named, belong to whoever may see that
+    /// session, so a device is told of no other.
+    Device,
+}
+
 impl Controller {
     /// Revokes a grant, its descendants, and everything they were being used for.
     ///
@@ -24,8 +35,9 @@ impl Controller {
     /// advances no revision. Advancing one would fence every live connection on the host for a
     /// retry that changed nothing.
     ///
-    /// `carried` is the admission of the mutation this revocation is performing, when it is
-    /// performing one. It is checked again inside the transaction that withdraws the rows, once
+    /// `audience` is who the answer is for ([`Audience`]). `carried` is the admission of the
+    /// mutation this revocation is performing, when it is performing one. It is checked again
+    /// inside the transaction that withdraws the rows, once
     /// the rows have been read and immediately before the first of them changes: an admission has
     /// a deadline, and the wait for the store's lock and the read that follows it can each outlast
     /// one. The local owner's own revocation carries none.
@@ -41,6 +53,7 @@ impl Controller {
     pub async fn revoke_grant(
         &self,
         grant_id: kr_protocol::ids::GrantId,
+        audience: Audience,
         carried: Option<&crate::authority::AdmittedMutation>,
         claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
@@ -69,7 +82,7 @@ impl Controller {
             revocation.debt,
             &revocation.revoked,
         ));
-        self.complete_revocation(revocation.revoked.iter().copied().collect(), own)
+        self.complete_revocation(audience, revocation.revoked.iter().copied().collect(), own)
             .await
     }
 
@@ -213,13 +226,21 @@ impl Controller {
             // Nothing was withdrawn and nothing is owed, so there is nothing to finish.
             Some(error) if !owes => Err(error),
             Some(error) => {
-                self.complete_revocation(revocation.revoked.iter().copied().collect(), own)
-                    .await?;
+                self.complete_revocation(
+                    Audience::Host,
+                    revocation.revoked.iter().copied().collect(),
+                    own,
+                )
+                .await?;
                 Err(error)
             }
             None => {
-                self.complete_revocation(revocation.revoked.iter().copied().collect(), own)
-                    .await
+                self.complete_revocation(
+                    Audience::Host,
+                    revocation.revoked.iter().copied().collect(),
+                    own,
+                )
+                .await
             }
         }
     }
@@ -322,6 +343,7 @@ impl Controller {
     /// answered with the revision in force and the barrier as it stands.
     pub(super) async fn complete_revocation(
         &self,
+        audience: Audience,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
         own: OwnBarrier,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
@@ -330,6 +352,7 @@ impl Controller {
         // named one revision and carried a barrier for another would be evidence of no single
         // moment.
         let barrier = self.barrier(own).await?;
+        let barrier = self.barrier_for(audience, &revoked_grants, barrier)?;
         // Cut to what one control frame carries: a revocation takes effect whatever it withdrew,
         // and the caller is owed an answer it can decode. Every total is counted before the cut.
         let answer = kr_protocol::sharing::RevocationResult::bounded(
@@ -341,6 +364,37 @@ impl Controller {
             Self::report_uncarriable_answer("a revocation");
         }
         Ok(answer)
+    }
+
+    /// The barrier as `audience` is told of it.
+    ///
+    /// A device is told of the workers of the sessions the revoked grants cover, and of no other:
+    /// the barrier names every worker the host holds, and for a worker the session it serves and
+    /// the actions its fence named. A grant that covers any session covers the sessions of the
+    /// device that holds it, so the device is told of them all.
+    fn barrier_for(
+        &self,
+        audience: Audience,
+        revoked_grants: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
+        barrier: kr_protocol::action::RevocationBarrier,
+    ) -> Result<kr_protocol::action::RevocationBarrier> {
+        if audience == Audience::Host {
+            return Ok(barrier);
+        }
+        let mut covered = std::collections::BTreeSet::new();
+        for grant_id in revoked_grants {
+            let Some(record) = self.sharing.grants().record(*grant_id)? else {
+                continue;
+            };
+            match record.grant.session_selector {
+                kr_protocol::grant::SessionSelector::Any => return Ok(barrier),
+                kr_protocol::grant::SessionSelector::These { session_ids } => {
+                    covered.extend(session_ids.iter().copied());
+                }
+                kr_protocol::grant::SessionSelector::None => {}
+            }
+        }
+        Ok(barrier.within(&covered))
     }
 
     /// The same, for a transfer: the grant written travels in the answer beside the revocation,

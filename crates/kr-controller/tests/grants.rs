@@ -36,7 +36,7 @@ use kr_controller::grants::{
     AccessRequest, AuthorityFeed, FeedRefusal, GrantDirectory, GrantRecord, HostPolicy, Refusal,
     decide, rights_for, unconditional_rights_for,
 };
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Audience, Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::verify::ControllerIdentity;
@@ -3039,7 +3039,7 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
 
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None, None),
+        controller.revoke_grant(held.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("the revocation completes")
@@ -3119,7 +3119,7 @@ async fn a_revocation_whose_admission_no_longer_stands_withdraws_nothing() {
     };
     let refused = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, Some(&lapsed), None),
+        controller.revoke_grant(held.grant_id, Audience::Host, Some(&lapsed), None),
     )
     .await
     .expect("completes")
@@ -3150,7 +3150,7 @@ async fn a_revocation_whose_admission_no_longer_stands_withdraws_nothing() {
     // The same revocation, carrying nothing, is the local owner's own and goes through.
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None, None),
+        controller.revoke_grant(held.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("completes")
@@ -3170,7 +3170,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
 
     let first = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None, None),
+        controller.revoke_grant(held.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("completes")
@@ -3179,7 +3179,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
 
     let second = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None, None),
+        controller.revoke_grant(held.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("completes")
@@ -3202,7 +3202,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
         .expect("the host advances its own revision");
     let third = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None, None),
+        controller.revoke_grant(held.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("completes")
@@ -4470,7 +4470,7 @@ async fn a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_wi
         .expect("the floor is written");
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(earlier.grant_id, None, None),
+        controller.revoke_grant(earlier.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("the earlier revocation completes")
@@ -4574,7 +4574,7 @@ async fn a_revocation_answered_from_the_rows_names_only_what_it_withdrew() {
     }
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(earlier.grant_id, None, None),
+        controller.revoke_grant(earlier.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("the earlier revocation completes")
@@ -4681,7 +4681,7 @@ async fn a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew(
     }
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(earlier.grant_id, None, None),
+        controller.revoke_grant(earlier.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("the earlier revocation completes")

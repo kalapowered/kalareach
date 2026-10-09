@@ -584,11 +584,25 @@ async fn shared(
     world: &fake::Silent,
     mutation: &MutationRequest,
 ) -> Result<ParamsValue, ControllerError> {
+    shared_by(
+        world,
+        &ActorId::new("local:test").expect("a principal"),
+        mutation,
+    )
+    .await
+}
+
+/// Performs a share as the actor `actor_id`, and returns its answer.
+async fn shared_by(
+    world: &fake::Silent,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+) -> Result<ParamsValue, ControllerError> {
     let carried = fake::admission(&world.controller, world.accepted).await;
     world
         .controller
         .authority_change(
-            &ActorId::new("local:test").expect("a principal"),
+            actor_id,
             crate::service::authority_changes::AuthorityCaller::Owner,
             mutation,
             Method::GrantCreate,
@@ -627,8 +641,10 @@ fn grants_written(world: &fake::Silent) -> usize {
 /// Whether the daemon holds the invitation a share written as `action` carries: a share's
 /// invitation takes its identity from its action.
 fn invitation_written(world: &fake::Silent, action: u8) -> bool {
-    let (_, invitation_id) =
-        crate::service::Controller::share_identities(Uuid::from_bytes([action; 16]));
+    let (_, invitation_id) = crate::service::Controller::share_identities(
+        &ActorId::new("local:test").expect("a principal"),
+        Uuid::from_bytes([action; 16]),
+    );
     world
         .controller
         .sharing()
@@ -706,6 +722,68 @@ async fn kr_req_10_50_a_share_is_written_only_for_a_screen_its_issuer_was_shown_
         drop(holding);
         world.serving.abort();
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-23.49: a share's action belongs to its actor
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-23.49: an action is claimed per actor, so two actors that send one action identifier
+/// write two shares, and an attempt of one that ended before it recorded its answer is never
+/// answered with the share the other wrote. The control is the actor that did write it, which is
+/// answered its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_actors_that_send_one_action_identifier_write_two_shares() {
+    let (world, holding) = world(Holding::default(), holds_question_reads()).await;
+    let mutation = share(
+        world.environment_id,
+        world.session_id,
+        0x91,
+        RoleSelection::plain(SessionRole::Viewer),
+    );
+    let first = result_of(shared(&world, &mutation).await);
+    let other = ActorId::new("local:other").expect("a principal");
+    let second = result_of(shared_by(&world, &other, &mutation).await);
+    assert_ne!(
+        first.grant.grant_id, second.grant.grant_id,
+        "the second actor writes a share of its own"
+    );
+    assert_eq!(grants_written(&world), 2);
+
+    // A third actor's attempt under the same identifier ended after it claimed the action and
+    // before it wrote anything: its retry is told the outcome is not known, not given a share.
+    let third = ActorId::new("local:third").expect("a principal");
+    let digest = kr_protocol::digest::mutation_digest(&mutation, &third).expect("a digest");
+    let crate::grants::ActionClaim::Claimed { hold } = world
+        .controller
+        .sharing()
+        .grants()
+        .claim_action(&third, mutation.action_id, &digest, kr_ipc::now_ms().get())
+        .expect("the claim is written")
+    else {
+        panic!("the first claim of an action is this attempt's");
+    };
+    drop(hold);
+    let ControlFrame::Response(response) = world
+        .controller
+        .retained_authority_answer(&third, &mutation)
+        .await
+        .expect("this host holds the claim")
+    else {
+        panic!("a retry is answered with a response");
+    };
+    let Outcome::Error(error) = response.outcome else {
+        panic!("another actor's share was given to the retry: {response:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(grants_written(&world), 2);
+
+    // The actor that wrote the share is answered it, from its record, and nothing is written.
+    let again = result_of(shared(&world, &mutation).await);
+    assert_eq!(again.grant.grant_id, first.grant.grant_id);
+    assert_eq!(grants_written(&world), 2);
+    drop(holding);
+    world.serving.abort();
 }
 
 // ---------------------------------------------------------------------------------------------

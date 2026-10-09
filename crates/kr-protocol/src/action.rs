@@ -522,6 +522,20 @@ impl RevocationBarrier {
         }
     }
 
+    /// This barrier over the workers of `sessions` alone, whole: its total is how many remain.
+    ///
+    /// For a reader who may know of those sessions and no others. What it reads of the barrier
+    /// ([`Self::holds`], [`Self::pending`]) is the barrier of the sessions it may know of.
+    #[must_use]
+    pub fn within(self, sessions: &std::collections::BTreeSet<SessionId>) -> Self {
+        let workers: Vec<WorkerBarrier> = self
+            .workers
+            .into_iter()
+            .filter(|worker| sessions.contains(&worker.session_id))
+            .collect();
+        Self::new(self.authority_revision, workers)
+    }
+
     /// Returns true when every worker's barrier holds.
     #[must_use]
     pub fn holds(&self) -> bool {

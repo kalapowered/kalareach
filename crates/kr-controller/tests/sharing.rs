@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Audience, Controller, ControllerSetup};
 use kr_controller::sharing::{
     ConfirmedAction, ShareRequest, SharingService, TransferWrite, requires_owner_confirmation,
     roles, transfer,
@@ -2519,7 +2519,7 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
     let before = controller.policy().authority_revision();
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(issued.grant.grant_id, None, None),
+        controller.revoke_grant(issued.grant.grant_id, Audience::Host, None, None),
     )
     .await
     .expect("the revocation completes")

@@ -7,8 +7,10 @@
 
 mod net_support;
 
+use kr_controller::service::net::dispatch::GRANT_WATCH;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::hostinfo::configuration::Change;
 use kr_protocol::ids::{ActionId, GrantId, QuestionId, RequestId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -169,7 +171,7 @@ async fn kr_req_18_03_a_device_delegates_a_narrower_grant_and_revokes_what_it_de
     assert!(holds(&host, above.grant.grant_id));
     assert_eq!(
         connection
-            .answered_before_closing(RequestId::new(u64::MAX), std::time::Duration::from_secs(5))
+            .answered_before_closing(RequestId::new(u64::MAX), GRANT_WATCH / 3)
             .await,
         Some(false),
         "the friend's connection is ended with the grant it acted under"
@@ -330,6 +332,7 @@ async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes
         &friend_record,
     )
     .await;
+    let mut told = Vec::new();
     for (name, from, target) in [
         (
             "a grant the device itself holds",
@@ -351,6 +354,11 @@ async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes
             &stranger_connection,
             given.grant_id,
         ),
+        (
+            "a grant that does not exist",
+            &boss_connection,
+            GrantId::new(Uuid::from_bytes([0x77; 16])),
+        ),
     ] {
         let refused = revoke(&host, from, ActionId::new(kr_ipc::new_uuid()), target)
             .await
@@ -360,11 +368,143 @@ async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes
             ErrorCode::PermissionDenied,
             "{name}: {refused:?}"
         );
+        told.push(refused.message);
     }
+    assert!(
+        told.windows(2).all(|pair| pair[0] == pair[1]),
+        "every refusal says the same, so none tells which grants exist: {told:?}"
+    );
     assert!(holds(&host, above.grant.grant_id));
     assert!(holds(&host, strangers.grant.grant_id));
     assert!(holds(&host, given.grant_id));
+
+    // A revocation acts on a grant, which belongs to this host and not to a session, so a target
+    // that names one is refused rather than answered for something the revocation never touched.
+    let refused = boss_connection
+        .mutate(
+            Method::GrantRevoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(&host, session_id),
+            &GrantRevokeParams {
+                grant_id: given.grant_id,
+            },
+        )
+        .await
+        .expect_err("a revocation names no session");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(holds(&host, given.grant_id));
+
+    // And a device revokes what is delegated further down than the grant it delegated itself: the
+    // friend passes its share on, and the boss, who holds the grant above, revokes it.
+    let (third, third_record) = recipient(&host, &owner).await;
+    let created = create(
+        &host,
+        &friend_connection,
+        &delegation(
+            session_id,
+            third_record.device_id,
+            Some(given.grant_id),
+            viewer.clone(),
+            300_000,
+        ),
+    )
+    .await
+    .expect("the friend passes a narrower share on");
+    let grandchild = created.grant;
+    let third_connection = RawDevice::connect(&host, &third, &third_record).await;
+    third_connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: created.preview.invitation_id,
+            },
+        )
+        .await
+        .expect("the third device redeems it");
+    let revoked = revoke(
+        &host,
+        &boss_connection,
+        ActionId::new(kr_ipc::new_uuid()),
+        grandchild.grant_id,
+    )
+    .await
+    .expect("a device revokes what descends from a grant it holds, however far down");
+    assert!(revoked.revoked_grants.contains(&grandchild.grant_id));
+    assert!(!holds(&host, grandchild.grant_id));
+    assert!(
+        holds(&host, given.grant_id),
+        "and only what is below it, not the grant between"
+    );
+    third_connection.close();
     friend_connection.close();
     owners.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.49 and 26.15: a delegation hands on no right this host's configuration removes from
+/// the grant it is made from. A delegation of viewing from a share whose viewing the configuration
+/// removed is refused, before the session is asked for any text of it; the same delegation under a
+/// ceiling that keeps viewing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_49_a_delegation_hands_on_no_right_the_configuration_removed() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let keeping = |rights: &[ActionRight]| {
+        Change::GrantRights(Some(
+            rights
+                .iter()
+                .map(|right| right.as_str().to_owned())
+                .collect(),
+        ))
+    };
+    host.controller()
+        .apply_configuration(&keeping(&[
+            ActionRight::SessionView,
+            ActionRight::SessionShare,
+        ]))
+        .await
+        .expect("a ceiling that keeps viewing and sharing");
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let (_friend, friend_record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
+    let viewer = delegation(
+        session_id,
+        friend_record.device_id,
+        Some(above.grant.grant_id),
+        RoleSelection::plain(SessionRole::Viewer),
+        600_000,
+    );
+    create(&host, &boss_connection, &viewer)
+        .await
+        .expect("viewing is inside the ceiling, so it is delegated");
+    boss_connection.close();
+
+    host.controller()
+        .apply_configuration(&keeping(&[ActionRight::SessionShare]))
+        .await
+        .expect("a ceiling that keeps sharing alone");
+    let boss_connection = RawDevice::connect(&host, &boss, &boss_record).await;
+    let refused = create(&host, &boss_connection, &viewer)
+        .await
+        .expect_err("viewing is outside the ceiling, so it is not delegated");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("configuration"),
+        "the refusal says the configuration removed it: {refused:?}"
+    );
+    assert_eq!(
+        host.controller()
+            .sharing()
+            .grants()
+            .records_for_device(friend_record.device_id)
+            .expect("readable")
+            .len(),
+        1,
+        "and only the first delegation was written"
+    );
+    boss_connection.close();
     host.stop().await;
 }
