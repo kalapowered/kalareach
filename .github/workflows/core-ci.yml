@@ -526,7 +526,7 @@ jobs:
       # restores is what was signed. Only a green run on the default branch saves it, as with the
       # cargo caches.
       - name: Save libsodium's archives
-        if: ${{ success() && matrix.part == 'first' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/task/T-CI-SPEED-2') && steps.libsodium.outputs.cache-hit != 'true' }}
+        if: ${{ success() && matrix.part == 'first' && github.ref == 'refs/heads/main' && steps.libsodium.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.libsodium.outputs.path }}
