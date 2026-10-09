@@ -125,6 +125,11 @@ impl Tree {
         }
     }
 
+    /// Where the root shell writes down what it started.
+    fn written(&self) -> std::path::PathBuf {
+        self._host.root().join("started")
+    }
+
     /// Returns the process the root shell wrote down as `kind`.
     fn pid(&self, kind: &str) -> u32 {
         self.started
@@ -444,15 +449,27 @@ fn ends(pid: u32, what: &str) {
 
 /// KR-REQ-07.66: the worker's own close asks what it recorded to stop with a hangup, and ends what
 /// is left with the kill that cannot be refused. A job that takes the hangup ends at the request; a
-/// job that ignores it is still running afterwards and ends at the force.
+/// job that ignores it is still running afterwards and ends at the force. The wait between the two
+/// is the closure's, and not part of what is stopped here.
 #[test]
 fn kr_req_07_66_the_workers_close_hangs_up_and_then_ends_what_ignored_it() {
     let _turn = turn();
     let mut tree = Tree::start(
-        "sleep 60 & echo \"a job that takes a hangup $!\" >> \"$KR_TREE\"; \
-         (trap '' HUP; exec sleep 60) & echo \"a job that ignores a hangup $!\" >> \"$KR_TREE\"",
+        "sleep 600 & echo \"a job that takes a hangup $!\" >> \"$KR_TREE\"; \
+         (trap '' HUP; touch \"$KR_TREE.deaf\"; exec sleep 600) & \
+         echo \"a job that ignores a hangup $!\" >> \"$KR_TREE\"",
         2,
     );
+    // The job has set its trap before the hangup is sent: it writes this after it, and a sleep
+    // of ten minutes cannot end by itself before the force the case waits for.
+    let deadline = Instant::now() + LIVENESS;
+    while !Path::new(&format!("{}.deaf", tree.written().display())).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the job that ignores a hangup has set its trap"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let hearing = tree.pid("a job that takes a hangup");
     let deaf = tree.pid("a job that ignores a hangup");
     let seen = tree.seen();
