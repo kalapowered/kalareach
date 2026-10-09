@@ -178,19 +178,24 @@ describe('a question that changed or ended while a person was answering', () => 
     expect(screen.queryByTestId('question-ended')).toBeNull()
   })
 
-  it('says the same when the press comes after the question has gone', async () => {
+  it('shows the worker’s own refusal when the press comes before the next read', async () => {
     const { controls } = start()
     const question = await questionAbout(WHICH_BRANCH)
     const person = userEvent.setup()
+    // The next reads are held, so the question is still listed when the person presses Send.
+    const held = controls.hold('questionRead')
     await person.click(within(question).getByRole('radio', { name: 'main' }))
-    const send = within(question).getByRole('button', { name: 'Send answer' })
     act(() => {
       controls.questions.answerElsewhere(QUESTION_SELECT)
     })
-    await person.click(send)
-    const closed = await screen.findByTestId('question-ended', undefined, { timeout: 20_000 })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    const closed = await screen.findByTestId('question-ended')
+    expect(within(closed).getByTestId('question-refusal')).toHaveTextContent(
+      'already answered or withdrawn'
+    )
     expect(closed).toHaveTextContent('You had chosen “main”.')
     expect(controls.questions.sent).toHaveLength(0)
+    held.release()
   })
 
   it('does not answer a revised question until the person has seen it', async () => {

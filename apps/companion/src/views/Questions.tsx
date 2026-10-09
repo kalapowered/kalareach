@@ -256,11 +256,12 @@ export function QuestionRequests({
   const now = shown?.atMs ?? 0
   const blocked = unavailable(rights)
 
-  const ended = Object.values(closed).filter(
-    (each) => !questions.some((listed) => listed.question_id === each.question.question_id)
-  )
+  // A question the worker refused an answer to has ended, whatever the last read still lists: it
+  // is shown as ended, with what the person chose, and not as a question still waiting.
+  const ended = Object.values(closed)
+  const waitingNow = questions.filter((each) => !(each.question_id in closed))
 
-  if (refusal !== null && questions.length === 0 && ended.length === 0) {
+  if (refusal !== null && waitingNow.length === 0 && ended.length === 0) {
     return (
       <Banner
         tone="warning"
@@ -270,7 +271,7 @@ export function QuestionRequests({
       />
     )
   }
-  if (questions.length === 0 && ended.length === 0) return null
+  if (waitingNow.length === 0 && ended.length === 0) return null
 
   return (
     <section className="questions" aria-label="Waiting for your answer" data-testid="questions">
@@ -282,7 +283,7 @@ export function QuestionRequests({
           action={<Button onClick={readAgain}>Try again</Button>}
         />
       ) : null}
-      {questions.map((question) => {
+      {waitingNow.map((question) => {
         const asker = askerOf(question)
         const form = formOf(question)
         const made = answerOf(question, form)

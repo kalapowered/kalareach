@@ -124,6 +124,26 @@ describe('a draft is written to the store as it is typed', () => {
   })
 })
 
+describe('a lost connection', () => {
+  it('takes every draft’s association away and writes nothing, keeping text and edits as they were', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'half a thought')
+    type(book, BUILD, 'another')
+    await book.settled()
+    const before = book.snapshot().drafts.map((draft) => [draft.text, draft.revision])
+    const writes = store.calls.length
+
+    book.connectionLost()
+    await book.settled()
+
+    const after = book.snapshot().drafts
+    expect(after.map((draft) => draft.state)).toEqual(['detached', 'detached'])
+    expect(after.map((draft) => [draft.text, draft.revision])).toEqual(before)
+    expect(store.calls.length).toBe(writes)
+  })
+})
+
 describe('a store that cannot be opened', () => {
   it('leaves the drafts in this window and says nothing is kept', async () => {
     const store = new FakeDraftStore()
