@@ -1,4 +1,5 @@
-//! A stand-in for the managed storage, backup manifest and authority feed services.
+//! A stand-in for the managed storage, backup manifest, authority feed and recovery bundle
+//! services.
 //!
 //! The service is the web repository's Worker, and what it answers is stated by that repository's
 //! service contract. This crate answers as the contract states, with the state the service keeps,
@@ -8,10 +9,11 @@
 //! daemon's own transport reaches it.
 //!
 //! Where the stand-in and the Worker could differ, the Worker is right. The recorded answers a
-//! local Worker gave (`fixtures/service/storage-answers.json` and
-//! `fixtures/service/authority-answers.json`) are what a test holds the stand-in to, and what the
-//! clients are held to read: `crates/kr-client/tests/service_answers.rs` and
-//! `crates/kr-client/tests/authority_answers.rs`.
+//! local Worker gave (`fixtures/service/storage-answers.json`,
+//! `fixtures/service/authority-answers.json` and `fixtures/service/bundle-answers.json`) are what a
+//! test holds the stand-in to, and what the clients are held to read:
+//! `crates/kr-client/tests/service_answers.rs`, `crates/kr-client/tests/authority_answers.rs` and
+//! `crates/kr-client/tests/bundle_answers.rs`.
 //!
 //! # What each behaviour is held to
 //!
@@ -19,7 +21,7 @@
 //! run against a Worker and the stand-in and the status, the shape of the body and what the
 //! clients decoded it to agree, or it is read from the contract and the Worker's source, because a
 //! local Worker cannot be made to do it. The files are in the web repository: the contract in
-//! `packages/service-contracts/src/{storage,backup,authority}.ts`, the Worker in
+//! `packages/service-contracts/src/{storage,backup,authority,sync}.ts`, the Worker in
 //! `workers/api/src`.
 //!
 //! | Behaviour | Held to | Worker | Test |
@@ -39,6 +41,12 @@
 //! | A new generation published with no account proof is `402 QUOTA_EXHAUSTED` | contract and source only: a local deployment's free tier includes backup storage, so the Worker accepts it there | `backup/index.ts:224`, the production catalogue | the daemon's `an_account_the_service_turns_away_is_waited_for_as_a_person` reaches it through the status route instead |
 //! | `RATE_LIMITED` and `SERVICE_UNAVAILABLE` carry `retryAfterSeconds`, and the `Retry-After` header | source only: a local Worker cannot be made to rate limit or to be unavailable | `object-call.ts:64-73`, `auth/routes.ts:369` | `Moment::Refuse`; the daemon's reaction table; the client's own reading of it in `services/signed.rs` |
 //! | A collection deleted from the account console is `410 COLLECTION_DELETED` | source only | `storage/index.ts:211`, `backup/collection.ts:531` | `ServiceWeb::delete_collection`; `a_deleted_collection_stops_the_attempt` |
+//! | A write of the recovery bundle at its locator, under a token with `backup.write`, is applied when it names the revision the locator holds, or none where it holds none, and is answered with the record and the place the write took; one that names another revision is `conflict`, keeps no copy and says where the bundle stands | recorded | `sync/collection.ts:484, 1568`, `sync/index.ts:813-935` | `the_stand_in_answers_as_the_worker_did` in `bundle_answers.rs`; the companion's `turning_recovery_on_*` |
+//! | A write sent again under its identity is answered from its receipt; another bundle under that identity is `409 ID_CONFLICT`; a fenced identity is `409 REQUEST_FENCED` | recorded | `sync/collection.ts:605-680` | same |
+//! | A read, a write, a status query and a fence under a token the account system did not issue, an expired one or one without the scope are `404 COLLECTION_ABSENT`, word for word as for a locator nobody wrote to; a read also admits `backup.restore`, and a write with that scope alone is turned away | recorded for an unissued token and for a write with `backup.restore` alone | `sync/index.ts:796-801, 956-975` | same |
+//! | A status query says `applied` with the record, `refused` with the record the bundle had, or `unknown` for an identity never seen; a fence on an identity with no receipt ends it as `fenced` with `never_ran`, and answers the same again | recorded | `sync/collection.ts:1222-1380` | same |
+//! | A request that names a locator is read against the closed shape of its member: another field, a locator that is not a canonical UUID, a revision that is not one, a bundle outside 41 bytes to 128 KiB, or a fence naming its earliest attempt after its latest, is `400` | source only: this crate's client sends none of these | `service-contracts/src/sync.ts:1411-1558` | none |
+//! | A write signed before a collection's cutoff is `409 SIGNED_BEFORE_CUTOFF`; the account whose write first applies owns the collection and every other account is answered `COLLECTION_ABSENT`; a collection put back from an archive names a history | not modelled: the service knows one account and sweeps and restores nothing | `sync/collection.ts:2393-2460` | none |
 //! | A transport fault: the request never arrives, its answer is lost, the connection is held open with no answer, the body arrives cut short | none: the Worker does not choose these | not applicable | `Moment::{Before, After, Hold, Slow, BodyCut}` |
 //! | A feed is addressed by the identifier of its host's authorisation key; the host reads it, and an owner who names it reads what the owner published | recorded | `authority-feed/index.ts:237-239` | `the_stand_in_answers_as_the_worker_did` in `authority_answers.rs` |
 //! | A request the host proves reaches the host's own feed whatever its body names, and the host may publish to it and remove it | source only: the script keeps one host and has it read and revise | `authority-feed/index.ts:237-239, 515-527` | `feed.rs` in this crate |
@@ -56,12 +64,14 @@
 //! | Uploads the service has lost answer `NOT_FOUND` | source only | `storage/upload.ts:607` | `Moment::UploadsLost`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | Storage not confirming the write of a part answers `INTERNAL` and closes the upload | source only | `storage/index.ts:830`, `storage/upload.ts:577` | `Moment::PartWriteFails`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 
+mod bundle;
 mod feed;
 mod http;
 mod web;
 
 pub use http::{Served, serve};
 pub use web::{
-    ACCOUNT, Arrived, BACKUP_WRITE_SCOPE, Handled, IN_PROCESS_ORIGIN, MAX_GENERATIONS, Moment,
-    PART, ServiceWeb, StaleRefusal, TOKEN, document_of, refusal, refusal_after,
+    ACCOUNT, Arrived, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Handled, IN_PROCESS_ORIGIN,
+    MAX_GENERATIONS, Moment, PART, RESTORE_TOKEN, ServiceWeb, StaleRefusal, TOKEN, document_of,
+    refusal, refusal_after,
 };
