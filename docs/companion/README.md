@@ -270,6 +270,10 @@ that means, and each rule is a fact about a file here rather than a convention:
   invitation's text or secret, a key, a transcript, a challenge or a proof, and it cannot complete
   a confirmation: `owner.confirmation.complete` is a method only native code calls.
 
+- **Recovery's secrets stay native.** The page asks for recovery to be turned on and for the kit to
+  be saved. The seed, the bundle's locator and the account's token stay in native code, and the kit
+  is written to a destination the save dialog returned.
+
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
 One hardening switch is deliberately off. `freezePrototype` freezes `Object.prototype` before the
@@ -373,6 +377,39 @@ dismissed and the answer is "not confirmed". Nothing on the page can answer the 
 that desktop automation synthesises can start a review and cannot finish one. While a review runs,
 the watcher does not connect to another host whose configuration shares the reviewed host's relay,
 because that connection would close the endpoint the answer goes over.
+
+## The sync service and recovery
+
+The sync service is a setting of its own. It is the managed service, `https://reach.kala.to`, until
+the person picks another, and the choice is kept in `sync-origin` in the application's data
+directory. It is not taken from the account's origin, the pairing service or a host. The Account
+sheet shows it with a Change control, as the pairing screen does for its service, and accepts an
+https origin or an http one on this computer.
+
+Recovery keeps the owner's seed on this computer and an encrypted bundle at a stable locator on the
+sync service. `src-tauri/src/recovery.rs` does it with `kr-client`'s `BundleStore`, which owns the
+bundle's rules: writes that compare the revision they replace, a record of any write whose answer
+never came back, and a checkpoint that never moves back.
+
+- Turning recovery on makes the seed and keeps it in the device's secure store. It then writes
+  `recovery/recovery.json` (the service, the locator, and whether the first write landed) and puts
+  the first bundle at the service. A kit exists only once that write has landed. A start that did
+  not finish goes on with the locator it began with, and a bundle that landed unrecorded is read
+  and kept, never written over.
+- A write whose answer never came back shows as unsettled, and nothing else is written until the
+  person settles it. Settling asks the service to fence the write's identity and reads the bundle
+  back. A restart keeps the write unsettled.
+- Saving the kit writes the seed, the locator and the service to a file at a destination the save
+  dialog returned, readable by the user alone. The page is sent none of them.
+- `Recovery::enable_writer` is how a backup writer is made recovery-enabled. It commits the bundle
+  with the writer named in it, and returns the evidence that the writer is enabled only after that
+  commit has landed.
+
+The bundle is reached with this device's signature and the account's token, and the token goes only
+to the service the account is signed in to. When the sync service setting names another service, no
+request is made and the refusal names the setting. A sign-in that does not carry the right to write
+the account's backup storage sends nothing either, and the person signs in again with that right.
+A phone shows the setting and offers no recovery.
 
 ## The design system
 
