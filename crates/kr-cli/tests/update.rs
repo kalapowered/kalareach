@@ -9728,6 +9728,53 @@ async fn a_command_that_registered_and_was_refused_leaves_a_host_that_can_be_upd
     );
 }
 
+/// KR-REQ-26.10: a registration of a command that cannot be read refuses the switch, whatever the
+/// others say, before anything is stopped: a record that is wider than owner-only, or that names no
+/// roots, hides a root the update must look at. Removing it lets the same rollback go ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_that_cannot_be_read_refuses_the_switch_until_it_is_removed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = Host::bare();
+    let one = reading_the_document_at_1("0.1.0+aaaaaaaaaaaa");
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&two);
+    host.put(&one);
+    kr_ipc::paths::create_private_directory(&host.store.roots()).expect("the records");
+    let damaged = host.store.roots().join("0123456789abcdef.registered");
+
+    // Wider than owner-only.
+    std::fs::write(&damaged, b"/nowhere\0/nowhere").expect("a registration");
+    std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o666))
+        .expect("wider than owner-only");
+    let (output, said) = host.roll_back_to(&one);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+
+    // Owner-only, and naming no roots.
+    std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o600)).expect("owner-only");
+    std::fs::write(&damaged, b"no roots here").expect("a registration that names none");
+    let (output, said) = host.roll_back_to(&one);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+
+    // The control: removed, the same rollback goes ahead.
+    std::fs::remove_file(&damaged).expect("removed");
+    let (output, said) = host.roll_back_to(&one);
+    assert!(
+        output.status.success(),
+        "the control: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+}
+
 /// KR-REQ-26.10: a store does not hand over, and does not read the daemon records of, a root another
 /// store serves. A `kr` of one store run against another store's roots registers them; the first
 /// store's update checks what a command writes there and leaves the second store's daemon serving,
