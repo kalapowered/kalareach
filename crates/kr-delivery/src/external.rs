@@ -654,8 +654,8 @@ mod tests {
     /// the notice's audience admitted, whatever the viewer's history or rights: a history cursor, no
     /// retained history and no `session.view` do not refuse it, since nothing in it was read from
     /// anyone's history, and that holds when every line offered was left out as well. The control:
-    /// the same viewers are still not given a line from before their bound, so the filter has not
-    /// been switched off, and the message says a line was left out.
+    /// the same viewers are still not given a session's line their filter does not reach, so the
+    /// filter has not been switched off, and the message says a line was left out.
     #[test]
     fn a_generic_alert_with_no_line_left_is_composed_for_a_viewer_whatever_their_history() {
         use kr_protocol::grant::HistoryScope;
@@ -697,8 +697,8 @@ mod tests {
             assert!(message.body.ends_with(RECIPIENTS_CAN_READ));
             assert!(message.withheld.is_empty(), "{name}: nothing was left out");
 
-            // The control: a line from before the bound is still not carried, and the alert the
-            // audience admitted still goes, saying that a line was left out.
+            // The control: a session's line the filter does not reach is still not carried, and
+            // the alert the audience admitted still goes, saying that a line was left out.
             let lined = compose(
                 DestinationKind::Slack,
                 PushAlert::ApprovalWaiting,
@@ -713,7 +713,7 @@ mod tests {
             } else {
                 assert!(
                     !lined.body.contains("an old line"),
-                    "{name}: a line from before the bound is not carried"
+                    "{name}: a session's line the filter does not reach is not carried"
                 );
                 assert!(
                     lined.body.contains("left out of this message"),
@@ -726,8 +726,8 @@ mod tests {
     /// A line that names no session is the host's own words, and a message carries it for a viewer
     /// whatever their history reaches and whether or not they may see a session at all, since
     /// what the viewer may be told of the host was decided where the notice was placed in an
-    /// audience. The control: a line of a session from before the same viewer's bound is still
-    /// left out, and the message says one line was.
+    /// audience. The control: a session's line that the same viewer's filter does not reach is
+    /// still left out, and the message says one line was.
     #[test]
     fn a_line_with_no_session_is_carried_whatever_the_viewers_history() {
         use kr_protocol::grant::HistoryScope;
@@ -768,7 +768,7 @@ mod tests {
             );
             assert!(
                 !message.body.contains("an old line"),
-                "{name}: and a session's line from before the bound is not"
+                "{name}: and a session's line the filter does not reach is not"
             );
             assert_eq!(
                 message.withheld,

@@ -404,8 +404,10 @@ impl RecipientScope {
     /// The filter the lines of a message to this recipient pass through.
     ///
     /// Its reach is the one [`Audience::admits`] decides a notice by: from `history_from_ms`, the
-    /// grant's own history cursor or its start. Both read that one field, so a notice the
-    /// audience admits is never a notice whose line the filter refuses for its date.
+    /// grant's own history cursor or its start. A grant with a cursor keeps it as the filter's
+    /// bound, and the host sets `history_from_ms` to that same cursor; a grant without one gets
+    /// `history_from_ms`, its start, as the bound, whether or not it includes the live screen. So
+    /// a notice the audience admits is not a notice whose line the filter refuses for its date.
     #[must_use]
     pub fn line_filter(&self) -> HistoryFilter {
         HistoryFilter::new(self.viewer.clone().reaching_from(self.history_from_ms))
@@ -636,10 +638,10 @@ impl Fate {
 /// The lines an external message carries for one announcement, in the host's own words.
 ///
 /// What a message names is what the host itself knows of the condition: which rule raised it, the
-/// session it belongs to and when it was first seen, and the host's own summary when it has one.
-/// A session's own words never enter: the attention store keeps none of them, and a message built
-/// here could not carry them if it tried. The lines are committed with the notice, so a recovery
-/// that produces from the event again composes the same message.
+/// session it belongs to and when it was first seen, and, for an automation paused by a limit, the
+/// host's own summary of it. A session's own words never enter: the attention store keeps none of
+/// them, and a message built here could not carry them if it tried. The lines are committed with
+/// the notice, so a recovery that produces from the event again composes from the same lines.
 ///
 /// Each line is dated by when the condition was first seen and names its session, which is what
 /// lets the message be checked against the grant of the rule that sends it, resource by resource
@@ -672,9 +674,9 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
         text,
     };
     let mut lines = vec![line(sentence)];
-    // Only a rule whose summary is the host's own record of a limit goes out with it. A summary
-    // the host composes from a command line, a turn or a notice's body is free text that a person
-    // or a program wrote, and a rule that carries it is a decision of its own.
+    // Only an automation paused by a limit carries its summary out: it is the host's own record
+    // of the limit. Any other rule's summary can be made of a command line, a turn or a notice's
+    // body, which a person or a program wrote, and stays with the host.
     if rule == AttentionRule::AutomationPaused && !notice.summary.is_empty() {
         lines.push(line(notice.summary.clone()));
     }
@@ -3033,16 +3035,23 @@ mod tests {
                 produced_at_ms: Some(at_ms),
                 text: text.to_owned(),
             };
-            let admitted = Audience::Sessions {
+            let audience = |at_ms| Audience::Sessions {
                 sessions: vec![session(1)],
-                at_ms: began + 1,
+                at_ms,
             };
-            assert!(admitted.admits(&scope), "{name}: the audience admits it");
+            assert!(
+                audience(began).admits(&scope),
+                "{name}: the audience admits a condition first seen as the reach begins"
+            );
+            assert!(
+                !audience(began - 1).admits(&scope),
+                "{name}: and refuses one first seen before it"
+            );
             let message = external::compose(
                 DestinationKind::Webhook,
                 PushAlert::SessionNeedsAttention,
                 vec![
-                    line(began + 1, "first seen after the reach began"),
+                    line(began, "first seen as the reach began"),
                     line(began - 1, "first seen before it"),
                 ],
                 &scope.line_filter(),
@@ -3051,7 +3060,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert!(
-                message.body.contains("first seen after the reach began"),
+                message.body.contains("first seen as the reach began"),
                 "{name}: the line the audience admitted is carried: {}",
                 message.body
             );
@@ -3104,7 +3113,7 @@ mod tests {
 
     /// An adapter's failure is told as a failure that needs attention and nothing more: the words
     /// the host holds for it (the adapter and what it reported) are a summary that stays with the
-    /// host, since a rule whose words a program wrote goes out only when it is decided.
+    /// host, because only an automation pause carries its summary out.
     #[test]
     fn an_adapter_that_needs_attention_is_told_without_the_words_it_reported() {
         let mut attention = store();
