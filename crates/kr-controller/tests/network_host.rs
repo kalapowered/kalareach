@@ -4,7 +4,9 @@
 //! Two groups are here. The host diagnostics are served at both doors, and what leaves for a
 //! device is the owner's own answer with every name and path held to its class and its length.
 //! The skill setup group is served at the local door alone: a device whose grant manages the host
-//! is refused each of its methods, and nothing is written for it.
+//! is refused each of its methods, and nothing is written for it. So is `device.revoke`: a remote
+//! owner's revocation of a device reaches the host through the signed authority feed, never as a
+//! live call on a paired connection.
 //!
 //! The daemon starts no worker, so every answer here is one it gives itself. Everything a test
 //! writes is in its own temporary host tree on the internal disk.
@@ -20,6 +22,7 @@ use kr_protocol::ids::ActionId;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
 use kr_protocol::skill::{AgentTarget, AgentToolsParams, InstallScope};
 use net_support::{Device, Host, RawDevice};
 
@@ -225,6 +228,74 @@ async fn a_paired_device_is_refused_the_skill_setup_and_nothing_is_written_for_i
             .expect("the owner reads the status"),
     );
     assert!(status.installed, "{status:?}");
+    host.stop().await;
+}
+
+/// KR-REQ-23.27: `device.revoke` is the owner's at this machine. A paired device whose grant
+/// manages the host is refused it by name, as for any method its door does not list, and the
+/// device it named stays paired with the grants it holds. The control: the owner's own revocation
+/// of the same device is served and ends its pairing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_is_refused_the_revocation_of_a_device_and_the_owner_is_not() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let managing = Device::create().await;
+    let managing_record = net_support::pair_with(
+        &host,
+        &managing,
+        &owner,
+        net_support::proposal(&[ActionRight::HostManage, ActionRight::SessionView]),
+    )
+    .await;
+    let target = Device::create().await;
+    let target_record = net_support::pair_with(
+        &host,
+        &target,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let params = DeviceRevokeParams {
+        device_id: target_record.device_id,
+    };
+    let still_paired = || {
+        host.network()
+            .devices()
+            .record_for_device(target_record.device_id)
+            .expect("readable")
+            .expect("the record")
+            .is_paired()
+    };
+
+    let raw = RawDevice::connect(&host, &managing, &managing_record).await;
+    raw.claim();
+    let refused = net_support::refusal(
+        raw.mutate(
+            Method::DeviceRevoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await,
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    raw.close();
+    assert!(still_paired(), "the refused call revoked nothing");
+
+    let mut local = host.client().await;
+    let _: RevocationResult = typed(
+        &local
+            .mutate(
+                Method::DeviceRevoke,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner revokes the device"),
+    );
+    assert!(!still_paired(), "the owner's revocation ended the pairing");
     host.stop().await;
 }
 
