@@ -49,16 +49,17 @@
           "kind": "sqlite_table",
           "table": "attention_schema"
         },
-        "version": 10,
+        "version": 11,
         "migrates_from": 9
       },
-      "digest": "b5ab0d1037646db041bb2f5e4d9698651c1471ffba3be7aae8bc419d94d8cc1a",
+      "digest": "4027328c5f9f69b041eb7a1eee70a302ad6435dd9f0930b25f2ca9650a09c062",
       "kept": [
         "AttentionAcknowledgeResult",
         "AttentionQuietHoursResult",
         "ReviewAcknowledgeResult",
         "VisitAcknowledgeResult",
-        "HostTimeState"
+        "HostTimeState",
+        "words of attention sources"
       ]
     },
     {
@@ -174,10 +175,10 @@
           "kind": "sqlite_table",
           "table": "delivery_schema"
         },
-        "version": 8,
+        "version": 9,
         "migrates_from": 6
       },
-      "digest": "b8b1360989308c6f51393e6dafc1db1347c035535e310e3cdde7c6f0cf50e0f3",
+      "digest": "f8ba6eb8a6327ec55d420b0639e68ac93af24ab82e2532896f4208e868e258da",
       "kept": [
         "PushDeliveryRequest",
         "SealedEnvelope",
