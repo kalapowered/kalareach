@@ -193,7 +193,10 @@ impl Controller {
                 self.check_admission(&registry, &carried)?;
                 self.owner
                     .covers(&confirmed, digest, "organisation enrolment")?;
-                self.head_holds_still(&params.authority, reading.as_ref())
+                self.head_holds_still(
+                    params.authority.head.payload.expires_at_ms,
+                    reading.as_ref(),
+                )
             },
         )?;
         drop(registry);
@@ -214,14 +217,14 @@ impl Controller {
     /// out, or a bound this host cannot answer while the floor is owed its record.
     fn head_holds_still(
         &self,
-        authority: &kr_protocol::account::PolicyAuthority,
+        head_expires_at: TimestampMs,
         read: Option<&crate::service::net::devices::ObservedUtc>,
     ) -> Result<()> {
         if !self.lifetimes.clock_trust().is_trusted_now() {
             return Err(chain_refusal(ChainRefused::ClockUntrusted));
         }
         let head_ends = kr_protocol::grant::GrantExpiry::At {
-            expires_at_ms: authority.head.payload.expires_at_ms,
+            expires_at_ms: head_expires_at,
         };
         let read_at = read.map_or(0, |reading| reading.now.get());
         if self.sharing.grants().bound_passed(head_ends, read_at)? {
@@ -324,5 +327,70 @@ impl Controller {
             clock_trusted,
             exclusive_events: self.sharing.grants().exclusive_management_events()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::an_owner_establishes_the_clock::distrusting;
+    use crate::service::net::devices::ObservedUtc;
+    use crate::service::net::tests::{daemon_on, manual_clocks, stopped};
+    use kr_protocol::error::ErrorCode;
+    use std::sync::atomic::Ordering;
+
+    const MINUTE_MS: u64 = 60_000;
+
+    fn reading(now: u64) -> ObservedUtc {
+        ObservedUtc {
+            now: TimestampMs::new(now),
+            behind_ms: 0,
+        }
+    }
+
+    /// KR-REQ-17.53: the check an enrolment makes inside the policy transaction finds a head that
+    /// has run out since it was judged, and answers a head that has not as current.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_check_inside_the_transaction_finds_a_head_that_ran_out_while_it_waited() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
+        let start = wall.load(Ordering::SeqCst);
+        let head_ends = TimestampMs::new(start + 10 * MINUTE_MS);
+        let judged = reading(start);
+
+        controller
+            .head_holds_still(head_ends, Some(&judged))
+            .expect("a head with ten minutes left is current");
+        wall.store(start + 9 * MINUTE_MS, Ordering::SeqCst);
+        controller
+            .head_holds_still(head_ends, Some(&judged))
+            .expect("and with one minute left");
+
+        wall.store(start + 11 * MINUTE_MS, Ordering::SeqCst);
+        let refused = controller
+            .head_holds_still(head_ends, Some(&judged))
+            .expect_err("a head that ran out during the wait is not enrolled");
+        assert!(
+            matches!(
+                refused.code(),
+                ErrorCode::InvalidArgument | ErrorCode::StorageUnavailable
+            ),
+            "{refused:?}"
+        );
+        stopped(controller).await;
+    }
+
+    /// KR-REQ-17.53: the same check finds a clock the host stopped trusting since the head was
+    /// judged, whatever the head says.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_check_inside_the_transaction_finds_a_clock_distrusted_while_it_waited() {
+        let (_temp, controller, _continuous, wall, _clocks) = distrusting().await;
+        let now = wall.load(Ordering::SeqCst);
+        let refused = controller
+            .head_holds_still(TimestampMs::new(now + 10 * MINUTE_MS), Some(&reading(now)))
+            .expect_err("a clock that is not trusted judges no head");
+        assert_eq!(refused.code(), ErrorCode::ClockUntrusted, "{refused:?}");
+        stopped(controller).await;
     }
 }

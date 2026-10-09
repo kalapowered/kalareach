@@ -743,45 +743,46 @@ async fn a_head_that_runs_out_while_the_enrolment_waits_for_the_store_enrols_not
     host.stop().await;
 }
 
-/// KR-REQ-17.53: a host that stops trusting its clock while the enrolment waits enrols nothing,
-/// and asks for no more confirmations of chains until an owner establishes the clock again.
+/// KR-REQ-17.53: a host that distrusts its clock shows an owner no chain and enrols nothing: a
+/// head is current only against a clock the host trusts, and an owner establishes the clock again
+/// before any chain is judged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_clock_distrusted_while_the_enrolment_waits_for_the_store_enrols_nothing() {
+async fn a_host_that_distrusts_its_clock_shows_an_owner_no_chain() {
     let owner = keys();
     let (moved, clocks) = moved_clocks();
     let host = Host::start_on_clocks(&owner, clocks).await;
     let mut client = host.client().await;
     let (organisation, now) = organisation(0x21);
     let params = enrol_params(&organisation, now);
-    calls::confirm_subject(
-        host.environment_id,
-        &mut client,
-        subject(&params),
-        &Signer::OwnerDevice(&owner),
-    )
-    .await
-    .expect("the owner confirms the chain");
+    assert!(list(&mut client).await.clock_trusted);
 
-    let mut reader = host.client().await;
+    // The wall clock steps back by more than the host forgives, and the next reading finds it.
     let back = i64::try_from(kr_controller::service::net::devices::CLOCK_TOLERANCE_MS + 60_000)
         .expect("fits");
-    let (mut client, answer) = enrol_while_it_waits(&host, client, &params, async || {
-        // The wall clock steps back, and the next reading of it is the host's finding.
-        moved.fetch_sub(back, Ordering::SeqCst);
-        assert!(
-            !list(&mut reader).await.clock_trusted,
-            "a reading after a step back distrusts the clock"
-        );
-    })
-    .await;
-    let refused = answer.expect_err("the clock was distrusted before the policy was written");
-    assert_eq!(refused.code, ErrorCode::ClockUntrusted, "{refused:?}");
-    assert!(list(&mut client).await.enrolments.is_empty());
-
-    // A host that distrusts its clock shows an owner no chain either.
+    moved.fetch_sub(back, Ordering::SeqCst);
+    assert!(
+        !list(&mut client).await.clock_trusted,
+        "the host finds the step back"
+    );
     let refused = calls::request(host.environment_id, &mut client, subject(&params))
         .await
         .expect_err("no chain is judged at a clock that is not trusted");
     assert_eq!(refused.code, ErrorCode::ClockUntrusted, "{refused:?}");
+    let refused = enrol(
+        &host,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        &params,
+    )
+    .await
+    .expect_err("and none is enrolled");
+    assert!(
+        matches!(
+            refused.code,
+            ErrorCode::ClockUntrusted | ErrorCode::OwnerConfirmationRequired
+        ),
+        "{refused:?}"
+    );
+    assert!(list(&mut client).await.enrolments.is_empty());
     host.stop().await;
 }
