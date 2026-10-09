@@ -3314,9 +3314,11 @@ async fn an_announcement_names_the_grants_a_withdrawal_reached_and_the_host_for_
     .await
     .expect("the revocation completes")
     .expect("it succeeds");
+    let announced = first_announced(before);
     assert_eq!(
-        first_announced(before).reach,
+        announced.reach,
         RevisionReach::Within {
+            since: AuthorityRevision::new(announced.revision - 1),
             grants: [held.grant_id].into_iter().collect(),
             devices: CanonicalSet::new(),
         },

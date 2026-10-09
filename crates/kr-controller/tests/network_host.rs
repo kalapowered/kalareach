@@ -232,7 +232,7 @@ async fn a_paired_device_is_refused_the_skill_setup_and_nothing_is_written_for_i
 }
 
 /// KR-REQ-23.27: `device.revoke` is the owner's at this machine. A paired device whose grant
-/// manages the host is refused it by name, as for any method its door does not list, and the
+/// manages the host is refused it as it is any method its door does not list, and the
 /// device it named stays paired with the grants it holds. The control: the owner's own revocation
 /// of the same device is served and ends its pairing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

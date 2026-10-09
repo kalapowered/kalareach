@@ -101,7 +101,7 @@ impl Controller {
         };
         let own = self.publish_debts(&Self::under_the_grants(
             revocation.debt,
-            &revocation.revoked,
+            &revocation.reached,
         ));
         self.complete_revocation(
             audience,
@@ -120,13 +120,18 @@ impl Controller {
     }
 
     /// A revocation's debt, when it wrote one, as one that reaches the connections acting under
-    /// the grants it withdrew and no others.
+    /// the grants of the subtree it withdrew and no others.
+    ///
+    /// The grants are everything of the subtree that anyone held
+    /// ([`crate::grants::GrantRevocation::reached`]), not only what this call revoked: a grant a
+    /// concurrent revocation withdrew just before this one read the subtree is fenced by whichever
+    /// barrier runs first.
     fn under_the_grants(
         debt: Option<crate::grants::store::DebtId>,
-        revoked: &[kr_protocol::ids::GrantId],
+        reached: &[kr_protocol::ids::GrantId],
     ) -> Vec<(crate::grants::store::DebtId, Reach)> {
         debt.into_iter()
-            .map(|debt| (debt, Reach::Grants(revoked.iter().copied().collect())))
+            .map(|debt| (debt, Reach::Grants(reached.iter().copied().collect())))
             .collect()
     }
 
@@ -329,7 +334,7 @@ impl Controller {
         let transfer = transfer?;
         let own = self.publish_debts(&Self::under_the_grants(
             transfer.revoked.debt,
-            &transfer.revoked.revoked,
+            &transfer.revoked.reached,
         ));
         self.complete_transfer(
             transfer.issued,

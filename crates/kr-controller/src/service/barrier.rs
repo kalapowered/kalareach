@@ -88,15 +88,36 @@ pub(super) struct Debts {
     pending: BTreeMap<crate::grants::store::DebtId, Reach>,
     pub(super) published: BTreeMap<crate::grants::store::DebtId, Published>,
     pub(super) retiring: std::collections::BTreeSet<crate::grants::store::DebtId>,
-    /// What each of the latest revisions withdrew, by revision, for the announcement of it.
+    /// What each of the latest revisions withdrew, by revision, for the announcement of it: the
+    /// grants and devices, or none for a revision that withdrew authority this daemon cannot name.
     ///
     /// A daemon that restarts keeps none, and a revision with no entry is announced as the whole
     /// host's, which fences every caller under a grant.
-    reaches: BTreeMap<u64, kr_protocol::worker::RevisionReach>,
+    reaches: BTreeMap<u64, Option<Named>>,
+}
+
+/// The grants and the devices one revision withdrew authority from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Named {
+    grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
+    devices: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
+}
+
+impl Named {
+    fn len(&self) -> usize {
+        self.grants.len() + self.devices.len()
+    }
+
+    fn joined(&self, other: &Self) -> Self {
+        Self {
+            grants: self.grants.union(&other.grants).copied().collect(),
+            devices: self.devices.union(&other.devices).copied().collect(),
+        }
+    }
 }
 
 /// How many revisions' reaches the daemon keeps for their announcements.
-const KEPT_REVISION_REACHES: usize = 32;
+const KEPT_REVISION_REACHES: usize = 16;
 
 /// One published debt ([`Debts`]).
 #[derive(Clone, Debug)]
@@ -767,42 +788,66 @@ impl Controller {
         }
     }
 
-    /// Whose authority the debts one revision captured withdrew, as the workers are told.
+    /// Whose authority the debts one revision captured withdrew, or none when that is the whole
+    /// host's or cannot be named.
     ///
-    /// A debt that reaches every connection, or one this cannot name, is the whole host. The
-    /// others are the grants and the devices they name. More names than a frame should carry is
-    /// the whole host too, which is the reach every worker fences by when it knows no better.
-    fn reach_of(
-        captured: &BTreeMap<crate::grants::store::DebtId, Reach>,
-    ) -> kr_protocol::worker::RevisionReach {
-        let mut grants = kr_protocol::scalars::CanonicalSet::new();
-        let mut devices = kr_protocol::scalars::CanonicalSet::new();
+    /// A debt that reaches every connection is the whole host. The others are the grants and the
+    /// devices they name; more names than a notice should carry is the whole host too, which is
+    /// the reach every worker fences by when it knows no better.
+    fn reach_of(captured: &BTreeMap<crate::grants::store::DebtId, Reach>) -> Option<Named> {
+        let mut named = Named::default();
         for reach in captured.values() {
             match reach {
-                Reach::Host => return kr_protocol::worker::RevisionReach::Host,
+                Reach::Host => return None,
                 Reach::Device(device_id) => {
-                    devices.insert(*device_id);
+                    named.devices.insert(*device_id);
                 }
-                Reach::Grants(named) => {
-                    for grant_id in named {
-                        grants.insert(*grant_id);
-                    }
-                }
+                Reach::Grants(grants) => named.grants.extend(grants.iter().copied()),
             }
         }
-        let names = grants.len() + devices.len();
-        if names == 0 || names > kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+        let names = named.len();
+        (names > 0 && names <= kr_protocol::worker::MAX_REVISION_REACH_NAMES).then_some(named)
+    }
+
+    /// What the revisions up to `revision` withdrew, as far back as this daemon can say.
+    ///
+    /// The reaches of the consecutive revisions before it that each name their authority are joined
+    /// to its own, so a worker that has missed some of them, or that announces a later revision
+    /// than the one that was written, is still told. The reach describes the revisions after
+    /// `since`, the first one back that this daemon cannot name or that would make the notice too
+    /// large; a worker that has fenced that one applies it, and any other fences every caller under
+    /// a grant. A revision this daemon holds no reach for, because it restarted since, is the
+    /// whole host's.
+    fn reach_up_to(&self, revision: AuthorityRevision) -> kr_protocol::worker::RevisionReach {
+        let debts = self.debts();
+        let Some(Some(newest)) = debts.reaches.get(&revision.get()) else {
             return kr_protocol::worker::RevisionReach::Host;
+        };
+        let mut named = newest.clone();
+        let mut since = revision.get().saturating_sub(1);
+        while since > 0 {
+            let Some(Some(earlier)) = debts.reaches.get(&since) else {
+                break;
+            };
+            let joined = named.joined(earlier);
+            if joined.len() > kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+                break;
+            }
+            named = joined;
+            since -= 1;
         }
-        kr_protocol::worker::RevisionReach::Within { grants, devices }
+        kr_protocol::worker::RevisionReach::Within {
+            since: AuthorityRevision::new(since),
+            grants: named.grants.into_iter().collect(),
+            devices: named.devices.into_iter().collect(),
+        }
     }
 
     /// The announcement of `revision` to a worker that said `capabilities` in its hello.
     ///
-    /// It names whose authority the revision withdrew only to a worker that reads that, and only
-    /// for the first page of the revision's evidence: a continuation asks for names of a revision
-    /// the worker has already fenced. A revision this daemon holds no reach for, because it
-    /// restarted since, is announced as the whole host's.
+    /// It names whose authority the revisions withdrew ([`Self::reach_up_to`]) only to a worker
+    /// that reads that, and only for the first page of the revision's evidence: a continuation asks
+    /// for names of a revision the worker has already fenced.
     pub(crate) fn revision_notice(
         &self,
         revision: AuthorityRevision,
@@ -811,11 +856,7 @@ impl Controller {
     ) -> kr_protocol::worker::AuthorityRevisionNotice {
         let reach = if evidence_from == 0 && kr_protocol::local::reads_revision_reach(capabilities)
         {
-            self.debts()
-                .reaches
-                .get(&revision.get())
-                .cloned()
-                .unwrap_or_default()
+            self.reach_up_to(revision)
         } else {
             kr_protocol::worker::RevisionReach::Host
         };

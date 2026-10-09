@@ -158,8 +158,18 @@ struct Authority {
     /// The announcement was refused, because a fence cannot interleave with a dispatch and waiting
     /// for the boundary would hold a connection the dispatch may need. What must not depend on the
     /// daemon announcing again is the *fence*, so the revision is recorded here and the host's own
-    /// maintenance runs it.
-    owed_revision: Option<kr_protocol::ids::AuthorityRevision>,
+    /// maintenance runs it, with the reach it was announced with.
+    owed: Option<Owed>,
+}
+
+/// A revision this worker owes a fence for, and whose authority it withdrew.
+#[derive(Clone, Debug)]
+struct Owed {
+    /// The highest revision the worker was refused.
+    revision: kr_protocol::ids::AuthorityRevision,
+    /// The reach of every revision refused since the last it fenced, or the whole host's when the
+    /// refused announcements do not join up.
+    reach: kr_protocol::worker::RevisionReach,
 }
 
 /// The worker's endpoint server.
@@ -475,7 +485,7 @@ impl WorkerService {
                 attention_connection: None,
                 descriptions_connection: None,
                 acknowledged_revision: None,
-                owed_revision: None,
+                owed: None,
             }),
             dispatch: Mutex::new(()),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2949,7 +2959,7 @@ impl WorkerService {
             // changes the binding. So the check above can have been true and stopped being true,
             // and work recorded after that would be work left behind by a connection this worker
             // has stopped answering to.
-            if let Err(error) = self.owe_fence(state, notice.revision) {
+            if let Err(error) = self.owe_fence(state, notice) {
                 return failure(RequestId::new(0), &error.to_protocol_error());
             }
             return failure(
@@ -2991,16 +3001,10 @@ impl WorkerService {
             // newer revision's list would skip that list's beginning.
             return self.evidence_reply(state, notice.revision, page_from);
         }
-        // A named reach is the reach of this revision alone, so it is trusted only when this
-        // worker has fenced every revision before it: the one after the last it acknowledged.
-        // Otherwise a revision it missed, or one it was refused for its boundary, withdrew
-        // authority this notice says nothing about.
-        let reach =
-            if held.is_some_and(|held| held.get().checked_add(1) == Some(notice.revision.get())) {
-                &notice.reach
-            } else {
-                &kr_protocol::worker::RevisionReach::Host
-            };
+        // A named reach describes the revisions after its `since`, so it is trusted only when this
+        // worker has fenced every revision up to that one. Otherwise a revision it missed, or one
+        // it was refused for its boundary, withdrew authority this notice says nothing about.
+        let reach = notice.reach.applied_by_a_worker_at(held, notice.revision);
         if let Err(error) = self.fence(notice.revision, reach) {
             // The acknowledgement is what the daemon waits on before it calls a revocation
             // complete. Reporting success while the fence did not finish would answer it wrongly;
@@ -3084,10 +3088,11 @@ impl WorkerService {
         // and clearing that would leave the maintenance with nothing to do and the newer
         // revocation waiting on a caller.
         if authority
-            .owed_revision
-            .is_some_and(|owed| owed.get() <= revision.get())
+            .owed
+            .as_ref()
+            .is_some_and(|owed| owed.revision.get() <= revision.get())
         {
-            authority.owed_revision = None;
+            authority.owed = None;
         }
         Ok(())
     }
@@ -3104,13 +3109,17 @@ impl WorkerService {
                 .expect("the authority lock is not poisoned");
             let held = authority.acknowledged_revision;
             authority
-                .owed_revision
-                .filter(|owed| held.is_none_or(|held| held.get() < owed.get()))
+                .owed
+                .clone()
+                .filter(|owed| held.is_none_or(|held| held.get() < owed.revision.get()))
+                .map(|owed| (owed, held))
         };
-        if let Some(revision) = owed {
-            // The revision it was announced with is not kept, so every caller under a grant is
-            // fenced.
-            let _ = self.fence(revision, &kr_protocol::worker::RevisionReach::Host);
+        if let Some((owed, held)) = owed {
+            // The reach it was refused with is applied as an announcement's is, to the revisions
+            // this worker has not fenced: one that does not join up with what it has fenced is
+            // the whole host's.
+            let reach = owed.reach.applied_by_a_worker_at(held, owed.revision);
+            let _ = self.fence(owed.revision, reach);
         }
     }
 
@@ -3433,10 +3442,10 @@ impl WorkerService {
     /// afterwards could be replaced in between, and would leave this worker holding a revision to
     /// fence on behalf of a connection it no longer answers to.
     ///
-    /// The highest revision wins, because an older announcement arriving late is not news. The
-    /// record carries no generation of its own: a revision is the host's own, the fence it asks
-    /// for is this host's own work, and a replacement controller inherits it rather than starting
-    /// again.
+    /// The highest revision wins, because an older announcement arriving late is not news, and the
+    /// reaches of the revisions refused join up into one. The record carries no generation of its
+    /// own: a revision is the host's own, the fence it asks for is this host's own work, and a
+    /// replacement controller inherits it rather than starting again.
     ///
     /// # Errors
     ///
@@ -3445,19 +3454,25 @@ impl WorkerService {
     fn owe_fence(
         &self,
         state: &ConnectionState,
-        revision: kr_protocol::ids::AuthorityRevision,
+        notice: &kr_protocol::worker::AuthorityRevisionNotice,
     ) -> Result<()> {
         let mut authority = self
             .authority
             .lock()
             .expect("the authority lock is not poisoned");
         Self::check_bound(state, &authority)?;
-        if authority
-            .owed_revision
-            .is_none_or(|owed| owed.get() < revision.get())
-        {
-            authority.owed_revision = Some(revision);
-        }
+        authority.owed = match authority.owed.take() {
+            None => Some(Owed {
+                revision: notice.revision,
+                reach: notice.reach.clone(),
+            }),
+            // An older announcement arriving late is not news.
+            Some(owed) if owed.revision.get() >= notice.revision.get() => Some(owed),
+            Some(owed) => Some(Owed {
+                revision: notice.revision,
+                reach: owed.reach.then(owed.revision, &notice.reach),
+            }),
+        };
         Ok(())
     }
 

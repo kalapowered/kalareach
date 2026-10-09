@@ -200,6 +200,14 @@ pub struct GrantRevocation {
     pub grant_id: GrantId,
     /// Every grant this revocation revoked: the named one and its descendants, in order.
     pub revoked: Vec<GrantId>,
+    /// Every grant of the subtree that anyone held, whether this call revoked it or an earlier one
+    /// did: the live ones, which is where a worker can hold input under what was withdrawn.
+    ///
+    /// A grant a concurrent revocation withdrew just before this one read the subtree is not in
+    /// [`Self::revoked`], and its own change may not have reached its barrier yet, so a fence that
+    /// named only what this call revoked would leave it out. A proposal nobody redeemed has no
+    /// holder and is not in here.
+    pub reached: Vec<GrantId>,
     /// The devices that held them, which is what a revocation has to fence.
     pub devices: BTreeSet<DeviceId>,
     /// The sessions those grants covered, which is what a revocation has to close subscriptions
@@ -893,6 +901,7 @@ impl GrantDirectory {
                     |record| record.grant.grant_id,
                 ),
                 revoked: Vec::new(),
+                reached: Vec::new(),
                 devices: BTreeSet::new(),
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
@@ -933,6 +942,7 @@ impl GrantDirectory {
                     connection, *grant_id, subtree, now_ms, &mut debt, &covers,
                 )?;
                 merged.revoked.extend(one.revoked);
+                merged.reached.extend(one.reached);
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
                 merged.covers_every_session |= one.covers_every_session;
@@ -989,11 +999,15 @@ impl GrantDirectory {
         covers: &str,
     ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
+        let mut reached = Vec::new();
         let mut devices = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
         let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
         for record in subtree {
+            if record.is_active() && owes_a_fence(&record.grant) {
+                reached.push(record.grant.grant_id);
+            }
             let is_the_named_one = record.grant.grant_id == grant_id;
             let changed = connection
                 .execute(
@@ -1047,6 +1061,7 @@ impl GrantDirectory {
         Ok(GrantRevocation {
             grant_id,
             revoked,
+            reached,
             devices,
             sessions,
             covers_every_session,

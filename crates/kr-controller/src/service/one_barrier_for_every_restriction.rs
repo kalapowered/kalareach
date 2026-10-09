@@ -309,6 +309,50 @@ async fn an_acceptance_whose_ceiling_could_not_move_fences_under_no_debt_of_its_
     drop(controller);
 }
 
+/// The capability a worker states when it reads a revision's reach.
+fn stating() -> kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId> {
+    kr_protocol::scalars::CanonicalSet::from_iter([kr_protocol::ids::CapabilityId::new(
+        kr_protocol::local::AUTHORITY_REVISION_REACH,
+    )
+    .expect("a capability")])
+}
+
+fn a_grant(byte: u8) -> kr_protocol::ids::GrantId {
+    kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
+}
+
+/// Raises one barrier for a change whose debt reaches `reach`, and returns the revision it
+/// advanced to.
+async fn barrier_for(controller: &Controller, reach: Reach) -> kr_protocol::ids::AuthorityRevision {
+    let debt = controller
+        .owe_debt("a change", reach.clone())
+        .expect("written");
+    let own = controller.publish_debts(&[(debt, reach)]);
+    controller.barrier(own).await.expect("a barrier");
+    kr_protocol::ids::AuthorityRevision::new(revision(controller).await)
+}
+
+fn grants_reach(bytes: &[u8]) -> Reach {
+    Reach::Grants(bytes.iter().map(|byte| a_grant(*byte)).collect())
+}
+
+fn within(
+    since: kr_protocol::ids::AuthorityRevision,
+    grants: &[u8],
+) -> kr_protocol::worker::RevisionReach {
+    kr_protocol::worker::RevisionReach::Within {
+        since,
+        grants: grants.iter().map(|byte| a_grant(*byte)).collect(),
+        devices: kr_protocol::scalars::CanonicalSet::new(),
+    }
+}
+
+fn one_before(
+    revision: kr_protocol::ids::AuthorityRevision,
+) -> kr_protocol::ids::AuthorityRevision {
+    kr_protocol::ids::AuthorityRevision::new(revision.get() - 1)
+}
+
 /// KR-REQ-10.45: a revision is announced with the grants its withdrawal reached to a worker that
 /// says it reads them, and as the whole host's to a worker that does not, and for a page of the
 /// evidence that follows its first announcement.
@@ -317,32 +361,16 @@ async fn an_acceptance_whose_ceiling_could_not_move_fences_under_no_debt_of_its_
 /// so the member is never sent to one, and no worker built here can be made to stand in for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_that_does_not_read_a_revisions_reach_is_announced_the_whole_host() {
-    use kr_protocol::ids::{AuthorityRevision, CapabilityId, GrantId};
-    use kr_protocol::scalars::{CanonicalSet, Uuid};
+    use kr_protocol::scalars::CanonicalSet;
     use kr_protocol::worker::RevisionReach;
 
     let temp = kr_ipc::testing::TempHost::create();
     let controller = super::a_floor_owed_its_record::daemon(&temp).await;
-    let grant = GrantId::new(Uuid::from_bytes([0x61; 16]));
-    let reaching = Reach::Grants([grant].into_iter().collect());
-    let debt = controller
-        .owe_debt("a share", reaching.clone())
-        .expect("written");
-    let own = controller.publish_debts(&[(debt, reaching)]);
-    controller.barrier(own).await.expect("a barrier");
-    let revision = AuthorityRevision::new(revision(&controller).await);
+    let revision = barrier_for(&controller, grants_reach(&[0x61])).await;
 
-    let stating =
-        CanonicalSet::from_iter([
-            CapabilityId::new(kr_protocol::local::AUTHORITY_REVISION_REACH).expect("a capability"),
-        ]);
-    let names_the_grant = RevisionReach::Within {
-        grants: [grant].into_iter().collect(),
-        devices: CanonicalSet::new(),
-    };
     assert_eq!(
-        controller.revision_notice(revision, 0, &stating).reach,
-        names_the_grant
+        controller.revision_notice(revision, 0, &stating()).reach,
+        within(one_before(revision), &[0x61])
     );
     assert_eq!(
         controller
@@ -352,9 +380,256 @@ async fn a_worker_that_does_not_read_a_revisions_reach_is_announced_the_whole_ho
         "a worker that states nothing is told nothing of the reach"
     );
     assert_eq!(
-        controller.revision_notice(revision, 3, &stating).reach,
+        controller.revision_notice(revision, 3, &stating()).reach,
         RevisionReach::Host,
         "a page of the evidence of a revision the worker has fenced names no reach"
+    );
+    drop(controller);
+}
+
+/// KR-REQ-10.45: the reach of a revision is what its barrier captured: every debt it took joined,
+/// and the whole host as soon as one of them reaches the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revision_is_announced_with_every_debt_its_barrier_captured_or_as_the_host() {
+    use kr_protocol::worker::RevisionReach;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+
+    // Two withdrawals whose debts one barrier takes: a grant and a device, and then a grant with a
+    // restriction that reaches the host in any position.
+    let first = controller
+        .owe_debt("a grant", grants_reach(&[0x61, 0x62]))
+        .expect("written");
+    let second = controller
+        .owe_debt(
+            "a device",
+            Reach::Device(kr_protocol::ids::DeviceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0x71; 16]),
+            )),
+        )
+        .expect("written");
+    let own = controller.publish_debts(&[
+        (first, grants_reach(&[0x61, 0x62])),
+        (
+            second,
+            Reach::Device(kr_protocol::ids::DeviceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0x71; 16]),
+            )),
+        ),
+    ]);
+    controller.barrier(own).await.expect("a barrier");
+    let both = kr_protocol::ids::AuthorityRevision::new(revision(&controller).await);
+    let RevisionReach::Within {
+        grants, devices, ..
+    } = controller.revision_notice(both, 0, &stating()).reach
+    else {
+        panic!("a grant and a device are named");
+    };
+    assert_eq!((grants.len(), devices.len()), (2, 1));
+
+    for position in 0..3 {
+        let mut debts = vec![
+            (
+                controller
+                    .owe_debt("a", grants_reach(&[0x63]))
+                    .expect("written"),
+                grants_reach(&[0x63]),
+            ),
+            (
+                controller
+                    .owe_debt("b", grants_reach(&[0x64]))
+                    .expect("written"),
+                grants_reach(&[0x64]),
+            ),
+        ];
+        debts.insert(
+            position,
+            (
+                controller
+                    .owe_debt("the host", Reach::Host)
+                    .expect("written"),
+                Reach::Host,
+            ),
+        );
+        let own = controller.publish_debts(&debts);
+        controller.barrier(own).await.expect("a barrier");
+        let revision = kr_protocol::ids::AuthorityRevision::new(revision(&controller).await);
+        assert_eq!(
+            controller.revision_notice(revision, 0, &stating()).reach,
+            RevisionReach::Host,
+            "a restriction that reaches the host is the host's whatever else it took ({position})"
+        );
+    }
+    drop(controller);
+}
+
+/// KR-REQ-10.45: a worker that has missed some revisions, or that is told of a later revision than
+/// the one that was written, is told what the revisions it has not fenced withdrew: the reaches of
+/// the consecutive revisions that name their authority are joined, back to the first one that
+/// cannot be named, which the notice says it follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revision_is_announced_with_the_reach_of_the_revisions_before_it_that_name_theirs() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+
+    let host = barrier_for(&controller, Reach::Host).await;
+    let first = barrier_for(&controller, grants_reach(&[0x61])).await;
+    let second = barrier_for(&controller, grants_reach(&[0x62])).await;
+    assert_eq!(
+        controller.revision_notice(second, 0, &stating()).reach,
+        within(host, &[0x61, 0x62]),
+        "the two revisions after the one that reached the host"
+    );
+    assert_eq!(
+        controller.revision_notice(first, 0, &stating()).reach,
+        within(host, &[0x61]),
+        "a revision announced after a later one was written is described as it was"
+    );
+    assert!(
+        controller
+            .revision_notice(host, 0, &stating())
+            .reach
+            .is_host()
+    );
+    drop(controller);
+}
+
+/// KR-REQ-10.45: a reach is never larger than a notice should carry: one revision that names too
+/// many is the whole host's, and a revision joins to the ones before it only while the joined reach
+/// is within the bound, the notice following the first it could not take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reach_that_names_too_many_is_the_host_and_a_join_stops_at_the_bound() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+    let many = |first: u32, count: u32| {
+        Reach::Grants(
+            (first..first + count)
+                .map(|number| {
+                    let mut bytes = [0_u8; 16];
+                    bytes[..4].copy_from_slice(&number.to_be_bytes());
+                    kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+                })
+                .collect(),
+        )
+    };
+    let bound = u32::try_from(kr_protocol::worker::MAX_REVISION_REACH_NAMES).expect("fits");
+
+    let over = barrier_for(&controller, many(1, bound + 1)).await;
+    assert!(
+        controller
+            .revision_notice(over, 0, &stating())
+            .reach
+            .is_host()
+    );
+
+    let big = barrier_for(&controller, many(1, bound - 10)).await;
+    let small = barrier_for(&controller, many(1_000_000, 20)).await;
+    let kr_protocol::worker::RevisionReach::Within { since, grants, .. } =
+        controller.revision_notice(small, 0, &stating()).reach
+    else {
+        panic!("the revision names its grants");
+    };
+    assert_eq!(
+        since, big,
+        "the revision before it would take the notice over the bound"
+    );
+    assert_eq!(grants.len(), 20);
+    drop(controller);
+}
+
+/// A grant of the kind a device holds below another, for the store.
+fn a_held_grant(
+    id: kr_protocol::ids::GrantId,
+    parent: Option<kr_protocol::ids::GrantId>,
+) -> kr_protocol::grant::Grant {
+    use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{AuthorityRevision, DeviceId};
+    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
+
+    kr_protocol::grant::Grant {
+        grant_id: id,
+        parent_grant_id: Nullable(parent),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([0xf1; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [kr_protocol::rights::ActionRight::SessionView]
+            .into_iter()
+            .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(1)),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    }
+}
+
+/// KR-REQ-10.45: a revocation fences everything of its subtree that anyone held, not only what
+/// it revoked itself. A grant a concurrent revocation withdrew just before the subtree was read is
+/// already revoked and is not this call's, and its own change may not have raised its barrier yet;
+/// the barrier of the revocation that reaches it names it, and a proposal nobody redeemed, which
+/// has no holder, is not named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revocation_names_every_held_grant_of_its_subtree_including_one_revoked_a_moment_before()
+{
+    use kr_protocol::worker::RevisionReach;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+    let (parent, child, proposal) = (a_grant(0x81), a_grant(0x82), a_grant(0x83));
+    for (id, parent_id, activated) in [
+        (parent, None, true),
+        (child, Some(parent), true),
+        (proposal, Some(parent), false),
+    ] {
+        controller
+            .sharing()
+            .grants()
+            .issue(
+                &crate::grants::GrantRecord {
+                    grant: a_held_grant(id, parent_id),
+                    session_id: None,
+                    issued_at_ms: 1_000,
+                    activated_at_ms: activated.then_some(1_000),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("written");
+    }
+
+    // The child's revocation has committed and has not published its debt.
+    controller
+        .sharing()
+        .revoke(child, 2_000, || Ok(()), None)
+        .expect("the child is revoked");
+
+    let before = revision(&controller).await;
+    controller
+        .revoke_grant(parent, super::Audience::Host, None, None)
+        .await
+        .expect("the parent is revoked");
+    let revision = kr_protocol::ids::AuthorityRevision::new(revision(&controller).await);
+    assert_eq!(revision.get(), before + 1);
+    let RevisionReach::Within { grants, .. } =
+        controller.revision_notice(revision, 0, &stating()).reach
+    else {
+        panic!("the revocation names its grants");
+    };
+    assert!(grants.contains(&parent), "the parent");
+    assert!(
+        grants.contains(&child),
+        "the child a concurrent revocation withdrew first"
+    );
+    assert!(
+        !grants.contains(&proposal),
+        "a proposal nobody redeemed has no holder"
     );
     drop(controller);
 }
