@@ -579,6 +579,14 @@ fn guards_of(attach: u32) -> usize {
 /// that the reader has everything the guard wrote. A test that says the guard wrote *nothing* of
 /// some kind can look only after this: before it, the absence is the guard not having got there.
 ///
+/// The guard is not the only thing that writes to the terminal once its attach process is gone. The
+/// shell that ran the command writes how the command ended, when it gets to collecting the status,
+/// and that can be after the guard has ended. A line typed before that report is whole can be
+/// echoed in two pieces with the report between them (the Linux line discipline does, when the
+/// writes meet), and the line is then never in the output as one. So the line is typed once the
+/// shell has said how the command ended: its report, `attach-finished-<status>`, is the last thing
+/// written to the terminal before the shell waits for input. The caller's command line prints it.
+///
 /// `guard` is the guard's identity, read while its attach process was still running. The terminal
 /// has to echo: it is in the modes the guard restored, which are the ones it had before the
 /// attachment took it, and a terminal that does not say so here fails this wait.
@@ -601,6 +609,7 @@ fn after_the_guard_wrote(
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    exit_status(output, "attach-finished-");
     let line = format!("kr-after-the-guard-{}", kr_ipc::new_uuid());
     let typed = format!("{line}\n");
     let mut rest = typed.as_bytes();
