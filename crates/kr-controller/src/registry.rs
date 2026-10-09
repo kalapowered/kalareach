@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -943,6 +943,7 @@ impl Registry {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -952,6 +953,7 @@ impl Registry {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -960,6 +962,7 @@ impl Registry {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -967,23 +970,31 @@ impl Registry {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
             }
-            Some(8) => self.migrate_8_to_9()?,
+            Some(8) => {
+                self.migrate_8_to_9()?;
+                self.migrate_9_to_10()?;
+            }
+            Some(9) => self.migrate_9_to_10()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1281,6 +1292,24 @@ impl Registry {
     fn migrate_8_to_9(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 9", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 9 to 10: the registry keeps two more kinds of answer to an action.
+    ///
+    /// A redemption (`grant.redeem`) keeps its answer, a `GrantRedeemResult`, beside the claim of
+    /// its action, in the commit that activates the grant, and a transfer of control
+    /// (`grant.transfer`) keeps its answer, a `GrantTransferResult`, when it answers. Both are
+    /// read back to a repeat of the action, as the answers to a share and to a revocation are, and
+    /// a release that reads 9 does not know the methods that write them. No row changes, and no
+    /// table: a row of either kind is written only by a release that writes 10.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_9_to_10(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 10", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -4309,7 +4338,13 @@ mod tests {
             .expect("sets the file back to the release before");
 
         let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
-        assert_eq!(carried, Some(Carried { from: 7, to: 9 }));
+        assert_eq!(
+            carried,
+            Some(Carried {
+                from: 7,
+                to: SCHEMA_VERSION
+            })
+        );
         let read = Registry::open_to_read(&path, environment()).expect("reads at this version");
         let accepted = read.accepted_configuration().expect("reads the record");
         assert_eq!(accepted.revision, 4);
@@ -4322,6 +4357,46 @@ mod tests {
             .expect("the record is a document this build reads");
         assert_eq!(document.version, 2, "read at the version this build writes");
         assert_eq!(document.revision, 4);
+    }
+
+    /// The release before this one, which reads version 9, kept no answer to a redemption or to a
+    /// transfer of control. A registry it left comes forward to this version with no row changed:
+    /// the answers these methods keep are written by a release that writes 10.
+    #[test]
+    fn a_registry_at_the_version_before_comes_forward_and_changes_no_row() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(Registry::open(&path, environment()).expect("a registry"));
+        let connection = Connection::open(&path).expect("opens");
+        connection
+            .execute("UPDATE schema_version SET version = 9", [])
+            .expect("sets the file back to the release before");
+        let rows = |connection: &Connection| -> i64 {
+            connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM authority_receipts) + (SELECT COUNT(*) FROM grants)",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("counts")
+        };
+        let before = rows(&connection);
+        drop(connection);
+
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(
+            carried,
+            Some(Carried {
+                from: 9,
+                to: SCHEMA_VERSION
+            })
+        );
+        let connection = Connection::open(&path).expect("opens");
+        assert_eq!(rows(&connection), before);
+        let version: i64 = connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("the version");
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     /// A registry that is at this build's schema is not migrated, and one with no log to take in is
