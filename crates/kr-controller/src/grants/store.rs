@@ -370,7 +370,7 @@ impl GrantDirectory {
                      bound_at_ms     INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS exclusive_management_events (
-                     sequence         INTEGER PRIMARY KEY NOT NULL,
+                     sequence         INTEGER PRIMARY KEY AUTOINCREMENT,
                      at_ms            INTEGER NOT NULL,
                      channel          BLOB NOT NULL,
                      organisation_ids BLOB NOT NULL
