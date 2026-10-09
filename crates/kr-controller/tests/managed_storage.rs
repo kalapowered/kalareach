@@ -1473,17 +1473,7 @@ async fn a_woken_carrier_waits_only_for_what_is_left_of_a_delay() {
     // asked to be left alone, and waits the rest.
     timer.advance(Duration::from_secs(100));
     rig.admit(2, &[(3, plaintext(2048))]);
-    // A pass the first admission woke may have asked for the whole delay before the clock moved:
-    // that wait was asked for at the earlier reading and is not the one this test is about.
-    let left = within("the rest of the delay", async {
-        loop {
-            let (asked, _) = timer.next_wait().await;
-            if asked < Duration::from_secs(600) {
-                break asked;
-            }
-        }
-    })
-    .await;
+    let (left, _) = within("the rest of the delay", timer.next_wait()).await;
     assert_eq!(left, Duration::from_secs(500));
     assert!(!rig.published(1));
 }
