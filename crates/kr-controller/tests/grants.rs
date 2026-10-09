@@ -3034,10 +3034,10 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
 }
 
 /// A feed that answered that this host was removed from it says so, keeps the last
-/// synchronisation before it, settles what it was still owed, and forgets the removal once the host
-/// reads another feed. The removal survives a restart.
+/// synchronisation before it, and settles what it was still owed. The removal is written down
+/// apart from the record, and a record read back without it does not carry it.
 #[test]
-fn a_removal_the_feed_answered_is_shown_kept_across_a_restart_and_forgotten_for_another_feed() {
+fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart() {
     let host = device_id(0xf0);
     let mut feed = AuthorityFeed::new(host, AuthorityRevision::new(3));
     feed.enrol(host);
@@ -3098,6 +3098,54 @@ fn a_removal_the_feed_answered_is_shown_kept_across_a_restart_and_forgotten_for_
     assert_eq!(
         restored.status().removed_at_ms,
         Nullable::some(TimestampMs::new(6_000))
+    );
+}
+
+/// A request the host refused after it began to take it is refused again when the feed holds it
+/// again, however long after and whatever the host has issued since: the refusal is kept with the
+/// record, and a request that took effect is never taken for a refused one.
+#[test]
+fn a_request_the_host_refused_after_it_began_is_still_refused_when_it_is_read_back() {
+    let host = device_id(0xf0);
+    let other = device_id(0xf1);
+    let mut feed = AuthorityFeed::new(host, AuthorityRevision::new(3));
+    feed.enrol(host);
+    let request = |byte: u8| kr_protocol::pairing::RevocationRequest {
+        request_id: RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16])),
+        issuer_device_id: other,
+        host_device_id: host,
+        target: kr_protocol::pairing::RevocationTarget::Devices {
+            device_ids: [device_id(0xc0)].into_iter().collect(),
+        },
+        issued_at_ms: TimestampMs::new(1_000),
+        issuer_key_id: kr_protocol::scalars::KeyId::from_bytes([7; 32]),
+        signature: Signature64::from_bytes([0; 64]),
+    };
+    let refused = request(1);
+    let applied = request(2);
+    feed.begin(refused.clone(), AuthorityRevision::new(3), 5_000)
+        .expect("taken");
+    feed.begin(applied.clone(), AuthorityRevision::new(3), 5_000)
+        .expect("taken");
+    feed.took_effect(applied.request_id, AuthorityRevision::new(4));
+
+    feed.note_refusal(refused.request_id, host);
+    feed.note_refusal(applied.request_id, host);
+
+    let restored = AuthorityFeed::restore(&feed.snapshot());
+    assert!(
+        restored
+            .record(refused.request_id)
+            .expect("kept")
+            .is_refused_by(host),
+        "refused, and still refused after a restart"
+    );
+    assert!(
+        !restored
+            .record(applied.request_id)
+            .expect("kept")
+            .is_refused_by(host),
+        "a request that took effect has a revision and is not a refused one"
     );
 }
 
