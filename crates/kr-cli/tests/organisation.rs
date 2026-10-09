@@ -283,3 +283,40 @@ async fn an_enrolment_stops_where_only_an_owner_device_can_go_on() {
         "nothing was enrolled"
     );
 }
+
+/// KR-REQ-17.53: an invitation that requires an organisation names the enrolment the host holds,
+/// so a host enrolled in no such organisation has none to name: `kr pair invite --organisation` is
+/// refused before anybody is asked to confirm anything, saying how a host gets enrolled, and a
+/// file that is larger than any chain a control frame carries is refused before it is read whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_for_an_organisation_the_host_is_not_enrolled_in_is_refused() {
+    let host = Host::start().await;
+    let organisation = OrganisationId::new(Uuid::from_bytes([0x21; 16])).to_string();
+    let output = host.kr(&["pair", "invite", "--view", "--organisation", &organisation]);
+    assert!(!output.status.success(), "nothing to name");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("not enrolled in that organisation"),
+        "{said}\n{}",
+        host.log()
+    );
+    assert!(said.contains("kr organisation enrol"), "{said}");
+    let output = host.kr(&[
+        "pair",
+        "invite",
+        "--view",
+        "--organisation",
+        "not-an-identifier",
+    ]);
+    assert!(!output.status.success(), "an identifier is a UUID");
+
+    let directory = host.temp.root().join("exports");
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let too_large = directory.join("too-large.json");
+    let file = std::fs::File::create(&too_large).expect("creates");
+    file.set_len(2 * 1024 * 1024).expect("a sparse file");
+    let output = host.kr(&["organisation", "enrol", too_large.to_str().expect("a path")]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("larger than any chain"), "{said}");
+}

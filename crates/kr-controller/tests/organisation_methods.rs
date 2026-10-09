@@ -14,6 +14,7 @@ mod organisation_support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use kr_client::pairing::paired::PairedHost;
 use kr_controller::service::{Clocks, WallClock};
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::account::PolicyAuthorityHead;
@@ -23,16 +24,16 @@ use kr_protocol::confirmation::{
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::OrganisationRequirement;
-use kr_protocol::ids::{ActionId, AuthorityRevision, PolicyKeyRevision};
-use kr_protocol::invitation::InviteGrantKind;
+use kr_protocol::ids::{ActionId, AuthorityRevision, DeviceKeyRevision, PolicyKeyRevision};
+use kr_protocol::invitation::{InviteGrantKind, InviteMode, PairInviteParams};
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
     OrganisationEnrolParams, OrganisationEnrolResult, OrganisationListParams,
     OrganisationListResult,
 };
-use kr_protocol::pairing::{KeyPurpose, ProposedGrant, SensitiveAction, key_id};
+use kr_protocol::pairing::{KeyPurpose, NetworkConfig, ProposedGrant, SensitiveAction, key_id};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Nullable, Signature64};
+use kr_protocol::scalars::{Nullable, Signature64, TimestampMs};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Device, Host, RawDevice, connect, pair_with, proposal};
 use organisation_support::Organisation;
@@ -59,6 +60,24 @@ fn enrol_params(organisation: &Organisation, now: u64) -> OrganisationEnrolParam
 
 fn subject(params: &OrganisationEnrolParams) -> ConfirmationSubject {
     ConfirmationSubject::EnrolOrganisation(Box::new(params.clone()))
+}
+
+/// The record an owner's device keeps of `host`, from what the host says of itself.
+fn paired_host(host: &Host) -> PairedHost {
+    let owner = host.owner.clone().expect("the owner device");
+    let identity = host.network().pairing().identity();
+    PairedHost {
+        host_device_id: identity.device_id,
+        host_key_revision: DeviceKeyRevision::new(1),
+        host_keys: identity.keys,
+        host_endpoint_id: host.network().endpoint_id(),
+        network_config: NetworkConfig::empty(),
+        device_id: owner.device_id,
+        grant_id: owner.grant.grant_id,
+        proposed_grant: kr_pairing::grants::personal_owner_grant(),
+        name: Some("studio".to_owned()),
+        paired_at_ms: owner.paired_at_ms.get(),
+    }
 }
 
 async fn list(client: &mut kr_ipc::client::LocalClient) -> OrganisationListResult {
@@ -143,6 +162,43 @@ async fn a_daemon_is_enrolled_from_a_signed_chain_on_an_owner_devices_confirmati
         "{:?}",
         shown.display
     );
+    // The owner's client checks what it is shown against the digest it is asked to sign, on the
+    // host it knows, before it signs: a display that differs in any member, an activation time
+    // included, is refused, and the line its platform's dialog shows names both keys.
+    let paired = paired_host(&host);
+    let subject_checked = kr_client::pairing::owner::check(shown, &paired)
+        .expect("the owner's client takes the challenge the host issued");
+    assert_eq!(
+        subject_checked,
+        kr_client::pairing::owner::Subject::EnrolOrganisation(plan)
+    );
+    let line = kr_client::pairing::owner::reason(&subject_checked, "studio", now)
+        .expect("a line for the dialog");
+    assert!(line.contains(" on studio"), "{line}");
+    let mut altered = plan;
+    altered.anchor.not_before_ms = TimestampMs::new(plan.anchor.not_before_ms.get() + 1);
+    let swapped = kr_protocol::confirmation::PendingConfirmation {
+        display: altered.display(),
+        ..shown.clone()
+    };
+    assert_eq!(
+        kr_client::pairing::owner::check(&swapped, &paired),
+        Err(kr_client::pairing::owner::CannotCheck::DigestMismatch),
+        "a display that differs from what the digest covers is not signed"
+    );
+    let elsewhere = PairedHost {
+        host_endpoint_id: DeviceKeys::generate()
+            .expect("keys")
+            .public_keys()
+            .transport,
+        ..paired.clone()
+    };
+    assert_eq!(
+        kr_client::pairing::owner::check(shown, &elsewhere),
+        Err(kr_client::pairing::owner::CannotCheck::AnotherHost),
+        "and neither is a challenge of another host"
+    );
+
     let (proof, bootstrap) = calls::sign(&challenge.request, &Signer::OwnerDevice(&owner));
     calls::complete(host.environment_id, &mut client, proof, bootstrap)
         .await
@@ -345,6 +401,16 @@ async fn a_chain_that_does_not_verify_is_not_shown_to_an_owner() {
             "{name}: {refused:?}"
         );
     }
+    // A change of exclusive management is described by this host's policy and not by the caller,
+    // so a caller cannot obtain a confirmation of one by naming it.
+    let refused = calls::request(
+        host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+    )
+    .await
+    .expect_err("this host describes no change of exclusive management to an owner");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
     assert!(
         calls::pending(&mut client)
             .await
@@ -616,7 +682,40 @@ async fn an_invitation_proposes_only_an_organisation_this_host_is_enrolled_in() 
             ErrorCode::InvalidArgument,
             "{name}: {refused:?}"
         );
+        // The invitation's own check does not depend on the request for a confirmation having
+        // refused first: with no confirmation at all, the proposal is refused for what it
+        // requires, and a conforming one is asked for its confirmation instead.
+        let refused = calls::mutate::<_, kr_protocol::invitation::PairInviteResult>(
+            host.environment_id,
+            &mut client,
+            Method::PairInvite,
+            &PairInviteParams {
+                mode: InviteMode::Direct,
+                grant_kind: InviteGrantKind::SessionInvitation,
+                proposed_grant: grant,
+            },
+        )
+        .await
+        .expect_err(name);
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidArgument,
+            "{name} at the invitation: {refused:?}"
+        );
     }
+    let unconfirmed = calls::mutate::<_, kr_protocol::invitation::PairInviteResult>(
+        host.environment_id,
+        &mut client,
+        Method::PairInvite,
+        &PairInviteParams {
+            mode: InviteMode::Direct,
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: member_grant(&organisation, revision, &[ActionRight::SessionView]),
+        },
+    )
+    .await
+    .expect_err("a conforming proposal still needs the owner's confirmation");
+    assert_eq!(unconfirmed.code, ErrorCode::OwnerConfirmationRequired);
 
     // The control: a proposal that conforms pairs a member device whose grant keeps the
     // requirement it was issued with.
@@ -740,6 +839,51 @@ async fn a_head_that_runs_out_while_the_enrolment_waits_for_the_store_enrols_not
         "only the first chain is enrolled"
     );
     assert_ne!(listed.enrolments[0].organisation_id, late.organisation_id);
+    host.stop().await;
+}
+
+/// KR-REQ-17.53: the owner's confirmation is a decision made now, and the enrolment asks whether
+/// it still is where it writes the policy. A confirmation whose short life passes while the
+/// enrolment waits for the store enrols nothing and is spent; the owner confirms the chain again,
+/// and the same enrolment then goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_that_runs_out_while_the_enrolment_waits_for_the_store_enrols_nothing() {
+    let owner = keys();
+    let host = Host::start(&owner).await;
+    let client = host.client().await;
+    let (organisation, now) = organisation(0x21);
+    let params = enrol_params(&organisation, now);
+    let signer = Signer::OwnerDevice(&owner);
+    let mut client = client;
+    calls::confirm_subject(host.environment_id, &mut client, subject(&params), &signer)
+        .await
+        .expect("the owner confirms the chain");
+
+    let owner_authority = Arc::clone(host.controller().owner_authority());
+    let (mut client, answer) = enrol_while_it_waits(&host, client, &params, async || {
+        owner_authority.pass(std::time::Duration::from_secs(10 * 60));
+    })
+    .await;
+    let refused = answer.expect_err("the confirmation ran out before the policy was written");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        list(&mut client).await.enrolments.is_empty(),
+        "nothing was enrolled"
+    );
+
+    // The control: a confirmation inside its life enrols the same chain.
+    calls::confirm_subject(host.environment_id, &mut client, subject(&params), &signer)
+        .await
+        .expect("the owner confirms the chain again");
+    enrol(
+        &host,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        &params,
+    )
+    .await
+    .expect("and the host enrols");
+    assert_eq!(list(&mut client).await.enrolments.len(), 1);
     host.stop().await;
 }
 
