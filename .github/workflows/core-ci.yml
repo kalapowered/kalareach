@@ -464,7 +464,7 @@ jobs:
         id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: windows
+          name: windows-trial
 
       # The ARM64 compile's output apart from the x86-64 build's, which the other leg saves: the leg
       # that compiles for ARM64 saves this one, so the x86-64 output is not saved twice.
@@ -473,7 +473,7 @@ jobs:
         if: ${{ matrix.part == 'second' }}
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: windows-arm64
+          name: windows-arm64-trial
           paths: target/aarch64-pc-windows-msvc
 
       # On Windows, libsodium-sys-stable's build script downloads libsodium's prebuilt libraries
