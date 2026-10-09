@@ -8930,6 +8930,18 @@ async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_ag
             found.contains(remedy) && found.contains("no new session is created"),
             "{what}: kr doctor says what happens and how to put it right: {report}"
         );
+        let descriptions = report["doctor"]["checks"]
+            .as_array()
+            .and_then(|checks| checks.iter().find(|check| check["id"] == "descriptions"))
+            .expect("the diagnostics check descriptions");
+        assert!(
+            descriptions["remedy"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("configuration document"),
+            "{what}: descriptions are off, and the check does not send a person to a command the \
+             unusable document refuses: {descriptions}"
+        );
         assert!(!host.descriptions_are_on(), "{what}: descriptions are off");
         let (output, said) = host.kr_new();
         assert!(
@@ -8946,7 +8958,6 @@ async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_ag
             "{what}: and not the path of the host's own directories: {said}"
         );
         // A command that edits the document is refused with the same words and leaves the file.
-        let before = std::fs::read(host.configuration_document()).expect("the document");
         let (edit, refused) = host.kr_json(&["host", "startup", "--set", "standalone", "--json"]);
         assert!(!edit.status.success(), "{what}: {refused}");
         assert!(
@@ -8958,8 +8969,8 @@ async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_ag
         );
         assert_eq!(
             std::fs::read(host.configuration_document()).expect("the document"),
-            before,
-            "{what}: the file is left as it was"
+            contents,
+            "{what}: through the doctor, the refused create and the refused edit, the file is as it was written"
         );
 
         // Rewritten, the next create is made and descriptions are on again.
@@ -9056,6 +9067,78 @@ async fn a_create_repeated_after_the_document_breaks_is_answered_and_a_new_one_i
         refused.code,
         kr_protocol::error::ErrorCode::HostNotConfigured,
         "{refused:?}"
+    );
+}
+
+/// KR-REQ-26.13: a create made right after the document is put right, with nothing asking the host
+/// what it is configured as first, is made under what the document now says: the host accepts the
+/// document before it reads what the session is started with, so the variable the owner added is
+/// the session's. A direct create is how an app or a paired device creates; `kr new` asks the host
+/// first and would not show it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_made_right_after_the_document_is_put_right_takes_what_it_now_says() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    host.write_the_configuration_as(br#"{"version": 3}"#, 0o600);
+    host.doctor();
+
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let params = host.headless_create_params();
+    let refused = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.tree.environment_id()),
+            &params,
+        )
+        .await
+        .expect("the host answers")
+        .expect_err("refused while the document cannot be used");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::HostNotConfigured,
+        "{refused:?}"
+    );
+
+    // Put right, with a variable added to every session this host starts; nothing asks the host
+    // what it is configured as before the create.
+    host.write_the_configuration_as(
+        br#"{"version": 2, "preferences": {"environment_additions": {"PATH": "/usr/bin:/bin"}}}"#,
+        0o600,
+    );
+    let created: kr_protocol::session::SessionCreateResult = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.tree.environment_id()),
+            &params,
+        )
+        .await
+        .expect("the host answers")
+        .expect("the document is put right, so the create is made")
+        .to_typed()
+        .expect("decodes");
+    assert!(!created.deduplicated);
+    let report = host.doctor();
+    let sessions = report["session_environments"]["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["path"] == "configured_addition"),
+        "the session was started with the variable the document now adds: {report}"
     );
 }
 

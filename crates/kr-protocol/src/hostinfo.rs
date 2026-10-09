@@ -2376,9 +2376,11 @@ pub mod configuration {
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
         /// and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and
         /// account service, plugin repositories and the managed storage service. Nothing goes
-        /// around it, so an address it cannot reach fails. Name lookups and mail submission do not
-        /// use it. It is this machine's own choice: no invitation or host bundle carries it. It
-        /// names no user and no password, because a proxy that needs credentials is not supported.
+        /// around it, so an address it cannot reach fails, and a daemon that started over a
+        /// document it could not use sends nothing through these routes until it starts again
+        /// over one it can. Name lookups and mail submission do not use it. It is this
+        /// machine's own choice: no invitation or host bundle carries it. It names no user and
+        /// no password, because a proxy that needs credentials is not supported.
         pub proxy_url: Nullable<String>,
     }
 
@@ -2670,7 +2672,7 @@ pub mod configuration {
         pub detail: super::export::Sentence,
     }
 
-    /// A document this host read, or the reason it is using defaults instead.
+    /// A document this host read, or the reason it cannot use one, which makes it fail closed.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Loaded {
         /// The document, when one could be used.

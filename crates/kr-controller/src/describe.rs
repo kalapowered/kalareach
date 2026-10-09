@@ -419,7 +419,11 @@ impl DescribeModule {
             (None, _) => (
                 DoctorStatus::NotApplicable,
                 Sentence::new().stated("this daemon is not generating session descriptions"),
-                None,
+                // A document this host cannot use turns them off, and every edit of it is refused,
+                // so the command that would turn them on cannot; the document is what to put right.
+                unusable.map(|_| {
+                    "Descriptions are off because the configuration document cannot be used; the check of that document says how to put it right."
+                }),
             ),
             (Some(_), Some(reason)) => (
                 DoctorStatus::NotApplicable,
@@ -434,8 +438,6 @@ impl DescribeModule {
             (Some(_), None) if !settings.enabled => (
                 DoctorStatus::NotApplicable,
                 Sentence::new().stated("descriptions are off; nothing new is generated, and a session shows the title it has from metadata, a pin or an earlier description"),
-                // A document this host cannot use turned them off, and every edit of it is refused,
-                // so the command that would turn them on cannot; the document is what to put right.
                 Some(if unusable.is_some() {
                     "Descriptions are off because the configuration document cannot be used; the check of that document says how to put it right."
                 } else {

@@ -924,7 +924,7 @@ async fn a_narrowed_ceiling_fences_a_device_before_the_edit_is_acknowledged() {
 /// KR-REQ-26.15: a configured budget more permissive than section 11 allows never applies.
 ///
 /// Two gates, and this shows both. The document is refused when it is read, so nothing is taken
-/// out of it and every value is the product default; and the intersection refuses the budget on
+/// out of it and the host fails closed; and the intersection refuses the budget on
 /// its own account, so a document that reached the ceiling function by some other path would still
 /// not get what it asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
