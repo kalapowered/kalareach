@@ -90,6 +90,9 @@ kr-controller = { workspace = true, features = ["testing"] }
 kr-describe = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-transport.workspace = true
+# A real session worker, with its question ledger and its admission of every caller, for the suite
+# that answers an agent's questions on one.
+kr-worker.workspace = true
 tempfile.workspace = true
 # Paused time, so the phone session's waits run in a test without taking that long, and the
 # pairing suite's multi-threaded runtime.

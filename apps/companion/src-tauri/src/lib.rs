@@ -34,6 +34,7 @@ pub mod export;
 pub mod links;
 pub mod owner;
 pub mod pairing;
+pub mod questions;
 pub mod remote;
 pub mod setup;
 pub mod state;
