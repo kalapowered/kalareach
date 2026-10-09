@@ -229,3 +229,109 @@ fn a_process_that_runs_a_new_program_while_it_is_being_stopped_is_still_stopped(
     assert!(ended(&mut child.0), "and it ends");
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// A process that holds the signals a stop sends, and, when the test says so, writes down which of
+/// them are waiting for it, one word to a line.
+///
+/// It blocks them and sets its own handlers, so a hang-up that the test process inherited as ignored
+/// (as it is under `nohup`) is not one this process ignores, and a signal sent to it stays pending
+/// until the test asks: a stop has sent every signal it sends by the time it returns, so what is
+/// pending then is everything it sent, and the answer does not rest on how long anything took.
+#[cfg(unix)]
+fn holding(trigger: &std::path::Path, ready: &std::path::Path, report: &std::path::Path) -> Child {
+    const PROGRAM: &str = r#"
+        use POSIX qw(sigprocmask sigpending SIG_BLOCK SIGHUP SIGTERM SIGCONT);
+        my ($trigger, $ready, $report) = @ARGV;
+        $SIG{HUP} = sub { };
+        $SIG{TERM} = sub { };
+        $SIG{CONT} = sub { };
+        my $held = POSIX::SigSet->new(SIGHUP, SIGTERM, SIGCONT);
+        sigprocmask(SIG_BLOCK, $held);
+        open(my $out, '>', $ready); close $out;
+        select(undef, undef, undef, 0.02) until -e $trigger;
+        my $pending = POSIX::SigSet->new;
+        sigpending($pending);
+        open($out, '>', "$report.part");
+        print $out "HUP\n" if $pending->ismember(SIGHUP);
+        print $out "TERM\n" if $pending->ismember(SIGTERM);
+        print $out "CONT\n" if $pending->ismember(SIGCONT);
+        close $out;
+        rename "$report.part", $report;
+        select(undef, undef, undef, 0.02) while 1;
+    "#;
+    Command::new("/usr/bin/perl")
+        .args(["-e", PROGRAM])
+        .arg(trigger)
+        .arg(ready)
+        .arg(report)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starts the process")
+}
+
+/// Waits until the process holds the signals, sends one request, asks the process which signals are
+/// waiting for it, and returns them.
+#[cfg(unix)]
+fn signals_sent(stop: Stop) -> Vec<String> {
+    let directory = std::env::temp_dir().join(format!(
+        "kr-stop-{}-{}",
+        std::process::id(),
+        kr_ipc::new_uuid()
+    ));
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let (trigger, ready, report) = (
+        directory.join("trigger"),
+        directory.join("ready"),
+        directory.join("report"),
+    );
+    let child = Reaped(holding(&trigger, &ready, &report));
+    let identity = identity_of(&child.0);
+    let started = Instant::now();
+    while !ready.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the process never held the signals"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(stop_process(&identity, stop), Stopped::Signalled);
+    std::fs::write(&trigger, b"").expect("asks which are waiting");
+    let started = Instant::now();
+    while !report.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the process never said which signals were waiting"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let seen = std::fs::read_to_string(&report)
+        .expect("the report")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let _ = std::fs::remove_dir_all(&directory);
+    seen
+}
+
+/// A request to terminate that is not a hang-up is a terminate and a continue and nothing else, and
+/// a hang-up is a hang-up and a continue: the server of an application dies on the one and ends
+/// what it started on the other.
+#[cfg(unix)]
+#[test]
+fn a_terminate_without_a_hang_up_and_a_hang_up_alone_send_what_they_name() {
+    assert_eq!(signals_sent(Stop::Term), ["TERM", "CONT"]);
+    assert_eq!(signals_sent(Stop::Hangup), ["HUP", "CONT"]);
+    assert_eq!(signals_sent(Stop::Terminate), ["HUP", "TERM", "CONT"]);
+}
+
+#[cfg(windows)]
+#[test]
+fn no_request_but_force_is_made_to_a_process_on_this_platform() {
+    let child = Reaped(stubborn());
+    let identity = identity_of(&child.0);
+    assert_eq!(stop_process(&identity, Stop::Term), Stopped::Unsupported);
+    assert_eq!(stop_process(&identity, Stop::Hangup), Stopped::Unsupported);
+    assert_eq!(process_state(&identity), ProcessState::Running);
+}
