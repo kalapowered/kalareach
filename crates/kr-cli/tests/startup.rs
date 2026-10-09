@@ -12,10 +12,11 @@
 //! come up and is then used. The start is selected by a command that needs no daemon, on a host
 //! where none has ever run, and `kr doctor` reports it with the document it came from.
 //! KR-REQ-07.13: with the start selected, neither the command that selects it nor the `kr new`
-//! that starts the daemon runs a service-manager, lingering or privilege tool, the daemon it starts
-//! runs nothing but read-only queries of the service manager (and, when it is started inside a
-//! service this host started, the one transient scope it moves itself into), and nothing is written
-//! in the home they are given. KR-REQ-08.02: `kr status` on a session the started daemon holds reports each
+//! that starts the daemon runs a service-manager, lingering or privilege tool, and the daemon it
+//! starts runs, while it starts, nothing but read-only queries of the service manager (and, when it
+//! is started inside a service this host started, the one transient scope it moves itself into);
+//! once it serves, with a manager to ask, it launches its workers as transient services. Nothing is
+//! written in the home they are given. KR-REQ-08.02: `kr status` on a session the started daemon holds reports each
 //! terminal attachment's presentation and the reason for it.
 //!
 //! The installation is laid out the way a package lays it out: `kr`, its restoration guard, the
@@ -898,9 +899,28 @@ struct Allowance<'a> {
     /// The daemon's own program, when it was started inside a service this host started: it may
     /// move itself into one transient scope by running that program there.
     scope_for: Option<&'a Path>,
+    /// Whether the scope's command line carries the flag that stops expansion of `$` in the
+    /// arguments, which a systemd from 254 has and the daemon passes to it.
+    no_expansion: bool,
     /// The worker program a daemon of this installation launches as a transient service, as one
     /// does where a service manager answers.
     workers: Option<&'a Path>,
+}
+
+/// Whether the `systemd-run` this host has takes the flag that stops expansion in a scope's
+/// command line, which it does from systemd 254.
+#[cfg(target_os = "linux")]
+fn systemd_run_stops_expansion() -> bool {
+    let output = Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .expect("systemd-run reports its version");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|version| version.parse::<u32>().ok())
+        .expect("a version number")
+        >= 254
 }
 
 /// Whether one recorded call is one the standalone start may make.
@@ -936,9 +956,10 @@ fn allowed(call: &Recorded, daemons: &[u32], allowance: Allowance<'_>) -> Result
             else {
                 return false;
             };
-            let rest = match rest {
-                ["--expand-environment=no", more @ ..] => more,
-                other => other,
+            let rest = match (rest, allowance.no_expansion) {
+                (["--expand-environment=no", more @ ..], true) => more,
+                (other, false) => other,
+                _ => return false,
             };
             matches!(
                 rest,
@@ -948,21 +969,37 @@ fn allowed(call: &Recorded, daemons: &[u32], allowance: Allowance<'_>) -> Result
                         && started_with.contains(&"--own-session")
             )
         });
+    // The forms the supervisor writes for a worker, in its order: the unit, the options it sets,
+    // then the worker's program first and its reservation, the unit's own.
     let worker = call.tool == "systemd-run"
         && allowance.workers.is_some_and(|program| {
-            let ["--user", unit, "--collect", ..] = arguments.as_slice() else {
+            let ["--user", unit, "--collect", rest @ ..] = arguments.as_slice() else {
                 return false;
             };
             let Some(reservation) = unit.strip_prefix("--unit=kr-worker-") else {
                 return false;
             };
-            arguments
-                .iter()
-                .position(|argument| Path::new(argument) == program)
-                .is_some_and(|at| {
-                    arguments.get(at + 1) == Some(&"--reservation")
-                        && arguments.get(at + 2) == Some(&reservation)
-                })
+            let mut rest = rest.iter();
+            while let Some(argument) = rest.next() {
+                let option = match *argument {
+                    "-p" => rest.next().is_some_and(|value| {
+                        value == &"Type=exec"
+                            || value == &"Restart=no"
+                            || value.starts_with("WorkingDirectory=")
+                    }),
+                    "--quiet" => true,
+                    other => {
+                        other.starts_with("--setenv=")
+                            || other.starts_with("--property=UnsetEnvironment=")
+                    }
+                };
+                if !option {
+                    return Path::new(argument) == program
+                        && rest.next() == Some(&"--reservation")
+                        && rest.next() == Some(&reservation);
+                }
+            }
+            false
         });
     if query || own_scope || worker {
         Ok(())
@@ -1283,10 +1320,16 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
     let worker_program = Path::new("/opt/kr/kr-worker");
     let inside = Allowance {
         scope_for: Some(program),
+        no_expansion: false,
         workers: None,
+    };
+    let expanding_off = Allowance {
+        no_expansion: true,
+        ..inside
     };
     let everything = Allowance {
         scope_for: Some(program),
+        no_expansion: false,
         workers: Some(worker_program),
     };
     for allowance in [Allowance::default(), inside, everything] {
@@ -1436,62 +1479,78 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
     )
     .map(str::to_owned)
     .to_vec();
+    assert!(
+        own_scope(1, daemon, &expanding, expanding_off).is_err(),
+        "where the tool stops expansion the scope carries the flag that says so"
+    );
     expanding.insert(4, "--expand-environment=no".to_owned());
     assert_eq!(
-        own_scope(1, daemon, &expanding, inside),
+        own_scope(1, daemon, &expanding, expanding_off),
         Ok(()),
-        "from systemd 258 the scope carries the one flag that stops expansion"
+        "and with it the scope is the one call"
+    );
+    assert!(
+        own_scope(1, daemon, &expanding, inside).is_err(),
+        "where the tool has no such flag a scope that carries it is refused: it would not start"
     );
     expanding[4] = "--expand-environment=yes".to_owned();
     assert!(
-        own_scope(1, daemon, &expanding, inside).is_err(),
-        "and no other form of it"
+        own_scope(1, daemon, &expanding, expanding_off).is_err(),
+        "and no other form of the flag"
     );
 
     // A worker's transient service is the supervisor's, only where the daemon has a manager, and
     // only for the worker program a daemon of the installation launches.
-    let worker = |program: &'static str, reservation: &'static str| {
-        [
-            "--user",
-            "--unit=kr-worker-0123",
-            "--collect",
-            "-p",
-            "Type=exec",
-            "--quiet",
-            program,
-            "--reservation",
-            reservation,
-        ]
+    let worker = |options: &[&'static str], program: &'static str, reservation: &'static str| {
+        let mut arguments = vec!["--user", "--unit=kr-worker-0123", "--collect"];
+        arguments.extend(options);
+        arguments.extend([program, "--reservation", reservation]);
+        arguments
     };
-    assert!(
-        allowed(
-            &call(
-                1,
-                daemon,
-                "systemd-run",
-                &worker("/opt/kr/kr-worker", "0123")
-            ),
-            &[daemon],
-            inside
-        )
-        .is_err()
-    );
+    let written = ["-p", "Type=exec", "-p", "Restart=no", "--quiet"];
+    let good = worker(&written, "/opt/kr/kr-worker", "0123");
+    assert!(allowed(&call(1, daemon, "systemd-run", &good), &[daemon], inside).is_err());
     assert_eq!(
         allowed(
-            &call(
-                daemon,
-                daemon + 1,
-                "systemd-run",
-                &worker("/opt/kr/kr-worker", "0123")
-            ),
+            &call(daemon, daemon + 1, "systemd-run", &good),
             &[daemon],
             everything
         ),
         Ok(())
     );
     for (what, arguments) in [
-        ("another program", worker("/bin/sh", "0123")),
-        ("another reservation", worker("/opt/kr/kr-worker", "4567")),
+        ("another program", worker(&written, "/bin/sh", "0123")),
+        (
+            "another reservation",
+            worker(&written, "/opt/kr/kr-worker", "4567"),
+        ),
+        (
+            "a unit of the system manager",
+            worker(&["--system"], "/opt/kr/kr-worker", "0123"),
+        ),
+        ("a scope", worker(&["--scope"], "/opt/kr/kr-worker", "0123")),
+        (
+            "a command before the worker's",
+            vec![
+                "--user",
+                "--unit=kr-worker-0123",
+                "--collect",
+                "/bin/sh",
+                "-c",
+                "exit 0",
+                "/opt/kr/kr-worker",
+                "--reservation",
+                "0123",
+            ],
+        ),
+        (
+            "a property that runs a command first",
+            worker(
+                &["-p", "ExecStartPre=/bin/true"],
+                "/opt/kr/kr-worker",
+                "0123",
+            ),
+        ),
     ] {
         assert!(
             allowed(
@@ -1500,7 +1559,7 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
                 everything
             )
             .is_err(),
-            "a service under a worker's name that runs {what} is refused"
+            "a service under a worker's name that is {what} is refused: {arguments:?}"
         );
     }
 }
@@ -3360,6 +3419,12 @@ fn control_group_of(pid: u32) -> String {
         .to_owned()
 }
 
+/// The leaf of the control group the first environment's session runs its worker in.
+#[cfg(target_os = "linux")]
+fn control_group_of_worker(host: &ServiceHost, inside: &Inside) -> String {
+    control_group_of(u32::try_from(inside.worker(host).pid.get()).expect("a pid"))
+}
+
 /// Polls `check` until it gives something, for at most [`LIVENESS_DEADLINE`].
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn until_there<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
@@ -3656,6 +3721,16 @@ impl Inside {
             std::fs::read_to_string(self.said.with_extension(extension)).unwrap_or_default()
         };
         until_there("the second kr new to end", || status.exists().then_some(()));
+        // A daemon held for the first worker to record it is given kr new's own start bound, which
+        // the test cannot lengthen: a worker slow to record it ends the command here, and the
+        // message says so rather than leave it to look like a defect.
+        assert!(
+            !text_of("err").contains("did not answer within"),
+            "precondition: the second kr new gave up waiting for its daemon, which was held until \
+             the first worker recorded it, and the worker took longer than kr new's start bound \
+             to do so: {}",
+            text_of("err")
+        );
         assert_eq!(
             text_of("status").trim(),
             "0",
@@ -3737,6 +3812,10 @@ enum End {
     /// The session is closed: the worker observes its session once more as it closes.
     #[cfg(target_os = "linux")]
     Close,
+    /// The daemon ends after the worker has read it in its scope, and then the session is closed:
+    /// the worker can no longer read the daemon, and has to remember that it left.
+    #[cfg(target_os = "linux")]
+    CloseAfterItEnded,
 }
 
 /// A daemon `kr new` starts from inside a session is still running, and still answers, once that
@@ -3799,6 +3878,24 @@ fn a_daemon_started_from_inside_a_session_outlives_it(recorded: bool, end: End) 
              {record:?}"
         );
     }
+    #[cfg(target_os = "linux")]
+    if matches!(end, End::CloseAfterItEnded) {
+        // The worker has read the daemon in its scope once it no longer records it: the next
+        // observation moved it out. Then the daemon ends, with nothing left to read it by.
+        until_there("the worker to stop recording the daemon", || {
+            (!inside.recorded(&host)?.processes.contains(&started.daemon)).then_some(())
+        });
+        assert!(
+            matches!(
+                kr_ipc::identity::stop_process(&started.daemon, kr_ipc::identity::Stop::Kill),
+                kr_ipc::identity::Stopped::Signalled
+            ),
+            "the daemon is ended"
+        );
+        until_there("the daemon to end", || {
+            (kr_ipc::identity::process_state(&started.daemon) == ProcessState::Ended).then_some(())
+        });
+    }
     match end {
         End::Crash => assert!(
             matches!(
@@ -3808,7 +3905,7 @@ fn a_daemon_started_from_inside_a_session_outlives_it(recorded: bool, end: End) 
             "the worker is killed"
         ),
         #[cfg(target_os = "linux")]
-        End::Close => host.close(&inside.created),
+        End::Close | End::CloseAfterItEnded => host.close(&inside.created),
     }
     let closure = inside.wait_until_closed(&host);
     // On Linux the manager drops a service once nothing is left in it, so its being gone is the
@@ -3823,15 +3920,22 @@ fn a_daemon_started_from_inside_a_session_outlives_it(recorded: bool, end: End) 
         .expect("asks the manager");
         (String::from_utf8_lossy(&shown.stdout).trim() == "not-found").then_some(())
     });
-    assert_eq!(
-        kr_ipc::identity::process_state(&started.daemon),
-        ProcessState::Running,
-        "the second environment's daemon is still running once the first session is over"
-    );
-    assert!(
-        answers(&inside.second.tree.environment()),
-        "and still answers"
-    );
+    // Ended on purpose, the daemon of the last case is gone; the others go on running.
+    #[cfg(target_os = "linux")]
+    let ended_on_purpose = matches!(end, End::CloseAfterItEnded);
+    #[cfg(not(target_os = "linux"))]
+    let ended_on_purpose = false;
+    if !ended_on_purpose {
+        assert_eq!(
+            kr_ipc::identity::process_state(&started.daemon),
+            ProcessState::Running,
+            "the second environment's daemon is still running once the first session is over"
+        );
+        assert!(
+            answers(&inside.second.tree.environment()),
+            "and still answers"
+        );
+    }
     // The closure does not count the daemon among the session's processes, ended or surviving.
     let pid = started.daemon.pid.get();
     assert!(
@@ -3860,7 +3964,7 @@ fn a_daemon_started_from_inside_a_session_outlives_it(recorded: bool, end: End) 
                     && resource.detail.contains(&format!("process {pid} "))
             )
             .count(),
-        usize::from(recorded),
+        usize::from(recorded && !ended_on_purpose),
         "{closure:?}"
     );
     #[cfg(target_os = "linux")]
@@ -3941,6 +4045,14 @@ fn a_daemon_the_worker_recorded_outlives_the_close_of_its_session() {
     a_daemon_started_from_inside_a_session_outlives_it(true, End::Close);
 }
 
+/// KR-REQ-07.12, KR-REQ-07.66: a daemon the worker read in its own scope and that ends before the
+/// session is closed is not a process the session ended: the worker remembers that it left.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_that_left_and_ended_before_the_session_closed_is_not_one_the_session_ended() {
+    a_daemon_started_from_inside_a_session_outlives_it(true, End::CloseAfterItEnded);
+}
+
 /// KR-REQ-07.12, KR-REQ-07.13: a daemon `kr new` starts from inside a service this host started
 /// asks the user's service manager for one transient scope, for itself, and for nothing else in
 /// starting; it is the same process `kr new` started, now in a control group of its own.
@@ -3974,38 +4086,59 @@ fn a_daemon_started_inside_a_service_asks_for_one_scope_and_is_the_process_kr_st
     let program = service_installation().join("daemon").join("kr-controller");
     let worker_program = service_installation().join("daemon").join("kr-worker");
     let recorded = recorded_calls(&calls);
+    let allowance = Allowance {
+        scope_for: Some(&program),
+        no_expansion: systemd_run_stops_expansion(),
+        workers: Some(&worker_program),
+    };
     for call in &recorded {
-        let allowance = Allowance {
-            scope_for: Some(&program),
-            workers: Some(&worker_program),
-        };
         if let Err(refused) = allowed(call, &[daemon], allowance) {
             panic!("{refused}; everything recorded: {recorded:?}");
         }
     }
     // What the daemon starts, apart from the version it reads of the tool it runs: the scope is
-    // the first, it is the only one, and the daemon's own process asks for it.
+    // the first, it is the only one, and the daemon's own process asks for it; then the one worker
+    // of the one session its `kr new` created.
     let launches: Vec<&Recorded> = recorded
         .iter()
         .filter(|call| call.tool == "systemd-run" && call.arguments != ["--version"])
         .collect();
-    let scopes: Vec<&&Recorded> = launches
-        .iter()
-        .filter(|call| call.arguments.iter().any(|argument| argument == "--scope"))
-        .collect();
-    assert_eq!(scopes.len(), 1, "one scope was asked for: {recorded:?}");
-    assert_eq!(scopes[0].pid, daemon, "by the daemon's own process");
-    assert!(
-        std::ptr::eq(*scopes[0], launches[0]),
-        "before anything else was started: {recorded:?}"
+    let is_scope = |call: &&Recorded| call.arguments.iter().any(|argument| argument == "--scope");
+    assert_eq!(
+        launches.iter().filter(|call| is_scope(call)).count(),
+        1,
+        "one scope was asked for: {recorded:?}"
     );
     assert!(
-        recorded.iter().any(|call| call.tool == "systemctl"
-            && call
-                .arguments
-                .iter()
-                .any(|argument| argument == "--property=ControlGroup")),
-        "after asking the manager about the service it is in: {recorded:?}"
+        is_scope(&launches[0]) && launches[0].pid == daemon,
+        "the first thing started is the scope, asked for by the daemon's own process: {recorded:?}"
+    );
+    assert_eq!(
+        launches.len(),
+        2,
+        "and the one worker of the one session: {recorded:?}"
+    );
+    // The manager is asked about the service the daemon is in before the scope is: the first
+    // environment's worker, whose service the second `kr new` ran in.
+    let service = format!("{}.service", control_group_of_worker(&host, &inside));
+    let asked = recorded
+        .iter()
+        .position(|call| {
+            call.tool == "systemctl"
+                && call
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "--property=ControlGroup")
+                && call.arguments.last().map(String::as_str) == Some(service.as_str())
+        })
+        .unwrap_or_else(|| panic!("the manager is asked about {service}: {recorded:?}"));
+    let scoped = recorded
+        .iter()
+        .position(|call| std::ptr::eq(call, launches[0]))
+        .expect("the scope is recorded");
+    assert!(
+        asked < scoped,
+        "and asked before the scope is: {recorded:?}"
     );
     let group = control_group_of(daemon);
     assert!(
@@ -4052,6 +4185,7 @@ fn a_daemon_that_cannot_leave_the_service_it_started_in_is_named_by_the_doctor()
     for call in &recorded {
         let allowance = Allowance {
             scope_for: Some(&program),
+            no_expansion: systemd_run_stops_expansion(),
             workers: None,
         };
         if let Err(refused) = allowed(call, &[daemon], allowance) {
@@ -4127,12 +4261,21 @@ fn a_daemon_started_outside_a_service_asks_for_no_scope() {
     for call in &recorded {
         let allowance = Allowance {
             scope_for: None,
+            no_expansion: false,
             workers: Some(&worker_program),
         };
         if let Err(refused) = allowed(call, &[daemon], allowance) {
             panic!("{refused}; everything recorded: {recorded:?}");
         }
     }
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|call| call.tool == "systemd-run" && call.arguments != ["--version"])
+            .count(),
+        1,
+        "what it started is the one worker of the one session its kr new created: {recorded:?}"
+    );
     assert!(
         !control_group_of(daemon).starts_with("kr-daemon-"),
         "and the daemon is not in a scope of its own"
