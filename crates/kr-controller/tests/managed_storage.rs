@@ -45,6 +45,9 @@ use kr_protocol::archive::{
     BACKUP_WRITER_DOMAIN, BackupWriterRecord, BackupWriterRecordPayload, TrustedWriter,
 };
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::host_account::{
+    AccountReport, AccountSignInParams, AccountState, AccountStatusParams,
+};
 use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
 use kr_protocol::ids::{
     ActionId, ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, BuildId, DeviceId,
@@ -221,13 +224,12 @@ enum Token {
     None,
     /// An account signed in at the service with the scope backup storage needs.
     Usable,
-    /// An account signed in at another service.
-    ForAnotherService,
     /// An account signed in at the service without the scope, as one made before storage was
     /// selected is.
     WithoutTheScope,
-    /// An account signed in at the service whose sign-in the service has since ended.
-    Ended,
+    /// An account signed in at the service whose access token has run out and which the service
+    /// does not answer a renewal for.
+    NotRenewable,
 }
 
 /// What the test arranges before the daemon starts.
@@ -486,11 +488,23 @@ impl Rig {
 
 /// Writes the configuration document that selects `origin`, or one that selects nothing.
 fn write_document(host: &kr_ipc::testing::TempHost, origin: Option<&str>) {
+    write_document_selecting(host, origin, None);
+}
+
+/// Writes the configuration document that selects `storage` as the storage service and `voice` as
+/// the voice broker, either of which may be none.
+fn write_document_selecting(
+    host: &kr_ipc::testing::TempHost,
+    storage: Option<&str>,
+    voice: Option<&str>,
+) {
     let environment = host.environment();
     let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
     document.revision = 1;
     document.storage.origin =
-        origin.map_or_else(Nullable::null, |origin| Nullable::some(origin.to_owned()));
+        storage.map_or_else(Nullable::null, |origin| Nullable::some(origin.to_owned()));
+    document.voice.broker_origin =
+        voice.map_or_else(Nullable::null, |origin| Nullable::some(origin.to_owned()));
     let path = kr_worker::config::document_path(&environment);
     std::fs::create_dir_all(path.parent().expect("a state directory")).expect("the directory");
     kr_ipc::paths::write_owner_only_file(
@@ -514,29 +528,11 @@ async fn sign_in(host: &kr_ipc::testing::TempHost, token: Token, origin: &str) {
             )
             .await;
         }
-        Token::ForAnotherService => {
-            keep_sign_in(
-                host,
-                "https://elsewhere.example",
-                TOKEN,
-                &["openid", "voice", "backup.write"],
-                3600,
-            )
-            .await;
-        }
         Token::WithoutTheScope => {
             keep_sign_in(host, origin, TOKEN, &["openid", "voice"], 3600).await;
         }
-        Token::Ended => {
-            // The access token is at its end, so the first token asked of the sign-in is a
-            // renewal, which the service refuses as it does a sign-in it has ended.
-            let account =
-                keep_sign_in(host, origin, TOKEN, &["openid", "voice", "backup.write"], 0).await;
-            account
-                .tokens()
-                .token("backup.write")
-                .await
-                .expect_err("the service ended the sign-in");
+        Token::NotRenewable => {
+            keep_sign_in(host, origin, TOKEN, &["openid", "voice", "backup.write"], 0).await;
         }
     }
 }
@@ -556,16 +552,18 @@ async fn keep_sign_in(
         Arc::from(store.store),
         host.environment_id(),
         environment.runtime_root(),
-        Some(Service {
+        Ok(Service {
             origin: origin.to_owned(),
-            account: Arc::new(RenewalRefused),
+            scopes: Vec::new(),
+            account: Arc::new(NeverAsked),
         }),
+        None,
     );
     account
         .keep_for_test(IssuedGrant {
             access_token: AccountToken::new(access).expect("a token"),
             expires_in_seconds,
-            refresh_token: RefreshToken::new("a-refresh-token-the-service-ended").expect("a token"),
+            refresh_token: RefreshToken::new("a-refresh-token").expect("a token"),
             scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
             subject: "account-1".to_owned(),
         })
@@ -573,41 +571,39 @@ async fn keep_sign_in(
     account
 }
 
-/// An account service that issues nothing and refuses every renewal, as the service does for a
-/// sign-in it has ended.
+/// The account service of a host that is signed in before its daemon starts: the seeding keeps a
+/// grant and asks the service nothing, so every question it is asked is turned away.
 #[derive(Debug)]
-struct RenewalRefused;
+struct NeverAsked;
 
-impl AccountService for RenewalRefused {
+fn never_asked<T>() -> ServiceFuture<'static, T> {
+    Box::pin(async {
+        Err(kr_client::ClientError::refusal(
+            kr_protocol::error::ErrorCode::ResourceUnavailable,
+            kr_client::shown::Shown::said("this stand-in is never asked"),
+        ))
+    })
+}
+
+impl AccountService for NeverAsked {
     fn exchange<'a>(&'a self, _grant: &'a AuthorisationGrant) -> ServiceFuture<'a, Exchanged> {
-        Box::pin(async { Ok(Exchanged::Refused { leftover: None }) })
+        never_asked()
     }
 
     fn refresh<'a>(&'a self, _stored: &'a StoredGrant) -> ServiceFuture<'a, Refreshed> {
-        Box::pin(async { Ok(Refreshed::Ended) })
+        never_asked()
     }
 
     fn revoke<'a>(&'a self, _refresh: &'a RefreshToken) -> ServiceFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        never_asked()
     }
 
     fn identity<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountIdentity> {
-        Box::pin(async {
-            Ok(AccountIdentity {
-                subject: "account-1".to_owned(),
-                email: None,
-                name: None,
-            })
-        })
+        never_asked()
     }
 
     fn usage<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountUsage> {
-        Box::pin(async {
-            Err(kr_client::ClientError::refusal(
-                kr_protocol::error::ErrorCode::ResourceUnavailable,
-                kr_client::shown::Shown::said("this stand-in reads no usage"),
-            ))
-        })
+        never_asked()
     }
 }
 
@@ -620,43 +616,73 @@ async fn start_daemon(
     kr_ipc::paths::Endpoint,
     Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
 ) {
-    let environment = host.environment();
-    let environment_id = host.environment_id();
-    environment.create().expect("the environment's directories");
-    let secrets = environment.secrets_dir();
-    let controller = kr_controller::testing::taken_over(|| {
-        let secrets = secrets.clone();
-        Controller::start_on_backup_timer(
-            ControllerSetup {
-                paths: environment.clone(),
-                environment_id,
-                identity: Box::new(move || {
-                    let store =
-                        open_store_in(&secrets).expect("a secret store for the test environment");
-                    Ok(
-                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                            .expect("an identity"),
-                    )
-                }),
-                secret_store: StoreSelection::File,
-                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: Box::new(NoWorkers),
-                worker_program: PathBuf::from("/nonexistent/kr-worker"),
-                build_id: build(),
-                release: "0".to_owned(),
-                shell_packages: None,
-                terminal: Box::new(kr_controller::supervision::NoTerminal),
-            },
-            Arc::clone(&timer) as Arc<dyn Timer>,
-        )
-    })
-    .await
-    .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
-    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let controller = try_start_controller(host, timer, selected_origin_of(host))
+        .await
+        .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+    let endpoint = host
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
     let serving = vec![tokio::spawn(Arc::clone(&controller).serve_clients(
         Listener::bind(&endpoint).expect("binds the client endpoint"),
     ))];
     (controller, endpoint, serving)
+}
+
+/// The origin the service the host's document selects for storage is at, or else the voice broker,
+/// which a suite stands the account service at as well, because the managed account service is the
+/// one service a host presents its account token to.
+fn selected_origin_of(host: &kr_ipc::testing::TempHost) -> Option<String> {
+    let bytes = std::fs::read(kr_worker::config::document_path(&host.environment())).ok()?;
+    let document = kr_protocol::hostinfo::configuration::load(Some(&bytes)).document?;
+    document
+        .storage
+        .origin()
+        .or_else(|| document.voice.broker_origin())
+        .map(str::to_owned)
+}
+
+/// Starts a daemon on `host`, whose carrier waits by `timer` and whose account service is at
+/// `account_at`, or says why it does not start.
+async fn try_start_controller(
+    host: &kr_ipc::testing::TempHost,
+    timer: Arc<HeldTimer>,
+    account_at: Option<String>,
+) -> kr_controller::Result<Arc<Controller>> {
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    environment.create().expect("the environment's directories");
+    let secrets = environment.secrets_dir();
+    kr_controller::testing::taken_over(|| {
+        let secrets = secrets.clone();
+        kr_controller::testing::with_account_origin(
+            account_at.clone(),
+            Controller::start_on_backup_timer(
+                ControllerSetup {
+                    paths: environment.clone(),
+                    environment_id,
+                    identity: Box::new(move || {
+                        let store = open_store_in(&secrets)
+                            .expect("a secret store for the test environment");
+                        Ok(
+                            ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                                .expect("an identity"),
+                        )
+                    }),
+                    secret_store: StoreSelection::File,
+                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    supervisor: Box::new(NoWorkers),
+                    worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                    build_id: build(),
+                    release: "0".to_owned(),
+                    shell_packages: None,
+                    terminal: Box::new(kr_controller::supervision::NoTerminal),
+                },
+                Arc::clone(&timer) as Arc<dyn Timer>,
+            ),
+        )
+    })
+    .await
 }
 
 /// The writer key the daemon holds, read from the secret store it keeps in the host tree.
@@ -1304,9 +1330,8 @@ async fn a_writer_nobody_enrolled_is_asked_for_again_only_as_a_person_can_act() 
 async fn a_token_that_is_not_usable_never_leaves_the_host() {
     for (token, said) in [
         (Token::None, "no account is signed in"),
-        (Token::ForAnotherService, "belongs to another service"),
         (Token::WithoutTheScope, "lacks the backup.write scope"),
-        (Token::Ended, "ended the sign-in"),
+        (Token::NotRenewable, "could not renew the token"),
     ] {
         let timer = HeldTimer::held();
         let rig = Rig::start(
@@ -1655,7 +1680,7 @@ async fn a_delay_named_to_the_doctor_in_the_middle_of_an_upload_holds_what_comes
 /// question carries no token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_daemon_finds_the_publication_the_service_holds_whatever_its_token_is() {
-    for token in [Token::Usable, Token::Ended] {
+    for token in [Token::Usable, Token::NotRenewable] {
         let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
         let web = Arc::clone(rig.served.web());
         // The publication reaches the service and its answer is lost. The question the daemon asks
@@ -1755,6 +1780,118 @@ async fn the_cleanup_privacy_mode_owes_ends_the_work_in_hand_whatever_the_token_
     );
 }
 
+/// The sign-in asks for the scope of each service the host presents its account to and no other:
+/// backup storage where the document selects a storage service, voice where the broker is the
+/// account service. A broker at another origin is asked for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_asks_for_the_scope_of_each_service_the_host_presents_its_account_to() {
+    for (storage, voice, backup, voice_scope) in [
+        (Some(true), None, true, false),
+        (None, Some(true), false, true),
+        (Some(true), Some(true), true, true),
+        (Some(true), Some(false), true, false),
+    ] {
+        let host = kr_ipc::testing::TempHost::create();
+        let served = serve().await;
+        let origin = served.origin();
+        let broker = |at_the_account: bool| {
+            if at_the_account {
+                origin
+            } else {
+                "https://elsewhere.example"
+            }
+        };
+        write_document_selecting(&host, storage.map(|_| origin), voice.map(broker));
+        let (controller, endpoint, _serving) = start_daemon(&host, HeldTimer::held()).await;
+        controller
+            .host_account()
+            .listen_on("127.0.0.1:0".parse().expect("an address"));
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        client
+            .mutate(
+                Method::AccountSignIn,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id()),
+                &AccountSignInParams {},
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the daemon starts the sign-in");
+        let report: AccountReport = client
+            .request(Method::AccountStatus, &AccountStatusParams {})
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the daemon reports")
+            .to_typed()
+            .expect("a report");
+        let AccountState::WaitingForBrowser { authorise_url, .. } = report.state else {
+            panic!("a sign-in is waiting for the browser: {:?}", report.state);
+        };
+        let asked: Vec<String> = url::Url::parse(&authorise_url)
+            .expect("an address")
+            .query_pairs()
+            .find(|(name, _)| name == "scope")
+            .map(|(_, value)| value.split(' ').map(str::to_owned).collect())
+            .expect("the sign-in names its scopes");
+        let case = format!("storage {storage:?}, voice {voice:?}: {asked:?}");
+        assert_eq!(
+            asked.iter().any(|scope| scope == "backup.write"),
+            backup,
+            "{case}"
+        );
+        assert_eq!(
+            asked.iter().any(|scope| scope == "voice"),
+            voice_scope,
+            "{case}"
+        );
+    }
+}
+
+/// A host whose document selects a storage service that is not the account service does not start,
+/// and says which key: its account token would go to a service that did not issue it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_selects_a_storage_service_other_than_the_account_service_does_not_start() {
+    let host = kr_ipc::testing::TempHost::create();
+    let served = serve().await;
+    write_document(&host, Some(served.origin()));
+    let error = try_start_controller(
+        &host,
+        HeldTimer::held(),
+        Some("https://elsewhere.example".to_owned()),
+    )
+    .await
+    .expect_err("the daemon refuses to start");
+    assert!(error.to_string().contains("storage.origin"), "{error}");
+}
+
+/// The account token goes to the account service and to no other: a call to a service at another
+/// origin is refused one, whatever the account holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_account_token_is_handed_to_the_account_service_and_to_no_other() {
+    let host = kr_ipc::testing::TempHost::create();
+    let served = serve().await;
+    let account = keep_sign_in(
+        &host,
+        served.origin(),
+        TOKEN,
+        &["openid", "voice", "backup.write"],
+        3600,
+    )
+    .await;
+    account
+        .tokens_for(served.origin())
+        .token("backup.write")
+        .await
+        .expect("the account service is handed the token");
+    account
+        .tokens_for("https://elsewhere.example")
+        .token("backup.write")
+        .await
+        .expect_err("another service is handed none");
+}
+
 /// A host whose document selects no storage service reaches none, and says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_selects_no_storage_service_contacts_none() {
@@ -1825,6 +1962,10 @@ async fn the_daemon_a_person_runs_reaches_the_storage_service_it_selects() {
         .arg(host.root().join("no-such-worker"))
         .arg("--secret-store")
         .arg("file")
+        .env(
+            kr_controller::testing::ACCOUNT_ORIGIN_VARIABLE,
+            served.origin(),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(log.try_clone().expect("duplicates the log"))
