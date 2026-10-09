@@ -346,9 +346,9 @@ impl Shared {
     /// Notes what a pass found, and says what to wait on.
     ///
     /// `account_moved` says the account changed while the pass ran: the pass's answers from the
-    /// service are noted, and what held its work back is not, because it may have been the token
-    /// of the account before the change or of the one after, and the pass is looked at again
-    /// soon. `token_refused` says that what held the work back was the host's own token and not a
+    /// service are noted, and so is a delay the service named, but what else held its work back
+    /// is not, because it may have been the token of the account before the change or of the one
+    /// after. The carrier looks again soon. `token_refused` says that what held the work back was the host's own token and not a
     /// thing at the service, so the doctor says the token and not a refusal.
     fn absorb(
         &self,
@@ -382,15 +382,20 @@ impl Shared {
             // that was turned back at its first question carried no work, and what it met is the
             // status refusal above.
             if account_moved {
-                // Only the service names a delay, so a delay the pass was given stands whichever
-                // account it was asked for; a pass that stopped at a delay says nothing of what
-                // held the work before. What else the pass met may have been the token of the
-                // account before the change or of the one after.
+                // Only the service names a delay, so a delay the pass was given or stopped at
+                // stands whichever account it was asked for. A pass that stopped at a delay with
+                // no hold of its own says nothing of what held the work before. What else the
+                // pass met may have been the token of the account before the change or of the
+                // one after.
                 observed.pass_hold =
                     match (report.hold.and_then(|hold| hold.retry_after), report.quiet) {
                         (Some(retry_after), _) => Some(Hold {
                             code: ErrorCode::ServiceCapacity,
                             retry_after: Some(retry_after),
+                        }),
+                        (None, Some(owed)) if report.hold.is_some() => Some(Hold {
+                            code: ErrorCode::ServiceCapacity,
+                            retry_after: Some(owed.left),
                         }),
                         (None, Some(_)) => observed.pass_hold,
                         (None, None) => None,

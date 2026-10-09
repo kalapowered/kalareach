@@ -291,6 +291,25 @@ impl Rig {
         );
     }
 
+    /// Signs the host in again at the service with a usable grant. The grant is another grant
+    /// than the one the host held, as a sign-in made by a person is.
+    async fn sign_in_again(&self) {
+        self.controller
+            .host_account()
+            .keep_for_test(IssuedGrant {
+                access_token: AccountToken::new(TOKEN).expect("a token"),
+                expires_in_seconds: 3600,
+                refresh_token: RefreshToken::new("a-refresh-token").expect("a token"),
+                scopes: vec![
+                    "openid".to_owned(),
+                    "voice".to_owned(),
+                    "backup.write".to_owned(),
+                ],
+                subject: "account-1".to_owned(),
+            })
+            .await;
+    }
+
     /// Whether the daemon's store holds `generation` as published.
     fn published(&self, generation: u64) -> bool {
         self.controller
@@ -1721,6 +1740,102 @@ async fn a_delay_named_to_the_doctor_in_the_middle_of_an_upload_holds_what_comes
     .await;
 }
 
+/// A delay named to `kr doctor` while a part is on its way, and a sign-in made while that part is
+/// on its way, still hold back what the daemon would send next, and the doctor still says so: the
+/// pass ends under another grant than it began under, and the delay is the service's whichever grant
+/// asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delay_the_service_names_stands_when_the_host_signs_in_again_during_the_pass() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    web.fail(PART, 2, Moment::Slow);
+    rig.admit(1, &[(1, plaintext(17 * 1024 * 1024))]);
+    within("the second part is on its way", web.requests_reach(PART, 2)).await;
+
+    web.fail(
+        STATUS,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(600),
+        },
+    );
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    rig.sign_in_again().await;
+    web.release_held();
+    // The pass ended under another grant, so the carrier looks again soon, and finds the delay
+    // still owed and sends nothing inside it.
+    let (waited, release) = within("the daemon looks again", timer.next_wait()).await;
+    assert_eq!(waited, TOKEN_CHECK);
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(
+        status,
+        DoctorStatus::Warning,
+        "the doctor says the delay is owed: {detail}"
+    );
+    release.notify_one();
+    let (waited, _) = within("the daemon waits out the delay", timer.next_wait()).await;
+    assert!(
+        waited > Duration::from_secs(500) && waited <= Duration::from_secs(600),
+        "{waited:?}"
+    );
+    assert_eq!(
+        web.requests_to(PART),
+        2,
+        "no part was sent inside the delay"
+    );
+}
+
+/// A part the service turns back with a delay, in a pass during which the host signs in again,
+/// holds the carrier for the delay: the sign-in costs a short look again and the doctor says the
+/// service asked to be left alone, not that all is well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_turned_back_with_a_delay_in_a_pass_that_spans_a_sign_in_holds_the_carrier() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    rig.enrol_the_writer_and_let_the_carrier_settle().await;
+    web.fail(CREATE, 1, Moment::Slow);
+    rig.admit_to_an_enrolled_archive(1, &[(1, plaintext(2048))]);
+    within("the upload is being begun", web.requests_reach(CREATE, 1)).await;
+    rig.sign_in_again().await;
+    web.fail(
+        PART,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(600),
+        },
+    );
+    web.release_held();
+    let (waited, release) = within("the daemon looks again", timer.next_wait()).await;
+    assert_eq!(
+        waited, TOKEN_CHECK,
+        "a pass that spans a sign-in is looked at again soon"
+    );
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    assert_eq!(web.requests_to(PART), 1, "the part was sent once");
+
+    // The look again finds the delay still owed and sends nothing inside it.
+    release.notify_one();
+    let (waited, _) = within("the daemon waits out the delay", timer.next_wait()).await;
+    assert!(
+        waited > Duration::from_secs(500) && waited <= Duration::from_secs(600),
+        "{waited:?}"
+    );
+    assert_eq!(
+        web.requests_to(PART),
+        1,
+        "no part was sent inside the delay"
+    );
+}
+
 /// A publication left unanswered when the daemon stopped, which the service holds, is found when the
 /// daemon starts and the generation ends complete, whatever account token the host holds then: the
 /// question carries no token.
@@ -1822,20 +1937,7 @@ async fn the_cleanup_privacy_mode_owes_ends_the_work_in_hand_whatever_the_token_
     // What the abandonment was turned back for was the host's own token and not a thing at the
     // service. The person signs in again with a usable grant, and the doctor does not go on blaming
     // the writer key or the service for it.
-    rig.controller
-        .host_account()
-        .keep_for_test(IssuedGrant {
-            access_token: AccountToken::new(TOKEN).expect("a token"),
-            expires_in_seconds: 3600,
-            refresh_token: RefreshToken::new("a-refresh-token").expect("a token"),
-            scopes: vec![
-                "openid".to_owned(),
-                "voice".to_owned(),
-                "backup.write".to_owned(),
-            ],
-            subject: "account-1".to_owned(),
-        })
-        .await;
+    rig.sign_in_again().await;
     let (status, detail) = rig.storage_check().await;
     assert_eq!(status, DoctorStatus::Ok, "{detail}");
 

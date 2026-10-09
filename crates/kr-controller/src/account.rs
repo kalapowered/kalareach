@@ -319,7 +319,8 @@ impl HostAccount {
     /// A mark of the grant this host holds now, for whatever must know that the grant it saw has
     /// not been replaced since.
     ///
-    /// Two marks are equal while it is the same grant with the same scopes: a refresh keeps both.
+    /// Two marks are equal while it is the same grant with the same scopes, address and name: a
+    /// refresh keeps all of them.
     /// They differ after a sign-in, a sign-out, a sign-in again of the same account, a grant the
     /// service ended, or a refresh that narrowed the scopes. They read the grant that is kept, and
     /// not the state of a sign-in attempt under way. A store that cannot be read gives a mark that
