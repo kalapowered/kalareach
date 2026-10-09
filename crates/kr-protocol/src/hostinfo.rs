@@ -1652,8 +1652,21 @@ pub mod configuration {
         Ok(Some(bytes))
     }
 
-    /// The version this build writes and reads.
-    pub const VERSION: u64 = 1;
+    /// The version this build writes.
+    ///
+    /// Version 2 is where the managed storage service's selection arrived (`storage`). A release
+    /// that reads version 1 only refuses a document with a section it does not know, so the version
+    /// rose with the section, and a switch back to such a release is refused while the document is
+    /// at 2.
+    pub const VERSION: u64 = 2;
+
+    /// The oldest version this build reads and brings forward.
+    ///
+    /// A document at version 1 has no `storage` section, which reads as a selection of none; it is
+    /// read as a document at [`VERSION`], and the next edit writes it at that version. Raise this,
+    /// and remove the step in [`load`] that brings an earlier document forward, once no supported
+    /// upgrade starts from a document at version 1.
+    pub const OLDEST_VERSION: u64 = 1;
 
     /// The longest configuration document this host reads.
     ///
@@ -2710,7 +2723,7 @@ pub mod configuration {
             .get("version")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(VERSION);
-        if declared != VERSION {
+        if !(OLDEST_VERSION..=VERSION).contains(&declared) {
             return Loaded {
                 document: None,
                 status: DocumentStatus {
@@ -2718,13 +2731,15 @@ pub mod configuration {
                     detail: Sentence::new()
                         .stated("this document declares version ")
                         .number(declared)
-                        .stated(" and this build knows version ")
+                        .stated(" and this build reads versions ")
+                        .number(OLDEST_VERSION)
+                        .stated(" to ")
                         .number(VERSION)
                         .stated("; it is left alone and every value is the product default"),
                 },
             };
         }
-        let document: ConfigurationDocument = match serde_json::from_value(value) {
+        let mut document: ConfigurationDocument = match serde_json::from_value(value) {
             Ok(document) => document,
             Err(error) => {
                 return invalid(vec![
@@ -2734,6 +2749,20 @@ pub mod configuration {
                 ]);
             }
         };
+        // The step from an earlier version: its sections are read as they are, and the ones it
+        // lacks are the defaults, so only the version it is read at changes. The file is not
+        // touched; the next edit writes it at the version this build writes.
+        let detail = if document.version < VERSION {
+            let detail = Sentence::new()
+                .stated("version ")
+                .number(document.version)
+                .stated(", read as version ")
+                .number(VERSION);
+            document.version = VERSION;
+            detail
+        } else {
+            Sentence::new().stated("version ").number(VERSION)
+        };
         if let Err(problems) = validate(&document) {
             return invalid(problems);
         }
@@ -2741,7 +2770,7 @@ pub mod configuration {
             document: Some(document),
             status: DocumentStatus {
                 state: DocumentState::Loaded,
-                detail: Sentence::new().stated("version ").number(VERSION),
+                detail,
             },
         }
     }
@@ -2786,7 +2815,7 @@ pub mod configuration {
     #[must_use]
     pub fn contents(document: &ConfigurationDocument) -> String {
         let mut text = serde_json::to_string_pretty(document)
-            .unwrap_or_else(|_| "{\"version\": 1}".to_owned());
+            .unwrap_or_else(|_| format!("{{\"version\": {VERSION}}}"));
         text.push('\n');
         text
     }

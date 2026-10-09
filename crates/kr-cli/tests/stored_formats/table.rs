@@ -607,7 +607,7 @@ pub fn table() -> Vec<Store> {
                 "config.json",
                 member("version", 1),
                 u32::try_from(hostinfo::configuration::VERSION).expect("a small number"),
-                u32::try_from(hostinfo::configuration::VERSION).expect("a small number"),
+                u32::try_from(hostinfo::configuration::OLDEST_VERSION).expect("a small number"),
             ),
             owned: Vec::new(),
             kept: vec![protocol::<hostinfo::configuration::ConfigurationDocument>(

@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -942,6 +942,7 @@ impl Registry {
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
+                self.migrate_8_to_9()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -950,6 +951,7 @@ impl Registry {
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
+                self.migrate_8_to_9()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -957,23 +959,31 @@ impl Registry {
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
+                self.migrate_8_to_9()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
+                self.migrate_8_to_9()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
+                self.migrate_8_to_9()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
+                self.migrate_8_to_9()?;
             }
-            Some(7) => self.migrate_7_to_8()?,
+            Some(7) => {
+                self.migrate_7_to_8()?;
+                self.migrate_8_to_9()?;
+            }
+            Some(8) => self.migrate_8_to_9()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1253,6 +1263,24 @@ impl Registry {
     fn migrate_7_to_8(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 8", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 8 to 9: the configuration document the registry keeps a record of is at version 2.
+    ///
+    /// The registry holds, for each environment, the document it last accepted, as text. A document
+    /// gained its `storage` section, and with it a version: the record written from now on is at
+    /// version 2, and a release that reads version 1 of the document cannot read it. A record the
+    /// release before wrote stays as it is, at version 1, and is read as a document at version 2
+    /// (the configuration document's own step), so it is still the document the file holds and the
+    /// next start does not take the file for an edit it has not seen. No row changes.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_8_to_9(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 9", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }

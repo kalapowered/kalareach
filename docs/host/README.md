@@ -120,7 +120,7 @@ configuration file this host reads.
 
 | Rule | What it means |
 | --- | --- |
-| `version` | The schema version. A document declaring one this build does not know is left exactly as it is, nothing is read out of it, every value falls to the product default, and `kr doctor` reports the version it found |
+| `version` | The schema version, 2. A document at version 1 is read as one at version 2 with no `storage` section, and the next edit writes it at version 2. A document declaring any other version is left exactly as it is, nothing is read out of it, every value falls to the product default, and `kr doctor` reports the version it found |
 | `revision` | Rises by one with each validated edit. An edit names the revision it was built on and is refused if another writer moved it first, so no edit silently erases another |
 | 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |
 | owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
