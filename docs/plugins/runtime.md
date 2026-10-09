@@ -622,19 +622,20 @@ The request names the attachment in these members of its parameters:
 | --- | --- |
 | `attachment.transfer_id` | the transfer's identifier |
 | `attachment.media_type` | the media type the upload declared |
-| `attachment.byte_len` | the exact size of the file, in bytes |
+| `attachment.byte_len` | the exact size of the file, in bytes, as a JSON number |
 | `attachment.content_digest` | the SHA-256 digest of the file's bytes, as unpadded base64url |
 | `attachment.read_grant.path` | the path on the environment's host that the grant lets the receiver read |
-| `attachment.read_grant.expires_at_ms` | when the grant expires, in milliseconds on the wall clock |
+| `attachment.read_grant.expires_at_ms` | when the grant expires, as a JSON number of UTC milliseconds since the Unix epoch |
 | `attachment.read_grant.environment_id` | the environment the grant is valid in |
 
-It is expected that the receiver opens the path, checks that the file at that path has the given
-size and digest, and only then acknowledges the request. The host has no way of knowing whether the
-receiver actually does this. If the file is not what the request says, the receiver refuses the
-request with the invalid-parameters error (-32602), and the offer then fails, with the draft and the
-upload kept for a retry. If the upstream returns any other error, the worker records the outcome of
-the action as unknown, because such an error does not prove that nothing happened, so the next offer
-of the attachment names the action it supersedes.
+A receiver of such a request is expected to open the path, confirm that the file there has the
+stated size and digest, and only then acknowledge the request. There is no way for the host to know
+if the receiver does this. A receiver that finds the file is not what the request says refuses with
+the invalid-parameters error (-32602), and the offer then fails with the draft and the upload kept
+for a retry. The same holds for the other reserved errors that say a request was not acted on: parse
+error (-32700), invalid request (-32600) and method not found (-32601). The worker records any other
+error from the upstream as an unknown outcome, because such an error does not prove that nothing
+happened, so the next offer of the attachment names the action it supersedes.
 
 `accepted_by_agent` therefore records that the receiver of this typed request acknowledged it after
 the file named by the grant was available to it. It does not record that the agent used or
