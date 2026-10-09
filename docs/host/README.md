@@ -2629,6 +2629,54 @@ devices bound to member accounts with the lease the host last recorded for each.
 whether exclusive management is on, whether the host trusts its clock, and every time exclusive
 management was turned off.
 
+### Presenting a lease
+
+A member's device presents the lease its organisation signed for it with `membership.present`, at
+the paired door only. The device proves its own key, and the host asks nothing else of it than a
+grant that answers to the organisation: the grant names the revision of this host's enrolment, and
+its environment selector admits this host's environment. On a host that is exclusively
+organisation-managed, a live personal grant answers too, because its owner's access needs a lease
+there. Without such a grant the host refuses the lease before it reads it. A device whose grant
+needs a lease is refused every other method until the host has installed one, so presenting is the
+one thing it can do first.
+
+The host judges the lease on its own copy of the policy. It checks that the revision named is one it
+has authenticated from its anchor, that the signature is that revision's, that the lease names the
+key the connection proved, that it lasts at most fifteen minutes and stays inside its role's
+ceiling, that it was not issued before its revision took over or after its revision was succeeded,
+and that it is not from this host's future. Each refusal is `PERMISSION_DENIED` and carries the name
+of the rule that refused. A host that distrusts its clock answers `CLOCK_UNTRUSTED`, and one whose
+clock floor is owed its record answers `STORAGE_UNAVAILABLE`, since neither says anything about the
+lease. The first lease a device presents binds it to that lease's account and key, and a later lease
+for another member on that device is refused. A lease older than the newest the host holds is
+refused as superseded, and a lease the host installed before it restarted is refused as installed
+earlier: no lease survives a restart, and the member's client fetches a new one.
+
+The lease ends on both clocks, the host's continuous clock and its reading of UTC, whichever comes
+first, and a device that does not present another is refused every read and mutation from then on
+while its connection stays up. The member's client refreshes every five minutes, so a renewal
+reaches the host about ten minutes before the lease it replaces ends.
+
+The organisation's chain may travel beside the lease. The host follows a newer one before it judges
+the lease, so a lease signed by a revision the host has not heard of is accepted with the chain that
+brings the revision in. A chain that is not newer changes nothing and does not refuse the lease
+beside it. A newer chain that does not verify, or that does not carry the host's anchor, or that
+belongs to another organisation, refuses the whole presentation and installs nothing.
+
+A renewal that says less than the lease it replaces, and a chain that shows an installed lease was
+signed after its revision was succeeded, take access away from copies of it that may still be in
+use. Each writes its debt for a fence before the policy changes and publishes it afterwards, and the
+host answers once the lease is installed and the debt is published. A narrowing renewal's fence
+reaches the presenting device, which connects again and presents the same lease under a new action.
+A dropped lease may be anyone's, so its fence reaches the whole host. The admission and the deadline
+of the presentation are asked again inside the transaction that writes the policy, so a presentation
+that waited for the store past either writes nothing.
+
+The answer names the organisation, the account, the revision that signed the lease and when it ends.
+It also says whether this host is exclusively organisation-managed, and when exclusive management
+was last turned off at the host's terminal, so that a member's client can carry that to the
+organisation with its next lease request.
+
 ## What the host owes the transport
 
 Two contracts `docs/transport/README.md` names, and where they are kept:

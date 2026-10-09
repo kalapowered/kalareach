@@ -557,8 +557,9 @@ impl GrantDirectory {
         outcome
     }
 
-    /// Arms the pause a delegation, a redemption, a transfer or a change of the policy for an
-    /// action stops at once it has done what it does before it takes the store's transaction.
+    /// Arms the pause a delegation, a redemption, a transfer, a change of the policy for an
+    /// action or a presented membership lease stops at once it has done what it does before it
+    /// takes the store's transaction.
     /// Returns the end that says the effect has arrived, and the end that lets it go. The pause
     /// fires once.
     #[cfg(feature = "testing")]
@@ -1990,6 +1991,9 @@ impl GrantDirectory {
     ) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(policy)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // As the policy change for an action: the pause is before the store's locks.
+        #[cfg(feature = "testing")]
+        self.before_effect.wait();
         self.in_transaction(|connection| {
             still_admitted()?;
             connection
