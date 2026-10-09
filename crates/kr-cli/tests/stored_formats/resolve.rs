@@ -8,12 +8,20 @@
 //! because the walk lost its way.
 //!
 //! What this resolves: paths, generic arguments, tuples, references, arrays and slices; `use` lines
-//! with renames, groups and globs; `crate::`, `self::` and `super::`; modules that are files or
-//! inline; and re-exports. What it refuses to resolve, and says so: a type made by a macro, a trait
-//! object, an `impl` type, a qualified path (`<T as Trait>::Name`), an alias, a name that is not
-//! brought in by any `use` and is not defined in the file, and an item defined twice in one file.
+//! with renames, groups and globs; `crate::`, `self::` and `super::`; modules that are files; and
+//! re-exports. What it refuses to resolve, and says so: a type made by a macro, a trait object, an
+//! `impl` type, a qualified path (`<T as Trait>::Name`), an alias, a name that is not brought in by
+//! any `use` and is not defined in the file, an item defined twice in one file, an item inside an
+//! inline module, and a path through an inline module or a module with a `#[path]` attribute (an
+//! inline module has a scope of its own, which this does not keep apart).
+//!
+//! What it does not see, and the documents say so: a serde attribute (`from`, `into`, `with`,
+//! `remote`) or a hand-written `Serialize` that changes the stored form of a field without
+//! changing its type; the form of a type of another crate beyond its name and crate; and the
+//! protocol's identifier and scalar types, which are accepted as one kind whose forms the committed
+//! protocol schema records.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -47,6 +55,12 @@ const STANDARD: [&str; 14] = [
     "PathBuf", "Duration", "Result", "Cow",
 ];
 
+/// The language's own types, which a stored item may hold and which need no following.
+const PRIMITIVES: [&str; 17] = [
+    "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+    "i128", "isize", "f32", "f64",
+];
+
 /// The names of the crates the standard library is.
 const STANDARD_CRATES: [&str; 3] = ["std", "core", "alloc"];
 
@@ -71,10 +85,14 @@ struct Contents {
     defined: HashMap<String, usize>,
     /// The aliases it defines.
     aliases: BTreeSet<String>,
-    /// The words in the macro invocations at its top level, which can define types.
+    /// The capitalised words in the macro invocations at its top level, which can define types.
     macro_words: BTreeSet<String>,
-    /// The inline modules it declares, and the modules it declares that are files.
+    /// The modules it declares, inline or files.
     modules: BTreeSet<String>,
+    /// Those of them that are inline, whose scope is not kept apart from the file's.
+    inline: BTreeSet<String>,
+    /// Those of them with a `#[path]` attribute, whose file is not found by name.
+    pathed: BTreeSet<String>,
 }
 
 /// The sources of a workspace.
@@ -82,6 +100,9 @@ pub struct Workspace {
     root: PathBuf,
     files: RefCell<HashMap<String, Rc<Contents>>>,
     scalars: Vec<String>,
+    /// Whether a path through an inline module ends at the file that holds it: for the path
+    /// `std::any::type_name` gives, which is where the type is defined, whatever module that is.
+    through_inline: Cell<bool>,
 }
 
 impl Workspace {
@@ -134,6 +155,7 @@ impl Workspace {
             root,
             files: RefCell::new(HashMap::new()),
             scalars,
+            through_inline: Cell::new(false),
         })
     }
 
@@ -194,6 +216,11 @@ impl Workspace {
             .ok_or_else(|| format!("{krate} is not a crate of this workspace"))?;
         let mut directory = PathBuf::from(format!("crates/{}/src", krate.replace('_', "-")));
         for step in module {
+            if self.contents(&file)?.pathed.contains(step) {
+                return Err(format!(
+                    "the module {step} of {file} has a #[path] attribute and is not followed"
+                ));
+            }
             let as_file = directory.join(format!("{step}.rs"));
             let as_directory = directory.join(step).join("mod.rs");
             if self.root.join(&as_file).is_file() {
@@ -202,8 +229,13 @@ impl Workspace {
             } else if self.root.join(&as_directory).is_file() {
                 file = as_directory.to_string_lossy().into_owned();
                 directory = directory.join(step);
-            } else if self.contents(&file)?.modules.contains(step) {
-                // An inline module: its items are read with the file's.
+            } else if self.contents(&file)?.inline.contains(step) {
+                if self.through_inline.get() {
+                    return Ok(file);
+                }
+                return Err(format!(
+                    "the inline module {step} of {file} is not followed"
+                ));
             } else if let Some(binding) = self
                 .contents(&file)?
                 .bindings
@@ -270,6 +302,14 @@ impl Workspace {
             return self.follow(&inner_crate, &inner_module, &binding.path, depth + 1, &file);
         }
         for glob in &contents.globs {
+            // What a glob of the standard library brings in is known by name, and nothing else is
+            // taken to come from it.
+            if glob
+                .first()
+                .is_some_and(|first| STANDARD_CRATES.contains(&first.as_str()))
+            {
+                continue;
+            }
             let (inner_crate, inner_module) = Self::place_of(&file)?;
             let mut path = glob.clone();
             path.push(name.to_owned());
@@ -278,6 +318,14 @@ impl Workspace {
             }
         }
         if contents.macro_words.contains(name) {
+            return Ok(Type {
+                origin: Origin::Defined(file),
+                name: name.to_owned(),
+            });
+        }
+        // The path of a type that exists names where it is defined, an inline module of the file
+        // included.
+        if self.through_inline.get() {
             return Ok(Type {
                 origin: Origin::Defined(file),
                 name: name.to_owned(),
@@ -411,18 +459,24 @@ impl Workspace {
             }
             return self.follow(krate, module, &binding.path, depth + 1, holder);
         }
-        if STANDARD.contains(&name) {
-            return Ok(Type {
-                origin: Origin::Std,
-                name: name.to_owned(),
-            });
-        }
         for glob in &contents.globs {
+            if glob
+                .first()
+                .is_some_and(|first| STANDARD_CRATES.contains(&first.as_str()))
+            {
+                continue;
+            }
             let mut path = glob.clone();
             path.push(name.to_owned());
             if let Ok(found) = self.follow(krate, module, &path, depth + 1, holder) {
                 return Ok(found);
             }
+        }
+        if STANDARD.contains(&name) {
+            return Ok(Type {
+                origin: Origin::Std,
+                name: name.to_owned(),
+            });
         }
         if contents.macro_words.contains(name) {
             return Ok(Type {
@@ -503,7 +557,10 @@ impl Workspace {
                 name: name.clone(),
             });
         }
-        self.defined_in(krate, &steps[1..], name, 0)
+        self.through_inline.set(true);
+        let found = self.defined_in(krate, &steps[1..], name, 0);
+        self.through_inline.set(false);
+        found
     }
 }
 
@@ -525,27 +582,38 @@ fn collect(items: &[syn::Item], contents: &mut Contents) {
             }
             syn::Item::Use(item) => flatten(&item.tree, &mut Vec::new(), contents),
             syn::Item::Mod(item) => {
-                contents.modules.insert(item.ident.to_string());
-                let test_only = item.attrs.iter().any(|attribute| {
-                    attribute.path().is_ident("cfg")
-                        && attribute
-                            .meta
-                            .require_list()
-                            .is_ok_and(|list| list.tokens.to_string() == "test")
-                });
-                if let (Some((_, inside)), false) = (&item.content, test_only) {
-                    collect(inside, contents);
+                let name = item.ident.to_string();
+                contents.modules.insert(name.clone());
+                if item.content.is_some() {
+                    contents.inline.insert(name.clone());
+                }
+                if item
+                    .attrs
+                    .iter()
+                    .any(|attribute| attribute.path().is_ident("path"))
+                {
+                    contents.pathed.insert(name);
                 }
             }
             syn::Item::Macro(item) => {
-                for word in item
-                    .mac
-                    .tokens
-                    .to_string()
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|word| !word.is_empty())
-                {
-                    contents.macro_words.insert(word.to_owned());
+                let text = item.mac.tokens.to_string();
+                let words = text.split(|c: char| !c.is_alphanumeric() && c != '_');
+                if item.ident.is_some() {
+                    // A definition (`macro_rules!`) defines the types its template declares: the
+                    // names after `struct` and `enum`.
+                    let words: Vec<&str> = words.filter(|word| !word.is_empty()).collect();
+                    for pair in words.windows(2) {
+                        if matches!(pair[0], "struct" | "enum") {
+                            contents.macro_words.insert(pair[1].to_owned());
+                        }
+                    }
+                } else {
+                    // An invocation can name the types it makes.
+                    for word in
+                        words.filter(|word| word.chars().next().is_some_and(char::is_uppercase))
+                    {
+                        contents.macro_words.insert(word.to_owned());
+                    }
                 }
             }
             _ => {}
@@ -593,24 +661,14 @@ fn flatten(tree: &syn::UseTree, prefix: &mut Vec<String>, contents: &mut Content
     }
 }
 
-/// The struct, enum or union named `name` among `items`, at any depth of inline modules.
+/// The struct, enum or union named `name` among `items`, at the top level of the file.
 fn find<'a>(items: &'a [syn::Item], name: &str) -> Option<&'a syn::Item> {
-    for item in items {
-        match item {
-            syn::Item::Struct(found) if found.ident == name => return Some(item),
-            syn::Item::Enum(found) if found.ident == name => return Some(item),
-            syn::Item::Union(found) if found.ident == name => return Some(item),
-            syn::Item::Mod(module) => {
-                if let Some((_, inside)) = &module.content
-                    && let Some(found) = find(inside, name)
-                {
-                    return Some(found);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    items.iter().find(|item| match item {
+        syn::Item::Struct(found) => found.ident == name,
+        syn::Item::Enum(found) => found.ident == name,
+        syn::Item::Union(found) => found.ident == name,
+        _ => false,
+    })
 }
 
 /// The paths of the types in the fields of an item, and what it holds that cannot be followed.
@@ -660,8 +718,9 @@ impl<'ast> syn::visit::Visit<'ast> for Walker {
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect();
-        // A primitive is a single lowercase name.
-        let primitive = names.len() == 1 && names[0].chars().next().is_some_and(char::is_lowercase);
+        // A primitive is one of the language's own names, and nothing else lowercase is: a type can
+        // be brought in under a lowercase name.
+        let primitive = names.len() == 1 && PRIMITIVES.contains(&names[0].as_str());
         if !primitive {
             self.paths.push(names);
         }
