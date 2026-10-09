@@ -11,8 +11,8 @@
 //! draft holds, claims the one binding it is about to offer, and reports what became of the offer
 //! ([`Drafts`]). The report is the part that has to arrive: the daemon may be down when the agent
 //! answers, so reports wait in a queue with a task of its own that asks again until the daemon
-//! records or refuses for good ([`Reporter`]). A worker that dies first is a closed session, which
-//! the daemon fails every unreported offer of, so the queue needs no storage of its own.
+//! records or refuses for good. A worker that dies first is a closed session, which the daemon
+//! fails every unreported offer of, so the queue needs no storage of its own.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
