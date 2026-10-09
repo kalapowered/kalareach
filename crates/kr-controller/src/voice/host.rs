@@ -14,6 +14,7 @@ use kr_voice::{Proposal, VoiceError};
 
 use super::context::{SessionFacts, SessionSnapshot};
 use super::submit::HostDispatch;
+use crate::error::ControllerError;
 use crate::privacy::Published;
 use crate::service::Controller;
 
@@ -39,6 +40,14 @@ fn gone() -> VoiceError {
     ))
 }
 
+/// A failure of this daemon's own, as the coordinator carries it.
+fn host_error(error: ControllerError) -> VoiceError {
+    VoiceError::Host(kr_protocol::error::ProtocolError::new(
+        error.code(),
+        error.to_string(),
+    ))
+}
+
 impl SessionFacts for ControllerFacts {
     fn snapshot<'a>(&'a self, session_id: SessionId) -> VoiceFuture<'a, SessionSnapshot> {
         let daemon = self.daemon.clone();
@@ -47,12 +56,7 @@ impl SessionFacts for ControllerFacts {
             daemon
                 .voice_session_snapshot(session_id)
                 .await
-                .map_err(|error| {
-                    VoiceError::Host(kr_protocol::error::ProtocolError::new(
-                        error.code(),
-                        error.to_string(),
-                    ))
-                })
+                .map_err(host_error)
         })
     }
 
@@ -71,7 +75,10 @@ impl SessionFacts for ControllerFacts {
         let daemon = self.daemon.clone();
         Box::pin(async move {
             let daemon = daemon.upgrade().ok_or_else(gone)?;
-            Ok(daemon.voice_session_number(session_id).await)
+            daemon
+                .voice_session_number(session_id)
+                .await
+                .map_err(host_error)
         })
     }
 
@@ -136,12 +143,7 @@ impl HostDispatch for ControllerDispatch {
             daemon
                 .voice_perform(method, proposal)
                 .await
-                .map_err(|error| {
-                    VoiceError::Host(kr_protocol::error::ProtocolError::new(
-                        error.code(),
-                        error.to_string(),
-                    ))
-                })
+                .map_err(host_error)
         })
     }
 }

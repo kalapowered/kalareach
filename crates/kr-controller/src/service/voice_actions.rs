@@ -197,16 +197,22 @@ impl Controller {
     /// number a closed session was listed under. A lookup that asked each session's worker would
     /// wait on a worker that does not answer, for a session the person did not name, and would
     /// read a worker's silence as a session that has no number.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry's error when it cannot be read: a registry that cannot say is not a
+    /// session with no number, and the answer a person is given for the second is kept.
     pub(crate) async fn voice_session_number(
         self: &Arc<Self>,
         session_id: SessionId,
-    ) -> Option<u64> {
+    ) -> Result<Option<u64>> {
         if let Some(worker) = self.directory.lock().await.get(session_id) {
-            return Some(worker.descriptor.display_number.get());
+            return Ok(Some(worker.descriptor.display_number.get()));
         }
         let registry = self.registry.lock().await;
-        let reservation = registry.reservation_for_session(session_id).ok()??;
-        Some(reservation.display_number.get())
+        Ok(registry
+            .reservation_for_session(session_id)?
+            .map(|reservation| reservation.display_number.get()))
     }
 
     /// What the description host holds of a session: the name a person pinned, what a model wrote

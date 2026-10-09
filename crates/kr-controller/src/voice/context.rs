@@ -176,7 +176,12 @@ pub trait SessionFacts: Send + Sync + std::fmt::Debug {
         approval_request_id: &'a ApprovalRequestId,
     ) -> VoiceFuture<'a, Option<Digest256>>;
 
-    /// The display number of one session, as a person says it, when this host can read the session.
+    /// The display number of one session, as a person says it, when this host holds one for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host's records cannot be read, which is no number and is not
+    /// the answer for a session without one.
     fn display_number<'a>(&'a self, session_id: SessionId) -> VoiceFuture<'a, Option<u64>>;
 
     /// The state of privacy mode as it stands now, which a reading is noted under before it is
