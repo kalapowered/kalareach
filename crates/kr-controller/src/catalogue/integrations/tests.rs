@@ -705,9 +705,9 @@ fn an_integration_turned_off_carries_no_flags() {
     assert!(entries[0].flags.is_empty(), "{:?}", entries[0].flags);
 }
 
-/// One flag of the most bytes a package's integration may take: an owner is shown what the
+/// One flag as long as a package's integration can have in plain text: an owner is shown what the
 /// integration does whole, and that is at most `MAX_STATEMENT_CHARS` characters, the flag and the
-/// rest of the statement together.
+/// rest of the statement together. A flag of multi-byte characters takes more bytes than this.
 fn largest_flags() -> Vec<String> {
     vec![format!(
         "--{}",
@@ -894,7 +894,7 @@ fn a_session_carries_the_flags_of_its_integrations_within_a_bound() {
     assert_eq!(
         fill.omitted.len(),
         count - largest_that_fit_a_session(),
-        "only as many integrations with the most flags a package may declare as fit are carried"
+        "only as many of these integrations as fit are carried"
     );
     assert_eq!(fill.entries.len() + fill.omitted.len(), count);
     for entry in &fill.entries {
@@ -1002,7 +1002,7 @@ fn the_doctor_carries_whole_reports_within_its_bytes() {
     assert!(carried <= MAX_REPORT_BYTES, "{carried} bytes");
     assert!(
         carried + sizes.iter().max().copied().unwrap_or_default() > MAX_REPORT_BYTES,
-        "one more of the largest declarations would not fit"
+        "one more of these declarations would not fit"
     );
     for report in &reported.reports {
         assert_eq!(report.flags, largest_flags(), "a report is carried whole");

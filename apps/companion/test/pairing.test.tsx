@@ -390,6 +390,7 @@ function request(overrides: Partial<ConfirmationRequest> = {}): ConfirmationRequ
     facts: [],
     notice: null,
     statement: null,
+    reading: null,
     expires_at_ms: Date.now() + 110_000,
     checkable: true,
     ...overrides
@@ -466,6 +467,50 @@ describe("the owner's confirmation of a repository and of an installation", () =
     expect(
       notice.compareDocumentPosition(statement) & Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy()
+  })
+
+  it("captions this host's reading of a command integration as the host's, apart from the publisher's words", async () => {
+    const { controls } = start({ view: 'attention' })
+    const words = 'Adds one registration file in the application’s directory, which it starts.'
+    const reading = 'Runs "codex" in KalaReach sessions with these arguments added: "--remote".'
+    const notice = 'This package changes how a command you run in a KalaReach session starts.'
+    for (const publisher of [null, words]) {
+      act(() => {
+        controls.setConfirmations({
+          ceremony: 'touch_id',
+          requests: [
+            request({
+              title: 'Install a plugin',
+              detail: 'Install kalareach/codex 0.3.0 from community on studio.',
+              value: null,
+              facts: [{ label: 'Plugin', value: 'kalareach/codex 0.3.0', code: true }],
+              notice,
+              statement: publisher,
+              reading
+            })
+          ]
+        })
+      })
+      const shown = await screen.findByTestId('confirmation-reading')
+      expect(within(shown).getByText(reading).tagName).toBe('BLOCKQUOTE')
+      expect(within(shown).queryByText('The publisher says')).toBeNull()
+      expect(
+        within(shown).getByText("This host's exact reading of the command integration")
+      ).toBeInTheDocument()
+      const quoted = screen.queryByTestId('confirmation-statement')
+      if (publisher === null) {
+        expect(quoted).toBeNull()
+      } else {
+        // The publisher's words stand in their own figure, before the host's reading, and the
+        // reading is not inside the publisher's quote.
+        expect(quoted).not.toBeNull()
+        expect(within(quoted as HTMLElement).getByText(words)).toBeInTheDocument()
+        expect((quoted as HTMLElement).textContent).not.toContain('"--remote"')
+        expect(
+          (quoted as HTMLElement).compareDocumentPosition(shown) & Node.DOCUMENT_POSITION_FOLLOWING
+        ).toBeTruthy()
+      }
+    }
   })
 
   it('shows no statement for an installation whose release says nothing of a bridge', async () => {

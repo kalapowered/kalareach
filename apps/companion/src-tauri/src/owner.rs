@@ -25,7 +25,9 @@ use kr_client::pairing::owner::{
     STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown_host, shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
-use kr_protocol::confirmation::{CatalogueTrustPlan, PluginInstallPlan, install_notices};
+use kr_protocol::confirmation::{
+    CatalogueTrustPlan, PluginInstallPlan, install_notices, split_install_statement,
+};
 use kr_protocol::ids::{ConfirmationId, DeviceId};
 use kr_protocol::pairing::{OwnerConfirmationRequest, SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
@@ -76,6 +78,9 @@ pub struct RequestView {
     /// What the publisher says in its own words about what the release does. The page quotes it
     /// apart from the host's own words, so it is never read as the host's.
     pub statement: Option<String>,
+    /// What this host reads of the release's command integration, exactly, where the request
+    /// would grant one. The page captions it as the host's, apart from the publisher's words.
+    pub reading: Option<String>,
     /// When the host stops accepting an answer.
     pub expires_at_ms: u64,
     /// False when it cannot be checked, so it cannot be confirmed here.
@@ -438,6 +443,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         facts: Vec::new(),
         notice: None,
         statement: None,
+        reading: None,
         expires_at_ms,
         checkable: false,
     };
@@ -488,6 +494,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         facts: particulars.facts,
         notice: particulars.notice,
         statement: particulars.statement,
+        reading: particulars.reading,
         expires_at_ms,
         checkable: true,
     }
@@ -498,10 +505,11 @@ struct Particulars {
     facts: Vec<Fact>,
     notice: Option<String>,
     statement: Option<String>,
+    reading: Option<String>,
 }
 
-/// The facts, the host's notice and the publisher's statement for an enrolment or an installation,
-/// and nothing for any other request. `None` when a word the host or the publisher wrote could
+/// The facts, the host's notice, the publisher's statement and the host's reading for an
+/// enrolment or an installation, and nothing for any other request. `None` when a word the host or the publisher wrote could
 /// not be shown exactly as it was written.
 fn particulars(subject: &Subject) -> Option<Particulars> {
     match subject {
@@ -509,25 +517,32 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
             facts: enrolment_facts(plan)?,
             notice: None,
             statement: None,
+            reading: None,
         }),
         Subject::PluginInstall(plan) => {
             // The host's own notice for each capability in the grant that it describes, apart from
             // the statement the release makes.
             let grant: Vec<String> = plan.grant.iter().cloned().collect();
             let notices = install_notices(&grant);
+            // The statement is shown whole or not at all, then told apart at the host's label: the
+            // publisher's words before it, the host's reading after.
+            let parts = match &plan.grant_statement {
+                Some(words) => Some(plain(words, STATEMENT_CHARS)?),
+                None => None,
+            };
+            let split = parts.as_deref().map(split_install_statement);
             Some(Particulars {
                 facts: installation_facts(plan)?,
                 notice: (!notices.is_empty()).then(|| notices.join(" ")),
-                statement: match &plan.grant_statement {
-                    Some(words) => Some(plain(words, STATEMENT_CHARS)?),
-                    None => None,
-                },
+                statement: split.and_then(|split| split.publisher).map(str::to_owned),
+                reading: split.and_then(|split| split.reading).map(str::to_owned),
             })
         }
         _ => Some(Particulars {
             facts: Vec::new(),
             notice: None,
             statement: None,
+            reading: None,
         }),
     }
 }
@@ -952,6 +967,7 @@ mod tests {
         );
         assert_eq!(view.notice, None);
         assert_eq!(view.statement, None);
+        assert_eq!(view.reading, None);
         assert!(
             view.facts.contains(&fact(
                 "Granted",
@@ -964,15 +980,14 @@ mod tests {
     }
 
     /// KR-REQ-12.07: an installation whose grant holds a command integration carries the host's own
-    /// notice of it, and its statement holds the host's reading of the declaration after the label
-    /// that says so, so a bridge's words that come before it are not taken for it. A grant that
-    /// holds a native bridge too carries both notices, and a grant with only the integration
-    /// claims no bridge.
+    /// notice of it and the host's reading of the declaration as a part of its own, apart from the
+    /// publisher's words about a bridge that come before it, so the page can caption each by who
+    /// wrote it. A grant that holds a native bridge too carries both notices, and a grant with only
+    /// the integration claims no bridge and has no publisher's words.
     #[test]
     fn an_installation_with_a_command_integration_shows_the_hosts_notice_for_it_alone() {
         use kr_protocol::confirmation::{
-            COMMAND_INTEGRATION_NOTICE, INTEGRATION_STATEMENT_LABEL, NATIVE_BRIDGE_NOTICE,
-            install_statement,
+            COMMAND_INTEGRATION_NOTICE, NATIVE_BRIDGE_NOTICE, install_statement,
         };
         let reading = "Runs \"codex\" in KalaReach sessions with no arguments added. It sets no \
                        environment variables.";
@@ -999,10 +1014,8 @@ mod tests {
         );
         assert!(only.checkable);
         assert_eq!(only.notice.as_deref(), Some(COMMAND_INTEGRATION_NOTICE));
-        assert_eq!(
-            only.statement,
-            Some(format!("{INTEGRATION_STATEMENT_LABEL} {reading}"))
-        );
+        assert_eq!(only.statement, None, "none of it is the publisher's words");
+        assert_eq!(only.reading.as_deref(), Some(reading));
         assert!(
             only.detail.as_deref().is_some_and(|line| {
                 line.contains("a command integration that changes how a command starts")
@@ -1023,11 +1036,11 @@ mod tests {
                 "{NATIVE_BRIDGE_NOTICE} {COMMAND_INTEGRATION_NOTICE}"
             ))
         );
+        assert_eq!(both.statement.as_deref(), Some(PUBLISHER));
         assert_eq!(
-            both.statement,
-            Some(format!(
-                "{PUBLISHER} {INTEGRATION_STATEMENT_LABEL} {reading}"
-            ))
+            both.reading.as_deref(),
+            Some(reading),
+            "the publisher's words and the host's reading are two parts, told apart at the label"
         );
     }
 
@@ -1060,7 +1073,12 @@ mod tests {
                 NOW,
             );
             assert!(!view.checkable, "{bad:?}");
-            assert!(view.facts.is_empty() && view.statement.is_none() && view.notice.is_none());
+            assert!(
+                view.facts.is_empty()
+                    && view.statement.is_none()
+                    && view.reading.is_none()
+                    && view.notice.is_none()
+            );
             let hostile_name = CatalogueTrustPlan {
                 catalogue_id: bad.to_owned(),
                 ..enrolment()

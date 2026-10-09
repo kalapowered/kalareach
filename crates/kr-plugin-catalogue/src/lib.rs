@@ -2325,18 +2325,35 @@ impl Catalogue {
             .as_ref()
             .filter(|_| grant.holds(PluginCapability::NativeBridgeInstall))
             .map(|bridge| bridge.grant_statement.as_str());
-        let integration = manifest
-            .command_integration
-            .as_ref()
-            .filter(|_| grant.holds(PluginCapability::CommandIntegrationLaunch))
-            .map(kr_plugin_sdk::integration::CommandIntegration::statement);
+        // The host's label tells its reading from the publisher's words, so words that hold it are
+        // not shown: the package check refuses them, and a manifest kept from before does too.
+        if bridge.is_some_and(|words| {
+            words.contains(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL)
+        }) {
+            return Err(CatalogueError::UnsafePackage {
+                detail: format!(
+                    "{subject} is not a package this host will install: the bridge's statement \
+                     holds the words the host writes before its own reading of a command \
+                     integration"
+                ),
+            });
+        }
+        // A release that asks for the integration and declares none is told so in the reading.
+        let integration = grant
+            .holds(PluginCapability::CommandIntegrationLaunch)
+            .then(|| {
+                manifest.command_integration.as_ref().map_or_else(
+                    || "The package declares no command integration.".to_owned(),
+                    kr_plugin_sdk::integration::CommandIntegration::statement,
+                )
+            });
         if integration.as_ref().is_some_and(|text| {
             text.chars().count() > kr_plugin_sdk::integration::MAX_STATEMENT_CHARS
         }) {
-            return Err(CatalogueError::Integrity {
+            return Err(CatalogueError::UnsafePackage {
                 detail: format!(
-                    "the command integration of {subject} is described in more characters than \
-                     an owner is shown whole"
+                    "{subject} is not a package this host will install: the statement of what \
+                     its command integration does is longer than an owner is shown whole"
                 ),
             });
         }

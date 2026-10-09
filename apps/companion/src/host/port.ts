@@ -345,6 +345,11 @@ export interface ConfirmationRequest {
   readonly notice: string | null
   /** What the publisher says in its own words about the release, quoted apart from the host's. */
   readonly statement: string | null
+  /**
+   * What the host reads of the release's command integration, exactly, where the request would
+   * grant one. It is the host's, captioned apart from the publisher's words.
+   */
+  readonly reading: string | null
   readonly expires_at_ms: number
   readonly checkable: boolean
 }

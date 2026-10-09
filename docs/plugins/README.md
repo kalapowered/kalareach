@@ -174,7 +174,7 @@ typed, and `kr doctor` says why.
   declared with no backend.
 - `launching_words` are the bare words (letters, digits, `_` and `-`, at most 32 bytes, none
   starting with `-`, none listed twice, at most eight) that may follow the command for a launch the
-  backend is started for. The launch has to type no option, and its first word has to be absent or
+  declaration applies to. The launch has to type no option, and its first word has to be absent or
   listed; any other launch runs as typed, with the reason named. The list is closed because it is
   what the package qualified: an option would not reach the server, and a word that is another
   subcommand's name (`login`, `exec`) is not a terminal at all.
@@ -214,11 +214,12 @@ names, the exact package hash, which covers the declaration, and a statement. If
 `command_integration.launch` the statement ends with the host's own exact reading of the
 declaration, which describes the command and flags as JSON strings in order, variables in the form
 `NAME="value"`, arguments to pass to the application server if any, and when the integration
-applies. The host generates this reading from the signed manifest, and it is never shortened.
-Packages whose reading is longer than 4,000 characters will not be accepted. Any `grant_statement`
-included in the command integration itself will not be shown. `plugin.grant` does not add
-`command_integration.launch` to an installed release: it names `plugin.install`, where the owner is
-shown the reading.
+applies. The host generates this reading from the signed manifest, and it is never shortened. A
+bridge's statement cannot hold the label the reading follows, and the package check refuses one that
+does. Packages whose reading is longer than 4,000 characters will not be accepted. Any
+`grant_statement` included in the command integration itself will not be shown. `plugin.grant` does
+not add `command_integration.launch` to an installed release: it names `plugin.install`, where the
+owner is shown the reading.
 
 A host reads the integration only from the verified manifest, never from what an installation says
 about it, and applies it only while the installation holds `command_integration.launch`. The
@@ -520,12 +521,13 @@ component fault disables rich meaning without stalling or discarding valid nativ
   component interprets them. A table that answers none gives its package no such trust, so a
   protocol whose answer is a response to the request itself, rather than a request of its own, is
   answered by the native client alone.
-- **Messages:** The table describes the messages sent between an application and one of its servers.
-  The top level members, other than the message identifier and method, are named `params`, `result`
-  and `error`. A request names the method member, and a response names exactly one of the result and
-  error members. All five names must be different, except that a request and response may share
-  their identifier member, as is the case with JSON-RPC. A table that does not need the member
-  leaves it out, and a package whose table declares it states `"sdk_range": ">=0.1.5, <0.2.0"`.
+- **Messages:** The `messages` member of an application server's table names the top-level members,
+  other than the message identifier and method, that a message is read by: `params`, `result` and
+  `error` each hold the name of one. A request names the method member, and a response names exactly
+  one of the result and error members. All five names must be different, except that a request and
+  response may share their identifier member, as is the case with JSON-RPC. A table that does not
+  need the member leaves it out, and a package whose table declares it states
+  `"sdk_range": ">=0.1.5, <0.2.0"`.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
@@ -720,7 +722,7 @@ report the same code for the same defect.
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 | `integration_without_capability` | A command integration without `command_integration.launch` |
-| `integration_invalid` | A command integration names another command, adds a flag it may not, sets a variable the contract does not permit, has a statement of what it does that is longer than an owner is shown whole, or declares a backend that breaks the contract (a missing or repeated `{gateway}`, arguments or launching words out of bounds, no table to read) |
+| `integration_invalid` | A command integration (1) names another command, (2) adds a flag it may not, (3) sets a variable the contract does not permit, (4) has a statement of what it does that is longer than an owner is shown whole, or (5) declares a backend that breaks the contract (e.g. by omitting or repeating `{gateway}`, by including arguments or launching words that fall outside the bounds, or by providing no table to read) |
 | `launch_probe_without_capability` | A launch probe without `launch.probe` |
 | `launch_probe_invalid` | A launch probe passes no argument or too many, carries an option that is not a name, or names a mode that is not a JSON Pointer |
 

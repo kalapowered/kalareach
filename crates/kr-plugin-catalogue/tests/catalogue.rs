@@ -2399,8 +2399,135 @@ async fn kr_req_11_11_an_owner_is_shown_the_reading_of_a_command_integration_the
         .await
         .expect_err("a reading no device shows whole");
     assert!(
-        matches!(refusal, CatalogueError::Integrity { .. }),
+        matches!(refusal, CatalogueError::UnsafePackage { .. }),
         "{refusal:?}"
+    );
+}
+
+/// Writes the example package at `version` into `directory`, asking for a native bridge whose
+/// statement is `words`, and a command integration too where `integration` is true. The bridge's
+/// recipe changes one configuration key, which is all a statement needs of it.
+fn bridging(
+    directory: &std::path::Path,
+    version: &str,
+    words: &str,
+    integration: bool,
+) -> std::path::PathBuf {
+    let package = integrating(directory, version, &["--flag"]);
+    let path = package.join(kr_plugin_sdk::package::MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the manifest reads"))
+            .expect("the manifest is JSON");
+    manifest["capabilities"]
+        .as_array_mut()
+        .expect("the manifest requests capabilities")
+        .push(serde_json::json!({
+            "capability": "native_bridge.install",
+            "reason": "Register the forwarder the example agent starts"
+        }));
+    manifest["native_bridge"] = serde_json::json!({
+        "application": "Example Agent",
+        "application_range": ">=1.0.0, <2.0.0",
+        "install": [{
+            "type": "add_configuration_key",
+            "file": "settings.json",
+            "key": "enabled.example",
+            "value": "true"
+        }],
+        "remove": [{
+            "type": "remove_configuration_key",
+            "file": "settings.json",
+            "key": "enabled.example"
+        }],
+        "grant_statement": words
+    });
+    if !integration {
+        manifest["command_integration"] = serde_json::Value::Null;
+    }
+    let mut text = serde_json::to_string_pretty(&manifest).expect("the manifest serialises");
+    text.push('\n');
+    std::fs::write(&path, text).expect("the manifest writes");
+    package
+}
+
+/// What an owner is shown of a release whose bridge says `words`, for a grant that holds the
+/// bridge and the integration, where the release declares an integration or `integration` is false.
+async fn statement_of(words: &str, integration: bool) -> CatalogueResult<Option<String>> {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let packages = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            package: Some(bridging(packages.path(), "0.1.0", words, integration)),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    catalogue
+        .grant_statement(
+            &repository(),
+            &plugin(),
+            &PackageVersion::parse("0.1.0").expect("a valid version"),
+            generation.manifest_digest(),
+            &InstallationGrant::with([
+                PluginCapability::NativeBridgeInstall,
+                PluginCapability::CommandIntegrationLaunch,
+            ]),
+        )
+        .await
+}
+
+/// The words of a native bridge are the publisher's, and the host's reading of a command
+/// integration follows them after the host's own label: an owner can tell which is which because
+/// the publisher cannot write that label, and a release that asks for the integration and
+/// declares none is told so in the reading.
+#[tokio::test]
+async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
+    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, split_install_statement};
+    let words = "Changes one setting of the example agent.";
+
+    // The words and the reading are told apart at the label, the publisher's first.
+    let shown = statement_of(words, true)
+        .await
+        .expect("the manifest the index pins is read")
+        .expect("a statement");
+    let parts = split_install_statement(&shown);
+    assert_eq!(parts.publisher, Some(words));
+    assert!(
+        parts
+            .reading
+            .is_some_and(|reading| reading.contains("\"--flag\"")),
+        "{shown}"
+    );
+
+    // Words that hold the label are not shown, however they are placed.
+    let imitation = format!("Harmless. {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
+    let refusal = statement_of(&imitation, true)
+        .await
+        .expect_err("the publisher wrote the host's label");
+    assert!(
+        matches!(refusal, CatalogueError::UnsafePackage { .. }),
+        "{refusal:?}"
+    );
+
+    // A release that asks for the integration and declares none is told so, not left unread.
+    let none = statement_of(words, false)
+        .await
+        .expect("the manifest the index pins is read")
+        .expect("a statement");
+    assert!(
+        split_install_statement(&none)
+            .reading
+            .is_some_and(|reading| reading.contains("declares no command integration")),
+        "{none}"
     );
 }
 

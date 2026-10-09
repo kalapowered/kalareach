@@ -1397,54 +1397,61 @@ async fn an_installation_confirmed_on_an_owner_device_is_installed_with_the_publ
 
 /// KR-REQ-12.07: an installation whose grant holds a command integration is asked for on an owner
 /// device the same way, and the terminal says what that device is shown: the host's own notice that
-/// the package changes how a command starts and the host's reading of what it declares, with no
-/// claim that a native bridge is installed. The control is the bridge installation above.
+/// the package changes how a command starts and the host's reading of what it declares, apart from
+/// the publisher's words about a bridge where the grant holds one, and with no claim that a bridge
+/// is installed where it does not. The control is the bridge installation above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_installation_with_a_command_integration_is_shown_the_hosts_reading_of_it() {
     use kr_protocol::confirmation::{
         COMMAND_INTEGRATION_NOTICE, INTEGRATION_STATEMENT_LABEL, NATIVE_BRIDGE_NOTICE,
     };
-    let temp = kr_ipc::testing::TempHost::create();
-    let seen = Arc::new(Mutex::new(Seen::default()));
-    let (_asked, serving) = scripted_daemon(
-        &temp,
-        OwnerDevice {
-            effect: "plugin.install",
-            refusals: Some(3),
-            expires_at_ms: kr_ipc::now_ms().get() + 600_000,
-            initial_bootstrap: false,
-            budgets: allowed(),
-            answer: installed(&temp),
-        }
-        .script(&temp, Arc::clone(&seen)),
-    );
-    let output = run_kr(&temp, &command_integration_install_line());
-    let said = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{said}{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        said.contains(COMMAND_INTEGRATION_NOTICE),
-        "the host's own notice of the integration: {said}"
-    );
-    assert!(
-        !said.contains(NATIVE_BRIDGE_NOTICE),
-        "no bridge is installed, so none is claimed: {said}"
-    );
-    assert!(
-        said.contains(&format!(
-            "the statement: {INTEGRATION_STATEMENT_LABEL} {INTEGRATION_READING}"
-        )),
-        "the host's reading, labelled as the host's: {said}"
-    );
-    assert!(
-        !said.contains("the publisher says"),
-        "none of it is the publisher's words: {said}"
-    );
-    serving.abort();
+    // `--grant` takes one capability and is repeated for each.
+    let mut both = command_integration_install_line();
+    both.extend(["--grant", "native_bridge.install"]);
+    let reading = format!("  {INTEGRATION_STATEMENT_LABEL} {INTEGRATION_READING}");
+    for (line, bridge) in [(command_integration_install_line(), false), (both, true)] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (_asked, serving) = scripted_daemon(
+            &temp,
+            OwnerDevice {
+                effect: "plugin.install",
+                refusals: Some(3),
+                expires_at_ms: kr_ipc::now_ms().get() + 600_000,
+                initial_bootstrap: false,
+                budgets: allowed(),
+                answer: installed(&temp),
+            }
+            .script(&temp, Arc::clone(&seen)),
+        );
+        let output = run_kr(&temp, &line);
+        let said = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{said}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            said.contains(COMMAND_INTEGRATION_NOTICE),
+            "the host's own notice of the integration: {said}"
+        );
+        assert_eq!(
+            said.contains(NATIVE_BRIDGE_NOTICE),
+            bridge,
+            "a bridge is claimed when the grant holds one: {said}"
+        );
+        assert!(
+            said.contains(&reading),
+            "the host's reading, under the host's label: {said}"
+        );
+        assert_eq!(
+            said.contains(&format!("the publisher says: {STATEMENT}")),
+            bridge,
+            "the publisher's words are shown for a bridge, apart from the reading: {said}"
+        );
+        serving.abort();
+    }
 }
 
 /// KR-REQ-07.47: when no owner device answers, the command waits until the challenge's own

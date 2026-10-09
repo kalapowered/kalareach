@@ -187,13 +187,23 @@ impl Installation {
         None
     }
 
-    /// What a refused later grant says to do instead, for the capability `added`.
+    /// What a refused later grant says to do instead, for the capability `added`: the capability
+    /// that makes it the install's is the bridge where the release asks for one, whatever is added.
     #[must_use]
     pub fn install_requirement(&self, added: PluginCapability) -> String {
+        let forcing = if self
+            .requested
+            .iter()
+            .any(|request| request.capability == PluginCapability::NativeBridgeInstall)
+        {
+            PluginCapability::NativeBridgeInstall
+        } else {
+            added
+        };
         format!(
-            "plugin.install of the installed release: {} asks for {added}, so a grant that adds to \
-             what it holds is made when the owner confirms the release, which shows the statement \
-             of what it does and the host's notice of it",
+            "plugin.install of the installed release: {} asks for {forcing}, so a grant that adds \
+             {added} to what it holds is made when the owner confirms the release, which shows the \
+             statement of what it does and the host's notice of it",
             self.plugin_id
         )
     }

@@ -3044,6 +3044,7 @@ test.describe('pairing', () => {
             facts: [],
             notice: null,
             statement: null,
+reading: null,
             expires_at_ms: Date.now() + 120_000,
             checkable: true
           },
@@ -3056,6 +3057,7 @@ test.describe('pairing', () => {
             facts: [],
             notice: null,
             statement: null,
+reading: null,
             expires_at_ms: Date.now() + 90_000,
             checkable: false
           }
@@ -3115,6 +3117,7 @@ test.describe('pairing', () => {
             ],
             notice: null,
             statement: null,
+reading: null,
             expires_at_ms: Date.now() + 120_000,
             checkable: true
           },
@@ -3135,6 +3138,7 @@ test.describe('pairing', () => {
               "This package installs a native bridge: code in the application's own directory that runs with the application's permissions, outside the plugin sandbox. The publisher's own statement of what it does follows.",
             statement:
               'Installs three registration files under /Users/someone/.claude/skills/kalareach-channels/hooks/hooks-with-a-long-name-and-no-break.json, where they apply  to every project  and every later session.',
+            reading: null,
             expires_at_ms: Date.now() + 120_000,
             checkable: true
           }
@@ -3213,6 +3217,7 @@ test.describe('a control that commits on a completed action', () => {
               facts: [],
               notice: null,
               statement: null,
+reading: null,
               expires_at_ms: Date.now() + 120_000,
               checkable: true
             }

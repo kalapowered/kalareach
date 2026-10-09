@@ -1445,8 +1445,12 @@ If the host responds that this one needs the owner, the command asks for a chall
 the owner's confirmation in the same way as `kr plugin repo add`. It prints what the owner device is
 shown: the release, its package hash and its grant. For a native bridge it also prints the host's
 own notice that the bridge runs outside the plugin sandbox, followed by what the publisher says the
-bridge does, set apart from the host's words. Each answer is spent once, and only by the request it
-was given for. With `--json` the document carries the challenge's identifier and its expiry.
+bridge does, set apart from the host's words. For a command integration it prints the host's notice
+that the package changes how a command starts, then the host's exact reading of what it declares:
+the command, each flag and variable, and the arguments of the application server it names. The
+reading follows a label that marks it as the host's, on a line of its own, apart from the
+publisher's words. Each answer is spent once, and only by the request it was given for. With
+`--json` the document carries the challenge's identifier and its expiry.
 
 A command integration the owner confirmed at installation applies only once the environment's
 configuration turns it on. `kr plugin integration enable <plugin>` adds the package to the host's

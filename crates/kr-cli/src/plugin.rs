@@ -33,9 +33,9 @@ use kr_protocol::catalogue::{
     PluginPinResult, PluginRemoveParams, PluginRemoveResult, PluginSummary,
 };
 use kr_protocol::confirmation::{
-    ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationPendingParams,
-    OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
-    install_notices,
+    ConfirmationDisplay, ConfirmationSubject, INTEGRATION_STATEMENT_LABEL,
+    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
+    OwnerConfirmationRequestResult, install_notices, split_install_statement,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{PluginId, RepositoryGeneration};
@@ -502,21 +502,22 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
                 output::line(&stdout_line!("{}", Shown::said(notice)));
             }
             if let Some(statement) = &grant_statement.0 {
-                // A statement of a bridge alone is the publisher's own words. With an integration
-                // in the grant it holds the host's reading too, after a label that says so.
-                let who = if grant
-                    .iter()
-                    .any(|name| name == "command_integration.launch")
-                {
-                    "the statement"
-                } else {
-                    "the publisher says"
-                };
-                output::line(&stdout_line!(
-                    "  {}: {}",
-                    Shown::said(who),
-                    Asked::text(Request::Plugins, statement)
-                ));
+                // The statement holds the publisher's words about a bridge and the host's reading
+                // of an integration, told apart at the label the host writes before its reading.
+                let parts = split_install_statement(statement);
+                if let Some(words) = parts.publisher {
+                    output::line(&stdout_line!(
+                        "  the publisher says: {}",
+                        Asked::text(Request::Plugins, words)
+                    ));
+                }
+                if let Some(reading) = parts.reading {
+                    output::line(&stdout_line!(
+                        "  {} {}",
+                        Shown::said(INTEGRATION_STATEMENT_LABEL),
+                        Asked::text(Request::Plugins, reading)
+                    ));
+                }
             }
         }
         _ => {}
