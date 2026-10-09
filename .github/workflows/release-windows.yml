@@ -279,9 +279,9 @@ jobs:
       # sign. Both are named here and both are hashed into the record the archive carries.
       #
       # The executables are named, by the program list, rather than swept up out of
-      # `target\release`, because that directory also holds the binaries those crates build that a
-      # release does not carry. The step that settles what this release is holds that list to what
-      # the workspace declares.
+      # `target\release`, so that the list alone decides what the archive holds: an executable it
+      # names that is not there stops the copy by its name. The step that settles what this release
+      # is holds that list to what the workspace declares.
       #
       # The PowerShell package's module goes in whole, with its startup script. The manifest loads
       # the module, the module dot-sources the three scripts beside it and reads the manifest and
