@@ -63,9 +63,10 @@ session ends, the session closes with `desktop_lost` and you create a new one.
 the one this table says you probably have. The answer names the service mechanism it is about, and
 a claim that a headless session survives logout also names what makes it survive.
 
-On a host with no per-user service manager the fallback is a detached process in its own process
-group, reparented to the system's first process. A worker started that way is in whatever login
-context the control daemon is in, so a headless session there has the desktop's variables stripped
+On a host with no per-user service manager the fallback is a detached process: a worker leads a
+session of its own, and the plugin runtime a process group of its own, each reparented when the
+control daemon exits. A worker started that way is in whatever login context the control daemon
+is in, so a headless session there has the desktop's variables stripped
 rather than a login context of its own. `kr doctor` reports that as what it is. Windows uses that
 fallback, and a worker there is a child of the control daemon and runs in the logon session the
 daemon runs in, so a headless session there is a session with no desktop handles and no promise
@@ -85,7 +86,8 @@ and, with lingering enabled, from boot, and the daemon runs with it.
 Either way the job starts only when a command asks for it, never at login, so after a reboot or a
 logout that ended it, nothing runs until the next `kr new`. A daemon that ends takes no session with
 it: every worker is a job of its own. A daemon the standalone start ran is in whatever login context
-the command that started it was in.
+the command that started it was in, and on Linux, started by a command of a session, it moves out
+of that session's service into a scope of its own.
 
 ### Enabling persistence on Linux
 
