@@ -601,7 +601,8 @@ stays allowed.
 A release that asks for `command_integration.launch` is granted that capability the same way.
 `plugin.grant` does not add it to an installed release: it refuses, names `plugin.install`, and
 spends no confirmation, because the install is where the owner is shown the host's exact reading of
-what the integration does. Narrowing, and widening by any other capability, stay allowed.
+what the integration does. Narrowing stays allowed, and so does adding another capability, unless
+the release asks for a native bridge, which refuses every addition.
 
 This has a cost, and it is stated here. An installation of a package that asks for capabilities past
 the repository's ceiling has to be granted all of them at once, so a seeded bridge package gets

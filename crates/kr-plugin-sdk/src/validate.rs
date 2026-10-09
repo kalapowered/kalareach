@@ -1422,6 +1422,20 @@ fn check_answer(
 
 /// Checks a native bridge recipe against the payloads the package declares.
 fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut Report) {
+    // An owner reads the bridge's own words beside the host's reading of a command integration,
+    // told apart by the host's label, so the publisher cannot write that label.
+    if bridge
+        .grant_statement
+        .as_str()
+        .contains(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL)
+    {
+        report.push(Finding::at(
+            FindingCode::BridgeRecipeInvalid,
+            MANIFEST_FILE,
+            "the bridge's statement holds the words the host writes before its own reading of a \
+             command integration",
+        ));
+    }
     if bridge.install.is_empty() {
         report.push(Finding::at(
             FindingCode::BridgeRecipeInvalid,

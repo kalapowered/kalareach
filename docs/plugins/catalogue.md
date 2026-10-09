@@ -381,18 +381,22 @@ every release that installs a native bridge or declares a command integration. W
 installation could do is read under the ceiling it was installed under, so a move to a repository
 that permits more is an increase too. The confirmation names the repository and its ceiling, as
 `catalogue.list` reports them, the release, the package hash, the grant and, where the grant holds a
-native bridge, the publisher's statement; it is accepted and
-consumed the way `plugin.grant`'s is, and asked again when the installation is recorded. The
-installation is held to the ceiling the owner was shown: a repository whose ceiling changed after
-the confirmation, before the installation holds it or before the installation is recorded, refuses
-it, and a new confirmation is needed. An installation that widens nothing needs none, and one that
-is given is spent all the same. `plugin.grant` takes the same confirmation for every widening of an
-installed package, so removing a package and installing it again is not a way around it.
+native bridge, the publisher's statement and, where it holds a command integration, the host's
+reading of it; it is accepted and consumed the way `plugin.grant`'s is, and asked again when the
+installation is recorded. The installation is held to the ceiling the owner was shown: a repository
+whose ceiling changed after the confirmation, before the installation holds it or before the
+installation is recorded, refuses it, and a new confirmation is needed. An installation that widens
+nothing needs none, and one that is given is spent all the same. `plugin.grant` takes the same
+confirmation for every widening of an installed package, so removing a package and installing it
+again is not a way around it.
 
 `plugin.grant` does not widen an installation whose release asks for `native_bridge.install`. It
 refuses with `PLUGIN_GRANT_REQUIRED`, names `plugin.install`, and spends no confirmation, because
 `plugin.install` is where the owner is shown the publisher's statement of what the bridge does and
-the host's notice that it runs outside the plugin sandbox. Narrowing such a grant stays allowed.
+the host's notice that it runs outside the plugin sandbox. Narrowing such a grant stays allowed. Nor
+does it add `command_integration.launch` to an installed release. `plugin.install` is where the
+owner is shown the host's exact reading of what the integration does, after a label that marks it as
+the host's, apart from the publisher's words about a bridge.
 
 This matters most for the packages the host seeds from its bundle, which are installed with an empty
 grant. The first grant of a seeded bridge is `plugin.install` of the installed release, with the

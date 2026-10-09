@@ -240,7 +240,9 @@ pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command
      host's own exact reading of what it declares follows in the statement.";
 
 /// What the host writes before its own exact reading of a command integration in an installation's
-/// statement, so that words of the publisher's that come before it are not taken for it.
+/// statement. A bridge's own words never hold it (the package check refuses them, and the host
+/// refuses a manifest that has it), so the first place it stands is where the host's reading
+/// starts and the publisher's words end.
 pub const INTEGRATION_STATEMENT_LABEL: &str =
     "The host's exact reading of the command integration:";
 
@@ -276,6 +278,36 @@ pub fn install_statement(bridge: Option<&str>, integration: Option<&str>) -> Opt
         (Some(bridge), None) => Some(bridge.to_owned()),
         (None, Some(integration)) => Some(integration),
         (Some(bridge), Some(integration)) => Some(format!("{bridge} {integration}")),
+    }
+}
+
+/// The parts of an installation's statement: the publisher's words about a native bridge, and the
+/// host's reading of a command integration, each where the statement has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatementParts<'a> {
+    /// The publisher's own words, before the host's label.
+    pub publisher: Option<&'a str>,
+    /// The host's reading, after its label.
+    pub reading: Option<&'a str>,
+}
+
+/// Splits an installation's statement at the host's label, so that a device captions each part by
+/// who wrote it. A statement with no label is all the publisher's.
+#[must_use]
+pub fn split_install_statement(statement: &str) -> StatementParts<'_> {
+    fn part(text: &str) -> Option<&str> {
+        let text = text.trim();
+        (!text.is_empty()).then_some(text)
+    }
+    match statement.split_once(INTEGRATION_STATEMENT_LABEL) {
+        Some((before, after)) => StatementParts {
+            publisher: part(before),
+            reading: part(after),
+        },
+        None => StatementParts {
+            publisher: part(statement),
+            reading: None,
+        },
     }
 }
 
