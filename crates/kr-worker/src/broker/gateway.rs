@@ -915,7 +915,7 @@ fn prepare_channel_answer(
 }
 
 /// The class a package's table states, as the core names it.
-const fn native_class(class: MethodClass) -> NativeMethodClass {
+pub(crate) const fn native_class(class: MethodClass) -> NativeMethodClass {
     match class {
         MethodClass::Observation => NativeMethodClass::Observation,
         MethodClass::Mutation => NativeMethodClass::Mutation,
