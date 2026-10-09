@@ -9,6 +9,7 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | an integrated command resolves to the connector its installed package carries, and to nothing else; its command, flags and variables are the verified manifest's, and apply only while `command_integration.launch` is granted |
 //! | KR-REQ-07.64 | a package's launch probe is the verified manifest's, and applies only while `launch.probe` is granted |
+//! | KR-REQ-11.30 | the table an installed Codex-shaped package carries compiles to the table the gateway interprets, which is the golden one; the broker pins it and reads every frame of a session as the installed table classifies it, an unlisted method as a presumed mutation; no table is compiled for an executable no signed record names, one the table is not qualified for, or a channel's table |
 //! | KR-REQ-11.34 | the table a channel is served with is the installed package's own |
 //! | KR-REQ-12.22 | Qoder CLI's launch flags give its launch a hook bridge on this installation's own forwarder, for Qoder CLI and nothing else |
 //! | KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22 | the test packages declare the command integrations the released packages declare |
@@ -16,11 +17,19 @@
 use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_protocol::scalars::Digest256;
+use kr_plugin_sdk::connector::MethodClass;
+use kr_plugin_sdk::ids::MethodName;
+use kr_protocol::broker::IntegrationMode;
+use kr_protocol::gateway::NativeMethodClass;
+use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+use kr_protocol::ids::{ApplicationInstanceId, SessionId, UpstreamRequestId};
+use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_worker::broker::bridge::{BridgeDeclaration, BridgeSurface, InstalledBridge};
 use kr_worker::broker::connectors::{
-    ConnectorSource, ConnectorSources, InstalledConnector, fixture,
+    ConnectorSource, ConnectorSources, InstalledConnector, QualifiedExecutable, fixture,
 };
+use kr_worker::broker::{Broker, BrokerTransport, Credential, ManagedProcess, TransportHandle};
+use kr_worker::persistence::JournalHealth;
 
 /// A directory of the test's own, removed when it is dropped.
 struct Store {
@@ -587,4 +596,268 @@ fn the_test_packages_declare_the_released_integrations() {
     let claude = &released("claude-code")["command_integration"];
     assert_eq!(claude["command"], fixture::COMMAND);
     assert_eq!(claude["flags"], serde_json::json!(fixture::FLAGS));
+}
+
+// -- the table the gateway interprets -------------------------------------------------------
+
+/// The digest a signed record names for the executable these cases run.
+fn executable() -> Digest256 {
+    Digest256::from_bytes([7; 32])
+}
+
+/// The Codex-shaped package, read from its installation, with a signed record that names `version`
+/// for the executable when there is one.
+fn codex_connector(store: &Store, version: Option<&str>) -> InstalledConnector {
+    let mut source = store.shaped(&fixture::Shape::codex_backend());
+    if let Some(version) = version {
+        source.qualified.push(QualifiedExecutable {
+            digest: executable(),
+            version: version.to_owned(),
+        });
+    }
+    InstalledConnector::read(source).expect("the installed package is read")
+}
+
+/// KR-REQ-11.30: the table an installed package carries compiles to the table the gateway
+/// interprets. The golden file is that table as the compile writes it; a change to what the compile
+/// makes of a package shows up as a change to it.
+#[test]
+fn kr_req_11_30_the_installed_table_compiles_to_the_golden_core_table() {
+    let store = Store::new("compile");
+    let connector = codex_connector(&store, Some(fixture::GATEWAY_QUALIFIED_VERSION));
+    let tables = connector
+        .native_tables(&executable())
+        .expect("the table compiles");
+    let compiled = serde_json::to_value(&tables.table).expect("a table encodes");
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("golden/native-tables/codex-backend.json"))
+            .expect("the golden file is JSON");
+    assert_eq!(
+        compiled,
+        golden,
+        "the compiled table is not the golden one:\n{}",
+        serde_json::to_string_pretty(&compiled).expect("a table prints")
+    );
+    tables
+        .table
+        .qualify(&tables.protocol_version)
+        .expect("the compiled table qualifies against the version the record names");
+    // A package that declares no rich method of its own has a rich table with none, and it is valid.
+    assert!(tables.rich.entries.is_empty());
+    tables
+        .rich
+        .qualify(&tables.protocol_version)
+        .expect("an empty rich table qualifies");
+    // The package declares a frame bound above the host's, and the host's holds.
+    assert!(tables.frame_limit_clamped);
+    assert_eq!(
+        tables.framing.limit(),
+        kr_worker::broker::gateway::MAX_NATIVE_FRAME_BYTES
+    );
+}
+
+fn managed(instance: ApplicationInstanceId) -> ManagedProcess {
+    let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
+    ManagedProcess::new(
+        instance,
+        process.clone(),
+        TransportHandle {
+            transport: BrokerTransport::PrivateSocket,
+            application_instance_id: instance,
+            executable_digest: executable(),
+            process,
+        },
+        Credential::from_bytes([9; 32]),
+        true,
+        TimestampMs::new(1),
+    )
+}
+
+fn core_class(class: MethodClass) -> NativeMethodClass {
+    match class {
+        MethodClass::Observation => NativeMethodClass::Observation,
+        MethodClass::Mutation => NativeMethodClass::Mutation,
+        MethodClass::Credential => NativeMethodClass::CredentialOrConfiguration,
+        MethodClass::Unsupported => NativeMethodClass::Unsupported,
+    }
+}
+
+/// KR-REQ-11.30: a broker pins the compiled table and reads the frames a session carries as the
+/// installed table classifies them. The frames are the pinned build's own shapes: its first
+/// exchange, a login, a thread, a turn and a command; and one method the table does not list.
+#[test]
+fn kr_req_11_30_the_broker_reads_a_session_s_frames_as_the_installed_table_classifies_them() {
+    let store = Store::new("admit");
+    let connector = codex_connector(&store, Some(fixture::GATEWAY_QUALIFIED_VERSION));
+    let broker = Broker::open(
+        None,
+        SessionId::new(Uuid::from_bytes([1; 16])),
+        JournalHealth::shared(),
+    )
+    .expect("the broker opens");
+    let instance = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
+    let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
+    broker
+        .register_instance(
+            instance,
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance)),
+        )
+        .expect("the instance is registered");
+    let tables = broker
+        .pin_compiled(instance, &connector, &executable())
+        .expect("the compiled tables are pinned");
+    let connection = broker
+        .open_native_connection(
+            instance,
+            &[9; 32],
+            &process,
+            &connector.plugin_id(),
+            &tables.protocol_version,
+        )
+        .expect("a native connection opens on the compiled tables");
+
+    // (the method on the wire, a frame that names it)
+    let corpus: [(&str, &str); 7] = [
+        (
+            "initialize",
+            r#"{"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"kr-probe","version":"0"},"capabilities":{"experimentalApi":true}}}"#,
+        ),
+        ("initialized", r#"{"method":"initialized"}"#),
+        (
+            "account/read",
+            r#"{"id":1,"method":"account/read","params":{}}"#,
+        ),
+        (
+            "account/login/start",
+            r#"{"id":2,"method":"account/login/start","params":{"type":"apiKey","apiKey":"not-a-key"}}"#,
+        ),
+        (
+            "thread/list",
+            r#"{"id":3,"method":"thread/list","params":{}}"#,
+        ),
+        (
+            "turn/start",
+            r#"{"id":4,"method":"turn/start","params":{"threadId":"t","input":[]}}"#,
+        ),
+        (
+            "command/exec",
+            r#"{"id":5,"method":"command/exec","params":{"command":["ls"]}}"#,
+        ),
+    ];
+    let installed = connector.table();
+    for (wire, frame) in corpus {
+        let route = installed
+            .route_for_wire_name(wire)
+            .unwrap_or_else(|| panic!("the installed table routes {wire}"));
+        let wanted = core_class(installed.classify(&route.method));
+        let identifier = serde_json::from_str::<serde_json::Value>(frame)
+            .expect("a frame")
+            .get("id")
+            .map(|_| UpstreamRequestId::new("\"kr-1\"").expect("an identifier"));
+        let admitted = broker
+            .admit_client_request(
+                connection,
+                frame.as_bytes(),
+                identifier.as_ref(),
+                TimestampMs::new(2),
+            )
+            .unwrap_or_else(|error| panic!("{wire} is admitted: {error}"));
+        assert_eq!(
+            admitted.classification.class, wanted,
+            "{wire} is classified as the installed table classifies it"
+        );
+        assert!(admitted.classification.declared, "{wire} is listed");
+    }
+
+    // A method the table does not list is presumed a mutation, as the package's own table presumes.
+    assert_eq!(
+        installed.classify(&MethodName::new("thread.start").expect("a method name")),
+        MethodClass::Mutation
+    );
+    let unlisted = broker
+        .admit_client_request(
+            connection,
+            br#"{"id":6,"method":"thread/start","params":{}}"#,
+            Some(&UpstreamRequestId::new("\"kr-2\"").expect("an identifier")),
+            TimestampMs::new(2),
+        )
+        .expect("an unlisted method is admitted and presumed");
+    assert_eq!(unlisted.classification.class, NativeMethodClass::Mutation);
+    assert!(!unlisted.classification.declared);
+}
+
+/// KR-REQ-11.30: no table is compiled for an executable that no signed record names, or whose
+/// version the table is not qualified for, and nothing is pinned for it.
+#[test]
+fn kr_req_11_30_no_table_is_compiled_for_an_executable_the_signed_records_do_not_qualify() {
+    for (what, version, expected) in [
+        ("an executable no signed record names", None, "no signed"),
+        (
+            "a version the table is not qualified for",
+            Some("0.160.1"),
+            "0.160.1",
+        ),
+    ] {
+        let store = Store::new("refuse");
+        let connector = codex_connector(&store, version);
+        let refusal = connector
+            .native_tables(&executable())
+            .expect_err("no table is compiled");
+        assert!(
+            refusal.detail.contains(expected),
+            "{what}: {}",
+            refusal.detail
+        );
+
+        let broker = Broker::open(
+            None,
+            SessionId::new(Uuid::from_bytes([1; 16])),
+            JournalHealth::shared(),
+        )
+        .expect("the broker opens");
+        let instance = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
+        broker
+            .register_instance(
+                instance,
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance)),
+            )
+            .expect("the instance is registered");
+        broker
+            .pin_compiled(instance, &connector, &executable())
+            .expect_err("nothing is pinned for it");
+        broker
+            .open_native_connection(
+                instance,
+                &[9; 32],
+                &ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900),
+                &connector.plugin_id(),
+                "0.155.1",
+            )
+            .expect_err("so no native connection opens on it");
+    }
+}
+
+/// KR-REQ-11.30: a connector whose table is a channel's, which reaches its application some other
+/// way than over a backend's standard streams, is not one the gateway compiles anything from.
+#[test]
+fn kr_req_11_30_a_channel_s_table_is_not_compiled() {
+    let store = Store::new("channel");
+    let mut source = store.package();
+    source.qualified.push(QualifiedExecutable {
+        digest: executable(),
+        version: fixture::QUALIFIED_VERSION.to_owned(),
+    });
+    let connector = InstalledConnector::read(source).expect("the installed package is read");
+    let refusal = connector
+        .native_tables(&executable())
+        .expect_err("a channel's table is not a gateway's");
+    assert!(
+        refusal.detail.contains("standard streams"),
+        "{}",
+        refusal.detail
+    );
 }
