@@ -321,43 +321,11 @@ impl SharingService {
 
         match request.parent_grant_id {
             Some(parent_grant_id) => {
-                let parent = self.grants.record(parent_grant_id)?.ok_or_else(|| {
-                    ControllerError::PermissionDenied {
-                        detail: "this host holds no such parent grant".to_owned(),
-                    }
-                })?;
-                // The issuer has to *hold* the parent. Naming one is not holding one: without this
-                // check any device that learned a grant identifier could delegate from somebody
-                // else's authority, and the structural narrowing check below would happily agree.
-                if parent.grant.recipient_device_id != request.issuer_device_id {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "that grant belongs to another device, so this one cannot \
-                                 delegate from it"
-                            .to_owned(),
-                    });
-                }
-                if parent.revoked_at_ms.is_some() {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "the grant this one delegates from has been revoked".to_owned(),
-                    });
-                }
-                // Under the store's own rule, on both of the parent's deadlines, so no expiry is
-                // answered from a reading this host has not written down. The store decides it
-                // again where the delegation is written, so a parent that runs out while this
-                // waits is found expired there.
-                if self.grants.lapsed(&parent, request.now_ms)? {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "the grant this one delegates from has expired".to_owned(),
-                    });
-                }
-                // Sharing is its own right. Holding the rights a grant contains is not authority
-                // to hand them on, which is what section 23 means by "current issuer/delegation
-                // authority" being separate from the grant's contents.
-                if !parent.grant.permits(ActionRight::SessionShare) {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "delegating a grant needs session.share".to_owned(),
-                    });
-                }
+                let parent = self.delegating_parent(
+                    request.issuer_device_id,
+                    parent_grant_id,
+                    request.now_ms,
+                )?;
                 // A delegation inherits its parent's organisation requirement. Dropping it would
                 // be a way to turn an organisation-scoped grant into a personal one.
                 grant.organisation = parent.grant.organisation;
@@ -406,6 +374,100 @@ impl SharingService {
             preview,
             authority_revision: request.authority_revision,
         })
+    }
+
+    /// The grant `issuer` delegates from, once it is shown to hold it and to be allowed to pass
+    /// it on.
+    ///
+    /// The issuer has to *hold* the parent. Naming one is not holding one: without this check any
+    /// device that learned a grant identifier could delegate from somebody else's authority, and
+    /// the structural narrowing check that follows would happily agree. The parent has to be
+    /// standing, under the store's own rule on both of its deadlines, so no expiry is answered from
+    /// a reading this host has not written down (the store decides it again where the delegation is
+    /// written, so a parent that runs out while this waits is found expired there). And sharing is
+    /// its own right: holding the rights a grant contains is not authority to hand them on, which
+    /// is what section 23 means by "current issuer/delegation authority" being separate from the
+    /// grant's contents.
+    fn delegating_parent(
+        &self,
+        issuer: DeviceId,
+        parent_grant_id: GrantId,
+        now_ms: u64,
+    ) -> Result<GrantRecord> {
+        let parent = self.grants.record(parent_grant_id)?.ok_or_else(|| {
+            ControllerError::PermissionDenied {
+                detail: "this host holds no such parent grant".to_owned(),
+            }
+        })?;
+        if parent.grant.recipient_device_id != issuer {
+            return Err(ControllerError::PermissionDenied {
+                detail: "that grant belongs to another device, so this one cannot delegate from it"
+                    .to_owned(),
+            });
+        }
+        if parent.revoked_at_ms.is_some() {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the grant this one delegates from has been revoked".to_owned(),
+            });
+        }
+        if self.grants.lapsed(&parent, now_ms)? {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the grant this one delegates from has expired".to_owned(),
+            });
+        }
+        if !parent.grant.permits(ActionRight::SessionShare) {
+            return Err(ControllerError::PermissionDenied {
+                detail: "delegating a grant needs session.share".to_owned(),
+            });
+        }
+        Ok(parent)
+    }
+
+    /// Whether the delegation `request` asks for is one its issuer may make from the grant it
+    /// holds, decided from the grants alone.
+    ///
+    /// This is [`Self::share`]'s delegation rule without its preview, so a caller can decide it
+    /// before it reads anything of the session for the preview: what an issuer is shown is limited
+    /// to what the grant it delegates from reaches, and a request that exceeds that parent is
+    /// refused before any of the session's text is read for it. Only the request's issuer, parent,
+    /// session, selection, lifetime and time are read; the previews it carries are not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] when the request names no parent, when the
+    /// issuer does not hold the parent or the parent cannot be passed on, and when the delegation
+    /// would exceed it; and [`ControllerError::InvalidArgument`] when the lifetime is outside its
+    /// bound.
+    pub fn delegation_allowed(&self, request: &ShareRequest) -> Result<()> {
+        let Some(parent_grant_id) = request.parent_grant_id else {
+            return Err(ControllerError::PermissionDenied {
+                detail: "a device delegates from a grant it holds, and none was named".to_owned(),
+            });
+        };
+        let proposed = roles::compile(
+            &request.selection,
+            request.session_id,
+            request.lifetime_ms,
+            request.now_ms,
+        )?;
+        let parent =
+            self.delegating_parent(request.issuer_device_id, parent_grant_id, request.now_ms)?;
+        let child = Grant {
+            grant_id: request.grant_id,
+            parent_grant_id: Nullable::some(parent_grant_id),
+            issuer_device_id: request.issuer_device_id,
+            recipient_device_id: request.recipient_device_id,
+            authority_revision: request.authority_revision,
+            environment_selector: kr_protocol::grant::EnvironmentSelector::These {
+                environment_ids: [request.environment_id].into_iter().collect(),
+            },
+            session_selector: proposed.session_selector,
+            actions: proposed.actions,
+            history: proposed.history,
+            expiry: proposed.expiry,
+            organisation: parent.grant.organisation,
+        };
+        roles::check_delegation(&child, &parent.grant)
     }
 
     /// What a share that wrote `grant_id` and `invitation_id` produced, when both are here.
