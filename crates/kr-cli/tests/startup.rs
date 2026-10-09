@@ -3855,8 +3855,10 @@ fn a_daemon_started_from_inside_a_session_outlives_it(recorded: bool, end: End) 
         closure
             .surviving
             .iter()
-            .filter(|resource| resource.kind == "external"
-                && resource.detail.contains(&format!("process {pid} ")))
+            .filter(
+                |resource| resource.kind == kr_worker::ownership::LEFT_FOR_A_DAEMON
+                    && resource.detail.contains(&format!("process {pid} "))
+            )
             .count(),
         usize::from(recorded),
         "{closure:?}"
