@@ -1408,7 +1408,7 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
         ),
     ] {
         assert!(
-            own_scope(1, daemon, &changed.map(str::to_owned).to_vec(), inside).is_err(),
+            own_scope(1, daemon, &changed.map(str::to_owned), inside).is_err(),
             "a scope under {what} is refused"
         );
     }
