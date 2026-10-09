@@ -45,7 +45,14 @@ function sessionName(session: Session): string {
 }
 
 /** The kept drafts, and what a person can do with each. */
-export function KeptDrafts({ onBack }: { readonly onBack?: () => void }): ReactNode {
+export function KeptDrafts({
+  onBack,
+  phone = false
+}: {
+  readonly onBack?: () => void
+  /** True on a phone, whose bar already names the screen and leaves it. */
+  readonly phone?: boolean
+}): ReactNode {
   const { port, say } = useApp()
   const book = useDraftBook()
   const { kept, status, problem } = useBook()
@@ -84,23 +91,30 @@ export function KeptDrafts({ onBack }: { readonly onBack?: () => void }): ReactN
 
   return (
     <>
-      <header className="page-heading">
-        <div>
-          <p className="eyebrow">Sessions</p>
-          <h1>Kept drafts</h1>
-          <p>
-            Drafts that are not in a composer. They stay on this device until you discard them, and
-            nothing here is sent.
-          </p>
-        </div>
-        {onBack === undefined ? null : (
-          <div className="page-actions">
-            <Button tone="quiet" data-testid="kept-drafts-back" onClick={onBack}>
-              Back to sessions
-            </Button>
+      {phone ? (
+        <p className="small muted">
+          Drafts that are not in a composer. They stay on this device until you discard them, and
+          nothing here is sent.
+        </p>
+      ) : (
+        <header className="page-heading">
+          <div>
+            <p className="eyebrow">Sessions</p>
+            <h1>Kept drafts</h1>
+            <p>
+              Drafts that are not in a composer. They stay on this device until you discard them, and
+              nothing here is sent.
+            </p>
           </div>
-        )}
-      </header>
+          {onBack === undefined ? null : (
+            <div className="page-actions">
+              <Button tone="quiet" data-testid="kept-drafts-back" onClick={onBack}>
+                Back to sessions
+              </Button>
+            </div>
+          )}
+        </header>
+      )}
       {status === 'memory-only' ? (
         <Banner
           tone="warning"

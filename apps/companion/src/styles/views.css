@@ -126,6 +126,50 @@
   margin-top: 14px;
 }
 
+/* ---- Kept drafts ----------------------------------------------------------------------------- */
+
+/*
+ * The drafts no composer shows. Sized in rem so a larger text size reflows it. The draft's own text
+ * is shown whole in a box that scrolls, so a long one never pushes the actions out of reach, and it
+ * can be selected and copied.
+ */
+.kept-drafts {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 14px 0 4px;
+  padding: 0;
+  list-style: none;
+}
+
+.kept-draft {
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--raised);
+}
+
+.kept-draft p {
+  overflow-wrap: anywhere;
+}
+
+.kept-draft-text {
+  margin: 10px 0;
+  padding: 10px 12px;
+  max-block-size: 14rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.kept-draft select {
+  min-block-size: var(--target);
+  max-inline-size: 100%;
+}
+
 /* ---- Questions ------------------------------------------------------------------------------- */
 
 /*

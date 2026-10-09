@@ -294,7 +294,7 @@ export function MobileApp({
           />
         ) : null}
         {inVoice ? <VoiceRoute surface={resolved} embedded /> : null}
-        {inDrafts ? <KeptDrafts /> : null}
+        {inDrafts ? <KeptDrafts phone /> : null}
         {inSession && place.sessionId ? (
           <MobileSession
             sessionId={place.sessionId}
