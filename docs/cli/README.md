@@ -601,7 +601,8 @@ destination (see `kr bridge`).
 `kr host terminal` prints the terminal applications this host has, in the order it would choose
 between them, and which one it prefers. `--set <id>` saves a preference for this environment, and
 `--clear` removes it and lets the host choose again. A `--set` that names an application this host
-does not have is `TERMINAL_UNAVAILABLE` and changes nothing.
+does not have is `TERMINAL_UNAVAILABLE` and changes nothing. A `--set` that finds a saved preference
+of a later format, or one it cannot read, leaves it as it is and says so; `--clear` removes it.
 
 The preference is the middle step of the order a `terminal` presentation uses: `kr new
 --terminal-app` wins over it, and detection decides when neither says anything. A preference that
@@ -870,7 +871,7 @@ bound to the session this process is running in. Outside a session every tool an
 | 6 | The command needed a terminal, or the terminal could not be changed |
 | 7 | No terminal application could be opened |
 | 8 | The host refused the request |
-| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, or a release an earlier install or update left in the store is held by a running program. Nothing was replaced, and whatever the update stopped runs again |
+| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, a release an earlier install or update left in the store is held by a running program, or a command that writes a stored record holds the writers' lock for more than thirty seconds. Nothing was replaced, and whatever the update stopped runs again. A command that waits that long for an update's switch exits with 9 as well, and writes nothing |
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the
