@@ -233,9 +233,8 @@ impl Controller {
         Self::start_with(setup, clocks, Arc::new(RealTimer)).await
     }
 
-    /// Starts the daemon with the waits between the passes of its backup and authority-feed
-    /// carriers in the hands of `timer`, which a test releases when it has seen how long the
-    /// daemon asked to wait.
+    /// Starts the daemon with the wait between the passes of its backup carrier in the hands of
+    /// `timer`, which a test releases when it has seen how long the daemon asked to wait.
     ///
     /// # Errors
     ///
