@@ -142,9 +142,9 @@ pub struct OwnedProcesses {
     /// the boundary still lists it: one that left the boundary after it was seen is still the
     /// session's to stop. The exception is a process that has left for a control daemon's own
     /// scope, which is never the session's: it is not in this set, and `seen` says it left. A
-    /// process read as having left through a shared reference is still in the set until
-    /// [`Self::take`] next runs, which an observation that cannot list anything never reaches, so
-    /// [`Self::record`] leaves it out.
+    /// process read as having left through a shared reference can stay in the set until a later
+    /// reading or [`Self::take`] removes it, and an observation that cannot list anything reaches
+    /// neither, so [`Self::record`] leaves it out.
     live: BTreeMap<(u64, u64), ProcessStartIdentity>,
     /// The boot this session began in. A process identity is only a statement about one boot.
     boot: Option<BootIdentity>,
@@ -272,10 +272,10 @@ impl OwnedProcesses {
     /// processes the session stops: a control daemon a command of the session started is the
     /// daemon of another environment, which the session did not start for itself. A reading made
     /// before this runs, in the walk of the tree or in the terminal's list, is applied by
-    /// [`Self::note_left`] when it is made, because a reading can be followed by a failure that
-    /// ends the observation before this is reached, and the process can end before anything reads
-    /// it again. This drops what has been flagged since the last call, reads again the recorded
-    /// processes it was not given, and applies a positive answer the same way.
+    /// [`Self::note_left`] when it is made, because this does not read again what it is given, the
+    /// walk can fail after a reading and never reach it, and the process can end before anything
+    /// reads it again. This drops what has been flagged since the last call, reads again the
+    /// recorded processes it was not given, and applies a positive answer the same way.
     fn take(&mut self, found: impl IntoIterator<Item = ProcessStartIdentity>) {
         let mut read = std::collections::BTreeSet::new();
         for identity in found {
@@ -1455,56 +1455,100 @@ mod tests {
         );
     }
 
-    /// KR-REQ-07.13: the walk of the worker's tree reads no further below a process already read
-    /// as having left, whatever its scope reads now: what it started is its own, and the session
-    /// would otherwise record it and stop it.
+    /// Ends a process group when it goes out of scope, so that a test that fails part way leaves
+    /// nothing running.
+    #[cfg(target_os = "linux")]
+    struct Group(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Group {
+        fn drop(&mut self) {
+            if let Some(group) = i32::try_from(self.0.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    /// KR-REQ-07.13: the walk of the worker's tree reads nothing below a process already read as
+    /// having left, whatever its scope reads now, and goes on with the rest of the tree: what the
+    /// process started is its own, and the session would otherwise record it and stop it.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_walk_reads_nothing_below_a_process_already_read_as_having_left() {
         use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
 
         adopt_orphans();
+        // A root that started two processes, each of which started one of its own. The root says
+        // so once both have: each writes its line after its child exists.
         let mut root = std::process::Command::new("sh")
-            .args(["-c", "sleep 30 & echo up; wait"])
+            .args([
+                "-c",
+                "(sleep 600 & echo a; wait) & (sleep 601 & echo b; wait) & wait",
+            ])
+            .process_group(0)
             .stdout(std::process::Stdio::piped())
             .spawn()
-            .expect("starts a process that starts another");
-        let mut said = String::new();
-        std::io::BufReader::new(root.stdout.take().expect("its output"))
-            .read_line(&mut said)
-            .expect("it says it started the other");
-        let identity = kr_ipc::identity::process_start_identity(root.id()).expect("its identity");
-        let mut owned = OwnedProcesses::establish(
-            OwnershipBoundary::TerminalGroup {
-                group: 1,
-                terminal: None,
-            },
-            identity.clone(),
-        );
-
-        let whole = owned.tree().expect("the tree of a running session is read");
-        let below: Vec<ProcessStartIdentity> = whole
-            .iter()
-            .filter(|member| **member != identity)
-            .cloned()
-            .collect();
-        assert!(
-            !below.is_empty(),
-            "control: the walk reads what the root started: {whole:?}"
-        );
-
-        owned.note_left(&identity);
-        let walked = owned.tree().expect("the tree is read again");
-        assert_eq!(
-            walked,
-            vec![identity.clone()],
-            "a root read as having left is read about no further"
-        );
-        for member in below {
-            let _ = kr_ipc::identity::stop_process(&member, kr_ipc::identity::Stop::Kill);
+            .expect("starts a root that starts two processes");
+        let output = root.stdout.take().expect("its output");
+        let root = Group(root);
+        let mut lines = std::io::BufReader::new(output).lines();
+        for _ in 0..2 {
+            lines
+                .next()
+                .expect("each of the two says its child started")
+                .expect("reads the line");
         }
-        let _ = root.kill();
-        let _ = root.wait();
+        let identity = |pid: u32| kr_ipc::identity::process_start_identity(pid).expect("identity");
+        let top = identity(root.0.id());
+        let middle = kr_ipc::identity::children_of(root.0.id()).expect("the root's children");
+        assert_eq!(middle.len(), 2, "the root started two processes");
+        let below: Vec<(ProcessStartIdentity, ProcessStartIdentity)> = middle
+            .iter()
+            .map(|pid| {
+                let grandchildren =
+                    kr_ipc::identity::children_of(*pid).expect("the process's children");
+                assert_eq!(grandchildren.len(), 1, "each of the two started one");
+                (identity(*pid), identity(grandchildren[0]))
+            })
+            .collect();
+
+        // Whichever of the two the walk meets first is the one that was read as having left, in
+        // turn: the walk reads nothing below it, and still reads the other one and what it started.
+        for (flagged, (left, child_of_left)) in below.iter().enumerate() {
+            let other = &below[1 - flagged];
+            let mut owned = OwnedProcesses::establish(
+                OwnershipBoundary::TerminalGroup {
+                    group: 1,
+                    terminal: None,
+                },
+                top.clone(),
+            );
+            owned.note_left(left);
+            let walked = owned.tree().expect("the tree of a running session is read");
+            for read in [&top, left, &other.0, &other.1] {
+                assert!(
+                    walked.contains(read),
+                    "the walk reads {read:?}, which is not below a process that left: {walked:?}"
+                );
+            }
+            assert!(
+                !walked.contains(child_of_left),
+                "the walk reads nothing below a process already read as having left: {walked:?}"
+            );
+            assert!(
+                matches!(
+                    kr_ipc::identity::process_state(child_of_left),
+                    kr_ipc::identity::ProcessState::Running
+                ),
+                "the process below the one that left is still running, so the walk skipped it \
+                 rather than found it gone"
+            );
+        }
     }
 
     /// KR-REQ-07.57: an owned process is its identifier and its start value together, so a process
