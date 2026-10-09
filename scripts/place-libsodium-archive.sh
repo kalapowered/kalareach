@@ -36,7 +36,7 @@ usage() {
 
 [ $# -eq 1 ] || usage
 
-locked="$(grep -A1 -x "name = \"$crate\"" "$root/Cargo.lock" | sed -n 's/^version = "\(.*\)"$/\1/p')"
+locked="$({ grep -A1 -x "name = \"$crate\"" "$root/Cargo.lock" || true; } | sed -n 's/^version = "\(.*\)"$/\1/p')"
 if [ "$locked" != "$crate_version" ]; then
     echo "place-libsodium-archive: Cargo.lock locks $crate ${locked:-nothing}, and this script knows the archive of $crate_version." >&2
     echo "place-libsodium-archive: Read the archive name in the new version's build.rs and change crate_version and archive." >&2
