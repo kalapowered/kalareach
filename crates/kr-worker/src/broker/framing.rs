@@ -11,21 +11,62 @@ use kr_protocol::gateway::NativeFraming;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::MAX_NATIVE_FRAME_BYTES;
 
+/// How many bytes a body may grow by on its way through this host.
+///
+/// A request the terminal sends is forwarded under an identifier this host gives it, and the
+/// reply comes back under the terminal's own. The longest identifier this host gives is a quoted
+/// `kr-` and twenty digits, 25 bytes, in place of one that may be a single character. A body is
+/// read at the limit its connector states and may be written that many bytes longer, so a frame at
+/// the limit is not carried in one direction and refused in the other.
+pub const IDENTIFIER_ALLOWANCE: usize = 32;
+
 /// Reads and writes one connector's frames, as its qualified table describes them.
 #[derive(Clone, Copy, Debug)]
-pub struct Framing(NativeFraming);
+pub struct Framing {
+    shape: NativeFraming,
+    /// The most bytes one body may have, which is never more than the host carries.
+    limit: usize,
+}
 
 impl Framing {
-    /// Frames as this connector does.
+    /// Frames as this connector does, with a body of up to the host's bound.
     #[must_use]
     pub const fn new(framing: NativeFraming) -> Self {
-        Self(framing)
+        Self {
+            shape: framing,
+            limit: MAX_NATIVE_FRAME_BYTES,
+        }
+    }
+
+    /// Frames as this connector does, with a body of up to the `declared` bytes its package states.
+    ///
+    /// A package that states less than the host carries is held to what it stated. One that states
+    /// more is held to what the host carries, so a declaration never raises the host's bound.
+    #[must_use]
+    pub fn within(framing: NativeFraming, declared: usize) -> Self {
+        Self {
+            shape: framing,
+            limit: declared.clamp(1, MAX_NATIVE_FRAME_BYTES),
+        }
+    }
+
+    /// Returns the most bytes one body may have when it is read.
+    #[must_use]
+    pub const fn limit(self) -> usize {
+        self.limit
+    }
+
+    /// Returns the most bytes one body may have when it is written: the limit, and what an
+    /// identifier this host gives a request adds.
+    #[must_use]
+    pub const fn largest_body(self) -> usize {
+        self.limit + IDENTIFIER_ALLOWANCE
     }
 
     /// Returns the stable name of this framing, as the registration file publishes it.
     #[must_use]
     pub const fn name(self) -> &'static str {
-        match self.0 {
+        match self.shape {
             NativeFraming::JsonLines => "json_lines",
             NativeFraming::LengthPrefixed => "length_prefixed",
             NativeFraming::ContentLength => "content_length",
@@ -35,7 +76,7 @@ impl Framing {
     /// Wraps one body in the framing this connector uses.
     #[must_use]
     pub fn encode(self, body: &[u8]) -> Vec<u8> {
-        match self.0 {
+        match self.shape {
             NativeFraming::JsonLines => {
                 let mut framed = Vec::with_capacity(body.len() + 1);
                 framed.extend_from_slice(body);
@@ -62,21 +103,21 @@ impl Framing {
     /// Returns [`BrokerError::InvalidArgument`] when the buffer holds something this framing
     /// cannot be reading: a declared length that is not a number, or one past the frame bound.
     pub fn decode(self, buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
-        match self.0 {
+        match self.shape {
             NativeFraming::JsonLines => {
                 let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
-                    Self::check_partial(buffer.len())?;
+                    self.check_partial(buffer.len())?;
                     return Ok(None);
                 };
                 // A line whose newline arrived in the same read that carried it past the bound is
                 // as long as one that never ended. The bound is on the body, whenever it ends.
-                Self::check_complete(end)?;
+                self.check_complete(end)?;
                 let body = buffer.drain(..=end).take(end).collect();
                 Ok(Some(body))
             }
             NativeFraming::LengthPrefixed => {
                 let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
-                    Self::check_partial(buffer.len())?;
+                    self.check_partial(buffer.len())?;
                     return Ok(None);
                 };
                 let declared = std::str::from_utf8(&buffer[..end])
@@ -85,7 +126,7 @@ impl Framing {
                     .ok_or_else(|| {
                         BrokerError::invalid("this frame declares no readable length")
                     })?;
-                Self::check_declared(declared)?;
+                self.check_declared(declared)?;
                 if buffer.len() < end + 1 + declared {
                     return Ok(None);
                 }
@@ -94,7 +135,7 @@ impl Framing {
             }
             NativeFraming::ContentLength => {
                 let Some(end) = find(buffer, b"\r\n\r\n") else {
-                    Self::check_partial(buffer.len())?;
+                    self.check_partial(buffer.len())?;
                     return Ok(None);
                 };
                 let headers = std::str::from_utf8(&buffer[..end])
@@ -110,7 +151,7 @@ impl Framing {
                     .ok_or_else(|| {
                         BrokerError::invalid("this frame declares no readable content length")
                     })?;
-                Self::check_declared(declared)?;
+                self.check_declared(declared)?;
                 if buffer.len() < end + 4 + declared {
                     return Ok(None);
                 }
@@ -120,31 +161,33 @@ impl Framing {
         }
     }
 
-    fn check_partial(held: usize) -> Result<()> {
-        if held > MAX_NATIVE_FRAME_BYTES {
+    fn check_partial(self, held: usize) -> Result<()> {
+        if held > self.limit {
             return Err(BrokerError::invalid(format!(
-                "a native frame is at most {MAX_NATIVE_FRAME_BYTES} bytes and this one has not \
-                 ended after {held}"
+                "a native frame on this connection is at most {} bytes and this one has not \
+                 ended after {held}",
+                self.limit
             )));
         }
         Ok(())
     }
 
-    fn check_complete(length: usize) -> Result<()> {
-        if length > MAX_NATIVE_FRAME_BYTES {
+    fn check_complete(self, length: usize) -> Result<()> {
+        if length > self.limit {
             return Err(BrokerError::invalid(format!(
-                "this frame is {length} bytes and a native frame is at most \
-                 {MAX_NATIVE_FRAME_BYTES}"
+                "this frame is {length} bytes and a native frame on this connection is at most {}",
+                self.limit
             )));
         }
         Ok(())
     }
 
-    fn check_declared(declared: usize) -> Result<()> {
-        if declared > MAX_NATIVE_FRAME_BYTES {
+    fn check_declared(self, declared: usize) -> Result<()> {
+        if declared > self.limit {
             return Err(BrokerError::invalid(format!(
-                "this frame declares {declared} bytes and a native frame is at most \
-                 {MAX_NATIVE_FRAME_BYTES}"
+                "this frame declares {declared} bytes and a native frame on this connection is at \
+                 most {}",
+                self.limit
             )));
         }
         Ok(())
