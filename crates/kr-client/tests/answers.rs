@@ -896,3 +896,112 @@ async fn keeping_an_answer_does_not_replace_one_it_cannot_read() {
     drafts.keep(&new, &permit).expect("a pipe is replaced");
     assert_eq!(drafts.drafts().expect("reads"), vec![new]);
 }
+
+/// KR-REQ-26.10: the lock a write of a kept answer holds is opened without following a link or
+/// waiting on a pipe. A link or a pipe at the lock's name refuses the write, which writes nothing and
+/// does not hang, and a link's target is not created.
+#[cfg(unix)]
+#[tokio::test]
+async fn keeping_an_answer_refuses_a_lock_that_is_a_link_or_a_pipe() {
+    let (directory, drafts) = store();
+    let asked = question(9);
+    let draft = AnswerDraft {
+        version: ANSWER_FORMAT,
+        target: target(),
+        session_id: asked.session_id,
+        question_id: asked.question_id,
+        question_revision: asked.revision,
+        answer: yes(),
+        drafted_at_ms: TimestampMs::new(1),
+    };
+    let writers = kr_ipc::install::hold_writers(
+        &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+        &mut || {},
+    )
+    .expect("a client outside a store holds nothing");
+    let permit = writers
+        .permit(&kr_client::answers::WRITTEN)
+        .expect("permitted");
+    let lock = directory.path().join("answers").join("answers.lock");
+    let _ = std::fs::remove_file(&lock);
+
+    // A link where the lock belongs: its target is not created, and nothing is kept.
+    let target_of_the_link = directory.path().join("somebody-elses");
+    std::os::unix::fs::symlink(&target_of_the_link, &lock).expect("plants a link");
+    let error = drafts
+        .keep(&draft, &permit)
+        .expect_err("a link is not a lock");
+    assert!(
+        matches!(error, AnswerError::Store { .. }),
+        "the write names the lock: {error}"
+    );
+    assert!(!target_of_the_link.exists(), "the link was not followed");
+    assert!(drafts.drafts().expect("reads").is_empty());
+
+    // A pipe where the lock belongs: refused at once, not waited on.
+    std::fs::remove_file(&lock).expect("removed");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&lock)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "a pipe is made");
+    let error = drafts
+        .keep(&draft, &permit)
+        .expect_err("a pipe is not a lock");
+    assert!(
+        matches!(error, AnswerError::Store { .. }),
+        "the write names the lock: {error}"
+    );
+    assert!(drafts.drafts().expect("reads").is_empty());
+}
+
+/// KR-REQ-26.10: a listing reads each kept answer through the same bounded, owner-only reader as a
+/// write, without following a link or waiting on a pipe: a pipe or a link under an answer's name is
+/// refused by name and does not hold the listing open, which blocks for ever on the base.
+#[cfg(unix)]
+#[tokio::test]
+async fn listing_the_kept_answers_refuses_a_pipe_or_a_link_under_an_answer_name() {
+    let (directory, drafts) = store();
+    let answers = directory.path().join("answers");
+    let asked = question(10);
+    answer_offline(&drafts, &asked).await;
+    let name = |id: &str| answers.join(format!("{id}.answer"));
+
+    // A pipe under another question's name.
+    let piped = name("0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&piped)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "a pipe is made");
+    let listing = std::thread::spawn({
+        let answers = answers.clone();
+        move || {
+            AnswerDrafts::open(&answers)
+                .expect("the store opens")
+                .drafts()
+        }
+    });
+    let started = std::time::Instant::now();
+    while !listing.is_finished() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the listing waits on the pipe"
+        );
+        std::thread::yield_now();
+    }
+    let error = listing
+        .join()
+        .expect("the listing ends")
+        .expect_err("a pipe is not an answer");
+    assert!(matches!(error, AnswerError::Unreadable { .. }), "{error}");
+    std::fs::remove_file(&piped).expect("removed");
+
+    // A link under another question's name.
+    let linked = name("1f1f1f1f-1f1f-1f1f-1f1f-1f1f1f1f1f1f");
+    std::os::unix::fs::symlink(name(&asked.question_id.to_string()), &linked).expect("a link");
+    let error = drafts.drafts().expect_err("a link is not an answer");
+    assert!(matches!(error, AnswerError::Unreadable { .. }), "{error}");
+    std::fs::remove_file(&linked).expect("removed");
+    assert_eq!(drafts.drafts().expect("reads").len(), 1);
+}
