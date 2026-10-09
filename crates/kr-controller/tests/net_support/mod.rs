@@ -804,6 +804,19 @@ impl RawDevice {
         method: Method,
         params: &P,
     ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        self.try_read(method, params)
+            .await
+            .expect("the control stream is open")
+    }
+
+    /// Sends one read, and returns what the host answered, or `None` when the host ended the
+    /// control stream instead: a connection the host withdrew may be answered or closed, and a
+    /// suite that holds either to be a withdrawal asks this.
+    pub async fn try_read<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        params: &P,
+    ) -> Option<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>> {
         use kr_client::transport::ControlTransport as _;
         use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
 
@@ -817,24 +830,24 @@ impl RawDevice {
             method_version: method.entry().version,
             params: ParamsValue::from_typed(params).expect("the parameters encode"),
         });
-        self.transport
-            .send(&frame)
-            .await
-            .expect("the frame is sent");
+        if self.transport.send(&frame).await.is_err() {
+            return None;
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             let frame = tokio::time::timeout_at(deadline, self.transport.recv())
                 .await
-                .expect("the host answers in time")
-                .expect("the control stream is open")
-                .expect("the host does not close the stream");
+                .expect("the host answers in time");
+            let Ok(Some(frame)) = frame else {
+                return None;
+            };
             if let ControlFrame::Response(response) = frame
                 && response.request_id == request_id
             {
-                return match response.outcome {
+                return Some(match response.outcome {
                     Outcome::Ok(value) => Ok(value),
                     Outcome::Error(error) => Err(error),
-                };
+                });
             }
         }
     }
