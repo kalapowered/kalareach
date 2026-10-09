@@ -72,8 +72,9 @@ pub struct RequestView {
     /// What the request names beyond the sentence, one fact to a line, exactly as the host
     /// described it and as the confirmation covers it.
     pub facts: Vec<Fact>,
-    /// What this host says in its own words about what the request would grant: the notice for each
-    /// capability it describes (code outside the plugin sandbox, a command that starts differently).
+    /// What this host says in its own words about what the request would grant: the notice for
+    /// each capability it describes (code outside the plugin sandbox, a command that starts
+    /// differently).
     pub notice: Option<String>,
     /// What the publisher says in its own words about what the release does. The page quotes it
     /// apart from the host's own words, so it is never read as the host's.

@@ -402,7 +402,8 @@ This matters most for the packages the host seeds from its bundle, which are ins
 grant. The first grant of a seeded bridge is `plugin.install` of the installed release, with the
 owner's confirmation, and it has a cost: an installation has to be granted every capability its
 release asks for beyond the repository's ceiling, all at once. A partial grant comes only from
-narrowing afterwards, and adding a capability back takes `plugin.install` again with all of them.
+narrowing afterwards, and adding a capability back takes `plugin.install` again with all of them. A
+seeded package that asks only for a command integration is granted it the same way.
 
 The owner device shows the installation itself, not a summary of it. For an installation that grants
 `native_bridge.install`, the host reads the publisher's description of what the bridge does from the
@@ -413,9 +414,9 @@ digest the confirmation covers, so a confirmation shown one statement cannot ins
 manifest says another. It is shown on the owner device apart from the host's own notice that the
 bridge runs under the application's permissions, outside the plugin sandbox. For an installation
 that grants `command_integration.launch`, it also shows the host's own exact reading of the
-integration the manifest declares, written after a label that marks it as the host's. A bridge's
-statement cannot hold that label, so the owner device tells the publisher's words from the host's
-reading at it. The host's second notice, that the package changes how a command starts, is shown
+integration the manifest declares, written after a label that marks it as the host's. Since the
+bridge can't say that, it's easy to know where the publisher's statement ends and the host's
+statement begins. The host's second notice, that the package changes how a command starts, is shown
 apart from both. The terminal signs nothing. When you run `kr plugin install` or `kr plugin repo
 add`, the command asks the host for the challenge that names the exact request, an owner device
 answers it, and the repeated request spends that one answer.

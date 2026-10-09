@@ -294,8 +294,12 @@ pub struct StatementParts<'a> {
 /// Splits an installation's statement at the host's label, so that a device captions each part by
 /// who wrote it. A statement with no label is all the publisher's, and so is every statement of a
 /// grant that does not hold `command_integration.launch`: a host writes the label only for a grant
-/// that holds it, so a device never takes words in the publisher's bridge statement for the host's
-/// reading, even from a host that does not refuse the label in them.
+/// that holds it, so for any other grant a device never takes words in the publisher's bridge
+/// statement for the host's reading, even from a host that does not refuse the label in them.
+///
+/// A grant that holds both capabilities, sent by a host that does not refuse the label in a
+/// bridge's words and does not write a reading, cannot be told from one a host that does sent: the
+/// device splits it at the first label all the same.
 #[must_use]
 pub fn split_install_statement<'a>(grant: &[String], statement: &'a str) -> StatementParts<'a> {
     fn part(text: &str) -> Option<&str> {
