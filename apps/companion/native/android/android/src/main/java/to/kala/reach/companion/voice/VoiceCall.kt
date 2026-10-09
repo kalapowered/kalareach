@@ -58,6 +58,8 @@ class VoiceCall private constructor(
     private val observer: Observer,
     /** This call's identity in the process, which the service's actions name. */
     val id: Long,
+    /** How the offer waits for the first round of candidate gathering. */
+    private val gathering: GatheringWait,
 ) {
     /** What a running call tells the application about. */
     interface Observer {
@@ -83,9 +85,6 @@ class VoiceCall private constructor(
 
     /** The provider's events channel, which this end creates before the offer and only reads. */
     private var events: DataChannel? = null
-
-    /** Counted down when the first round of candidate gathering reports itself done. */
-    private val gathered = CountDownLatch(1)
 
     /** Whether the provider's answer to the offer has been applied, and what it was read to say. */
     @Volatile
@@ -211,12 +210,17 @@ class VoiceCall private constructor(
          * microphone: that waits for [permit], the foreground service and the recorder.
          */
         @JvmStatic
-        fun start(context: Context, observer: Observer): VoiceCall {
+        fun start(context: Context, observer: Observer): VoiceCall =
+            start(context, observer, LatchGatheringWait())
+
+        /** The same, with the wait for candidate gathering supplied: a test holds it open. */
+        @JvmStatic
+        internal fun start(context: Context, observer: Observer, gathering: GatheringWait): VoiceCall {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
                     .createInitializationOptions(),
             )
-            val call = VoiceCall(context.applicationContext, observer, calls.incrementAndGet())
+            val call = VoiceCall(context.applicationContext, observer, calls.incrementAndGet(), gathering)
             // One microphone, one call. A second call started over a running one would leave the
             // first one's track and connection live with nothing owning them.
             if (!VoiceCallHolder.claim(call)) {
@@ -307,7 +311,7 @@ class VoiceCall private constructor(
         val open = openConnection()
         val made = awaitDescription { observer -> open.createOffer(observer, constraints) }
         awaitSet { observer -> open.setLocalDescription(observer, made) }
-        gathered.await(GATHERING_BOUND_SECONDS, TimeUnit.SECONDS)
+        gathering.await(GATHERING_BOUND_SECONDS)
         return open.localDescription?.description ?: made.description
     }
 
@@ -523,7 +527,7 @@ class VoiceCall private constructor(
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {}
         override fun onIceConnectionReceivingChange(receiving: Boolean) {}
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-            if (state == PeerConnection.IceGatheringState.COMPLETE) gathered.countDown()
+            if (state == PeerConnection.IceGatheringState.COMPLETE) gathering.finish()
         }
         override fun onIceCandidate(candidate: org.webrtc.IceCandidate) {}
         override fun onIceCandidatesRemoved(candidates: Array<out org.webrtc.IceCandidate>) {}
@@ -588,6 +592,26 @@ class VoiceCall private constructor(
         override fun onCreateFailure(reason: String) {}
         override fun onSetFailure(reason: String) {}
     }
+}
+
+/** How the offer waits for the first round of candidate gathering. */
+internal interface GatheringWait {
+    /** Returns when gathering is done or the wait was ended, and at the latest after `seconds`. */
+    fun await(seconds: Long)
+
+    /** Gathering is done: whoever waits, and whoever waits later, is released. */
+    fun finish()
+}
+
+/** Waits for the first round of candidate gathering to finish, or for a bound. */
+internal class LatchGatheringWait : GatheringWait {
+    private val done = CountDownLatch(1)
+
+    override fun await(seconds: Long) {
+        done.await(seconds, TimeUnit.SECONDS)
+    }
+
+    override fun finish() = done.countDown()
 }
 
 /**

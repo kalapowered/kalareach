@@ -38,9 +38,24 @@ final class VoiceAnswerTests: XCTestCase {
         ] {
             XCTAssertTrue(VoiceAnswer.usesDtx(sdp.replacingOccurrences(of: plain, with: on)), on)
         }
+        // The payload's name may stand after more than one space.
+        XCTAssertTrue(VoiceAnswer.usesDtx(
+            sdp.replacingOccurrences(of: plain, with: "a=fmtp:111 minptime=10;usedtx=1")
+                .replacingOccurrences(of: "a=rtpmap:111 opus", with: "a=rtpmap:111   opus")
+        ))
         XCTAssertFalse(VoiceAnswer.usesDtx(
             sdp.replacingOccurrences(of: plain, with: "a=fmtp:111 minptime=10;useinbandfec=1;usedtx=0")
         ))
+    }
+
+    /// KR-REQ-15.35: the setting counts for the audio the call carries. The same words in a section
+    /// that carries no audio, or in an audio section the answer rejected, say nothing about it.
+    func testDtxInASectionThatCarriesNoAudioIsNotTheCalls() throws {
+        let sdp = try recorded()
+        let dtx = "a=rtpmap:111 opus/48000/2\r\na=fmtp:111 usedtx=1\r\n"
+        XCTAssertFalse(VoiceAnswer.usesDtx(sdp + "m=video 9 UDP/TLS/RTP/SAVPF 111\r\n" + dtx))
+        XCTAssertFalse(VoiceAnswer.usesDtx(sdp + "m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n" + dtx))
+        XCTAssertTrue(VoiceAnswer.usesDtx(sdp + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" + dtx))
     }
 
     /// KR-REQ-15.35: the setting counts for the codec that carries the call. The same word on a

@@ -70,7 +70,7 @@ public final class VoiceCall: NSObject {
     /// The provider's events channel, which this end creates before the offer and only reads.
     private var events: RTCDataChannel?
     /// The first round of candidate gathering, which the offer waits for.
-    private let gathering = GatheringWait()
+    private let gathering: GatheringWait
     /// What the provider's answer was read to say, once it was applied; guarded by ``negotiation``.
     private let negotiation = NSLock()
     private var answer: (applied: Bool, usesDtx: Bool) = (false, false)
@@ -110,7 +110,14 @@ public final class VoiceCall: NSObject {
     /// is refused without touching the first.
     ///
     /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio.
-    public init(observer: VoiceCallObserver) throws {
+    public convenience init(observer: VoiceCallObserver) throws {
+        try self.init(observer: observer, gathering: IceGatheringWait())
+    }
+
+    /// The same, with the wait for candidate gathering supplied: a test holds it open to end the
+    /// call inside it.
+    init(observer: VoiceCallObserver, gathering: GatheringWait) throws {
+        self.gathering = gathering
         // Before the factory or any connection exists, so the audio unit cannot start by itself.
         AudioSession.shared.holdAudioUntilACallTurnsItOn()
 
@@ -411,8 +418,17 @@ extension VoiceCall: RTCDataChannelDelegate {
     }
 }
 
+/// How the offer waits for the first round of candidate gathering.
+protocol GatheringWait: AnyObject {
+    /// Returns when gathering is done or the wait was ended, and at the latest after `seconds`.
+    func wait(upTo seconds: TimeInterval) async
+
+    /// Gathering is done: whoever waits, and whoever waits later, is released.
+    func finish()
+}
+
 /// Waits for the first round of candidate gathering to finish, or for a bound.
-private final class GatheringWait {
+final class IceGatheringWait: GatheringWait {
     private let lock = NSLock()
     private var done = false
     private var waiting: CheckedContinuation<Void, Never>?

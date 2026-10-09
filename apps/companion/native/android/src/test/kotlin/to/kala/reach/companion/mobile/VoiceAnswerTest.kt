@@ -43,9 +43,29 @@ class VoiceAnswerTest {
         )) {
             assertTrue(on, VoiceAnswer.usesDtx(sdp.replace(plain, on)))
         }
+        // The payload's name may stand after more than one space.
+        assertTrue(
+            VoiceAnswer.usesDtx(
+                sdp.replace(plain, "a=fmtp:111 minptime=10;usedtx=1")
+                    .replace("a=rtpmap:111 opus", "a=rtpmap:111   opus"),
+            ),
+        )
         assertFalse(
             VoiceAnswer.usesDtx(sdp.replace(plain, "a=fmtp:111 minptime=10;useinbandfec=1;usedtx=0")),
         )
+    }
+
+    /**
+     * KR-REQ-15.35: the setting counts for the audio the call carries. The same words in a section
+     * that carries no audio, or in an audio section the answer rejected, say nothing about it.
+     */
+    @Test
+    fun dtx_in_a_section_that_carries_no_audio_is_not_the_calls() {
+        val sdp = recorded()
+        val dtx = "a=rtpmap:111 opus/48000/2\r\na=fmtp:111 usedtx=1\r\n"
+        assertFalse(VoiceAnswer.usesDtx(sdp + "m=video 9 UDP/TLS/RTP/SAVPF 111\r\n" + dtx))
+        assertFalse(VoiceAnswer.usesDtx(sdp + "m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n" + dtx))
+        assertTrue(VoiceAnswer.usesDtx(sdp + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" + dtx))
     }
 
     /**

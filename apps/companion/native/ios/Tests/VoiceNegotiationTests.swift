@@ -34,8 +34,66 @@ private final class Told: VoiceCallObserver {
     func voiceCallReceivedFirstAudio(_: VoiceCall) {}
 }
 
+/// A wait for candidate gathering that the test holds open until the call, or the test, ends it.
+private final class HeldGatheringWait: GatheringWait {
+    private let lock = NSLock()
+    private var released = false
+    private var waiting: CheckedContinuation<Void, Never>?
+
+    /// Fulfilled when the offer has reached the wait.
+    let reached = XCTestExpectation(description: "the offer is waiting for candidate gathering")
+
+    func wait(upTo _: TimeInterval) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if released {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiting = continuation
+            lock.unlock()
+            reached.fulfill()
+        }
+    }
+
+    func finish() {
+        lock.lock()
+        released = true
+        let waiter = waiting
+        waiting = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+}
+
+/// How an offer ended, kept for the test to read.
+private final class Outcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var kept: Result<String, Error>?
+
+    /// Fulfilled when the offer has ended, one way or the other.
+    let ended = XCTestExpectation(description: "the offer ended")
+
+    var result: Result<String, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return kept
+    }
+
+    func keep(_ result: Result<String, Error>) {
+        lock.lock()
+        kept = result
+        lock.unlock()
+        ended.fulfill()
+    }
+}
+
 /// A peer in this process that answers an offer and reads the channel the offer names.
 private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelegate {
+    /// How long the peer is given to gather, in seconds.
+    private static let gatherWithin: TimeInterval = 30
+
     private let factory = RTCPeerConnectionFactory()
     private let connection: RTCPeerConnection
     private let lock = NSLock()
@@ -85,6 +143,11 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
             } else {
                 gatheringDone = done
                 lock.unlock()
+                // A peer that never reports gathering done answers with what it has, and the
+                // test then fails on the wait that needs the answer's candidates.
+                DispatchQueue.global().asyncAfter(deadline: .now() + AnsweringPeer.gatherWithin) { [weak self] in
+                    self?.gatheringEnded()
+                }
             }
         }
         return connection.localDescription?.sdp ?? answer.sdp
@@ -100,6 +163,10 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
 
     func peerConnection(_: RTCPeerConnection, didChange state: RTCIceGatheringState) {
         guard state == .complete else { return }
+        gatheringEnded()
+    }
+
+    private func gatheringEnded() {
         lock.lock()
         gathered = true
         let waiting = gatheringDone
@@ -135,6 +202,9 @@ final class VoiceNegotiationTests: XCTestCase {
     /// How long the two ends are given to connect before the test calls it a failure. It bounds a
     /// wait that ends as soon as the connection does.
     private static let connectWithin: TimeInterval = 120
+
+    /// How long a call that ended is given to release what waits on it.
+    private static let endWithin: TimeInterval = 20
 
     /// A call and a peer that have exchanged an offer and an answer.
     private func negotiated(
@@ -191,9 +261,32 @@ final class VoiceNegotiationTests: XCTestCase {
         XCTAssertFalse(call.answerIsApplied)
         XCTAssertNil(call.answerUsesDtx)
 
+        // The host's answer comes first: nothing opens, and the call is still there to be answered.
+        let closes = UInt64(Date().timeIntervalSince1970 * 1_000) + 60_000
+        XCTAssertFalse(call.permit(voiceSessionId: "voice-session-1", closesAtEpochMs: closes))
+
         let answer = try await AnsweringPeer().answer(offer)
         try await call.accept(answerSdp: answer)
         XCTAssertTrue(call.answerIsApplied)
         XCTAssertEqual(call.answerUsesDtx, false)
+    }
+
+    /// KR-REQ-15.34: a call that ends while its offer waits for candidates makes no offer. The
+    /// owner would send it on, and the broker would reserve a provider session for a dead call.
+    func testACallEndedWhileItsOfferWaitsOffersNothing() async throws {
+        let held = HeldGatheringWait()
+        let call = try VoiceCall(observer: Told(), gathering: held)
+        defer { held.finish() }
+        let outcome = Outcome()
+        Task {
+            do { outcome.keep(.success(try await call.offer())) } catch { outcome.keep(.failure(error)) }
+        }
+
+        await fulfillment(of: [held.reached], timeout: Self.connectWithin)
+        call.stop()
+        await fulfillment(of: [outcome.ended], timeout: Self.endWithin)
+
+        guard let result = outcome.result else { return XCTFail("ending the call releases its offer") }
+        if case .success = result { XCTFail("an offer was handed on for a call that ended") }
     }
 }
