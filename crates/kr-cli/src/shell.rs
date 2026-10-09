@@ -599,7 +599,9 @@ mod tests {
     use super::*;
 
     /// Holds `record` as a program outside a store does, which holds nothing else.
-    fn hold(record: &EntryRecord) -> std::result::Result<startup::HeldRecord<'_>, RecordError> {
+    fn hold_the_record(
+        record: &EntryRecord,
+    ) -> std::result::Result<startup::HeldRecord<'_>, RecordError> {
         static WRITERS: std::sync::OnceLock<kr_ipc::install::Writers> = std::sync::OnceLock::new();
         static PERMIT: std::sync::OnceLock<kr_ipc::install::Permit<'static>> =
             std::sync::OnceLock::new();
@@ -878,7 +880,7 @@ mod tests {
         );
         let profile = home.path().join("profile.ps1");
         std::fs::write(&profile, &signed).expect("writes");
-        hold(&record)
+        hold_the_record(&record)
             .expect("holds")
             .add(ShellKind::PowerShell, std::slice::from_ref(&profile))
             .expect("records");
@@ -950,7 +952,7 @@ mod tests {
             Change::Added
         );
         // The install that wrote it recorded the file.
-        hold(&record)
+        hold_the_record(&record)
             .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
