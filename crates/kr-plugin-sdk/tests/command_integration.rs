@@ -288,3 +288,52 @@ fn manifests_under(root: &Path) -> Vec<PathBuf> {
     found.sort();
     found
 }
+
+/// KR-REQ-11.42: an owner reads a native bridge's own words beside the host's reading of a command
+/// integration, told apart by the label the host writes before its reading, so a bridge whose
+/// words hold that label is refused. The control is the same bridge with other words.
+#[test]
+fn kr_req_11_42_a_bridge_statement_that_holds_the_hosts_label_is_refused() {
+    let with_words = |words: &str| {
+        let mut manifest: Value =
+            serde_json::from_str(&example::example_manifest_json()).expect("the example manifest");
+        manifest["capabilities"]
+            .as_array_mut()
+            .expect("the manifest requests capabilities")
+            .push(json!({
+                "capability": "native_bridge.install",
+                "reason": "Register the forwarder the example agent starts"
+            }));
+        manifest["native_bridge"] = json!({
+            "application": "Example Agent",
+            "application_range": ">=1.0.0, <2.0.0",
+            "install": [{
+                "type": "add_configuration_key",
+                "file": "settings.json",
+                "key": "enabled.example",
+                "value": "true"
+            }],
+            "remove": [{
+                "type": "remove_configuration_key",
+                "file": "settings.json",
+                "key": "enabled.example"
+            }],
+            "grant_statement": words
+        });
+        validate(&manifest).report.findings
+    };
+    let named = |findings: &[kr_plugin_sdk::validate::Finding]| {
+        findings.iter().any(|finding| {
+            finding.code == FindingCode::BridgeRecipeInvalid
+                && finding.detail.contains("words the host writes before")
+        })
+    };
+    let imitation = format!(
+        "Harmless. {} Runs nothing.",
+        kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL
+    );
+    assert!(named(&with_words(&imitation)));
+    assert!(!named(&with_words(
+        "Changes one setting of the example agent."
+    )));
+}

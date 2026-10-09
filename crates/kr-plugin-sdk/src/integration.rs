@@ -227,8 +227,8 @@ impl CommandIntegration {
     /// Every flag is written as a JSON string, in the order it is added, and every variable as its
     /// name and its value as a JSON string. Nothing is shortened: every flag and every variable
     /// the host adds is in it, and so is every argument of the application server the declaration
-    /// names. The text is one plain line: a character a person could not see or tell from a space
-    /// is written as an escape.
+    /// names. The text is one line: a character the contract forbids in text, or a space other
+    /// than the plain one, is written as an escape.
     #[must_use]
     pub fn statement(&self) -> String {
         let mut statement = format!("Runs {} in KalaReach sessions", quoted(&self.command));
@@ -276,13 +276,14 @@ impl CommandIntegration {
                  server."
             ));
             statement.push_str(&if backend.launching_words.is_empty() {
-                " All of this applies only when the command is typed alone; any other \
-                 invocation runs as typed."
+                " All of this applies only when the command is typed alone, and only on a host \
+                 that runs such a server; any other invocation runs as typed."
                     .to_owned()
             } else {
                 format!(
                     " All of this applies only when the command is typed alone or followed by {} \
-                     and no option; any other invocation runs as typed.",
+                     and no option, and only on a host that runs such a server; any other \
+                     invocation runs as typed.",
                     backend
                         .launching_words
                         .iter()
@@ -547,8 +548,8 @@ fn flag_problem(flag: &str) -> Option<String> {
 
 /// Writes text as a JSON string, which shows every character it holds.
 ///
-/// A character that is hidden, that reorders text, or that is a space other than the plain one
-/// is written as its escape, so what comes back is never more than one visible line.
+/// A character the contract forbids in text (a control, zero-width or bidirectional one) or a space
+/// other than the plain one is written as its escape, so what comes back is one line.
 fn quoted(text: &str) -> String {
     let json = serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
     let mut written = String::with_capacity(json.len());
@@ -1004,7 +1005,8 @@ mod tests {
         assert!(
             statement.contains(
                 "only when the command is typed alone or followed by \"resume\" or \"fork\" and \
-                 no option; any other invocation runs as typed"
+                 no option, and only on a host that runs such a server; any other invocation runs \
+                 as typed"
             ),
             "{statement}"
         );
