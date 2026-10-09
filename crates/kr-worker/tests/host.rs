@@ -2347,7 +2347,28 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
             .find(|(name, _)| *name == "stubborn")
             .map(|(_, identity)| identity.clone())
             .expect("the tree's stubborn member");
-        kr_controller::testing::refuse_stopping(stubborn);
+        kr_controller::testing::refuse_stopping(stubborn.clone());
+        // That one is also moved into a control group below the service's, as a process of a
+        // session can be by what it runs: the manager's kill reaches it there, and the cleanup
+        // has to read it as the group's member to say it was forced. The service's group is the
+        // account's own to make groups in under a user service manager.
+        let below = Path::new("/sys/fs/cgroup")
+            .join(
+                recorded_by(&host, session_id)
+                    .and_then(|record| record.cgroup)
+                    .expect("the worker recorded its group")
+                    .trim_start_matches('/'),
+            )
+            .join("below");
+        std::fs::create_dir(&below).expect("makes a control group below the service's");
+        std::fs::write(below.join("cgroup.procs"), stubborn.pid.get().to_string())
+            .expect("moves the stubborn process into it");
+        let now = std::fs::read_to_string(format!("/proc/{}/cgroup", stubborn.pid.get()))
+            .expect("its group");
+        assert!(
+            now.trim().ends_with("/below"),
+            "the stubborn process is in the group below the service's: {now}"
+        );
         until("the worker to stop, every thread of it", || {
             hold_still(&worker).then_some(())
         })
