@@ -158,6 +158,31 @@ pub enum LeaseRefused {
 }
 
 impl LeaseRefused {
+    /// The rule's stable name, which a refusal carries so a member's client can tell one from
+    /// another without reading the sentence.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NotEnrolled => "not_enrolled",
+            Self::NoOrganisationGrant => "no_organisation_grant",
+            Self::UnauthenticatedRevision => "unauthenticated_revision",
+            Self::BadSignature => "bad_signature",
+            Self::DeviceMismatch => "device_mismatch",
+            Self::IssuedBeforeActivation => "issued_before_activation",
+            Self::SignedAfterSuccessor => "signed_after_successor",
+            Self::TooLong => "too_long",
+            Self::AboveRoleCeiling => "above_role_ceiling",
+            Self::ClockUntrusted => "clock_untrusted",
+            Self::FloorUnrecorded => "floor_unrecorded",
+            Self::NotYetValid => "not_yet_valid",
+            Self::Expired => "expired",
+            Self::InstalledEarlier => "installed_earlier",
+            Self::AmbiguousIssue => "ambiguous_issue",
+            Self::Superseded => "superseded",
+            Self::AccountMismatch => "account_mismatch",
+        }
+    }
+
     /// The sentence a presenting device is told.
     #[must_use]
     pub const fn detail(self) -> &'static str {

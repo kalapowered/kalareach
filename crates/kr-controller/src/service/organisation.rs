@@ -13,14 +13,16 @@ use kr_protocol::confirmation::{ConfirmationDisplay, OrganisationEnrolPlan};
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::organisation::{
-    OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
-    OrganisationLeaseView, OrganisationListResult, OrganisationMemberView,
+    MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
+    OrganisationEnrolResult, OrganisationEnrolmentView, OrganisationLeaseView,
+    OrganisationListResult, OrganisationMemberView,
 };
 use kr_protocol::pairing::{KeyPurpose, SensitiveAction, key_id};
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, TimestampMs};
 
 use crate::error::{ControllerError, Result};
-use crate::grants::organisation::ChainRefused;
+use crate::grants::LeaseRefused;
+use crate::grants::organisation::{ChainRefused, LeaseInstalled};
 use crate::grants::{CLOCK_DISTRUSTED, FLOOR_UNRECORDED};
 use crate::sharing::ConfirmedAction;
 
@@ -56,6 +58,23 @@ pub(super) fn chain_refusal(refused: ChainRefused) -> ControllerError {
         other => ControllerError::Refused {
             code: ErrorCode::InvalidArgument,
             detail: other.to_string(),
+        },
+    }
+}
+
+/// The refusal a lease that a rule refuses is reported as: `PERMISSION_DENIED` naming the rule,
+/// except where the clock decided it, which keeps the code every other decision of the clock has.
+fn lease_refusal(refused: LeaseRefused) -> ControllerError {
+    match refused {
+        LeaseRefused::ClockUntrusted => ControllerError::ClockUntrusted {
+            detail: CLOCK_DISTRUSTED.to_owned(),
+        },
+        LeaseRefused::FloorUnrecorded => ControllerError::Refused {
+            code: ErrorCode::StorageUnavailable,
+            detail: FLOOR_UNRECORDED.to_owned(),
+        },
+        other => ControllerError::PermissionDenied {
+            detail: format!("{} ({})", other.detail(), other.name()),
         },
     }
 }
@@ -231,6 +250,68 @@ impl Controller {
             return Err(chain_refusal(ChainRefused::HeadNotCurrent));
         }
         Ok(())
+    }
+
+    /// `membership.present`: a paired device presents the lease its organisation signed for it,
+    /// with the organisation's chain when it has moved, and is answered once the lease is installed
+    /// and the fence it may owe is published.
+    ///
+    /// The registry's guard is taken first and held to the end, like the owner's other authority
+    /// changes: the fence this host may owe is asked about under it, and the admission is asked
+    /// again inside the transaction that writes the policy. The key the lease must name is the one
+    /// the device's record holds, which the connection proved when it was admitted. A repeat of a
+    /// lease still in force is answered as the first presentation was, since the policy decides
+    /// the lease again each time; a lease that is not in force is answered with the rule that
+    /// refuses it, which is why the answer to a lost reply is the same lease presented again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rule that refuses the lease: `PERMISSION_DENIED` naming it, `CLOCK_UNTRUSTED`
+    /// when this host distrusts its clock, and a storage error when the floor the refusal stood on
+    /// or the policy cannot be written. A chain that does not verify refuses the presentation.
+    pub(crate) async fn membership_present(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        proven_key: &AuthorisationKey,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: MembershipPresentParams = parse(&mutation.params)?;
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        let installed = self
+            .present_membership_lease(
+                device_id,
+                proven_key,
+                &params.lease,
+                params.authority.as_ref(),
+                Some((&registry, &carried)),
+            )?
+            .map_err(lease_refusal)?;
+        drop(registry);
+        encode(&self.presented(&installed)?)
+    }
+
+    /// What the host tells a device whose lease it installed or found installed.
+    fn presented(&self, installed: &LeaseInstalled) -> Result<MembershipPresentResult> {
+        let ended_at_terminal = self
+            .sharing
+            .grants()
+            .exclusive_management_events()?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.channel == kr_protocol::pairing::ConfirmationChannel::LocalBootstrapTerminal
+            })
+            .map_or_else(Nullable::null, |event| Nullable::some(event.at_ms));
+        Ok(MembershipPresentResult {
+            organisation_id: installed.organisation_id,
+            account_id: installed.account_id.clone(),
+            key_revision: installed.key_revision,
+            expires_at_ms: TimestampMs::new(installed.expires_at_ms),
+            exclusive: self.policy().is_exclusively_managed(),
+            exclusive_ended_at_terminal_ms: ended_at_terminal,
+        })
     }
 
     /// Refuses a proposed grant that requires an organisation this host cannot answer for.
