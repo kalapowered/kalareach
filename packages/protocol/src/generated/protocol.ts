@@ -877,6 +877,10 @@ export type EventStream = 'session_state' | 'output' | 'attachments' | 'input_le
 export type HistoryGapCause =
   'retention' | 'host_capacity' | 'session_capacity' | 'spool_unavailable' | 'archive_incomplete'
 /**
+ * One organisation whose signed policy a host has opted into.
+ */
+export type OrganisationId = string
+/**
  * The kinds of external destination the owner configures: a webhook, which sends with no
  * credential, and the four that do ([`DestinationSecretKind`]).
  */
@@ -1065,10 +1069,6 @@ export type MethodTableVersion = string
  * One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider.
  */
 export type NotificationId = string
-/**
- * One organisation whose signed policy a host has opted into.
- */
-export type OrganisationId = string
 /**
  * The position of one completed pairing in the host's retained security outbox.
  */
@@ -1300,6 +1300,25 @@ export type NodeOutput =
  */
 export type NodeStatus =
   'pending' | 'running' | 'success' | 'failed' | 'unknown' | 'paused' | 'cancelled'
+/**
+ * What the claim of an organisation change keeps while its answer is still to be built from the
+ * fence the change owes.
+ *
+ * A withdrawal and making a host exclusively organisation-managed restrict work already
+ * admitted, so each writes its policy row and this marker in one transaction and answers from the
+ * barrier that follows. The marker is what lets a repeat of the action tell a change that
+ * committed from one that never began.
+ */
+export type OrganisationChangeMarker =
+  | {
+      withdrawn: {
+        /**
+         * One organisation whose signed policy a host has opted into.
+         */
+        organisation_id: string
+      }
+    }
+  | 'exclusive_on'
 /**
  * The least client version a policy accepts: alphanumeric with dots, hyphens and plus signs.
  */
@@ -2251,6 +2270,7 @@ export interface KalaReachProtocol {
   events_subscribe_result?: EventsSubscribeResult
   evidence_gap?: EvidenceGap
   evidence_reference?: EvidenceReference
+  exclusive_management_event?: ExclusiveManagementEvent
   expiration_tombstone?: ExpirationTombstone
   external_destination_kind?: ExternalDestinationKind
   fence_evidence?: FenceEvidence
@@ -2414,6 +2434,8 @@ export interface KalaReachProtocol {
   materialisation_record?: MaterialisationRecord1
   materialisation_result?: MaterialisationResult
   membership_lease?: MembershipLease
+  membership_present_params?: MembershipPresentParams
+  membership_present_result?: MembershipPresentResult
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   named_approval_preview?: NamedApprovalPreview
@@ -2425,7 +2447,18 @@ export interface KalaReachProtocol {
   observed_path?: ObservedPath
   offline_validity_policy?: OfflineValidityPolicy
   operation_record?: OperationRecord
+  organisation_change_marker?: OrganisationChangeMarker
+  organisation_enrol_params?: OrganisationEnrolParams
+  organisation_enrol_result?: OrganisationEnrolResult
+  organisation_enrolment_view?: OrganisationEnrolmentView
+  organisation_exclusive_set_params?: OrganisationExclusiveSetParams
+  organisation_exclusive_set_result?: OrganisationExclusiveSetResult
+  organisation_lease_view?: OrganisationLeaseView
+  organisation_list_params?: OrganisationListParams
+  organisation_list_result?: OrganisationListResult
+  organisation_member_view?: OrganisationMemberView
   organisation_policy?: OrganisationPolicy
+  organisation_withdraw_params?: OrganisationWithdrawParams
   output_event?: OutputEvent
   owner_confirmation_complete_params?: OwnerConfirmationCompleteParams
   owner_confirmation_complete_result?: OwnerConfirmationCompleteResult
@@ -14710,6 +14743,36 @@ export interface EvidenceGap {
   reason: string
 }
 /**
+ * A time exclusive management was turned off, kept by the host so its owners and the
+ * organisation can see it.
+ */
+export interface ExclusiveManagementEvent {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  at_ms: string
+  /**
+   * How the owner's confirmation reached the host. The interactive controlling terminal is the
+   * channel of a host that had no owner device left to confirm on.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  /**
+   * The organisations the host was enrolled in when it turned exclusive management off.
+   */
+  organisation_ids: OrganisationId[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+}
+/**
  * The record an expired object leaves behind.
  *
  * It outlives a retrust deliberately. Section 9 keeps old expiration tombstones when the wall
@@ -16964,7 +17027,7 @@ export interface MembershipLeasePayload {
    */
   issued_at_ms: string
   /**
-   * The policy-key revision that signed it.
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
    */
   key_revision: string
   /**
@@ -16972,13 +17035,156 @@ export interface MembershipLeasePayload {
    */
   maximum_grants: ActionRight[]
   /**
-   * The organisation the lease speaks for.
+   * One organisation whose signed policy a host has opted into.
    */
   organisation_id: string
   /**
    * The role that account held when the lease was signed.
    */
   role: 'viewer' | 'reviewer' | 'controller' | 'owner'
+}
+/**
+ * The parameters of `membership.present`.
+ */
+export interface MembershipPresentParams {
+  /**
+   * The organisation's chain, when it has moved since the host last accepted one. A chain
+   * that is not newer changes nothing, and the lease beside it is still judged against the
+   * keys the host already holds.
+   */
+  authority: PolicyAuthority | null
+  lease: MembershipLease1
+}
+/**
+ * An organisation's policy-signing authority as it is published.
+ */
+export interface PolicyAuthority {
+  /**
+   * Every revision in order, starting at the first.
+   */
+  chain: PolicyAuthorityLink[]
+  head: PolicyAuthorityHead
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
+}
+/**
+ * One step in an organisation's policy-signing authority chain.
+ *
+ * The first revision signs itself and names no predecessor, which is what a host pins. Every
+ * later revision is signed by the revision it names, so a host that pinned the first can follow
+ * the chain to the key signing now, and a link cannot be re-parented under a revision it was not
+ * issued against.
+ *
+ * A link carries no expiry, because when a revision stops signing is not known when it is issued.
+ * Its successor's `not_before_ms` is when it stopped.
+ */
+export interface PolicyAuthorityLink {
+  payload: PolicyAuthorityLinkPayload
+  /**
+   * The predecessor's signature over [`PolicyAuthorityLinkPayload::signing_input`], or this
+   * revision's own at the first revision.
+   */
+  signature: string
+}
+/**
+ * What this revision states.
+ */
+export interface PolicyAuthorityLinkPayload {
+  /**
+   * The revision this link establishes.
+   */
+  key_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  not_before_ms: string
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
+  /**
+   * The revision whose key signed it, or null at the first revision, which signs itself.
+   */
+  previous_key_revision: PolicyKeyRevision | null
+  /**
+   * The Ed25519 public key of this revision.
+   */
+  public_key: string
+}
+/**
+ * Which revision signs now, signed by that revision.
+ */
+export interface PolicyAuthorityHead {
+  payload: PolicyAuthorityHeadPayload
+  /**
+   * The signature of the revision the statement names, over
+   * [`PolicyAuthorityHeadPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the authority states.
+ */
+export interface PolicyAuthorityHeadPayload {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
+   */
+  key_revision: string
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
+}
+/**
+ * The lease the organisation signed for this device. The device the lease names is the one
+ * that presents it: a host refuses a lease that names another device's key.
+ */
+export interface MembershipLease1 {
+  payload: MembershipLeasePayload
+  /**
+   * The policy-signing key's signature over [`MembershipLeasePayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * The result of `membership.present`.
+ */
+export interface MembershipPresentResult {
+  /**
+   * The member account it names.
+   */
+  account_id: string
+  /**
+   * Whether this host is exclusively organisation-managed.
+   */
+  exclusive: boolean
+  /**
+   * The last time exclusive management was turned off at this host's terminal, or null when it
+   * never was. A member's client carries it to the organisation with its next lease request.
+   */
+  exclusive_ended_at_terminal_ms: TimestampMs | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
+   */
+  key_revision: string
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
 }
 /**
  * One exhaustive authority entry.
@@ -17125,6 +17331,8 @@ export interface MethodEntry {
     | 'machine.join'
     | 'machine.merge'
     | 'machine.split'
+    | 'organisation.enrol'
+    | 'organisation.list'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -17564,6 +17772,202 @@ export interface RemoteSpecification {
   url: string
 }
 /**
+ * The parameters of `organisation.enrol`.
+ */
+export interface OrganisationEnrolParams {
+  authority: PolicyAuthority1
+}
+/**
+ * The organisation's whole published policy-signing chain, as a member exported it. The host
+ * verifies every link and the head before it shows the owner anything, and the owner's
+ * confirmation is for exactly the root and the key signing now.
+ */
+export interface PolicyAuthority1 {
+  /**
+   * Every revision in order, starting at the first.
+   */
+  chain: PolicyAuthorityLink[]
+  head: PolicyAuthorityHead
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
+}
+/**
+ * The result of `organisation.enrol`, and what a repeat of the action is answered with.
+ */
+export interface OrganisationEnrolResult {
+  /**
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
+   */
+  accepted_head: string
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  enrolment_revision: string
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
+  /**
+   * The identifier of the organisation's first key, which is its identity: what an
+   * administrator can read out to the person enrolling.
+   */
+  root_key_id: string
+}
+/**
+ * One organisation this host is enrolled in.
+ */
+export interface OrganisationEnrolmentView {
+  /**
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
+   */
+  accepted_head: string
+  /**
+   * The identifier of that key.
+   */
+  anchor_key_id: string
+  /**
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
+   */
+  anchor_revision: string
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  enrolment_revision: string
+  /**
+   * The devices bound to member accounts, by device identity.
+   */
+  members: OrganisationMemberView[]
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
+  /**
+   * The identifier of its first key, which is its identity.
+   */
+  root_key_id: string
+}
+/**
+ * A device bound to a member account in an organisation.
+ */
+export interface OrganisationMemberView {
+  /**
+   * The member account its first verified lease named.
+   */
+  account_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  bound_at_ms: string
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * The identifier of the authorisation key that lease named and the device proved.
+   */
+  device_key_id: string
+  /**
+   * The newest lease the host recorded for the device, or null when it has recorded none. A
+   * restarted host holds no lease until the device presents a newer one, and this is the
+   * record of the last one, not a promise that it is still in force.
+   */
+  lease: OrganisationLeaseView | null
+}
+/**
+ * The lease a host holds for one bound device, as `organisation.list` reports it.
+ */
+export interface OrganisationLeaseView {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+}
+/**
+ * The parameters of `organisation.exclusive.set`.
+ */
+export interface OrganisationExclusiveSetParams {
+  /**
+   * True to make this host exclusively organisation-managed, false to end that.
+   */
+  exclusive: boolean
+}
+/**
+ * The result of `organisation.exclusive.set`.
+ */
+export interface OrganisationExclusiveSetResult {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * The per-worker completion of the fence that making a host exclusive owes, because it
+   * restricts work already admitted. Null when the change was to end exclusive management,
+   * which restricts nothing.
+   */
+  barrier: RevocationBarrier1 | null
+  /**
+   * Whether the host is exclusively organisation-managed now.
+   */
+  exclusive: boolean
+}
+/**
+ * The result of installing an authority revision across every affected worker.
+ *
+ * Until every barrier holds, this is `pending` with per-worker status. Cutting a network path or
+ * waiting for a lease timer is not completion, because a paused worker could already be inside a
+ * dispatch transition, so nothing here treats the absence of an answer as an answer.
+ */
+export interface RevocationBarrier1 {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * One entry per affected worker, in session order, cut to what one answer carries.
+   *
+   * A cut takes the workers whose barrier has not held before any that has, and always keeps
+   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
+   * when it holds on the whole. `workers_total` says how many there were.
+   */
+  workers: WorkerBarrier[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workers_total: string
+}
+/**
+ * The parameters of `organisation.list`. There are none.
+ */
+export interface OrganisationListParams {}
+/**
+ * The result of `organisation.list`.
+ */
+export interface OrganisationListResult {
+  /**
+   * Whether this host trusts its own clock. While it does not, it installs no lease and
+   * follows no chain, and the owner trusts the clock again with `host.clock.establish`.
+   */
+  clock_trusted: boolean
+  /**
+   * The organisations this host is enrolled in, by organisation identity.
+   */
+  enrolments: OrganisationEnrolmentView[]
+  /**
+   * Whether this host is exclusively organisation-managed.
+   */
+  exclusive: boolean
+  /**
+   * Every time exclusive management was turned off, oldest first.
+   */
+  exclusive_events: ExclusiveManagementEvent[]
+}
+/**
  * One organisation's host policy, signed by its policy-signing key.
  *
  * A host that pinned the organisation's policy-signing authority follows the chain to the revision
@@ -17599,7 +18003,7 @@ export interface OrganisationPolicyPayload {
    */
   issued_at_ms: string
   /**
-   * The policy-key revision that signed it.
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
    */
   key_revision: string
   /**
@@ -17612,7 +18016,7 @@ export interface OrganisationPolicyPayload {
    */
   minimum_client_version: ClientVersion | null
   /**
-   * The organisation the policy belongs to.
+   * One organisation whose signed policy a host has opted into.
    */
   organisation_id: string
   /**
@@ -17658,6 +18062,15 @@ export interface OrganisationRecoveryRecipient {
    * The recipient's stored-envelope key identifier.
    */
   recipient_key_id: string
+}
+/**
+ * The parameters of `organisation.withdraw`. The answer is a [`RevocationResult`].
+ */
+export interface OrganisationWithdrawParams {
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
 }
 /**
  * One batch of output bytes on the output stream.
@@ -17795,6 +18208,28 @@ export interface PendingConfirmation {
     | 'establish_clock'
     | {
         transfer_control: TransferControlPlan
+      }
+    | {
+        enrol_organisation: {
+          anchor: PolicyKeyShown
+          /**
+           * The organisation.
+           */
+          organisation_id: string
+          root: PolicyKeyShown1
+        }
+      }
+    | {
+        exclusive_management: {
+          /**
+           * True to make the host exclusively organisation-managed, false to end that.
+           */
+          exclusive: boolean
+          /**
+           * The organisations the host is enrolled in, in ascending order.
+           */
+          organisation_ids: OrganisationId[]
+        }
       }
     | {
         catalogue_add: {
@@ -18234,6 +18669,40 @@ export interface DevicePublicKeys7 {
   transport: string
 }
 /**
+ * The key signing now, which the host follows rotation from.
+ */
+export interface PolicyKeyShown {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  not_before_ms: string
+  /**
+   * The Ed25519 public key.
+   */
+  public_key: string
+  /**
+   * The revision of the key.
+   */
+  revision: string
+}
+/**
+ * The first key of its chain, which is its identity.
+ */
+export interface PolicyKeyShown1 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  not_before_ms: string
+  /**
+   * The Ed25519 public key.
+   */
+  public_key: string
+  /**
+   * The revision of the key.
+   */
+  revision: string
+}
+/**
  * The budgets its syncs and its cache run inside.
  */
 export interface CatalogueBudgets4 {
@@ -18430,6 +18899,17 @@ export interface OwnerConfirmationRequestParams {
     | 'establish_clock'
     | {
         transfer_control: TransferControlSubject
+      }
+    | {
+        enrol_organisation: OrganisationEnrolParams
+      }
+    | {
+        set_exclusive_management: {
+          /**
+           * True to make the host exclusively organisation-managed, false to end that.
+           */
+          exclusive: boolean
+        }
       }
     | {
         described: DescribedAction
@@ -19887,96 +20367,6 @@ export interface PluginRemoveResult {
    * A plugin identifier from its manifest.
    */
   plugin_id: string
-}
-/**
- * An organisation's policy-signing authority as it is published.
- */
-export interface PolicyAuthority {
-  /**
-   * Every revision in order, starting at the first.
-   */
-  chain: PolicyAuthorityLink[]
-  head: PolicyAuthorityHead
-  /**
-   * The organisation the chain belongs to.
-   */
-  organisation_id: string
-}
-/**
- * One step in an organisation's policy-signing authority chain.
- *
- * The first revision signs itself and names no predecessor, which is what a host pins. Every
- * later revision is signed by the revision it names, so a host that pinned the first can follow
- * the chain to the key signing now, and a link cannot be re-parented under a revision it was not
- * issued against.
- *
- * A link carries no expiry, because when a revision stops signing is not known when it is issued.
- * Its successor's `not_before_ms` is when it stopped.
- */
-export interface PolicyAuthorityLink {
-  payload: PolicyAuthorityLinkPayload
-  /**
-   * The predecessor's signature over [`PolicyAuthorityLinkPayload::signing_input`], or this
-   * revision's own at the first revision.
-   */
-  signature: string
-}
-/**
- * What this revision states.
- */
-export interface PolicyAuthorityLinkPayload {
-  /**
-   * The revision this link establishes.
-   */
-  key_revision: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  not_before_ms: string
-  /**
-   * The organisation whose chain this link belongs to.
-   */
-  organisation_id: string
-  /**
-   * The revision whose key signed it, or null at the first revision, which signs itself.
-   */
-  previous_key_revision: PolicyKeyRevision | null
-  /**
-   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
-   */
-  public_key: string
-}
-/**
- * Which revision signs now, signed by that revision.
- */
-export interface PolicyAuthorityHead {
-  payload: PolicyAuthorityHeadPayload
-  /**
-   * The signature of the revision the statement names, over
-   * [`PolicyAuthorityHeadPayload::signing_input`].
-   */
-  signature: string
-}
-/**
- * What the authority states.
- */
-export interface PolicyAuthorityHeadPayload {
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  expires_at_ms: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  issued_at_ms: string
-  /**
-   * The revision of an organisation's policy-signing key, advanced on every rotation.
-   */
-  key_revision: string
-  /**
-   * The organisation this statement belongs to.
-   */
-  organisation_id: string
 }
 /**
  * The effect one component prepared, as the broker receives it.
@@ -24865,31 +25255,6 @@ export interface RevocationAcknowledgement {
   request_id: string
 }
 /**
- * The result of installing an authority revision across every affected worker.
- *
- * Until every barrier holds, this is `pending` with per-worker status. Cutting a network path or
- * waiting for a lease timer is not completion, because a paused worker could already be inside a
- * dispatch transition, so nothing here treats the absence of an answer as an answer.
- */
-export interface RevocationBarrier1 {
-  /**
-   * The host's ordered authority revision. Only the host issues its own revisions.
-   */
-  authority_revision: string
-  /**
-   * One entry per affected worker, in session order, cut to what one answer carries.
-   *
-   * A cut takes the workers whose barrier has not held before any that has, and always keeps
-   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
-   * when it holds on the whole. `workers_total` says how many there were.
-   */
-  workers: WorkerBarrier[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  workers_total: string
-}
-/**
  * The result of `grant.revoke` and `device.revoke`.
  *
  * A revocation is not complete when the host records it. It is complete for a worker once that
@@ -25827,6 +26192,8 @@ export interface ServiceRequestPayload {
     | 'machine.join'
     | 'machine.merge'
     | 'machine.split'
+    | 'organisation.enrol'
+    | 'organisation.list'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
