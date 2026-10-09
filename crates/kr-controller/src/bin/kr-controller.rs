@@ -53,7 +53,8 @@ struct Arguments {
     /// hangup, an interrupt or the end of a login, reaches it. The process it is given must not
     /// already lead a process group, which a process a program starts directly never does. Started
     /// by a command of a session on Linux, in the service that session runs in, the daemon then
-    /// moves into a scope of its own, so that the end of that service does not end it.
+    /// moves into a scope of its own, where the user's service manager answers, so that the end of
+    /// that service does not end it.
     #[cfg(unix)]
     #[arg(long)]
     own_session: bool,
