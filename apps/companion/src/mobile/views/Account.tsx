@@ -30,7 +30,7 @@ export function Account({
   // (`commercialSurface`), so the channel changes nothing the panel draws.
   return (
     <div data-testid="mobile-account" data-channel={channel}>
-      <AccountPanel account={account} surface={surface} />
+      <AccountPanel account={account} port={port} surface={surface} />
     </div>
   )
 }
