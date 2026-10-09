@@ -155,8 +155,11 @@ fn key_identifier(value: &Value) -> Option<String> {
 fn counter(value: &Value) -> Option<u64> {
     let text = value.as_str()?;
     let parsed: u64 = text.parse().ok()?;
-    (parsed.to_string() == text).then_some(parsed)
+    (parsed.to_string() == text && parsed <= MAX_SAFE_COUNTER).then_some(parsed)
 }
+
+/// The largest counter the service reads: what a number in its language holds exactly.
+const MAX_SAFE_COUNTER: u64 = (1 << 53) - 1;
 
 /// The time as an RFC 3339 instant, in UTC, to the millisecond.
 fn instant(ms: u64) -> String {
@@ -413,13 +416,15 @@ fn build(
                 .map(str::to_owned)
                 .or_else(|| member.and_then(|member| key_identifier(&member["host_key_id"])))
                 .ok_or_else(|| invalid("A read names the host key identifier."))?;
-            let declared = member.map(|member| &member["after_sequence"]);
+            // A cursor that is named is a position this feed issued: `null` is not one, and is
+            // refused as any other name that is not a counter is.
+            let declared = member.and_then(|member| member.get("after_sequence"));
             let after = match declared {
-                Some(declared) if !declared.is_null() => Some(
+                Some(declared) => Some(
                     counter(declared)
                         .ok_or_else(|| invalid("A cursor is a position this feed has issued."))?,
                 ),
-                _ => None,
+                None => None,
             };
             let summary_only = member.is_some_and(|member| member["summary_only"] == json!(true));
             Ok((host, Call::Read, carried(after, summary_only)))
@@ -606,6 +611,9 @@ impl Feed {
     ) -> Outcome {
         let number = revision.authority_revision.get();
         let previous = revision.previous_revision.get();
+        if number > MAX_SAFE_COUNTER || previous > MAX_SAFE_COUNTER {
+            return Err(invalid("A revision is a counter."));
+        }
         if number <= previous {
             return Err(invalid("A revision follows the revision it names."));
         }
