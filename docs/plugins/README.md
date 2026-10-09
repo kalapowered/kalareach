@@ -141,10 +141,11 @@ written before the member existed reads and hashes as it did.
 
 #### A backend
 
-An application whose terminal speaks to a server (Codex's `--remote` terminal and its App Server)
-adds a `backend` member. The worker starts the server as the session's backend, from the
-executable the shell resolved for the command and the arguments declared here, and runs the
-terminal against a gateway the worker owns.
+An application whose terminal can communicate with a server (in Codex, a `--remote` terminal with an
+App Server) adds a `backend` member. A host that has backends starts the server as the session's
+backend, from the executable the shell resolved for the command and the arguments declared here, and
+runs the terminal against a gateway of its own. A host that has none runs the command as typed, and
+its diagnostics say why.
 
 ```json
 "command_integration": {
@@ -159,28 +160,30 @@ terminal against a gateway the worker owns.
 }
 ```
 
-- `arguments` are what the server is started with: one to eight, each 1 to 256 bytes and one
-  visible line, written as they stand. A package cannot name the executable: it is the one the shell
-  resolved, and it has to be a program the worker can read and hash, not a script.
-- `{gateway}` is the one flag element, exactly, that the worker replaces, once the launch is
-  committed, with the address of the gateway the terminal connects to. A backend declares it
-  exactly once; a flag that holds it and does not stand alone, or one declared with no backend, is a
-  finding.
-- `launching_words` are the bare words (letters, digits, `_` and `-`, at most 32 bytes, at most
-  eight) that may follow the command for a launch the backend is started for. The launch has to
-  type no option, and its first word has to be absent or listed; any other launch runs as typed,
-  with the reason named. The list is closed because it is what the package qualified: an option
-  would not reach the server, and a word that is another subcommand's name (`login`, `exec`) is not
-  a terminal at all.
-- The package ships a connector table the gateway can read, and the validator checks it: `stdio`,
-  line-delimited JSON, a matching identifier, the request identifier, the method and the response
-  identifier each one top-level member, at most 256 classified methods, and a `messages` member
-  (see the connector table below) whose names differ from one another and from those members.
-- A package that declares a backend states `"sdk_range": ">=0.1.5, <0.2.0"`, because an earlier
-  host would refuse a manifest member it never learned.
+- `arguments` are what the server is started with: one to eight, each 1 to 256 bytes and one visible
+  line, provided as they stand. A package cannot name the executable, which is always the one the
+  shell resolved, and it must be a program the host can read and hash, not a script.
+- `{gateway}` is the one flag element, exactly, that the host replaces, once the launch is
+  committed, with the address of the gateway the terminal connects to. A backend declares it exactly
+  once. It's a finding if a flag holds it and does not stand alone, or if it is declared with no
+  backend.
+- `launching_words` are the bare words (letters, digits, `_` and `-`, at most 32 bytes, none
+  starting with `-`, none listed twice, at most eight) that may follow the command for a launch the
+  backend is started for. The launch has to type no option, and its first word has to be absent or
+  listed; any other launch runs as typed, with the reason named. The list is closed because it is
+  what the package qualified: an option would not reach the server, and a word that is another
+  subcommand's name (`login`, `exec`) is not a terminal at all.
+- The package must provide a connector table the gateway can read, which the validator checks:
+  `stdio`, line-delimited JSON, a matching identifier, the request identifier, the method and the
+  response identifier each one top-level member, between one and 256 classified methods, a wire name
+  the gateway can hold for each (1 to 256 bytes, no control character), and a `messages` member
+  (described in the connector table below) whose names differ from one another and from those
+  members.
+- A package that declares a backend states `"sdk_range": ">=0.1.5, <0.2.0"`, because an earlier host
+  would refuse a manifest member it never learned.
 
-The three members are optional and left out when unset, so a manifest written before them reads
-and hashes exactly as it did.
+The `backend` member and the table's `messages` member are optional and left out when unset, so a
+manifest or a table written before them reads and hashes exactly as it did.
 
 ### The forwarder's placeholder
 
@@ -512,7 +515,8 @@ component fault disables rich meaning without stalling or discarding valid nativ
   beyond its identifier and method: `params`, `result` and `error`. A request names the method
   member, a response names exactly one of the result and error members, and the five names differ
   (a request and a response may share their identifier member, as JSON-RPC's do). A table that
-  declares no backend leaves the member out.
+  does not need the member leaves it out, and a package whose table declares it states
+  `"sdk_range": ">=0.1.5, <0.2.0"`.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
@@ -707,7 +711,7 @@ report the same code for the same defect.
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 | `integration_without_capability` | A command integration without `command_integration.launch` |
-| `integration_invalid` | A command integration names another command, adds a flag it may not or sets a variable the contract does not permit |
+| `integration_invalid` | A command integration names another command, adds a flag it may not, sets a variable the contract does not permit, or declares a backend that breaks the contract (a missing or repeated `{gateway}`, arguments or launching words out of bounds, no table to read) |
 | `launch_probe_without_capability` | A launch probe without `launch.probe` |
 | `launch_probe_invalid` | A launch probe passes no argument or too many, carries an option that is not a name, or names a mode that is not a JSON Pointer |
 

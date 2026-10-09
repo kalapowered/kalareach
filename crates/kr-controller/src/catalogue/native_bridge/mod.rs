@@ -3104,6 +3104,10 @@ fn same(kind: Kind, staged: &Identity, found: &Identity) -> bool {
     }
 }
 
+/// What [`read_executable`] says of a script, after its path: the program it runs is its
+/// interpreter, so no identity is read for it.
+pub(crate) const SCRIPT_READ: &str = "is a script, and the program it runs is its interpreter";
+
 /// Reads one executable, never running it: a regular file, not a script, read within the size
 /// its file reports and read again when it changed meanwhile.
 pub(crate) fn read_executable(path: &Path) -> std::result::Result<Digest256, String> {
@@ -3129,10 +3133,7 @@ pub(crate) fn read_executable(path: &Path) -> std::result::Result<Digest256, Str
             .read_to_end(&mut bytes)
             .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
         if bytes.starts_with(b"#!") {
-            return Err(format!(
-                "{} is a script, and the program it runs is its interpreter",
-                path.display()
-            ));
+            return Err(format!("{} {SCRIPT_READ}", path.display()));
         }
         let after = file
             .metadata()

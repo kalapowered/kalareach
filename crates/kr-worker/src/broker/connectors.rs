@@ -1080,11 +1080,11 @@ pub mod fixture {
     }
 
     /// The upstream version the gateway fixture's table is qualified for.
-    pub const GATEWAY_QUALIFIED_VERSION: &str = "0.155.1";
+    const GATEWAY_QUALIFIED_VERSION: &str = "0.155.1";
 
     /// A table the worker's gateway reads: one JSON document per line over the backend's standard
-    /// streams, the members it reads a message by at the top level, and a few of the methods a
-    /// Codex-shaped application sends, one of each class.
+    /// streams, the members it reads a message by at the top level, and two of the methods a
+    /// Codex-shaped application sends. It answers no approval.
     fn gateway_connector_json_for(plugin_id: &str) -> String {
         let path =
             |name: &str| serde_json::json!({ "segments": [{ "type": "member", "name": name }] });
@@ -1103,20 +1103,12 @@ pub mod fixture {
             "response_correlation": { "type": "matching_id", "id_path": path("id") },
             "messages": { "params": "params", "result": "result", "error": "error" },
             "routes": [
-                { "method": "account.login.start", "wire_name": "account/login/start", "direction": "host_to_upstream" },
                 { "method": "initialize", "wire_name": "initialize", "direction": "host_to_upstream" },
-                { "method": "item.command-execution.request-approval", "wire_name": "item/commandExecution/requestApproval", "direction": "upstream_to_host" },
-                { "method": "thread.list", "wire_name": "thread/list", "direction": "host_to_upstream" },
-                { "method": "thread.shell-command", "wire_name": "thread/shellCommand", "direction": "host_to_upstream" },
-                { "method": "turn.interrupt", "wire_name": "turn/interrupt", "direction": "host_to_upstream" }
+                { "method": "thread.list", "wire_name": "thread/list", "direction": "host_to_upstream" }
             ],
             "methods": [
-                { "method": "account.login.start", "class": "credential", "evidence": "Starts a sign-in and can carry a key" },
                 { "method": "initialize", "class": "mutation", "evidence": "Negotiates what the connection may call" },
-                { "method": "item.command-execution.request-approval", "class": "mutation", "evidence": "Asks whether a command may run" },
-                { "method": "thread.list", "class": "observation", "evidence": "Reads the threads and changes none" },
-                { "method": "thread.shell-command", "class": "unsupported", "evidence": "Runs outside the application's sandbox" },
-                { "method": "turn.interrupt", "class": "mutation", "evidence": "Cancels the turn in flight" }
+                { "method": "thread.list", "class": "observation", "evidence": "Reads the threads and changes none" }
             ],
             "decision_destination": null,
             "volatile_forwarding": false,

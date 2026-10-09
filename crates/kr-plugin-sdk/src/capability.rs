@@ -73,7 +73,8 @@ pub enum PluginCapability {
     #[serde(rename = "native_bridge.install")]
     NativeBridgeInstall,
     /// Add the flags and set the variables the package's command integration declares to an
-    /// interactive invocation of its command in a managed root shell.
+    /// interactive invocation of its command in a managed root shell, and, where it declares a
+    /// backend, start that backend for a plain launch of the terminal.
     #[serde(rename = "command_integration.launch")]
     CommandIntegrationLaunch,
     /// Run the application's own executable with the arguments the package's launch probe

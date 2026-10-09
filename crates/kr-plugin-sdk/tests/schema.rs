@@ -140,6 +140,15 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
     assert_eq!(integration["max_command_bytes"], 64);
     assert_eq!(integration["max_flags"], 16);
     assert_eq!(integration["max_flag_bytes"], 4096);
+    assert_eq!(integration["max_backend_arguments"], 8);
+    assert_eq!(integration["max_backend_argument_bytes"], 256);
+    assert_eq!(integration["max_launching_words"], 8);
+    assert_eq!(integration["max_launching_word_bytes"], 32);
+    assert_eq!(integration["gateway_placeholder"], "{gateway}");
+    assert_eq!(
+        integration["max_backend_methods"],
+        kr_protocol::gateway::MAX_TABLE_METHODS
+    );
     assert_eq!(
         integration["permitted_variables"][0]["name"],
         "GEMINI_CLI_NO_RELAUNCH"

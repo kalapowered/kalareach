@@ -508,18 +508,25 @@ fn resolved(
     if let Some(command) = report.command.0.as_deref()
         && let Some(executable) = resolve(command, &host.search_path)
     {
+        // Read once: the digest names the version a signed record gives it, and a script, which
+        // the worker reads no identity for, is the reason an invocation runs as typed.
+        let read = connector.map(|_| super::native_bridge::read_executable(&executable));
         report.executable_version = Nullable(connector.and_then(|connector| {
-            super::native_bridge::read_executable(&executable)
-                .ok()
-                .and_then(|digest| connector.qualified_version(&digest).map(str::to_owned))
+            read.as_ref()
+                .and_then(|read| read.as_ref().ok())
+                .and_then(|digest| connector.qualified_version(digest).map(str::to_owned))
         }));
         report.executable = Nullable::some(executable.display().to_string());
         // What the shell finds first is what an invocation runs, and a launcher cannot start a
         // shim: an invocation that finds one runs as typed, which a person who turned the
         // integration on is told here, beside the executable. A script is one wherever the
-        // platform starts it: the program it runs is its interpreter, so the worker reads no
-        // identity for it, and a package installed from npm puts one first on the search path.
-        if (!kr_worker::broker::commands::starts_directly(&executable) || is_script(&executable))
+        // platform starts it, since the program it runs is its interpreter: a package installed
+        // from npm puts one first on the search path.
+        let script = read
+            .as_ref()
+            .and_then(|read| read.as_ref().err())
+            .is_some_and(|error| error.ends_with(super::native_bridge::SCRIPT_READ));
+        if (!kr_worker::broker::commands::starts_directly(&executable) || script)
             && report.reason.0.is_none()
         {
             report.reason = Nullable::some(format!(
@@ -529,8 +536,8 @@ fn resolved(
             ));
         }
     }
-    // An integration that starts a backend is not served until this worker runs one, so every
-    // invocation runs as typed, and the owner who turned it on is told, beside the state.
+    // An integration that declares a backend is one this host does not serve, so every invocation
+    // runs as typed, and the owner who turned it on is told, beside the state.
     if report.state == CommandIntegrationState::On
         && report.reason.0.is_none()
         && connector
@@ -538,8 +545,8 @@ fn resolved(
             .is_some_and(|declared| declared.backend.is_some())
     {
         report.reason = Nullable::some(
-            "its integration starts a backend, which this worker does not run yet, so an \
-             invocation runs as typed"
+            "its integration declares a backend, and this host runs none, so an invocation runs \
+             as typed"
                 .to_owned(),
         );
     }
@@ -551,17 +558,6 @@ fn resolved(
         report.mode = IntegrationMode::NativeBridge;
     }
     report
-}
-
-/// Whether `path` names a script: a file that opens with `#!`, which no launcher starts as the
-/// program it is.
-fn is_script(path: &Path) -> bool {
-    use std::io::Read as _;
-
-    let mut start = [0_u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut start))
-        .is_ok_and(|()| &start == b"#!")
 }
 
 /// The bytes `report` takes in an answer, in the larger of its two forms: the owner's, and the
@@ -663,7 +659,8 @@ pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
     }
     // A reason beside an integration that is on says why an invocation runs as typed here: the
     // flags cannot be written, they name the forwarder by its own name on a platform where that is
-    // not safe, or the executable found first is a shim, so a new session gets none of it.
+    // not safe, or the executable found first is a shim or a script, so a new session gets none of
+    // it.
     let usable = |report: &&CommandIntegrationReport| {
         report.state == CommandIntegrationState::On
             && report.unavailable.0.is_none()

@@ -146,7 +146,8 @@ pub enum FindingCode {
     /// The package declares a command integration without requesting the capability to apply it.
     IntegrationWithoutCapability,
     /// A command integration names something other than a bare command of the package, adds a
-    /// flag it may not, or sets a variable the contract does not permit.
+    /// flag it may not, sets a variable the contract does not permit, or declares a backend that
+    /// breaks the contract.
     IntegrationInvalid,
     /// The package declares a launch probe without requesting the capability to run it.
     LaunchProbeWithoutCapability,
@@ -2161,8 +2162,8 @@ fn check_backend_table(connector: Option<&ConnectorManifest>, report: &mut Repor
         report.push(Finding::at(
             FindingCode::IntegrationInvalid,
             MANIFEST_FILE,
-            "the integration declares a backend and the package ships no connector table, so \
-             there is nothing for the gateway to read",
+            "the integration declares a backend and the package ships no connector table that \
+             reads, so there is nothing for the gateway to read",
         ));
         return;
     };
@@ -2175,8 +2176,8 @@ fn check_backend_table(connector: Option<&ConnectorManifest>, report: &mut Repor
     };
     if connector.transport != BrokerTransport::Stdio {
         refuse(format!(
-            "a backend is read over its standard streams, and the table's transport is {:?}",
-            connector.transport
+            "a backend is read over its standard streams, and the table's transport is {}",
+            serde_json::to_string(&connector.transport).unwrap_or_default()
         ));
     }
     if !matches!(connector.framing, Framing::LineDelimitedJson { .. }) {
@@ -2186,13 +2187,16 @@ fn check_backend_table(connector: Option<&ConnectorManifest>, report: &mut Repor
                 .to_owned(),
         );
     }
-    let ResponseCorrelation::MatchingId { id_path } = &connector.response_correlation else {
-        refuse(
-            "a backend's responses repeat the request's identifier, and the table correlates \
-             them by order"
-                .to_owned(),
-        );
-        return;
+    let response_id_path = match &connector.response_correlation {
+        ResponseCorrelation::MatchingId { id_path } => Some(id_path),
+        ResponseCorrelation::Ordered {} => {
+            refuse(
+                "a backend's responses repeat the request's identifier, and the table \
+                 correlates them by order"
+                    .to_owned(),
+            );
+            None
+        }
     };
     let top_level = |path: &FieldPath, what: &str, refuse: &mut dyn FnMut(String)| {
         if let [FieldSegment::Member { name }] = path.segments.as_slice() {
@@ -2210,13 +2214,27 @@ fn check_backend_table(connector: Option<&ConnectorManifest>, report: &mut Repor
         &mut refuse,
     );
     let method = top_level(&connector.method_path, "a message's method", &mut refuse);
-    let response_id = top_level(id_path, "a response's identifier", &mut refuse);
+    let response_id =
+        response_id_path.and_then(|path| top_level(path, "a response's identifier", &mut refuse));
+    if connector.methods.is_empty() {
+        refuse("the gateway interprets a table that classifies at least one method".to_owned());
+    }
     if connector.methods.len() > kr_protocol::gateway::MAX_TABLE_METHODS {
         refuse(format!(
             "the gateway interprets at most {} methods, and the table classifies {}",
             kr_protocol::gateway::MAX_TABLE_METHODS,
             connector.methods.len()
         ));
+    }
+    // The gateway names a method as the wire spells it, and a name the host cannot hold as a method
+    // (empty, over 256 bytes, or with a control character in it) would be dropped there.
+    for route in &connector.routes {
+        if let Err(error) = kr_protocol::ids::UpstreamMethod::new(route.wire_name.as_str()) {
+            refuse(format!(
+                "the wire name {:?} of {} is not a method name the gateway can hold: {error}",
+                route.wire_name, route.method
+            ));
+        }
     }
     let Some(messages) = &connector.messages else {
         refuse(
