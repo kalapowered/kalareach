@@ -112,6 +112,10 @@ pub const PREFERENCE_VERSION_KEY: &str = "version";
 /// one written before the format was recorded.
 pub const PREFERENCE_VERSION: u64 = 1;
 
+/// The saved preference, as a release's manifest lists it and at the version this build writes it.
+pub const PREFERENCE_WRITTEN: kr_ipc::install::Written =
+    kr_ipc::install::Written::new("terminal-preference", PREFERENCE_VERSION);
+
 /// The longest preference file this host reads.
 ///
 /// The document holds one identifier. A file larger than this is not one of ours, and reading it
@@ -179,6 +183,68 @@ fn hold_preference_within(
         patience,
     )
     .map(|lock| PreferenceHold { _lock: lock })
+}
+
+/// Why the saved preference was not written.
+#[derive(Debug, thiserror::Error)]
+pub enum SaveRefused {
+    /// The release this host is on does not read the preference at the version this build writes it,
+    /// or an update is switching releases.
+    #[error("{0}")]
+    Barred(#[source] kr_ipc::install::WriteRefused),
+    /// The file there is a document of a later format, or one this build does not read, and is
+    /// left as it is; `kr host terminal --clear` removes it.
+    #[error("the saved preference is a document this build does not read")]
+    NotOurs,
+    /// The file there could not be read, or the preference could not be written.
+    #[error("{0}")]
+    Store(#[source] kr_ipc::IpcError),
+}
+
+/// Saves `chosen` as the environment's terminal preference, replacing a preference of this build's
+/// format or one that states none.
+///
+/// `held` is the hold on the preference, and `permit` the release's leave to write it at the
+/// version this build writes it ([`PREFERENCE_WRITTEN`]). A file at the preference's name that is not
+/// a regular file (a link, a pipe) holds no document this build wrote, and the write replaces the
+/// name; a regular file is read first, and a document of a later format or one this build cannot read
+/// is refused and left as it is.
+///
+/// # Errors
+///
+/// Returns [`SaveRefused`].
+pub fn save_preference(
+    state_dir: &std::path::Path,
+    chosen: &str,
+    _held: &PreferenceHold,
+    permit: &kr_ipc::install::Permit<'_>,
+) -> Result<(), SaveRefused> {
+    permit
+        .require(&PREFERENCE_WRITTEN)
+        .map_err(SaveRefused::Barred)?;
+    let file = state_dir.join(PREFERENCE_FILE);
+    if std::fs::symlink_metadata(&file).is_ok_and(|about| about.file_type().is_file()) {
+        let bytes = kr_ipc::paths::read_owner_only_file(&file, PREFERENCE_MAX_LEN)
+            .map_err(SaveRefused::Store)?;
+        if let Some(bytes) = bytes {
+            let read = serde_json::from_slice::<
+                std::collections::BTreeMap<String, serde_json::Value>,
+            >(&bytes)
+            .ok();
+            let readable = read.is_some_and(|members| {
+                members.get(PREFERENCE_VERSION_KEY).is_none_or(|stated| {
+                    stated
+                        .as_u64()
+                        .is_some_and(|stated| stated <= PREFERENCE_VERSION)
+                })
+            });
+            if !readable {
+                return Err(SaveRefused::NotOurs);
+            }
+        }
+    }
+    kr_ipc::paths::write_owner_only_file(&file, preference_document(chosen).as_bytes())
+        .map_err(SaveRefused::Store)
 }
 
 /// Writes the saved terminal preference again with its format stated, where the file is a document
@@ -757,6 +823,72 @@ mod tests {
                 "the pipe is neither waited for nor replaced"
             );
         }
+    }
+
+    /// KR-REQ-26.10: saving a preference reads the one it replaces first, under the hold. One that
+    /// states no format, or an earlier one, or this one, is replaced; one of a later format and one
+    /// this build cannot read are left as they are and nothing is saved; a pipe holds no document and
+    /// the save replaces the name. A leave to write another record is refused.
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_preference_does_not_replace_one_it_cannot_read() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join(PREFERENCE_FILE);
+        let writers = kr_ipc::install::hold_writers(&mut || {})
+            .expect("a test outside a store holds nothing");
+        let permit = writers.permit(&PREFERENCE_WRITTEN).expect("permitted");
+        let held = hold_preference(directory.path()).expect("held");
+        let save = || save_preference(directory.path(), "kitty", &held, &permit);
+
+        for unreadable in [
+            br#"{"terminal": "iterm2", "version": 2}"#.to_vec(),
+            br#"{"terminal": "iterm2", "version": "one"}"#.to_vec(),
+            b"not a document".to_vec(),
+        ] {
+            kr_ipc::paths::write_owner_only_file(&file, &unreadable).expect("planted");
+            assert!(
+                matches!(save(), Err(SaveRefused::NotOurs)),
+                "{}",
+                String::from_utf8_lossy(&unreadable)
+            );
+            assert_eq!(
+                std::fs::read(&file).expect("reads"),
+                unreadable,
+                "left as it is"
+            );
+        }
+        for replaced in [
+            br#"{"terminal": "iterm2"}"#.to_vec(),
+            br#"{"terminal": "iterm2", "version": 0}"#.to_vec(),
+            preference_document("iterm2").into_bytes(),
+        ] {
+            kr_ipc::paths::write_owner_only_file(&file, &replaced).expect("planted");
+            save().expect("replaced");
+            assert_eq!(
+                std::fs::read_to_string(&file).expect("reads"),
+                preference_document("kitty")
+            );
+        }
+        // A pipe is not opened, and the name is replaced.
+        std::fs::remove_file(&file).expect("removed");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&file)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a named pipe where the file would be");
+        save().expect("a pipe holds no document, and is replaced");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("reads"),
+            preference_document("kitty")
+        );
+
+        let other = writers
+            .permit(&kr_ipc::install::Written::new("another-record", 1))
+            .expect("permitted");
+        assert!(matches!(
+            save_preference(directory.path(), "kitty", &held, &other),
+            Err(SaveRefused::Barred(_))
+        ));
     }
 
     /// The stamp and a change of the preference take the same hold, in turn: while a change is under

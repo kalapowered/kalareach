@@ -105,3 +105,87 @@ impl From<&WriteRefused> for CliError {
         }
     }
 }
+
+/// A store of a test's own, for the tests of the writers that ask for a permit.
+#[cfg(all(test, unix))]
+pub(crate) mod testing {
+    use kr_ipc::install::{Store, Writers};
+    use kr_protocol::update::ReleaseName;
+
+    /// A store whose current release lists each of `stores` at the version given, and the writers'
+    /// lock held shared on it, as a command of that store holds it. The store goes with this.
+    pub(crate) struct Listing {
+        _directory: tempfile::TempDir,
+        pub(crate) writers: Writers,
+    }
+
+    impl Listing {
+        pub(crate) fn of(stores: &[(&str, u32)]) -> Self {
+            let directory = tempfile::tempdir().expect("a directory");
+            let store = Store::at(directory.path().join("host"));
+            store.create_directories().expect("the store's directories");
+            std::fs::write(store.record(), b"{}\n").expect("the store's record");
+            let release = ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release name");
+            let release_directory = store.release_directory(&release);
+            std::fs::create_dir_all(&release_directory).expect("the release");
+            let listed: Vec<_> = stores
+                .iter()
+                .map(|(name, version)| {
+                    serde_json::json!({
+                        "store": name,
+                        "scope": "state_root",
+                        "path": format!("{name}.json"),
+                        "recording": { "kind": "json_member", "member": "version", "absent": 0 },
+                        "version": version,
+                        "migrates_from": 0,
+                    })
+                })
+                .collect();
+            let manifest = serde_json::json!({
+                "signed": {
+                    "_type": "kalareach-release",
+                    "release": release,
+                    "sequence": "1",
+                    "commit": "4254aa6e62e585478ff8dcff5518f23c7263f4ce",
+                    "target": "aarch64-apple-darwin",
+                    "os_floor": { "system": "macos", "version": "14.0" },
+                    "protocol_version": { "major": 0, "minor": 48, "patch": 0 },
+                    "public_majors": [1],
+                    "retained_levels": ["0.48"],
+                    "shells": [],
+                    "stores": listed,
+                    "files": [],
+                },
+                "signatures": [],
+            });
+            std::fs::write(store.manifest(&release), manifest.to_string()).expect("the manifest");
+            let update = store
+                .try_lock_update()
+                .expect("locks")
+                .expect("nothing else updates");
+            let install = store
+                .try_lock_install()
+                .expect("locks")
+                .expect("nothing starts a daemon");
+            let exclusive = store
+                .try_lock_writers()
+                .expect("locks")
+                .expect("no command is writing");
+            store
+                .switch(&release, &update, &install, &exclusive)
+                .expect("the release is current");
+            drop(exclusive);
+            let writers = store
+                .hold_writers(
+                    Some(&release),
+                    std::time::Duration::from_secs(1),
+                    &mut || {},
+                )
+                .expect("holds");
+            Self {
+                _directory: directory,
+                writers,
+            }
+        }
+    }
+}

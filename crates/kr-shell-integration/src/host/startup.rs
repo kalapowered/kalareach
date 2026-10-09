@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_ipc::install::{Permit, WriteRefused, Written};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::qualification::ShellKind;
@@ -1167,6 +1168,10 @@ const ENTRY_RECORD_LIMIT: u64 = 1024 * 1024;
 /// left; a release before it therefore has `kr` stamp every record it finds.
 pub const ENTRY_RECORD_VERSION: u32 = 1;
 
+/// The record of startup entries, as a release's manifest lists it and at the version this build
+/// writes it.
+pub const ENTRY_WRITTEN: Written = Written::new("shell-entries", ENTRY_RECORD_VERSION as u64);
+
 /// The startup files `kr shell install` has put an entry in, for each shell.
 ///
 /// Removal works from this record and from nothing else: not from where an entry would go now,
@@ -1194,6 +1199,10 @@ pub enum RecordError {
     /// The file there is not a record this build writes.
     #[error("the file is not a record of startup entries")]
     NotARecord,
+    /// The release this host is on does not read the record at the version this build writes it, or
+    /// an update is switching releases.
+    #[error("{0}")]
+    Barred(#[source] WriteRefused),
 }
 
 /// What the record holds.
@@ -1267,17 +1276,25 @@ impl EntryRecord {
     /// install's recording a file and its writing the entry there, find no entry and forget the
     /// file, which would leave an entry the record does not name and no removal would take out.
     ///
+    /// `permit` is the release's leave to write the record at the version this build writes it
+    /// ([`ENTRY_WRITTEN`]), and the hold lasts no longer than it.
+    ///
     /// # Errors
     ///
     /// Returns [`RecordError::Store`] when the directory cannot be made this user's own, or when
     /// another `kr` held the record for the whole of the wait, and the failure to write a record
-    /// of an earlier format again, stamped.
-    pub fn hold(&self) -> Result<HeldRecord<'_>, RecordError> {
+    /// of an earlier format again, stamped, and [`RecordError::Barred`] when the permit is for
+    /// another record.
+    pub fn hold<'a>(&'a self, permit: &'a Permit<'a>) -> Result<HeldRecord<'a>, RecordError> {
+        permit
+            .require(&ENTRY_WRITTEN)
+            .map_err(RecordError::Barred)?;
         kr_ipc::paths::create_private_tree(&self.directory, &self.directory)?;
         let lock = FileLock::take(&self.path)
             .map_err(|error| kr_ipc::IpcError::io("lock", &self.path, error))?;
         let held = HeldRecord {
             record: self,
+            _permit: permit,
             _lock: lock,
         };
         // A record written before the format was recorded is written again at once, stamped.
@@ -1312,6 +1329,8 @@ impl EntryRecord {
 pub struct HeldRecord<'a> {
     /// The record held.
     record: &'a EntryRecord,
+    /// The leave to write it, which the hold cannot outlast.
+    _permit: &'a Permit<'a>,
     /// The lock that holds it, beside the record in the same directory. Dropping it lets go.
     _lock: FileLock,
 }
@@ -1935,6 +1954,17 @@ fn read_or_empty(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Holds `record` as a program outside a store does, which holds nothing else.
+    fn hold(record: &EntryRecord) -> Result<HeldRecord<'_>, RecordError> {
+        static WRITERS: std::sync::OnceLock<kr_ipc::install::Writers> = std::sync::OnceLock::new();
+        static PERMIT: std::sync::OnceLock<Permit<'static>> = std::sync::OnceLock::new();
+        let writers = WRITERS.get_or_init(|| {
+            kr_ipc::install::hold_writers(&mut || {}).expect("a test outside a store holds nothing")
+        });
+        let permit = PERMIT.get_or_init(|| writers.permit(&ENTRY_WRITTEN).expect("permitted"));
+        record.hold(permit)
+    }
 
     /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
     /// program that reads each file as it is written holds it.
@@ -4747,8 +4777,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(record.path()).expect("the record"))
                 .expect("JSON")
         };
-        record
-            .hold()
+        hold(&record)
             .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
@@ -4763,7 +4792,7 @@ mod tests {
                 .expect("an unstamped record is read"),
             vec![zshrc.clone()]
         );
-        drop(record.hold().expect("holds"));
+        drop(hold(&record).expect("holds"));
         assert_eq!(
             written(&record)["version"],
             ENTRY_RECORD_VERSION,
@@ -4804,7 +4833,7 @@ mod tests {
         let zshrc = PathBuf::from("/home/the person's home/.zshrc");
         let bashrc = PathBuf::from("/home/the person's home/.bashrc");
         let profile = PathBuf::from("/home/the person's home/.bash_profile");
-        let held = record.hold().expect("holds");
+        let held = hold(&record).expect("holds");
         held.add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
         held.add(ShellKind::Bash, &[bashrc.clone(), profile.clone()])
@@ -4846,8 +4875,7 @@ mod tests {
         let root = tempfile::tempdir().expect("a directory");
         let record = EntryRecord::in_state_directory(&root.path().join("state"));
         let name = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/h\xffme/.zshrc"));
-        record
-            .hold()
+        hold(&record)
             .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&name))
             .expect("records");
@@ -4899,11 +4927,11 @@ mod tests {
     fn a_second_holder_of_the_record_waits_for_the_first_to_let_go() {
         let root = tempfile::tempdir().expect("a directory");
         let record = EntryRecord::in_state_directory(&root.path().join("state"));
-        let first = record.hold().expect("holds");
+        let first = hold(&record).expect("holds");
         let (held, second) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let holding = record.hold().expect("holds once the first lets go");
+                let holding = hold(&record).expect("holds once the first lets go");
                 held.send(()).expect("says so");
                 drop(holding);
             });

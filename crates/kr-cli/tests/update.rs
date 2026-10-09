@@ -8614,6 +8614,64 @@ async fn a_command_that_waited_through_a_switch_is_judged_by_the_release_switche
     assert!(!document.exists(), "so nothing was written");
 }
 
+/// KR-REQ-26.10, KR-REQ-24.30: every command that writes a stored record is judged by the release
+/// `current` names. Where it lists the record at another version than this `kr` writes, the command
+/// is refused naming the record, with nothing written; where it lists no such record the command is
+/// not stopped by that.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_does_not_write() {
+    for (store, arguments) in [
+        (
+            "terminal-preference",
+            &["host", "terminal", "--set", "apple-terminal", "--json"][..],
+        ),
+        ("shell-entries", &["shell", "remove", "--json"][..]),
+    ] {
+        let writes = release_stores()
+            .into_iter()
+            .find(|listed| listed.store == store)
+            .expect("a store this build declares")
+            .version;
+        let refused = Host::bare();
+        refused.install(
+            &Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+                store,
+                0,
+                writes + 1,
+            )),
+        );
+        let (output, said) = refused.kr_json(arguments);
+        let message = said["message"].as_str().unwrap_or_default();
+        assert_eq!(output.status.code(), Some(1), "{store}: {said}");
+        assert!(
+            message.contains(store)
+                && message.contains(&writes.to_string())
+                && message.contains(&(writes + 1).to_string()),
+            "{store}: it names the record and both versions: {said}"
+        );
+
+        // The control: a release that does not list the record does not stop the command with that.
+        let unlisted = Host::bare();
+        unlisted.install(
+            &Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(
+                release_stores()
+                    .into_iter()
+                    .filter(|listed| listed.store != store)
+                    .collect(),
+            ),
+        );
+        let (output, said) = unlisted.kr_json(arguments);
+        assert!(
+            !said["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nothing was written: the current release"),
+            "{store}: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// KR-REQ-26.10: a command that tries after an update has checked the stores and before it has
 /// switched waits, and is judged by the release switched to. A real rollback to a release that reads
 /// the configuration document at version 1 is held inside its classification of the registry's workers

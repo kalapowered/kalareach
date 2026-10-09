@@ -31,7 +31,7 @@
 //! proved against it before anything is sent.
 
 use kr_client::shown;
-use kr_client::shown::Shown;
+use kr_client::shown::{Said as _, Shown};
 use std::collections::BTreeMap;
 
 use kr_client::answers::{
@@ -150,7 +150,12 @@ pub async fn answer(
     .await;
     match answered {
         Ok(Answered::Sent(resolved)) => shown(*resolved),
-        Ok(Answered::Kept(draft)) => Err(kept(&workers, draft.question_id, "was kept")),
+        // The answer is a stored record: keeping it holds the writers' lock and asks for the leave to
+        // write it, which no send does.
+        Ok(Answered::NotSent(draft)) => match keep_answer(&drafts, &draft) {
+            Ok(()) => Err(kept(&workers, draft.question_id, "was kept")),
+            Err(why) => Err(lost(&workers, draft.question_id, &why)),
+        },
         // What the failure says of the answer is what the attempt established, not what the
         // failure's kind suggests.
         Err(error) => Err(match (workers.delivery(), error) {
@@ -168,7 +173,7 @@ pub async fn answer(
             }
             // Keeping it was the fallback, and it failed too.
             (_, error @ (AnswerError::Store { .. } | AnswerError::Unreadable { .. })) => {
-                lost(&workers, question_id, &error)
+                lost(&workers, question_id, &shown!("{}", error))
             }
             (Delivery::Unknown, error) => unkept(&workers, question_id, error),
             (Delivery::NotSent | Delivery::NotTaken, error) => answer_failure(error),
@@ -297,6 +302,17 @@ fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerE
             }
         }
     }
+}
+
+/// Keeps an answer on this device, under the writers' lock and the leave to write a kept answer,
+/// and says why it could not be.
+fn keep_answer(drafts: &AnswerDrafts, draft: &AnswerDraft) -> std::result::Result<(), Shown> {
+    let writers = crate::barrier::hold().map_err(|refused| refused.said())?;
+    let permit =
+        crate::barrier::permit(&writers, &answers::WRITTEN).map_err(|refused| refused.said())?;
+    drafts
+        .keep(draft, &permit)
+        .map_err(|error| shown!("{}", error))
 }
 
 /// Opens the answers kept on this device, in this user's state directory, readable only by its
@@ -470,11 +486,11 @@ fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> Cli
 
 /// The failure reported for an answer its worker did not take, or may not have taken, that could
 /// not be kept on this device either, so the person knows it is in neither place.
-fn lost(workers: &Workers, question_id: QuestionId, error: &AnswerError) -> CliError {
+fn lost(workers: &Workers, question_id: QuestionId, why_not_kept: &Shown) -> CliError {
     let retention = shown!(
         "the answer to question {} could not be kept on this device ({})",
         question_id,
-        *error
+        why_not_kept.clone()
     );
     let why = workers.failure().map_or_else(
         || Shown::said("its session's worker could not take it"),
@@ -581,7 +597,7 @@ fn answer_failure(error: AnswerError) -> CliError {
             code,
             Shown::said(UNLISTED_BECAUSE),
         )),
-        AnswerError::Store { .. } | AnswerError::Unreadable { .. } => {
+        AnswerError::Store { .. } | AnswerError::Unreadable { .. } | AnswerError::NotPermitted => {
             CliError::Other(shown!("{}", error))
         }
     }

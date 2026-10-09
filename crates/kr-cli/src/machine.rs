@@ -58,6 +58,7 @@ use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_controller::bridge::invoke::{self, Invocation, Refusal};
 use kr_ipc::client::LocalClient;
+use kr_ipc::install::{Writers, Written};
 use kr_ipc::paths::HostPaths;
 use kr_protocol::envelope::{ActionTarget, MutationRequest, Outcome, ParamsValue, Request};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -97,6 +98,9 @@ const PLAN_FILE: &str = "machine-merge-plan";
 /// Remove the reading of a plan that states no version once no supported upgrade starts from one
 /// written before the format was recorded.
 pub const PLAN_FORMAT: u32 = 1;
+
+/// The merge plan, as a release's manifest lists it and at the format this build writes it.
+pub const WRITTEN: Written = Written::new("machine-merge-plan", PLAN_FORMAT as u64);
 
 /// Whether a plan states no format, which is how an earlier build wrote every one.
 const fn unstated(version: &u32) -> bool {
@@ -833,9 +837,31 @@ fn encoded(plan: &Plan) -> Result<Vec<u8>> {
         .map_err(|_| CliError::Other(Shown::said("the merge plan could not be encoded")))
 }
 
-/// Keeps the plan, replacing what was kept.
+/// Keeps the plan, replacing what was kept, under the writers' lock for the write alone: a plan is
+/// saved before each step is sent, and a command may run for minutes between saves.
 fn save(paths: &HostPaths, plan: &Plan) -> Result<()> {
+    save_under(paths, plan, &crate::barrier::hold()?)
+}
+
+/// Keeps the plan, replacing what was kept, if the release `current` names does not list a plan at
+/// another format than this build writes.
+fn save_under(paths: &HostPaths, plan: &Plan, writers: &Writers) -> Result<()> {
+    crate::barrier::permit(writers, &WRITTEN)?;
     kr_ipc::paths::write_owner_only_file(&plan_path(paths), &encoded(plan)?)?;
+    Ok(())
+}
+
+/// Keeps a plan that is the first, which fails when one is kept already, under the writers' lock for
+/// the write alone.
+fn create(paths: &HostPaths, plan: &Plan) -> Result<()> {
+    create_under(paths, plan, &crate::barrier::hold()?)
+}
+
+/// Keeps the first plan, if the release `current` names does not list a plan at another format than
+/// this build writes.
+fn create_under(paths: &HostPaths, plan: &Plan, writers: &Writers) -> Result<()> {
+    crate::barrier::permit(writers, &WRITTEN)?;
+    kr_ipc::paths::create_new_owner_only_file(&plan_path(paths), &encoded(plan)?)?;
     Ok(())
 }
 
@@ -921,7 +947,7 @@ async fn plan_made(
     };
     // Written before anything is sent, and never replaced by another: a second plan would be a
     // second set of steps for the same environments.
-    kr_ipc::paths::create_new_owner_only_file(&plan_path(paths), &encoded(&plan)?)?;
+    create(paths, &plan)?;
     take_steps(paths, plan, json).await
 }
 
@@ -1616,6 +1642,44 @@ mod tests {
             load(paths).is_err(),
             "a later release's plan is not read as this one's"
         );
+    }
+
+    /// KR-REQ-26.10: a plan is written only at the format the release `current` names lists for it.
+    /// Where it lists the plan at another, neither the first write of a plan nor a later save writes
+    /// anything; where it lists the same, or does not list it, both write.
+    #[test]
+    fn a_plan_is_written_only_at_the_format_the_current_release_lists() {
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.paths();
+        let plan = Plan {
+            version: PLAN_FORMAT,
+            into: MachineId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
+            from: MachineId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            steps: vec![step()],
+            undo: Vec::new(),
+            undoing: false,
+        };
+        let elsewhere = crate::barrier::testing::Listing::of(&[(WRITTEN.store, PLAN_FORMAT + 1)]);
+        assert!(
+            create_under(paths, &plan, &elsewhere.writers).is_err(),
+            "a plan is not created in a format the current release does not list"
+        );
+        assert!(!plan_path(paths).exists());
+
+        let same = crate::barrier::testing::Listing::of(&[(WRITTEN.store, PLAN_FORMAT)]);
+        create_under(paths, &plan, &same.writers).expect("created in the listed format");
+        assert!(plan_path(paths).exists());
+        let before = std::fs::read(plan_path(paths)).expect("reads");
+        assert!(
+            save_under(paths, &plan, &elsewhere.writers).is_err(),
+            "nor is it saved"
+        );
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), before);
+        save_under(paths, &plan, &same.writers).expect("saved in the listed format");
+
+        // A release that lists other stores does not read the plan.
+        let unlisted = crate::barrier::testing::Listing::of(&[("registry", 7)]);
+        save_under(paths, &plan, &unlisted.writers).expect("saved: the release does not read it");
     }
 
     fn at_the_precondition() -> MachineGroup {

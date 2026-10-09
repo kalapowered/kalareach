@@ -263,9 +263,22 @@ async fn answer_offline(drafts: &AnswerDrafts, question: &Question) -> AnswerDra
     .await
     .expect("the answer is kept")
     {
-        Answered::Kept(draft) => draft,
+        Answered::NotSent(draft) => {
+            keep(drafts, &draft);
+            draft
+        }
         Answered::Sent(question) => panic!("nothing could have been sent: {question:?}"),
     }
+}
+
+/// Keeps `draft` as a client outside a store does, which holds nothing and may write any record.
+fn keep(drafts: &AnswerDrafts, draft: &AnswerDraft) {
+    let writers =
+        kr_ipc::install::hold_writers(&mut || {}).expect("a client outside a store holds nothing");
+    let permit = writers
+        .permit(&kr_client::answers::WRITTEN)
+        .expect("a client outside a store may keep an answer");
+    drafts.keep(draft, &permit).expect("the answer is kept");
 }
 
 /// KR-REQ-11.63: an answer a person gives while the client cannot reach the host stays a draft on
@@ -514,9 +527,10 @@ async fn an_answer_lost_with_its_connection_is_kept_and_never_sent_twice() {
     )
     .await
     .expect("kept");
-    let Answered::Kept(kept) = outcome else {
+    let Answered::NotSent(kept) = outcome else {
         panic!("an answer whose outcome is unknown is kept: {outcome:?}");
     };
+    keep(&drafts, &kept);
     *host.line.lock().expect("the lock") = Line::Up;
 
     assert_eq!(
@@ -555,9 +569,10 @@ async fn keeps_then_retires(byte: u8, line: Line) {
     )
     .await
     .expect("kept");
-    let Answered::Kept(kept) = outcome else {
+    let Answered::NotSent(kept) = outcome else {
         panic!("an answer whose outcome is not known is kept ({line:?}): {outcome:?}");
     };
+    keep(&drafts, &kept);
     *host.line.lock().expect("the lock") = Line::Up;
     assert_eq!(
         reconcile(&host, &drafts).await.expect("reconciles"),
@@ -687,9 +702,10 @@ async fn the_store_keeps_one_owner_only_file_per_question_and_writes_through_not
     )
     .await
     .expect("kept");
-    let Answered::Kept(later) = later else {
+    let Answered::NotSent(later) = later else {
         panic!("kept");
     };
+    keep(&drafts, &later);
     assert_eq!(drafts.drafts().expect("reads"), vec![later]);
     assert_eq!(
         std::fs::read(&victim).expect("reads"),
@@ -706,6 +722,7 @@ async fn the_store_keeps_one_owner_only_file_per_question_and_writes_through_not
                 .to_string_lossy()
                 .into_owned()
         })
+        .filter(|name| name != "answers.lock")
         .collect();
     assert_eq!(names, vec![format!("{}.answer", asked.question_id)]);
     let kept = answers.join(format!("{}.answer", asked.question_id));
@@ -777,4 +794,99 @@ async fn a_kept_answer_states_its_format_and_one_of_a_later_format_is_not_read()
         matches!(drafts.drafts(), Err(AnswerError::Unreadable { .. })),
         "a later release's answer is not read as this one's"
     );
+}
+
+/// KR-REQ-26.10: keeping an answer reads the answer it replaces first. One of an earlier format, or
+/// of none, is replaced; one of a later format and one that cannot be read are left as they are and
+/// the new answer is not kept, whatever the release `current` names lists; a link or a pipe at the
+/// name holds no answer this build wrote and is replaced.
+#[cfg(unix)]
+#[tokio::test]
+async fn keeping_an_answer_does_not_replace_one_it_cannot_read() {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+
+    let (directory, drafts) = store();
+    let asked = question(7);
+    let kept = answer_offline(&drafts, &asked).await;
+    let file = directory
+        .path()
+        .join("answers")
+        .join(format!("{}.answer", asked.question_id));
+    let CanonicalValue::Map(record) = kr_cbor::decode(
+        &std::fs::read(&file).expect("reads"),
+        &kr_cbor::Limits::DEFAULT,
+    )
+    .expect("the record decodes") else {
+        panic!("a kept answer is a map");
+    };
+    let with_version = |version: Option<i128>| {
+        let mut entries: Vec<(String, CanonicalValue)> = record
+            .entries()
+            .iter()
+            .filter(|(name, _)| name != "version")
+            .cloned()
+            .collect();
+        if let Some(version) = version {
+            entries.push((
+                "version".to_owned(),
+                CanonicalValue::integer(version).expect("an integer"),
+            ));
+        }
+        kr_cbor::encode(&CanonicalValue::Map(
+            CanonicalMap::from_entries(entries).expect("a map"),
+        ))
+    };
+    let writers =
+        kr_ipc::install::hold_writers(&mut || {}).expect("a client outside a store holds nothing");
+    let permit = writers
+        .permit(&kr_client::answers::WRITTEN)
+        .expect("permitted");
+    let new = AnswerDraft {
+        answer: QuestionAnswer::Decision { decided: false },
+        ..kept.clone()
+    };
+
+    for (what, bytes) in [
+        (
+            "a later format",
+            with_version(Some(i128::from(ANSWER_FORMAT) + 1)),
+        ),
+        ("something that is not a record", b"not a record".to_vec()),
+    ] {
+        std::fs::write(&file, &bytes).expect("planted");
+        assert!(
+            matches!(
+                drafts.keep(&new, &permit),
+                Err(AnswerError::Unreadable { .. })
+            ),
+            "{what} is not replaced"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("reads"),
+            bytes,
+            "{what} is left as it is"
+        );
+    }
+
+    // One of an earlier format, and one of this one, are replaced.
+    for (what, bytes) in [
+        ("none", with_version(None)),
+        ("this format", with_version(Some(i128::from(ANSWER_FORMAT)))),
+    ] {
+        std::fs::write(&file, bytes).expect("planted");
+        drafts
+            .keep(&new, &permit)
+            .unwrap_or_else(|error| panic!("an answer of {what} is replaced: {error}"));
+        assert_eq!(drafts.drafts().expect("reads"), vec![new.clone()]);
+    }
+
+    // A pipe at the name holds no answer, and is replaced by the rename and not opened.
+    std::fs::remove_file(&file).expect("removed");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&file)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "a pipe is made");
+    drafts.keep(&new, &permit).expect("a pipe is replaced");
+    assert_eq!(drafts.drafts().expect("reads"), vec![new]);
 }
