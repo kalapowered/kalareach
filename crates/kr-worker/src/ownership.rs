@@ -135,7 +135,8 @@ pub struct OwnedProcesses {
     /// the part of it that is still running, so its size follows the processes that run and not the
     /// session's history. A process stays in it until the kernel says it has ended, whether or not
     /// the boundary still lists it: one that left the boundary after it was seen is still the
-    /// session's to stop.
+    /// session's to stop. The exception is a process that has left for a control daemon's own
+    /// scope, which is never the session's: it is not in this set, and `seen` says it left.
     live: BTreeMap<(u64, u64), ProcessStartIdentity>,
     /// The boot this session began in. A process identity is only a statement about one boot.
     boot: Option<BootIdentity>,
@@ -884,33 +885,26 @@ pub fn adopt_orphans() {
 /// something else by now.
 #[cfg(unix)]
 pub fn request_stop(owned: &OwnedProcesses) {
-    signal_surviving(owned, rustix::process::Signal::HUP);
+    signal_surviving(owned, kr_ipc::identity::Stop::Hangup);
 }
 
 /// Forces every process the boundary still holds to stop.
 #[cfg(unix)]
 pub fn force_stop(owned: &OwnedProcesses) {
-    signal_surviving(owned, rustix::process::Signal::KILL);
+    signal_surviving(owned, kr_ipc::identity::Stop::Kill);
 }
 
+/// Stops each recorded process that is still the one recorded, through the platform's hold on it.
+///
+/// The identity is checked and the signal is sent against one hold, so a number that passes to
+/// another process between the two is never signalled: a process descriptor on Linux, the kernel's
+/// own version of the process on macOS. A process the platform cannot hold is not signalled by its
+/// number, and stays in the record for the closure to name; leaving a descendant running is better
+/// than signalling a stranger.
 #[cfg(unix)]
-fn signal_surviving(owned: &OwnedProcesses, signal: rustix::process::Signal) {
+fn signal_surviving(owned: &OwnedProcesses, how: kr_ipc::identity::Stop) {
     for identity in owned.surviving() {
-        // Only a process this host still confirms is the one it recorded. A bare identifier can be
-        // reused, and signalling a stranger is worse than leaving a descendant running.
-        if !matches!(
-            kr_ipc::identity::process_state(&identity),
-            kr_ipc::identity::ProcessState::Running
-        ) {
-            continue;
-        }
-        let Ok(pid) = i32::try_from(identity.pid.get()) else {
-            continue;
-        };
-        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
-            continue;
-        };
-        let _ = rustix::process::kill_process(pid, signal);
+        let _ = kr_ipc::identity::stop_process(&identity, how);
     }
 }
 
