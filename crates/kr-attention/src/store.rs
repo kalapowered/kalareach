@@ -104,16 +104,17 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 
 /// The schema this build writes and reads.
 ///
-/// A store written under any other version is refused rather than read, except the one before it,
-/// which is brought forward once as it is opened. Two things in here are
-/// derived rather than stored on their own - an item's key, and the order a review page continues
-/// by - so a row written under a different derivation would be read under a name that does not
-/// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
-/// each of its intervals is measured from, and a row that predates those columns carries none.
-pub const SCHEMA_VERSION: i64 = 10;
+/// A store written under any other version is refused rather than read, except the ones from
+/// [`OLDEST_SCHEMA_VERSION`] up, which are brought forward once as they are opened. Two things in
+/// here are derived rather than stored on their own - an item's key, and the order a review page
+/// continues by - so a row written under a different derivation would be read under a name that
+/// does not describe it, which is worse than not reading it at all. Every row also has to carry
+/// the anchor each of its intervals is measured from, and a row that predates those columns
+/// carries none. Version 11 adds the approvals source to the values a row's `source` holds, which
+/// a build that does not know it reads as a row it cannot read.
+pub const SCHEMA_VERSION: i64 = 11;
 
-/// The oldest schema this build brings forward, the one before the one it writes: see
-/// `migrate_from_nine`.
+/// The oldest schema this build brings forward rather than refusing: see `migrate_forward`.
 pub const OLDEST_SCHEMA_VERSION: i64 = 9;
 
 /// How long a write waits for another holder of the same file before it is refused.
@@ -546,16 +547,19 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
     })
 }
 
-/// Brings a store written under schema 9 forward to this build's, in one transaction.
+/// Brings a store written under schema 9 or 10 forward to this build's, in one transaction.
 ///
-/// What changed is three columns on the items: the time the announcement an item last made was
-/// first decided, and the privacy generation and mode it was decided under, none of which an item
-/// written before this carries. Its existing rows are given the time of their last announcement,
-/// which is the best value they have: it is the time the decision was made, or the time it was made
-/// again when quiet hours released it. They are given no privacy state, because nothing recorded it
-/// and a state guessed from a clock is what the column exists to replace: a reader treats a row
-/// with none as decided at that time. Nothing reads schema 9 after this has run.
-fn migrate_from_nine(connection: &mut Connection) -> Result<()> {
+/// From schema 9, what changed is three columns on the items: the time the announcement an item
+/// last made was first decided, and the privacy generation and mode it was decided under, none of
+/// which an item written before this carries. Its existing rows are given the time of their last
+/// announcement, which is the best value they have: it is the time the decision was made, or the
+/// time it was made again when quiet hours released it. They are given no privacy state, because
+/// nothing recorded it and a state guessed from a clock is what the column exists to replace: a
+/// reader treats a row with none as decided at that time.
+///
+/// From schema 10, nothing in the tables changes: the approvals source has no cursor until the
+/// first page of a session's approval transitions is taken, which reads them from the start.
+fn migrate_forward(connection: &mut Connection, from: i64) -> Result<()> {
     let transaction = connection.transaction()?;
     // The tables first, because a start that stopped after it recorded its version and before it
     // created them left a store with a version and no items.
@@ -565,7 +569,7 @@ fn migrate_from_nine(connection: &mut Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
-    if has_column == 0 {
+    if from < 10 && has_column == 0 {
         transaction.execute_batch(
             "ALTER TABLE attention_items ADD COLUMN decided_at_ms INTEGER;
              ALTER TABLE attention_items ADD COLUMN decided_generation INTEGER;
@@ -1657,8 +1661,8 @@ impl Store {
             .optional()?;
         match recorded {
             Some(version) if version == SCHEMA_VERSION => {}
-            Some(version) if version == OLDEST_SCHEMA_VERSION => {
-                migrate_from_nine(&mut connection)?;
+            Some(version) if (OLDEST_SCHEMA_VERSION..SCHEMA_VERSION).contains(&version) => {
+                migrate_forward(&mut connection, version)?;
             }
             Some(_) => return Err(unreadable("schema version")),
             None => {
