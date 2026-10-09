@@ -219,6 +219,8 @@ export interface FakeRecovery {
   readonly kitsSaved: readonly string[]
   /** Sets where recovery stands, as the backend would report it. */
   set(view: Partial<Omit<RecoveryView, 'sync_service'>>): void
+  /** Makes every read of recovery refuse with these words until it is given none. */
+  failReads(message: string | null): void
 }
 
 /** What the fake host can be told to do before a test drives the interface. */
@@ -643,6 +645,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let recoveryTurnOns = 0
   let recoverySettles = 0
   let recoverySignIns = 0
+  let recoveryReadFails: string | null = null
   const kitsSaved: string[] = []
   const recoveryView = (): RecoveryView => ({ sync_service: syncService, ...recovery })
 
@@ -1551,7 +1554,10 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       syncService = { origin: trimmed, host, is_default: trimmed === 'https://reach.kala.to' }
       return Promise.resolve(syncService)
     },
-    recoveryView: () => Promise.resolve(recoveryView()),
+    recoveryView: () =>
+      recoveryReadFails === null
+        ? Promise.resolve(recoveryView())
+        : refused('RESOURCE_UNAVAILABLE', recoveryReadFails),
     recoveryTurnOn: () => {
       recoveryTurnOns += 1
       if (recovery.blocker !== null) {
@@ -1591,6 +1597,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       kitsSaved,
       set(view) {
         recovery = { ...recovery, ...view }
+      },
+      failReads(message) {
+        recoveryReadFails = message
       }
     },
     account: {
