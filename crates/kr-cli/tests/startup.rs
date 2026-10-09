@@ -3721,14 +3721,15 @@ impl Inside {
             std::fs::read_to_string(self.said.with_extension(extension)).unwrap_or_default()
         };
         until_there("the second kr new to end", || status.exists().then_some(()));
-        // A daemon held for the first worker to record it is given kr new's own start bound, which
-        // the test cannot lengthen: a worker slow to record it ends the command here, and the
-        // message says so rather than leave it to look like a defect.
+        // The second kr new waits for its daemon no longer than its own start bound, which the
+        // test cannot lengthen. Where the daemon is held until the first worker has recorded it, a
+        // worker slow to record it ends the command here, and the message says so rather than leave
+        // it to look like a defect.
         assert!(
             !text_of("err").contains("did not answer within"),
-            "precondition: the second kr new gave up waiting for its daemon, which was held until \
-             the first worker recorded it, and the worker took longer than kr new's start bound \
-             to do so: {}",
+            "precondition: the second kr new gave up waiting for its daemon within its start \
+             bound (where the daemon is held, the first worker took longer than that to record \
+             it): {}",
             text_of("err")
         );
         assert_eq!(
