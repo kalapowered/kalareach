@@ -613,7 +613,8 @@ pub struct DraftSnapshot {
 /// frame to the upstream names them.
 ///
 /// The file's original name is not here. It is metadata the upstream is not given: the grant's path
-/// is derived from the transfer's identifier alone.
+/// ends in the transfer's identifier and, at most, one extension from the closed list the storage
+/// keeps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedAttachment {
     /// The transfer the attachment is.
