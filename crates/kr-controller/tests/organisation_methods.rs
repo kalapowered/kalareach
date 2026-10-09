@@ -898,7 +898,7 @@ async fn a_head_that_runs_out_while_the_enrolment_waits_for_the_store_enrols_not
     calls::confirm_subject(host.environment_id, &mut client, subject(&params), &signer)
         .await
         .expect("the owner confirms the second chain");
-    let passed = i64::try_from(2 * 60 * 60 * 1000).expect("fits");
+    let passed = i64::from(2 * 60 * 60 * 1000);
     let (mut client, answer) = enrol_while_it_waits(&host, client, &params, async || {
         moved.fetch_add(passed, Ordering::SeqCst);
     })
