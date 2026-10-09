@@ -151,9 +151,19 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // none takes an address; the page asks, and is told where it stands.
     ("account_status", None),
     ("account_sign_in", None),
+    ("account_sign_in_for_recovery", None),
     ("account_sign_in_cancel", None),
     ("account_sign_out", None),
     ("account_usage", None),
+    // The sync service this computer is set to use, and the recovery material kept on it. None is
+    // a host method. The page names an origin, or a destination a save dialog returned, and is
+    // never given the seed, the locator or a token.
+    ("sync_service_view", None),
+    ("sync_service_set", None),
+    ("recovery_view", None),
+    ("recovery_turn_on", None),
+    ("recovery_settle", None),
+    ("recovery_save_kit", None),
 ];
 
 /// The commands whose native code performs protocol methods of its own, and which.
@@ -307,9 +317,16 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         connection_state,
         account_status,
         account_sign_in,
+        account_sign_in_for_recovery,
         account_sign_in_cancel,
         account_sign_out,
         account_usage,
+        sync_service_view,
+        sync_service_set,
+        recovery_view,
+        recovery_turn_on,
+        recovery_settle,
+        recovery_save_kit,
     ]
 }
 
@@ -2004,13 +2021,23 @@ mod tests {
                 // needs it.
                 "voice_call_state",
                 "voice_set_muted",
-                // The account's five. Each reaches the account service or this device's secure
+                // The account's six. Each reaches the account service or this device's secure
                 // store, and none reaches a host.
                 "account_sign_in",
                 "account_sign_in_cancel",
+                "account_sign_in_for_recovery",
                 "account_sign_out",
                 "account_status",
                 "account_usage",
+                // The sync service setting's two and recovery's four. The setting is one origin
+                // kept on this computer; recovery's seed is made, kept and written by native code,
+                // and a kit is written only where a save dialog put it.
+                "sync_service_set",
+                "sync_service_view",
+                "recovery_save_kit",
+                "recovery_settle",
+                "recovery_turn_on",
+                "recovery_view",
                 // The raw terminal view's five. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
                 // session, a size, its moves and the person's input, and native code makes every
@@ -2664,6 +2691,15 @@ pub async fn account_sign_in(
     Ok(account.get().await?.sign_in().await)
 }
 
+/// Signs this device in again through the system browser, asking for the right to write the
+/// account's backup storage as well, which keeping a recovery bundle takes.
+#[tauri::command]
+pub async fn account_sign_in_for_recovery(
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::account::AccountView> {
+    Ok(account.get().await?.sign_in_for_recovery().await)
+}
+
 /// Ends the sign-in that is waiting for the browser.
 #[tauri::command]
 pub async fn account_sign_in_cancel(account: State<'_, crate::account::AccountSlot>) -> Result<()> {
@@ -2685,4 +2721,63 @@ pub async fn account_usage(
     account: State<'_, crate::account::AccountSlot>,
 ) -> Result<crate::account::UsageView> {
     Ok(account.get().await?.usage().await)
+}
+
+/// The sync service this computer is set to use.
+#[tauri::command]
+pub fn sync_service_view(
+    state: State<'_, AppState>,
+) -> Result<crate::sync_service::SyncServiceView> {
+    Ok(state.sync_service()?.view())
+}
+
+/// Chooses another sync service. The page names an origin and nothing else: no path, no token.
+#[tauri::command]
+pub fn sync_service_set(
+    state: State<'_, AppState>,
+    origin: String,
+) -> Result<crate::sync_service::SyncServiceView> {
+    state.sync_service()?.set(&origin)
+}
+
+/// Where recovery stands on this computer, and what stops the next step.
+#[tauri::command]
+pub async fn recovery_view(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::recovery::RecoveryView> {
+    state.recovery()?.view(account.get().await?).await
+}
+
+/// Makes the recovery seed, keeps it in this device's secure store, and puts the bundle at the
+/// sync service before anything is written down for the person to keep.
+#[tauri::command]
+pub async fn recovery_turn_on(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::recovery::RecoveryView> {
+    state.recovery()?.turn_on(account.get().await?).await
+}
+
+/// Ends a write to the recovery bundle that was not answered, so that the next one can go.
+#[tauri::command]
+pub async fn recovery_settle(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::recovery::RecoveryView> {
+    state.recovery()?.settle(account.get().await?).await
+}
+
+/// Writes the recovery kit to the file the person chose.
+///
+/// The kit holds the seed, so it is written by this process to a destination a save dialog
+/// returned, and the page is told only where. Nothing the kit holds reaches the page.
+#[tauri::command]
+pub async fn recovery_save_kit(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::recovery::KitSaved> {
+    let destination = state.take_export_destination(std::path::Path::new(&path))?;
+    state.recovery()?.save_kit(&destination).await?;
+    Ok(crate::recovery::KitSaved { path })
 }
