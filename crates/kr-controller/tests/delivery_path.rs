@@ -4193,9 +4193,9 @@ async fn an_external_message_under_a_grant_with_no_history_bound_leaves_nothing_
 /// KR-REQ-25.23: the credentialed kinds are configured through the same method, with their
 /// credential in the request or kept before with `delivery.destination.secret.set`, and each sends
 /// from the host to the service it names: Slack and Discord to the webhook address the owner
-/// handed over, Telegram to the Bot API under the bot's token. The credential is in none of the messages, and removing a
-/// destination takes its credential away. An email destination is made the same way; its sending
-/// is the mail adapter's own suite.
+/// handed over, Telegram to the Bot API under the bot's token. The credential is in none of the
+/// messages, and removing a destination takes its credential away. An email destination is made the
+/// same way; its sending is the mail adapter's own suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_own_service() {
     use kr_protocol::delivery::DestinationSecret;
