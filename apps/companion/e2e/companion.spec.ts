@@ -3044,7 +3044,7 @@ test.describe('pairing', () => {
             facts: [],
             notice: null,
             statement: null,
-reading: null,
+            reading: null,
             expires_at_ms: Date.now() + 120_000,
             checkable: true
           },
@@ -3057,7 +3057,7 @@ reading: null,
             facts: [],
             notice: null,
             statement: null,
-reading: null,
+            reading: null,
             expires_at_ms: Date.now() + 90_000,
             checkable: false
           }
@@ -3117,7 +3117,7 @@ reading: null,
             ],
             notice: null,
             statement: null,
-reading: null,
+            reading: null,
             expires_at_ms: Date.now() + 120_000,
             checkable: true
           },
@@ -3217,7 +3217,7 @@ test.describe('a control that commits on a completed action', () => {
               facts: [],
               notice: null,
               statement: null,
-reading: null,
+              reading: null,
               expires_at_ms: Date.now() + 120_000,
               checkable: true
             }
