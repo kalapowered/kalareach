@@ -32,6 +32,11 @@
 //! terminal's, and a descendant that calls `setsid` leaves the terminal and stops being visible.
 //! Nothing here pretends otherwise: such a host reports incomplete coverage and lists what it
 //! confirmed.
+//!
+//! A process that leaves the session for a control daemon's own scope is not the session's: a
+//! control daemon of another environment that a command of the session started moves into a scope
+//! named for it, and the worker neither records nor stops it. The closure names it apart, as left
+//! for a daemon, and it does not count against what the closure accounts for.
 
 use std::collections::BTreeMap;
 
@@ -162,7 +167,8 @@ pub struct OwnedRecord {
     pub boot: Option<BootIdentity>,
     /// The session's root shell.
     pub root: ProcessStartIdentity,
-    /// The root shell and every process seen below it that has not been read as ended.
+    /// The root shell and every process seen below it that has not been read as ended, except one
+    /// that has left for a control daemon's own scope.
     pub processes: Vec<ProcessStartIdentity>,
     /// The control group the worker ran in, on a platform that has them.
     pub cgroup: Option<String>,
@@ -243,12 +249,7 @@ impl OwnedProcesses {
         OwnedRecord {
             boot: self.boot.clone(),
             root: self.root.clone(),
-            processes: self
-                .live
-                .values()
-                .filter(|identity| !self.in_a_daemons_scope(identity))
-                .cloned()
-                .collect(),
+            processes: self.live.values().cloned().collect(),
             cgroup: self.cgroup.clone(),
             boundary: self.boundary.describe(),
             limits: self.unestablished(),
@@ -259,26 +260,30 @@ impl OwnedProcesses {
     /// that gave its start, and forgets those the kernel now says have ended.
     ///
     /// A process that has left the session for a control daemon's own scope is noted as having
-    /// left, and is not among the processes the session stops: a control daemon a command of the
-    /// session started is the daemon of another environment, which the session did not start for
-    /// itself.
+    /// left, whether it is new or was recorded before it moved, and is not among the processes the
+    /// session stops: a control daemon a command of the session started is the daemon of another
+    /// environment, which the session did not start for itself. That it left is kept once read,
+    /// because the process can end before the closure and then cannot be read again.
     fn take(&mut self, found: impl IntoIterator<Item = ProcessStartIdentity>) {
+        let mut read = std::collections::BTreeSet::new();
         for identity in found {
             let left = self.in_a_daemons_scope(&identity);
+            read.insert(key(&identity));
             if !left {
                 self.live.insert(key(&identity), identity.clone());
             }
-            self.seen.entry(key(&identity)).or_insert(Recorded {
+            let recorded = self.seen.entry(key(&identity)).or_insert(Recorded {
                 identity,
                 forced: false,
                 left,
             });
+            recorded.left |= left;
         }
-        // One that was recorded before it moved is read again, and left behind from here on.
+        // One recorded earlier and not found this time is read again: it may have moved.
         let moved: Vec<(u64, u64)> = self
             .live
             .iter()
-            .filter(|(_, identity)| self.in_a_daemons_scope(identity))
+            .filter(|(key, identity)| !read.contains(*key) && self.in_a_daemons_scope(identity))
             .map(|(key, _)| *key)
             .collect();
         for key in moved {
@@ -295,18 +300,13 @@ impl OwnedProcesses {
         });
     }
 
-    /// Whether a process is, now, in a control daemon's own scope outside this session's service,
-    /// leading a session of its own: not one of the session's, whatever it was recorded as.
+    /// Whether a recorded process is, now, in a control daemon's own scope outside this session's
+    /// service, leading a session of its own: not one of the session's, whatever it was recorded
+    /// as.
     fn in_a_daemons_scope(&self, identity: &ProcessStartIdentity) -> bool {
-        match (
-            u32::try_from(identity.pid.get()),
-            u32::try_from(self.root.pid.get()),
-        ) {
-            (Ok(pid), Ok(session)) => {
-                kr_ipc::identity::left_for_a_daemon(pid, session, self.cgroup.as_deref())
-            }
-            _ => false,
-        }
+        u32::try_from(self.root.pid.get()).is_ok_and(|session| {
+            kr_ipc::identity::left_for_a_daemon(identity, session, self.cgroup.as_deref())
+        })
     }
 
     /// Whether a recorded process is no longer one of the session's: it was read in a control
@@ -547,6 +547,11 @@ impl OwnedProcesses {
                     continue;
                 }
                 members.push(identity.clone());
+                // A process that left for a control daemon's own scope is read about no further:
+                // what it started is its own, not the session's.
+                if self.in_a_daemons_scope(&identity) {
+                    continue;
+                }
                 let children = kr_ipc::identity::children_of(pid).ok()?;
                 let mut batch = Vec::new();
                 for child in children {
@@ -891,7 +896,8 @@ pub fn adopt_orphans() {
 ///
 /// The root shell is signalled through its own child handle; this reaches the rest. A process that
 /// has already ended is skipped rather than signalled, because its identifier may belong to
-/// something else by now.
+/// something else by now, and one that has left for a control daemon's own scope is not the
+/// session's.
 #[cfg(unix)]
 pub fn request_stop(owned: &OwnedProcesses) {
     signal_surviving(owned, kr_ipc::identity::Stop::Hangup);
@@ -908,12 +914,20 @@ pub fn force_stop(owned: &OwnedProcesses) {
 /// The identity is checked and the signal is sent against one hold, so a number that passes to
 /// another process between the two is never signalled: a process descriptor on Linux, the kernel's
 /// own version of the process on macOS. A process the platform cannot hold is not signalled by its
-/// number, and stays in the record for the closure to name; leaving a descendant running is better
-/// than signalling a stranger.
+/// number, and stays in the record for the closure to name, with the reason; leaving a descendant
+/// running is better than signalling a stranger.
 #[cfg(unix)]
 fn signal_surviving(owned: &OwnedProcesses, how: kr_ipc::identity::Stop) {
+    use kr_ipc::identity::Stopped;
+
     for identity in owned.surviving() {
-        let _ = kr_ipc::identity::stop_process(&identity, how);
+        match kr_ipc::identity::stop_process(&identity, how) {
+            Stopped::Signalled | Stopped::Gone | Stopped::Unsupported => {}
+            Stopped::Refused(why) | Stopped::Unsafe(why) => owned.note_unestablished(format!(
+                "process {} could not be stopped: {why}",
+                identity.pid.get()
+            )),
+        }
     }
 }
 

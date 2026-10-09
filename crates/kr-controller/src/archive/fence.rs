@@ -26,6 +26,13 @@
 //! and the number of its endpoint only ever increases, so no later session shares an identity with
 //! it.
 //!
+//! **What is not the session's.** A recorded process that leads a session of its own other than the
+//! root shell's, in a scope named for a control daemon outside the worker's own service, is the
+//! daemon of another environment that a command of the session started, and left. It is not
+//! stopped and is not counted among what the pass answers for; the closure names it as left for a
+//! daemon after the coverage is decided. It is read at the time of the pass, so a daemon the
+//! worker's last record no longer holds is not named.
+//!
 //! **Coverage** is complete only for a boundary this pass confirmed: a control group it proved the
 //! worker ran in and read empty at the end, or a job that needed no help. Everywhere else it is
 //! incomplete, always on macOS and on a Linux host with no service manager, because a process the
@@ -445,27 +452,16 @@ impl ArchiveService {
     }
 }
 
-/// Whether a recorded process has left the session for a control daemon's own scope: it leads a
-/// session other than the root's and is in a scope named for a daemon outside the worker's own
-/// service. Read now, after the identity is the recorded one, and only on a platform with control
-/// groups.
+/// Whether a recorded process has left the session for a control daemon's own scope: it is still
+/// the recorded process, it leads a session other than the root's and it is in a scope named for a
+/// daemon outside the worker's own service. Read now, and only on a platform with control groups.
 fn left_for_a_daemon(
     identity: &ProcessStartIdentity,
     root: &ProcessStartIdentity,
     unit: Option<&str>,
 ) -> bool {
-    match (
-        u32::try_from(identity.pid.get()),
-        u32::try_from(root.pid.get()),
-    ) {
-        (Ok(pid), Ok(session)) => {
-            matches!(
-                kr_ipc::identity::process_state(identity),
-                kr_ipc::identity::ProcessState::Running
-            ) && kr_ipc::identity::left_for_a_daemon(pid, session, unit)
-        }
-        _ => false,
-    }
+    u32::try_from(root.pid.get())
+        .is_ok_and(|session| kr_ipc::identity::left_for_a_daemon(identity, session, unit))
 }
 
 /// The kind of a surviving resource that is a reason this pass could not account for something.
@@ -828,7 +824,7 @@ fn members_below(
                     queued += 1;
                     if queued > GROUP_BUDGET {
                         return Err(format!(
-                            "more than {GROUP_BUDGET} control groups lie below the service's"
+                            "the service's control group and the groups below it are more than the {GROUP_BUDGET} the walk reads"
                         ));
                     }
                     pending.push(entry.path());
