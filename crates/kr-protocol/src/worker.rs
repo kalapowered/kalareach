@@ -23,8 +23,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::hello::ProtocolVersion;
 use crate::identity::{BootIdentity, ProcessStartIdentity, WorkerProfile};
-use crate::ids::{AuthorityRevision, ControllerGeneration, EnvironmentId, SessionEpoch, SessionId};
-use crate::scalars::{AuthorisationKey, Nonce256, Nullable, Signature64, TimestampMs, U64, Uuid};
+use crate::ids::{
+    AuthorityRevision, ControllerGeneration, DeviceId, EnvironmentId, GrantId, SessionEpoch,
+    SessionId,
+};
+use crate::scalars::{
+    AuthorisationKey, CanonicalSet, Nonce256, Nullable, Signature64, TimestampMs, U64, Uuid,
+};
 use crate::session::DisplayNumber;
 
 /// The domain separating a worker's startup rendezvous.
@@ -417,13 +422,19 @@ pub struct GenerationAccepted {
 /// revoked authority has acknowledged the revision that removed it. Until then the revocation
 /// reports `pending` for that worker, or the worker is confirmed ended, which answers the same
 /// question a different way.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityRevisionNotice {
     /// The environment whose authority changed.
     pub environment_id: EnvironmentId,
     /// The revision now in force.
     pub revision: AuthorityRevision,
+    /// Whose authority the revision withdrew, when the host can name it.
+    ///
+    /// It is absent from the wire when it is the whole host, which is what a worker that does not
+    /// state [`crate::local::AUTHORITY_REVISION_REACH`] is always sent.
+    #[serde(default, skip_serializing_if = "RevisionReach::is_host")]
+    pub reach: RevisionReach,
     /// How many names of this revision's fence evidence the daemon already has.
     ///
     /// Nought asks for the first page, which is what a first announcement is. An announcement that
@@ -441,6 +452,56 @@ pub struct AuthorityRevisionNotice {
 /// Returns whether this is a request for the first page of fence evidence.
 fn is_first_page(evidence_from: &u64) -> bool {
     *evidence_from == 0
+}
+
+/// How many grants and devices together a revision's reach may name before it is the whole host.
+pub const MAX_REVISION_REACH_NAMES: usize = 256;
+
+/// Whose authority one revision withdrew.
+///
+/// A revision invalidates the host's dispatch leases wholesale, but what it takes away from a
+/// session's workers is the authority held under the grants and by the devices it withdrew. A
+/// worker fences the input of the callers it names and leaves every other caller's, so one
+/// device's own grant changes do not take the input lease another device holds.
+///
+/// A worker applies a named reach only to the revision that follows the one it last acknowledged:
+/// a worker that missed a revision, that was refused for its dispatch boundary, or that has
+/// acknowledged none fences every caller acting under a grant, as it does for [`Self::Host`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RevisionReach {
+    /// Any authority the host holds, or authority the host cannot name.
+    #[default]
+    Host,
+    /// Only the authority held under these grants and by these devices.
+    Within {
+        /// The grants the revision withdrew, with everything delegated from them.
+        grants: CanonicalSet<GrantId>,
+        /// The devices the revision withdrew.
+        devices: CanonicalSet<DeviceId>,
+    },
+}
+
+impl RevisionReach {
+    /// Returns whether this is the whole host, the reach that is not sent.
+    #[must_use]
+    pub const fn is_host(&self) -> bool {
+        matches!(self, Self::Host)
+    }
+
+    /// Returns whether a caller acting under `grant_id`, or from `device_id`, is within this
+    /// reach. A caller that carries neither is within every reach.
+    #[must_use]
+    pub fn names(&self, grant_id: Option<GrantId>, device_id: Option<DeviceId>) -> bool {
+        match self {
+            Self::Host => true,
+            Self::Within { grants, devices } => {
+                (grant_id.is_none() && device_id.is_none())
+                    || grant_id.is_some_and(|grant| grants.contains(&grant))
+                    || device_id.is_some_and(|device| devices.contains(&device))
+            }
+        }
+    }
 }
 
 /// A worker's acknowledgement that it is acting under an authority revision.
@@ -748,6 +809,55 @@ mod tests {
                 .expect("reads"),
             off
         );
+    }
+
+    /// A worker built before a revision's reach existed reads this notice, and ends the link of a
+    /// frame with a member it does not know: the whole host's reach is therefore not on the wire
+    /// at all, and a notice that names one round-trips.
+    #[test]
+    fn a_notice_of_the_whole_host_is_what_an_earlier_worker_reads() {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([7; 16]));
+        let whole = AuthorityRevisionNotice {
+            environment_id,
+            revision: AuthorityRevision::new(4),
+            reach: RevisionReach::Host,
+            evidence_from: 0,
+        };
+        let CanonicalValue::Map(map) = kr_cbor::to_canonical_value(&whole).expect("encodes") else {
+            panic!("a notice is a map");
+        };
+        assert!(map.get("reach").is_none(), "the whole host is not sent");
+        assert!(map.get("evidence_from").is_none());
+
+        let named = AuthorityRevisionNotice {
+            reach: RevisionReach::Within {
+                grants: [GrantId::new(Uuid::from_bytes([1; 16]))]
+                    .into_iter()
+                    .collect(),
+                devices: CanonicalSet::new(),
+            },
+            ..whole
+        };
+        let encoded = kr_cbor::to_canonical_value(&named).expect("encodes");
+        let decoded: AuthorityRevisionNotice =
+            kr_cbor::from_canonical_value(&encoded).expect("decodes");
+        assert_eq!(decoded, named);
+    }
+
+    /// A reach names the grants and the devices it holds, and a caller that carries neither a grant
+    /// nor a device, which cannot be shown to be outside it.
+    #[test]
+    fn a_reach_names_what_it_holds_and_a_caller_that_carries_neither() {
+        let grant = GrantId::new(Uuid::from_bytes([1; 16]));
+        let device = DeviceId::new(Uuid::from_bytes([2; 16]));
+        let named = RevisionReach::Within {
+            grants: [grant].into_iter().collect(),
+            devices: CanonicalSet::new(),
+        };
+        assert!(named.names(None, None));
+        assert!(named.names(Some(grant), None));
+        assert!(!named.names(Some(GrantId::new(Uuid::from_bytes([3; 16]))), Some(device)));
+        assert!(RevisionReach::Host.names(Some(grant), Some(device)));
     }
 
     #[test]

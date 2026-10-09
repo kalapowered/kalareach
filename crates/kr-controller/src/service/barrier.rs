@@ -88,7 +88,15 @@ pub(super) struct Debts {
     pending: BTreeMap<crate::grants::store::DebtId, Reach>,
     pub(super) published: BTreeMap<crate::grants::store::DebtId, Published>,
     pub(super) retiring: std::collections::BTreeSet<crate::grants::store::DebtId>,
+    /// What each of the latest revisions withdrew, by revision, for the announcement of it.
+    ///
+    /// A daemon that restarts keeps none, and a revision with no entry is announced as the whole
+    /// host's, which fences every caller under a grant.
+    reaches: BTreeMap<u64, kr_protocol::worker::RevisionReach>,
 }
+
+/// How many revisions' reaches the daemon keeps for their announcements.
+const KEPT_REVISION_REACHES: usize = 32;
 
 /// One published debt ([`Debts`]).
 #[derive(Clone, Debug)]
@@ -374,11 +382,11 @@ impl Controller {
                         // revocation from reporting `pending` for it, and must not stop the
                         // announcement reaching the workers after it. Section 9 makes waiting the
                         // opposite of completion.
-                        let notice = kr_protocol::worker::AuthorityRevisionNotice {
-                            environment_id: self.paths.environment_id(),
+                        let notice = self.revision_notice(
                             revision,
-                            evidence_from: 0,
-                        };
+                            0,
+                            &link.client().acknowledgement().capabilities,
+                        );
                         #[cfg(feature = "testing")]
                         self.record_announcement(session_id, &notice);
                         let answered = tokio::time::timeout(
@@ -581,9 +589,12 @@ impl Controller {
             let Some(from) = self.leases.evidence_owed(session_id, revision) else {
                 return;
             };
+            // A continuation asks for names of a revision the worker has already fenced, so it
+            // names no reach.
             let notice = kr_protocol::worker::AuthorityRevisionNotice {
                 environment_id: self.paths.environment_id(),
                 revision,
+                reach: kr_protocol::worker::RevisionReach::Host,
                 evidence_from: from,
             };
             let answered = {
@@ -756,6 +767,66 @@ impl Controller {
         }
     }
 
+    /// Whose authority the debts one revision captured withdrew, as the workers are told.
+    ///
+    /// A debt that reaches every connection, or one this cannot name, is the whole host. The
+    /// others are the grants and the devices they name. More names than a frame should carry is
+    /// the whole host too, which is the reach every worker fences by when it knows no better.
+    fn reach_of(
+        captured: &BTreeMap<crate::grants::store::DebtId, Reach>,
+    ) -> kr_protocol::worker::RevisionReach {
+        let mut grants = kr_protocol::scalars::CanonicalSet::new();
+        let mut devices = kr_protocol::scalars::CanonicalSet::new();
+        for reach in captured.values() {
+            match reach {
+                Reach::Host => return kr_protocol::worker::RevisionReach::Host,
+                Reach::Device(device_id) => {
+                    devices.insert(*device_id);
+                }
+                Reach::Grants(named) => {
+                    for grant_id in named {
+                        grants.insert(*grant_id);
+                    }
+                }
+            }
+        }
+        let names = grants.len() + devices.len();
+        if names == 0 || names > kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+            return kr_protocol::worker::RevisionReach::Host;
+        }
+        kr_protocol::worker::RevisionReach::Within { grants, devices }
+    }
+
+    /// The announcement of `revision` to a worker that said `capabilities` in its hello.
+    ///
+    /// It names whose authority the revision withdrew only to a worker that reads that, and only
+    /// for the first page of the revision's evidence: a continuation asks for names of a revision
+    /// the worker has already fenced. A revision this daemon holds no reach for, because it
+    /// restarted since, is announced as the whole host's.
+    pub(crate) fn revision_notice(
+        &self,
+        revision: AuthorityRevision,
+        evidence_from: u64,
+        capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
+    ) -> kr_protocol::worker::AuthorityRevisionNotice {
+        let reach = if evidence_from == 0 && kr_protocol::local::reads_revision_reach(capabilities)
+        {
+            self.debts()
+                .reaches
+                .get(&revision.get())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            kr_protocol::worker::RevisionReach::Host
+        };
+        kr_protocol::worker::AuthorityRevisionNotice {
+            environment_id: self.paths.environment_id(),
+            revision,
+            reach,
+            evidence_from,
+        }
+    }
+
     /// A barrier's first step. Inside the registry critical section that advances the revision,
     /// it captures the published debts `capture` names, and nothing else: memory is the one record
     /// of which debts a barrier may take, so no row read from disk can be captured before its
@@ -790,6 +861,7 @@ impl Controller {
                 registry.advance_authority_revision()?;
                 let revision = registry.authority_revision()?;
                 let host_wide = captured.values().any(|reach| *reach == Reach::Host);
+                let reach = Self::reach_of(&captured);
                 let revoked_grants: std::collections::BTreeSet<kr_protocol::ids::GrantId> =
                     captured
                         .values()
@@ -839,6 +911,10 @@ impl Controller {
                 for debt in captured.keys() {
                     debts.published.remove(debt);
                     debts.retiring.insert(*debt);
+                }
+                debts.reaches.insert(revision.get(), reach);
+                while debts.reaches.len() > KEPT_REVISION_REACHES {
+                    debts.reaches.pop_first();
                 }
                 Some((revision, captured))
             }

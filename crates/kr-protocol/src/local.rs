@@ -292,6 +292,27 @@ pub fn holds_results_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> boo
 /// member.
 pub const FORWARDED_SCREEN_BASIS: &str = "forwarded.screen-basis/1";
 
+/// The capability a worker states when it reads which grants and devices an authority revision
+/// withdrew ([`crate::worker::AuthorityRevisionNotice::reach`]) and fences the input of those
+/// callers alone.
+///
+/// A worker of an earlier build ends the link a frame with a member it does not know arrived on,
+/// so a daemon names a revision's reach only to a worker that states this, and announces the
+/// revision to any other as it always did, which fences every caller acting under a grant.
+///
+/// A worker of an earlier build can outlive the daemon that started it, so the statement is kept
+/// until no such worker can be reached by a daemon of this build.
+pub const AUTHORITY_REVISION_REACH: &str = "authority.revision-reach/1";
+
+/// Returns true when a worker's statement says it fences the input of the callers a revision's
+/// reach names ([`AUTHORITY_REVISION_REACH`]).
+#[must_use]
+pub fn reads_revision_reach(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == AUTHORITY_REVISION_REACH)
+}
+
 /// The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
 /// session's screen the attachment is drawn.
 ///

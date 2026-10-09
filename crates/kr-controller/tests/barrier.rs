@@ -313,6 +313,7 @@ fn notice(worker: &Worker, revision: u64) -> kr_protocol::worker::AuthorityRevis
     kr_protocol::worker::AuthorityRevisionNotice {
         environment_id: worker.environment_id,
         revision: AuthorityRevision::new(revision),
+        reach: kr_protocol::worker::RevisionReach::Host,
         evidence_from: 0,
     }
 }
@@ -594,6 +595,7 @@ async fn an_announcement_from_a_replaced_controller_leaves_no_fence_behind() {
         replaced.announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
             environment_id: worker.environment_id,
             revision: AuthorityRevision::new(9),
+            reach: kr_protocol::worker::RevisionReach::Host,
             evidence_from: 0,
         }),
     )
@@ -638,6 +640,7 @@ async fn an_announcement_from_a_replaced_controller_leaves_no_fence_behind() {
         bound.announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
             environment_id: worker.environment_id,
             revision: AuthorityRevision::new(9),
+            reach: kr_protocol::worker::RevisionReach::Host,
             evidence_from: 0,
         }),
     )
@@ -3240,6 +3243,99 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
             0
         );
     }
+}
+
+/// KR-REQ-10.45: the revision a withdrawal of one grant advances to is announced to a worker with
+/// the grants that withdrawal reached, and the revision of a restriction that names none, here a
+/// revocation of the host's authority as it stands, is announced as the whole host's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_announcement_names_the_grants_a_withdrawal_reached_and_the_host_for_one_that_names_none()
+ {
+    use kr_controller::grants::GrantRecord;
+    use kr_controller::service::Audience;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::CanonicalSet;
+    use kr_protocol::worker::RevisionReach;
+
+    let hosted = hosted_worker().await;
+    let held = Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([0x41; 16])),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([0xf1; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [ActionRight::SessionView].into_iter().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(1)),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    };
+    hosted
+        .controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: held.clone(),
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+
+    let first_announced = |from: usize| {
+        hosted.controller.announcements_sent_for_tests()[from..]
+            .iter()
+            .find(|sent| sent.session_id == hosted.session_id && sent.evidence_from == 0)
+            .cloned()
+            .expect("the worker is announced to")
+    };
+    let before = hosted.controller.announcements_sent_for_tests().len();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted
+            .controller
+            .revoke_grant(held.grant_id, Audience::Host, None, None),
+    )
+    .await
+    .expect("the revocation completes")
+    .expect("it succeeds");
+    assert_eq!(
+        first_announced(before).reach,
+        RevisionReach::Within {
+            grants: [held.grant_id].into_iter().collect(),
+            devices: CanonicalSet::new(),
+        },
+        "the worker is told which grant the revision withdrew"
+    );
+
+    let before = hosted.controller.announcements_sent_for_tests().len();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation completes")
+    .expect("it succeeds");
+    assert_eq!(
+        first_announced(before).reach,
+        RevisionReach::Host,
+        "a restriction that names no grant is announced as the whole host's"
+    );
 }
 
 /// Writes one mutation to this daemon and returns what it answered.
