@@ -116,6 +116,49 @@ impl RemoteConnection {
             .await
     }
 
+    /// Decides one mutation of this device's, under the grant it acts under.
+    ///
+    /// A delegation acts under the share it delegates from, which its parameters name, and a
+    /// revocation of one acts under the share its device delegated the revoked grant from, which
+    /// no parameter names: the grants say. Every other mutation acts under the grant it names in
+    /// its envelope, or the one the session selects ([`Self::ask_naming`]).
+    pub(super) fn ask_mutation(
+        &self,
+        mutation: &MutationRequest,
+        entry: &'static MethodEntry,
+    ) -> std::result::Result<Asked, ProtocolError> {
+        let session_id = mutation.target.session_id.as_ref().copied();
+        let claims_geometry = claims_geometry(mutation);
+        let named = mutation.grant_id.as_ref().copied();
+        let invalid = |error: kr_cbor::CborError| {
+            ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+        };
+        match entry.method {
+            Method::GrantCreate => {
+                let parent = mutation
+                    .params
+                    .to_typed::<kr_protocol::sharing::GrantCreateParams>()
+                    .map_err(invalid)?
+                    .parent_grant_id
+                    .0;
+                self.ask_naming(session_id, entry, claims_geometry, named.or(parent))
+            }
+            Method::GrantRevoke => {
+                let params = mutation
+                    .params
+                    .to_typed::<kr_protocol::sharing::GrantRevokeParams>()
+                    .map_err(invalid)?;
+                let ancestor = self
+                    .controller
+                    .delegating_ancestor(self.device.device_id, params.grant_id)
+                    .map_err(|error| error.to_protocol_error())?;
+                let acting = self.acting_as_share(ancestor)?;
+                self.ask_under(acting, session_id, entry, claims_geometry)
+            }
+            _ => self.ask_naming(session_id, entry, claims_geometry, named),
+        }
+    }
+
     /// Decides this device's request through the one intersection ([`Self::check_grant`]), under
     /// the grant it acts under for the session ([`Self::acting_for`]), and keeps what was asked
     /// with the decision.
@@ -405,6 +448,16 @@ impl RemoteConnection {
                 .map_err(|error| {
                     ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
                 })?;
+        }
+        // A delegation names the session it shares, which the generic check below holds to its
+        // parameters. A revocation acts on a grant, which belongs to this host rather than to a
+        // session: a target naming one is refused rather than producing a receipt against
+        // something the revocation never touched.
+        if entry.method == Method::GrantRevoke && mutation.target.session_id.as_ref().is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "a grant belongs to this host, not to one session",
+            ));
         }
         // A voice mutation's subject is this host. A voice session is not a shell session, so the
         // target names none, and the session a delegation acts on travels in the parameters where

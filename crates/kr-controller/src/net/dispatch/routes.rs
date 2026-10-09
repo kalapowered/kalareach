@@ -15,7 +15,7 @@ use super::super::proxy::Vouched;
 use crate::error::Result;
 
 use super::super::Retained;
-use super::decision::{Answered, Asked, claims_geometry, refuses_a_working_tree, session_of};
+use super::decision::{Answered, Asked, refuses_a_working_tree, session_of};
 use super::forwarding::RouteRefusal;
 use super::{RemoteConnection, failure, outcome_unknown};
 
@@ -492,12 +492,7 @@ impl RemoteConnection {
         let actor_id = self.device.principal();
         // The rights this request was decided with: the grant as this host's policy and its
         // configured ceiling leave it. They are what the worker is told the host checked.
-        let decided = match self.ask_naming(
-            mutation.target.session_id.as_ref().copied(),
-            entry,
-            claims_geometry(mutation),
-            mutation.grant_id.as_ref().copied(),
-        ) {
+        let decided = match self.ask_mutation(mutation, entry) {
             Ok(decided) => decided,
             Err(error) => return failure(mutation.request_id, error),
         };
@@ -1123,6 +1118,64 @@ impl RemoteConnection {
                             crate::service::authority_changes::AuthorityCaller::Device(device_id),
                             &mutation,
                             Method::GrantRedeem,
+                            carried,
+                        )
+                        .await
+                });
+                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
+            }
+            // A device delegates a narrower grant from a share it holds, and revokes what it
+            // delegated. They are this daemon's own effects, once per actor's action, for the
+            // device that sends them and decided under a share: a pairing grant is not a grant to
+            // delegate from, and the grant a delegation is made from is the one it acts under.
+            Method::GrantCreate | Method::GrantRevoke => {
+                if decided.acting.held != super::acting::Held::Share {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "a device delegates from a share it holds, and its pairing grant is \
+                             not one",
+                        ),
+                    );
+                }
+                if entry.method == Method::GrantCreate {
+                    let from = mutation
+                        .params
+                        .to_typed::<kr_protocol::sharing::GrantCreateParams>()
+                        .ok()
+                        .and_then(|params| params.parent_grant_id.0);
+                    if from != Some(decided.acting.grant.grant_id) {
+                        return failure(
+                            mutation.request_id,
+                            ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                "a delegation names the grant it is made from, and the request \
+                                 acts under that grant",
+                            ),
+                        );
+                    }
+                }
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let device_id = self.device.device_id;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let effect = tokio::spawn(async move {
+                    controller
+                        .authority_change(
+                            &actor_id,
+                            crate::service::authority_changes::AuthorityCaller::Device(device_id),
+                            &mutation,
+                            method,
                             carried,
                         )
                         .await

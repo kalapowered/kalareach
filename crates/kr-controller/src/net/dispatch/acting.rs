@@ -312,6 +312,24 @@ impl RemoteConnection {
         }
     }
 
+    /// The share this device holds, as a request decided under it acts.
+    ///
+    /// For a request that has no session to select a grant by, and is decided under the share it
+    /// delegated from: a revocation of what that share's delegations became.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a grant that is not a share this device holds.
+    pub(super) fn acting_as_share(
+        &self,
+        grant_id: GrantId,
+    ) -> std::result::Result<Acting, ProtocolError> {
+        Ok(Acting {
+            grant: self.share_record(grant_id)?.grant,
+            held: Held::Share,
+        })
+    }
+
     /// The grant a request that names none is decided under.
     fn selected(&self, session_id: SessionId) -> std::result::Result<Acting, ProtocolError> {
         let pairing = &self.device.grant;

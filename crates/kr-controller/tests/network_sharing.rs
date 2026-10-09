@@ -14,41 +14,14 @@ use kr_controller::sharing::ShareRequest;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{ActionId, DeviceId, GrantId, InvitationId, SessionId};
 use kr_protocol::method::Method;
-use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::sharing::{
     AuthorityNotice, GrantCreateParams, GrantCreateResult, GrantRedeemParams, GrantRedeemResult,
     GrantRevokeParams, InvitationState, RoleSelection, SessionRole,
 };
-use net_support::{Device, Host, RawDevice, pair_with, proposal};
-
-/// A target that names this host and no session, which is what a redemption and a revocation act
-/// on.
-fn on_the_host(host: &Host) -> ActionTarget {
-    ActionTarget {
-        environment_id: host.environment_id,
-        session_id: Nullable::null(),
-        session_epoch: Nullable::null(),
-        application_instance_id: Nullable::null(),
-        agent_binding_revision: Nullable::null(),
-    }
-}
-
-/// A device paired under a grant that reaches no session: the way a person who was only ever asked
-/// to look at one session is paired.
-async fn recipient(
-    host: &Host,
-    owner: &DeviceKeys,
-) -> (Device, kr_controller::service::net::devices::DeviceRecord) {
-    let device = Device::create().await;
-    let mut grant = proposal(&[ActionRight::SessionView]);
-    grant.session_selector = SessionSelector::None;
-    let record = pair_with(host, &device, owner, grant).await;
-    (device, record)
-}
+use net_support::{Host, RawDevice, on_the_host, recipient};
 
 /// Shares `session_id` with `recipient` as a viewer, as the owner at this machine does.
 async fn shared(host: &Host, session_id: SessionId, recipient: DeviceId) -> GrantCreateResult {

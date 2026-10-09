@@ -4745,13 +4745,13 @@ An invitation that was withdrawn or has expired activates nothing. Withdrawing o
 grant it carries with `grant.revoke`, which settles the invitation as withdrawn in the same commit,
 so cancelling is a complete answer rather than a note beside live authority.
 
-**Transfer of control is not a delegation.** The transferring device does not keep what it hands
-over. The recipient receives an active grant over the session named in the plan, which keeps the
-issuer and the parent of the grant it replaces and ends no later than that grant does on the
-continuous clock, and the transferring device's grant is revoked with its descendants, both in one
-commit. It changes who holds authority, so it takes the owner's confirmation every time, and only
-the person at this machine asks for it: `grant.transfer` is served on local IPC alone, and a paired
-device that asks for the confirmation or for the transfer is refused.
+**Transfer of control is not a delegation.** The transferring device does not retain any of the
+control it hands over. The recipient receives an active grant over the session named in the plan,
+with the same issuer and parent as the grant it replaces, which ends no later than that grant does
+on the continuous clock. The transferring device's grant is revoked with its descendants, both in
+one commit. It changes who holds authority, so it takes the owner's confirmation every time, and
+only the person at this machine asks for it: `grant.transfer` is served on local IPC alone, and a
+paired device that asks for the confirmation or for the transfer is refused.
 
 The host describes the transfer from its own records. `owner.confirmation.request` names the
 session, the grant given up, the receiving device and the identifier of the action that will make
@@ -4772,12 +4772,12 @@ digest covering the whole plan. A challenge that supplied its own answers to tho
 it. The signer and the outstanding-challenge ledger are the caller's too, so the acceptance is only
 as strong as the caller's own enrolment record. What comes out of that acceptance is evidence bound
 to the host it was accepted for, to the boot it was accepted in, and to the ceremony's own monotonic
-deadline, and the transfer checks all three before it does anything and again where it writes. A
-confirmation accepted for another host, in an earlier boot, or past its lifetime authorises
-nothing.
+deadline, and the transfer checks all three before it does anything and again where it writes.
+Confirmations accepted for other hosts, previous boots of the host, or which are now out of date
+will not be accepted.
 
-The transfer hands over no more than the transferring grant carries, and it advances the revision
-and fences like any other revocation.
+The rights transferred will not include more rights than the grant being transferred carries. Like
+any other revocation, the transfer advances the revision and fences.
 
 **Nothing is lent through an intermediary.** A plugin action, an attachment action and a workflow
 are each decided where they act, by the rights their own class needs. A plugin action and a terminal
@@ -4794,6 +4794,18 @@ is its pairing grant, and each node needs its own rights in that grant: a node t
 **Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
 delegates from (naming one is not holding one), and that grant has to carry `session.share`.
 Only this host's own device issues a grant that delegates from nothing.
+
+A paired device delegates with `grant.create` over its own connection, as itself, from a share it
+holds. The request names that share as its parent and is decided under that share's rights; a
+pairing grant is not a grant to delegate from. All narrowing of the parent (rights, sessions,
+history, screen, named questions, named approvals and lifetime) will be done based solely on the
+grants before the worker of the session is queried for the preview text, so that what a device is
+shown of a session never exceeds what the grant it delegates from reaches. The grant written will
+not authorise anything until it is redeemed by the device it names, and it ends with its parent. A
+device revokes with `grant.revoke` whatever descends from a grant it holds, decided under that grant
+and again where the revocation is made, and lists what it issued with `grant.list`. A grant it holds
+itself, one that descends from another device's grant, and one that does not exist are refused
+alike.
 
 ### Revocation
 
