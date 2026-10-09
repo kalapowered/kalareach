@@ -8217,9 +8217,7 @@ async fn a_daemon_the_service_manager_started_is_started_again_by_it() {
 /// waits for it.
 const WAITS_FOR_AN_UPDATE: &str = "switching releases";
 
-/// The lock a command that writes a stored record takes shared and an update holds exclusively from
-/// before its check of the stores until its switch has been made.
-const WRITERS_LOCK: &str = "writers.lock";
+use kr_ipc::install::WRITERS_LOCK;
 
 impl Host {
     /// Holds the writers' lock exclusively, as an update does between its check and its switch.
@@ -8422,8 +8420,8 @@ async fn a_command_refuses_to_write_a_version_current_does_not_write() {
     let message = said["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("configuration")
-            && message.contains(&reads.to_string())
-            && message.contains(&writes.to_string()),
+            && message.contains(&format!("version {reads}"))
+            && message.contains(&format!("version {writes}")),
         "it names the store and both versions: {said}"
     );
     assert!(!document.exists(), "and nothing was written");
@@ -8441,6 +8439,148 @@ async fn a_command_refuses_to_write_a_version_current_does_not_write() {
     let (code, said) = other.write_the_configuration().finish();
     assert_eq!(code, Some(0), "{said}");
     assert!(other.configuration_document().exists());
+}
+
+/// KR-REQ-26.10, KR-REQ-24.30: the service start's record is written only at the version the current
+/// release lists. Where it lists the record at another, `kr host startup --set service` is refused
+/// before anything is changed: no record, no document, and nothing the service manager would take.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_service_start_is_refused_a_record_version_current_does_not_write() {
+    let host = Host::bare();
+    let writes = release_stores()
+        .into_iter()
+        .find(|listed| listed.store == "controller-service")
+        .expect("a store this build declares")
+        .version;
+    host.install(
+        &Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+            "controller-service",
+            0,
+            writes + 1,
+        )),
+    );
+    // A home of the test's own, so that nothing is ever written in this user's.
+    let home = host.scratch("home");
+    let (output, said) = host.kr_json_with(
+        &[
+            ("HOME", home.as_os_str()),
+            ("XDG_CONFIG_HOME", home.as_os_str()),
+        ],
+        &["host", "startup", "--set", "service", "--json"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let message = said["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("controller-service")
+            && message.contains(&format!("version {}", writes + 1))
+            && message.contains(&format!("version {writes}")),
+        "it names the record and both versions: {said}"
+    );
+    assert!(!host.configuration_document().exists(), "no document");
+    let state = host.tree.environment().state_dir().to_path_buf();
+    assert!(
+        !state.join(kr_cli::service_manager::RECORD_FILE).exists(),
+        "no record"
+    );
+    assert_eq!(
+        std::fs::read_dir(&home).expect("the home").count(),
+        0,
+        "and nothing was written in the home the command would have written a definition in"
+    );
+}
+
+/// KR-REQ-26.10: a command that cannot use the writers' lock writes nothing, and says why; and a
+/// current release whose manifest this build cannot read refuses the command of another release's
+/// `kr`, which says to run the current release's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_cannot_use_the_lock_or_read_current_writes_nothing() {
+    let host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let document = host.configuration_document();
+
+    // A directory where the lock file belongs cannot be opened as one.
+    let lock = host.store.root().join(WRITERS_LOCK);
+    std::fs::remove_file(&lock).expect("the lock file an install made");
+    std::fs::create_dir(&lock).expect("a directory in its place");
+    let (code, said) = host.write_the_configuration().finish();
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(WRITERS_LOCK),
+        "it names the lock: {said}"
+    );
+    assert!(!document.exists(), "and writes nothing");
+    std::fs::remove_dir(&lock).expect("removed");
+
+    // A current release whose manifest is damaged, with the command run from the release before.
+    host.put(&two);
+    host.switch(two.name());
+    let directory = host.store.release_directory(two.name());
+    writable(&directory);
+    let manifest = host.store.manifest(two.name());
+    std::fs::remove_file(&manifest).expect("the manifest a release is sealed with");
+    std::fs::write(&manifest, b"not a manifest").expect("damaged");
+    let output = host.run(
+        &host.program(one.name(), Program::Kr),
+        &["host", "startup", "--set", "standalone", "--json"],
+    );
+    let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the kr of the current release"),
+        "it says which kr to run: {said}"
+    );
+    assert!(!document.exists(), "and writes nothing");
+}
+
+/// KR-REQ-26.08, KR-REQ-26.10: an update whose writers' lock cannot be used stops nothing for good.
+/// With a directory where the lock file belongs the update, after it has stopped the daemon, ends
+/// with exit 1 and starts the daemon again from the release still current, and the next update
+/// goes through once the directory is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_whose_writers_lock_cannot_be_used_stops_nothing_for_good() {
+    let (host, one, two, archive) = host_to_update().await;
+    let lock = host.store.root().join(WRITERS_LOCK);
+    std::fs::remove_file(&lock).expect("the lock file an install made");
+    std::fs::create_dir(&lock).expect("a directory in its place");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon the update stopped serves again, from the release still current"
+    );
+    assert!(host.record()["update"].is_null());
+
+    std::fs::remove_dir(&lock).expect("removed");
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "the control: kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
 }
 
 /// KR-REQ-26.10: a command that waited through an update's switch is judged by the release the

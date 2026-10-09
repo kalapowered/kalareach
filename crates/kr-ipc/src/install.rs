@@ -89,8 +89,9 @@ pub const STAGING: &str = "staging";
 /// The directory releases are moved into to be removed.
 pub const TRASH: &str = "trash";
 
-/// The lock a command that writes a stored record takes shared, and an update takes exclusively.
-const WRITERS_LOCK: &str = "writers.lock";
+/// The lock file in the store's directory that a command that writes a stored record takes shared,
+/// and an update takes exclusively.
+pub const WRITERS_LOCK: &str = "writers.lock";
 
 /// How many seconds a command that writes a stored record waits for an update that is switching
 /// releases, and an update for a command that is writing one.
@@ -1283,15 +1284,6 @@ impl Drop for StoreLock {
 #[derive(Debug)]
 pub struct ExclusiveWriters(StoreLock);
 
-#[cfg(unix)]
-impl ExclusiveWriters {
-    /// The lock file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        self.0.path()
-    }
-}
-
 /// A record a command writes, by the name a release's manifest lists it under and the version this
 /// build writes it at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1381,7 +1373,7 @@ impl Writers {
     /// once a state root names the store that serves it and a program outside a store takes that
     /// store's lock or refuses to write.
     #[must_use]
-    pub const fn outside_a_store() -> Self {
+    pub(crate) const fn outside_a_store() -> Self {
         Self {
             #[cfg(unix)]
             shared: None,
@@ -1446,7 +1438,7 @@ impl Permit<'_> {
 
 /// Holds the writers' lock of this process's store, for a command that writes a stored record, and
 /// reads the manifest of the release `current` names under it. A process outside a store holds
-/// nothing ([`Writers::outside_a_store`]).
+/// nothing, and every record is permitted.
 ///
 /// `on_wait` runs once when an update holds the lock and the wait begins; it waits for up to
 /// [`WRITERS_WAIT_SECONDS`].
