@@ -54,8 +54,12 @@ pub const MAX_GENERATIONS: usize = 16;
 /// The one account this web knows, and the token that proves it.
 pub const ACCOUNT: &str = "account-one";
 
-/// The token that proves [`ACCOUNT`].
+/// The token that proves [`ACCOUNT`], issued with [`BACKUP_WRITE_SCOPE`].
 pub const TOKEN: &str = "the-account-token";
+
+/// A token that proves [`ACCOUNT`] for a read of the recovery bundle alone, issued with
+/// [`BACKUP_RESTORE_SCOPE`] and not [`BACKUP_WRITE_SCOPE`].
+pub const RESTORE_TOKEN: &str = "the-restore-token";
 
 /// The part size, which is the protocol's.
 pub const PART: u64 = 8 * 1024 * 1024;
@@ -229,7 +233,7 @@ struct State {
     /// The authority feeds, by the identifier of each host's authorisation key.
     feeds: BTreeMap<String, crate::feed::Feed>,
     /// The recovery bundles, by locator.
-    bundles: BTreeMap<String, crate::sync::Bundle>,
+    bundles: crate::sync::Bundles,
     /// The mailboxes, by the identifier of each recipient's stored-envelope key.
     mailboxes: BTreeMap<String, crate::mailbox::Mailbox>,
     /// The relay control plane's authorisations and leases.
@@ -302,6 +306,14 @@ impl ServiceWeb {
                     live: true,
                 },
             );
+            state.tokens.insert(
+                RESTORE_TOKEN.to_owned(),
+                Token {
+                    account: ACCOUNT.to_owned(),
+                    scopes: BTreeSet::from([BACKUP_RESTORE_SCOPE.to_owned()]),
+                    live: true,
+                },
+            );
         }
         web
     }
@@ -335,9 +347,7 @@ impl ServiceWeb {
             .lock()
             .expect("the state")
             .bundles
-            .entry(locator.to_owned())
-            .or_default()
-            .write(account, ciphertext);
+            .put(locator, account, &ciphertext, now_ms());
     }
 
     /// The collection at `locator` is in the history `recovery` names, as one put back from an
@@ -347,9 +357,7 @@ impl ServiceWeb {
             .lock()
             .expect("the state")
             .bundles
-            .entry(locator.to_owned())
-            .or_default()
-            .recovery = Some(recovery.to_owned());
+            .put_back(locator, recovery);
     }
 
     /// The service stores `bytes` as one object of `archive`, charged to `account`, as the
@@ -530,6 +538,13 @@ impl ServiceWeb {
     #[must_use]
     pub fn relay_leases(&self) -> Vec<crate::relay::RelayLeaseView> {
         self.state.lock().expect("the state").relay.views()
+    }
+
+    /// The write sequence and the sealed stream the recovery bundle at `locator` stands at, when
+    /// one is held.
+    #[must_use]
+    pub fn bundle(&self, locator: &str) -> Option<(u64, Vec<u8>)> {
+        self.state.lock().expect("the state").bundles.held(locator)
     }
 
     /// `token` expires: from now on it proves no account.
@@ -913,7 +928,10 @@ impl ServiceWeb {
             return crate::feed::sync(&mut state.feeds, &signature, body, now_ms());
         }
         if method == "sync.compare_exchange" {
-            return crate::sync::exchange(&state.bundles, &state.tokens, body, token);
+            let State {
+                bundles, tokens, ..
+            } = &mut *state;
+            return bundles.handle(tokens, body, token, now_ms());
         }
         if method == "mailbox.deliver" {
             return crate::mailbox::deliver(&mut state.mailboxes, &signature, body, now_ms());
