@@ -1,0 +1,72 @@
+{
+  "digest": "Ks8PLWnY6FDcu5ySlb8e_YLYCBBWFaZFqLxcBgilkQY",
+  "entries": [
+    {
+      "approval_option_field": null,
+      "class": "credential_or_configuration",
+      "expects_response": true,
+      "method": "account/login/start",
+      "reverse": null
+    },
+    {
+      "approval_option_field": null,
+      "class": "observation",
+      "expects_response": true,
+      "method": "account/read",
+      "reverse": null
+    },
+    {
+      "approval_option_field": null,
+      "class": "unsupported",
+      "expects_response": true,
+      "method": "command/exec",
+      "reverse": null
+    },
+    {
+      "approval_option_field": null,
+      "class": "mutation",
+      "expects_response": true,
+      "method": "initialize",
+      "reverse": null
+    },
+    {
+      "approval_option_field": null,
+      "class": "mutation",
+      "expects_response": true,
+      "method": "initialized",
+      "reverse": null
+    },
+    {
+      "approval_option_field": null,
+      "class": "observation",
+      "expects_response": true,
+      "method": "remoteControl/status/changed",
+      "reverse": null
+    },
+    {
+      "approval_option_field": null,
+      "class": "observation",
+      "expects_response": true,
+      "method": "thread/list",
+      "reverse": null
+    },
+    {
+      "approval_option_field": null,
+      "class": "mutation",
+      "expects_response": true,
+      "method": "turn/start",
+      "reverse": null
+    }
+  ],
+  "error_field": "error",
+  "framing": "json_lines",
+  "method_field": "method",
+  "params_field": "params",
+  "plugin_id": "kalareach/codex",
+  "publisher_id": "kalareach",
+  "request_id_field": "id",
+  "response_id_field": "id",
+  "result_field": "result",
+  "table_version": "1",
+  "upstream_protocol_version": "0.155.1"
+}
