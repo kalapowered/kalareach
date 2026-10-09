@@ -876,7 +876,15 @@ async fn run(cli: Cli) -> Result<Completion> {
                         )
                     })
                     .transpose()?;
-                if terminal.set.is_some() {
+                // A terminal this host does not have changes nothing, not even the environment's
+                // directories.
+                if let Some(chosen) = terminal.set.as_deref() {
+                    if !available.iter().any(|application| application.id == chosen) {
+                        return Err(CliError::TerminalUnavailable(shown!(
+                            "the terminal given is not installed on this host; it has {}",
+                            describe_terminals(&available)
+                        )));
+                    }
                     environment.paths.create()?;
                 }
                 // A change of the saved preference is made while the preference is held, as the
@@ -917,12 +925,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                         }
                     }
                 } else if let Some(chosen) = terminal.set.as_deref() {
-                    if !available.iter().any(|application| application.id == chosen) {
-                        return Err(CliError::TerminalUnavailable(shown!(
-                            "the terminal given is not installed on this host; it has {}",
-                            describe_terminals(&available)
-                        )));
-                    }
                     let (Some(held), Some(permit)) = (&held, &permit) else {
                         return Err(CliError::Other(Shown::said(
                             "the preference could not be held for saving",
