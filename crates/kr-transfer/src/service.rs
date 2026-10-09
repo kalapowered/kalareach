@@ -2327,8 +2327,9 @@ impl TransferService {
     /// operation accepts; the claim's deadline has not passed, read once the store is held; and the
     /// draft, as the claim leaves it and with the longest report of every offer in flight added,
     /// still fits the reply that carries it. The binding becomes `inserting` for the offer's owner,
-    /// the grant is written, and the draft takes one revision. A repeat by the owner of a claim that stands is answered with the same
-    /// claim and the same grant, so a reply that was lost leaves nothing behind.
+    /// the grant is written, and the draft takes one revision. A repeat by the owner of a claim that
+    /// stands is answered with the same grant and the draft as it now stands, so a reply that was
+    /// lost leaves nothing behind.
     ///
     /// The claim is refused while the journal still holds sessions of earlier builds
     /// ([`Noting`]): a build that cannot read an `inserting` binding could open such a journal.
