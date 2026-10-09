@@ -946,3 +946,69 @@ const fn class_of(operation: PreparedOperation) -> DeclaredClass {
         PreparedOperation::TerminalText => DeclaredClass::TerminalInput,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::ids::{DraftId, DraftRevision, EnvironmentId, GrantId};
+    use kr_protocol::insertion::{BindingFacts, InsertionClaim};
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+    use kr_protocol::transfer::{AttachmentReadGrant, DraftState, InsertionMethod, InsertionState};
+
+    fn transfer(byte: u8) -> TransferId {
+        TransferId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    /// A claim over the attachment `bound`, with a grant over the file of the attachment `granted`.
+    fn claim(bound: u8, granted: u8) -> InsertionClaim {
+        InsertionClaim {
+            facts: DraftFacts {
+                draft_id: DraftId::new(Uuid::from_bytes([1; 16])),
+                revision: DraftRevision::new(3),
+                state: DraftState::Open,
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                bindings: vec![BindingFacts {
+                    transfer_id: transfer(bound),
+                    attempt: U64::new(1),
+                    insertion_method: InsertionMethod::TypedSubmission,
+                    state: InsertionState::Inserting,
+                    media_type: "image/png".to_owned(),
+                    byte_len: U64::new(64),
+                    content_digest: Digest256::from_bytes([7; 32]),
+                    external_destination: Nullable::null(),
+                }],
+            },
+            grant: AttachmentReadGrant {
+                grant_id: GrantId::new(Uuid::from_bytes([2; 16])),
+                environment_id: EnvironmentId::new(Uuid::from_bytes([3; 16])),
+                transfer_id: transfer(granted),
+                insertion_method: InsertionMethod::TypedSubmission,
+                host_path: "/staging/file.png".to_owned(),
+                expires_at_ms: TimestampMs::new(9),
+            },
+        }
+    }
+
+    /// The frame names the file of the attachment the offer is for. A claim whose grant covers
+    /// another file, or whose facts do not hold the binding, would send the receiver to a file that
+    /// is not the attachment, and the worker offers nothing on it.
+    #[test]
+    fn a_claim_over_another_file_than_the_attachment_is_not_offered() {
+        let named = claimed_attachment(&claim(5, 5), transfer(5)).expect("a claim that covers it");
+        assert_eq!(named.transfer_id, transfer(5));
+        assert_eq!(named.path, "/staging/file.png");
+        assert_eq!(named.byte_len, U64::new(64));
+
+        let other_grant = claimed_attachment(&claim(5, 6), transfer(5));
+        assert!(
+            matches!(other_grant, Err(BrokerError::PreconditionFailed { .. })),
+            "{other_grant:?}"
+        );
+        let other_binding = claimed_attachment(&claim(6, 5), transfer(5));
+        assert!(
+            matches!(other_binding, Err(BrokerError::PreconditionFailed { .. })),
+            "{other_binding:?}"
+        );
+    }
+}
