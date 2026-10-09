@@ -1,0 +1,1268 @@
+{
+  "decoded": [
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "read with a token the service did not issue"
+    },
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "write with a token the service did not issue"
+    },
+    {
+      "outcome": "nothing held, history none",
+      "step": "read where nothing was ever written"
+    },
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "write with a token that may only restore"
+    },
+    {
+      "outcome": "refused, copy none, the bundle at nothing, history none",
+      "step": "write naming a revision where none is held"
+    },
+    {
+      "outcome": "nothing held, history none",
+      "step": "read where that write left nothing"
+    },
+    {
+      "outcome": "applied at write 1, revision named, history none",
+      "step": "the first write"
+    },
+    {
+      "outcome": "applied at write 1, revision named, history none",
+      "step": "the same write under the same identity"
+    },
+    {
+      "outcome": "refused IdConflict, Update, after None",
+      "step": "another bundle under the same identity"
+    },
+    {
+      "outcome": "refused, copy none, the bundle at write 1, revision named, history none, history none",
+      "step": "write again as if nothing were held"
+    },
+    {
+      "outcome": "held at write 1, revision named, history none, 96 bytes, the bytes written",
+      "step": "read what was written"
+    },
+    {
+      "outcome": "held at write 1, revision named, history none, 96 bytes, the bytes written",
+      "step": "read it with the token that may only restore"
+    },
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "read it with a token the service did not issue"
+    },
+    {
+      "outcome": "applied at write 2, revision named, history none",
+      "step": "write against the place the bundle is at"
+    },
+    {
+      "outcome": "refused, copy none, the bundle at write 2, revision named, history none, history none",
+      "step": "write against the place it has left"
+    },
+    {
+      "outcome": "held at write 2, revision named, history none, 96 bytes, the bytes written",
+      "step": "read after the refusal"
+    },
+    {
+      "outcome": "applied at write 2, revision named, history none",
+      "step": "status of a write that applied"
+    },
+    {
+      "outcome": "refused, copy none, history none",
+      "step": "status of a write that was refused"
+    },
+    {
+      "outcome": "unknown, history none",
+      "step": "status of an identity the service never saw"
+    },
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "status with a token the service did not issue"
+    },
+    {
+      "outcome": "fenced, never ran true, history none",
+      "step": "fence an identity the service never saw"
+    },
+    {
+      "outcome": "fenced, never ran true, history none",
+      "step": "fence it again"
+    },
+    {
+      "outcome": "fenced, never ran true, history none",
+      "step": "status of the fenced identity"
+    },
+    {
+      "outcome": "refused PermissionDenied, Nothing, after None",
+      "step": "write under the fenced identity"
+    },
+    {
+      "outcome": "applied at write 2, revision named, history none",
+      "step": "fence a write that applied"
+    },
+    {
+      "outcome": "refused, copy none, history none",
+      "step": "fence a write that was refused"
+    },
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "fence with a token the service did not issue"
+    }
+  ],
+  "exchanges": [
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "read with a token the service did not issue"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "write with a token the service did not issue"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "0",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "0"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": null
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": null
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read where nothing was ever written"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "write with a token that may only restore"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": null,
+          "current_write_sequence": "0",
+          "record": null,
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "0",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "0"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "null",
+          "current_write_sequence": "string",
+          "record": "null",
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write naming a revision where none is held"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "0",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "0"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": null
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": null
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read where that write left nothing"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+            "updated_at": "2026-10-09T12:54:14.160Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the first write"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+            "updated_at": "2026-10-09T12:54:14.160Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "the same write under the same identity"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "ID_CONFLICT",
+          "message": "That request identity was used for a different settings-sync request."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "ID_CONFLICT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "another bundle under the same identity"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+            "updated_at": "2026-10-09T12:54:14.160Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write again as if nothing were held"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "recovery_bundle",
+              "object": {
+                "ciphertext": "ERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERER"
+              },
+              "object_id": "61616161-6161-6161-6161-616161616161",
+              "revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+              "updated_at": "2026-10-09T12:54:14.160Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "61616161-6161-6161-6161-616161616161",
+              "revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read what was written"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "recovery_bundle",
+              "object": {
+                "ciphertext": "ERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERER"
+              },
+              "object_id": "61616161-6161-6161-6161-616161616161",
+              "revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+              "updated_at": "2026-10-09T12:54:14.160Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "61616161-6161-6161-6161-616161616161",
+              "revision": "c5f20d1b-f2d9-462c-83ae-885da77a3d38",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read it with the token that may only restore"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "read it with a token the service did not issue"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+          "current_write_sequence": "2",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+            "updated_at": "2026-10-09T12:54:14.220Z",
+            "write_sequence": "2"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against the place the bundle is at"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+          "current_write_sequence": "2",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+            "updated_at": "2026-10-09T12:54:14.220Z",
+            "write_sequence": "2"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against the place it has left"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "recovery_bundle",
+              "object": {
+                "ciphertext": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi"
+              },
+              "object_id": "61616161-6161-6161-6161-616161616161",
+              "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+              "updated_at": "2026-10-09T12:54:14.220Z",
+              "write_sequence": "2"
+            }
+          ],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "61616161-6161-6161-6161-616161616161",
+              "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+              "write_sequence": "2"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "352",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read after the refusal"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+          "current_write_sequence": "2",
+          "never_ran": false,
+          "outcome": "written",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+            "updated_at": "2026-10-09T12:54:14.220Z",
+            "write_sequence": "2"
+          },
+          "recorded_at": "2026-10-09T12:54:14.241Z",
+          "recovery_id": null,
+          "request_id": "13131313-1313-1313-1313-131313131313",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "status of a write that applied"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+          "current_write_sequence": "2",
+          "never_ran": false,
+          "outcome": "conflict",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+            "updated_at": "2026-10-09T12:54:14.220Z",
+            "write_sequence": "2"
+          },
+          "recorded_at": "2026-10-09T12:54:14.260Z",
+          "recovery_id": null,
+          "request_id": "14141414-1414-1414-1414-141414141414",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "status of a write that was refused"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "never_ran": false,
+          "outcome": null,
+          "record": null,
+          "recorded_at": null,
+          "recovery_id": null,
+          "request_id": "15151515-1515-1515-1515-151515151515",
+          "state": "unknown"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "never_ran": "boolean",
+          "outcome": "null",
+          "record": "null",
+          "recorded_at": "null",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "unknown"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "status of an identity the service never saw"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "status with a token the service did not issue"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "never_ran": true,
+          "outcome": "fenced",
+          "record": null,
+          "recorded_at": "2026-10-09T12:54:14.298Z",
+          "recovery_id": null,
+          "request_id": "15151515-1515-1515-1515-151515151515",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": "null",
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fence an identity the service never saw"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "never_ran": true,
+          "outcome": "fenced",
+          "record": null,
+          "recorded_at": "2026-10-09T12:54:14.298Z",
+          "recovery_id": null,
+          "request_id": "15151515-1515-1515-1515-151515151515",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": "null",
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fence it again"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "never_ran": true,
+          "outcome": "fenced",
+          "record": null,
+          "recorded_at": "2026-10-09T12:54:14.298Z",
+          "recovery_id": null,
+          "request_id": "15151515-1515-1515-1515-151515151515",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": "null",
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "status of the fenced identity"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "REQUEST_FENCED",
+          "message": "That settings-sync request identity has been fenced and will not be run."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "REQUEST_FENCED",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "write under the fenced identity"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+          "current_write_sequence": "2",
+          "never_ran": false,
+          "outcome": "written",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+            "updated_at": "2026-10-09T12:54:14.220Z",
+            "write_sequence": "2"
+          },
+          "recorded_at": "2026-10-09T12:54:14.241Z",
+          "recovery_id": null,
+          "request_id": "13131313-1313-1313-1313-131313131313",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fence a write that applied"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+          "current_write_sequence": "2",
+          "never_ran": false,
+          "outcome": "conflict",
+          "record": {
+            "bytes": "352",
+            "kind": "recovery_bundle",
+            "object_id": "61616161-6161-6161-6161-616161616161",
+            "revision": "81e2684d-4010-4047-8dcd-922a77c798c9",
+            "updated_at": "2026-10-09T12:54:14.220Z",
+            "write_sequence": "2"
+          },
+          "recorded_at": "2026-10-09T12:54:14.260Z",
+          "recovery_id": null,
+          "request_id": "14141414-1414-1414-1414-141414141414",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fence a write that was refused"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fence with a token the service did not issue"
+    }
+  ],
+  "names": [
+    "eSuX0W4xR7n67a_FtVzwINIGFVxCKJiVMw7BUwfxAD4"
+  ],
+  "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
+  "web_commit": "9347c57e1ada1b593571000f9d67b2e93c1d2836"
+}
