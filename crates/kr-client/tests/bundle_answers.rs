@@ -1,18 +1,21 @@
-//! What the settings-sync route answers a read of the recovery bundle, what this crate's client
-//! makes of it, and what the stand-in the daemon's tests talk to answers, held to one recording.
+//! What the settings-sync route answers about the recovery bundle, what this crate's client makes
+//! of it, and what the stand-in the daemon's and the companion's tests talk to answers, held to one
+//! recording.
 //!
-//! A device restoring from a kit reads the bundle at the kit's locator. The route admits it on two
-//! proofs: an installation's signature (a host's key is refused) and an account token carrying
-//! `backup.write` or `backup.restore`. `fixtures/service/bundle-answers.json` keeps, for each
-//! request of one script, the status and the body a Worker on this machine answered and what the
-//! client decoded it to.
+//! A device restoring from a kit reads the bundle at the kit's locator. The owner's device writes
+//! it, asks what became of a write whose answer it did not see, and ends a write that has none.
+//! The route admits each on two proofs: an installation's signature (a host's key is refused) and
+//! an account token carrying `backup.write`, which a read also admits with `backup.restore`.
+//! `fixtures/service/bundle-answers.json` keeps, for each request of two scripts that use a locator
+//! each, the status and the body a Worker on this machine answered and what the client decoded it
+//! to. The first script reads; the second writes, asks and fences.
 //!
 //! * [`the_client_decodes_what_the_worker_answered`] replays the recorded bodies through the
 //!   client, with no stand-in between.
-//! * [`the_stand_in_answers_as_the_worker_did`] runs the script against the stand-in and holds each
-//!   status, shape and decoded value to the record. The write that puts the bundle in place is the
-//!   script's setup, so the stand-in is given the bundle it holds after that write rather than
-//!   answering the write.
+//! * [`the_stand_in_answers_as_the_worker_did`] runs the scripts against the stand-in and holds each
+//!   status, shape and decoded value to the record. The write that puts the bundle in place for the
+//!   reads is that script's setup, so the stand-in is given the bundle it holds after that write
+//!   rather than answering the write.
 //!
 //! The recording is made again when the route's contract changes:
 //!
@@ -24,10 +27,11 @@
 //!   KR_WEB_COMMIT=<the web commit> cargo test -p kr-client --test bundle_answers record -- --ignored
 //! ```
 //!
-//! What a local Worker cannot be made to do is not in the script: an account other than the
-//! owner's reading the owner's locator (the deployment signs one account in). The stand-in's answer
-//! for it is read from the Worker's source, and the table in the stand-in crate's documentation
-//! names the line.
+//! What a local Worker cannot be made to do is not in the scripts: an account other than the
+//! owner's reaching the owner's locator (the deployment signs one account in), a write signed
+//! before a collection's cutoff, a collection put back from an archive, and a service that does not
+//! answer. The stand-in's answers for those are read from the contract and the Worker's source, and
+//! the table in the stand-in crate's documentation names the line of each.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,9 +39,11 @@ use kr_client::recovery::{bundle_collection, fresh_locator};
 use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, ServiceFuture, ServiceHttp, SyncBackupService,
-    SyncFetched, managed_response_limits,
+    SyncDispatch, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence, SyncRequestStatus,
+    SyncRevision, managed_response_limits,
 };
 use kr_protocol::archive::RecoveryContext;
+use kr_protocol::scalars::Uuid;
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::{ACCOUNT, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, ServiceWeb};
 
@@ -45,7 +51,7 @@ mod recording;
 
 use recording::{
     Journal, Recording, Replaying, debug, decoded, differences, held_exchanges, held_outcomes,
-    keyed, recorded,
+    keyed, recorded, refused, written,
 };
 
 const FIXTURE: &str = include_str!("../../../fixtures/service/bundle-answers.json");
@@ -112,8 +118,8 @@ fn shown(fetched: &SyncFetched, written: &[u8]) -> String {
     }
 }
 
-/// Runs the script against one service through `service`.
-async fn run_the_script(
+/// Runs the script of reads against one service through `service`.
+async fn run_the_read_script(
     service: &Arc<dyn ServiceHttp>,
     origin: &GatewayOrigin,
     tokens: &Tokens,
@@ -186,6 +192,306 @@ async fn run_the_script(
     .fetch(&collection)
     .await;
     journal.decoded(decoded(&answer, debug));
+}
+
+/// A fixed identifier, so a recording and a replay of it name the same locator and requests.
+fn fixed(byte: u8) -> Uuid {
+    Uuid::from_bytes([byte; 16])
+}
+
+/// A sealed bundle the service cannot open and does not try to: bytes of the length one has.
+fn sealed(byte: u8) -> Vec<u8> {
+    vec![byte; 96]
+}
+
+/// Where a write stands, in the words a caller acts on: its place in the order, whether the
+/// service named it, and whether it names a history. The name itself is the service's own.
+fn standing(position: &SyncPosition) -> String {
+    format!(
+        "write {}, revision {}, history {}",
+        position.write_sequence,
+        if position.revision.0.is_some() {
+            "named"
+        } else {
+            "none"
+        },
+        if position.recovery.0.is_some() {
+            "named"
+        } else {
+            "none"
+        },
+    )
+}
+
+fn show_dispatch(dispatch: &SyncDispatch) -> String {
+    match dispatch {
+        SyncDispatch::Answered(SyncExchanged::Applied { position }) => {
+            format!("applied at {}", standing(position))
+        }
+        SyncDispatch::Answered(SyncExchanged::Refused {
+            retained,
+            current,
+            recovery,
+        }) => format!(
+            "refused, copy {}, the bundle at {}, history {}",
+            if retained.is_some() { "kept" } else { "none" },
+            current
+                .as_ref()
+                .map_or_else(|| "nothing".to_owned(), standing),
+            if recovery.is_some() { "named" } else { "none" },
+        ),
+        SyncDispatch::Answered(SyncExchanged::SignedBeforeCutoff) => {
+            "refused as signed before the cutoff".to_owned()
+        }
+        SyncDispatch::NotSent(error) => format!("not sent: {}", refused(error)),
+    }
+}
+
+fn show_fetched(fetched: &SyncFetched, written: &[u8]) -> String {
+    match fetched {
+        SyncFetched::Held {
+            position,
+            ciphertext,
+        } => format!(
+            "held at {}, {} bytes, {}",
+            standing(position),
+            ciphertext.len(),
+            if ciphertext == written {
+                "the bytes written"
+            } else {
+                "other bytes than written"
+            }
+        ),
+        SyncFetched::Absent { recovery } => format!(
+            "nothing held, history {}",
+            if recovery.is_some() { "named" } else { "none" }
+        ),
+    }
+}
+
+fn show_status(status: &SyncRequestStatus) -> String {
+    match status {
+        SyncRequestStatus::Applied { position } => format!("applied at {}", standing(position)),
+        SyncRequestStatus::Refused { retained, recovery } => format!(
+            "refused, copy {}, history {}",
+            if retained.is_some() { "kept" } else { "none" },
+            if recovery.is_some() { "named" } else { "none" }
+        ),
+        SyncRequestStatus::Fenced {
+            never_ran,
+            recovery,
+        } => format!(
+            "fenced, never ran {never_ran}, history {}",
+            if recovery.is_some() { "named" } else { "none" }
+        ),
+        SyncRequestStatus::Unknown { recovery } => format!(
+            "unknown, history {}",
+            if recovery.is_some() { "named" } else { "none" }
+        ),
+    }
+}
+
+fn show_fence(fence: &SyncRequestFence) -> String {
+    match fence {
+        SyncRequestFence::Applied { position } => format!("applied at {}", standing(position)),
+        SyncRequestFence::Refused { retained, recovery } => format!(
+            "refused, copy {}, history {}",
+            if retained.is_some() { "kept" } else { "none" },
+            if recovery.is_some() { "named" } else { "none" }
+        ),
+        SyncRequestFence::Fenced {
+            never_ran,
+            recovery,
+        } => format!(
+            "fenced, never ran {never_ran}, history {}",
+            if recovery.is_some() { "named" } else { "none" }
+        ),
+    }
+}
+
+/// Runs the script of the owner's writes, status queries and fences against one service through
+/// `service`.
+///
+/// Every request is made by this crate's own client, as the owner's device and as a device
+/// restoring from a kit make them, and what the client decoded is kept in `journal`. Whatever a
+/// step expects it does not assert: what each answer was is the record's to say, and the stand-in
+/// is held to it afterwards.
+async fn run_the_exchange_script(
+    service: &Arc<dyn ServiceHttp>,
+    origin: &GatewayOrigin,
+    write_token: &str,
+    restore_token: &str,
+    journal: &Journal,
+) {
+    let device = keyed(ServiceRequestSigner::Installation);
+    journal.name(written(&device));
+    let client = |token: &str, scope: &'static str| {
+        ManagedSyncService::new(
+            origin.clone(),
+            Arc::clone(service),
+            Arc::clone(&device) as _,
+        )
+        .presenting(Arc::new(Bearer(token.to_owned())), scope)
+    };
+    let owner = client(write_token, BACKUP_WRITE_SCOPE);
+    let restoring = client(restore_token, BACKUP_RESTORE_SCOPE);
+    let stranger = client("not-a-token-this-service-issued", BACKUP_WRITE_SCOPE);
+
+    let locator = fixed(0x61);
+    let collection = bundle_collection(&RecoveryContext {
+        service_origin: origin.as_str().to_owned(),
+        bundle_locator: locator.to_string(),
+    });
+    let collection = collection.as_str();
+    let empty_collection = bundle_collection(&RecoveryContext {
+        service_origin: origin.as_str().to_owned(),
+        bundle_locator: fixed(0x62).to_string(),
+    });
+    let first = sealed(0x11);
+    let second = sealed(0x22);
+    let third = sealed(0x33);
+
+    // Who may reach it.
+    journal.step("read with a token the service did not issue");
+    let fetched = stranger.fetch(collection).await;
+    journal.decoded(decoded(&fetched, |fetched| show_fetched(fetched, &first)));
+    journal.step("write with a token the service did not issue");
+    let wrote = stranger
+        .compare_exchange_dispatched(collection, fixed(0x01), now_ms(), None, &first)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    journal.step("read where nothing was ever written");
+    let fetched = owner.fetch(collection).await;
+    journal.decoded(decoded(&fetched, |fetched| show_fetched(fetched, &first)));
+    journal.step("write with a token that may only restore");
+    let wrote = restoring
+        .compare_exchange_dispatched(collection, fixed(0x02), now_ms(), None, &first)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+
+    // A comparison against a place where nothing is held.
+    journal.step("write naming a revision where none is held");
+    let named = SyncPosition::at(1, SyncRevision::new(fixed(0x77)), None);
+    let wrote = owner
+        .compare_exchange_dispatched(
+            &empty_collection,
+            fixed(0x03),
+            now_ms(),
+            Some(named),
+            &first,
+        )
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    journal.step("read where that write left nothing");
+    let fetched = owner.fetch(&empty_collection).await;
+    journal.decoded(decoded(&fetched, |fetched| show_fetched(fetched, &first)));
+
+    // The first write, and the same write again.
+    journal.step("the first write");
+    let wrote = owner
+        .compare_exchange_dispatched(collection, fixed(0x11), now_ms(), None, &first)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    let landed = match &wrote {
+        Ok(SyncDispatch::Answered(SyncExchanged::Applied { position })) => Some(*position),
+        _ => None,
+    };
+    journal.step("the same write under the same identity");
+    let wrote = owner
+        .compare_exchange_dispatched(collection, fixed(0x11), now_ms(), None, &first)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    journal.step("another bundle under the same identity");
+    let wrote = owner
+        .compare_exchange_dispatched(collection, fixed(0x11), now_ms(), None, &second)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    journal.step("write again as if nothing were held");
+    let wrote = owner
+        .compare_exchange_dispatched(collection, fixed(0x12), now_ms(), None, &second)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+
+    // Reading it.
+    journal.step("read what was written");
+    let fetched = owner.fetch(collection).await;
+    journal.decoded(decoded(&fetched, |fetched| show_fetched(fetched, &first)));
+    journal.step("read it with the token that may only restore");
+    let fetched = restoring.fetch(collection).await;
+    journal.decoded(decoded(&fetched, |fetched| show_fetched(fetched, &first)));
+    journal.step("read it with a token the service did not issue");
+    let fetched = stranger.fetch(collection).await;
+    journal.decoded(decoded(&fetched, |fetched| show_fetched(fetched, &first)));
+
+    // The next write, and a write against a place the bundle has left.
+    journal.step("write against the place the bundle is at");
+    let wrote = owner
+        .compare_exchange_dispatched(collection, fixed(0x13), now_ms(), landed, &second)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    journal.step("write against the place it has left");
+    let wrote = owner
+        .compare_exchange_dispatched(collection, fixed(0x14), now_ms(), landed, &third)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    journal.step("read after the refusal");
+    let fetched = owner.fetch(collection).await;
+    journal.decoded(decoded(&fetched, |fetched| show_fetched(fetched, &second)));
+
+    // What became of a request.
+    journal.step("status of a write that applied");
+    let status = owner.request_status(collection, fixed(0x13)).await;
+    journal.decoded(decoded(&status, show_status));
+    journal.step("status of a write that was refused");
+    let status = owner.request_status(collection, fixed(0x14)).await;
+    journal.decoded(decoded(&status, show_status));
+    journal.step("status of an identity the service never saw");
+    let status = owner.request_status(collection, fixed(0x15)).await;
+    journal.decoded(decoded(&status, show_status));
+    journal.step("status with a token the service did not issue");
+    let status = stranger.request_status(collection, fixed(0x13)).await;
+    journal.decoded(decoded(&status, show_status));
+
+    // Ending a request.
+    journal.step("fence an identity the service never saw");
+    let at = now_ms();
+    let fence = owner.fence_request(collection, fixed(0x15), at, at).await;
+    journal.decoded(decoded(&fence, show_fence));
+    journal.step("fence it again");
+    let fence = owner.fence_request(collection, fixed(0x15), at, at).await;
+    journal.decoded(decoded(&fence, show_fence));
+    journal.step("status of the fenced identity");
+    let status = owner.request_status(collection, fixed(0x15)).await;
+    journal.decoded(decoded(&status, show_status));
+    journal.step("write under the fenced identity");
+    let wrote = owner
+        .compare_exchange_dispatched(collection, fixed(0x15), now_ms(), None, &third)
+        .await;
+    journal.decoded(decoded(&wrote, show_dispatch));
+    journal.step("fence a write that applied");
+    let fence = owner.fence_request(collection, fixed(0x13), at, at).await;
+    journal.decoded(decoded(&fence, show_fence));
+    journal.step("fence a write that was refused");
+    let fence = owner.fence_request(collection, fixed(0x14), at, at).await;
+    journal.decoded(decoded(&fence, show_fence));
+    journal.step("fence with a token the service did not issue");
+    let fence = stranger
+        .fence_request(collection, fixed(0x16), at, at)
+        .await;
+    journal.decoded(decoded(&fence, show_fence));
+}
+
+/// Runs both scripts against one service through `service`: the reads of a device restoring from a
+/// kit, and the owner's writes, status queries and fences. Each keeps to a locator of its own.
+async fn run_the_script(
+    service: &Arc<dyn ServiceHttp>,
+    origin: &GatewayOrigin,
+    tokens: &Tokens,
+    setup: &Setup<'_>,
+    journal: &Journal,
+) {
+    run_the_read_script(service, origin, tokens, setup, journal).await;
+    run_the_exchange_script(service, origin, &tokens.write, &tokens.restore, journal).await;
 }
 
 fn now_ms() -> u64 {
@@ -298,6 +604,16 @@ async fn the_stand_in_answers_as_the_worker_did() {
     );
 }
 
+/// What a write, a status query and a fence of `collection` are answered through `service`.
+async fn write_status_and_fence(service: &ManagedSyncService, collection: &str, at: u64) -> String {
+    let wrote = service
+        .compare_exchange_dispatched(collection, fixed(0x31), at, None, &sealed(0x31))
+        .await;
+    let asked = service.request_status(collection, fixed(0x31)).await;
+    let fenced = service.fence_request(collection, fixed(0x31), at, at).await;
+    format!("{wrote:?} {asked:?} {fenced:?}")
+}
+
 /// A token another account holds reads nothing, and says what an absent collection says.
 ///
 /// Source only: the Worker's deployment signs one account in, so no recording can show a second
@@ -341,6 +657,13 @@ async fn another_accounts_token_is_told_what_an_absent_collection_is_told() {
     // A token the account holds without a scope a read is answered for proves nothing.
     let other_scope = read("a-token-for-another-scope").fetch(&collection).await;
     assert_eq!(format!("{other_scope:?}"), format!("{nobody:?}"));
+    // A write, a status query and a fence of the owner's locator are turned away the same way.
+    let at = now_ms();
+    assert_eq!(
+        write_status_and_fence(&read("a-stranger"), &collection, at).await,
+        write_status_and_fence(&read("not-a-token-this-service-issued"), &collection, at).await,
+        "a token of another account is answered as no token is"
+    );
     // Nor does one that has expired.
     web.expire_token(WRITE_TOKEN);
     let expired = read(WRITE_TOKEN).fetch(&collection).await;
