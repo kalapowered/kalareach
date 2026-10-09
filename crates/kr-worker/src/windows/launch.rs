@@ -790,6 +790,114 @@ mod platform {
             stdout: kept_output.map(std::fs::File::from),
         })
     }
+
+    /// The system refuses to end a process for which it has no sign yet that another thread is
+    /// ending it, and the end of a process cannot be held between its refusal and its first sign,
+    /// so the refusal is made here by a handle that has no right to end the process. What the
+    /// system says of the process is the same, and so is what is waited for.
+    #[cfg(test)]
+    mod tests {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            CloseThreadWaitChainSession, GetThreadWaitChain, OpenThreadWaitChainSession,
+            WAITCHAIN_NODE_INFO, WCT_MAX_NODE_COUNT, WCT_OUT_OF_PROC_COM_FLAG,
+            WCT_OUT_OF_PROC_CS_FLAG, WCT_OUT_OF_PROC_FLAG, WctProcessWaitType,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        };
+
+        use super::{TerminateProcess, end_process, has_exit_status};
+
+        /// A process that waits far longer than any test takes, and a handle on it that can be
+        /// waited on and asked its status but cannot end it.
+        fn waiting_process_and_a_handle_that_cannot_end_it() -> (std::process::Child, OwnedHandle) {
+            let child = std::process::Command::new("ping.exe")
+                .args(["-n", "600", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a process that waits starts");
+            // SAFETY: the call takes a process identifier and nothing this function owns.
+            let opened = unsafe {
+                OpenProcess(
+                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    child.id(),
+                )
+            };
+            assert!(!opened.is_null(), "the process is opened to be watched");
+            // SAFETY: the handle is a new one this function owns, closed once.
+            let watcher = unsafe { OwnedHandle::from_raw_handle(opened.cast()) };
+            // The premise: the refusal arrives, and the process shows neither sign.
+            // SAFETY: the handle is open for the call.
+            let ended = unsafe { TerminateProcess(watcher.as_raw_handle().cast(), 1) };
+            assert_eq!(ended, 0, "this handle cannot end the process");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                i32::try_from(ERROR_ACCESS_DENIED).ok(),
+                "and the system's answer is a refusal"
+            );
+            assert!(
+                !has_exit_status(&watcher),
+                "the process has neither ended nor begun to"
+            );
+            (child, watcher)
+        }
+
+        /// Says whether the thread `thread` is waiting for a process to end.
+        fn waits_for_a_process(session: *const std::ffi::c_void, thread: u32) -> bool {
+            let mut nodes = [WAITCHAIN_NODE_INFO::default(); WCT_MAX_NODE_COUNT as usize];
+            let mut count = WCT_MAX_NODE_COUNT;
+            let mut cycle = 0;
+            // SAFETY: the session is open, and the array holds as many nodes as the count says.
+            let read = unsafe {
+                GetThreadWaitChain(
+                    session,
+                    0,
+                    WCT_OUT_OF_PROC_FLAG | WCT_OUT_OF_PROC_COM_FLAG | WCT_OUT_OF_PROC_CS_FLAG,
+                    thread,
+                    &raw mut count,
+                    nodes.as_mut_ptr(),
+                    &raw mut cycle,
+                )
+            };
+            // A thread that is not waiting, or has gone, has no chain to read.
+            read != 0
+                && nodes[..count as usize]
+                    .iter()
+                    .any(|node| node.ObjectType == WctProcessWaitType)
+        }
+
+        /// A refused end of a process that shows no sign yet is waited out: the process that
+        /// ends then is ended, where a refusal taken for a failure at once would report an end
+        /// that was about to happen as one that could not.
+        #[test]
+        fn a_refused_end_of_a_process_that_shows_no_sign_waits_for_the_process_to_end() {
+            let (mut child, watcher) = waiting_process_and_a_handle_that_cannot_end_it();
+            let ending = std::thread::spawn(move || end_process(&watcher));
+            let thread = {
+                // SAFETY: the handle is the thread's own, open for as long as it is not joined.
+                unsafe { GetThreadId(ending.as_raw_handle().cast()) }
+            };
+            // SAFETY: both arguments are the documented "synchronous, no callback".
+            let session = unsafe { OpenThreadWaitChainSession(0, None) };
+            assert!(!session.is_null(), "a session to read the thread's wait");
+            // Until the call has returned or is waiting for the process: the process must not
+            // end before the call has refused and found no sign, or there is nothing to wait for.
+            while !ending.is_finished() && !waits_for_a_process(session, thread) {
+                std::thread::yield_now();
+            }
+            // SAFETY: the session is open and closed once.
+            unsafe { CloseThreadWaitChainSession(session) };
+            child.kill().expect("the process is ended by its owner");
+            let outcome = ending.join().expect("the call returns");
+            child.wait().expect("the process is collected");
+            outcome.expect("a refused end of a process that then ends is not a failure");
+        }
+    }
 }
 
 #[cfg(test)]
