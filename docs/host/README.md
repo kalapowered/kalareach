@@ -3051,7 +3051,7 @@ process that the group held and the manager's delivered kill found is listed as 
 cleanup stopped waiting for is not counted, a kill the manager reported as failed is not counted,
 a group the host could not read to the end beforehand attributes nothing, and a process that ended
 by itself between that reading and the kill is counted: the flag is the host's best reading, and a
-process the manager ended that the worker never recorded is not listed.
+process the manager ended that the worker never recorded is listed with the others.
 
 **What it cannot reach, and what a survivor means.** On macOS, a process that left the terminal's
 session, a process the worker started outside it and a process that began after the worker's last
@@ -3069,6 +3069,15 @@ coverage, so that nobody reads it as gone. The next session's control group is n
 reservation, and the number of its endpoint only grows, so no later session shares an identity with
 a survivor. Coverage is complete only where the cleanup confirmed a boundary: a control group the
 worker ran in and the kernel read empty, or a job that needed no help.
+
+**Where the cleanup cannot see.** Where `/proc` is mounted to hide other accounts' processes, a
+recorded process that became one of another account's is described as one the host cannot describe,
+and never as ended. A Linux worker that cannot read its process tree records the processes on the
+session's terminal instead, and the closure says that this leaves out a process that left the
+terminal's session. A host that gives no hold on a process by more than its number sends it no
+hangup or kill, from the worker's own close as from the cleanup; the closure names it. When a
+service's control group is read, a process in it that the worker never recorded and that the
+manager's kill ends is listed with the others, as forced.
 
 **A control daemon that a session's command started.** This happens on Linux when `kr new` or
 `kr update` runs from the shell of a session. In that case the daemon starts in the service of the
