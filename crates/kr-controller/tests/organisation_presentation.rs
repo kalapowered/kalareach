@@ -473,10 +473,15 @@ async fn a_narrower_renewal_narrows_what_is_served_and_the_presenter_reconnects(
     fixture.until_the_fence_is_retired().await;
     // The fence the narrowing owed withdrew the presenter's registration: the connection it was
     // made on stays up and is served nothing more, though the lease still allows reads.
-    assert!(
-        denied(&net_support::refusal(read_host_info(&raw).await)),
-        "the connection the narrowing was presented on is withdrawn"
-    );
+    // The host answers a withdrawn connection with a refusal or ends its stream, whichever its
+    // barrier reaches first.
+    match raw.try_read(Method::HostInfo, &()).await {
+        None => {}
+        Some(answer) => assert!(
+            denied(&net_support::refusal(answer)),
+            "the connection the narrowing was presented on is withdrawn"
+        ),
+    }
 
     let again = ada.connect(&fixture).await;
     read_host_info(&again)
