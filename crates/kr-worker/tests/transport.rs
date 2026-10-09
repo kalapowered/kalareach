@@ -4260,6 +4260,342 @@ async fn kr_req_11_32_a_frame_above_the_bound_tells_the_terminal_what_it_was_wai
     );
 }
 
+// -- the WebSocket leg ----------------------------------------------------------------------
+
+/// A WebSocket client of the kind a native terminal is, over a real local socket.
+type TerminalClient = tokio_websockets::WebSocketStream<SocketStream>;
+
+/// One owner whose terminal speaks WebSocket over a real socket, with the upstream's own end and
+/// the terminal's client.
+struct Upgraded {
+    owner: Arc<Duplex>,
+    /// The upstream's end of its connection.
+    upstream: SocketStream,
+    /// The native terminal.
+    terminal: TerminalClient,
+    drained: tokio::task::JoinHandle<()>,
+    /// The two reader tasks, upstream then terminal.
+    serving: [tokio::task::JoinHandle<()>; 2],
+}
+
+/// Upgrades a terminal's connection as the gateway does, and starts an owner over it.
+async fn upgraded(broker: &Arc<Broker>, framing: Framing) -> Upgraded {
+    let (terminal_end, gateway_end) = socket_pair();
+    let accepting =
+        tokio::spawn(
+            async move { kr_worker::broker::websocket::accept(gateway_end, framing).await },
+        );
+    let (terminal, _response) = tokio_websockets::ClientBuilder::new()
+        .uri("ws://localhost/rpc")
+        .expect("a URI")
+        .connect_on(terminal_end)
+        .await
+        .expect("the terminal upgrades");
+    let lines = accepting
+        .await
+        .expect("the accept task is joined")
+        .expect("the gateway accepts the upgrade");
+    let (upstream_here, upstream_there) = socket_pair();
+    let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
+    let (terminal_reads, terminal_writes) = tokio::io::split(lines);
+    let (owner, writes) = Duplex::new(
+        Arc::clone(broker),
+        GatewayConnectionId::new(1),
+        framing,
+        upstream_writes,
+        terminal_writes,
+        site(),
+        "agent-user",
+    );
+    let drained = tokio::spawn(writes);
+    let serving = [
+        {
+            let owner = Arc::clone(&owner);
+            tokio::spawn(async move { owner.serve(upstream_reads, true).await })
+        },
+        {
+            let owner = Arc::clone(&owner);
+            tokio::spawn(async move { owner.serve(terminal_reads, false).await })
+        },
+    ];
+    Upgraded {
+        owner,
+        upstream: upstream_there,
+        terminal,
+        drained,
+        serving,
+    }
+}
+
+/// The next text message a terminal is sent.
+async fn next_text(terminal: &mut TerminalClient) -> String {
+    use futures_util::StreamExt as _;
+    let message = tokio::time::timeout(LIVENESS_DEADLINE, terminal.next())
+        .await
+        .expect("a message arrives")
+        .expect("the connection is open")
+        .expect("the message is readable");
+    message
+        .as_text()
+        .expect("the gateway sends text messages")
+        .to_owned()
+}
+
+/// KR-REQ-11.32 and KR-REQ-12.11: a terminal that upgrades its connection to a WebSocket is
+/// carried by the gateway as its lines are: each of its text messages is one frame to the upstream
+/// under an identifier of this host's, and each frame the upstream sends it is one text message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_terminal_over_a_websocket_is_carried_both_ways() {
+    use futures_util::SinkExt as _;
+    let broker = broker();
+    let mut up = upgraded(&broker, Framing::new(NativeFraming::JsonLines)).await;
+    let mut upstream = tokio::io::BufReader::new(&mut up.upstream);
+
+    // The terminal asks; the upstream reads one line, under an identifier of this host's.
+    up.terminal
+        .send(tokio_websockets::Message::text(
+            r#"{"id":1,"method":"session/update","params":{"seq":7}}"#,
+        ))
+        .await
+        .expect("the terminal sends");
+    let line = next_line(&mut upstream).await;
+    let asked: serde_json::Value = serde_json::from_str(line.trim_end()).expect("one frame");
+    assert_eq!(asked["params"]["seq"], 7);
+    let minted = asked["id"].clone();
+    assert!(
+        minted.as_str().is_some_and(|id| id.starts_with("kr-")),
+        "the request goes out under an identifier of this host's: {line}"
+    );
+
+    // The upstream answers, and the terminal is sent one message, under its own identifier.
+    let reply = serde_json::json!({ "id": minted, "result": { "ok": true } });
+    tokio::io::AsyncWriteExt::write_all(upstream.get_mut(), format!("{reply}\n").as_bytes())
+        .await
+        .expect("the upstream answers");
+    let told: serde_json::Value =
+        serde_json::from_str(&next_text(&mut up.terminal).await).expect("one message");
+    assert_eq!(
+        told,
+        serde_json::json!({ "id": 1, "result": { "ok": true } })
+    );
+
+    // The upstream asks the terminal's side something of its own: one line, one message.
+    let notice = r#"{"method":"session/update","params":{"seq":8}}"#;
+    tokio::io::AsyncWriteExt::write_all(upstream.get_mut(), format!("{notice}\n").as_bytes())
+        .await
+        .expect("the upstream notifies");
+    assert_eq!(next_text(&mut up.terminal).await, notice);
+    up.owner.shutdown();
+    up.drained.abort();
+}
+
+/// A raw upgrade request, with `extra` header lines after the ones a terminal sends.
+fn upgrade_request(extra: &str) -> String {
+    format!(
+        "GET /rpc HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n"
+    )
+}
+
+/// Sends `request` to the gateway's accept and returns what it answered and why it refused.
+async fn upgrade_attempt(
+    request: &str,
+) -> (String, Result<(), kr_worker::broker::error::BrokerError>) {
+    let (mut terminal_end, gateway_end) = socket_pair();
+    let accepting = tokio::spawn(async move {
+        kr_worker::broker::websocket::accept(gateway_end, Framing::new(NativeFraming::JsonLines))
+            .await
+            .map(drop)
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut terminal_end, request.as_bytes())
+        .await
+        .expect("the request is written");
+    let mut head = vec![0_u8; 4096];
+    let read = tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        tokio::io::AsyncReadExt::read(&mut terminal_end, &mut head),
+    )
+    .await
+    .expect("the gateway answers")
+    .expect("the answer is readable");
+    let answer = String::from_utf8_lossy(&head[..read]).into_owned();
+    drop(terminal_end);
+    (answer, accepting.await.expect("the accept task is joined"))
+}
+
+/// KR-REQ-11.32: an upgrade request that carries anything a browser adds is refused with a status
+/// before anything is upgraded, whichever line carries it and however the name is spelled, and the
+/// key every WebSocket client sends is not one of those.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_32_an_upgrade_a_browser_could_send_is_refused() {
+    for extra in [
+        "Origin: https://example.test\r\n",
+        "x-first: 1\r\nX-Second: 2\r\nORIGIN: https://example.test\r\n",
+        "Sec-Fetch-Site: cross-site\r\n",
+        "Sec-Fetch-Mode: websocket\r\n",
+        "Referer: https://example.test/\r\n",
+    ] {
+        let (answer, outcome) = upgrade_attempt(&upgrade_request(extra)).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 403"),
+            "{extra:?} is answered with a refusal: {answer}"
+        );
+        assert_eq!(
+            outcome.expect_err("and is not upgraded").code(),
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "{extra:?}"
+        );
+    }
+    // The control: the request a terminal sends, with its key and nothing a browser adds.
+    let (answer, outcome) = upgrade_attempt(&upgrade_request("")).await;
+    assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
+    outcome.expect("and is upgraded");
+}
+
+/// KR-REQ-11.32: an upgrade request that is not a plain GET over HTTP/1.1, or that is larger than
+/// a request is, is refused with a status; and no subprotocol is selected for one that offers some.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_32_an_upgrade_that_is_not_a_plain_get_is_refused_and_selects_no_subprotocol() {
+    let post = upgrade_request("").replacen("GET", "POST", 1);
+    let old = upgrade_request("").replacen("HTTP/1.1", "HTTP/1.0", 1);
+    let large = upgrade_request(&format!(
+        "X-Padding: {}\r\n",
+        "p".repeat(kr_worker::broker::websocket::MAX_REQUEST_HEAD_BYTES)
+    ));
+    for (what, request) in [("a POST", post), ("HTTP/1.0", old), ("a large head", large)] {
+        let (answer, outcome) = upgrade_attempt(&request).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{what}: {answer}");
+        outcome.expect_err("and is not upgraded");
+    }
+    let (answer, outcome) = upgrade_attempt(&upgrade_request(
+        "Sec-WebSocket-Protocol: chat, superchat\r\n",
+    ))
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
+    assert!(
+        !answer
+            .to_ascii_lowercase()
+            .contains("sec-websocket-protocol"),
+        "the response selects no subprotocol: {answer}"
+    );
+    outcome.expect("the upgrade still completes");
+}
+
+/// KR-REQ-11.32: a terminal that sends its upgrade request in pieces and never finishes it is
+/// refused when the deadline passes.
+#[tokio::test(start_paused = true)]
+async fn kr_req_11_32_an_upgrade_request_that_never_ends_is_refused_at_the_deadline() {
+    let (mut terminal_end, gateway_end) = tokio::io::duplex(1 << 16);
+    let accepting = tokio::spawn(async move {
+        kr_worker::broker::websocket::accept(gateway_end, Framing::new(NativeFraming::JsonLines))
+            .await
+            .map(drop)
+    });
+    tokio::io::AsyncWriteExt::write_all(
+        &mut terminal_end,
+        b"GET /rpc HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n",
+    )
+    .await
+    .expect("the first part is written");
+    // The clock is the test's: it runs on only when everything is waiting, so a request that is
+    // refused at its deadline is refused before a second more has passed, and one that is not
+    // refused at all is still waiting when this one's timer goes.
+    let deadline = kr_worker::broker::websocket::UPGRADE_DEADLINE;
+    tokio::time::advance(deadline).await;
+    tokio::time::timeout(deadline + std::time::Duration::from_secs(1), accepting)
+        .await
+        .expect("a request that does not end is refused at the deadline")
+        .expect("the accept task is joined")
+        .expect_err("a request that does not end in time is refused");
+}
+
+/// KR-REQ-11.32: only a text message that is one line crosses a WebSocket, and one above the
+/// connection's frame bound does not: a binary message, a text message with a line break in it and
+/// a message above the bound each end what the gateway reads from the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_only_a_text_message_of_one_line_within_the_bound_crosses_a_websocket() {
+    use futures_util::SinkExt as _;
+    let bound = 4096;
+    let framing = Framing::within(NativeFraming::JsonLines, bound);
+    for (what, message) in [
+        (
+            "a binary message",
+            tokio_websockets::Message::binary(vec![1_u8, 2, 3]),
+        ),
+        (
+            "a text message with a line break",
+            tokio_websockets::Message::text(concat!(
+                r#"{"id":1,"method":"session/update","params":{}}"#,
+                "\n",
+                r#"{"id":2,"method":"session/update","params":{}}"#
+            )),
+        ),
+        (
+            "a message above the bound",
+            tokio_websockets::Message::text(request_of(3, "session/update", bound + 1)),
+        ),
+    ] {
+        let broker = broker();
+        let mut up = upgraded(&broker, framing).await;
+        up.terminal.send(message).await.expect("the terminal sends");
+        let [_, terminal_reader] = &mut up.serving;
+        tokio::time::timeout(LIVENESS_DEADLINE, terminal_reader)
+            .await
+            .unwrap_or_else(|_| panic!("{what} ends the gateway's reading of the terminal"))
+            .expect("the reader is joined");
+        up.owner.shutdown();
+        up.drained.abort();
+    }
+    // The control: a message of exactly the bound is carried.
+    let broker = broker();
+    let mut up = upgraded(&broker, framing).await;
+    let mut upstream = tokio::io::BufReader::new(&mut up.upstream);
+    up.terminal
+        .send(tokio_websockets::Message::text(request_of(
+            4,
+            "session/update",
+            bound,
+        )))
+        .await
+        .expect("the terminal sends");
+    let line = next_line(&mut upstream).await;
+    assert!(
+        line.len() > bound,
+        "the whole message arrived: {} bytes",
+        line.len()
+    );
+    up.owner.shutdown();
+    up.drained.abort();
+}
+
+/// KR-REQ-11.32 and section 9: a frame the terminal does not read ends the connection when the
+/// write deadline passes, with no later traffic to find out.
+///
+/// The frame is the last thing the gateway has for the terminal, and it is larger than anything
+/// the sockets between them hold. A flush that returned when the frame was handed to a buffer would
+/// call it delivered; a flush that returns when the library has sent it keeps the deadline's
+/// meaning, so the frame is reported as not sent and the connection ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_last_frame_the_terminal_does_not_read_ends_the_connection() {
+    let broker = broker();
+    let up = upgraded(&broker, Framing::new(NativeFraming::JsonLines)).await;
+    let big = request_of(5, "session/update", 900_000);
+    up.owner
+        .from_upstream(big.as_bytes(), TimestampMs::new(2))
+        .await
+        .expect("the frame is queued for the terminal");
+    // The terminal reads nothing. The deadline for the write is the owner's.
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    while !up.owner.stopping() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        up.owner.stopping(),
+        "a frame the terminal never read ended the connection"
+    );
+    up.drained.abort();
+}
+
 /// KR-REQ-12.13 and section 9: the client's own requests are bounded, given up on a deadline, and
 /// cleared when the connection ends.
 ///
