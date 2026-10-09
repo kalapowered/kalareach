@@ -516,14 +516,22 @@ jobs:
           & "$env:ProgramFiles\Git\usr\bin\sh.exe" -c 'echo the POSIX shell the test scripts use is here'
           whoami /priv
 
+      # A cargo cache that hits brings libsodium's build output with it, and then the build script,
+      # which checks the archives against libsodium's public key, does not run again. The archives
+      # are saved only by a run on the default branch that did not restore them, so that run takes
+      # the output out and the compile below checks the archives it is about to save.
+      - name: Make the compile check the archives it saves
+        if: ${{ matrix.part == 'first' && github.ref == 'refs/heads/main' && steps.libsodium.outputs.cache-hit != 'true' }}
+        run: cargo clean --locked --package libsodium-sys-stable
+
       # Everything the workspace compiles for this target, including the test targets: a test that
       # only builds on Unix is a Windows failure, and this is where it is caught.
       - name: Compile the workspace and its tests
         if: ${{ matrix.part == 'first' }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # The build above checked both archives against libsodium's public key, so what a later run
-      # restores is what was signed. Only a green run on the default branch saves it, as with the
+      # The build script has just checked both archives, so what a later run restores is what was
+      # signed, whatever the tests below find. Only the default branch saves them, as with the
       # cargo caches.
       - name: Save libsodium's archives
         if: ${{ success() && matrix.part == 'first' && github.ref == 'refs/heads/main' && steps.libsodium.outputs.cache-hit != 'true' }}
