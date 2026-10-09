@@ -2526,11 +2526,11 @@ async fn a_delegation_answered_before_is_answered_again_under_the_authority_that
         "{:?}",
         again.outcome
     );
-    let read_again = fixture
-        .submitter
-        .proposals()
-        .pop()
-        .expect("the read made again");
+    // A repeat of a read is a new read, under the authority that stands now: a second proposal
+    // reached the host, and it is the kept action that it names.
+    let proposals = fixture.submitter.proposals();
+    assert_eq!(proposals.len(), 2, "the read was made again");
+    let read_again = proposals.last().expect("the read made again");
     assert_eq!(read_again.action, VoiceAction::Status);
     assert_eq!(read_again.session_id, Some(session(SESSION_A)));
     fixture.script.says(

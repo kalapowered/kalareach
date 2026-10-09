@@ -2121,10 +2121,13 @@ pub fn narrower_history(
 /// 15 ¶8 forbids in the case that matters most. So: an explicit refusal in the words is refused
 /// outright, and something that agrees has to be there.
 ///
-/// What this is not. The words reach this host from the paired device, which is what transcribed
-/// them, so they are content and never authority: the grant is what permits the effect, this
-/// confirmation is the extra thing section 15 ¶13 asks for on top of it, and a host that is given
-/// an accumulated transcript of its own can check more than this one can.
+/// What this is not. The words reach this host from the paired device, which hands over what the
+/// provider's transcript wrote, so they are content and never authority: the grant is what permits
+/// the effect, and this confirmation is the extra thing section 15 ¶13 asks for on top of it.
+///
+/// An apostrophe is no part of a word, however it is written, so a contraction of "not" is one
+/// word ("don't", "don’t" and "dont" are the same) and the refusing words hold every one of
+/// them.
 fn is_clear_affirmative(spoken: &str) -> bool {
     /// Words that agree.
     const AGREEING: &[&str] = &[
@@ -2147,12 +2150,31 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "proceed",
         "please",
     ];
-    /// Words that refuse, whatever else is in the sentence.
+    /// Words that refuse, whatever else is in the sentence, with the contractions of "not" written
+    /// without the apostrophe.
     const REFUSING: &[&str] = &[
         "no",
         "not",
-        "don't",
         "dont",
+        "doesnt",
+        "didnt",
+        "wont",
+        "wouldnt",
+        "cant",
+        "cannot",
+        "couldnt",
+        "shouldnt",
+        "mustnt",
+        "mightnt",
+        "neednt",
+        "isnt",
+        "arent",
+        "wasnt",
+        "werent",
+        "hasnt",
+        "havent",
+        "hadnt",
+        "aint",
         "never",
         "cancel",
         "stop",
@@ -2162,10 +2184,14 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "nevermind",
     ];
 
-    // A transcript writes the apostrophe straight or curly; "don\u{2019}t" is "don't".
-    let spoken = spoken.replace('\u{2019}', "'");
+    // A transcript writes the apostrophe straight, curly or modified; none of them is part of a
+    // word.
+    let spoken: String = spoken
+        .chars()
+        .filter(|character| !matches!(character, '\'' | '\u{2018}' | '\u{2019}' | '\u{02bc}' | '`'))
+        .collect();
     let mut words = spoken
-        .split(|character: char| !(character.is_alphanumeric() || character == '\''))
+        .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
         .peekable();
@@ -2263,6 +2289,20 @@ mod tests {
         assert!(!is_clear_affirmative("do not send that"));
         assert!(!is_clear_affirmative("don't send it"));
         assert!(!is_clear_affirmative("no, cancel"));
+        // A contraction of "not" refuses whichever apostrophe the transcript writes, or none.
+        for refusal in [
+            "I won't send it to the build session",
+            "I wouldn't send it",
+            "you can't send it, yes",
+            "didn\u{2019}t say send",
+            "it isn`t ok to send",
+            "doesn\u{02bc}t sound right, go",
+            "dont send it",
+            "wont send it",
+            "send it, shouldn't we?",
+        ] {
+            assert!(!is_clear_affirmative(refusal), "{refusal:?}");
+        }
     }
 
     #[test]
