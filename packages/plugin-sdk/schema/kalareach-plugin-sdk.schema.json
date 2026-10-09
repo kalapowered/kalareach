@@ -1858,7 +1858,7 @@
         },
         {
           "const": "bridge_recipe_invalid",
-          "description": "A native bridge recipe is incomplete or refers to something absent.",
+          "description": "A native bridge recipe is incomplete, refers to something absent, or has a statement that\nholds the words the host writes before its own reading of a command integration.",
           "type": "string"
         },
         {
