@@ -140,6 +140,7 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
     assert_eq!(integration["max_command_bytes"], 64);
     assert_eq!(integration["max_flags"], 16);
     assert_eq!(integration["max_flag_bytes"], 4096);
+    assert_eq!(integration["max_statement_chars"], 4000);
     assert_eq!(integration["max_backend_arguments"], 8);
     assert_eq!(integration["max_backend_argument_bytes"], 256);
     assert_eq!(integration["max_launching_words"], 8);

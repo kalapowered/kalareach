@@ -515,16 +515,14 @@ async fn kr_req_11_42_the_doctor_carries_the_check_of_the_native_bridges() {
     assert_eq!(check.status, DoctorStatus::NotApplicable, "{check:?}");
 }
 
-/// Sixteen flags of the most bytes a flag may have: the most a package may declare.
+/// One flag of the most bytes a package's integration may take: an owner is shown what the
+/// integration does whole, and that is at most [`MAX_STATEMENT_CHARS`] characters, the flag and
+/// the rest of the statement together.
 fn largest_flags() -> Vec<String> {
-    (0..kr_plugin_sdk::integration::MAX_FLAGS)
-        .map(|index| {
-            format!(
-                "--{index}{}",
-                "x".repeat(kr_plugin_sdk::integration::MAX_FLAG_BYTES - 4)
-            )
-        })
-        .collect()
+    vec![format!(
+        "--{}",
+        "x".repeat(kr_plugin_sdk::integration::MAX_STATEMENT_CHARS - 400)
+    )]
 }
 
 /// KR-REQ-12.07: a session whose integrations its launch specification cannot carry beside the
@@ -532,19 +530,28 @@ fn largest_flags() -> Vec<String> {
 /// catalogue check names the session and every integration it was launched without.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_07_a_launch_without_room_for_an_integration_is_named_for_the_doctor() {
+    // The create request below takes the whole control frame but about two kilobytes, which the
+    // largest integration a package may declare (about four) does not fit in.
+    const FILLERS: usize = 255;
+    const LAST_FILLER: usize = 19_000;
     let flags = largest_flags();
     let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
     let daemon = daemon_declaring(Some(&["kalareach/gemini-cli"]), &flags).await;
-    // A create request that one frame carries, with less room beside it than the integration takes.
     let mut request = create(daemon.environment_id, LaunchProfile::default());
     // A session whose creator sends its environment is one its creator is shown.
     request.presentation = Presentation::Attach;
-    request.environment_snapshot = (0..245)
+    request.environment_snapshot = (0..FILLERS)
         .map(|index| kr_protocol::session::EnvironmentVariable {
             name: format!("FILLER_{index}"),
             value: "x".repeat(4_000),
         })
         .collect();
+    request
+        .environment_snapshot
+        .push(kr_protocol::session::EnvironmentVariable {
+            name: "FILLER_LAST".to_owned(),
+            value: "x".repeat(LAST_FILLER),
+        });
     let specification = launched_from(&daemon, request).await;
     assert!(
         specification

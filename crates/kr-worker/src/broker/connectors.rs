@@ -705,12 +705,13 @@ impl ConnectorSources {
 
 /// Builds connector packages the way the catalogue's store extracts one, for this host's tests.
 ///
-/// The packages are Claude Code's shape: its Channels table with the decision destination that
-/// answers a relayed tool approval, and a manifest that names every file by digest and declares the
-/// package's command integration. Claude Code's own also carries the three bridge files core pins;
-/// [`Shape`] gives the other shapes the tests need. A package is written under `root` as
-/// `packages/<hash>/`, and what comes back is the source an installation would hand over for it.
-/// It is compiled away in every shipped build.
+/// A [`Shape`] says what a package is. Claude Code's has its Channels table with the decision
+/// destination that answers a relayed tool approval, and the three bridge files core pins; the
+/// Gemini CLI, Qoder CLI and Codex shapes have the integration they release and, for Codex, the
+/// table of its application server. Every manifest names each file by digest and declares the
+/// package's command integration. A package is written under `root` as `packages/<hash>/`, and what
+/// comes back is the source an installation would hand over for it. It is compiled away in every
+/// shipped build.
 #[cfg(feature = "testing")]
 pub mod fixture {
     use std::collections::BTreeSet;

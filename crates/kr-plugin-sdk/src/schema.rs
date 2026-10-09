@@ -233,6 +233,7 @@ pub fn package_contract() -> Value {
             "max_command_bytes": crate::integration::MAX_COMMAND_BYTES,
             "max_flags": crate::integration::MAX_FLAGS,
             "max_flag_bytes": crate::integration::MAX_FLAG_BYTES,
+            "max_statement_chars": crate::integration::MAX_STATEMENT_CHARS,
             "max_backend_arguments": crate::integration::MAX_BACKEND_ARGUMENTS,
             "max_backend_argument_bytes": crate::integration::MAX_BACKEND_ARGUMENT_BYTES,
             "max_launching_words": crate::integration::MAX_LAUNCHING_WORDS,

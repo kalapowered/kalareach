@@ -116,6 +116,7 @@
     "max_flags": 16,
     "max_launching_word_bytes": 32,
     "max_launching_words": 8,
+    "max_statement_chars": 4000,
     "permitted_variables": [
       {
         "application": "Gemini CLI",

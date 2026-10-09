@@ -1214,11 +1214,11 @@ async fn kr_req_12_07_an_integration_that_declares_a_backend_establishes_nothing
             .expect_err("no backend is established")
     };
     let why = refused(&["codex", "-c", "model=x"]);
-    assert!(why.contains("\"-c\" is an option"), "{why}");
+    assert!(why.contains("\"-c\" is typed"), "{why}");
     assert!(why.ends_with("so this invocation runs as typed"), "{why}");
     let why = refused(&["codex", "exec", "task"]);
     assert!(
-        why.contains("\"exec\" is not a launch the gateway serves"),
+        why.contains("\"exec\" is not a word the integration applies to"),
         "{why}"
     );
     for typed in [
