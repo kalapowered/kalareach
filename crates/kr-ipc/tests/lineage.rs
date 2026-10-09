@@ -64,6 +64,11 @@ fn a_process_that_has_gone_has_no_reading() {
 /// that finds nothing must not read that number as its own failure.
 fn fail_a_call() {
     assert!(std::fs::File::open("/nowhere/at/all").is_err());
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::NotFound,
+        "the failed call left its error number on this thread"
+    );
 }
 
 #[test]
@@ -95,4 +100,22 @@ fn a_terminal_that_nothing_holds_is_an_empty_list_whatever_failed_before_it() {
         holders.is_empty(),
         "no process holds that terminal: {holders:?}"
     );
+}
+
+#[test]
+fn a_group_lists_the_process_that_leads_it() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exec sleep 600"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starts a child");
+    let group = child.id();
+    fail_a_call();
+    let members = processes_in_group(group).expect("a group with a member lists it");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(members, vec![group], "the child is the group's only member");
 }

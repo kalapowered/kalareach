@@ -1355,27 +1355,15 @@ mod platform {
 mod platform {
     use libproc::bsd_info::BSDInfo;
     use libproc::proc_pid::pidinfo;
-    use libproc::processes::{ProcFilter, pids_by_type};
     use sysctl::Sysctl as _;
 
-    /// Lists the processes a filter names.
-    ///
-    /// The kernel answers a listing that finds nothing and a listing that failed with the same
-    /// length, zero, and the library tells them apart by the calling thread's error number alone.
-    /// A number that an earlier failed call on this thread left behind would make an empty group
-    /// or terminal read as that call's failure, so the number is cleared first.
-    fn list(filter: ProcFilter) -> std::io::Result<Vec<u32>> {
-        super::macos_errno::clear();
-        pids_by_type(filter)
-    }
-
     pub(super) fn processes_in_group(group: u32) -> super::Result<Vec<u32>> {
-        list(ProcFilter::ByProgramGroup { pgrpid: group })
+        super::macos_listing::in_group(group)
             .map_err(|error| super::unavailable("process group", format!("group {group}: {error}")))
     }
 
     pub(super) fn processes_on_terminal(terminal: u32) -> super::Result<Vec<u32>> {
-        list(ProcFilter::ByTTY { tty: terminal }).map_err(|error| {
+        super::macos_listing::on_terminal(terminal).map_err(|error| {
             super::unavailable(
                 "controlling terminal",
                 format!("terminal {terminal}: {error}"),
@@ -1594,22 +1582,71 @@ mod platform {
     }
 }
 
-/// The one place on macOS that writes the calling thread's error number.
+/// The one place on macOS that asks the kernel which processes are in a group or on a terminal.
 ///
-/// The crate denies unsafe code and relaxes the rule here: the number lives in the C library's
-/// per-thread storage, and std offers no way to write it.
+/// The crate denies unsafe code and relaxes the rule here: `proc_listpids` has no safe interface.
+/// The system's call answers a listing that finds nothing and a listing that failed with the same
+/// length, zero, and tells them apart by the calling thread's error number alone, which it sets
+/// only when it fails. So the number is cleared immediately before the call and read immediately
+/// after it, with nothing between that could write it: whatever an earlier failed call on the
+/// thread left behind would otherwise make a group or a terminal nobody holds read as that call's
+/// failure.
 #[cfg(target_os = "macos")]
-mod macos_errno {
+mod macos_listing {
     #![expect(
         unsafe_code,
-        reason = "the calling thread's error number can only be written through the C library"
+        reason = "the kernel's list of a group's or a terminal's processes has no safe interface, \
+                  and its failure is told from an empty list by the thread's error number"
     )]
 
-    /// Sets the calling thread's error number to zero.
-    pub(super) fn clear() {
-        // SAFETY: `__error` returns the address of the calling thread's own error number, which
-        // is valid for the life of the thread and is read and written by that thread alone.
-        unsafe { *libc::__error() = 0 };
+    /// `PROC_PGRP_ONLY` of `<sys/proc_info.h>`: the processes of one group.
+    const PROC_PGRP_ONLY: u32 = 2;
+
+    /// `PROC_TTY_ONLY` of `<sys/proc_info.h>`: the processes on one terminal.
+    const PROC_TTY_ONLY: u32 = 3;
+
+    /// How many identifiers the first buffer holds. A listing that fills its buffer may have had
+    /// more to say, so it is made again with a buffer twice as long.
+    const FIRST_ENTRIES: usize = 1 << 10;
+
+    /// The most identifiers a buffer is grown to, which no system's processes reach.
+    const MOST_ENTRIES: usize = 1 << 22;
+
+    /// Returns the processes in the group `group`.
+    pub(super) fn in_group(group: u32) -> std::io::Result<Vec<u32>> {
+        list(PROC_PGRP_ONLY, group)
+    }
+
+    /// Returns the processes on the terminal `terminal`.
+    pub(super) fn on_terminal(terminal: u32) -> std::io::Result<Vec<u32>> {
+        list(PROC_TTY_ONLY, terminal)
+    }
+
+    fn list(kind: u32, info: u32) -> std::io::Result<Vec<u32>> {
+        let mut entries = FIRST_ENTRIES;
+        while entries <= MOST_ENTRIES {
+            let mut pids = vec![0_u32; entries];
+            let size = libc::c_int::try_from(entries * size_of::<u32>())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+            // SAFETY: `__error` returns the address of the calling thread's own error number,
+            // which is valid for the life of the thread and is read and written by that thread
+            // alone.
+            unsafe { *libc::__error() = 0 };
+            // SAFETY: `pids` is a live, writable allocation of exactly `size` bytes, which the
+            // kernel writes at most that much into and keeps no pointer to.
+            let filled = unsafe { libc::proc_listpids(kind, info, pids.as_mut_ptr().cast(), size) };
+            let error = std::io::Error::last_os_error();
+            if filled < 0 || (filled == 0 && error.raw_os_error().unwrap_or(0) != 0) {
+                return Err(error);
+            }
+            let count = usize::try_from(filled).unwrap_or_default() / size_of::<u32>();
+            if count < entries {
+                pids.truncate(count);
+                return Ok(pids);
+            }
+            entries *= 2;
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
     }
 }
 
