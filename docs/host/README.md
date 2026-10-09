@@ -3117,8 +3117,11 @@ identity this host never learned and refuses another creation until the upload's
 out, and a pass after that creates it again.
 
 A publication is signed at the instant its generation was admitted, so one the service refused,
-or one refused on this host before it left, goes again as the same bytes. The exception is a
-refusal from a service that already holds a generation of the archive at or above it. The backup
+or one refused on this host before it left, goes again as the same bytes. An exception is a
+refusal that says the service cannot settle the outcome (`OUTCOME_UNKNOWN`): that publication may
+have taken effect, so it is treated as one that may have left without an answer, and the next look
+at the service fetches the generation first. The other exception is a refusal from a service that
+already holds a generation of the archive at or above it. The backup
 manifest takes no generation at or below the newest it has held, so the attempt stops, and the
 report names that generation as the one that carries its content. One that may have left without
 an answer is never sent again. The uploader fetches the generation instead and records it
@@ -3188,6 +3191,9 @@ and never saw answered (`Uploader::settle`). It gives the service five seconds, 
 store and starts carrying the outbox. A service that does not answer in time does not hold the
 start: reconciliation records the generation as unknown, as it does for a publication nothing could
 ask about. That question carries no account token, so it is asked whatever token the host holds.
+If the service answers it with a delay to wait out, the question is not asked again inside the
+budget: the delay binds every question, so reconciliation records the generation as unknown and the
+next generation carries the backup.
 
 Requests that spend an account's storage carry the account token the operator imported with `kr
 account token import`, beside the writer's signature. The client reads the file for each request,
@@ -3242,7 +3248,10 @@ token is usable and when it stops being accepted, whether backup storage is on f
 what allowance the service reports, what the last pass did, and what the service turned back,
 whether a status read or a pass met it. The check reads well only when the token is usable, backup
 storage is on, and neither the last status read nor the last pass that carried work was turned back.
-When the service
+When the last status read and the last pass were each turned back for something only a person can
+mend, the remedy shown is the one for the question asked last. When the host's own token is what a
+pass was turned back for, the check names the token and not a refusal, under a privacy fence as
+well, and the fence keeps the wait it asked for. When the service
 refused the writer, the detail gives the start of the writer key's identifier for the owner to
 enrol. With no origin configured the check is not applicable. The status read happens once, for five
 seconds at most, and not at all while the service has asked to be left alone or the host has no
