@@ -5061,6 +5061,25 @@ fn reading_transfers_from_2() -> Vec<ReleaseStore> {
         .collect()
 }
 
+/// The stores a release assembled here declares it reads, with the configuration document's versions
+/// given.
+fn reading_the_configuration_at(migrates_from: u32, version: u32) -> Vec<ReleaseStore> {
+    release_stores()
+        .into_iter()
+        .map(|store| {
+            if store.store == "configuration" {
+                ReleaseStore {
+                    migrates_from,
+                    version,
+                    ..store
+                }
+            } else {
+                store
+            }
+        })
+        .collect()
+}
+
 /// The stores a release assembled here declares it reads, with the registry's versions given.
 fn reading_the_registry_at(migrates_from: u32, version: u32) -> Vec<ReleaseStore> {
     release_stores()
@@ -5370,6 +5389,90 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
         recorded(&registry),
         i64::from(registry_version()),
         "the registry was left as it was"
+    );
+}
+
+/// KR-REQ-26.10: a rollback is refused, naming the document, when the configuration document is at a
+/// version the older release does not read: the document this build writes is at version 2, and a release
+/// that reads version 1 only cannot take it. Nothing is switched, and the document is left as it was; a
+/// document at the older release's own version is no obstacle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
+        .reading(reading_the_configuration_at(1, 1));
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The owner's choice, written by this build as it writes one.
+    let environment = host.tree.environment();
+    kr_cli::doctor::configuration::apply(
+        &environment,
+        &kr_protocol::hostinfo::configuration::Change::SleepInhibition(
+            kr_protocol::desktop::SleepInhibitionSetting::MainsOnly,
+        ),
+    )
+    .expect("the owner's choice");
+    let document = kr_cli::doctor::configuration::document_path(&environment);
+    let written = std::fs::read(&document).expect("the document");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&document.display().to_string())
+            && message.contains("records version 2")
+            && message.contains("reads versions 1 to 1"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon the rollback stopped serves again, from the release still current"
+    );
+    assert_eq!(
+        std::fs::read(&document).expect("the document"),
+        written,
+        "the document was left as it was"
+    );
+
+    // The control: a document at the version the older release reads goes back.
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 1}"#).expect("a document");
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
     );
 }
 

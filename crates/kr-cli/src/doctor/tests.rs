@@ -841,6 +841,58 @@ fn an_entry_the_format_cannot_carry_is_refused() {
     );
 }
 
+/// KR-REQ-26.10: a document the release before wrote, at version 1, is read as it was, and the next
+/// edit writes it at the version this build writes with every choice it held.
+#[test]
+fn a_document_the_release_before_wrote_is_read_and_the_next_edit_writes_it_forward() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let earlier = br#"{
+  "version": 1,
+  "revision": 4,
+  "preferences": { "sleep_inhibition": "mains_only" },
+  "profiles": { "review": { "sleep_inhibition": "off" } },
+  "default_profile": "review"
+}"#;
+    kr_ipc::paths::write_owner_only_file(&configuration::document_path(&environment), earlier)
+        .expect("writes the document the release before wrote");
+
+    let loaded = configuration::load(&environment);
+    assert_eq!(loaded.status.state, DocumentState::Loaded);
+    assert_eq!(loaded.revision(), 4);
+    assert_eq!(
+        loaded
+            .preferences()
+            .and_then(|set| set.sleep_inhibition.0)
+            .expect("the choice it held"),
+        kr_protocol::desktop::SleepInhibitionSetting::MainsOnly
+    );
+
+    let revision = configuration::apply(
+        &environment,
+        &kr_protocol::hostinfo::configuration::Change::SleepInhibition(
+            kr_protocol::desktop::SleepInhibitionSetting::Off,
+        ),
+    )
+    .expect("the owner's next choice");
+    assert_eq!(revision, 5);
+    let written: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(configuration::document_path(&environment)).expect("the document"),
+    )
+    .expect("JSON");
+    assert_eq!(
+        written["version"], 2,
+        "written at the version this build writes"
+    );
+    assert_eq!(written["revision"], 5);
+    assert_eq!(written["preferences"]["sleep_inhibition"], "off");
+    assert_eq!(
+        written["profiles"]["review"]["sleep_inhibition"], "off",
+        "the profile it held is kept"
+    );
+    assert_eq!(written["default_profile"], "review");
+}
+
 /// KR-REQ-26.16: the command's edit is the same validated one the host applies.
 #[test]
 fn the_commands_edit_validates_before_it_writes_and_refuses_a_document_it_must_not_rewrite() {

@@ -4257,6 +4257,45 @@ mod tests {
         assert_eq!(kept, 1234);
     }
 
+    /// The release before this one recorded the document an environment accepted at version 1 of the
+    /// configuration document. A registry of that release comes forward with the record as it was,
+    /// and the record is still the document it was: read at the version this build writes, not
+    /// refused as one it does not know.
+    #[test]
+    fn a_registry_of_the_release_before_is_brought_forward_with_the_document_it_accepted() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let earlier =
+            r#"{"version":1,"revision":4,"preferences":{"sleep_inhibition":"mains_only"}}"#;
+        let mut registry = Registry::open(&path, environment()).expect("a registry");
+        registry
+            .record_accepted_configuration(&AcceptedConfiguration {
+                revision: 4,
+                document: Some(earlier.to_owned()),
+            })
+            .expect("records the document");
+        drop(registry);
+        Connection::open(&path)
+            .expect("opens")
+            .execute("UPDATE schema_version SET version = 8", [])
+            .expect("sets the file back to the release before");
+
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(carried, Some(Carried { from: 8, to: 9 }));
+        let read = Registry::open_to_read(&path, environment()).expect("reads at this version");
+        let accepted = read.accepted_configuration().expect("reads the record");
+        assert_eq!(accepted.revision, 4);
+        assert_eq!(
+            accepted.document.as_deref(),
+            Some(earlier),
+            "the record is as it was"
+        );
+        let document = crate::config::from_record(accepted.document.as_deref())
+            .expect("the record is a document this build reads");
+        assert_eq!(document.version, 2, "read at the version this build writes");
+        assert_eq!(document.revision, 4);
+    }
+
     /// A registry that is at this build's schema is not migrated, and one with no log to take in is
     /// not opened for writing, so it is not changed, and a registry that cannot be brought forward
     /// by this build is left as it is, for the reader to refuse in its own words.
