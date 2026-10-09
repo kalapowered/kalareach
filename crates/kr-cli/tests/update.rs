@@ -8644,8 +8644,8 @@ async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_
         assert_eq!(output.status.code(), Some(1), "{store}: {said}");
         assert!(
             message.contains(store)
-                && message.contains(&writes.to_string())
-                && message.contains(&(writes + 1).to_string()),
+                && message.contains(&format!("version {writes}"))
+                && message.contains(&format!("version {}", writes + 1)),
             "{store}: it names the record and both versions: {said}"
         );
 
@@ -9079,10 +9079,26 @@ fn broken_by_command_written_records(
 /// written. Until the gaps in `OPEN_GAPS` are closed or accepted, a record that is exposed by one
 /// stays at the version its floor gives, which is what every release that lists its stores reads.
 ///
-/// The next raise of the configuration document, past 2, needs the gaps that expose it ruled on, the
-/// registry's version raised with its forward step (the registry keeps the document it accepted), the
-/// lock written, and `OLDEST_VERSION` kept at 1 while a release that writes version 1 is a source of
-/// an update. Remove an entry of `OPEN_GAPS` when its gap is closed, with the reason in the change.
+/// The next raise of the configuration document, past 2, needs:
+/// - each gap that exposes it (the third and fourth above, and the first two, which expose every
+///   record) closed, or ruled to be accepted, and its line removed with the reason in the change;
+/// - the document's `VERSION` at 3, `OLDEST_VERSION` kept at 1 while a release that writes version 1
+///   is a source of an update, the version-1 reading kept, and the floor entry for the document
+///   replaced by the table of what releases without the lock write, not deleted;
+/// - the registry's version raised with its forward step, since the registry keeps the document it
+///   accepted, and `stored-formats.lock` written, the document at 3 in the release's `stores` list
+///   (with equality a list at 2 refuses the release's own commands);
+/// - the schema the protocol generates and the guides' examples, and the test of a document the
+///   build does not recognise, which names version 3 as that document's unknown version;
+/// - a test that a rollback is refused naming a version 3 document, as
+///   `a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read` does for 2,
+///   and the sentence in `docs/host/updates.md` that gives the floor;
+/// - a base that holds the writers' lock. The owners of the gaps: the updater's survey of recorded
+///   environments (the second, fourth), its reading of a configuration document where a later daemon
+///   would read it (the third), and the rule that ties a state root to the store that serves it (the
+///   first).
+///
+/// Remove an entry of `OPEN_GAPS` when its gap is closed.
 #[test]
 fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_while_a_gap_is_open() {
     let stores: Vec<_> = stored_formats::table::table()
@@ -9120,6 +9136,20 @@ fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_whi
             barred.contains(name),
             "{name} is a record a command writes and holds the writers' lock"
         );
+    }
+    // And the other way: the gaps expose the records of this list, so a record a command writes that
+    // is not in it would pass with the gaps open. A record added to the table as one a command
+    // writes is added to the list, with the gaps that expose it.
+    for (writers, name, ..) in &borrowed {
+        if matches!(
+            writers,
+            stored_formats::Writers::Barred(_) | stored_formats::Writers::Commands
+        ) {
+            assert!(
+                COMMAND_WRITTEN.contains(name),
+                "{name} is a record a command writes: add it to COMMAND_WRITTEN, and to the gaps that expose it"
+            );
+        }
     }
 }
 
@@ -9174,9 +9204,11 @@ fn the_gate_on_command_written_records_refuses_what_it_is_for() {
     let requiring = [(Writers::Barred(&ANSWERS_1), "kept-answers", 1, 1)];
     assert_eq!(broken_by_command_written_records(&requiring, &[]).len(), 1);
 
-    // A writer given leave for another version than the one the lock records.
+    // A writer given leave for another version than the one the lock records, and for another name.
     let strayed = [(Writers::Barred(&CONFIGURATION_3), "configuration", 2, 1)];
     assert_eq!(broken_by_command_written_records(&strayed, &[]).len(), 1);
+    let misnamed = [(Writers::Barred(&ANSWERS_1), "configuration", 1, 1)];
+    assert_eq!(broken_by_command_written_records(&misnamed, &[]).len(), 1);
 }
 
 /// KR-REQ-26.10: a rollback to a release whose manifest lists no store is refused, naming that, and

@@ -597,6 +597,9 @@ pub const fn change_name(change: Change) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::planted::{only_asked, only_asked_lines, planted_text};
+    use crate::shown::marker::MARKER;
+    use kr_shell_integration::host::startup::Placement;
 
     /// Holds `record` as a program outside a store does, which holds nothing else.
     fn hold_the_record(
@@ -611,9 +614,6 @@ mod tests {
         let permit = PERMIT.get_or_init(|| writers.permit(&ENTRY_WRITTEN).expect("permitted"));
         record.hold(permit)
     }
-    use crate::output::planted::{only_asked, only_asked_lines, planted_text};
-    use crate::shown::marker::MARKER;
-    use kr_shell_integration::host::startup::Placement;
 
     /// KR-REQ-23.25: text planted in every field a shell's report holds shows only where the person
     /// asked for it, which is every one of them: the package's executable, flags, version, editor
