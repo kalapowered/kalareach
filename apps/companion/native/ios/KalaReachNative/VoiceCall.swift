@@ -8,9 +8,11 @@
 //  without passing through the interface or through KalaReach.
 //
 //  Section 15 ¶6 is the other constraint: the provider's data channel is read-only. This
-//  connection creates no data channel of its own and sends **zero** bytes on the one the provider
-//  opens. What arrives is handed to the caller as bytes with a type, and an event the caller does
-//  not recognise is dropped rather than reflected into anything.
+//  connection creates the one channel the provider's protocol names, `oai-events`, before it makes
+//  the offer, because the offer has to describe it and the provider writes to it, and it sends
+//  **zero** bytes on that channel or on any other. What arrives is handed to the caller as bytes
+//  with a type, and an event the caller does not recognise is dropped rather than reflected into
+//  anything.
 //
 
 import Foundation
@@ -41,6 +43,15 @@ public protocol VoiceCallObserver: AnyObject {
 /// speech once the recorder reports itself running. Timers and the platform's reports run on this
 /// call's own queue, never the main one.
 public final class VoiceCall: NSObject {
+    /// The label the provider's protocol gives the channel its events arrive on.
+    static let eventsLabel = "oai-events"
+
+    /// The longest the offer waits for candidate gathering to report itself done, in seconds.
+    ///
+    /// Gathering is continual, and nothing promises it ever reports done, so the wait is bounded: a
+    /// device that has gathered nothing by then offers what it has.
+    static let gatheringBound: TimeInterval = 3
+
     /// Shared across calls, because building one is expensive and it holds the audio device.
     private static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
@@ -56,6 +67,13 @@ public final class VoiceCall: NSObject {
     private var announcedFirstAudio = false
     /// The call's own queue: its timer, and every report from the audio session and WebRTC.
     private let queue: DispatchQueue
+    /// The provider's events channel, which this end creates before the offer and only reads.
+    private var events: RTCDataChannel?
+    /// The first round of candidate gathering, which the offer waits for.
+    private let gathering = GatheringWait()
+    /// What the provider's answer was read to say, once it was applied; guarded by ``negotiation``.
+    private let negotiation = NSLock()
+    private var answer: (applied: Bool, usesDtx: Bool) = (false, false)
     /// Every decision about the microphone, the speaker and the end of this call.
     private var control: VoiceCallControl!
     /// Asks, while the audio device is on, how much audio the call's source has taken in, and hands
@@ -68,6 +86,21 @@ public final class VoiceCall: NSObject {
 
     /// Whether the remote voice is silenced on this device.
     public var isPlaybackMuted: Bool { control.isPlaybackMuted }
+
+    /// Whether the provider's answer to the offer has been applied to the connection.
+    public var answerIsApplied: Bool {
+        negotiation.lock()
+        defer { negotiation.unlock() }
+        return answer.applied
+    }
+
+    /// Whether the provider's answer turns Opus discontinuous transmission on (`usedtx=1`), which
+    /// stops the stream during silence. `nil` until the answer is applied.
+    public var answerUsesDtx: Bool? {
+        negotiation.lock()
+        defer { negotiation.unlock() }
+        return answer.applied ? answer.usesDtx : nil
+    }
 
     /// Builds a call for its offer and its answer, with the audio unit and the microphone off.
     ///
@@ -135,6 +168,17 @@ public final class VoiceCall: NSObject {
         recorderReader = VoiceRecorderReader(control: control)
         connection.delegate = self
         connection.add(microphone, streamIds: ["kr-voice"])
+        // Before any offer exists: an offer made first would not describe the channel, and the
+        // provider writes its events to this one.
+        guard let channel = connection.dataChannel(
+            forLabel: VoiceCall.eventsLabel,
+            configuration: RTCDataChannelConfiguration()
+        ) else {
+            stop()
+            throw VoiceAudioError.eventChannelNotOpened
+        }
+        channel.delegate = self
+        events = channel
     }
 
     /// Tells the reader the device came on or went off, and asks for readings while it is on. The
@@ -190,6 +234,9 @@ public final class VoiceCall: NSObject {
     /// Makes this call's SDP offer.
     ///
     /// Section 15 ¶3: the client creates the offer. The host forwards it and never generates one.
+    /// The offer is returned after the first round of candidate gathering, or after
+    /// ``gatheringBound``, so that it names the addresses this device can be reached at: the
+    /// provider is answered once, and a candidate found later is not sent.
     public func offer() async throws -> String {
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
@@ -201,7 +248,8 @@ public final class VoiceCall: NSObject {
         do {
             let description = try await connection.offer(for: constraints)
             try await connection.setLocalDescription(description)
-            return description.sdp
+            await gathering.wait(upTo: VoiceCall.gatheringBound)
+            return connection.localDescription?.sdp ?? description.sdp
         } catch {
             // A call that cannot make its offer has nothing to wait for, and gives the audio back.
             stop()
@@ -210,11 +258,14 @@ public final class VoiceCall: NSObject {
     }
 
     /// Applies the provider's SDP answer. It starts nothing: the audio unit stays off until the
-    /// call is permitted.
+    /// call is permitted, and a permit before this has applied the answer is refused.
     public func accept(answerSdp: String) async throws {
-        let answer = RTCSessionDescription(type: .answer, sdp: answerSdp)
+        let description = RTCSessionDescription(type: .answer, sdp: answerSdp)
         do {
-            try await connection.setRemoteDescription(answer)
+            try await connection.setRemoteDescription(description)
+            negotiation.lock()
+            answer = (true, VoiceAnswer.usesDtx(answerSdp))
+            negotiation.unlock()
         } catch {
             // The same: a call whose answer does not apply ends, and gives the audio back.
             stop()
@@ -253,7 +304,7 @@ public final class VoiceCall: NSObject {
 
         func epochMs() -> UInt64 { UInt64(Date().timeIntervalSince1970 * 1_000) }
 
-        func answerApplied() -> Bool { true }
+        func answerApplied() -> Bool { call.answerIsApplied }
 
         func activate() throws { try AudioSession.shared.activate(for: call) }
 
@@ -334,7 +385,7 @@ extension VoiceCall: RTCPeerConnectionDelegate {
     }
 
     public func peerConnection(_: RTCPeerConnection, didOpen channel: RTCDataChannel) {
-        // The provider opened its channel. This end reads it and never writes to it.
+        // A channel the provider opened. This end reads it and never writes to it.
         channel.delegate = self
     }
 
@@ -343,7 +394,9 @@ extension VoiceCall: RTCPeerConnectionDelegate {
     public func peerConnection(_: RTCPeerConnection, didAdd _: RTCMediaStream) {}
     public func peerConnection(_: RTCPeerConnection, didRemove _: RTCMediaStream) {}
     public func peerConnection(_: RTCPeerConnection, didChange _: RTCIceConnectionState) {}
-    public func peerConnection(_: RTCPeerConnection, didChange _: RTCIceGatheringState) {}
+    public func peerConnection(_: RTCPeerConnection, didChange state: RTCIceGatheringState) {
+        if state == .complete { gathering.finish() }
+    }
     public func peerConnection(_: RTCPeerConnection, didGenerate _: RTCIceCandidate) {}
     public func peerConnection(_: RTCPeerConnection, didRemove _: [RTCIceCandidate]) {}
 }
@@ -355,5 +408,41 @@ extension VoiceCall: RTCDataChannelDelegate {
         // Handed up as bytes. What is a known event and what is not is decided by the frozen
         // provider profile, one level above this file, and an unknown one is dropped there.
         observer?.voiceCall(self, receivedProviderEvent: buffer.data)
+    }
+}
+
+/// Waits for the first round of candidate gathering to finish, or for a bound.
+private final class GatheringWait {
+    private let lock = NSLock()
+    private var done = false
+    private var waiting: CheckedContinuation<Void, Never>?
+
+    /// Gathering reported itself done, or the bound passed. Any number of times; the waiter is
+    /// resumed once.
+    func finish() {
+        lock.lock()
+        done = true
+        let waiter = waiting
+        waiting = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    /// Returns when gathering is done, which may be before this is called, and at the latest after
+    /// `seconds`.
+    func wait(upTo seconds: TimeInterval) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if done {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiting = continuation
+            lock.unlock()
+            DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [weak self] in
+                self?.finish()
+            }
+        }
     }
 }

@@ -264,4 +264,6 @@ public enum VoiceAudioError: Error, Equatable {
     case callAlreadyRunning
     /// The provider's answer could not be applied to this connection.
     case answerNotApplicable(String)
+    /// This device could not open the channel the provider writes its events to.
+    case eventChannelNotOpened
 }
