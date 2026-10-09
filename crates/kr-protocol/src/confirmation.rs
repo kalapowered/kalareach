@@ -213,10 +213,12 @@ pub enum ConfirmationDisplay {
         ceiling: Vec<String>,
         /// The capabilities the installation is granted.
         grant: Vec<String>,
-        /// What the release's own manifest says a native bridge it installs does, where it
-        /// installs one. These are the publisher's words, taken by the host from the verified
-        /// manifest of the exact package hash and covered by the confirmation; a device shows
-        /// them apart from [`NATIVE_BRIDGE_NOTICE`], which is the host's.
+        /// What the release's own manifest says of what the grant would let it do: for a native
+        /// bridge, the publisher's words; for a command integration, the host's own exact reading
+        /// of the declaration, after [`INTEGRATION_STATEMENT_LABEL`]. The host takes both from the
+        /// verified manifest of the exact package hash (see [`install_statement`]) and the
+        /// confirmation covers them; a device shows them apart from the host's notices
+        /// ([`NATIVE_BRIDGE_NOTICE`], [`COMMAND_INTEGRATION_NOTICE`]).
         grant_statement: Nullable<String>,
     },
     /// An action its caller described.
@@ -229,6 +231,53 @@ pub enum ConfirmationDisplay {
 pub const NATIVE_BRIDGE_NOTICE: &str = "This package installs a native bridge: code in the \
      application's own directory that runs with the application's permissions, outside the plugin \
      sandbox. The publisher's own statement of what it does follows.";
+
+/// What the host says, in its own words, of a command integration an installation would grant: the
+/// command a person runs in a KalaReach session starts with arguments and environment variables
+/// the package declares. The host's own exact reading of the declaration is in the statement.
+pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command you run in a \
+     KalaReach session starts, with the arguments and environment variables it declares. The \
+     host's own exact reading of what it declares follows in the statement.";
+
+/// What the host writes before its own exact reading of a command integration in an installation's
+/// statement, so that words of the publisher's that come before it are not taken for it.
+pub const INTEGRATION_STATEMENT_LABEL: &str =
+    "The host's exact reading of the command integration:";
+
+/// The host's notices for an installation with this grant, in the order they are shown: one for
+/// each capability in it that the host describes in its own words.
+#[must_use]
+pub fn install_notices(grant: &[String]) -> Vec<&'static str> {
+    let mut notices = Vec::new();
+    if grant.iter().any(|name| name == "native_bridge.install") {
+        notices.push(NATIVE_BRIDGE_NOTICE);
+    }
+    if grant
+        .iter()
+        .any(|name| name == "command_integration.launch")
+    {
+        notices.push(COMMAND_INTEGRATION_NOTICE);
+    }
+    notices
+}
+
+/// The statement an installation's confirmation carries, from the words the release's manifest
+/// gives for a native bridge it installs and the host's reading of a command integration it
+/// declares, each present only where the grant holds the capability that applies it.
+///
+/// A bridge's words are the publisher's and come first; the integration's follow after
+/// [`INTEGRATION_STATEMENT_LABEL`], which is the host's, so a reader can tell where the publisher's
+/// words end.
+#[must_use]
+pub fn install_statement(bridge: Option<&str>, integration: Option<&str>) -> Option<String> {
+    let integration = integration.map(|text| format!("{INTEGRATION_STATEMENT_LABEL} {text}"));
+    match (bridge, integration) {
+        (None, None) => None,
+        (Some(bridge), None) => Some(bridge.to_owned()),
+        (None, Some(integration)) => Some(integration),
+        (Some(bridge), Some(integration)) => Some(format!("{bridge} {integration}")),
+    }
+}
 
 /// Adopting a repository's trust root, as the owner is asked to confirm it.
 ///
@@ -424,9 +473,9 @@ pub struct PluginInstallPlan {
     pub package_digest: String,
     /// The capabilities the installation is granted, as a whole set.
     pub grant: CanonicalSet<String>,
-    /// What the release's manifest says a native bridge it installs does, which the owner reads
-    /// before confirming. It is in the digest, so a confirmation shown one statement cannot
-    /// install a release whose manifest says another.
+    /// What the release's manifest says its grant would let it do (see [`install_statement`]),
+    /// which the owner reads before confirming. It is in the digest, so a confirmation shown one
+    /// statement cannot install a release whose manifest says another.
     pub grant_statement: Option<String>,
 }
 

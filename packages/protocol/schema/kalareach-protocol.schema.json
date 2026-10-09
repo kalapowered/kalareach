@@ -8250,7 +8250,7 @@
                       "type": "null"
                     }
                   ],
-                  "description": "What the release's own manifest says a native bridge it installs does, where it\ninstalls one. These are the publisher's words, taken by the host from the verified\nmanifest of the exact package hash and covered by the confirmation; a device shows\nthem apart from [`NATIVE_BRIDGE_NOTICE`], which is the host's."
+                  "description": "What the release's own manifest says of what the grant would let it do: for a native\nbridge, the publisher's words; for a command integration, the host's own exact reading\nof the declaration, after [`INTEGRATION_STATEMENT_LABEL`]. The host takes both from the\nverified manifest of the exact package hash (see [`install_statement`]) and the\nconfirmation covers them; a device shows them apart from the host's notices\n([`NATIVE_BRIDGE_NOTICE`], [`COMMAND_INTEGRATION_NOTICE`])."
                 },
                 "package_digest": {
                   "description": "The exact package hash.",

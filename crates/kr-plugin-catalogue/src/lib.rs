@@ -2233,9 +2233,11 @@ impl Catalogue {
         }
     }
 
-    /// Returns what the release's own manifest says a native bridge it installs does, where it
-    /// installs one: the publisher's statement, taken from the manifest the signed index pins by
-    /// hash for this exact release.
+    /// Returns what an owner is shown of what `grant` would let this release do: the publisher's
+    /// statement of a native bridge it installs, where the grant holds `native_bridge.install`, and
+    /// the host's exact reading of a command integration it declares, where the grant holds
+    /// `command_integration.launch`. Both are taken from the manifest the signed index pins by hash
+    /// for this exact release.
     ///
     /// The manifest is read from the cache when it is there and fetched by its hash, like the
     /// first thing an installation downloads, when it is not; either way it is held to the length
@@ -2247,14 +2249,16 @@ impl Catalogue {
     ///
     /// Returns [`CatalogueError::NotFound`] when the repository has no activated generation or its
     /// index does not carry the release, [`CatalogueError::Integrity`] when the hash is not the
-    /// one the index declares or the manifest is not the document it names, and the refusal a
-    /// fetch decided when the manifest has to be fetched and cannot be.
+    /// one the index declares, the manifest is not the document it names, or the statement of its
+    /// integration is longer than an owner is shown whole, and the refusal a fetch decided when
+    /// the manifest has to be fetched and cannot be.
     pub async fn grant_statement(
         &mut self,
         id: &RepositoryId,
         plugin_id: &PluginId,
         version: &PackageVersion,
         package_hash: PayloadDigest,
+        grant: &InstallationGrant,
     ) -> CatalogueResult<Option<String>> {
         let (store, _lock, enrolled) = self.locked(&self.enrolled(id)?)?;
         let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
@@ -2315,10 +2319,31 @@ impl Catalogue {
                 detail: format!("the manifest of {subject} is not a manifest: {source}"),
             })?;
         extract::reconcile(&entry, &manifest, &subject)?;
-        Ok(manifest
+        let bridge = manifest
             .native_bridge
             .0
-            .map(|bridge| bridge.grant_statement.as_str().to_owned()))
+            .as_ref()
+            .filter(|_| grant.holds(PluginCapability::NativeBridgeInstall))
+            .map(|bridge| bridge.grant_statement.as_str());
+        let integration = manifest
+            .command_integration
+            .as_ref()
+            .filter(|_| grant.holds(PluginCapability::CommandIntegrationLaunch))
+            .map(kr_plugin_sdk::integration::CommandIntegration::statement);
+        if integration.as_ref().is_some_and(|text| {
+            text.chars().count() > kr_plugin_sdk::integration::MAX_STATEMENT_CHARS
+        }) {
+            return Err(CatalogueError::Integrity {
+                detail: format!(
+                    "the command integration of {subject} is described in more characters than \
+                     an owner is shown whole"
+                ),
+            });
+        }
+        Ok(kr_protocol::confirmation::install_statement(
+            bridge,
+            integration.as_deref(),
+        ))
     }
 
     /// Installs one verified package into one environment, as the owner acting directly.
@@ -2699,17 +2724,10 @@ impl Catalogue {
                     });
                 }
             }
-            if let Some(added) = current.widening_for_a_bridge(&grant) {
+            if let Some(added) = current.widening_for_a_statement(&grant) {
                 return Err(CatalogueError::GrantRequired {
                     capability: added,
-                    requirement: format!(
-                        "plugin.install of the installed release: {plugin_id} asks for \
-                         {}, so a grant that adds to what it holds is made when the owner \
-                         confirms the release, which shows the publisher's own statement of what \
-                         the bridge does and the host's notice that it runs outside the plugin \
-                         sandbox",
-                        PluginCapability::NativeBridgeInstall.as_str()
-                    ),
+                    requirement: current.install_requirement(added),
                 });
             }
             if let Some(added) = current.grant.increase_over(&grant).first().copied()
