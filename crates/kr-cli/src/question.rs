@@ -131,7 +131,7 @@ pub async fn show(
 /// has already been resolved, has expired, or has moved to a revision this command did not read,
 /// [`CliError::Unfinished`] when the worker took the answer and its reply cannot be read, and
 /// [`CliError::UpdateDeferred`] when it could neither be sent nor kept because an update of this
-/// host held the writers' lock for the whole wait.
+/// host held one of its locks for the whole wait.
 pub async fn answer(
     paths: &HostPaths,
     question_id: QuestionId,
@@ -174,10 +174,6 @@ pub async fn answer(
             // answer kept for it earlier is reported as the store has it.
             (_, AnswerError::Retired(reason)) => {
                 ended_first(question_id, reason, &kept_copy(&drafts, question_id))
-            }
-            // An answer kept earlier for the question could not be read or removed.
-            (_, error @ (AnswerError::Store { .. } | AnswerError::Unreadable { .. })) => {
-                lost(&workers, question_id, &shown!("{}", error))
             }
             (Delivery::Unknown, error) => unkept(&workers, question_id, error),
             (Delivery::NotSent | Delivery::NotTaken, error) => answer_failure(error),
@@ -323,7 +319,7 @@ fn keep_answer(
 }
 
 /// The failure reported for an answer that was not sent and was not kept because `refused`, with
-/// the exit status of the refusal: an update that held the writers' lock for the whole wait is exit 9
+/// the exit status of the refusal: an update that held one of its locks for the whole wait is exit 9
 /// here as it is for every command.
 fn lost_when_not_kept(workers: &Workers, question_id: QuestionId, refused: CliError) -> CliError {
     let lost = lost(workers, question_id, &refused.said());
