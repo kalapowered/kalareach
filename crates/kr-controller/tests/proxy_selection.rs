@@ -265,24 +265,10 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
         // route would reach: it fetches nothing, and says why.
         let (repository, repository_authority, repository_listener) = unreached();
         let catalogue_transport = controller.catalogue().transport().clone();
-        let fetched = tokio::time::timeout(
-            WATCHDOG,
-            tough::Transport::fetch(
-                &*catalogue_transport,
-                format!("{repository}/1.root.json")
-                    .parse()
-                    .expect("an address"),
-            ),
-        )
-        .await
-        .expect("the fetch ends");
-        let Err(refused) = fetched else {
-            panic!("{what}: the catalogue fetches a repository");
-        };
-        assert!(
-            refused.to_string().contains("config.json"),
-            "{what}: {refused}"
-        );
+        let refused = fetch_error(&catalogue_transport, &format!("{repository}/1.root.json"))
+            .await
+            .expect_err("the closed route fetches nothing");
+        assert!(refused.contains("config.json"), "{what}: {refused}");
         heard_nothing(&repository_listener);
 
         // The transport the daemon attached, and not one the test builds: asked for an address a
@@ -336,27 +322,44 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
             .expect("the message ends");
         assert_eq!(proxy.asked(), vec![format!("POST {address} HTTP/1.1")]);
         heard_nothing(&hook);
-        // And the catalogue's repositories, through the restarted daemon's own transport.
-        let _ = tokio::time::timeout(
-            WATCHDOG,
-            tough::Transport::fetch(
-                &**restarted.catalogue().transport(),
-                format!("{repository}/1.root.json")
-                    .parse()
-                    .expect("an address"),
-            ),
+        // And the catalogue's repositories, through the restarted daemon's own transport: the
+        // proxy is asked to open a tunnel to the repository, as often as the transport tries.
+        let _ = fetch_error(
+            restarted.catalogue().transport(),
+            &format!("{repository}/1.root.json"),
         )
-        .await
-        .expect("the fetch ends");
-        assert_eq!(
-            proxy.asked(),
-            vec![
-                format!("POST {address} HTTP/1.1"),
-                format!("CONNECT {repository_authority} HTTP/1.1")
-            ]
+        .await;
+        let asked = proxy.asked();
+        let tunnel = format!("CONNECT {repository_authority} HTTP/1.1");
+        assert_eq!(asked.first(), Some(&format!("POST {address} HTTP/1.1")));
+        assert!(
+            asked.len() >= 2 && asked[1..].iter().all(|line| *line == tunnel),
+            "{what}: the repository is asked for only through the proxy: {asked:?}"
         );
         heard_nothing(&repository_listener);
     }
+}
+
+/// Fetches `address` through `transport` and reads the whole answer: the stream the transport always
+/// returns carries every failure, so a fetch that fails is an error at the end of it.
+async fn fetch_error(
+    transport: &std::sync::Arc<kr_plugin_catalogue::transport::RepositoryTransport>,
+    address: &str,
+) -> Result<(), String> {
+    use futures_util::TryStreamExt as _;
+
+    let opened = tokio::time::timeout(
+        WATCHDOG,
+        tough::Transport::fetch(&**transport, address.parse().expect("an address")),
+    )
+    .await
+    .map_err(|_| "the fetch did not end".to_owned())?
+    .map_err(|error| error.to_string())?;
+    tokio::time::timeout(WATCHDOG, opened.try_collect::<Vec<tough::Bytes>>())
+        .await
+        .map_err(|_| "the answer did not end".to_owned())?
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// A document that others can read, where there are modes to read it by.
