@@ -150,7 +150,15 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
                 }
             }
         }
-        return connection.localDescription?.sdp ?? answer.sdp
+        return AnsweringPeer.asIceLite(connection.localDescription?.sdp ?? answer.sdp)
+    }
+
+    /// The answer as the provider's reads: it says it is an ICE-lite agent, which only answers the
+    /// checks it is sent. Given an offer with no candidate this peer has none to check either, so
+    /// the call's own checks to the candidates in the answer are all that can connect the two.
+    private static func asIceLite(_ sdp: String) -> String {
+        guard !sdp.contains("a=ice-lite"), let media = sdp.range(of: "m=") else { return sdp }
+        return sdp.replacingCharacters(in: media.lowerBound..<media.lowerBound, with: "a=ice-lite\r\n")
     }
 
     /// Sends `text` on the channel the offer named.
@@ -226,6 +234,19 @@ final class VoiceNegotiationTests: XCTestCase {
         defer { call.stop() }
 
         XCTAssertTrue(offer.contains("m=application"), "the offer holds a data channel section")
+        await fulfillment(of: [peer.channelOpen], timeout: Self.connectWithin)
+        XCTAssertEqual(peer.channelLabel, "oai-events")
+    }
+
+    /// KR-REQ-15.03: the offer is sent with no candidate in it, and still connects to an answerer
+    /// that is ICE-lite, as the provider is: that answerer learns where the call is from the call's
+    /// own checks to the candidates in the answer, so the candidates the call finds after the
+    /// offer is made are not needed and nothing waits for them.
+    func testAnOfferWithNoCandidateConnectsToAnIceLiteAnswerer() async throws {
+        let (call, peer, offer) = try await negotiated(observer: Told())
+        defer { call.stop() }
+
+        XCTAssertFalse(offer.contains("a=candidate:"), "the offer was made before any candidate was found")
         await fulfillment(of: [peer.channelOpen], timeout: Self.connectWithin)
         XCTAssertEqual(peer.channelLabel, "oai-events")
     }

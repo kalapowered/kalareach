@@ -123,7 +123,19 @@ class VoiceNegotiationTest {
             await({ made = it }) { connection.createAnswer(it, constraints) }
             await { connection.setLocalDescription(it, made!!) }
             assertTrue("the peer gathered its candidates", gathered.await(SECONDS, TimeUnit.SECONDS))
-            return connection.localDescription.description
+            return asIceLite(connection.localDescription.description)
+        }
+
+        /**
+         * The answer as the provider's reads: it says it is an ICE-lite agent, which only answers
+         * the checks it is sent. Given an offer with no candidate this peer has none to check
+         * either, so the call's own checks to the candidates in the answer are all that can
+         * connect the two.
+         */
+        private fun asIceLite(sdp: String): String {
+            val media = sdp.indexOf("m=")
+            return if (sdp.contains("a=ice-lite") || media < 0) sdp
+            else sdp.substring(0, media) + "a=ice-lite\r\n" + sdp.substring(media)
         }
 
         /** Sends `text` on the channel the offer named. */
@@ -192,6 +204,21 @@ class VoiceNegotiationTest {
         val (_, offer) = negotiated(Told())
 
         assertTrue("the offer holds a data channel section", offer.contains("m=application"))
+        assertTrue(peer!!.channelOpen.await(SECONDS, TimeUnit.SECONDS))
+        assertEquals("oai-events", peer!!.channelLabel)
+    }
+
+    /**
+     * KR-REQ-15.03: the offer is sent with no candidate in it, and still connects to an answerer
+     * that is ICE-lite, as the provider is: that answerer learns where the call is from the call's
+     * own checks to the candidates in the answer, so the candidates the call finds after the offer
+     * is made are not needed and nothing waits for them.
+     */
+    @Test
+    fun an_offer_with_no_candidate_connects_to_an_ice_lite_answerer() {
+        val (_, offer) = negotiated(Told())
+
+        assertFalse("the offer was made before any candidate was found", offer.contains("a=candidate:"))
         assertTrue(peer!!.channelOpen.await(SECONDS, TimeUnit.SECONDS))
         assertEquals("oai-events", peer!!.channelLabel)
     }
