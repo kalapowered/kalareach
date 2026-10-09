@@ -732,3 +732,63 @@ async fn an_answer_the_worker_never_replies_to_is_kept_within_the_time_an_exchan
         .expect("the kept answers");
     assert_eq!(kept["answers"].as_array().map(Vec::len), Some(1));
 }
+
+/// KR-REQ-11.63: the worker took a kept answer and the copy kept on this device cannot be removed
+/// afterwards. The answer was taken, and the page is told so and that a copy is left, which is never
+/// sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_be_removed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let kept_in = page.kept.path().join("kept-answers");
+
+    // An answer is given and the worker goes away before it replies, so the answer is kept.
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("main")),
+    );
+    link.expect(Method::QuestionAnswer).await;
+    drop(link);
+    let told = answered(asked).await.expect("kept");
+    let drafted_at = told["draft"]["drafted_at_ms"].clone();
+
+    // Its directory can be listed and read but nothing in it can be removed.
+    let directory = std::fs::read_dir(&kept_in)
+        .expect("the kept answers")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("the worker's environment");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).expect("locked");
+
+    let sending = page.call(
+        "question_send_kept",
+        json!({ "params": { "questionId": question_id().to_string(), "draftedAtMs": drafted_at } }),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    link.answer(&call, &resolution(&worker, QuestionState::Answered))
+        .await;
+    let result = answered(sending).await;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).expect("unlocked");
+    let told = result.expect("the worker took it");
+    assert_eq!(told["outcome"], "taken");
+    assert_eq!(told["leftover"], true);
+}
