@@ -717,12 +717,12 @@ report the same code for the same defect.
 | `payload_role_invalid` | A structural payload role is at the wrong path or declared twice |
 | `implementation_mismatch` | An action's implementation cannot produce its effect class |
 | `implementation_unsatisfied` | An implementation names something the package does not carry |
-| `bridge_recipe_invalid` | A native bridge recipe is incomplete or names something absent |
+| `bridge_recipe_invalid` | A native bridge recipe is incomplete, names something absent, or has a statement that holds the words the host writes before its own reading of a command integration |
 | `duplicate_element_id` | Two nodes or two controls share an identifier |
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 | `integration_without_capability` | A command integration without `command_integration.launch` |
-| `integration_invalid` | A command integration (1) names another command, (2) adds a flag it may not, (3) sets a variable the contract does not permit, (4) has a statement of what it does that is longer than an owner is shown whole, or (5) declares a backend that breaks the contract (e.g. by omitting or repeating `{gateway}`, by including arguments or launching words that fall outside the bounds, or by providing no table to read) |
+| `integration_invalid` | A command integration (1) references another command, (2) adds a flag not permitted by the contract, (3) sets a variable not permitted by the contract, (4) has a statement of what it does that is longer than an owner is shown whole, or (5) includes a backend declaration that does not adhere to the contract (e.g. by omitting or repeating `{gateway}`, by including arguments or launching words that fall outside the acceptable bounds, or by failing to provide a table to read from) |
 | `launch_probe_without_capability` | A launch probe without `launch.probe` |
 | `launch_probe_invalid` | A launch probe passes no argument or too many, carries an option that is not a name, or names a mode that is not a JSON Pointer |
 

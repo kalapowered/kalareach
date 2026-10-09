@@ -292,14 +292,23 @@ pub struct StatementParts<'a> {
 }
 
 /// Splits an installation's statement at the host's label, so that a device captions each part by
-/// who wrote it. A statement with no label is all the publisher's.
+/// who wrote it. A statement with no label is all the publisher's, and so is every statement of a
+/// grant that does not hold `command_integration.launch`: a host writes the label only for a grant
+/// that holds it, so a device never takes words in the publisher's bridge statement for the host's
+/// reading, even from a host that does not refuse the label in them.
 #[must_use]
-pub fn split_install_statement(statement: &str) -> StatementParts<'_> {
+pub fn split_install_statement<'a>(grant: &[String], statement: &'a str) -> StatementParts<'a> {
     fn part(text: &str) -> Option<&str> {
         let text = text.trim();
         (!text.is_empty()).then_some(text)
     }
-    match statement.split_once(INTEGRATION_STATEMENT_LABEL) {
+    let integration = grant
+        .iter()
+        .any(|name| name == "command_integration.launch");
+    let split = integration
+        .then(|| statement.split_once(INTEGRATION_STATEMENT_LABEL))
+        .flatten();
+    match split {
         Some((before, after)) => StatementParts {
             publisher: part(before),
             reading: part(after),
@@ -771,6 +780,44 @@ mod tests {
         assert!(
             NATIVE_BRIDGE_NOTICE.contains("outside"),
             "the host's own sentence says the bridge runs outside the plugin sandbox"
+        );
+    }
+
+    /// A device tells the publisher's bridge words from the host's reading at the host's label, and
+    /// only for a grant that holds the integration: the first label is the host's, a label inside
+    /// the reading (a flag may hold any text) stays in the reading, and the space the host writes
+    /// around the label is not part of either.
+    #[test]
+    fn a_statement_is_split_at_the_hosts_first_label_for_a_grant_that_holds_the_integration() {
+        let grant = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let both = grant(&["command_integration.launch", "native_bridge.install"]);
+        let reading = format!(r#"Runs "x" with "{INTEGRATION_STATEMENT_LABEL} fake"."#);
+        let composed =
+            install_statement(Some("Changes one setting."), Some(&reading)).expect("a statement");
+        let parts = split_install_statement(&both, &composed);
+        assert_eq!(parts.publisher, Some("Changes one setting."));
+        assert_eq!(parts.reading, Some(reading.as_str()));
+
+        let alone = install_statement(None, Some("Runs x.")).expect("a statement");
+        let parts = split_install_statement(&grant(&["command_integration.launch"]), &alone);
+        assert_eq!((parts.publisher, parts.reading), (None, Some("Runs x.")));
+
+        // No label, or a grant without the integration: all of it is the publisher's.
+        let plain = split_install_statement(&both, "Changes one setting.");
+        assert_eq!(
+            (plain.publisher, plain.reading),
+            (Some("Changes one setting."), None)
+        );
+        let forged = format!("Harmless. {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
+        let bridge = split_install_statement(&grant(&["native_bridge.install"]), &forged);
+        assert_eq!(
+            (bridge.publisher, bridge.reading),
+            (Some(forged.as_str()), None)
         );
     }
 

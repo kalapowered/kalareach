@@ -1355,8 +1355,9 @@
   }
 }
 
-/* The host's notice is its own sentence. The publisher's words come after it, quoted, with the
-   attribution above them: a rule beside the quote marks them as another party's. */
+/* The host's notice is its own sentence. The publisher's words and the host's reading of an
+   integration come after it, each quoted with its attribution above it: a rule beside the quote
+   marks it as text quoted, not the notice's own sentence. */
 .confirmation-notice {
   margin: var(--gap-2) 0 0;
 }

@@ -550,8 +550,9 @@ fn largest_flags() -> Vec<String> {
 /// catalogue check names the session and every integration it was launched without.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_07_a_launch_without_room_for_an_integration_is_named_for_the_doctor() {
-    // The create request below takes the whole control frame but about two kilobytes, which the
-    // largest integration a package may declare (about four) does not fit in.
+    // The create request below takes the whole control frame but about two kilobytes, which an
+    // integration with a flag of the length used here (about four kilobytes with its rest) does
+    // not fit in.
     const FILLERS: usize = 255;
     const LAST_FILLER: usize = 19_000;
     let flags = largest_flags();

@@ -411,10 +411,14 @@ read where it is installed. Otherwise it comes from the cached payload, or is fe
 and checked against the length and hash the signed index declares. The statement is part of the
 digest the confirmation covers, so a confirmation shown one statement cannot install a release whose
 manifest says another. It is shown on the owner device apart from the host's own notice that the
-bridge runs under the application's permissions, outside the plugin sandbox. The terminal signs
-nothing. When you run `kr plugin install` or `kr plugin repo add`, the command asks the host for the
-challenge that names the exact request, an owner device answers it, and the repeated request spends
-that one answer.
+bridge runs under the application's permissions, outside the plugin sandbox. For an installation
+that grants `command_integration.launch`, it also shows the host's own exact reading of the
+integration the manifest declares, written after a label that marks it as the host's. A bridge's
+statement cannot hold that label, so the owner device tells the publisher's words from the host's
+reading at it. The host's second notice, that the package changes how a command starts, is shown
+apart from both. The terminal signs nothing. When you run `kr plugin install` or `kr plugin repo
+add`, the command asks the host for the challenge that names the exact request, an owner device
+answers it, and the repeated request spends that one answer.
 
 Qualification data ships as signed, immutable catalogue artifacts, separately from host binaries. A
 vendor can say "this release was qualified against ExternalApp 1.4" without waiting for a core release,

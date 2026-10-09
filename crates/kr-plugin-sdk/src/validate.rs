@@ -135,7 +135,8 @@ pub enum FindingCode {
     ImplementationMismatch,
     /// An action's implementation refers to something the package does not carry.
     ImplementationUnsatisfied,
-    /// A native bridge recipe is incomplete or refers to something absent.
+    /// A native bridge recipe is incomplete, refers to something absent, or has a statement that
+    /// holds the words the host writes before its own reading of a command integration.
     BridgeRecipeInvalid,
     /// Two document nodes or two controls share an identifier.
     DuplicateElementId,

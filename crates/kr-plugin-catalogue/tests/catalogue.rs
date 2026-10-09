@@ -2493,13 +2493,14 @@ async fn statement_of(words: &str, integration: bool) -> CatalogueResult<Option<
 async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
     use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, split_install_statement};
     let words = "Changes one setting of the example agent.";
+    let grant = ["native_bridge.install", "command_integration.launch"].map(str::to_owned);
 
     // The words and the reading are told apart at the label, the publisher's first.
     let shown = statement_of(words, true)
         .await
         .expect("the manifest the index pins is read")
         .expect("a statement");
-    let parts = split_install_statement(&shown);
+    let parts = split_install_statement(&grant, &shown);
     assert_eq!(parts.publisher, Some(words));
     assert!(
         parts
@@ -2524,7 +2525,7 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         .expect("the manifest the index pins is read")
         .expect("a statement");
     assert!(
-        split_install_statement(&none)
+        split_install_statement(&grant, &none)
             .reading
             .is_some_and(|reading| reading.contains("declares no command integration")),
         "{none}"

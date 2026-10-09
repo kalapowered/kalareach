@@ -341,7 +341,11 @@ export interface ConfirmationRequest {
   readonly value: string | null
   /** Everything the confirmation covers beyond the sentence, one fact to a line. */
   readonly facts: readonly ConfirmationFact[]
-  /** What the host says in its own words about code it would place outside the plugin sandbox. */
+  /**
+   * What the host says in its own words about what the request would grant: a notice for each
+   * capability it describes, code placed outside the plugin sandbox and a command that starts
+   * differently.
+   */
   readonly notice: string | null
   /** What the publisher says in its own words about the release, quoted apart from the host's. */
   readonly statement: string | null

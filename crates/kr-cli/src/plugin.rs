@@ -504,7 +504,7 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
             if let Some(statement) = &grant_statement.0 {
                 // The statement holds the publisher's words about a bridge and the host's reading
                 // of an integration, told apart at the label the host writes before its reading.
-                let parts = split_install_statement(statement);
+                let parts = split_install_statement(grant, statement);
                 if let Some(words) = parts.publisher {
                     output::line(&stdout_line!(
                         "  the publisher says: {}",
