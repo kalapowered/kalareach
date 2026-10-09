@@ -55,8 +55,9 @@ tauri-plugin-clipboard-manager.workspace = true
 tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
 thiserror.workspace = true
-# The desktop sign-in's loopback listener reads one request and writes one page.
-tokio = { workspace = true, features = ["io-util", "net"] }
+# The desktop sign-in's loopback listener reads one request and writes one page, and recovery keeps
+# one bundle store open behind a lock its calls take in turn.
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 tracing.workspace = true
 ureq.workspace = true
 
@@ -89,6 +90,9 @@ kr-controller = { workspace = true, features = ["testing"] }
 # places under the in-process daemon.
 kr-describe = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
+# The sync service the recovery suite talks to over loopback, answering as the Worker did when it
+# was recorded.
+kr-service-stand-in = { path = "../../../tests/support/service-stand-in" }
 kr-transport.workspace = true
 tempfile.workspace = true
 # Paused time, so the phone session's waits run in a test without taking that long, and the
