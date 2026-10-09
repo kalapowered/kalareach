@@ -78,9 +78,9 @@ use crate::error::{ControllerError, Result};
 #[derive(Clone, Debug)]
 pub struct HostPairingClock {
     boot: kr_pairing::platform::BootIdentity,
-    /// How far this host's own tests have moved the monotonic reading on, in milliseconds. The
-    /// reading is the machine's own counter, which a test cannot move.
-    #[cfg(test)]
+    /// How far a test has moved the monotonic reading on, in milliseconds. The reading is the
+    /// machine's own counter, which a test cannot move.
+    #[cfg(any(test, feature = "testing"))]
     passed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -95,14 +95,14 @@ impl HostPairingClock {
         let digest = kr_cbor::sha256(boot_identity.value.as_slice());
         Self {
             boot: kr_pairing::platform::BootIdentity(digest),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             passed_ms: std::sync::Arc::default(),
         }
     }
 
     /// Moves the monotonic reading on by `by`, for a test of a deadline decided on it.
-    #[cfg(test)]
-    pub(crate) fn pass(&self, by: std::time::Duration) {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn pass(&self, by: std::time::Duration) {
         let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
         self.passed_ms
             .fetch_add(by, std::sync::atomic::Ordering::SeqCst);
@@ -113,7 +113,7 @@ impl PairingClock for HostPairingClock {
     fn monotonic_ms(&self) -> u64 {
         let reading =
             kr_ipc::clock::SharedClock::boot_elapsed_ms(&kr_ipc::clock::SystemSharedClock);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         let reading =
             reading.saturating_add(self.passed_ms.load(std::sync::atomic::Ordering::SeqCst));
         reading

@@ -306,8 +306,8 @@ impl Spendable {
 
 impl OwnerAuthority {
     /// Moves the monotonic clock the challenges' deadlines are decided on by `by`.
-    #[cfg(test)]
-    pub(crate) fn pass(&self, by: std::time::Duration) {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn pass(&self, by: std::time::Duration) {
         self.clock.pass(by);
     }
 
