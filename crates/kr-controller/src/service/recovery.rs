@@ -156,11 +156,15 @@ impl Controller {
         }
         // The workers a start meets are started beside the claimed ones, so a daemon that finds
         // both kinds waits for the longest cleanup and not for one kind and then the other.
-        crashed.extend(self.start_recovering_workers().await?);
-        for task in crashed {
+        let (published, outcome) = match self.start_recovering_workers().await {
+            Ok(started) => (started, Ok(())),
+            Err(error) => (Vec::new(), Err(error)),
+        };
+        // A start that failed on the workers still waits for the claimed cleanups it began.
+        for task in crashed.into_iter().chain(published) {
             let _ = task.await;
         }
-        Ok(())
+        outcome
     }
 
     /// Recovers a worker whose claim was consumed but whose session never reached the directory.
