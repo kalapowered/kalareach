@@ -34,18 +34,26 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_plugin_sdk::connector::{ConnectorManifest, RouteDirection};
+use kr_plugin_sdk::connector::{
+    BrokerTransport, ConnectorManifest, FieldPath, FieldSegment, ResponseCorrelation,
+    RouteDirection,
+};
 use kr_plugin_sdk::effect::{ActionImplementation, ParameterKind};
 use kr_plugin_sdk::launch_probe::LaunchProbe;
 use kr_plugin_sdk::plugin::PluginManifest;
 use kr_protocol::broker::{DecodingTrust, OfferedDecision};
-use kr_protocol::ids::{PluginId, PublisherId, UpstreamMethod};
-use kr_protocol::scalars::{CanonicalSet, Digest256, TimestampMs, U64};
+use kr_protocol::gateway::{
+    DeclarativeEntry, DeclarativeTable, MAX_TABLE_METHODS, NativeFraming, RichMethodTable,
+};
+use kr_protocol::ids::{MethodTableVersion, PluginId, PublisherId, UpstreamMethod};
+use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64};
 use kr_protocol::session::EnvironmentVariable;
 pub use kr_shell_integration::host::command::lookup_name;
 
 use crate::broker::PackageIdentity;
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
+use crate::broker::framing::Framing;
+use crate::broker::gateway::{MAX_NATIVE_FRAME_BYTES, native_class};
 
 /// The command an integration resolves, the flags it adds to an invocation of it and the variables
 /// it sets for that invocation, as the verified manifest declares them.
@@ -118,6 +126,24 @@ impl ConnectorRefusal {
             detail: detail.into(),
         }
     }
+}
+
+/// A connector's table in the form the gateway interprets, and how a connection over it frames.
+#[derive(Clone, Debug)]
+pub struct NativeTables {
+    /// The declarative table the core classifies frames by.
+    pub table: DeclarativeTable,
+    /// The closed table of rich methods, which lists none for a connector that declares no rich
+    /// method of its own.
+    pub rich: RichMethodTable,
+    /// The upstream protocol version both tables are pinned to: the version a signed
+    /// qualification record names for the executable.
+    pub protocol_version: String,
+    /// How a connection over these tables frames, with the bound the package declares held to
+    /// what the host carries.
+    pub framing: Framing,
+    /// True when the package declares a bound above what the host carries, and the host's holds.
+    pub frame_limit_clamped: bool,
 }
 
 /// A connector read from its installed package, and checked.
@@ -335,6 +361,161 @@ impl InstalledConnector {
     #[must_use]
     pub const fn table(&self) -> &ConnectorManifest {
         &self.table
+    }
+
+    /// Compiles the connector's table into the form the gateway interprets, for the executable
+    /// that runs.
+    ///
+    /// The channel reads the package's table directly; the gateway reads the core's declarative
+    /// table, and this makes it. Removal condition: when the channel and the gateway read a
+    /// connector's table through one reader, that reader replaces this compile and the core form
+    /// it makes.
+    ///
+    /// The tables are pinned to the version a signed qualification record names for the
+    /// executable's digest, and only when the table's qualified range admits it. Every method the
+    /// table lists is named as the wire spells it and classified as the table classifies it; a
+    /// frame with no identifier creates no resource, so every listed method is one that may
+    /// expect a response. The core writes no answer to an approval from this table: an approval
+    /// is held as an opaque pending resource until a person answers it. The host's bound on a
+    /// frame holds over any larger one the package declares.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorRefusal`] when no signed record names the executable, when the table is
+    /// not qualified for the version it names, when the table is not one the gateway reads (its
+    /// framing is not one JSON document per line, it correlates responses by order, it reads a
+    /// member by a path other than one top-level member, or it names no message members), when a
+    /// classified method has no route to name it by, or when the result is not a table the core
+    /// interprets.
+    pub fn native_tables(&self, executable: &Digest256) -> Result<NativeTables, ConnectorRefusal> {
+        let table = &self.table;
+        let version = self.qualified_version(executable).ok_or_else(|| {
+            ConnectorRefusal::new(
+                "no signed qualification record names the executable running, so its version is \
+                 unknown and the connector's table is not qualified against it",
+            )
+        })?;
+        let qualified = kr_plugin_sdk::version::PackageVersion::parse(version)
+            .is_ok_and(|version| table.protocol.qualified_range.admits(&version));
+        if !qualified {
+            return Err(ConnectorRefusal::new(format!(
+                "the connector's table is not qualified for version {version} of {}",
+                table.protocol.name
+            )));
+        }
+        if table.transport != BrokerTransport::Stdio {
+            return Err(ConnectorRefusal::new(
+                "the gateway reads a backend over its standard streams, and the table's transport \
+                 is another",
+            ));
+        }
+        let kr_plugin_sdk::connector::Framing::LineDelimitedJson { max_message_bytes } =
+            &table.framing
+        else {
+            return Err(ConnectorRefusal::new(
+                "the gateway reads one JSON document per line, and the table frames messages \
+                 another way",
+            ));
+        };
+        let ResponseCorrelation::MatchingId { id_path } = &table.response_correlation else {
+            return Err(ConnectorRefusal::new(
+                "the gateway matches a response to its request by the identifier the response \
+                 repeats, and the table correlates them by order",
+            ));
+        };
+        let member = |path: &FieldPath, what: &str| match path.segments.as_slice() {
+            [FieldSegment::Member { name }] => Ok(name.clone()),
+            _ => Err(ConnectorRefusal::new(format!(
+                "the gateway reads {what} as one top-level member, and the table's path is another"
+            ))),
+        };
+        let request_id_field = member(&table.request_id_path, "a request's identifier")?;
+        let method_field = member(&table.method_path, "a message's method")?;
+        let response_id_field = member(id_path, "a response's identifier")?;
+        let messages = table.messages.as_ref().ok_or_else(|| {
+            ConnectorRefusal::new(
+                "the table names no message members (messages), so it is not a backend's",
+            )
+        })?;
+        if table.methods.len() > MAX_TABLE_METHODS {
+            return Err(ConnectorRefusal::new(format!(
+                "the gateway interprets at most {MAX_TABLE_METHODS} methods, and the table \
+                 classifies {}",
+                table.methods.len()
+            )));
+        }
+        let mut entries = Vec::with_capacity(table.methods.len());
+        for classified in &table.methods {
+            let route = table
+                .routes
+                .iter()
+                .find(|route| route.method == classified.method)
+                .ok_or_else(|| {
+                    ConnectorRefusal::new(format!(
+                        "{} is classified and has no route, so the gateway cannot name it as the \
+                         wire does",
+                        classified.method
+                    ))
+                })?;
+            let method = UpstreamMethod::new(route.wire_name.as_str()).map_err(|error| {
+                ConnectorRefusal::new(format!(
+                    "the wire name {:?} of {} is not a method name the gateway can hold: {error}",
+                    route.wire_name, route.method
+                ))
+            })?;
+            entries.push(DeclarativeEntry {
+                method,
+                class: native_class(classified.class),
+                expects_response: true,
+                reverse: Nullable::null(),
+                approval_option_field: Nullable::null(),
+            });
+        }
+        entries.sort_by(|first, second| first.method.cmp(&second.method));
+        let mut compiled = DeclarativeTable {
+            plugin_id: self.package.plugin_id.clone(),
+            publisher_id: self.package.publisher_id.clone(),
+            table_version: MethodTableVersion::new(1),
+            upstream_protocol_version: version.to_owned(),
+            digest: Digest256::from_bytes([0; 32]),
+            framing: NativeFraming::JsonLines,
+            request_id_field,
+            response_id_field,
+            method_field,
+            params_field: messages.params.clone(),
+            result_field: messages.result.clone(),
+            error_field: messages.error.clone(),
+            entries,
+        };
+        compiled.digest = compiled.canonical_digest().map_err(|error| {
+            ConnectorRefusal::new(format!("the compiled table will not encode: {error}"))
+        })?;
+        compiled.qualify(version).map_err(|error| {
+            ConnectorRefusal::new(format!(
+                "the compiled table is not one the gateway interprets: {error}"
+            ))
+        })?;
+        let rich = RichMethodTable {
+            table_version: MethodTableVersion::new(1),
+            upstream_protocol_version: version.to_owned(),
+            entries: Vec::new(),
+        };
+        rich.qualify(version).map_err(|error| {
+            ConnectorRefusal::new(format!(
+                "the compiled rich table is not one the gateway interprets: {error}"
+            ))
+        })?;
+        let declared = max_message_bytes.get();
+        Ok(NativeTables {
+            table: compiled,
+            rich,
+            protocol_version: version.to_owned(),
+            framing: Framing::within(
+                NativeFraming::JsonLines,
+                usize::try_from(declared).unwrap_or(usize::MAX),
+            ),
+            frame_limit_clamped: declared > MAX_NATIVE_FRAME_BYTES as u64,
+        })
     }
 
     /// Returns the command integration the verified manifest declares, where it declares one and
@@ -1081,11 +1262,12 @@ pub mod fixture {
     }
 
     /// The upstream version the gateway fixture's table is qualified for.
-    const GATEWAY_QUALIFIED_VERSION: &str = "0.155.1";
+    pub const GATEWAY_QUALIFIED_VERSION: &str = "0.155.1";
 
     /// A table the worker's gateway reads: one JSON document per line over the backend's standard
-    /// streams, the members it reads a message by at the top level, and two of the methods a
-    /// Codex-shaped application sends. It answers no approval.
+    /// streams, the members it reads a message by at the top level, and the methods a
+    /// Codex-shaped application's session sends that its classes tell apart: one of each class,
+    /// and a notification in each direction. It answers no approval.
     fn gateway_connector_json_for(plugin_id: &str) -> String {
         let path =
             |name: &str| serde_json::json!({ "segments": [{ "type": "member", "name": name }] });
@@ -1105,11 +1287,23 @@ pub mod fixture {
             "messages": { "params": "params", "result": "result", "error": "error" },
             "routes": [
                 { "method": "initialize", "wire_name": "initialize", "direction": "host_to_upstream" },
-                { "method": "thread.list", "wire_name": "thread/list", "direction": "host_to_upstream" }
+                { "method": "initialized", "wire_name": "initialized", "direction": "host_to_upstream" },
+                { "method": "account.read", "wire_name": "account/read", "direction": "host_to_upstream" },
+                { "method": "account.login.start", "wire_name": "account/login/start", "direction": "host_to_upstream" },
+                { "method": "thread.list", "wire_name": "thread/list", "direction": "host_to_upstream" },
+                { "method": "turn.start", "wire_name": "turn/start", "direction": "host_to_upstream" },
+                { "method": "command.exec", "wire_name": "command/exec", "direction": "host_to_upstream" },
+                { "method": "remote.control.status.changed", "wire_name": "remoteControl/status/changed", "direction": "upstream_to_host" }
             ],
             "methods": [
                 { "method": "initialize", "class": "mutation", "evidence": "Negotiates what the connection may call" },
-                { "method": "thread.list", "class": "observation", "evidence": "Reads the threads and changes none" }
+                { "method": "initialized", "class": "mutation", "evidence": "Completes the handshake the connection began" },
+                { "method": "account.read", "class": "observation", "evidence": "Reads the account and changes none" },
+                { "method": "account.login.start", "class": "credential", "evidence": "Carries the key or token a person signs in with" },
+                { "method": "thread.list", "class": "observation", "evidence": "Reads the threads and changes none" },
+                { "method": "turn.start", "class": "mutation", "evidence": "Starts a turn the agent acts on" },
+                { "method": "command.exec", "class": "unsupported", "evidence": "Runs a command outside the agent's own approvals" },
+                { "method": "remote.control.status.changed", "class": "observation", "evidence": "Reports the remote control status and changes none" }
             ],
             "decision_destination": null,
             "volatile_forwarding": false,
