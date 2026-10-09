@@ -264,6 +264,11 @@ fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Opt
     let mut found = false;
     for source in &sources {
         let path = Path::new(source);
+        // A source that is listed and cannot be looked at is one the tree no longer has.
+        let modified = match std::fs::metadata(path).and_then(|about| about.modified()) {
+            Ok(modified) => modified,
+            Err(error) => return Some(format!("{source} cannot be looked at: {error}")),
+        };
         // A file a crate includes from outside its sources is named through `..` from inside them;
         // it is read as the path it comes to, and is one of the crate's sources only if that is.
         let mut named = PathBuf::new();
@@ -282,9 +287,7 @@ fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Opt
             }
             found = true;
         }
-        if let Ok(modified) = std::fs::metadata(path).and_then(|about| about.modified())
-            && modified > built
-        {
+        if modified > built {
             return Some(format!("{source} has changed since it was built"));
         }
     }
@@ -477,6 +480,14 @@ fn a_program_not_built_from_this_tree_is_refused() {
         .expect("a stale program is refused");
     assert!(why.contains("has changed since it was built"), "{why}");
     set_time(&source, long_ago);
+
+    // A source it lists that the tree no longer has.
+    let gone = repository.join("crates/kr-controller/src/bin/gone.rs");
+    listing(&[&source, &gone]);
+    let why = built_from_another_tree(&program, "kr-controller", &repository)
+        .expect("a program built from a source that is gone is refused");
+    assert!(why.contains("cannot be looked at"), "{why}");
+    listing(&[&source]);
 
     // Built from the sources of another checkout.
     listing(&[&other_tree]);
