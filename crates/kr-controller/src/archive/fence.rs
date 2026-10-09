@@ -31,7 +31,8 @@
 //! daemon of another environment that a command of the session started, and left. It is not
 //! stopped and is not counted among what the pass answers for; the closure names it as left for a
 //! daemon after the coverage is decided. It is read at the time of the pass, so a daemon the
-//! worker's last record no longer holds is not named.
+//! worker's last record no longer holds is not named, and one the record still holds that has
+//! ended by then can no longer be read, and is counted among the processes that ended.
 //!
 //! **Coverage** is complete only for a boundary this pass confirmed: a control group it proved the
 //! worker ran in and read empty at the end, or a job that needed no help. Everywhere else it is
