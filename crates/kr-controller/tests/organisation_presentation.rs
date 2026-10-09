@@ -871,7 +871,9 @@ async fn a_presentation_whose_deadline_passes_while_it_waits_for_the_store_write
             (raw, answered)
         })
     };
-    tokio::task::spawn_blocking(move || arrived.recv())
+    // Thirty seconds is how long the test waits for a presentation that never gets as far as the
+    // store, so that it fails rather than hangs.
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
         .await
         .expect("the wait ends")
         .expect("the presentation reaches the store");
