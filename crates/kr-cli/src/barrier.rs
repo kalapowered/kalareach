@@ -2,29 +2,78 @@
 //!
 //! An update checks that the release it switches to can read every store, and then switches. A
 //! command that writes a stored record between the two could write a version that release cannot
-//! read. So a command holds the writers' lock of its store, shared, from before it asks for its
-//! permit to the end of its last versioned write ([`kr_ipc::install::hold_writers`]), and an update
-//! holds it exclusively from before it checks the stores until it has switched. A command that
-//! finds an update holding it says so, once, and waits; if the update still holds it after
-//! [`WRITERS_WAIT_SECONDS`] seconds the command is refused with exit 9, and run again it writes. A
-//! command is judged by the release `current` names once the lock is its own: a store that release
-//! lists is written only at the version it says its programs write.
+//! read. So a command registers what it works in and holds the writers' lock of its store, shared,
+//! from before it asks for its permit to the end of its last versioned write
+//! ([`kr_ipc::install::hold_writers`]), and an update holds that lock exclusively from before it
+//! checks the stores until it has switched. A command that finds an update holding either lock says
+//! so, once, and waits; if the update still holds it after [`WRITERS_WAIT_SECONDS`] seconds the
+//! command is refused with exit 9, and a run after the switch is judged by the release then
+//! current, which can refuse it. A command is judged by the release `current` names once the lock is
+//! its own: a store that release lists is written only at the version it says its programs write.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
-use kr_ipc::install::{InstallError, Permit, WRITERS_WAIT_SECONDS, WriteRefused, Writers, Written};
+use kr_ipc::install::{
+    InstallError, Permit, WRITERS_WAIT_SECONDS, WriteRefused, Writers, Writing, Written,
+};
+use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 
 use crate::error::{CliError, Result};
 
-/// Holds the writers' lock of this program's store, shared. The hold ends when the value is
-/// dropped, so a command drops it at its last versioned write, before it asks a daemon anything.
+/// The stores a command writes, by the name a release's manifest lists them under. An update looks
+/// for these, and only these, in a root that no control daemon of the store served and that a
+/// command alone registered.
+pub const COMMAND_WRITTEN_STORES: [&str; 6] = [
+    crate::doctor::configuration::WRITTEN.store,
+    crate::service_manager::WRITTEN.store,
+    kr_shell_integration::host::startup::ENTRY_WRITTEN.store,
+    kr_shell_integration::host::terminal::PREFERENCE_WRITTEN.store,
+    kr_client::answers::WRITTEN.store,
+    crate::machine::WRITTEN.store,
+];
+
+/// Holds the writers' lock of this program's store, shared, for a command that works in the roots
+/// of `paths`. The hold ends when the value is dropped, so a command drops it at its last
+/// versioned write, before it asks a daemon anything.
 ///
 /// # Errors
 ///
-/// Returns [`CliError::UpdateDeferred`] when an update held the lock for the whole wait, and
-/// [`CliError::Other`] when the lock cannot be used or the release `current` names cannot be read.
-pub fn hold() -> Result<Writers> {
-    kr_ipc::install::hold_writers(&mut || {
+/// Returns [`CliError::UpdateDeferred`] when an update held a lock for the whole wait, and
+/// [`CliError::Other`] when a lock cannot be used, the registration cannot be written or the
+/// release `current` names cannot be read.
+pub fn hold(paths: &HostPaths) -> Result<Writers> {
+    hold_writing(Writing::in_roots(paths.runtime_root(), paths.state_root()))
+}
+
+/// [`hold`] for a command that works in the roots of one environment.
+///
+/// # Errors
+///
+/// As [`hold`].
+pub fn hold_in(environment: &EnvironmentPaths) -> Result<Writers> {
+    hold_writing(Writing::in_roots(
+        environment.runtime_root(),
+        environment.state_root(),
+    ))
+}
+
+/// [`hold`] for a command that writes the configuration document of one environment, which an
+/// update then looks for where this command writes it.
+///
+/// # Errors
+///
+/// As [`hold`].
+pub fn hold_for_configuration(environment: &EnvironmentPaths) -> Result<Writers> {
+    hold_writing(
+        Writing::in_roots(environment.runtime_root(), environment.state_root()).with_document(
+            environment.environment_id(),
+            crate::doctor::configuration::document_path(environment),
+        ),
+    )
+}
+
+fn hold_writing(writing: Writing) -> Result<Writers> {
+    kr_ipc::install::hold_writers(&writing, &mut || {
         crate::report::say(&shown!(
             "an update of this host is switching releases; this command waits for it, for up to \
              {} seconds",
@@ -174,10 +223,14 @@ pub(crate) mod testing {
             store
                 .switch(&release, &update, &install, &exclusive)
                 .expect("the release is current");
-            drop(exclusive);
+            drop((exclusive, install, update));
             let writers = store
                 .hold_writers(
                     Some(&release),
+                    &kr_ipc::install::Writing::in_roots(
+                        directory.path().join("run"),
+                        directory.path().join("state"),
+                    ),
                     std::time::Duration::from_secs(1),
                     &mut || {},
                 )

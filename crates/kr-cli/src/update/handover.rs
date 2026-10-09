@@ -257,7 +257,7 @@ pub async fn install_lock(
     store: &Store,
     within: Duration,
     command: &'static str,
-) -> Result<kr_ipc::install::StoreLock> {
+) -> Result<kr_ipc::install::ExclusiveInstall> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         match store.try_lock_install() {

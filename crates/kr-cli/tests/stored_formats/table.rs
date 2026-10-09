@@ -672,7 +672,7 @@ pub fn named() -> Vec<Named> {
         content(
             StoreScope::StateRoot,
             "host",
-            "the store of releases on a platform whose default state root holds it; its record is the store install-record, and roots/<digest>.root is a frozen form (two paths separated by a NUL byte) that a change replaces with a file of another name",
+            "the store of releases on a platform whose default state root holds it; its record is the store install-record, and roots/<digest>.root, roots/<digest>.registered (a command's roots) and roots/<digest>.document (an environment and a path, separated by a NUL byte) are frozen forms (two values separated by a NUL byte) that a change replaces with a file of another name",
         ),
         content(
             StoreScope::StateRoot,

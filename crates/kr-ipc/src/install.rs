@@ -12,7 +12,7 @@
 //! | `current` | A relative symbolic link to the release new processes start from |
 //! | `staging/` | A release being unpacked and checked, before it is renamed into `versions/` |
 //! | `trash/` | A release being removed, renamed out of `versions/` before anything of it goes |
-//! | `roots/` | The runtime and state roots the control daemons of this store have served |
+//! | `roots/` | The runtime and state roots the control daemons of this store have served (`.root`), those a command of this store has worked in (`.registered`), and the configuration documents either has written or read (`.document`) |
 //! | `install.json` | The store's own record, which makes the directory a store |
 //! | `update.lock`, `install.lock` | The locks an update and a starting control daemon take |
 //! | `writers.lock` | The lock a command that writes a stored record takes, shared, and an update takes, exclusively, from before it checks the stores to after it switches |
@@ -60,7 +60,15 @@
 //! one that release does not read. A program of a release older or newer than `current`, which a
 //! switch leaves running, therefore cannot leave a record that `current` cannot read.
 //!
-//! A program that runs outside a store holds nothing and is permitted every record.
+//! Before it takes `writers.lock` a writer registers what it works in ([`Writing`]), under
+//! `install.lock` taken shared: the runtime and state roots, and the configuration document it
+//! writes. An update holds `install.lock` exclusively from before it stops anything until it has
+//! switched and surveys the store's roots under it, so a registration is either complete before
+//! that survey, which then finds the root, or waits for the whole update and is judged by the
+//! release it made current.
+//!
+//! A program that runs outside a store holds nothing, registers nothing and is permitted every
+//! record.
 //!
 //! Windows keeps no store here: a directory link there cannot be replaced in one step by a user
 //! who does not administer the machine, so every Windows process runs as a build outside a store.
@@ -914,11 +922,12 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked for any reason
     /// but a holder.
-    pub fn try_lock_install(&self) -> Result<Option<StoreLock>> {
+    pub fn try_lock_install(&self) -> Result<Option<ExclusiveInstall>> {
         StoreLock::try_take(
             &self.root.join("install.lock"),
             rustix::fs::FlockOperation::NonBlockingLockExclusive,
         )
+        .map(|taken| taken.map(ExclusiveInstall))
     }
 
     /// Takes the writers' lock exclusively when no command holds it, without waiting. An update
@@ -937,26 +946,53 @@ impl Store {
         .map(|taken| taken.map(ExclusiveWriters))
     }
 
-    /// Holds the writers' lock shared, for a command that writes a stored record in this store, and
-    /// reads the manifest of the release `current` names under it.
+    /// Registers what a command works in, then holds the writers' lock shared, for a command that
+    /// writes a stored record in this store, and reads the manifest of the release `current` names
+    /// under it.
     ///
-    /// `own` is the release of the program that writes, where it is one of this store. The lock is
-    /// polled for up to `wait`; `on_wait` runs once, if the first try finds it held.
+    /// The registration is made under the install lock, taken shared, which an update holds
+    /// exclusively from before it stops anything until it has switched: a registration made before
+    /// the update's survey of the store's roots is found by it, and one that is not waits for the
+    /// whole update and is judged by the release it made current. The install lock is let go of
+    /// once the writers' lock is held.
+    ///
+    /// `own` is the release of the program that writes, where it is one of this store. Both locks
+    /// are polled for up to `wait` together; `on_wait` runs once, if the first try of either finds
+    /// it held.
     ///
     /// # Errors
     ///
-    /// Returns [`WriteRefused::Switching`] when an update held the lock for the whole wait, and
-    /// [`WriteRefused::Store`] when the lock cannot be opened or locked, or `current` names no
-    /// release whose manifest this build reads.
+    /// Returns [`WriteRefused::Switching`] when an update held a lock for the whole wait, and
+    /// [`WriteRefused::Store`] when a lock cannot be opened or locked, when the registration cannot
+    /// be written, or when `current` names no release whose manifest this build reads. Nothing a
+    /// command writes has been written then.
     pub fn hold_writers(
         &self,
         own: Option<&ReleaseName>,
+        writing: &Writing,
         wait: Duration,
         on_wait: &mut dyn FnMut(),
     ) -> std::result::Result<Writers, WriteRefused> {
-        let lock = StoreLock::take_shared_within(&self.root.join(WRITERS_LOCK), wait, on_wait)
-            .map_err(WriteRefused::Store)?
-            .ok_or(WriteRefused::Switching)?;
+        let started = Instant::now();
+        let mut said = false;
+        let mut notice = || {
+            if !std::mem::replace(&mut said, true) {
+                on_wait();
+            }
+        };
+        let install =
+            StoreLock::take_shared_within(&self.root.join("install.lock"), wait, &mut notice)
+                .map_err(WriteRefused::Store)?
+                .ok_or(WriteRefused::Switching)?;
+        self.register(writing).map_err(WriteRefused::Store)?;
+        let lock = StoreLock::take_shared_within(
+            &self.root.join(WRITERS_LOCK),
+            wait.saturating_sub(started.elapsed()),
+            &mut notice,
+        )
+        .map_err(WriteRefused::Store)?
+        .ok_or(WriteRefused::Switching)?;
+        drop(install);
         let link = self.current_link();
         let current = self
             .current()
@@ -1009,11 +1045,11 @@ impl Store {
         &self,
         release: &ReleaseName,
         update: &StoreLock,
-        install: &StoreLock,
+        install: &ExclusiveInstall,
         writers: &ExclusiveWriters,
     ) -> Result<()> {
         debug_assert_eq!(update.path, self.root.join("update.lock"));
-        debug_assert_eq!(install.path, self.root.join("install.lock"));
+        debug_assert_eq!(install.0.path, self.root.join("install.lock"));
         debug_assert_eq!(writers.0.path, self.root.join(WRITERS_LOCK));
         if !self.manifest(release).is_file() {
             return Err(InstallError::Replaced {
@@ -1118,28 +1154,11 @@ impl Store {
     pub fn record_roots(&self, runtime_root: &Path, state_root: &Path) -> Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let roots = self.roots();
-        crate::paths::create_private_directory(&roots).map_err(|error| {
-            InstallError::io(
-                "create the store directory",
-                &roots,
-                std::io::Error::other(error),
-            )
-        })?;
         let state = state_root.as_os_str().as_bytes();
-        let runtime = runtime_root.as_os_str().as_bytes();
-        let digest = kr_cbor::sha256(state);
-        let name: String = digest[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let mut contents = Vec::with_capacity(runtime.len() + state.len() + 1);
-        contents.extend_from_slice(runtime);
+        let mut contents = runtime_root.as_os_str().as_bytes().to_vec();
         contents.push(0);
         contents.extend_from_slice(state);
-        let path = roots.join(format!("{name}.root"));
-        crate::paths::write_owner_only_file(&path, &contents)
-            .map_err(|error| InstallError::io("write", &path, std::io::Error::other(error)))
+        self.write_record(state, &contents, ROOT_RECORD)
     }
 
     /// Every pair of roots a control daemon of this store has served, in record order.
@@ -1148,19 +1167,129 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when the records cannot be read.
     pub fn recorded_roots(&self) -> Result<Vec<RecordedRoots>> {
+        self.read_roots(ROOT_RECORD)
+    }
+
+    /// Every pair of roots a command of this store has registered, in record order. A command's
+    /// record never replaces a control daemon's, whose runtime root is the one its clients reach it
+    /// at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the records cannot be read.
+    pub fn registered_roots(&self) -> Result<Vec<RecordedRoots>> {
+        self.read_roots(REGISTERED_RECORD)
+    }
+
+    fn read_roots(&self, extension: &str) -> Result<Vec<RecordedRoots>> {
+        let mut recorded = Vec::new();
+        for (path, contents) in self.read_records(extension)? {
+            let Some(split) = contents.iter().position(|byte| *byte == 0) else {
+                continue;
+            };
+            recorded.push(RecordedRoots {
+                runtime_root: bytes_path(&contents[..split]),
+                state_root: bytes_path(&contents[split + 1..]),
+                record: path,
+            });
+        }
+        Ok(recorded)
+    }
+
+    /// Every configuration document a control daemon or a command of this store has recorded
+    /// reading or writing, in record order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the records cannot be read.
+    pub fn recorded_documents(&self) -> Result<Vec<RecordedDocument>> {
+        let mut recorded = Vec::new();
+        for (path, contents) in self.read_records(DOCUMENT_RECORD)? {
+            let Some(split) = contents.iter().position(|byte| *byte == 0) else {
+                continue;
+            };
+            let Ok(environment) = String::from_utf8_lossy(&contents[..split]).parse() else {
+                continue;
+            };
+            recorded.push(RecordedDocument {
+                environment,
+                path: bytes_path(&contents[split + 1..]),
+                record: path,
+            });
+        }
+        Ok(recorded)
+    }
+
+    /// Records that a configuration document of `environment` is at `path` (made absolute), so an
+    /// update checks it wherever its variables put it. One record for each path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the record cannot be written.
+    pub fn record_document(
+        &self,
+        environment: kr_protocol::ids::EnvironmentId,
+        path: &Path,
+    ) -> Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
 
+        let path =
+            std::path::absolute(path).map_err(|error| InstallError::io("resolve", path, error))?;
+        let mut contents = environment.to_string().into_bytes();
+        contents.push(0);
+        contents.extend_from_slice(path.as_os_str().as_bytes());
+        self.write_record(&contents, &contents, DOCUMENT_RECORD)
+    }
+
+    /// Registers what a command works in: its roots, and the configuration document it writes.
+    fn register(&self, writing: &Writing) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let state = writing.state_root.as_os_str().as_bytes();
+        let mut contents = writing.runtime_root.as_os_str().as_bytes().to_vec();
+        contents.push(0);
+        contents.extend_from_slice(state);
+        self.write_record(state, &contents, REGISTERED_RECORD)?;
+        if let Some((environment, path)) = &writing.document {
+            self.record_document(*environment, path)?;
+        }
+        Ok(())
+    }
+
+    /// Writes `contents` as the record of `extension` that `named` names: the first sixteen bytes of
+    /// its digest, in hexadecimal.
+    fn write_record(&self, named: &[u8], contents: &[u8], extension: &str) -> Result<()> {
+        let roots = self.roots();
+        crate::paths::create_private_directory(&roots).map_err(|error| {
+            InstallError::io(
+                "create the store directory",
+                &roots,
+                std::io::Error::other(error),
+            )
+        })?;
+        let digest = kr_cbor::sha256(named);
+        let name: String = digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let path = roots.join(format!("{name}.{extension}"));
+        crate::paths::write_owner_only_file(&path, contents)
+            .map_err(|error| InstallError::io("write", &path, std::io::Error::other(error)))
+    }
+
+    /// The records of `extension` in `roots/`, with what each holds, in the order of their names.
+    fn read_records(&self, extension: &str) -> Result<Vec<(PathBuf, Vec<u8>)>> {
         let roots = self.roots();
         let entries = match std::fs::read_dir(&roots) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(InstallError::io("read", &roots, error)),
         };
-        let mut recorded = Vec::new();
+        let mut records = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| InstallError::io("read", &roots, error))?;
             let path = entry.path();
-            if path.extension() != Some(OsStr::new("root")) {
+            if path.extension() != Some(OsStr::new(extension)) {
                 continue;
             }
             let Some(contents) = crate::paths::read_owner_only_file(&path, 64 * 1024)
@@ -1168,17 +1297,66 @@ impl Store {
             else {
                 continue;
             };
-            let Some(split) = contents.iter().position(|byte| *byte == 0) else {
-                continue;
-            };
-            recorded.push(RecordedRoots {
-                runtime_root: PathBuf::from(OsStr::from_bytes(&contents[..split])),
-                state_root: PathBuf::from(OsStr::from_bytes(&contents[split + 1..])),
-                record: path,
-            });
+            records.push((path, contents));
         }
-        recorded.sort_by(|one, other| one.record.cmp(&other.record));
-        Ok(recorded)
+        records.sort_by(|one, other| one.0.cmp(&other.0));
+        Ok(records)
+    }
+}
+
+/// The bytes of a path a record holds.
+#[cfg(unix)]
+fn bytes_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+/// The extension of the record of the roots a control daemon served.
+#[cfg(unix)]
+const ROOT_RECORD: &str = "root";
+
+/// The extension of the record of the roots a command worked in.
+#[cfg(unix)]
+const REGISTERED_RECORD: &str = "registered";
+
+/// The extension of the record of a configuration document.
+#[cfg(unix)]
+const DOCUMENT_RECORD: &str = "document";
+
+/// What a command works in, which it registers with the store before it writes a record
+/// ([`Store::hold_writers`]).
+#[derive(Clone, Debug)]
+pub struct Writing {
+    /// The runtime root the command works in.
+    pub runtime_root: PathBuf,
+    /// The state root the command works in.
+    pub state_root: PathBuf,
+    /// The environment whose configuration document the command writes, and the document's
+    /// absolute path.
+    pub document: Option<(kr_protocol::ids::EnvironmentId, PathBuf)>,
+}
+
+impl Writing {
+    /// A command that works in these roots.
+    #[must_use]
+    pub fn in_roots(runtime_root: impl Into<PathBuf>, state_root: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime_root: runtime_root.into(),
+            state_root: state_root.into(),
+            document: None,
+        }
+    }
+
+    /// A command that also writes the configuration document of `environment` at `path`.
+    #[must_use]
+    pub fn with_document(
+        mut self,
+        environment: kr_protocol::ids::EnvironmentId,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        self.document = Some((environment, path.into()));
+        self
     }
 }
 
@@ -1189,6 +1367,17 @@ pub struct RecordedRoots {
     pub runtime_root: PathBuf,
     /// The state root.
     pub state_root: PathBuf,
+    /// The record that says so.
+    pub record: PathBuf,
+}
+
+/// A configuration document a control daemon or a command of a store has recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedDocument {
+    /// The environment the document belongs to.
+    pub environment: kr_protocol::ids::EnvironmentId,
+    /// Where it is, as an absolute path.
+    pub path: PathBuf,
     /// The record that says so.
     pub record: PathBuf,
 }
@@ -1277,6 +1466,13 @@ impl Drop for StoreLock {
         let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
     }
 }
+
+/// The install lock held exclusively: no control daemon of this store starts, and no command
+/// registers what it works in, while it is held. An update takes it before it stops anything and
+/// holds it until it has switched, and [`Store::switch`] asks for it by type.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ExclusiveInstall(StoreLock);
 
 /// The writers' lock held exclusively: no command writes a stored record of this store while it is
 /// held. An update takes it before it checks the stores and holds it until it has switched.
@@ -1436,11 +1632,12 @@ impl Permit<'_> {
     }
 }
 
-/// Holds the writers' lock of this process's store, for a command that writes a stored record, and
-/// reads the manifest of the release `current` names under it. A process outside a store holds
-/// nothing, and every record is permitted.
+/// Registers what a command works in with this process's store and holds the writers' lock of that
+/// store, for a command that writes a stored record, and reads the manifest of the release
+/// `current` names under it. A process outside a store holds nothing, registers nothing, and every
+/// record is permitted.
 ///
-/// `on_wait` runs once when an update holds the lock and the wait begins; it waits for up to
+/// `on_wait` runs once when an update holds a lock and the wait begins; it waits for up to
 /// [`WRITERS_WAIT_SECONDS`].
 ///
 /// # Errors
@@ -1448,12 +1645,16 @@ impl Permit<'_> {
 /// Returns what [`Store::hold_writers`] returns, and [`WriteRefused::Process`] when this process
 /// could not establish the release it runs.
 #[cfg(unix)]
-pub fn hold_writers(on_wait: &mut dyn FnMut()) -> std::result::Result<Writers, WriteRefused> {
+pub fn hold_writers(
+    writing: &Writing,
+    on_wait: &mut dyn FnMut(),
+) -> std::result::Result<Writers, WriteRefused> {
     match this_process() {
         Err(error) => Err(WriteRefused::Process(error)),
         Ok(Running::Loose { .. }) => Ok(Writers::outside_a_store()),
         Ok(Running::Installed(installed)) => installed.store.hold_writers(
             Some(&installed.release),
+            writing,
             Duration::from_secs(WRITERS_WAIT_SECONDS),
             on_wait,
         ),
@@ -1466,7 +1667,10 @@ pub fn hold_writers(on_wait: &mut dyn FnMut()) -> std::result::Result<Writers, W
 ///
 /// Never.
 #[cfg(not(unix))]
-pub fn hold_writers(_on_wait: &mut dyn FnMut()) -> std::result::Result<Writers, WriteRefused> {
+pub fn hold_writers(
+    _writing: &Writing,
+    _on_wait: &mut dyn FnMut(),
+) -> std::result::Result<Writers, WriteRefused> {
     Ok(Writers::outside_a_store())
 }
 
