@@ -362,8 +362,9 @@ impl ArchiveService {
         // Windows: the job closed with the worker, and the claim holds only if nothing needed
         // help to end.
         let job = cfg!(windows) && record.is_some();
-        // A process this pass names as still there is never inside a complete claim, whatever else
-        // ended: the claim is read off the report it sits in.
+        // A process of the session this pass names as still there is never inside a complete claim,
+        // whatever else ended: the claim is read off the report it sits in. A process that left
+        // for a control daemon's scope is not the session's and is named after the claim is made.
         let complete = record.is_some()
             && surviving.is_empty()
             && ((job && !forced_job) || (group.is_some() && boundary_confirmed));

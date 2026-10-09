@@ -8,7 +8,7 @@
 //! | --- | --- | --- |
 //! | macOS | a per-session launchd job, bootstrapped into the domain the profile names and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
 //! | Linux with systemd | a transient user *service*, `systemd-run --user --unit=... --collect -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
-//! | other Unix | a `setsid` launch, reparented to init | the spawned child's identifier, then `/proc` or `proc_pidinfo` |
+//! | other Unix | a detached launch: a worker leads a session of its own, a plain service a process group of its own, and each is reparented when the daemon exits | the spawned child's identifier, then `/proc` or `proc_pidinfo` |
 //! | Windows | the spawned child, outside the daemon's kill-on-close Job | the child's identifier and creation time |
 //!
 //! `kickstart -p` and not `-k`: the second would restart a job that is already running, which for
@@ -1216,12 +1216,15 @@ fn program_on_the_path(name: &str) -> Option<PathBuf> {
         })
 }
 
-/// The fallback supervisor: a detached process in its own process group.
+/// The fallback supervisor: a detached process that leaves this daemon's session or process group.
 ///
 /// This is what a non-systemd Unix host uses, and what a macOS host without a GUI bootstrap domain
-/// falls back to. The child has its own process group and no inherited terminal, so nothing aimed
-/// at this daemon reaches it, and it is reparented to init when this daemon exits. It has no
-/// parent-death signal, and the daemon reconnects to its endpoint rather than to a pipe.
+/// falls back to. A worker is made no process group here and leaves this daemon's session and
+/// terminal by its own `setsid` as the first thing it does; a plain service, the plugin runtime
+/// above all, is given a process group of its own and stays in the daemon's session. Neither is
+/// reached by what is aimed at this daemon's group, and each is reparented, to init or to the nearest
+/// process that adopts orphans, when this daemon exits. There is no parent-death signal, and the
+/// daemon reconnects to its endpoint rather than to a pipe.
 ///
 /// On Unix its standard error goes where a launchd job's does, the job's diagnostics file in the
 /// owner-only jobs directory, so what a process says there on its way out is kept whichever
