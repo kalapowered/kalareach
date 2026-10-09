@@ -57,6 +57,44 @@ fn summary(session_id: SessionId) -> kr_protocol::session::SessionSummary {
     }
 }
 
+/// A worker's published endpoint, stood in for by a file at the endpoint's address.
+///
+/// On Windows the address is a pipe name, which as a path is relative to the working directory, so
+/// the file lands in the crate's directory rather than in the test's tree. It is removed when this
+/// is dropped, and removing a file the code under test has already removed is not an error.
+struct PublishedEndpoint(std::path::PathBuf);
+
+impl PublishedEndpoint {
+    /// Publishes the endpoint of the worker with `display_number`.
+    fn of(archive: &ArchiveService, display_number: DisplayNumber) -> Self {
+        let endpoint = archive
+            .paths()
+            .worker_endpoint(display_number)
+            .expect("an endpoint");
+        let path = endpoint.as_path().to_path_buf();
+        let published = Self(path.clone());
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).expect("the directory");
+        }
+        std::fs::write(&path, b"a socket").expect("writes it");
+        published
+    }
+
+    /// Whether the file is there.
+    fn exists(&self) -> bool {
+        self.0.exists()
+    }
+}
+
+impl Drop for PublishedEndpoint {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Writes a journal where a session's journal belongs, and returns the archive over it.
 fn host() -> (TempHost, ArchiveService) {
     let temp = TempHost::create();
@@ -683,12 +721,7 @@ fn a_live_workers_endpoint_is_not_fenced_by_an_enquiry_that_is_refused() {
     let descriptor = archive.paths().descriptor_file(session_id);
     std::fs::create_dir_all(descriptor.parent().expect("a parent")).expect("the directory");
     std::fs::write(&descriptor, b"a descriptor").expect("writes it");
-    let endpoint = archive
-        .paths()
-        .worker_endpoint(DisplayNumber::new(1))
-        .expect("an endpoint");
-    std::fs::create_dir_all(endpoint.as_path().parent().expect("a parent")).expect("the directory");
-    std::fs::write(endpoint.as_path(), b"a socket").expect("writes it");
+    let endpoint = PublishedEndpoint::of(&archive, DisplayNumber::new(1));
 
     let alive = kr_ipc::identity::current_process_start_identity().expect("an identity");
     archive
@@ -696,7 +729,7 @@ fn a_live_workers_endpoint_is_not_fenced_by_an_enquiry_that_is_refused() {
         .expect_err("a live worker's stores are not the archive's");
     assert!(descriptor.exists(), "the descriptor is still published");
     assert!(
-        endpoint.as_path().exists(),
+        endpoint.exists(),
         "the live worker's endpoint is still there"
     );
 }
@@ -709,12 +742,7 @@ fn ownership_fences_the_endpoint_once_death_is_validated() {
     let descriptor = archive.paths().descriptor_file(session_id);
     std::fs::create_dir_all(descriptor.parent().expect("a parent")).expect("the directory");
     std::fs::write(&descriptor, b"a descriptor").expect("writes it");
-    let endpoint = archive
-        .paths()
-        .worker_endpoint(DisplayNumber::new(1))
-        .expect("an endpoint");
-    std::fs::create_dir_all(endpoint.as_path().parent().expect("a parent")).expect("the directory");
-    std::fs::write(endpoint.as_path(), b"a socket").expect("writes it");
+    let endpoint = PublishedEndpoint::of(&archive, DisplayNumber::new(1));
 
     // A process identity the kernel never described belongs to a process that had ended.
     // An identity the kernel never described belongs to a process that had already ended when it
@@ -725,7 +753,7 @@ fn ownership_fences_the_endpoint_once_death_is_validated() {
         .expect("a dead worker's stores are the archive's");
     assert!(ownership.endpoint_fenced);
     assert!(!descriptor.exists(), "the descriptor was fenced");
-    assert!(!endpoint.as_path().exists(), "the endpoint was fenced");
+    assert!(!endpoint.exists(), "the endpoint was fenced");
     assert_eq!(ownership.session_id, session_id);
 }
 
@@ -1871,11 +1899,7 @@ fn what_is_left_of_an_ended_worker_that_cannot_be_removed_stops_the_import() {
         let session_id = session();
         write_version_one_journal(&archive, session_id);
         publish_descriptor(&archive, session_id, &ended);
-        let endpoint = archive
-            .paths()
-            .worker_endpoint(DisplayNumber::new(1))
-            .expect("an endpoint");
-        std::fs::write(endpoint.as_path(), b"a socket").expect("the endpoint's file");
+        let _endpoint = PublishedEndpoint::of(&archive, DisplayNumber::new(1));
         let imported = {
             let _held = Mode::read_only(directory(&archive));
             [
