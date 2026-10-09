@@ -4981,6 +4981,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
+ "httparse",
  "kr-cbor",
  "kr-client",
  "kr-controller",
@@ -5007,6 +5009,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-websockets",
  "windows-sys 0.61.2",
 ]
 

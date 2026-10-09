@@ -6136,8 +6136,9 @@ part of the worker starts at the same moment holds none of them. This allows the
 backend's output to see the end of the file when the backend's last process lets go.
 
 A connection carrying any header a browser adds (`origin`, `referer`, `sec-fetch-site`,
-`sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method`) is refused. A page that
-guesses the address still cannot speak to it.
+`sec-fetch-mode`, `access-control-request-method`) is refused. A page that guesses the address
+still cannot speak to it. The key every WebSocket client sends is not such a header: a browser's
+request carries `origin` too.
 
 Registration authenticates against the launch and process binding **and** a private exchange. An
 environment-variable session identifier is carried so a person debugging can see what the
