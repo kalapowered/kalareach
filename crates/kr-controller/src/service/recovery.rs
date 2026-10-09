@@ -90,6 +90,9 @@ impl Drop for Held {
     }
 }
 
+/// The task that stops what a crashed session owned and records its closure.
+type Cleanup = tokio::task::JoinHandle<Result<Option<kr_protocol::session::ClosureRecord>>>;
+
 impl Controller {
     /// Resolves every create that a previous daemon did not finish.
     ///
@@ -97,7 +100,25 @@ impl Controller {
     /// resolved and stops occupying the environment; a launch that may have started is preserved,
     /// never respawned, and keeps its slot until something confirms what happened to it.
     pub(super) async fn recover_reservations(&self) -> Result<()> {
-        let mut crashed = Vec::new();
+        // Every cleanup a scan starts is waited for, whether or not the scan went on to the end:
+        // the tasks are the caller's, and an error does not drop them.
+        let mut cleanups = Vec::new();
+        let mut outcome = self.scan_reservations(&mut cleanups).await;
+        if outcome.is_ok() {
+            // The workers a start meets are started beside the claimed ones, so a daemon that
+            // finds both kinds waits for the longest cleanup and not for one kind and then the
+            // other.
+            outcome = self.scan_workers(&mut cleanups).await;
+        }
+        for task in cleanups {
+            let _ = task.await;
+        }
+        outcome
+    }
+
+    /// The scan of [`Self::recover_reservations`]: resolves what it can and starts, into
+    /// `cleanups`, the cleanup of every claimed worker confirmed gone.
+    async fn scan_reservations(&self, cleanups: &mut Vec<Cleanup>) -> Result<()> {
         let unresolved = {
             let registry = self.registry.lock().await;
             let mut rows = registry.reservations_in(LaunchPhase::Reserved)?;
@@ -148,23 +169,13 @@ impl Controller {
                     // own; every such task is started before any is waited for, so a daemon that
                     // starts beside several of them costs one bound and not one each.
                     if let Some(task) = self.recover_claim_started(&reservation, &held).await? {
-                        crashed.push(task);
+                        cleanups.push(task);
                     }
                 }
                 _ => {}
             }
         }
-        // The workers a start meets are started beside the claimed ones, so a daemon that finds
-        // both kinds waits for the longest cleanup and not for one kind and then the other.
-        let (published, outcome) = match self.start_recovering_workers().await {
-            Ok(started) => (started, Ok(())),
-            Err(error) => (Vec::new(), Err(error)),
-        };
-        // A start that failed on the workers still waits for the claimed cleanups it began.
-        for task in crashed.into_iter().chain(published) {
-            let _ = task.await;
-        }
-        outcome
+        Ok(())
     }
 
     /// Recovers a worker whose claim was consumed but whose session never reached the directory.
@@ -196,8 +207,7 @@ impl Controller {
         &self,
         reservation: &crate::registry::Reservation,
         held: &ReservationHold,
-    ) -> Result<Option<tokio::task::JoinHandle<Result<Option<kr_protocol::session::ClosureRecord>>>>>
-    {
+    ) -> Result<Option<Cleanup>> {
         let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
         let challenged = match reservation.claimed_key {
             Some(key) => Some(
@@ -368,24 +378,22 @@ impl Controller {
     /// everything a challenge needs, and the worker's own answer carries everything a descriptor
     /// needs.
     pub(super) async fn recover_workers(&self) -> Result<()> {
-        for task in self.start_recovering_workers().await? {
+        let mut cleanups = Vec::new();
+        let outcome = self.scan_workers(&mut cleanups).await;
+        for task in cleanups {
             let _ = task.await;
         }
-        Ok(())
+        outcome
     }
 
-    /// [`Self::recover_workers`] up to the point where each worker confirmed gone has what its
-    /// session owned stopped, on a task this daemon owns. The tasks are returned for the caller to
-    /// wait for.
-    async fn start_recovering_workers(
-        &self,
-    ) -> Result<Vec<tokio::task::JoinHandle<Result<Option<kr_protocol::session::ClosureRecord>>>>>
-    {
+    /// The scan of [`Self::recover_workers`]: adopts the workers that answer and starts, into
+    /// `cleanups` and on a task this daemon owns, what each worker confirmed gone owned stopped.
+    /// The caller waits for the tasks, whatever this returns.
+    async fn scan_workers(&self, cleanups: &mut Vec<Cleanup>) -> Result<()> {
         let rows = {
             let registry = self.registry.lock().await;
             registry.workers()?
         };
-        let mut reconciling = Vec::new();
         for row in rows {
             if self.directory.lock().await.get(row.session_id).is_some() {
                 continue;
@@ -437,7 +445,7 @@ impl Controller {
                     // Every crashed session's cleanup is started before any is waited for: a
                     // daemon that starts beside several of them costs one bound, not one each.
                     match self.reconcile_soon(row.session_id) {
-                        Some(task) => reconciling.push(task),
+                        Some(task) => cleanups.push(task),
                         None => {
                             let _ = self.reconcile(row.session_id).await;
                         }
@@ -445,7 +453,7 @@ impl Controller {
                 }
             }
         }
-        Ok(reconciling)
+        Ok(())
     }
 
     /// Challenges a worker against a key this daemon already holds, presents its generation, and
