@@ -826,7 +826,7 @@ A worker's lifetime belongs to the platform, not to the control daemon.
 | --- | --- | --- |
 | macOS | a per-session launchd job, bootstrapped into `gui/<uid>` and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
 | Linux with systemd | a transient user *service*, `systemd-run --user --unit=... --collect -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
-| other Unix | a child in its own process group, reparented to init when the daemon exits | the spawned child |
+| other Unix | a child that leads a session of its own, reparented when the daemon exits | the spawned child |
 | Windows | the spawned child, outside the daemon's kill-on-close Job | the child's identifier and creation time |
 
 `kickstart -p`, never `-k`: the second restarts a job that is already running, which for a session
@@ -3034,7 +3034,7 @@ record as the set changes. Each process is recorded from one reading that gives 
 fact that puts it in the session's tree (its parent, its session, its terminal, its group, or the
 session's job), so an identifier the kernel gave to a stranger after the process it listed ended is
 not recorded. A process stays in the record until the kernel says it has ended, so one that left
-the tree after it was seen is still stopped.
+the tree after it was seen is still stopped, unless it left for a control daemon's own scope.
 The record belongs to one boot: one from another boot, one from an earlier build that names no boot,
 and a missing one are not acted on, and the closure says why. A recorded process is stopped only
 through the platform's hold on it: a process descriptor on Linux, the kernel's own version of the
@@ -3059,7 +3059,7 @@ record are not found; on a Linux host with no service manager, a process that le
 and lost its parent before an observation recorded it (and what such a process starts), a process the
 worker started outside the session and a process that began after the last record are not. There
 the record and the worker's own tree or terminal are all there is, and a recorded process that
-left the session is still stopped. Where a service's
+left the session is still stopped, unless it left for a control daemon's own scope. Where a service's
 control group is read, those three are reached by the group, and a process that moved itself to
 another service or scope is the one that is not found. A process that outlasts the attempt, such as
 one the platform will not let this host signal, is fenced rather than stopped: the worker that
@@ -3069,6 +3069,25 @@ coverage, so that nobody reads it as gone. The next session's control group is n
 reservation, and the number of its endpoint only grows, so no later session shares an identity with
 a survivor. Coverage is complete only where the cleanup confirmed a boundary: a control group the
 worker ran in and the kernel read empty, or a job that needed no help.
+
+**A control daemon that a session's command started.** This happens on Linux when `kr new` or
+`kr update` runs from the shell of a session. In that case the daemon starts in the service of the
+session and would be ended at the end of the service. To avoid that, if the user service manager
+responds to its request, it moves itself into a transient scope named `kr-daemon-<id>.scope` before
+it starts serving. It will not move if it is running on macOS, if there is no user service manager
+on the Linux host or if for some reason `systemd-run` does not work, or if it was started in a group
+below a service. `kr doctor` will report the service in which the daemon is running in that case.
+
+In the cases where the daemon does not move, or before it does, two mechanisms take care of ending
+the daemon at the end of the session: The service mechanism will end everything in the service at
+the end of the service. The worker will end it at the end of the session if it recorded it. On Linux
+the worker will record the process for as long as it is a descendant of the root shell of the
+session, which is to say for the entirety of the command that started the daemon. On macOS the
+worker will record the process for as long as it is running on the session's terminal, which is to
+say until the daemon moves to its own session with `setsid`. A recorded process that is later read
+in a daemon's scope is not stopped. The closure lists it as `left_for_a_daemon`, apart from the
+processes the session owned and outside the coverage decision, for as long as the worker's last
+record still holds it.
 
 **Who waits for it.** The closure is recorded after the cleanup, so a read, a list, the barrier
 and a daemon that starts beside a crashed session wait for it: about five seconds when a recorded
