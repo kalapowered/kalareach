@@ -37,10 +37,10 @@ use super::RemoteConnection;
 /// The longest a connection waits for a grant to end before it looks at the grants again, which a
 /// clock stepped forward can have ended sooner than the time they had left.
 #[cfg(not(test))]
-const GRANT_WATCH: std::time::Duration = std::time::Duration::from_secs(15);
+pub const GRANT_WATCH: std::time::Duration = std::time::Duration::from_secs(15);
 /// A test moves its clocks by hand and waits for the connection to notice.
 #[cfg(test)]
-const GRANT_WATCH: std::time::Duration = std::time::Duration::from_millis(10);
+pub const GRANT_WATCH: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Where a grant a request is decided under comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -166,9 +166,9 @@ pub struct ExactAction<'a> {
 
 /// Where a sensitive action's owner confirmation is checked.
 ///
-/// The catalogue's two confirmed methods reach the ceremony through this rather than through the
-/// network host directly, so the check is the same one whether a host is on a network or not and a
-/// test can drive a real ceremony without one.
+/// The catalogue's two confirmed methods and the transfer of control reach the ceremony through
+/// this rather than through the network host directly, so the check is the same one whether a host
+/// is on a network or not and a test can drive a real ceremony without one.
 pub trait OwnerConfirmations: Send + Sync {
     /// Accepts the owner's confirmation of one exact action and consumes its challenge.
     ///
@@ -187,13 +187,17 @@ pub trait OwnerConfirmations: Send + Sync {
     ///
     /// This is how a caller that has no owner key of its own, a terminal, has an owner's
     /// confirmation spent: it asked the host for the challenge, an owner device answered it, and
-    /// the effect it repeats spends that answer. An answer whose signer has lost its authority is
-    /// passed over.
+    /// the effect it repeats spends that answer. A digest that does not name the action (the
+    /// catalogue's) is spent by any action that repeats the effect. One that does (a transfer's,
+    /// whose new grant takes its identity from the action) is spent by that action alone, and an
+    /// answer for another action stays listed until it expires. An answer whose signer has lost its
+    /// authority is passed over.
     ///
     /// # Errors
     ///
     /// Returns `OWNER_CONFIRMATION_REQUIRED` while no answered challenge equals this action, so a
-    /// caller can ask again until the challenge's deadline.
+    /// caller can ask again until the challenge's deadline. An action whose refusal is kept does
+    /// not ask again: it is sent as a new action, with a challenge asked for that one.
     fn accept_recorded(&self, what: &ExactAction<'_>) -> Result<ConfirmedAction>;
 
     /// The host a confirmation accepted here is about.

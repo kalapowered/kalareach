@@ -2,7 +2,7 @@
 //!
 //! | Requirement | Tests |
 //! | --- | --- |
-//! | KR-REQ-09.12 | `an_answer_inside_the_limits_is_kept_whole`, `an_answer_past_the_collection_bound_is_cut_to_what_decodes_and_counts_what_it_cut`, `every_list_is_cut_to_a_prefix_in_identity_order`, `a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held`, `a_cut_barrier_reads_as_the_whole_one_would`, `a_cut_takes_the_workers_that_have_not_held_before_any_that_has`, `a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits`, `totals_raised_to_their_lists_are_measured_where_the_frame_is_nearly_full`, `names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries` |
+//! | KR-REQ-09.12 | `the_answer_to_a_transfer_is_cut_around_the_grant_it_carries`, `an_answer_inside_the_limits_is_kept_whole`, `an_answer_past_the_collection_bound_is_cut_to_what_decodes_and_counts_what_it_cut`, `every_list_is_cut_to_a_prefix_in_identity_order`, `a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held`, `a_cut_barrier_reads_as_the_whole_one_would`, `a_cut_takes_the_workers_that_have_not_held_before_any_that_has`, `a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits`, `totals_raised_to_their_lists_are_measured_where_the_frame_is_nearly_full`, `names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries` |
 
 use kr_cbor::Limits;
 use kr_protocol::action::{
@@ -10,11 +10,17 @@ use kr_protocol::action::{
 };
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 use kr_protocol::frame::{FrameCodec, StreamKind};
-use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, GrantId, RequestId, SessionId};
+use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
+use kr_protocol::ids::{
+    ActionId, ActorId, AuthorityRevision, DeviceId, GrantId, RequestId, SessionId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::receipt::ReceiptState;
-use kr_protocol::scalars::{Nullable, U64, Uuid};
-use kr_protocol::sharing::RevocationResult;
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::sharing::{GrantTransferResult, RevocationResult};
+use kr_protocol::wire::WireMessage;
+use serde::Serialize;
 
 fn grant(index: u128) -> GrantId {
     GrantId::new(Uuid::from_bytes((0x1000_u128 + index).to_be_bytes()))
@@ -67,17 +73,22 @@ fn revision() -> AuthorityRevision {
     AuthorityRevision::new(4)
 }
 
-/// The answer as the daemon writes it: inside a response frame on the control stream, then read
-/// back by the decoder every caller has.
-fn through_a_control_frame(answer: &RevocationResult) -> RevocationResult {
+/// The answer as the daemon writes it: inside a response frame on the control stream.
+fn encoded_in_a_control_frame<T: Serialize>(
+    answer: &T,
+) -> Result<Vec<u8>, kr_protocol::frame::FrameError> {
     let frame = ControlFrame::Response(Response {
         request_id: RequestId::new(7),
         outcome: Outcome::Ok(ParamsValue::from_typed(answer).expect("the answer is a value")),
     });
+    FrameCodec::new(StreamKind::Control).encode_message(&frame)
+}
+
+/// The answer as the daemon writes it: inside a response frame on the control stream, then read
+/// back by the decoder every caller has.
+fn through_a_control_frame<T: WireMessage>(answer: &T) -> T {
+    let bytes = encoded_in_a_control_frame(answer).expect("the answer fits one control frame");
     let codec = FrameCodec::new(StreamKind::Control);
-    let bytes = codec
-        .encode_message(&frame)
-        .expect("the answer fits one control frame");
     let (decoded, _) = codec
         .decode_message::<ControlFrame>(&bytes)
         .expect("the frame decodes");
@@ -408,4 +419,65 @@ fn names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries() {
             < 8_000,
         "the names are cut to what the frame carries"
     );
+}
+
+/// KR-REQ-09.12: a transfer's answer carries the grant that was written beside the revocation, and
+/// the revocation is cut around it. A revocation cut as if it travelled alone fills the frame to
+/// its reserve, and the grant and the wrapper around it then take the frame past the decoder's
+/// limit: the transfer has happened and its caller cannot read what it was told.
+#[test]
+fn the_answer_to_a_transfer_is_cut_around_the_grant_it_carries() {
+    let replacement = Grant {
+        grant_id: grant(1),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([2; 16])),
+        authority_revision: revision(),
+        environment_selector: EnvironmentSelector::Any,
+        // A grant over many sessions: a few hundred items beside the revocation, however many the
+        // revocation leaves unspent.
+        session_selector: SessionSelector::These {
+            session_ids: (0..100).map(session).collect(),
+        },
+        actions: [ActionRight::SessionView, ActionRight::SessionShare]
+            .into_iter()
+            .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(10_000),
+        },
+        organisation: Nullable::null(),
+    };
+    // Enough workers that a revocation alone is cut to the very edge of what a frame may carry.
+    let barrier = RevocationBarrier::new(
+        revision(),
+        (0..3_500)
+            .map(|index| worker(index, BarrierState::Acknowledged))
+            .collect(),
+    );
+
+    // The control: the revocation cut as if it travelled alone has no room for the grant beside it.
+    let alone = RevocationResult::bounded(revision(), (0..10).map(grant), barrier.clone());
+    assert!(alone.fits_a_frame());
+    let uncut = GrantTransferResult {
+        replacement: replacement.clone(),
+        revoked: alone,
+    };
+    assert!(
+        !uncut.fits_a_frame() && encoded_in_a_control_frame(&uncut).is_err(),
+        "the fixture fills the frame, so the grant beside the revocation does not fit"
+    );
+
+    let answer =
+        GrantTransferResult::bounded(replacement.clone(), revision(), (0..10).map(grant), barrier);
+    assert!(answer.fits_a_frame());
+    assert_eq!(answer.replacement, replacement, "the grant is kept whole");
+    assert_eq!(answer.revoked.revoked_grants_total.get(), 10);
+    assert_eq!(answer.revoked.barrier.workers_total.get(), 3_500);
+    assert_eq!(through_a_control_frame(&answer), answer);
 }

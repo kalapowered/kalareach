@@ -66,6 +66,7 @@ mod narrowing;
 mod output;
 mod routes;
 
+pub use acting::GRANT_WATCH;
 pub use decision::Answered;
 pub use output::{AUTHORITY_POLL, ExpiryObserver, RELAY_DECISIONS, RemoteOutput, WITHDRAWN};
 pub use routes::EFFECT_WAIT;

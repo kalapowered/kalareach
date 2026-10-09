@@ -927,6 +927,76 @@ fn a_redemption_whose_admission_lapsed_activates_nothing() {
         .expect("the invitation is still open under an admission that holds");
 }
 
+/// A transfer whose admission lapses while the store is waited for writes no grant and revokes
+/// nothing.
+///
+/// The check the caller hands in runs inside the transaction that writes, so a window that shut
+/// while the transfer waited for the store's lock leaves the transferring device holding what it
+/// held, and the same transfer admitted afterwards writes.
+#[test]
+fn a_transfer_whose_admission_lapsed_writes_nothing() {
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    let owner = service
+        .share(&share(SessionRole::Owner, 1), || Ok(()))
+        .expect("an owner");
+    service
+        .redeem(
+            owner.preview.invitation_id,
+            device_id(0xf1),
+            NOW + 1,
+            || Ok(()),
+            None,
+        )
+        .expect("the owner redeems it");
+    let plan = plan_of(&owner.grant, device_id(0xf2), grant_id(9));
+    let confirmed = confirm_transfer(
+        &plan,
+        &kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key"),
+    );
+
+    service
+        .transfer_control(
+            &plan,
+            &confirmed,
+            &Clock,
+            written(AuthorityRevision::new(1), NOW + 2),
+            || {
+                Err(kr_controller::error::ControllerError::WindowExpired {
+                    detail: "the window shut while this waited for the store".to_owned(),
+                })
+            },
+        )
+        .expect_err("a lapsed admission writes nothing");
+    assert!(
+        service
+            .grants()
+            .record(grant_id(9))
+            .expect("readable")
+            .is_none(),
+        "no grant was written for the receiving device"
+    );
+    assert!(
+        service
+            .grants()
+            .record(owner.grant.grant_id)
+            .expect("readable")
+            .expect("present")
+            .revoked_at_ms
+            .is_none(),
+        "and the transferring device still holds its grant"
+    );
+
+    service
+        .transfer_control(
+            &plan,
+            &confirmed,
+            &Clock,
+            written(AuthorityRevision::new(1), NOW + 3),
+            || Ok(()),
+        )
+        .expect("the same transfer, admitted, writes");
+}
+
 #[test]
 fn an_invitation_is_single_use_and_expires() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
@@ -1577,6 +1647,29 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
         "unexpected refusal: {error}"
     );
 
+    // Nor be issued or delegated otherwise: whoever could revoke the grant given up can revoke its
+    // replacement, and nobody else can.
+    let reparented = TransferControlPlan {
+        parent_grant_id: kr_protocol::scalars::Nullable::some(grant_id(0x77)),
+        ..plan.clone()
+    };
+    let error = transfer::check_transfer(&reparented, &owner.grant)
+        .expect_err("a transfer is delegated from the grant's own parent");
+    assert!(
+        error.to_string().contains("issued or delegated"),
+        "unexpected refusal: {error}"
+    );
+    let reissued = TransferControlPlan {
+        issuer_device_id: device_id(0x77),
+        ..plan.clone()
+    };
+    let error = transfer::check_transfer(&reissued, &owner.grant)
+        .expect_err("a transfer is issued by the grant's own issuer");
+    assert!(
+        error.to_string().contains("issued or delegated"),
+        "unexpected refusal: {error}"
+    );
+
     // Nor reach further than the grant it takes from in time: a grant that ends is not replaced
     // by one that never does.
     let outliving = TransferControlPlan {
@@ -1787,6 +1880,7 @@ async fn transferring_control_through_the_daemon_completes_through_the_barrier()
         )
         .expect("the owner redeems it");
 
+    receiver_paired(&controller);
     let plan = plan_of(&owner.grant, device_id(0xf2), grant_id(9));
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
     // Evidence the owner gave for **another** host does not authorise a transfer on this one, even
@@ -1802,15 +1896,16 @@ async fn transferring_control_through_the_daemon_completes_through_the_barrier()
 
     let confirmed = confirm_transfer_for(&plan, host_device_id, &owner_key);
     let before = controller.policy().authority_revision();
-    let (transfer, completed) = tokio::time::timeout(
+    let answered = tokio::time::timeout(
         Duration::from_secs(20),
         controller.transfer_control(&plan, &confirmed, &Clock, None, None),
     )
     .await
     .expect("the transfer completes")
     .expect("it succeeds");
+    let completed = answered.revoked;
 
-    assert_eq!(transfer.issued.recipient_device_id, device_id(0xf2));
+    assert_eq!(answered.replacement.recipient_device_id, device_id(0xf2));
     assert!(
         completed.authority_revision.get() > before.get(),
         "a transfer withdraws authority, so it advances the revision"
@@ -1953,12 +2048,48 @@ fn shared_and_redeemed(controller: &Controller, byte: u8, device: DeviceId) -> G
         .expect("the device redeems it")
 }
 
+/// The device a transfer hands control to, paired with this host: a transfer is written only for a
+/// device that is paired when it is written.
+fn receiver_paired(controller: &Controller) {
+    let device = device_id(0xf2);
+    if controller
+        .devices()
+        .record_for_device(device)
+        .expect("readable")
+        .is_some()
+    {
+        return;
+    }
+    controller
+        .devices()
+        .commit(&kr_controller::service::net::devices::DeviceRecord {
+            device_id: device,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([0xf2; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([0xf2; 32]),
+            stored_envelope: None,
+            notification_preview: None,
+            device_name: kr_protocol::pairing::DeviceName::new("a phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant: Grant {
+                recipient_device_id: device,
+                ..an_owner_grant()
+            },
+            paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+            revoked_at_ms: None,
+            committed_invitation_id: None,
+            expired_at_ms: None,
+        })
+        .expect("the device is paired");
+}
+
 /// Transfers `source` from the device holding it to another, with the owner's confirmation.
 async fn transfer_to_another(
     controller: &Controller,
     source: &Grant,
     issuing: GrantId,
 ) -> kr_controller::error::Result<()> {
+    receiver_paired(controller);
     let plan = plan_of(source, device_id(0xf2), issuing);
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
     let confirmed = confirm_transfer_for(

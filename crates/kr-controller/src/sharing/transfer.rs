@@ -63,8 +63,9 @@ pub struct ControlTransfer {
 ///
 /// Returns [`ControllerError::PermissionDenied`] when the transferring grant is not the one the
 /// plan gives up or is not its device's, does not carry `session.share`, does not cover the
-/// session, does not carry a right the plan hands over, or is narrower than the grant the plan
-/// writes in the environments it reaches, the history it shows, its lifetime or its organisation.
+/// session, does not carry a right the plan hands over, names another issuer or parent than the
+/// grant it gives up, or is narrower than the grant the plan writes in the environments it
+/// reaches, the history it shows, its lifetime or its organisation.
 pub fn check_transfer(plan: &TransferControlPlan, holding: &Grant) -> Result<()> {
     if holding.grant_id != plan.source_grant_id {
         return Err(ControllerError::PermissionDenied {
@@ -99,6 +100,16 @@ pub fn check_transfer(plan: &TransferControlPlan, holding: &Grant) -> Result<()>
                 "this transfer hands over {}, which the transferring grant does not carry",
                 right.as_str()
             ),
+        });
+    }
+    // The new grant is issued and delegated as the one given up was, so whoever could revoke that
+    // one can revoke this one, and nobody else can.
+    if plan.parent_grant_id != holding.parent_grant_id
+        || plan.issuer_device_id != holding.issuer_device_id
+    {
+        return Err(ControllerError::PermissionDenied {
+            detail: "this transfer is not issued or delegated as the transferring grant was"
+                .to_owned(),
         });
     }
     // The new grant reaches no further than the one given up, in anything it can reach.

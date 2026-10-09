@@ -9,6 +9,7 @@
 
 mod net_support;
 
+use kr_controller::service::net::dispatch::GRANT_WATCH;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::confirmation::{
     ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationRequestParams,
@@ -204,13 +205,14 @@ async fn kr_req_18_03_a_transfer_hands_a_session_to_another_device_on_the_owners
     );
 
     // The connection acting under the grant that was given up is ended when the transfer takes
-    // effect, and not when the host next looks at the grants it stands on, which is much later than
-    // this waits. The receiving device is decided under the grant it was given: its pairing grant
-    // reaches no session, so the replacement is the only thing that admits it, and there is no
-    // worker to answer.
+    // effect, and not when the host next looks at the grants it stands on, which is `GRANT_WATCH`
+    // later at the latest: it has to close within a third of that, so a connection that waited for
+    // the look misses by two thirds of it. The receiving device is decided under the grant it was
+    // given: its pairing grant reaches no session, so the replacement is the only thing that
+    // admits it, and there is no worker to answer.
     assert_eq!(
         giving
-            .answered_before_closing(RequestId::new(u64::MAX), std::time::Duration::from_secs(5))
+            .answered_before_closing(RequestId::new(u64::MAX), GRANT_WATCH / 3)
             .await,
         Some(false),
         "the giving device's connection is ended with its grant"

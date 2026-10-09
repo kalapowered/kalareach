@@ -744,6 +744,17 @@ impl RevocationResult {
         revoked_grants: impl IntoIterator<Item = GrantId>,
         barrier: RevocationBarrier,
     ) -> Self {
+        Self::bounded_beside(Cost::default(), authority_revision, revoked_grants, barrier)
+    }
+
+    /// The same answer, for one that travels in a frame beside something else, which `beside`
+    /// has already spent of the decoder's limits.
+    fn bounded_beside(
+        beside: Cost,
+        authority_revision: AuthorityRevision,
+        revoked_grants: impl IntoIterator<Item = GrantId>,
+        barrier: RevocationBarrier,
+    ) -> Self {
         let limits = kr_cbor::Limits::DEFAULT;
         let collection = limits.max_collection_len;
         let revoked: CanonicalSet<GrantId> = revoked_grants.into_iter().collect();
@@ -793,10 +804,12 @@ impl RevocationResult {
             items: limits
                 .max_items
                 .saturating_sub(FRAME_RESERVE_ITEMS)
+                .saturating_sub(beside.items)
                 .saturating_sub(fixed.items),
             bytes: limits
                 .max_message_len
                 .saturating_sub(FRAME_RESERVE_BYTES)
+                .saturating_sub(beside.bytes)
                 .saturating_sub(fixed.bytes),
         };
 
@@ -861,12 +874,50 @@ impl RevocationResult {
     /// Whether this answer decodes inside the decoder's limits, with the frame around it.
     #[must_use]
     pub fn fits_a_frame(&self) -> bool {
-        let limits = kr_cbor::Limits::DEFAULT;
-        Cost::of(self).is_some_and(|cost| {
-            cost.items <= limits.max_items - FRAME_RESERVE_ITEMS
-                && cost.bytes <= limits.max_message_len - FRAME_RESERVE_BYTES
-        })
+        fits_a_frame(self)
     }
+}
+
+impl GrantTransferResult {
+    /// The answer to a transfer, with the revocation cut to what is left of a frame beside the
+    /// grant that was written.
+    ///
+    /// The revocation takes effect, and the grant is written, whatever the size of what the
+    /// revocation withdrew, so the grant is kept whole and the revocation is cut around it as
+    /// [`RevocationResult::bounded`] cuts it.
+    #[must_use]
+    pub fn bounded(
+        replacement: Grant,
+        authority_revision: AuthorityRevision,
+        revoked_grants: impl IntoIterator<Item = GrantId>,
+        barrier: RevocationBarrier,
+    ) -> Self {
+        let beside = Cost::of(&replacement).unwrap_or_default();
+        Self {
+            revoked: RevocationResult::bounded_beside(
+                beside,
+                authority_revision,
+                revoked_grants,
+                barrier,
+            ),
+            replacement,
+        }
+    }
+
+    /// Whether this answer decodes inside the decoder's limits, with the frame around it.
+    #[must_use]
+    pub fn fits_a_frame(&self) -> bool {
+        fits_a_frame(self)
+    }
+}
+
+/// Whether `answer` decodes inside the decoder's limits, with the frame around it.
+fn fits_a_frame<T: Serialize>(answer: &T) -> bool {
+    let limits = kr_cbor::Limits::DEFAULT;
+    Cost::of(answer).is_some_and(|cost| {
+        cost.items <= limits.max_items - FRAME_RESERVE_ITEMS
+            && cost.bytes <= limits.max_message_len - FRAME_RESERVE_BYTES
+    })
 }
 
 /// Parameters of `grant.list`.
