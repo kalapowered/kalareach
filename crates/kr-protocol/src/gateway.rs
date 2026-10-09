@@ -705,13 +705,15 @@ impl RichMethodTable {
 
     /// Checks that the table is well formed and pinned to the installed upstream version.
     ///
+    /// A table that lists no method is well formed: a connector that declares no rich method of
+    /// its own has a closed table with nothing in it, and every rich invocation is refused as
+    /// unknown.
+    ///
     /// # Errors
     ///
-    /// Returns the same [`TableError`] values a declarative table does.
+    /// Returns the same [`TableError`] values a declarative table does, except that an empty table
+    /// is valid.
     pub fn qualify(&self, installed_protocol_version: &str) -> Result<(), TableError> {
-        if self.entries.is_empty() {
-            return Err(TableError::Empty);
-        }
         if self.entries.len() > MAX_TABLE_METHODS {
             return Err(TableError::TooManyMethods {
                 methods: self.entries.len(),
