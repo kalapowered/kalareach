@@ -1358,13 +1358,24 @@ mod platform {
     use libproc::processes::{ProcFilter, pids_by_type};
     use sysctl::Sysctl as _;
 
+    /// Lists the processes a filter names.
+    ///
+    /// The kernel answers a listing that finds nothing and a listing that failed with the same
+    /// length, zero, and the library tells them apart by the calling thread's error number alone.
+    /// A number that an earlier failed call on this thread left behind would make an empty group
+    /// or terminal read as that call's failure, so the number is cleared first.
+    fn list(filter: ProcFilter) -> std::io::Result<Vec<u32>> {
+        super::macos_errno::clear();
+        pids_by_type(filter)
+    }
+
     pub(super) fn processes_in_group(group: u32) -> super::Result<Vec<u32>> {
-        pids_by_type(ProcFilter::ByProgramGroup { pgrpid: group })
+        list(ProcFilter::ByProgramGroup { pgrpid: group })
             .map_err(|error| super::unavailable("process group", format!("group {group}: {error}")))
     }
 
     pub(super) fn processes_on_terminal(terminal: u32) -> super::Result<Vec<u32>> {
-        pids_by_type(ProcFilter::ByTTY { tty: terminal }).map_err(|error| {
+        list(ProcFilter::ByTTY { tty: terminal }).map_err(|error| {
             super::unavailable(
                 "controlling terminal",
                 format!("terminal {terminal}: {error}"),
@@ -1580,6 +1591,25 @@ mod platform {
             .find(|character: char| !character.is_ascii_digit())
             .map_or(after, |end| &after[..end]);
         digits.parse().ok()
+    }
+}
+
+/// The one place on macOS that writes the calling thread's error number.
+///
+/// The crate denies unsafe code and relaxes the rule here: the number lives in the C library's
+/// per-thread storage, and std offers no way to write it.
+#[cfg(target_os = "macos")]
+mod macos_errno {
+    #![expect(
+        unsafe_code,
+        reason = "the calling thread's error number can only be written through the C library"
+    )]
+
+    /// Sets the calling thread's error number to zero.
+    pub(super) fn clear() {
+        // SAFETY: `__error` returns the address of the calling thread's own error number, which
+        // is valid for the life of the thread and is read and written by that thread alone.
+        unsafe { *libc::__error() = 0 };
     }
 }
 
