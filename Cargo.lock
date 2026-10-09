@@ -4483,6 +4483,7 @@ dependencies = [
  "kr-controller",
  "kr-e2e-m1b",
  "kr-ipc",
+ "kr-plugin-sdk",
  "kr-protocol",
  "kr-worker",
  "memchr",

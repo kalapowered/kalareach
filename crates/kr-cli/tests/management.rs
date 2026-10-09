@@ -836,6 +836,21 @@ fn install_line() -> Vec<&'static str> {
     ]
 }
 
+/// An installation whose grant holds a command integration.
+fn command_integration_install_line() -> Vec<&'static str> {
+    vec![
+        "plugin",
+        "install",
+        "community",
+        PACKAGE,
+        "0.1.0",
+        "--digest",
+        PACKAGE_DIGEST,
+        "--grant",
+        "command_integration.launch",
+    ]
+}
+
 /// An installation whose grant holds a native bridge.
 fn native_bridge_install_line() -> Vec<&'static str> {
     vec![
@@ -862,6 +877,10 @@ struct Seen {
 /// The publisher's own words for the release the installation cases name.
 const STATEMENT: &str =
     "Adds one registration file under the application's own directory, which it runs.";
+
+/// The host's reading of the command integration the installation cases name.
+const INTEGRATION_READING: &str = "Runs \"codex\" in KalaReach sessions with these arguments \
+     added, in this order: \"--remote\" \"{gateway}\". It sets no environment variables.";
 
 /// A scripted daemon's owner device: the challenge it issues, what a device is shown for it, and
 /// the answer the effect gets once a device has answered.
@@ -936,11 +955,18 @@ impl OwnerDevice {
                 version: params.version.clone(),
                 package_digest: params.package_digest.clone(),
                 grant: params.grant.iter().cloned().collect(),
-                grant_statement: params
-                    .grant
-                    .iter()
-                    .any(|name| name == "native_bridge.install")
-                    .then(|| STATEMENT.to_owned()),
+                grant_statement: kr_protocol::confirmation::install_statement(
+                    params
+                        .grant
+                        .iter()
+                        .any(|name| name == "native_bridge.install")
+                        .then_some(STATEMENT),
+                    params
+                        .grant
+                        .iter()
+                        .any(|name| name == "command_integration.launch")
+                        .then_some(INTEGRATION_READING),
+                ),
             }
             .display(),
             other => panic!("a terminal asks for no challenge for {other:?}"),
@@ -1366,6 +1392,58 @@ async fn an_installation_confirmed_on_an_owner_device_is_installed_with_the_publ
     assert_eq!(document["plugin"]["plugin_id"], PACKAGE, "{document}");
     assert!(document.get("confirmation").is_none(), "{document}");
     assert_eq!(*asked.lock().expect("the record"), ["plugin.install"]);
+    serving.abort();
+}
+
+/// KR-REQ-12.07: an installation whose grant holds a command integration is asked for on an owner
+/// device the same way, and the terminal says what that device is shown: the host's own notice that
+/// the package changes how a command starts and the host's reading of what it declares, with no
+/// claim that a native bridge is installed. The control is the bridge installation above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_with_a_command_integration_is_shown_the_hosts_reading_of_it() {
+    use kr_protocol::confirmation::{
+        COMMAND_INTEGRATION_NOTICE, INTEGRATION_STATEMENT_LABEL, NATIVE_BRIDGE_NOTICE,
+    };
+    let temp = kr_ipc::testing::TempHost::create();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (_asked, serving) = scripted_daemon(
+        &temp,
+        OwnerDevice {
+            effect: "plugin.install",
+            refusals: Some(3),
+            expires_at_ms: kr_ipc::now_ms().get() + 600_000,
+            initial_bootstrap: false,
+            budgets: allowed(),
+            answer: installed(&temp),
+        }
+        .script(&temp, Arc::clone(&seen)),
+    );
+    let output = run_kr(&temp, &command_integration_install_line());
+    let said = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{said}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said.contains(COMMAND_INTEGRATION_NOTICE),
+        "the host's own notice of the integration: {said}"
+    );
+    assert!(
+        !said.contains(NATIVE_BRIDGE_NOTICE),
+        "no bridge is installed, so none is claimed: {said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "the statement: {INTEGRATION_STATEMENT_LABEL} {INTEGRATION_READING}"
+        )),
+        "the host's reading, labelled as the host's: {said}"
+    );
+    assert!(
+        !said.contains("the publisher says"),
+        "none of it is the publisher's words: {said}"
+    );
     serving.abort();
 }
 

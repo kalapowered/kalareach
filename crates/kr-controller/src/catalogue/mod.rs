@@ -1667,20 +1667,16 @@ impl CatalogueModule {
                         ),
                     ));
                 }
-                // A release that asks for a native bridge is granted to only by installing it, where
-                // the owner is shown the publisher's own statement of what the bridge does and the
-                // host's notice that it runs outside the plugin sandbox. This refuses before the
-                // owner's proof is spent, so a refused widening consumes no confirmation; the
-                // catalogue refuses it again inside the commit.
-                if let Some(added) = installed.widening_for_a_bridge(&grant) {
+                // A release that asks for a native bridge is granted to only by installing it, and
+                // so is the command integration of one that asks for that: the owner is shown the
+                // publisher's statement of the bridge, or the host's reading of the integration,
+                // and the host's notice of it. This refuses before the owner's proof is spent, so
+                // a refused widening consumes no confirmation; the catalogue refuses it again
+                // inside the commit.
+                if let Some(added) = installed.widening_for_a_statement(&grant) {
                     return Err(ProtocolError::from(CatalogueError::GrantRequired {
                         capability: added,
-                        requirement: "plugin.install of the installed release: it asks for a \
-                                      native bridge, so a grant that adds to what it holds is \
-                                      made when the owner confirms the release, which shows the \
-                                      publisher's own statement of what the bridge does and the \
-                                      host's notice that it runs outside the plugin sandbox"
-                            .to_owned(),
+                        requirement: installed.install_requirement(added),
                     }));
                 }
                 let plan = kr_protocol::confirmation::PluginGrantPlan {
@@ -2457,7 +2453,8 @@ fn plan_error(error: kr_cbor::CborError) -> ProtocolError {
 
 /// The plan an installation's confirmation covers, from the exact request and what this host
 /// holds: the repository's ceiling as `catalogue.list` reports it and, where the grant asks for a
-/// native bridge, the statement the signed index's own manifest for this release makes of it.
+/// native bridge or a command integration, the statement the signed index's own manifest for this
+/// release makes of it.
 ///
 /// Returns the repository's ceiling beside the plan, which the catalogue holds the installation to.
 async fn install_plan(
@@ -2479,13 +2476,18 @@ async fn install_plan(
                 format!("{repository} is not enrolled"),
             )
         })?;
-    let grant_statement = if params
-        .grant
-        .iter()
-        .any(|name| name == PluginCapability::NativeBridgeInstall.as_str())
+    let grant = grant_from(&params.grant)?;
+    let grant_statement = if grant.holds(PluginCapability::NativeBridgeInstall)
+        || grant.holds(PluginCapability::CommandIntegrationLaunch)
     {
         catalogue
-            .grant_statement(&repository, &params.plugin_id, &release, package_hash)
+            .grant_statement(
+                &repository,
+                &params.plugin_id,
+                &release,
+                package_hash,
+                &grant,
+            )
             .await
             .map_err(ProtocolError::from)?
     } else {

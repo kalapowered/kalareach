@@ -29,7 +29,7 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_pairing::platform::PairingClock;
 use kr_protocol::confirmation::{
     CLOCK_PURPOSE, CatalogueTrustPlan, ConfirmationDisplay, DescribedAction,
-    OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
+    INTEGRATION_STATEMENT_LABEL, OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
     OwnerConfirmationPendingResult, PendingConfirmation, PluginInstallPlan,
 };
 use kr_protocol::envelope::ActionTarget;
@@ -625,21 +625,31 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
             }
             Subject::PluginInstall(plan) => {
                 let package = hash_start(&plan.package_digest).ok_or(CannotCheck::CannotShow)?;
-                let bridge = plan.grant_statement.is_some()
-                    || plan.grant.contains(&"native_bridge.install".to_owned());
-                let granting = match (plan.grant.len(), bridge) {
-                    (0, false) => "nothing beyond what the repository allows".to_owned(),
-                    (0, true) => "a native bridge that runs outside the plugin sandbox".to_owned(),
-                    (1, false) => "1 capability".to_owned(),
-                    (more, false) => format!("{more} capabilities"),
-                    (1, true) => {
-                        "1 capability, a native bridge that runs outside the plugin sandbox"
-                            .to_owned()
+                // What the grant lets the package do that the host describes in its own words. A
+                // grant that holds both says less of each, to stay inside the one line a dialog
+                // shows.
+                let held = |name: &str| plan.grant.contains(&name.to_owned());
+                let among = |what: &str| match plan.grant.len() {
+                    1 => format!("1 capability, {what}"),
+                    more => format!("{more} capabilities, among them {what}"),
+                };
+                let granting = match (
+                    plan.grant.len(),
+                    held("native_bridge.install"),
+                    held("command_integration.launch"),
+                ) {
+                    (0, ..) => "nothing beyond what the repository allows".to_owned(),
+                    (1, false, false) => "1 capability".to_owned(),
+                    (more, false, false) => format!("{more} capabilities"),
+                    (_, true, false) => {
+                        among("a native bridge that runs outside the plugin sandbox")
                     }
-                    (more, true) => format!(
-                        "{more} capabilities, among them a native bridge that runs outside the \
-                         plugin sandbox"
-                    ),
+                    (_, false, true) => {
+                        among("a command integration that changes how a command starts")
+                    }
+                    (_, true, true) => {
+                        among("a native bridge outside the sandbox and a command integration")
+                    }
                 };
                 format!(
                     "install {} {} from {} on {host}, granting {granting}; package starts \
@@ -709,8 +719,14 @@ const fn platform(platform: DevicePlatform) -> &'static str {
 /// The longest address, name or identifier an enrolment or an installation shows whole.
 pub const FIELD_CHARS: usize = 2048;
 
-/// The longest statement a publisher's manifest may carry, and so the longest shown whole.
-pub const STATEMENT_CHARS: usize = 1000;
+/// The longest statement an installation's confirmation carries, and so the longest shown whole:
+/// the publisher's statement of a native bridge, the host's label, and the host's reading of a
+/// command integration, each at the longest the package contract allows.
+pub const STATEMENT_CHARS: usize = kr_plugin_sdk::text::Summary::LIMIT
+    + 1
+    + INTEGRATION_STATEMENT_LABEL.len()
+    + 1
+    + kr_plugin_sdk::integration::MAX_STATEMENT_CHARS;
 
 /// True when `text` is one line a person reads as it is written: no control character, no
 /// character that reorders or hides text, and no white space but the space.
@@ -1598,6 +1614,35 @@ mod tests {
             "install kalareach/claude-code 0.3.0 from community on studio, granting nothing \
              beyond what the repository allows; package starts e5f6 0718"
         );
+        // A command integration is named for what it is, and a bridge is not claimed for it; a
+        // grant that holds both names both.
+        let integrating = |grant: &[&str]| {
+            Subject::PluginInstall(PluginInstallPlan {
+                grant: grant.iter().map(|name| (*name).to_owned()).collect(),
+                ..install_plan()
+            })
+        };
+        let line =
+            reason(&integrating(&["command_integration.launch"]), "studio", NOW).expect("a line");
+        assert!(
+            line.contains(
+                "granting 1 capability, a command integration that changes how a command starts"
+            ) && !line.contains("native bridge"),
+            "{line}"
+        );
+        let line = reason(
+            &integrating(&["command_integration.launch", "native_bridge.install"]),
+            "studio",
+            NOW,
+        )
+        .expect("a line");
+        assert!(
+            line.contains(
+                "granting 2 capabilities, among them a native bridge outside the sandbox and a \
+                 command integration"
+            ),
+            "{line}"
+        );
 
         let long = Subject::PluginInstall(PluginInstallPlan {
             catalogue_id: "community".repeat(30),
@@ -1607,6 +1652,23 @@ mod tests {
         assert!(line.chars().count() <= MAX_REASON_CHARS, "{line}");
         assert!(
             line.contains("runs outside the plugin sandbox"),
+            "authority is never shortened away: {line}"
+        );
+        // A grant that holds a command integration as well still has its line, with both named.
+        let both = Subject::PluginInstall(PluginInstallPlan {
+            catalogue_id: "community".repeat(30),
+            grant: [
+                "command_integration.launch".to_owned(),
+                "native_bridge.install".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            ..install_plan()
+        });
+        let line = reason(&both, &"h".repeat(120), NOW).expect("a line");
+        assert!(line.chars().count() <= MAX_REASON_CHARS, "{line}");
+        assert!(
+            line.contains("a native bridge outside the sandbox and a command integration"),
             "authority is never shortened away: {line}"
         );
 
@@ -1686,7 +1748,7 @@ mod tests {
             ..install_plan()
         }));
         subjects.push(Subject::PluginInstall(PluginInstallPlan {
-            grant_statement: Some("x".repeat(kr_plugin_sdk::text::Summary::LIMIT + 1)),
+            grant_statement: Some("x".repeat(STATEMENT_CHARS + 1)),
             ..install_plan()
         }));
         subjects.push(Subject::PluginInstall(PluginInstallPlan {
@@ -1703,6 +1765,13 @@ mod tests {
         // The control: the same plans with the text as written.
         assert!(reason(&Subject::CatalogueAdd(trust_plan()), "studio", NOW).is_ok());
         assert!(reason(&Subject::PluginInstall(install_plan()), "studio", NOW).is_ok());
+        // The longest statement a bridge's words and an integration's reading can make together
+        // is shown whole.
+        let longest = Subject::PluginInstall(PluginInstallPlan {
+            grant_statement: Some("x".repeat(STATEMENT_CHARS)),
+            ..install_plan()
+        });
+        assert!(is_showable(&longest));
     }
 
     /// A review of one listed challenge on a listing of its own, and what the person was asked and

@@ -33,8 +33,9 @@ use kr_protocol::catalogue::{
     PluginPinResult, PluginRemoveParams, PluginRemoveResult, PluginSummary,
 };
 use kr_protocol::confirmation::{
-    ConfirmationDisplay, ConfirmationSubject, NATIVE_BRIDGE_NOTICE, OwnerConfirmationPendingParams,
+    ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationPendingParams,
     OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
+    install_notices,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{PluginId, RepositoryGeneration};
@@ -451,7 +452,8 @@ fn remaining(until_ms: u64, now_ms: u64) -> Shown {
 /// Says what an owner device is asked to confirm, as the host resolved it from the request.
 ///
 /// A native bridge's statement is the publisher's own words, and is written apart from the host's
-/// own notice that such a bridge runs outside the plugin sandbox.
+/// own notice that such a bridge runs outside the plugin sandbox. A command integration's is the
+/// host's exact reading of the declaration, with the host's notice of it.
 fn say_what_is_asked(display: &ConfirmationDisplay) {
     match display {
         ConfirmationDisplay::CatalogueAdd {
@@ -496,10 +498,23 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
                 Asked::text(Request::Plugins, catalogue_id),
                 Asked::text(Request::Plugins, &grant.join(", "))
             ));
+            for notice in install_notices(grant) {
+                output::line(&stdout_line!("{}", Shown::said(notice)));
+            }
             if let Some(statement) = &grant_statement.0 {
-                output::line(&stdout_line!("{}", Shown::said(NATIVE_BRIDGE_NOTICE)));
+                // A statement of a bridge alone is the publisher's own words. With an integration
+                // in the grant it holds the host's reading too, after a label that says so.
+                let who = if grant
+                    .iter()
+                    .any(|name| name == "command_integration.launch")
+                {
+                    "the statement"
+                } else {
+                    "the publisher says"
+                };
                 output::line(&stdout_line!(
-                    "  the publisher says: {}",
+                    "  {}: {}",
+                    Shown::said(who),
                     Asked::text(Request::Plugins, statement)
                 ));
             }
