@@ -18826,6 +18826,78 @@
       ],
       "type": "object"
     },
+    "MembershipPresentParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `membership.present`.",
+      "properties": {
+        "authority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyAuthority"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The organisation's chain, when it has moved since the host last accepted one. A chain\nthat is not newer changes nothing, and the lease beside it is still judged against the\nkeys the host already holds. A newer chain that does not verify refuses the presentation."
+        },
+        "lease": {
+          "$ref": "#/$defs/MembershipLease",
+          "description": "The lease the organisation signed for this device. The device the lease names is the one\nthat presents it: a host refuses a lease that names another device's key."
+        }
+      },
+      "required": [
+        "lease",
+        "authority"
+      ],
+      "type": "object"
+    },
+    "MembershipPresentResult": {
+      "additionalProperties": false,
+      "description": "The result of `membership.present`.",
+      "properties": {
+        "account_id": {
+          "$ref": "#/$defs/AccountId",
+          "description": "The member account it names."
+        },
+        "exclusive": {
+          "description": "Whether this host is exclusively organisation-managed.",
+          "type": "boolean"
+        },
+        "exclusive_ended_at_terminal_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last time exclusive management was turned off at this host's terminal, or null when it\nnever was. A member's client carries it to the organisation with its next lease request."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it stops being usable, in UTC milliseconds."
+        },
+        "key_revision": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The key revision that signed it."
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation the lease speaks for."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "account_id",
+        "key_revision",
+        "expires_at_ms",
+        "exclusive",
+        "exclusive_ended_at_terminal_ms"
+      ],
+      "type": "object"
+    },
     "MeteringRole": {
       "description": "A forwarding boundary inside one relay instance.\n\nA payload crosses two boundaries at a relay: it is read from the sending connection and it is\nwritten to the receiving one. They are not the same event. A payload counted as it arrives may\nstill be fenced by a revocation, dropped for a full queue or lost to a closing connection before\nit is delivered, so which boundary counts decides what the payer pays for.",
       "oneOf": [
@@ -18942,6 +19014,11 @@
         {
           "const": "organisation.list",
           "description": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
+          "type": "string"
+        },
+        {
+          "const": "membership.present",
+          "description": "Present the membership lease the organisation signed for this device, with the organisation's chain when it has moved, so the host answers for the device while the lease lasts. The device acts on its own standing and proves its own key.",
           "type": "string"
         },
         {
@@ -39302,6 +39379,12 @@
     },
     "membership_lease": {
       "$ref": "#/$defs/MembershipLease"
+    },
+    "membership_present_params": {
+      "$ref": "#/$defs/MembershipPresentParams"
+    },
+    "membership_present_result": {
+      "$ref": "#/$defs/MembershipPresentResult"
     },
     "method_entry": {
       "$ref": "#/$defs/MethodEntry"

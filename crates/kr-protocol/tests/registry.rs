@@ -640,6 +640,25 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // A member's device presents the lease its organisation signed for it, and nobody presents
+    // for anyone else: the method is the device's own, over the paired door alone, behind its own
+    // key and no right of the grant, since a device whose grant needs a lease cannot hold a right
+    // before it has one. It asks for no owner confirmation, because it only ever narrows or
+    // renews what the organisation signed.
+    let presenting = lookup("membership.present").expect("membership.present is in the registry");
+    assert_eq!(presenting.effect, EffectClass::Write);
+    assert_eq!(presenting.ingress, &[ActorIngress::PairedDevice]);
+    assert_eq!(
+        presenting.required_rights,
+        &[RequiredRight::basis(RequiredAuthority::ResourceOwner)],
+        "a device presents on its own standing, not on a right"
+    );
+    assert_eq!(presenting.confirmation, ConfirmationRequirement::None);
+    assert!(
+        matches!(presenting.idempotency, IdempotencyBehaviour::Keyed { .. }),
+        "a repeat of a presentation is the same lease, decided again"
+    );
+
     // No method in the group may reach a right that changes code or Git state. Section 23's rule
     // for this row is "no code mutation", and this is where that stops being a convention.
     for entry in REGISTRY
@@ -757,6 +776,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + owner.len()
             + clock.len()
             + organisation.len()
+            + 1
             + inspection.len(),
         "the registry holds the required methods and the named additions"
     );

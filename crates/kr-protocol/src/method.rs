@@ -501,6 +501,14 @@ methods! {
           bound to member accounts and the lease each holds, whether exclusive management is on, \
           and every time it was turned off, with how the owner confirmed it.";
 
+    MembershipPresent = "membership.present", HostAndEnvironment,
+    effect: Write, ingress: [PairedDevice], rights: [basis(ResourceOwner)], selectors: [Device],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: keyed("the lease's signing-input digest"),
+    doc: "Present the membership lease the organisation signed for this device, with the \
+          organisation's chain when it has moved, so the host answers for the device while the \
+          lease lasts. The device acts on its own standing and proves its own key.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],

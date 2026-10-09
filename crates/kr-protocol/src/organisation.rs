@@ -1,9 +1,11 @@
 //! Organisation policy on a host: opting in, and what the host reports of it.
 //!
 //! A host opts into an organisation's policy by pinning the chain of keys that signs it, on an
-//! owner's confirmation of exactly that chain (`organisation.enrol`). `organisation.list` reports
-//! what the host holds for each organisation, whether it is exclusively organisation-managed and
-//! every time that was turned off.
+//! owner's confirmation of exactly that chain (`organisation.enrol`). A member's device then
+//! presents the lease the organisation signed for it (`membership.present`), and the host answers
+//! for that device while the lease lasts. `organisation.list` reports what the host holds for each
+//! organisation, whether it is exclusively organisation-managed and every time that was turned
+//! off.
 //!
 //! What the host holds for an organisation is a key chain it verified when it enrolled and the
 //! rotations it has followed since, each through a link the anchor's own key signed. A lease is
@@ -12,6 +14,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::account::MembershipLease;
 use crate::account::PolicyAuthority;
 use crate::action::RevocationBarrier;
 use crate::ids::{AccountId, AuthorityRevision, DeviceId, OrganisationId, PolicyKeyRevision};
@@ -140,6 +143,38 @@ pub struct OrganisationListResult {
     pub clock_trusted: bool,
     /// Every time exclusive management was turned off, oldest first.
     pub exclusive_events: Vec<ExclusiveManagementEvent>,
+}
+
+/// The parameters of `membership.present`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipPresentParams {
+    /// The lease the organisation signed for this device. The device the lease names is the one
+    /// that presents it: a host refuses a lease that names another device's key.
+    pub lease: MembershipLease,
+    /// The organisation's chain, when it has moved since the host last accepted one. A chain
+    /// that is not newer changes nothing, and the lease beside it is still judged against the
+    /// keys the host already holds. A newer chain that does not verify refuses the presentation.
+    pub authority: Nullable<PolicyAuthority>,
+}
+
+/// The result of `membership.present`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipPresentResult {
+    /// The organisation the lease speaks for.
+    pub organisation_id: OrganisationId,
+    /// The member account it names.
+    pub account_id: AccountId,
+    /// The key revision that signed it.
+    pub key_revision: PolicyKeyRevision,
+    /// When it stops being usable, in UTC milliseconds.
+    pub expires_at_ms: TimestampMs,
+    /// Whether this host is exclusively organisation-managed.
+    pub exclusive: bool,
+    /// The last time exclusive management was turned off at this host's terminal, or null when it
+    /// never was. A member's client carries it to the organisation with its next lease request.
+    pub exclusive_ended_at_terminal_ms: Nullable<TimestampMs>,
 }
 
 /// What the claim of an organisation change keeps while its answer is still to be built from the

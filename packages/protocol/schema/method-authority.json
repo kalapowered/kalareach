@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 164,
+  "method_count": 165,
   "methods": [
     {
       "capability": "none",
@@ -551,6 +551,35 @@
         "host"
       ],
       "summary": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "the lease's signing-input digest"
+        }
+      },
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "membership.present",
+      "name": "membership.present",
+      "required_rights": [
+        {
+          "authority": "resource_owner",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "device"
+      ],
+      "summary": "Present the membership lease the organisation signed for this device, with the organisation's chain when it has moved, so the host answers for the device while the lease lasts. The device acts on its own standing and proves its own key.",
       "version": 1
     },
     {
