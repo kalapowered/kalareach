@@ -824,6 +824,7 @@ fn owned_record(
         cgroup: None,
         boundary: "the terminal's process group".to_owned(),
         limits: Vec::new(),
+        backends: Vec::new(),
     }
 }
 
@@ -899,6 +900,69 @@ async fn a_crash_stops_the_processes_the_worker_recorded_and_no_other() {
         fenced.coverage,
         OwnershipCoverage::Incomplete,
         "nothing here proves a boundary, so the coverage is incomplete"
+    );
+}
+
+/// A server the worker started is asked to end with a terminate and no hang-up. A hang-up kills a
+/// server at once and leaves the commands it started, and a terminate lets it end them first, so a
+/// server that is recorded as one is never sent the hang-up the other processes of a session are.
+///
+/// The server here ends its command and writes down that it was asked, when it is sent a terminate,
+/// and dies at once on a hang-up, as the application's server does.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_the_worker_recorded_is_asked_to_end_without_a_hang_up() {
+    let (temp, archive) = host();
+    let session_id = session();
+    let marker = temp.root().join("asked");
+    let ready = temp.root().join("ready");
+    let script = format!(
+        "trap 'echo terminated > \"{marker}\"; kill $command; exit 0' TERM; \
+         sleep 600 & command=$!; : > \"{ready}\"; wait",
+        marker = marker.display(),
+        ready = ready.display()
+    );
+    // Through `perl`, which gives the server the default disposition for a hang-up whatever this
+    // test process inherited (it is ignored under `nohup`): a hang-up would kill this server.
+    let server = std::process::Command::new("/usr/bin/perl")
+        .args(["-e", "$SIG{HUP} = q(DEFAULT); exec @ARGV", "/bin/sh", "-c"])
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("starts the server");
+    let identity = kr_ipc::identity::process_start_identity(server.id()).expect("its identity");
+    let server = Reaped {
+        child: server,
+        identity: identity.clone(),
+    };
+    let started = std::time::Instant::now();
+    while !ready.exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the server never set its trap"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    {
+        let mut record = owned_record(vec![identity.clone()]);
+        record.backends = vec![identity];
+        journal_for(&archive, session_id)
+            .record_owned(session_id, &record)
+            .expect("records what the session owned");
+    }
+    let ownership = take(&archive, session_id);
+
+    let fenced = archive.fence_owned(&ownership, None).await;
+
+    assert!(!server.running(), "the server was stopped: {fenced:?}");
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .map(|text| text.trim().to_owned())
+            .ok(),
+        Some("terminated".to_owned()),
+        "and it was asked with a terminate, which a hang-up before it would have pre-empted"
     );
 }
 
