@@ -47,6 +47,8 @@ mod teardown;
 #[cfg(target_os = "linux")]
 #[path = "support/user_manager.rs"]
 mod user_manager;
+#[path = "support/withholding_worker.rs"]
+mod withholding_worker;
 
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -4362,6 +4364,54 @@ impl Idle {
         self
     }
 
+    /// A live session whose worker is a peer of the test that answers its hello and holds its
+    /// challenge until the test lets it prove itself. No descriptor is published for it, so only the
+    /// classification of the registry's workers ever meets it.
+    fn with_a_worker_that_withholds_its_proof(self) -> (Self, withholding_worker::Withholding) {
+        use kr_controller::registry::{Registry, WorkerRecord};
+        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+        use kr_protocol::ids::{ActorId, AuthorityRevision};
+        use kr_protocol::session::SessionState;
+
+        let mut registry = Registry::open(self.registry(), self.temp.environment_id())
+            .expect("the registry opens");
+        let running =
+            kr_ipc::identity::current_process_start_identity().expect("this process's identity");
+        let reservation = reserve_with(
+            &mut registry,
+            &ActorId::new("local:501").expect("a principal"),
+            &running,
+            4,
+            b"intent",
+        );
+        let peer = withholding_worker::Withholding::start(
+            &self.temp.environment(),
+            reservation.display_number,
+            reservation.session_id,
+        );
+        registry
+            .claim_rendezvous(reservation.reservation_id, peer.key())
+            .expect("claims");
+        registry
+            .record_worker(
+                reservation.reservation_id,
+                &WorkerRecord {
+                    session_id: reservation.session_id,
+                    display_number: reservation.display_number,
+                    public_key: peer.key(),
+                    process_identity: running,
+                    endpoint: peer.endpoint().to_owned(),
+                    profile: WorkerProfile::HeadlessUser,
+                    state: SessionState::Live,
+                    acknowledged_revision: AuthorityRevision::new(0),
+                },
+                &DesktopBinding::none(),
+            )
+            .expect("records the worker");
+        drop(registry);
+        (self, peer)
+    }
+
     /// The registry as an earlier release left it at `version`, between 4 and 6: what each later
     /// schema added is taken away, and the version says so.
     fn shaped_as(self, version: i64) -> Self {
@@ -8119,6 +8169,385 @@ async fn a_daemon_the_service_manager_started_is_started_again_by_it() {
         served_by(&host),
         main_process_of(&manager, &unit),
         "the manager started it"
+    );
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* The lock the writers of stored records take                                                   */
+/* -------------------------------------------------------------------------------------------- */
+
+/// What a command of an installed release says, once, when it finds an update switching releases and
+/// waits for it.
+const WAITS_FOR_AN_UPDATE: &str = "switching releases";
+
+/// The lock a command that writes a stored record takes shared and an update holds exclusively from
+/// before its check of the stores until its switch has been made.
+const WRITERS_LOCK: &str = "writers.lock";
+
+impl Host {
+    /// Holds the writers' lock exclusively, as an update does between its check and its switch.
+    fn hold_writers_as_an_update(&self) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.store.root().join(WRITERS_LOCK))
+            .expect("the writers' lock file");
+        file.lock().expect("the lock is taken");
+        file
+    }
+
+    /// Holds the writers' lock shared, as a command that is writing a record does.
+    fn hold_writers_as_a_command(&self) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.store.root().join(WRITERS_LOCK))
+            .expect("the writers' lock file");
+        file.lock_shared().expect("the lock is taken");
+        file
+    }
+
+    /// Starts `kr host startup --set standalone` of the current release, which writes the
+    /// environment's configuration document and nothing else, and does not wait for it.
+    fn write_the_configuration(&self) -> Writing {
+        self.spawn_kr(&["host", "startup", "--set", "standalone", "--json"])
+    }
+
+    /// Starts `kr` of the current release with `arguments` and does not wait for it.
+    fn spawn_kr(&self, arguments: &[&str]) -> Writing {
+        let mut child = self
+            .command(&self.store.stable(Program::Kr), arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("kr runs");
+        let mut stdout = child.stdout.take().expect("piped");
+        let said = std::thread::spawn(move || {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut stdout, &mut text).expect("reads");
+            text
+        });
+        let stderr = child.stderr.take().expect("piped");
+        let (send, notices) = std::sync::mpsc::channel();
+        let lines = std::thread::spawn(move || {
+            let mut all = String::new();
+            for line in std::io::BufRead::lines(std::io::BufReader::new(stderr)) {
+                let line = line.expect("a line");
+                all.push_str(&line);
+                all.push('\n');
+                let _ = send.send(line);
+            }
+            all
+        });
+        Writing {
+            child,
+            notices,
+            said,
+            lines,
+        }
+    }
+
+    /// Where the environment's configuration document is.
+    fn configuration_document(&self) -> PathBuf {
+        kr_cli::doctor::configuration::document_path(&self.tree.environment())
+    }
+}
+
+/// A `kr` command that writes a stored record, started and not ended.
+struct Writing {
+    child: std::process::Child,
+    /// Each line it prints on standard error, as it prints it.
+    notices: std::sync::mpsc::Receiver<String>,
+    said: std::thread::JoinHandle<String>,
+    lines: std::thread::JoinHandle<String>,
+}
+
+impl Writing {
+    /// Waits until the command says it is waiting for an update, and says whether it did: a command
+    /// that ended without saying so did not wait.
+    fn waits_for_an_update(&self) -> bool {
+        loop {
+            match self.notices.recv_timeout(LIVENESS_DEADLINE) {
+                Ok(line) if line.contains(WAITS_FOR_AN_UPDATE) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// Waits for the command to end, and returns its exit status and what it printed on standard
+    /// output as JSON.
+    fn finish(self) -> (Option<i32>, Value) {
+        let Self {
+            mut child,
+            notices: _,
+            said,
+            lines,
+        } = self;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("asks") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the command did not end");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let said = said.join().expect("stdout is read");
+        lines.join().expect("stderr is read");
+        (
+            status.code(),
+            serde_json::from_str(&said).unwrap_or(Value::Null),
+        )
+    }
+}
+
+/// KR-REQ-26.10: a command that writes a stored record waits for an update that is switching releases
+/// and then writes. The writers' lock is held exclusively, as an update holds it between its check of
+/// the stores and its switch; the command says it waits, writes nothing while the lock is held, and
+/// writes once it is let go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_waits_for_an_update_and_then_writes() {
+    let host = Host::bare();
+    host.install(&Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1));
+    let document = host.configuration_document();
+
+    let update = host.hold_writers_as_an_update();
+    let writing = host.write_the_configuration();
+    assert!(
+        writing.waits_for_an_update(),
+        "the command says it waits for the update"
+    );
+    assert!(!document.exists(), "and writes nothing while it waits");
+    drop(update);
+    let (code, said) = writing.finish();
+    assert_eq!(
+        code,
+        Some(0),
+        "once the update lets go the command goes on: {said}"
+    );
+    assert!(document.exists(), "and writes");
+}
+
+/// KR-REQ-26.10: a command that has waited for an update's switch for longer than the bound is
+/// refused with the code for an update that waits, exit 9, and writes nothing; the same command
+/// succeeds once the lock is let go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_is_refused_while_an_update_holds_the_lock_past_the_bound() {
+    let host = Host::bare();
+    host.install(&Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1));
+    let document = host.configuration_document();
+
+    let update = host.hold_writers_as_an_update();
+    let writing = host.write_the_configuration();
+    assert!(writing.waits_for_an_update(), "the command waits");
+    let (code, said) = writing.finish();
+    assert_eq!(
+        code,
+        Some(9),
+        "the command is refused past the bound: {said}"
+    );
+    assert!(!document.exists(), "and wrote nothing");
+
+    drop(update);
+    let (code, said) = host.write_the_configuration().finish();
+    assert_eq!(
+        code,
+        Some(0),
+        "the control: with the lock let go it writes: {said}"
+    );
+    assert!(document.exists());
+}
+
+/// KR-REQ-26.10, KR-REQ-24.30: a command writes a record only at the version the current release
+/// lists for it. A current release that lists the configuration document at a version this `kr` does
+/// not write refuses the command, naming both versions, and the document is not written; a current
+/// release that lists no such store does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_refuses_to_write_a_version_current_does_not_write() {
+    let host = Host::bare();
+    let writes = u32::try_from(kr_protocol::hostinfo::configuration::VERSION).expect("small");
+    let reads = writes - 1;
+    host.install(
+        &Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+            "configuration",
+            reads,
+            reads,
+        )),
+    );
+    let document = host.configuration_document();
+    let (code, said) = host.write_the_configuration().finish();
+    assert_eq!(code, Some(1), "{said}");
+    let message = said["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("configuration")
+            && message.contains(&reads.to_string())
+            && message.contains(&writes.to_string()),
+        "it names the store and both versions: {said}"
+    );
+    assert!(!document.exists(), "and nothing was written");
+
+    // The control: a release that does not list the store does not read it, so any version goes.
+    let other = Host::bare();
+    other.install(
+        &Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(
+            release_stores()
+                .into_iter()
+                .filter(|store| store.store != "configuration")
+                .collect(),
+        ),
+    );
+    let (code, said) = other.write_the_configuration().finish();
+    assert_eq!(code, Some(0), "{said}");
+    assert!(other.configuration_document().exists());
+}
+
+/// KR-REQ-26.10: a command that waited through an update's switch is judged by the release the
+/// switch made current. The release switched to reads the configuration document at version 1 only,
+/// this `kr` writes version 2, and the command that was waiting is refused: the document is never at
+/// a version the release switched to cannot read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_waited_through_a_switch_is_judged_by_the_release_switched_to() {
+    let host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(reading_a_store_at(
+        "configuration",
+        1,
+        1,
+    ));
+    host.install(&one);
+    host.put(&two);
+    let document = host.configuration_document();
+
+    let update = host.hold_writers_as_an_update();
+    let writing = host.write_the_configuration();
+    assert!(writing.waits_for_an_update(), "the command waits");
+    host.switch(two.name());
+    drop(update);
+    let (code, said) = writing.finish();
+    assert_eq!(
+        code,
+        Some(1),
+        "the release now current does not read what this kr writes: {said}"
+    );
+    assert!(!document.exists(), "so nothing was written");
+}
+
+/// KR-REQ-26.10: a command that tries after an update has checked the stores and before it has
+/// switched waits, and is judged by the release switched to. A real rollback to a release that reads
+/// the configuration document at version 1 is held inside its classification of the registry's workers
+/// by a worker that withholds its proof: the stores have been checked and `current` has not changed.
+/// A command started then says it waits; the worker then proves itself, the rollback switches, and
+/// the command is refused: the document was never at version 2 while the rollback was under way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_tries_between_the_check_and_the_switch_of_a_real_rollback_waits_and_is_refused()
+ {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+        "configuration",
+        1,
+        1,
+    ));
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = host.configuration_document();
+    assert!(!document.exists(), "no document is written yet");
+
+    // An environment of the store with a live worker that is slow to prove itself.
+    let (_idle, mut worker) = Idle::new(&host.store).with_a_worker_that_withholds_its_proof();
+    let rollback = host.spawn_kr(&["host", "rollback", "--json"]);
+    tokio::time::timeout(LIVENESS_DEADLINE, worker.challenged())
+        .await
+        .expect("the rollback challenges the worker");
+
+    // The rollback is inside its classification: it has checked the stores and holds the lock.
+    let writing = host.write_the_configuration();
+    assert!(
+        writing.waits_for_an_update(),
+        "the command says it waits for the rollback"
+    );
+    assert!(!document.exists(), "and writes nothing while it waits");
+    worker.prove();
+
+    let (code, said) = rollback.finish();
+    assert_eq!(code, Some(0), "the rollback goes through: {said}");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    let (code, said) = writing.finish();
+    assert_eq!(
+        code,
+        Some(1),
+        "the release rolled back to reads the document at version 1, not 2: {said}"
+    );
+    assert!(!document.exists(), "the document was never written");
+    assert_eq!(
+        worker.connections(),
+        1,
+        "the one challenge the worker met was the classification's"
+    );
+}
+
+/// KR-REQ-26.08, KR-REQ-26.10: an update that cannot take the writers' lock stops nothing for good.
+/// A command holds it, shared, past the update's bound: the update exits 9 with every daemon it
+/// stopped started again from the release still current, and the next update goes through once the
+/// lock is let go.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_that_cannot_take_the_writers_lock_stops_nothing_for_good() {
+    let (host, one, two, archive) = host_to_update().await;
+
+    let writing = host.hold_writers_as_a_command();
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon the update stopped serves again, from the release still current"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+
+    drop(writing);
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "the control: kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
     );
 }
 
