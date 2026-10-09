@@ -1320,7 +1320,8 @@ mod tests {
             let verified = held
                 .verify_enrolment(&organisation.authority(NOW), Some(&reading))
                 .expect("the chain verifies");
-            held.enrol(verified).expect("the host enrols");
+            let revision = held.authority_revision();
+            held.enrol(verified, revision).expect("the host enrols");
             let before = held.clone();
             let lease = organisation.lease(
                 &kr_protocol::ids::AccountId::new("ada").expect("an account"),

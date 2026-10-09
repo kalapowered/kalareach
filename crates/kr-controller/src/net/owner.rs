@@ -402,6 +402,22 @@ impl OwnerAuthority {
         }
     }
 
+    /// Checks that a confirmation this host spent still covers the effect it is about to commit:
+    /// that it is about `action_digest` on this host, in this boot, and inside the challenge's own
+    /// deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` naming `subject` when it does not.
+    pub fn covers(
+        &self,
+        confirmed: &ConfirmedAction,
+        action_digest: Digest256,
+        subject: &str,
+    ) -> Result<()> {
+        confirmed.covers(action_digest, self.host_device_id, &self.clock, subject)
+    }
+
     /// Refuses a caller that is not this host's owner, which is whom owner confirmations are
     /// asked for.
     ///

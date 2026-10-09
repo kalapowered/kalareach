@@ -318,18 +318,66 @@ impl Controller {
         &self,
         change: impl FnOnce(&mut crate::grants::HostPolicy) -> T,
     ) -> Result<T> {
-        // The lock is held across the write. Releasing it first would let two accepted changes
-        // reach the store out of order and leave the older one on disk, which is the restriction
-        // silently coming back after the next restart.
+        self.commit_policy(
+            |policy| Ok(change(policy)),
+            |grants, snapshot, _| grants.store_policy(snapshot),
+        )
+    }
+
+    /// Changes this host's policy for the action `hold` claimed, and writes the policy and the
+    /// action's answer down in one transaction.
+    ///
+    /// `change` may refuse, and then nothing is written, published or advanced. It returns the
+    /// value the caller wants back and the bytes the claim keeps as the action's answer.
+    /// `still_admitted` runs inside the transaction, once the store's lock is held and before the
+    /// first write, so the wait for that lock cannot outlast the admission, the owner's
+    /// confirmation or any precondition the caller asks again there.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `change` or `still_admitted` refuses with, and a storage error when the policy
+    /// or the answer cannot be written; then neither is.
+    pub fn update_policy_claimed<T>(
+        &self,
+        hold: &crate::grants::ClaimHold,
+        change: impl FnOnce(&mut crate::grants::HostPolicy) -> Result<(T, Vec<u8>)>,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<T> {
+        self.commit_policy(change, |grants, snapshot, (_, answer)| {
+            grants.store_policy_claimed(
+                snapshot,
+                hold,
+                answer,
+                kr_ipc::now_ms().get(),
+                still_admitted,
+            )
+        })
+        .map(|(value, _)| value)
+    }
+
+    /// The one way a change to the policy is made, written and put in force.
+    ///
+    /// The lock is held across the write. Releasing it first would let two accepted changes reach
+    /// the store out of order and leave the older one on disk, which is the restriction silently
+    /// coming back after the next restart. The change is made to a copy and published only once it
+    /// is written down. Mutating the live policy first would let a relaxation that failed to
+    /// persist take effect anyway, and an error the caller sees would be an error about something
+    /// that happened. A change that refuses leaves the policy, its epoch and the store as they were.
+    fn commit_policy<C>(
+        &self,
+        change: impl FnOnce(&mut crate::grants::HostPolicy) -> Result<C>,
+        write: impl FnOnce(
+            &crate::grants::GrantDirectory,
+            &crate::grants::StoredPolicy,
+            &C,
+        ) -> Result<()>,
+    ) -> Result<C> {
         let mut held = self
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The change is made to a copy and published only once it is written down. Mutating the
-        // live policy first would let a relaxation that failed to persist take effect anyway, and
-        // an error the caller sees would be an error about something that happened.
         let mut candidate = held.clone();
-        let value = change(&mut candidate);
+        let value = change(&mut candidate)?;
         // The offline bound's time is taken with the policy that holds it: a change measured from
         // another synchronisation starts it again, and any other change keeps the time already
         // spent. Its record is written before the policy and is one of its own, so a stop between
@@ -342,7 +390,7 @@ impl Controller {
             &self.lifetimes.anchor_sources(),
         )?;
         let snapshot = candidate.snapshot();
-        self.sharing.grants().store_policy(&snapshot)?;
+        write(self.sharing.grants(), &snapshot, &value)?;
         self.utc_floor.wrote(snapshot.utc_floor_ms.get());
         if next != previous
             && let Err(error) = self

@@ -2981,7 +2981,8 @@ pub(crate) mod tests {
                 let verified = policy
                     .verify_enrolment(&organisation.authority(now), Some(&reading))
                     .expect("the chain verifies");
-                policy.enrol(verified).expect("the host enrols");
+                let revision = policy.authority_revision();
+                policy.enrol(verified, revision).expect("the host enrols");
             })
             .expect("the enrolment is written down");
         let (grant, record) = granted(GrantExpiry::Never, revision);

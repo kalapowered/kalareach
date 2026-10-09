@@ -554,6 +554,13 @@ impl Enrolment {
         self.members.get(&device_id)
     }
 
+    /// The devices bound to member accounts in this organisation, by device identity.
+    pub fn members(&self) -> impl Iterator<Item = (DeviceId, &Binding)> {
+        self.members
+            .iter()
+            .map(|(device_id, binding)| (*device_id, binding))
+    }
+
     /// The lease in force for the member `device_id` is bound to, at both readings, with its cell
     /// loaded once: the lease is decided from that snapshot and carried as it.
     ///

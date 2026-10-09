@@ -368,6 +368,12 @@ impl GrantDirectory {
                      device_key      BLOB NOT NULL,
                      lease_digest    BLOB NOT NULL,
                      bound_at_ms     INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS exclusive_management_events (
+                     sequence         INTEGER PRIMARY KEY NOT NULL,
+                     at_ms            INTEGER NOT NULL,
+                     channel          BLOB NOT NULL,
+                     organisation_ids BLOB NOT NULL
                  );",
             )
             .map_err(ControllerError::registry)?;
@@ -1857,6 +1863,104 @@ impl GrantDirectory {
                 );
             }
         }
+    }
+
+    /// Writes this host's policy together with the result of the action `hold` claimed, in one
+    /// transaction, so neither is on disk without the other.
+    ///
+    /// `still_admitted` is run inside the transaction, once this call holds the store's lock and
+    /// before the first write. The wait for that lock can outlast an admission's deadline and an
+    /// owner confirmation's, so a check made before it says only what was true before the wait.
+    /// The result takes only while the claim holds no outcome, as [`Self::retain_result`] writes
+    /// it, and a claim that holds one already is a refusal here: the policy it would have written
+    /// is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `still_admitted` refuses, when the claim has an outcome already, and
+    /// a storage error when either row cannot be written; then neither is.
+    pub fn store_policy_claimed(
+        &self,
+        policy: &StoredPolicy,
+        hold: &ClaimHold,
+        result: &[u8],
+        now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let encoded = kr_cbor::to_canonical_vec(policy)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        self.in_transaction(|connection| {
+            still_admitted()?;
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
+                    params![encoded],
+                )
+                .map_err(ControllerError::registry)?;
+            let kept = connection
+                .execute(
+                    "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4
+                      WHERE actor_id = ?1 AND action_id = ?2
+                        AND result IS NULL AND refusal_code IS NULL",
+                    params![
+                        hold.key.0,
+                        hold.key.1.as_slice(),
+                        result,
+                        i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            if kept == 0 {
+                return Err(ControllerError::Uncertain {
+                    detail: "this action already holds an outcome, so its change was not made"
+                        .to_owned(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    /// Every time exclusive management was turned off, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read or one does not decode.
+    pub fn exclusive_management_events(
+        &self,
+    ) -> Result<Vec<kr_protocol::organisation::ExclusiveManagementEvent>> {
+        type Columns = (i64, i64, Vec<u8>, Vec<u8>);
+        let rows: Vec<Columns> = self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT sequence, at_ms, channel, organisation_ids
+                 FROM exclusive_management_events ORDER BY sequence",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<Columns>>>()?;
+            Ok(rows)
+        })?;
+        let malformed = |what: &str| {
+            ControllerError::InvalidArgument(format!(
+                "an exclusive management event's {what} does not decode"
+            ))
+        };
+        let limits = kr_cbor::Limits::DEFAULT;
+        rows.into_iter()
+            .map(|(sequence, at_ms, channel, organisation_ids)| {
+                Ok(kr_protocol::organisation::ExclusiveManagementEvent {
+                    sequence: kr_protocol::scalars::U64::new(
+                        u64::try_from(sequence).map_err(|_| malformed("sequence"))?,
+                    ),
+                    at_ms: TimestampMs::new(u64::try_from(at_ms).map_err(|_| malformed("time"))?),
+                    channel: kr_cbor::from_canonical_slice(&channel, &limits)
+                        .map_err(|_| malformed("channel"))?,
+                    organisation_ids: kr_cbor::from_canonical_slice(&organisation_ids, &limits)
+                        .map_err(|_| malformed("organisations"))?,
+                })
+            })
+            .collect()
     }
 
     /// Writes this host's policy together with the retained event of the binding it made, in one

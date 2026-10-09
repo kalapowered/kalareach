@@ -819,7 +819,13 @@ impl HostPolicy {
         organisation::verify_enrolment(authority, settled_ms)
     }
 
-    /// Enrols this host in a verified organisation, at the authority revision in force.
+    /// Enrols this host in a verified organisation, at `enrolment_revision`, the authority revision
+    /// in force when the owner's action commits.
+    ///
+    /// The caller reads that revision from the registry, under the guard that holds the fence, and
+    /// not from this policy: a policy follows the registry's revision a moment after a barrier
+    /// advances it, and an enrolment that took the revision a barrier is about to replace would
+    /// honour the grants of the enrolment the barrier was raised against.
     ///
     /// Enrolling says nothing about whether this host is exclusively organisation-managed. That is
     /// [`Self::set_exclusively_managed`], because it is a decision about the *host* and a second
@@ -829,14 +835,18 @@ impl HostPolicy {
     ///
     /// Returns [`ChainRefused::AlreadyEnrolled`] when this host is enrolled in that organisation
     /// already: an enrolment is replaced only by withdrawing it first.
-    pub fn enrol(&mut self, verified: VerifiedEnrolment) -> std::result::Result<(), ChainRefused> {
+    pub fn enrol(
+        &mut self,
+        verified: VerifiedEnrolment,
+        enrolment_revision: AuthorityRevision,
+    ) -> std::result::Result<(), ChainRefused> {
         let organisation_id = verified.organisation_id();
         if self.enrolments.contains_key(&organisation_id) {
             return Err(ChainRefused::AlreadyEnrolled);
         }
         self.enrolments.insert(
             organisation_id,
-            Enrolment::new(verified, self.authority_revision),
+            Enrolment::new(verified, enrolment_revision),
         );
         Ok(())
     }
@@ -854,6 +864,13 @@ impl HostPolicy {
     #[must_use]
     pub fn enrolment(&self, organisation_id: OrganisationId) -> Option<&Enrolment> {
         self.enrolments.get(&organisation_id)
+    }
+
+    /// Every organisation this host is enrolled in, by organisation identity.
+    pub fn enrolments(&self) -> impl Iterator<Item = (OrganisationId, &Enrolment)> {
+        self.enrolments
+            .iter()
+            .map(|(organisation_id, enrolment)| (*organisation_id, enrolment))
     }
 
     /// Whether `device_id` is bound to a member account in any organisation this host is enrolled
@@ -1490,7 +1507,8 @@ mod one_snapshot_of_each_bound {
             let verified = policy
                 .verify_enrolment(&organisation.authority(NOW_MS), Some(&reading(NOW_MS)))
                 .expect("the chain verifies");
-            policy.enrol(verified).expect("the host enrols");
+            let revision = policy.authority_revision();
+            policy.enrol(verified, revision).expect("the host enrols");
             let device_id = DeviceId::new(kr_ipc::new_uuid());
             let grant = Grant {
                 grant_id: GrantId::new(kr_ipc::new_uuid()),

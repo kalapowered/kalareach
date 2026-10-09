@@ -57,8 +57,9 @@ fn entry(
 pub fn table() -> Vec<Store> {
     use kr_controller::registry::LaunchPhase;
     use kr_protocol::{
-        action, archive, attention, automation, catalogue, changeset, grant, hostinfo, invitation,
-        machine, mailbox, pairing, project, push, session, sharing, skill, transfer, voice,
+        action, archive, attention, automation, catalogue, changeset, delivery, describe, grant,
+        hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy, project,
+        push, session, sharing, skill, transfer, voice,
     };
 
     let mut stores = vec![
@@ -131,6 +132,25 @@ pub fn table() -> Vec<Store> {
                 protocol::<machine::MachineStepResult>("MachineStepResult"),
                 protocol::<voice::VoiceGrantResult>("VoiceGrantResult"),
                 protocol::<voice::VoiceDelegateResult>("VoiceDelegateResult"),
+                // What the registry keeps for an action it claimed, beside the claim. Each is the
+                // answer a repeat of that action is given.
+                protocol::<organisation::OrganisationEnrolResult>("OrganisationEnrolResult"),
+                protocol::<organisation::OrganisationExclusiveSetResult>(
+                    "OrganisationExclusiveSetResult",
+                ),
+                protocol::<organisation::OrganisationChangeMarker>("OrganisationChangeMarker"),
+                protocol::<describe::SessionRenameResult>("SessionRenameResult"),
+                protocol::<describe::DescriptionSetup>("DescriptionSetup"),
+                protocol::<delivery::DeliveryDestinationSecretSetResult>(
+                    "DeliveryDestinationSecretSetResult",
+                ),
+                protocol::<identity::EnvironmentEnrolResult>("EnvironmentEnrolResult"),
+                protocol::<identity::EnvironmentForgetResult>("EnvironmentForgetResult"),
+                protocol::<identity::EnvironmentRefreshResult>("EnvironmentRefreshResult"),
+                protocol::<kr_protocol::update::HostUpdateHandoverResult>(
+                    "HostUpdateHandoverResult",
+                ),
+                protocol::<privacy::PrivacyReport>("PrivacyReport"),
                 protocol::<invitation::PairingSecurityEvent>("PairingSecurityEvent"),
                 protocol::<pairing::OwnerConfirmationRequest>("OwnerConfirmationRequest"),
                 protocol::<pairing::OwnerConfirmationProof>("OwnerConfirmationProof"),
