@@ -15,9 +15,13 @@
 //!   between steps, and the page never sees it.
 //! * **The record** is `recovery/recovery.json` in the application's data directory: the service
 //!   the bundle is kept at, its locator, and whether the first write is known to have landed. It is
-//!   made before the first write leaves, because a write that landed under a locator this device
-//!   had not kept would be a bundle nobody could find. It holds nothing secret.
+//!   made, flushed to disk and renamed into place before the first write leaves, because a write
+//!   that landed under a locator this device had not kept would be a bundle nobody could find. It
+//!   holds nothing secret. Turning recovery on makes the record, then makes or reads the seed, then
+//!   puts the first bundle at the service, then marks the record kept.
 //! * **The store's own record** of the last write it sent is beside it, kept by `BundleStore`.
+//! * **The lock** is `recovery/recovery.lock`. Each step holds it, so a second companion process on
+//!   this machine waits for the step in hand instead of drawing a locator of its own.
 //!
 //! # The service, and the account's token
 //!
@@ -42,6 +46,9 @@ use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_crypto::store::{SecretStore, load_recovery_seed, store_recovery_seed};
+use kr_ipc::paths::{
+    create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
+};
 use kr_protocol::archive::{RecoveryContext, TrustedWriter};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
@@ -60,6 +67,12 @@ const DIRECTORY: &str = "recovery";
 
 /// The record of where this computer's bundle is, in [`DIRECTORY`].
 const RECORD: &str = "recovery.json";
+
+/// The file a step holds a lock on for as long as it runs, in [`DIRECTORY`].
+const LOCK: &str = "recovery.lock";
+
+/// The most a record may be, in bytes. It is a few lines of text.
+const RECORD_LIMIT: u64 = 16 * 1024;
 
 /// Where recovery stands on this computer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -188,9 +201,9 @@ pub struct Recovery {
     secrets: Arc<dyn SecretStore>,
     signer: Arc<dyn ServiceSigner>,
     service: Arc<SyncService>,
-    /// Taken for the length of each step. A store writes one bundle from this device at a time,
-    /// and it is opened for a step and closed at its end, so two steps at once would be two
-    /// writers and the second would be refused its lock.
+    /// This process's turn, taken for the length of each step beside the lock on [`LOCK`]. A store
+    /// writes one bundle from this device at a time, and it is opened for a step and closed at its
+    /// end, so two steps at once would be two writers.
     steps: tokio::sync::Mutex<()>,
 }
 
@@ -214,17 +227,59 @@ impl Recovery {
         service: Arc<SyncService>,
     ) -> Result<Self> {
         let directory = data.join(DIRECTORY);
-        std::fs::create_dir_all(&directory).map_err(|error| {
-            CommandError::local_failure(format!(
-                "the directory recovery keeps its records in could not be made: {error}"
-            ))
-        })?;
+        // The directory is on disk before anything is written in it: a record is made before the
+        // first write leaves, and a record in a directory a crash took is a bundle nobody finds.
+        create_private_directory(&directory)
+            .map_err(|error| error.to_string())
+            .and_then(|()| flush_path_names(&directory).map_err(|error| error.to_string()))
+            .map_err(|error| {
+                CommandError::local_failure(format!(
+                    "the directory recovery keeps its records in could not be made: {error}"
+                ))
+            })?;
         Ok(Self {
             directory,
             secrets,
             signer: Arc::new(DeviceSigner(key)),
             service,
             steps: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Takes this process's turn and then the lock a second companion on this machine would wait
+    /// for, and holds both until the step is dropped.
+    ///
+    /// Two companions that each found no record would each draw a locator and commit a bundle of
+    /// their own, and the kit one of them handed over would name a bundle the other had left
+    /// behind. So the record is read, made and updated inside one step of one process at a time.
+    async fn step(&self) -> Result<Step<'_>> {
+        let turn = self.steps.lock().await;
+        let path = self.directory.join(LOCK);
+        let file =
+            tauri::async_runtime::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+                let mut options = std::fs::OpenOptions::new();
+                options.create(true).truncate(false).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                let file = options.open(path)?;
+                file.lock()?;
+                Ok(file)
+            })
+            .await
+            .map_err(|error| {
+                CommandError::local_failure(format!("recovery was not started: {error}"))
+            })?
+            .map_err(|error| {
+                CommandError::local_failure(format!(
+                    "this computer's recovery lock could not be taken: {error}"
+                ))
+            })?;
+        Ok(Step {
+            _turn: turn,
+            _lock: file,
         })
     }
 
@@ -238,7 +293,7 @@ impl Recovery {
     ///
     /// Returns a local failure when this computer's records cannot be read.
     pub async fn view(&self, account: &Account) -> Result<RecoveryView> {
-        let _step = self.steps.lock().await;
+        let _step = self.step().await?;
         self.view_of(account)
     }
 
@@ -284,7 +339,7 @@ impl Recovery {
     /// having been made or sent; `OUTCOME_UNKNOWN` when the write was not answered, which has to be
     /// settled before anything else is written; and a local failure otherwise.
     pub async fn turn_on(&self, account: &Account) -> Result<RecoveryView> {
-        let _step = self.steps.lock().await;
+        let _step = self.step().await?;
         let mut record = match self.record()? {
             Some(record) if record.kept => return self.view_of(account),
             Some(record) => record,
@@ -330,7 +385,7 @@ impl Recovery {
     /// Returns a refusal when there is nothing to settle or the account cannot be used, and the
     /// service's own failure when it cannot be asked.
     pub async fn settle(&self, account: &Account) -> Result<RecoveryView> {
-        let _step = self.steps.lock().await;
+        let _step = self.step().await?;
         let Some(mut record) = self.record()? else {
             return Err(CommandError::refused("recovery has not been turned on"));
         };
@@ -356,8 +411,8 @@ impl Recovery {
     /* The kit                                                                 */
     /* ---------------------------------------------------------------------- */
 
-    /// Writes the recovery kit to `destination`, readable by this user alone where the platform
-    /// has such a thing.
+    /// Writes the recovery kit to `destination`, flushed to disk, with the owner-only mode (0600)
+    /// on Unix. On Windows it has the permissions of the folder the destination is in.
     ///
     /// # Errors
     ///
@@ -365,7 +420,7 @@ impl Recovery {
     /// written.
     pub async fn save_kit(&self, destination: &Path) -> Result<()> {
         let kit = {
-            let _step = self.steps.lock().await;
+            let _step = self.step().await?;
             let record = self
                 .record()?
                 .filter(|record| record.kept)
@@ -375,14 +430,14 @@ impl Recovery {
                 .map_err(said)?
         };
         let destination = destination.to_path_buf();
-        tauri::async_runtime::spawn_blocking(move || write_private(&destination, kit.as_bytes()))
-            .await
-            .map_err(|error| {
-                CommandError::local_failure(format!("the kit was not written: {error}"))
-            })?
-            .map_err(|error| {
-                CommandError::local_failure(format!("the kit could not be written: {error}"))
-            })
+        tauri::async_runtime::spawn_blocking(move || {
+            write_owner_only_file(&destination, kit.as_bytes())
+        })
+        .await
+        .map_err(|error| CommandError::local_failure(format!("the kit was not written: {error}")))?
+        .map_err(|error| {
+            CommandError::local_failure(format!("the kit could not be written: {error}"))
+        })
     }
 
     /* ---------------------------------------------------------------------- */
@@ -405,7 +460,7 @@ impl Recovery {
         account: &Account,
         writer: TrustedWriter,
     ) -> Result<WriterEnabled> {
-        let _step = self.steps.lock().await;
+        let _step = self.step().await?;
         let record = self
             .record()?
             .filter(|record| record.kept)
@@ -450,16 +505,15 @@ impl Recovery {
 
     fn record(&self) -> Result<Option<Record>> {
         let path = self.directory.join(RECORD);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(CommandError::local_failure(format!(
-                    "this computer's recovery record could not be read: {error}"
-                )));
-            }
+        let Some(bytes) = read_owner_only_file(&path, RECORD_LIMIT).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's recovery record could not be read: {error}"
+            ))
+        })?
+        else {
+            return Ok(None);
         };
-        let record: Record = serde_json::from_str(&text).map_err(|error| {
+        let record: Record = serde_json::from_slice(&bytes).map_err(|error| {
             CommandError::local_failure(format!(
                 "this computer's recovery record is not one this version reads: {error}"
             ))
@@ -472,22 +526,19 @@ impl Recovery {
         Ok(Some(record))
     }
 
-    /// Writes the record whole: to a file beside it, then renamed into place.
+    /// Writes the record whole and makes it durable: to a file beside it, flushed, then renamed
+    /// into place, and the directory flushed.
     fn keep(&self, record: &Record) -> Result<()> {
         let text = serde_json::to_vec_pretty(record).map_err(|error| {
             CommandError::local_failure(format!(
                 "the recovery record could not be written: {error}"
             ))
         })?;
-        let path = self.directory.join(RECORD);
-        let partial = self.directory.join("recovery.json.partial");
-        std::fs::write(&partial, text)
-            .and_then(|()| std::fs::rename(&partial, &path))
-            .map_err(|error| {
-                CommandError::local_failure(format!(
-                    "this computer's recovery record could not be kept: {error}"
-                ))
-            })
+        write_owner_only_file(&self.directory.join(RECORD), &text).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's recovery record could not be kept: {error}"
+            ))
+        })
     }
 
     /// The bundle store for `record`, opened for one step. It holds the lock on its record until
@@ -510,6 +561,12 @@ impl Recovery {
             .presenting(tokens, BACKUP_WRITE_SCOPE);
         BundleStore::open(Arc::new(service), record.context(), &self.directory).map_err(said)
     }
+}
+
+/// One step's hold on recovery: this process's turn, and the lock on the lock file.
+struct Step<'a> {
+    _turn: tokio::sync::MutexGuard<'a, ()>,
+    _lock: std::fs::File,
 }
 
 /// What stops the account being used at `used`, in the order the person mends it.
@@ -580,27 +637,4 @@ fn now() -> TimestampMs {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
             }),
     )
-}
-
-/// Writes `body` as the whole of the file at `path`, readable by this user alone where the
-/// platform has such a thing.
-fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        // A file that already existed keeps the mode it had, so it is set again.
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(body)?;
-    file.sync_all()
 }
