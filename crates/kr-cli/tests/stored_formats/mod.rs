@@ -28,9 +28,10 @@
 
 #![allow(dead_code)]
 
+pub mod resolve;
 pub mod table;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use kr_protocol::update::{Recording, ReleaseStore, StoreScope};
@@ -208,8 +209,9 @@ pub struct Named {
 
 /// What a store keeps that its tables do not describe.
 pub enum Kept {
-    /// A type the protocol generates a schema for.
-    Protocol(&'static str, Value),
+    /// A type the protocol generates a schema for, with its label, the schema and the path
+    /// `std::any::type_name` gives the type.
+    Protocol(&'static str, Value, &'static str),
     /// Types of the source, by the file they are in (relative to the repository) and their names.
     Source(&'static str, &'static [&'static str]),
     /// Words the code matches stored text against by hand.
@@ -220,7 +222,7 @@ impl Kept {
     /// What the lock says of it.
     pub fn label(&self) -> String {
         match self {
-            Self::Protocol(name, _) => (*name).to_owned(),
+            Self::Protocol(name, _, _) => (*name).to_owned(),
             Self::Source(file, items) => format!("{} ({file})", items.join(", ")),
             Self::Words(name, _) => format!("words of {name}"),
         }
@@ -230,7 +232,11 @@ impl Kept {
 /// The schema of a type the protocol generates one for.
 #[must_use]
 pub fn protocol<T: JsonSchema>(name: &'static str) -> Kept {
-    Kept::Protocol(name, kr_protocol::schema::schema_for::<T>())
+    Kept::Protocol(
+        name,
+        kr_protocol::schema::schema_for::<T>(),
+        std::any::type_name::<T>(),
+    )
 }
 
 /* -------------------------------------------------------------------------------------------- */
@@ -247,7 +253,7 @@ pub fn digest(store: &Store, ddl: &[String]) -> Result<String, String> {
     let mut kept = BTreeMap::new();
     for item in &store.kept {
         let value = match item {
-            Kept::Protocol(_, schema) => normalise_schema(schema),
+            Kept::Protocol(_, schema, _) => normalise_schema(schema),
             Kept::Source(file, items) => {
                 let mut definitions = Vec::new();
                 for name in *items {
@@ -764,7 +770,7 @@ fn scope_name(scope: StoreScope) -> &'static str {
 pub struct Known {
     /// The store that keeps it, by name.
     pub store: &'static str,
-    /// The name the table's checks match.
+    /// The name of the type, or of the set of words.
     pub name: &'static str,
     /// What it is.
     pub is: KnownIs,
@@ -774,8 +780,9 @@ pub struct Known {
 
 /// What a known type is.
 pub enum KnownIs {
-    /// A type the protocol generates a schema for, which includes every type it holds.
-    Protocol(Value),
+    /// A type the protocol generates a schema for, which includes every type it holds: the schema,
+    /// and the path `std::any::type_name` gives the type.
+    Protocol(Value, &'static str),
     /// A type of the source, by file; its fields' types are checked as a declared one's are.
     Source(&'static str),
     /// Words the code matches stored text against by hand.
@@ -792,12 +799,28 @@ impl Known {
     /// Returns what stops a type being read from the source.
     pub fn now(&self) -> Result<String, String> {
         let basis = match &self.is {
-            KnownIs::Protocol(schema) => normalise_schema(schema),
+            KnownIs::Protocol(schema, _) => normalise_schema(schema),
             KnownIs::Source(file) => json!(definition(file, self.name)?),
             KnownIs::Words(words) => json!(words),
             KnownIs::Crate(name) => json!({ "crate": name, "locked": locked_version(name)? }),
         };
         Ok(hex(&kr_cbor::sha256(canonical(&basis).as_bytes())))
+    }
+
+    /// Where the type comes from, when it is a type.
+    fn identity(&self, workspace: &resolve::Workspace) -> Result<Option<resolve::Type>, String> {
+        Ok(match &self.is {
+            KnownIs::Protocol(_, path) => Some(workspace.of_type_name(path)?),
+            KnownIs::Source(file) => Some(resolve::Type {
+                origin: resolve::Origin::Defined((*file).to_owned()),
+                name: self.name.to_owned(),
+            }),
+            KnownIs::Crate(name) => Some(resolve::Type {
+                origin: resolve::Origin::External((*name).to_owned()),
+                name: self.name.to_owned(),
+            }),
+            KnownIs::Words(_) => None,
+        })
     }
 }
 
@@ -833,179 +856,214 @@ pub fn known_protocol<T: JsonSchema>(
     Known {
         store,
         name,
-        is: KnownIs::Protocol(kr_protocol::schema::schema_for::<T>()),
+        is: KnownIs::Protocol(
+            kr_protocol::schema::schema_for::<T>(),
+            std::any::type_name::<T>(),
+        ),
         pinned,
     }
 }
 
-/// The types in the type positions of a definition: the types of a struct's fields and of an enum's
-/// variants, with the paths and generics of each reduced to the names in them.
+/// What the table accounts for in a store: the types the store declares and lists as known, by where
+/// they come from, and the source items whose fields are read.
+struct Accounted {
+    types: BTreeSet<resolve::Type>,
+    read: Vec<(&'static str, &'static str)>,
+}
+
+/// What `store` declares and `known` lists for it.
 ///
 /// # Errors
 ///
-/// Returns what stops the definition being read as a type.
-fn types_named_by(definition: &str) -> Result<Vec<String>, String> {
-    use syn::visit::Visit;
-
-    struct Names(Vec<String>);
-
-    impl<'ast> Visit<'ast> for Names {
-        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
-            if let Some(last) = path.path.segments.last() {
-                self.0.push(last.ident.to_string());
+/// Returns what stops a type being traced to where it comes from.
+fn accounted_for(
+    workspace: &resolve::Workspace,
+    store: &Store,
+    known: &[Known],
+) -> Result<Accounted, String> {
+    let mut accounted = Accounted {
+        types: BTreeSet::new(),
+        read: Vec::new(),
+    };
+    for item in &store.kept {
+        match item {
+            Kept::Protocol(label, _, path) => {
+                accounted.types.insert(
+                    workspace.of_type_name(path).map_err(|why| {
+                        format!("{label} (the store {}): {why}", store.entry.store)
+                    })?,
+                );
             }
-            syn::visit::visit_type_path(self, path);
+            Kept::Source(file, items) => {
+                for item in *items {
+                    accounted.types.insert(resolve::Type {
+                        origin: resolve::Origin::Defined((*file).to_owned()),
+                        name: (*item).to_owned(),
+                    });
+                    accounted.read.push((file, item));
+                }
+            }
+            Kept::Words(..) => {}
         }
     }
-
-    let item: syn::Item = syn::parse_str(definition)
-        .map_err(|error| format!("a definition cannot be read as a type: {error}"))?;
-    let mut names = Names(Vec::new());
-    match &item {
-        syn::Item::Struct(item) => {
-            for field in &item.fields {
-                names.visit_type(&field.ty);
-            }
+    for known in known
+        .iter()
+        .filter(|known| known.store == store.entry.store)
+    {
+        if let Some(identity) = known.identity(workspace).map_err(|why| {
+            format!(
+                "{} (known for the store {}): {why}",
+                known.name, store.entry.store
+            )
+        })? {
+            accounted.types.insert(identity);
         }
-        syn::Item::Enum(item) => {
-            for variant in &item.variants {
-                for field in &variant.fields {
-                    names.visit_type(&field.ty);
+        if let KnownIs::Source(file) = known.is {
+            accounted.read.push((file, known.name));
+        }
+    }
+    Ok(accounted)
+}
+
+/// The types a store's source items hold, by where they come from, and what could not be followed.
+fn held_in_store(
+    workspace: &resolve::Workspace,
+    accounted: &Accounted,
+    store: &str,
+) -> (BTreeSet<resolve::Type>, Vec<String>) {
+    let mut held = BTreeSet::new();
+    let mut problems = Vec::new();
+    for (file, item) in &accounted.read {
+        match workspace.held_by(file, item) {
+            Ok(found) => {
+                for held_type in found {
+                    held.insert((*file, *item, held_type));
+                }
+            }
+            Err(why) => {
+                for said in why {
+                    problems.push(format!(
+                        "{item} ({file}), which the store {store} keeps, holds what cannot be followed ({said}): \
+                         the detection does not skip it; declare the type it holds or list it as known"
+                    ));
                 }
             }
         }
-        _ => return Err("a kept item is neither a struct nor an enum".to_owned()),
     }
-    // A primitive is not a type to declare.
-    let mut types: Vec<String> = names
-        .0
-        .into_iter()
-        .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
-        .collect();
-    types.sort();
-    types.dedup();
-    Ok(types)
+    let mut types = BTreeSet::new();
+    let mut said = Vec::new();
+    for (file, item, held_type) in held {
+        if !matches!(
+            held_type.origin,
+            resolve::Origin::Std | resolve::Origin::Scalar
+        ) && !accounted.types.contains(&held_type)
+        {
+            said.push(format!(
+                "{item} ({file}), which the store {store} keeps, holds {} (from {}), which the table does not \
+                 name for that store: declare it, or list it as known with its store",
+                held_type.name,
+                origin_text(&held_type.origin),
+            ));
+        }
+        types.insert(held_type);
+    }
+    problems.extend(said);
+    (types, problems)
 }
 
-/// The identifier and scalar types of the protocol, by name: the newtypes over a UUID, a counter or a
-/// number that a stored item holds in its fields. Their forms are part of the wire, which the
-/// committed protocol schema records and its check refuses to see change unseen; they are not
-/// declared one by one in a store.
-fn wire_scalars() -> Result<Vec<String>, String> {
-    let mut names = Vec::new();
-    let ids = std::fs::read_to_string(repository().join("crates/kr-protocol/src/ids.rs"))
-        .map_err(|error| format!("ids.rs: {error}"))?;
-    for line in ids.lines() {
-        if let Some(name) = line
-            .strip_prefix("    ")
-            .and_then(|rest| rest.strip_suffix(','))
-            && !name.is_empty()
-            && name.chars().next().is_some_and(char::is_uppercase)
-            && name.chars().all(char::is_alphanumeric)
-        {
-            names.push(name.to_owned());
-        }
+/// Where a type comes from, in words.
+fn origin_text(origin: &resolve::Origin) -> String {
+    match origin {
+        resolve::Origin::Std => "the standard library".to_owned(),
+        resolve::Origin::Scalar => "the protocol's scalars".to_owned(),
+        resolve::Origin::Defined(file) => file.clone(),
+        resolve::Origin::External(name) => format!("the crate {name}"),
     }
-    let scalars = std::fs::read_to_string(repository().join("crates/kr-protocol/src/scalars.rs"))
-        .map_err(|error| format!("scalars.rs: {error}"))?;
-    let lines: Vec<&str> = scalars.lines().collect();
-    for (at, line) in lines.iter().enumerate() {
-        if let Some(rest) = line
-            .strip_prefix("pub struct ")
-            .or_else(|| line.strip_prefix("pub enum "))
-        {
-            names.push(
-                rest.chars()
-                    .take_while(|c| c.is_alphanumeric())
-                    .collect::<String>(),
-            );
-        }
-        // A fixed-size byte string is made by a macro that names it, then gives its length:
-        // `Digest256,` and `32,` on the next line.
-        if let Some(name) = line
-            .strip_prefix("    ")
-            .and_then(|rest| rest.strip_suffix(','))
-            && name.chars().next().is_some_and(char::is_uppercase)
-            && name.chars().all(char::is_alphanumeric)
-            && lines.get(at + 1).is_some_and(|next| {
-                next.trim()
-                    .strip_suffix(',')
-                    .is_some_and(|length| length.chars().all(|c| c.is_ascii_digit()))
-            })
-        {
-            names.push(name.to_owned());
-        }
-    }
-    Ok(names)
 }
 
-/// The names of the standard library that a type position names and that need no declaring.
-const STANDARD: [&str; 14] = [
-    "Self", "String", "Vec", "Option", "Box", "BTreeMap", "BTreeSet", "HashMap", "HashSet", "Arc",
-    "PathBuf", "Duration", "Result", "Cow",
-];
-
-/// Every type a store keeps in the source, and the types they hold, that the table names nowhere:
-/// not as a declared type of the store, not among the store's known types.
+/// Every type a store keeps in the source, and the types they hold, that the table names nowhere for
+/// the store: not as a declared type, not among its known types. A source item is followed field by
+/// field to the file that defines each type it holds, so two types of one name are two types; what
+/// cannot be followed is reported and never skipped.
 ///
-/// A declared source item is read for the types of its fields; so is a known one that has a source.
 /// A schema the protocol generates holds every type it holds, so a type in one needs no line of its
-/// own. A type that is not declared and not known fails here, however deep it is.
+/// own.
 ///
 /// # Errors
 ///
-/// Returns what stops a definition being read from the source.
+/// Returns what stops a declared type being traced to where it comes from.
 pub fn undeclared_in(stores: &[Store], known: &[Known]) -> Result<Vec<String>, String> {
-    let scalars = wire_scalars()?;
+    let workspace = resolve::Workspace::at(repository())?;
     let mut found = Vec::new();
     for store in stores {
-        let name = store.entry.store.as_str();
-        let mut named: Vec<&str> = Vec::new();
-        for item in &store.kept {
-            match item {
-                Kept::Protocol(label, _) => named.push(label),
-                Kept::Source(_, items) => named.extend(items.iter().copied()),
-                Kept::Words(..) => {}
-            }
+        let accounted = accounted_for(&workspace, store, known)?;
+        let (_, problems) = held_in_store(&workspace, &accounted, &store.entry.store);
+        found.extend(problems);
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+/// Each known type whose pinned digest is not the digest it has now, each that its store declares
+/// (its line is to be deleted), each that no store keeps, and each that nothing its store keeps holds
+/// any more and that is not the answer of a method `answers` names.
+///
+/// # Errors
+///
+/// Returns what stops a type being read from the source.
+pub fn known_that_changed(
+    stores: &[Store],
+    known: &[Known],
+    answers: &[&str],
+) -> Result<Vec<String>, String> {
+    let workspace = resolve::Workspace::at(repository())?;
+    let mut found = Vec::new();
+    for line in known {
+        let Some(store) = stores.iter().find(|store| store.entry.store == line.store) else {
+            found.push(format!(
+                "{} is listed as known for the store {}, which the table does not declare",
+                line.name, line.store
+            ));
+            continue;
+        };
+        let declared = store.kept.iter().any(|item| match item {
+            Kept::Protocol(label, _, _) => *label == line.name,
+            Kept::Source(_, items) => items.contains(&line.name),
+            Kept::Words(label, _) => *label == line.name,
+        });
+        if declared {
+            found.push(format!(
+                "{} is listed as known for the store {} and the store declares it: delete the line",
+                line.name, line.store
+            ));
+            continue;
         }
-        named.extend(
-            known
-                .iter()
-                .filter(|known| known.store == name)
-                .map(|known| known.name),
-        );
-        let mut read: Vec<(&str, &str)> = Vec::new();
-        for item in &store.kept {
-            if let Kept::Source(file, items) = item {
-                read.extend(items.iter().map(|item| (*file, *item)));
-            }
+        let now = line.now()?;
+        if now != line.pinned {
+            found.push(format!(
+                "{} is known for the store {} and has changed: its digest is {now} and the pinned one is {}; \
+                 declare it at the store's next raise and delete its line, never edit the digest",
+                line.name, line.store, line.pinned
+            ));
         }
-        read.extend(
-            known
-                .iter()
-                .filter(|known| known.store == name)
-                .filter_map(|known| match known.is {
-                    KnownIs::Source(file) => Some((file, known.name)),
-                    _ => None,
-                }),
-        );
-        for (file, item) in read {
-            for held in types_named_by(&definition(file, item)?)? {
-                if STANDARD.contains(&held.as_str())
-                    || scalars.contains(&held)
-                    || named.contains(&held.as_str())
-                {
-                    continue;
-                }
+    }
+    for store in stores {
+        let accounted = accounted_for(&workspace, store, known)?;
+        let (held, _) = held_in_store(&workspace, &accounted, &store.entry.store);
+        let held: BTreeSet<&resolve::Type> = held.iter().collect();
+        for line in known.iter().filter(|line| line.store == store.entry.store) {
+            let Some(identity) = line.identity(&workspace)? else {
+                continue;
+            };
+            if !held.contains(&identity) && !answers.contains(&line.name) {
                 found.push(format!(
-                    "{item} ({file}), which the store {name} keeps, holds {held}, which the table \
-                     does not name for that store: declare it, or list it as known with its store"
+                    "{} is listed as known for the store {} and nothing the store keeps holds it any more: delete the line",
+                    line.name, line.store
                 ));
             }
         }
     }
-    found.sort();
-    found.dedup();
     Ok(found)
 }
 
@@ -1025,7 +1083,7 @@ pub fn retained_unaccounted(
         .filter(|store| store.entry.store == "registry")
         .flat_map(|store| &store.kept)
         .filter_map(|kept| match kept {
-            Kept::Protocol(label, _) => Some(*label),
+            Kept::Protocol(label, _, _) => Some(*label),
             _ => None,
         })
         .chain(
@@ -1059,45 +1117,6 @@ pub fn retained_unaccounted(
         }
     }
     found
-}
-
-/// Each known type whose pinned digest is not the digest it has now, and each that no store keeps.
-///
-/// # Errors
-///
-/// Returns what stops a type being read from the source.
-pub fn known_that_changed(stores: &[Store], known: &[Known]) -> Result<Vec<String>, String> {
-    let mut found = Vec::new();
-    for known in known {
-        let Some(store) = stores.iter().find(|store| store.entry.store == known.store) else {
-            found.push(format!(
-                "{} is listed as known for the store {}, which the table does not declare",
-                known.name, known.store
-            ));
-            continue;
-        };
-        let declared = store.kept.iter().any(|item| match item {
-            Kept::Protocol(label, _) => *label == known.name,
-            Kept::Source(_, items) => items.contains(&known.name),
-            Kept::Words(..) => false,
-        });
-        if declared {
-            found.push(format!(
-                "{} is listed as known for the store {} and the store declares it: delete the line",
-                known.name, known.store
-            ));
-            continue;
-        }
-        let now = known.now()?;
-        if now != known.pinned {
-            found.push(format!(
-                "{} is known for the store {} and has changed: its digest is {now} and the pinned one is {}; \
-                 declare it at the store's next raise and delete its line, never edit the digest",
-                known.name, known.store, known.pinned
-            ));
-        }
-    }
-    Ok(found)
 }
 
 /* -------------------------------------------------------------------------------------------- */
