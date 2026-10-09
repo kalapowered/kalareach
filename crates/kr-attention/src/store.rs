@@ -110,8 +110,8 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 /// continues by - so a row written under a different derivation would be read under a name that
 /// does not describe it, which is worse than not reading it at all. Every row also has to carry
 /// the anchor each of its intervals is measured from, and a row that predates those columns
-/// carries none. Version 11 adds the approvals source to the values a row's `source` holds, which
-/// a build that does not know it reads as a row it cannot read.
+/// carries none. Version 11 adds the approvals source to the values a row's `source` or
+/// `record_source` holds, which a build that does not know it reads as a row it cannot read.
 pub const SCHEMA_VERSION: i64 = 11;
 
 /// The oldest schema this build brings forward rather than refusing: see `migrate_forward`.
@@ -559,6 +559,9 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
 ///
 /// From schema 10, nothing in the tables changes: the approvals source has no cursor until the
 /// first page of a session's approval transitions is taken, which reads them from the start.
+///
+/// Remove the step from schema 9, with its column check, once no supported upgrade starts from a
+/// store written under schema 9; `OLDEST_SCHEMA_VERSION` then moves up to 10.
 fn migrate_forward(connection: &mut Connection, from: i64) -> Result<()> {
     let transaction = connection.transaction()?;
     // The tables first, because a start that stopped after it recorded its version and before it
