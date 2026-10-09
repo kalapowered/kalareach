@@ -289,9 +289,10 @@ async fn a_member_device_is_refused_before_it_presents_and_served_after() {
 
     read_host_info(&raw).await.expect("a read under the lease");
     let error = close_a_session(&fixture, &raw).await;
-    assert!(
-        !denied(&error),
-        "a mutation under the lease gets as far as its session: {error:?}"
+    assert_eq!(
+        error.code,
+        ErrorCode::UnknownSession,
+        "a mutation under the lease gets as far as its session, which does not exist: {error:?}"
     );
 
     // The device is bound to the account and key of its first lease, durably and where the owner
@@ -385,6 +386,8 @@ async fn a_member_whose_lease_runs_out_is_refused_on_the_same_connection_and_ser
         denied(&net_support::refusal(read_host_info(&raw).await)),
         "a read after the end, on the connection that stayed up"
     );
+    // A mutation is made on a connection given a window after the time passed: a window lasts five
+    // minutes of the continuous clock, so the connection that stayed up could not carry one.
     let fresh = ada.connect(&fixture).await;
     assert!(
         denied(&close_a_session(&fixture, &fresh).await),
@@ -822,6 +825,15 @@ async fn a_chain_that_drops_another_devices_lease_fences_the_host() {
     // The barrier may withdraw the connection the answer was on; the lease is installed either way.
     drop(outcome);
     fixture.until_the_fence_is_retired().await;
+    // The fence reached the whole host: ada's own connection was admitted before the chain, her new
+    // lease is live, and it is served nothing more, because only the barrier stood in its way.
+    match ada_raw.try_read(Method::HostInfo, &()).await {
+        None => {}
+        Some(answer) => assert!(
+            denied(&net_support::refusal(answer)),
+            "a connection admitted before the chain is withdrawn with the host's fence"
+        ),
+    }
     let fresh = bea.connect(&fixture).await;
     assert!(
         denied(&net_support::refusal(read_host_info(&fresh).await)),
