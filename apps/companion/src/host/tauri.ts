@@ -24,16 +24,19 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
+  KitSaved,
   OwnerView,
   PairingOrigin,
   PairingView,
   PasteView,
+  RecoveryView,
   ReviewOutcome,
   SessionAgents,
   SessionSubject,
   Settled,
   SettingsPane,
   SetupIdentity,
+  SyncServiceView,
   TerminalView,
   TerminalViewState,
   VoiceCallState,
@@ -290,10 +293,18 @@ export function tauriPort(): HostPort {
 
     accountStatus: () => call<AccountView>('account_status', {}),
     accountSignIn: () => call<AccountView>('account_sign_in', {}),
+    accountSignInForRecovery: () => call<AccountView>('account_sign_in_for_recovery', {}),
     accountSignInCancel: () => call<undefined>('account_sign_in_cancel', {}),
     accountSignOut: () => call<AccountView>('account_sign_out', {}),
     accountUsage: () => call<UsageView>('account_usage', {}),
     onAccount: (listener) => listening<AccountView>(ACCOUNT_EVENT, listener),
+
+    syncServiceView: () => call<SyncServiceView>('sync_service_view', {}),
+    syncServiceSet: (origin) => call<SyncServiceView>('sync_service_set', { origin }),
+    recoveryView: () => call<RecoveryView>('recovery_view', {}),
+    recoveryTurnOn: () => call<RecoveryView>('recovery_turn_on', {}),
+    recoverySettle: () => call<RecoveryView>('recovery_settle', {}),
+    recoverySaveKit: (path) => call<KitSaved>('recovery_save_kit', { path }),
 
     subscribe: (listener: (event: HostEvent) => void) =>
       listening<PublishedEvent>(HOST_EVENT, (published) => {
