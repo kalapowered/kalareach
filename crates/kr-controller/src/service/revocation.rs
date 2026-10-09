@@ -12,8 +12,8 @@ use super::{Controller, net};
 /// It is a function of the actor that made the revocation and of nothing else, so no path that
 /// answers a revocation (the first answer, a repeat, a retry of an unfinished claim) can answer a
 /// device as it answers the owner. It covers `grant.revoke`, the one revocation a device makes;
-/// `device.revoke` and `grant.transfer` are served to the owner at this machine alone, and are
-/// answered as the owner's.
+/// `device.revoke` and `grant.transfer` are the owner's at this machine alone, are answered as the
+/// owner's, and are refused to a device before anything is claimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Audience {
     /// The owner at this machine: every worker the host holds.

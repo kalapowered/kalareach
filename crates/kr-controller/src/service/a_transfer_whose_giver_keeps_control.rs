@@ -274,7 +274,17 @@ async fn a_chain_with_a_missing_link_is_not_one_without_a_grant_above() {
     let refused =
         describe().expect_err("a chain that cannot be walked is not one with nothing above");
     assert!(
-        refused.to_string().contains("does not hold"),
+        refused.to_string().contains("names a parent"),
         "refused for the missing link, not described: {refused}"
     );
+
+    // A device that asks to revoke a grant on the broken chain is refused in the words it is
+    // refused in for a grant that does not exist: it learns nothing of which grants exist.
+    let broken = controller
+        .require_delegating_ancestor(giver, chain[1].grant_id)
+        .expect_err("the chain cannot be walked");
+    let missing = controller
+        .require_delegating_ancestor(giver, GrantId::new(Uuid::from_bytes([0x77; 16])))
+        .expect_err("there is no such grant");
+    assert_eq!(broken.to_string(), missing.to_string());
 }

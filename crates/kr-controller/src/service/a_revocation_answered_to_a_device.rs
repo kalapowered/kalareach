@@ -338,3 +338,46 @@ fn only_the_owners_own_socket_is_answered_as_the_owner() {
     assert_eq!(Audience::of(&device), Audience::Device);
     assert_eq!(Audience::of(&unknown), Audience::Device);
 }
+
+/// KR-REQ-23.49: the revocation of a device and the transfer of control are the owner's at this
+/// machine, and their answers are written for the owner, so a device that reaches the daemon with
+/// either is refused before anything is claimed, and its action is not spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_refused_what_only_the_owner_at_this_machine_does() {
+    let (temp, controller) = daemon().await;
+    let holder: DeviceId = paired(&controller, 1, None).device_id;
+    let actor_id = kr_transport::listener::device_principal(&holder);
+    let mutation = revoke_request(&temp, GrantId::new(kr_ipc::new_uuid()));
+    for method in [Method::DeviceRevoke, Method::GrantTransfer] {
+        let carried = crate::authority::AdmittedMutation {
+            connection_id: kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+            admitted_revision: controller.leases.authority_revision(),
+            deadline: None,
+        };
+        let refused = controller
+            .authority_change(
+                &actor_id,
+                super::authority_changes::AuthorityCaller::Device(holder),
+                &mutation,
+                method,
+                carried,
+            )
+            .await
+            .expect_err("a device does not make what the owner at this machine makes");
+        assert_eq!(
+            refused.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "{method:?}: {refused}"
+        );
+    }
+    let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("a digest");
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .recorded_action(&actor_id, mutation.action_id, &digest)
+            .expect("readable")
+            .is_none(),
+        "nothing was claimed for the action"
+    );
+}
