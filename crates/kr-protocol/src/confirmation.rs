@@ -297,9 +297,11 @@ pub struct StatementParts<'a> {
 /// that holds it, so for any other grant a device never takes words in the publisher's bridge
 /// statement for the host's reading, even from a host that does not refuse the label in them.
 ///
-/// A grant that holds both capabilities, sent by a host that does not refuse the label in a
-/// bridge's words and does not write a reading, cannot be told from one a host that does sent: the
-/// device splits it at the first label all the same.
+/// A grant that holds both capabilities has one case the device cannot settle. A host that does not
+/// refuse the label in a bridge's words and writes no reading sends the bridge's words alone, and
+/// when they hold the label the device cannot tell them from a statement that a host which does
+/// write the reading sent. It splits at the first label, so the publisher's words after it show as
+/// the host's reading.
 #[must_use]
 pub fn split_install_statement<'a>(grant: &[String], statement: &'a str) -> StatementParts<'a> {
     fn part(text: &str) -> Option<&str> {

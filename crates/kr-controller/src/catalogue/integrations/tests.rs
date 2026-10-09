@@ -706,8 +706,9 @@ fn an_integration_turned_off_carries_no_flags() {
 }
 
 /// One long flag: an owner is shown what the integration does whole, and that is at most
-/// `MAX_STATEMENT_CHARS` characters, the flag and the rest of the statement together, so a flag this
-/// long takes most of it. A flag of multi-byte characters takes more bytes than it has characters.
+/// `MAX_STATEMENT_CHARS` characters, the flag and the rest of the statement together, so a flag
+/// this long takes most of it. A flag of multi-byte characters takes more bytes than it has
+/// characters.
 fn largest_flags() -> Vec<String> {
     vec![format!(
         "--{}",
