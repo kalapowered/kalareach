@@ -8317,7 +8317,9 @@ async fn a_rollback_is_refused_to_a_release_that_lists_no_store() {
     let host = Host::create();
     let unlisted = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).without_stores();
     let listed = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
-    host.put(&unlisted);
+    // Written into the store as an earlier build left it: this build starts none of its programs,
+    // because its manifest is not one this build reads.
+    unlisted.write(&host.store.release_directory(unlisted.name()));
     host.put(&listed);
     host.switch(listed.name());
 
