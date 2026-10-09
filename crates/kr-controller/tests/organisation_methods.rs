@@ -588,6 +588,61 @@ async fn a_policy_write_the_store_refuses_enrols_nothing_and_spends_the_confirma
     host.stop().await;
 }
 
+/// KR-REQ-17.53: the enrolment and the answer to the action that asked for it are written together
+/// or not at all. When the store refuses the answer, the enrolment that went into the same
+/// transaction is not kept, the confirmation is spent, and the action's outcome is not known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_the_store_refuses_takes_the_enrolment_with_it() {
+    let owner = keys();
+    let host = Host::start(&owner).await;
+    let mut client = host.client().await;
+    let (organisation, now) = organisation(0x21);
+    let params = enrol_params(&organisation, now);
+    let signer = Signer::OwnerDevice(&owner);
+    calls::confirm_subject(host.environment_id, &mut client, subject(&params), &signer)
+        .await
+        .expect("the owner confirms the chain");
+
+    let blocker = rusqlite::Connection::open(host.registry_database()).expect("the registry opens");
+    blocker
+        .execute_batch(
+            "CREATE TRIGGER refuse_answer BEFORE UPDATE OF result ON authority_receipts
+             WHEN NEW.result IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the answer's write is refused");
+    let action = ActionId::new(kr_ipc::new_uuid());
+    enrol(&host, &mut client, action, &params)
+        .await
+        .expect_err("the store refuses the answer");
+    blocker
+        .execute_batch("DROP TRIGGER refuse_answer;")
+        .expect("the write is taken again");
+    drop(blocker);
+    assert!(
+        list(&mut client).await.enrolments.is_empty(),
+        "the policy that went with the answer was not kept"
+    );
+    let unknown = enrol(&host, &mut client, action, &params)
+        .await
+        .expect_err("the outcome of that attempt is not known");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown, "{unknown:?}");
+
+    calls::confirm_subject(host.environment_id, &mut client, subject(&params), &signer)
+        .await
+        .expect("the owner confirms again");
+    enrol(
+        &host,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        &params,
+    )
+    .await
+    .expect("and the host enrols");
+    assert_eq!(list(&mut client).await.enrolments.len(), 1);
+    host.stop().await;
+}
+
 /// The requirement a member's grant names, at the revision the host enrolled at.
 fn member_grant(
     organisation: &Organisation,
