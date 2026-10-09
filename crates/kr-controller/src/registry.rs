@@ -4389,6 +4389,21 @@ mod tests {
                 to: SCHEMA_VERSION
             })
         );
+        // Read before any store opens the file: opening the grants store makes the table whether
+        // or not the forward step did, so the step is judged by the file as it leaves it.
+        let table: String = Connection::open(&path)
+            .expect("opens")
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'table' AND name = 'exclusive_management_events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the forward step made the table");
+        assert!(
+            table.contains("AUTOINCREMENT"),
+            "the table's sequence is a cursor no later row can reuse: {table}"
+        );
         let grants = crate::grants::GrantDirectory::open(&path).expect("the grants store");
         assert_eq!(
             grants.exclusive_management_events().expect("the table"),
