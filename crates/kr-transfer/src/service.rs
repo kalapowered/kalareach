@@ -2147,8 +2147,8 @@ impl TransferService {
             return self.refuse_unless_performed(action, refusal);
         }
         // A method that needs the agent to open the file gets a narrow read grant over that one
-        // file, inside the staging area and outside every repository. A typed submission needs no
-        // path at all and is given none.
+        // file, inside the staging area and outside every repository. A typed submission is given
+        // none when it is added; the claim of an offer gives it one.
         let grant = if params.contribution.insertion_method.needs_read_grant() {
             Some(self.read_grant_for(&handle, params.contribution.insertion_method, now)?)
         } else {
