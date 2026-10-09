@@ -9169,6 +9169,18 @@ async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_ag
             contents,
             "{what}: through the doctor, the refused create and the refused edit, the file is as it was written"
         );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let kept = std::fs::metadata(host.configuration_document())
+                .expect("the document")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                kept, mode,
+                "{what}: and its permissions are as they were written"
+            );
+        }
 
         // Rewritten, the next create is made and descriptions are on again.
         host.write_the_configuration_as(br#"{"version": 2}"#, 0o600);

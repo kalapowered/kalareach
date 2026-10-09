@@ -141,7 +141,7 @@ restriction that only the unusable document holds is not applied. `kr doctor` an
 say what was found and how to put it right: use a release that reads the version, rewrite the
 document, or, for a file this host may not read, make it a regular file that only you can read and
 write, within the size bound. The refusal and the descriptions follow the document at the next
-acceptance, which every `kr doctor` and every create makes. When the problem is fixed, descriptions
+acceptance, which `kr doctor` and `kr new` make, and a create makes while the document is unusable. When the problem is fixed, descriptions
 and new sessions return then, and the closed selections return at the next start of the daemon.
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
