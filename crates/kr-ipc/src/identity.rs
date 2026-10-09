@@ -250,6 +250,85 @@ pub fn process_lineage(pid: u32) -> Result<Lineage> {
     platform::lineage(pid)
 }
 
+/// The start of the name of the transient scope a control daemon moves itself into when a command
+/// of a session starts it, so that the end of the session's service does not end it.
+pub const DAEMON_SCOPE_PREFIX: &str = "kr-daemon-";
+
+/// The name of a scope for a control daemon, `kr-daemon-<id>`, which the service manager completes
+/// with `.scope`.
+#[must_use]
+pub fn daemon_scope_name(id: impl std::fmt::Display) -> String {
+    format!("{DAEMON_SCOPE_PREFIX}{id}")
+}
+
+/// Whether the last component of a control group's path is a scope a control daemon made for
+/// itself: `kr-daemon-<id>.scope`.
+#[must_use]
+pub fn is_daemon_scope(leaf: &str) -> bool {
+    leaf.strip_prefix(DAEMON_SCOPE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".scope"))
+        .is_some_and(|id| !id.is_empty())
+}
+
+/// The path, in the unified control group hierarchy, of the control group a process is in.
+///
+/// Only a platform with control groups answers; elsewhere there is none to read, and this is
+/// `None` like a process that has gone.
+#[must_use]
+pub fn control_group_of(pid: u32) -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        platform::control_group_of(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether a control group `path` is a control daemon's own scope outside `unit`, the control group
+/// of the service a session runs in.
+///
+/// The scope has to be outside the unit: a process of the session can make `<unit>/kr-daemon-x.scope`
+/// for itself, and that is not a daemon leaving the session. Containment is by path component, so a
+/// unit whose name is the start of another's is not mistaken for its parent.
+#[must_use]
+pub fn is_outside_in_a_daemon_scope(path: &str, unit: Option<&str>) -> bool {
+    let Some(leaf) = path.rsplit('/').next() else {
+        return false;
+    };
+    if !is_daemon_scope(leaf) {
+        return false;
+    }
+    unit.is_none_or(|unit| {
+        let unit = unit.trim_end_matches('/');
+        path != unit
+            && !path
+                .strip_prefix(unit)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Whether a process has left the session it was recorded in for a control daemon's own scope: it
+/// leads a session of its own other than `session`, and its control group is a daemon's scope
+/// outside `unit`.
+///
+/// A control daemon that a command of the session starts calls `setsid` before it can be in its
+/// scope, so it always leads a session when it is in one. What this reads is a statement about the
+/// scope's name, which any process of the account can give its own scope; it decides that a process
+/// is not stopped with the session, and the closure names what it skipped.
+#[must_use]
+pub fn left_for_a_daemon(pid: u32, session: u32, unit: Option<&str>) -> bool {
+    let Some(path) = control_group_of(pid) else {
+        return false;
+    };
+    if !is_outside_in_a_daemon_scope(&path, unit) {
+        return false;
+    }
+    pid != session && process_lineage(pid).is_ok_and(|lineage| lineage.session == Some(pid))
+}
+
 /// Reads this process's own start identity.
 ///
 /// # Errors
@@ -1131,6 +1210,16 @@ mod platform {
             }
         }
         super::Stopped::Signalled
+    }
+
+    /// The `0::` line of `/proc/<pid>/cgroup`: where the process is in the unified hierarchy.
+    pub(super) fn control_group_of(pid: u32) -> Option<String> {
+        read_process_file(pid, "cgroup")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty())
     }
 
     pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
@@ -2688,6 +2777,49 @@ mod windows_boot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A control daemon's own scope is told from every other control group by its name, and is
+    /// outside the service of the session only when the service is not its parent or itself, by
+    /// path component: a session can make a scope of that name for itself below its own service,
+    /// and no product test can make a daemon do that.
+    #[test]
+    fn a_daemons_scope_is_outside_the_sessions_service_by_path_component() {
+        let unit = "/user.slice/app.slice/kr-worker-0123.service";
+        for (path, outside) in [
+            ("/user.slice/app.slice/kr-daemon-9f.scope", true),
+            (
+                "/user.slice/app.slice/kr-worker-01234.service/kr-daemon-9f.scope",
+                true,
+            ),
+            (
+                "/user.slice/app.slice/kr-worker-0123.service/kr-daemon-9f.scope",
+                false,
+            ),
+            (
+                "/user.slice/app.slice/kr-worker-0123.service/a/kr-daemon-9f.scope",
+                false,
+            ),
+            ("/user.slice/app.slice/kr-worker-0123.service", false),
+            ("/user.slice/app.slice/kr-daemon-.scope", false),
+            ("/user.slice/app.slice/kr-daemon-9f.service", false),
+            ("/user.slice/app.slice/other-9f.scope", false),
+        ] {
+            assert_eq!(
+                is_outside_in_a_daemon_scope(path, Some(unit)),
+                outside,
+                "{path}"
+            );
+        }
+        // The unit itself being a daemon's scope (a worker started where a daemon had moved): the
+        // equal path is not outside it, and a different scope is.
+        let scope = "/user.slice/app.slice/kr-daemon-9f.scope";
+        assert!(!is_outside_in_a_daemon_scope(scope, Some(scope)));
+        assert!(is_outside_in_a_daemon_scope(
+            "/user.slice/app.slice/kr-daemon-aa.scope",
+            Some(scope)
+        ));
+        assert!(is_outside_in_a_daemon_scope(scope, None));
+    }
 
     /// What a query about `pid` says about the process `identity` recorded.
     fn state_from(identity: &ProcessStartIdentity, pid: u32, query: ProcessQuery) -> ProcessState {
