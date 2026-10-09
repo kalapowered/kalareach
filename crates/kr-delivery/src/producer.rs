@@ -73,7 +73,7 @@ pub struct Notice {
     /// One line naming the subject in the host's own words, or empty when the only words for it
     /// are a session's text, which a notice never holds. A push destination carries it inside the
     /// seal. An external message carries it as a line only for a rule whose words are the host's
-    /// own identifiers and the name of a limit (an automation paused by one), and for no other.
+    /// own record of a limit (an automation paused by one), and for no other.
     pub summary: String,
     /// The session it belongs to, when it belongs to one.
     pub session_id: Option<SessionId>,
@@ -400,6 +400,18 @@ pub struct RecipientScope {
     pub history_from_ms: u64,
 }
 
+impl RecipientScope {
+    /// The filter the lines of a message to this recipient pass through.
+    ///
+    /// Its reach is the one [`Audience::admits`] decides a notice by: from `history_from_ms`, the
+    /// grant's own history cursor or its start. Both read that one field, so a notice the
+    /// audience admits is never a notice whose line the filter refuses for its date.
+    #[must_use]
+    pub fn line_filter(&self) -> HistoryFilter {
+        HistoryFilter::new(self.viewer.clone().reaching_from(self.history_from_ms))
+    }
+}
+
 /// What a destination's rule grants the recipient.
 ///
 /// The host that owns the grant store answers it.
@@ -660,9 +672,9 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
         text,
     };
     let mut lines = vec![line(sentence)];
-    // Only a rule whose summary is made of the host's own identifiers and the name of a limit
-    // goes out with it. A summary the host composes from a command line, a turn or a notice's body is free text
-    // that a person or a program wrote, and a rule that carries it is a decision of its own.
+    // Only a rule whose summary is the host's own record of a limit goes out with it. A summary
+    // the host composes from a command line, a turn or a notice's body is free text that a person
+    // or a program wrote, and a rule that carries it is a decision of its own.
     if rule == AttentionRule::AutomationPaused && !notice.summary.is_empty() {
         lines.push(line(notice.summary.clone()));
     }
@@ -1468,9 +1480,7 @@ impl Producer {
             external_destination.kind,
             notice.alert,
             lines.to_vec(),
-            // The reach the audience admitted the notice under: a grant with no history bound
-            // reaches what was first seen at or after its own start.
-            &HistoryFilter::new(scope.viewer.live_from(scope.history_from_ms)),
+            &scope.line_filter(),
             &scope.sessions,
             external::delivery_id(external_destination, notification_id),
         )?;
@@ -2983,10 +2993,79 @@ mod tests {
         )
     }
 
+    /// A line is dated by when its condition was first seen, which is what the audience admits a
+    /// notice by, so a message to a recipient the audience admitted loses no session line to its
+    /// date: whatever the grant says of a history bound and of the live screen, the filter reaches
+    /// back as far as the audience does and no further. The control is a line from before that
+    /// reach, which every shape of grant leaves out.
+    #[test]
+    fn a_notice_the_audience_admits_is_a_line_the_filter_reaches() {
+        use kr_protocol::grant::HistoryScope;
+
+        let began = 5_000;
+        let shapes = [
+            ("a bound and the live screen", Some(began), true),
+            ("a bound and no live screen", Some(began), false),
+            ("no bound and the live screen", None, true),
+            ("no bound and no live screen", None, false),
+        ];
+        for (name, bound, live_screen) in shapes {
+            let scope = RecipientScope {
+                viewer: ViewerScope::from_history(
+                    &HistoryScope {
+                        lower_bound_ms: bound
+                            .map_or_else(Nullable::null, |at| Nullable::some(TimestampMs::new(at))),
+                        include_live_screen: live_screen,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
+                    true,
+                ),
+                sessions: SessionSelector::Any,
+                rights: [ActionRight::SessionView].into_iter().collect(),
+                grant_id: GrantId::new(Uuid::from_bytes([9; 16])),
+                recipient: DeviceId::new(Uuid::from_bytes([10; 16])),
+                // The grant's own cursor, or its start when it has none.
+                history_from_ms: began,
+            };
+            let line = |at_ms: u64, text: &str| ContentLine {
+                session_id: Some(session(1)),
+                produced_at_ms: Some(at_ms),
+                text: text.to_owned(),
+            };
+            let admitted = Audience::Sessions {
+                sessions: vec![session(1)],
+                at_ms: began + 1,
+            };
+            assert!(admitted.admits(&scope), "{name}: the audience admits it");
+            let message = external::compose(
+                DestinationKind::Webhook,
+                PushAlert::SessionNeedsAttention,
+                vec![
+                    line(began + 1, "first seen after the reach began"),
+                    line(began - 1, "first seen before it"),
+                ],
+                &scope.line_filter(),
+                &scope.sessions,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(
+                message.body.contains("first seen after the reach began"),
+                "{name}: the line the audience admitted is carried: {}",
+                message.body
+            );
+            assert!(
+                !message.body.contains("first seen before it"),
+                "{name}: and an earlier one is not"
+            );
+        }
+    }
+
     /// A limit that paused a causal chain is told in the host's own words to a grant that may be
-    /// told of automation and sees no session: the message carries a sentence that is true of a
-    /// chain as of a workflow, the summary the host made of it, and no note that anything was left
-    /// out, because a line that names no session is not history.
+    /// told of automation and sees no session: the message carries the summary the host made of
+    /// it, does not call a chain a workflow, and says nothing was left out, because a line that
+    /// names no session is not history.
     #[test]
     fn an_automation_paused_by_a_limit_is_told_to_a_grant_that_sees_no_session() {
         use kr_protocol::attention::AttentionAutomationSubject;
@@ -3012,7 +3091,10 @@ mod tests {
             .expect("the store records the pause");
         let (body, summary) = message_for(&mut attention, &HostOnly);
         assert!(summary.contains("its causal budget ran out"), "{summary}");
-        assert!(body.contains("Automation was paused by a limit."), "{body}");
+        assert!(
+            !body.contains("workflow"),
+            "a causal chain is not called a workflow: {body}"
+        );
         assert!(
             body.contains(&summary),
             "the summary of an automation pause is carried: {body}"
@@ -3022,7 +3104,7 @@ mod tests {
 
     /// An adapter's failure is told as a failure that needs attention and nothing more: the words
     /// the host holds for it (the adapter and what it reported) are a summary that stays with the
-    /// host, since a rule whose words a program wrote is not one that goes out unless it is decided.
+    /// host, since a rule whose words a program wrote goes out only when it is decided.
     #[test]
     fn an_adapter_that_needs_attention_is_told_without_the_words_it_reported() {
         let mut attention = store();
@@ -3045,7 +3127,6 @@ mod tests {
             summary.contains("the index is locked"),
             "the control: the host holds the words it was given: {summary}"
         );
-        assert!(body.contains("An adapter needs attention."), "{body}");
         assert!(
             !body.contains("the index is locked"),
             "and the message does not carry them: {body}"
