@@ -201,13 +201,21 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     expect(counts.actionable).toBe(2)
   })
 
-  it('offers a decision only on an approval in a session, and none on a host it cannot reach', () => {
+  it('offers a decision on an approval or a question in a session, and none on a host it cannot reach', () => {
     const rows = order(INBOX, NOW)
     expect(rows.find((row) => row.kind === 'disconnected')?.actionable).toBe(false)
     expect(rows.find((row) => row.kind === 'pending_decision')?.actionable).toBe(true)
     const question = order(inbox([item({ rule: 'attention.pending_input' })]), NOW)[0]
     expect(question?.kind).toBe('pending_decision')
-    expect(question?.actionable).toBe(false)
+    expect(question?.actionable).toBe(true)
+    const waiting = order(inbox([item({ rule: 'attention.input_idle_reminder' })]), NOW)[0]
+    expect(waiting?.actionable).toBe(true)
+    // An item that names no session has nowhere to be answered.
+    const hostWide = order(
+      inbox([item({ rule: 'attention.pending_input', session_id: null })]),
+      NOW
+    )[0]
+    expect(hostWide?.actionable).toBe(false)
   })
 
   it('reads the kind aloud rather than leaving it to a colour', () => {

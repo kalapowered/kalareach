@@ -18,6 +18,7 @@ export type Shape =
   | { readonly kind: 'uuid' }
   | { readonly kind: 'u64' }
   | { readonly kind: 'bool' }
+  | { readonly kind: 'any' }
   | { readonly kind: 'prompt' }
   | { readonly kind: 'nullable'; readonly of: Shape }
   | { readonly kind: 'enum'; readonly values: readonly string[] }
@@ -31,6 +32,8 @@ export const opaque: Shape = { kind: 'opaque' }
 export const uuid: Shape = { kind: 'uuid' }
 export const u64: Shape = { kind: 'u64' }
 export const bool: Shape = { kind: 'bool' }
+/** A value the method reads further itself, such as an internally tagged union. */
+export const anything: Shape = { kind: 'any' }
 /** Prompt or steering text: one to 65,536 bytes of UTF-8. */
 export const prompt: Shape = { kind: 'prompt' }
 export const nullable = (of: Shape): Shape => ({ kind: 'nullable', of })
@@ -87,6 +90,8 @@ export function problemOf(value: unknown, shape: Shape, at: string): string | nu
     }
     case 'bool':
       return typeof value === 'boolean' ? null : `\`${at}\` is true or false`
+    case 'any':
+      return null
     case 'prompt':
       return typeof value === 'string' && value.length > 0 && bytesOf(value) <= MAX_PROMPT_BYTES
         ? null
@@ -227,6 +232,20 @@ export const ENVIRONMENT_PARAMS = object({ environment_id: uuid })
 export const STORAGE_OBJECT_DELETE_PARAMS = object({ object_id: opaque })
 
 export const HISTORY_PAGE_PARAMS = object({ session_id: uuid, from_cursor: u64, max_bytes: u64 })
+
+export const QUESTION_READ_PARAMS = object({
+  session_id: uuid,
+  question_id: nullable(uuid),
+  include_resolved: bool
+})
+export const QUESTION_ANSWER_PARAMS = object({
+  session_id: uuid,
+  question_id: uuid,
+  expected_revision: u64,
+  answer: anything
+})
+/** One kept answer, named as native code reads it: by question and by when it was given. */
+export const KEPT_REF_PARAMS = object({ questionId: uuid, draftedAtMs: u64 })
 
 export const AGENT_DRAFT_ADD_ATTACHMENT_PARAMS = object({
   draft_id: uuid,

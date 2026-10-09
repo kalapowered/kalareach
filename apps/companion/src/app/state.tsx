@@ -58,6 +58,13 @@ interface AppValue {
   readonly closeTab: (sessionId: string) => void
   /** This computer's owner confirmations, which every screen reads. */
   readonly confirmations: ConfirmationStore
+  /**
+   * How many times the answers kept on this device have changed since the window opened. A list of
+   * them reads again when it moves, so an answer given on one screen is listed on another at once.
+   */
+  readonly keptVersion: number
+  /** Says the answers kept on this device changed. */
+  readonly keptChanged: () => void
 }
 
 const AppContext = createContext<AppValue | null>(null)
@@ -78,6 +85,10 @@ export function AppProvider({
   const [place, setPlace] = useState<Place>(initialPlace)
   const [toast, setToast] = useState<ToastMessage | null>(null)
   const [tabs, setTabs] = useState<readonly string[]>([])
+  const [keptVersion, setKeptVersion] = useState(0)
+  const keptChanged = useCallback(() => {
+    setKeptVersion((current) => current + 1)
+  }, [])
   // One store per window, created once. A store built during render would be a different store on
   // every render, and every session's state would go with the old one.
   const [sessions] = useState(() => new SessionStates())
@@ -150,9 +161,24 @@ export function AppProvider({
       tabs,
       openTab,
       closeTab,
-      confirmations
+      confirmations,
+      keptVersion,
+      keptChanged
     }),
-    [port, sessions, place, go, toast, say, tabs, openTab, closeTab, confirmations]
+    [
+      port,
+      sessions,
+      place,
+      go,
+      toast,
+      say,
+      tabs,
+      openTab,
+      closeTab,
+      confirmations,
+      keptVersion,
+      keptChanged
+    ]
   )
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>

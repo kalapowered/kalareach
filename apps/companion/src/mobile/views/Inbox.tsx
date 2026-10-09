@@ -32,6 +32,7 @@ import {
   type AttentionRow
 } from '../../model/attention'
 import { ApprovalRequests } from '../../views/Approvals'
+import { KeptAnswers, QuestionRequests } from '../../views/Questions'
 import { ask } from '../model/call'
 import { minimumTarget, type Surface } from '../platform'
 
@@ -157,6 +158,8 @@ export function Inbox({
         />
       ) : null}
 
+      <KeptAnswers />
+
       <div className="m-filters" role="group" aria-label="Filter the inbox">
         {FILTERS.map((each) => (
           <button
@@ -237,6 +240,16 @@ export function Inbox({
       >
         {open?.item.session_id ? (
           <ApprovalRequests
+            sessionId={open.item.session_id}
+            onAnswered={() => {
+              again.current()
+            }}
+          />
+        ) : null}
+        {open?.item.session_id &&
+        (open.item.rule === 'attention.pending_input' ||
+          open.item.rule === 'attention.input_idle_reminder') ? (
+          <QuestionRequests
             sessionId={open.item.session_id}
             onAnswered={() => {
               again.current()

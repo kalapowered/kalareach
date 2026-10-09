@@ -333,3 +333,51 @@ describe('the desktop port and the connection state', () => {
     expect(await heard(live)).toEqual([live])
   })
 })
+
+describe('the desktop port and an agent’s questions', () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
+  const QUESTION = 'b1000000-0000-4000-8000-000000000001'
+
+  it('reads and answers a question with the method’s own parameters and nothing else', async () => {
+    const port = tauriPort()
+    await port.questionRead({ session_id: SESSION, question_id: null, include_resolved: false })
+    await port.questionAnswer({
+      session_id: SESSION,
+      question_id: QUESTION,
+      expected_revision: '2',
+      answer: { kind: 'choice', choice_id: 'main' }
+    })
+    expect(shell.invoked).toEqual([
+      {
+        command: 'question_read',
+        args: { params: { session_id: SESSION, question_id: null, include_resolved: false } }
+      },
+      {
+        command: 'question_answer',
+        args: {
+          params: {
+            session_id: SESSION,
+            question_id: QUESTION,
+            expected_revision: '2',
+            answer: { kind: 'choice', choice_id: 'main' }
+          }
+        }
+      }
+    ])
+  })
+
+  it('settles, sends and dismisses a kept answer by naming the question and when it was given', async () => {
+    const port = tauriPort()
+    const which = { questionId: QUESTION, draftedAtMs: '1763000000001' }
+    await port.questionKept()
+    await port.questionSettle(SESSION)
+    await port.questionSendKept(which)
+    await port.questionDismissKept(which)
+    expect(shell.invoked).toEqual([
+      { command: 'question_kept', args: {} },
+      { command: 'question_settle', args: { params: { sessionId: SESSION } } },
+      { command: 'question_send_kept', args: { params: which } },
+      { command: 'question_dismiss_kept', args: { params: which } }
+    ])
+  })
+})

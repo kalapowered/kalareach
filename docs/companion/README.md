@@ -36,6 +36,10 @@ output is read from its worker while it runs and from the daemon's archive once 
 operation whose parameters or result the protocol does not publish has no command, and the page
 refuses it with `UNSUPPORTED_SCHEMA`.
 
+Questions from a particular session belong to a particular worker, and are served to the page over the same link as the agent's calls. Each question presented to the person includes the program the worker verified (its executable and process), as well as the name the program gave itself, which is not verified. An answer commits on a completed press and names the revision the person saw. If the question changed while the person was typing, the first press says so and a second press sends the answer. The worker resolves a question once, for whoever answers first. If another device answers first, or the question expires, the page keeps what the person chose beside the reason it was not sent.
+
+If the worker cannot be reached, the answer is kept on this device, in a directory for each environment, and the page says it is kept. A kept answer is not sent again unless the person explicitly sends it. When the worker is reachable again, the session's questions are read and the page says whether each kept answer can still be sent. A kept answer whose question ended or changed stays kept, with what became of the question, until the person discards it.
+
 A failure the page shows says the host's own words and, where its code maps to something the person
 can do, that action after them: pair the device again, sign in, update, wait, refresh, check
 whether it went through, or change a setting. The client library says a host's refusal as its code,

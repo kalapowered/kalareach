@@ -43,3 +43,19 @@ export function useConnectionRights(): readonly ActionRight[] | null {
   }, [port, shared])
   return shared === undefined ? own : shared
 }
+
+/**
+ * The rights the connection last held, kept while contact is out.
+ *
+ * A control that only keeps what a person typed, as an answer to a question does while the worker
+ * cannot be reached, is offered on the rights the host last reported: the host checks them again
+ * when the answer is sent. Until a connection has reported any, they are not known and null.
+ */
+export function useLastKnownRights(): readonly ActionRight[] | null {
+  const now = useConnectionRights()
+  const [last, setLast] = useState<readonly ActionRight[] | null>(null)
+  // Remembered as the connection reports, not after it: the render that loses contact already
+  // has the rights it last held.
+  if (now !== null && now !== last) setLast(now)
+  return now ?? last
+}
