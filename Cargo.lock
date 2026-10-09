@@ -1260,6 +1260,7 @@ dependencies = [
  "kr-protocol",
  "kr-transport",
  "kr-width",
+ "kr-worker",
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",

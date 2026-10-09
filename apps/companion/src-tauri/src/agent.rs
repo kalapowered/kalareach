@@ -53,9 +53,9 @@ const MAX_RESOURCE_PAGES: usize = 256;
 const MAX_RESOURCE_RESTARTS: usize = 2;
 
 /// One session's link, and the worker it reaches.
-struct Link {
-    session: Session,
-    descriptor: WorkerDescriptor,
+pub(crate) struct Link {
+    pub(crate) session: Session,
+    pub(crate) descriptor: WorkerDescriptor,
 }
 
 /// The place one session's link is held, which the calls for that session take turns with while
@@ -239,7 +239,7 @@ impl WorkerLinks {
     }
 
     /// The link to `session_id`'s worker: the one held, or a new one.
-    async fn link(&self, session_id: SessionId) -> Result<Arc<Link>> {
+    pub(crate) async fn link(&self, session_id: SessionId) -> Result<Arc<Link>> {
         let slot = Arc::clone(self.lock().entry(session_id).or_default());
         let mut held = slot.lock().await;
         if let Some(link) = held.as_ref() {
@@ -267,7 +267,7 @@ impl WorkerLinks {
 
     /// Hands back what a call on `link` answered, and lets the link go when the answer says it
     /// has ended.
-    fn settle<T>(
+    pub(crate) fn settle<T>(
         &self,
         session_id: SessionId,
         link: &Arc<Link>,
@@ -283,7 +283,7 @@ impl WorkerLinks {
 
     /// Lets `link` go, if it is still the one held for `session_id`: a call that failed on an old
     /// link does not take a new one away.
-    fn forget(&self, session_id: SessionId, link: &Arc<Link>) {
+    pub(crate) fn forget(&self, session_id: SessionId, link: &Arc<Link>) {
         let Some(slot) = self.lock().get(&session_id).cloned() else {
             return;
         };
@@ -304,7 +304,7 @@ impl WorkerLinks {
 
 /// Whether a failure means the link itself has ended, rather than that the worker refused one
 /// call on a link that still stands.
-fn ends_the_link(error: &ClientError) -> bool {
+pub(crate) fn ends_the_link(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::Transport(_)
