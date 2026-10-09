@@ -2929,9 +2929,10 @@ left. A worker that ran as a systemd service also ran in that service's control 
 the reservation and unable to name anything else. The cleanup reads the group from the kernel, asks
 the manager to kill what it still holds, and reaches a process the worker never saw. A recorded
 process that the group held and the manager's delivered kill found is listed as forced; a kill the
-cleanup stopped waiting for is not counted, and a group the host could not read beforehand
-attributes nothing, so the flag is the host's best reading, and a process the manager ended that
-the worker never recorded is not listed.
+cleanup stopped waiting for is not counted, a kill the manager reported as failed is not counted,
+a group the host could not read to the end beforehand attributes nothing, and a process that ended
+by itself between that reading and the kill is counted: the flag is the host's best reading, and a
+process the manager ended that the worker never recorded is not listed.
 
 **What it cannot reach, and what a survivor means.** On macOS, a process that left the terminal's
 session, a process the worker started outside it and a process that began after the worker's last
