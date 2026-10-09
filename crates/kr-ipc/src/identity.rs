@@ -1302,14 +1302,80 @@ mod platform {
         })
     }
 
+    /// What the kernel says about a number `/proc` shows no entry for.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Held {
+        /// No process holds the number.
+        Nobody,
+        /// A process holds it, and `/proc` does not show it to this account.
+        Somebody,
+        /// The kernel did not say.
+        Unknown(String),
+    }
+
+    /// Asks whether any process holds `pid`, by a signal that sends nothing. Absent from `/proc`
+    /// is the process having gone, or `/proc` being mounted to hide the processes of other accounts
+    /// (`hidepid`); only the kernel's own answer to the signal tells the two apart.
+    fn held(pid: u32) -> Held {
+        let Some(number) = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            return Held::Nobody;
+        };
+        match rustix::process::test_kill_process(number) {
+            Ok(()) | Err(rustix::io::Errno::PERM) => Held::Somebody,
+            Err(rustix::io::Errno::SRCH) => Held::Nobody,
+            Err(error) => Held::Unknown(error.to_string()),
+        }
+    }
+
+    /// What a missing `/proc` entry comes to, given what asking the kernel found and what a second
+    /// reading of the entry found: the process has gone, the entry came into being, or a process
+    /// holds the number and cannot be described.
+    pub(super) fn after_a_missing_entry(
+        held: Held,
+        second_reading: impl FnOnce() -> std::io::Result<String>,
+        pid: u32,
+    ) -> std::result::Result<String, super::ProcessQuery> {
+        let path = format!("/proc/{pid}/stat");
+        match held {
+            Held::Nobody => Err(super::ProcessQuery::Gone),
+            Held::Unknown(why) => Err(super::ProcessQuery::CannotEstablish(unavailable(
+                "process start identity",
+                format!(
+                    "{path} is missing and whether a process holds {pid} was not answered: {why}"
+                ),
+            ))),
+            // A process holds the number: the entry may have appeared between the readings, or
+            // `/proc` does not show it. A process that is there and cannot be described is not one
+            // that has gone, and nothing here guesses its start.
+            Held::Somebody => second_reading().map_err(|error| {
+                super::ProcessQuery::CannotEstablish(unavailable(
+                    "process start identity",
+                    format!("{path}: a process holds {pid} and /proc does not show it ({error})"),
+                ))
+            }),
+        }
+    }
+
+    /// Whether a failed read of a `/proc` entry is the entry being absent.
+    fn is_absent(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound
+            || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+    }
+
     pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
         let path = format!("/proc/{pid}/stat");
         let text = match read_process_file(pid, "stat") {
             Ok(text) => text,
-            // The only failure that proves absence on Linux is a missing /proc entry. A permission,
+            // An absent entry is a process that has gone only when the kernel agrees. A permission,
             // a descriptor limit or an entry that vanished part way through a read proves nothing.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return super::ProcessQuery::Gone;
+            Err(error) if is_absent(&error) => {
+                match after_a_missing_entry(held(pid), || read_process_file(pid, "stat"), pid) {
+                    Ok(text) => text,
+                    Err(answer) => return answer,
+                }
             }
             Err(error) => {
                 return super::ProcessQuery::CannotEstablish(unavailable(
@@ -1345,8 +1411,36 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{decide, parse_start_ticks};
-        use crate::identity::ProcessState;
+        use super::{Held, after_a_missing_entry, decide, parse_start_ticks};
+        use crate::identity::{ProcessQuery, ProcessState};
+
+        /// A `/proc` entry that is missing is a process that has gone only when the kernel says
+        /// nobody holds the number. Where somebody does, and `/proc` shows nothing (a mount that
+        /// hides other accounts' processes), the answer is that the process cannot be described,
+        /// never that it has gone; a second reading that finds the entry is the entry.
+        #[test]
+        fn a_missing_proc_entry_is_a_process_that_has_gone_only_when_the_kernel_agrees() {
+            let missing = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            assert!(matches!(
+                after_a_missing_entry(Held::Nobody, missing, 4242),
+                Err(ProcessQuery::Gone)
+            ));
+            assert!(matches!(
+                after_a_missing_entry(Held::Somebody, missing, 4242),
+                Err(ProcessQuery::CannotEstablish(_))
+            ));
+            assert!(matches!(
+                after_a_missing_entry(Held::Unknown("no".to_owned()), missing, 4242),
+                Err(ProcessQuery::CannotEstablish(_))
+            ));
+            assert_eq!(
+                after_a_missing_entry(Held::Somebody, || Ok("4242 (x) S".to_owned()), 4242)
+                    .as_deref()
+                    .ok(),
+                Some("4242 (x) S"),
+                "an entry that has appeared by the second reading is read"
+            );
+        }
 
         /// Builds a `/proc/<pid>/stat` line with the state, thread count and start time given.
         ///
