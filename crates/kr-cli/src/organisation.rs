@@ -41,24 +41,46 @@ pub async fn run(paths: &HostPaths, command: OrganisationCommand, json: bool) ->
 /// Reads the chain a member exported.
 ///
 /// The file is bounded by what one control frame carries, which is what the host would refuse a
-/// larger chain for, and it is the organisation's published object as JSON.
+/// larger chain for, and it is the organisation's published object as JSON. A link and a pipe are
+/// refused where the platform can tell: this reads a file, and does not wait for a writer.
 fn read_chain(path: &std::path::Path) -> Result<PolicyAuthority> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        CliError::Usage(shown!(
-            "the chain file could not be read: {}",
-            Shown::io(&error)
-        ))
+    let bytes = read_bounded(path).map_err(|error| {
+        CliError::Usage(if error.kind() == std::io::ErrorKind::InvalidData {
+            Shown::said(
+                "the chain file is not a regular file, or is larger than any chain this host \
+                 would take",
+            )
+        } else {
+            shown!("the chain file could not be read: {}", Shown::io(&error))
+        })
     })?;
-    if bytes.len() > MAX_CONTROL_FRAME_LEN {
-        return Err(CliError::Usage(Shown::said(
-            "the chain file is larger than any chain this host would take",
-        )));
-    }
     serde_json::from_slice(&bytes).map_err(|_| {
         CliError::Usage(Shown::said(
             "the file is not an organisation's published policy-signing chain",
         ))
     })
+}
+
+/// The file's bytes, when it is a regular file of at most one control frame.
+#[cfg(unix)]
+fn read_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    kr_ipc::install::read_regular_file(path, MAX_CONTROL_FRAME_LEN as u64)
+}
+
+/// The file's bytes, when it is a regular file of at most one control frame.
+#[cfg(not(unix))]
+fn read_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let too_much = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file within the bound",
+        )
+    };
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_CONTROL_FRAME_LEN as u64 {
+        return Err(too_much());
+    }
+    std::fs::read(path)
 }
 
 /// `kr organisation enrol`.
