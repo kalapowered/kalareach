@@ -132,6 +132,8 @@ pub fn table() -> Vec<Store> {
                 protocol::<machine::MachineStepResult>("MachineStepResult"),
                 protocol::<voice::VoiceGrantResult>("VoiceGrantResult"),
                 protocol::<voice::VoiceDelegateResult>("VoiceDelegateResult"),
+                protocol::<voice::VoiceStartResult>("VoiceStartResult"),
+                protocol::<voice::VoiceStopResult>("VoiceStopResult"),
                 // What the registry keeps for an action it claimed, beside the claim. Each is the
                 // answer a repeat of that action is given.
                 protocol::<organisation::OrganisationEnrolResult>("OrganisationEnrolResult"),
