@@ -185,6 +185,13 @@ fn parent_of(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Returns the session a process is in now, as `/proc/<pid>/stat` field 6 says.
+fn session_of(pid: u32) -> Option<u32> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = text.rsplit_once(')')?;
+    rest.split_whitespace().nth(3)?.parse().ok()
+}
+
 /// KR-REQ-07.60: the observation records every process the session started, whatever became of
 /// it: the root shell, a job, a job that left the session and its terminal with `setsid`, and a
 /// process whose parent exited and which the worker, as the child subreaper, adopted. It records no
@@ -329,6 +336,17 @@ fn kr_req_07_66_the_children_of_a_parent_that_ended_while_they_were_read_are_not
     );
     let child = tree.pid("a child that left the session");
     let parent_now = tree.pid("its parent");
+    // The child has left the session before it is read: the root leads the session it was started
+    // in, and the child's own session is another once `setsid` has run.
+    let root = tree.root();
+    let deadline = Instant::now() + LIVENESS;
+    while session_of(child) == Some(root) {
+        assert!(
+            Instant::now() < deadline,
+            "the child leaves the session it was started in"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut ended = false;
     kr_ipc::identity::after_each_read(
         move |pid, file| {
