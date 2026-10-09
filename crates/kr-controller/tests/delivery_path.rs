@@ -2399,11 +2399,11 @@ impl Moved {
     /// Takes both clocks two days on, past the day the grant `proposal` gives a session invitation
     /// lasts.
     ///
-    /// The wall clock goes first. A daemon that reads between the two steps sees a wall clock two
-    /// days on against a continuous clock that has not moved, so a case that moves the clocks with
-    /// a grant still unanchored in this boot would find the host distrusting its wall clock; the
-    /// four cases that use this have anchored their grant at the connection, and the grant ends on
-    /// its continuous deadline whatever the host trusts.
+    /// The wall clock goes first. A daemon that reads between the two steps anchors the new wall
+    /// reading at the old continuous instant, and its first reading after the continuous step
+    /// finds the wall clock two days behind that anchor and distrusts it. A grant with no anchor
+    /// in this boot would then be refused; the three cases that use this anchored theirs at the
+    /// connection, and the grant ends on its continuous deadline whatever the host trusts.
     fn past_the_grant(&self) {
         let days = Duration::from_secs(2 * 24 * 60 * 60);
         self.past_the_grant_by_utc();
@@ -4162,21 +4162,30 @@ async fn an_external_message_under_a_grant_with_no_history_bound_leaves_nothing_
     }
 
     environment._worker.ask("deploy-1", "Deploy the release?");
-    until("both webhooks being posted to", || {
-        environment.gateway.posted().len() >= 2
-    })
-    .await;
-    for posted in environment.gateway.posted() {
-        let text = posted.text();
+    for name in ["with-screen", "without-screen"] {
+        let url = format!("https://hooks.example.test/in/{name}");
+        until("the webhook being posted to", || {
+            environment
+                .gateway
+                .posted()
+                .iter()
+                .any(|posted| posted.url == url)
+        })
+        .await;
+        let text = environment
+            .gateway
+            .posted()
+            .into_iter()
+            .find(|posted| posted.url == url)
+            .expect("posted")
+            .text();
         assert!(
             text.contains(&environment.worker_session.to_string()),
-            "{}: the message names the session the grant reaches: {text}",
-            posted.url
+            "{name}: the message names the session the grant reaches: {text}"
         );
         assert!(
             !text.contains("left out"),
-            "{}: and nothing the grant reaches is said to be left out: {text}",
-            posted.url
+            "{name}: and nothing the grant reaches is said to be left out: {text}"
         );
     }
 }
