@@ -794,15 +794,19 @@ mod tests {
             std::fs::write(deep.join("cgroup.procs"), "").expect("an empty list");
         }
         std::fs::write(unit.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
-        std::fs::write(unit.join("cgroup.procs"), "").expect("the unit's own list");
         let here = std::process::id();
+        let above = std::os::unix::process::parent_id();
+        std::fs::write(unit.join("cgroup.procs"), format!("{above}\n")).expect("the unit's list");
         std::fs::write(deep.join("cgroup.procs"), format!("{here}\n")).expect("the deep list");
         let unit_path = "/kr-worker-example.service";
 
         match read_group_under(root.path(), unit_path, true) {
             Holders::Some(held) => {
-                assert_eq!(held.len(), 1, "{held:?}");
-                assert_eq!(held[0].pid.get(), u64::from(here));
+                let mut pids: Vec<u64> = held.iter().map(|identity| identity.pid.get()).collect();
+                pids.sort_unstable();
+                let mut wanted = vec![u64::from(here), u64::from(above)];
+                wanted.sort_unstable();
+                assert_eq!(pids, wanted, "{held:?}");
             }
             Holders::None => panic!("a populated group read as empty"),
             Holders::Unreadable(why) => panic!("a group with a process below it: {why}"),
