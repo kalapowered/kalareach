@@ -1,12 +1,13 @@
 //! `kr account`: signing this host in to the managed account service and out of it, and saying where
 //! that stands.
 //!
-//! Managed voice spends an account's balance, so the host presents an account token of its own,
-//! and the control daemon alone holds the sign-in that makes one. Every command goes through the
-//! daemon under this user's own authority on this host. `sign-in` asks it to listen on the
-//! loopback address the desktop client is registered with, prints the address a person opens in a
-//! browser and opens it; the daemon exchanges the answer and keeps the account. `sign-out` has the
-//! daemon remove the account and ask the service to end it. `show` reads where that stands.
+//! Managed voice spends an account's balance and managed storage keeps an account's backups, so the
+//! host presents an account token of its own, and the control daemon alone holds the sign-in that
+//! makes one. Every command goes through the daemon under this user's own authority on this host.
+//! `sign-in` asks it to listen on the loopback address the desktop client is registered with,
+//! prints the address a person opens in a browser and opens it; the daemon exchanges the answer and
+//! keeps the account. `sign-out` has the daemon remove the account and ask the service to end it.
+//! `show` reads where that stands.
 //!
 //! **Nothing the daemon holds is printed.** The address to open carries this attempt's state and
 //! nonce, and is shown to the person who asked, as the command that asked for it; what is said of
@@ -197,8 +198,8 @@ fn lines(report: &AccountReport) -> Vec<Line> {
             "This host cannot reach the managed account service the way its configuration says: \
              the daemon's log says why."
         )),
-        (_, Some(SignInUnavailable::NoBroker)) | (None, None) => lines.push(stdout_line!(
-            "This host names no managed voice service: set voice.broker_origin in its \
+        (_, Some(SignInUnavailable::NoManagedService)) | (None, None) => lines.push(stdout_line!(
+            "This host names no managed service: set voice.broker_origin or storage.origin in its \
              configuration document to the managed account service's origin."
         )),
     }
@@ -273,7 +274,7 @@ const fn attempt_words(attempt: AccountAttempt) -> &'static str {
 /// Why a host signs in nowhere, as a script reads it.
 const fn unavailable_name(unavailable: SignInUnavailable) -> &'static str {
     match unavailable {
-        SignInUnavailable::NoBroker => "no_broker",
+        SignInUnavailable::NoManagedService => "no_managed_service",
         SignInUnavailable::BrokerIsAnotherService => "broker_is_another_service",
         SignInUnavailable::NotUsable => "not_usable",
     }
