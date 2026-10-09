@@ -103,6 +103,7 @@ import {
 } from '../model/receipts'
 import type { LaunchSurface } from '../model/pending'
 import { ApprovalRequests } from './Approvals'
+import { KeptAnswers, QuestionRequests } from './Questions'
 
 /** How close to the end still counts as being at it. */
 const AT_END_SLACK = 32
@@ -772,6 +773,8 @@ export function Conversation({
       </div>
 
       <ApprovalRequests sessionId={sessionId} onAnswered={refresh} />
+      <QuestionRequests sessionId={sessionId} onAnswered={refresh} />
+      <KeptAnswers sessionId={sessionId} />
 
       {launch !== null && shellMode === 'native_compat' ? (
         // A stock shell's editor is not the host's to see or to type into, so its launch buttons

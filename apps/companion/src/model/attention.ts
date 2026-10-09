@@ -190,6 +190,13 @@ export function detailOf(item: AttentionItem, nowMs: number): string {
   return sentences.join(' ')
 }
 
+/** The rules whose items are decided on the screen that lists them. */
+const DECIDED_HERE: ReadonlySet<AttentionItem['rule']> = new Set([
+  'attention.pending_approval',
+  'attention.pending_input',
+  'attention.input_idle_reminder'
+])
+
 /** Turns one item into the row the inbox draws. */
 export function present(item: AttentionItem, nowMs: number): AttentionRow {
   const kind = kindOf(item)
@@ -204,9 +211,10 @@ export function present(item: AttentionItem, nowMs: number): AttentionRow {
     title,
     detail,
     announcement: `${label}. ${title}. ${detail}`,
-    // An approval is answered where the session's worker can say what it offered. A lost host,
-    // a notice and finished work offer nothing to decide here.
-    actionable: item.rule === 'attention.pending_approval' && item.session_id !== null
+    // An approval is answered where the session's worker can say what it offered, and a question
+    // where the worker can say what it asked. A lost host, a notice and finished work offer nothing
+    // to decide here.
+    actionable: DECIDED_HERE.has(item.rule) && item.session_id !== null
   }
 }
 

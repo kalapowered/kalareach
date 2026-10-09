@@ -30,6 +30,7 @@ import type {
   AttachmentSummary,
   AttentionAcknowledgeParams,
   AttentionAcknowledgeResult,
+  ActionTarget,
   AttentionReadParams,
   AttentionReadResult,
   AuthorityNotice,
@@ -59,6 +60,12 @@ import type {
   PluginListParams,
   PluginListResult,
   ProjectedHyperlink,
+  Question,
+  QuestionAnswer,
+  QuestionAnswerParams,
+  QuestionReadParams,
+  QuestionReadResult,
+  QuestionResolveResult,
   Receipt,
   ReviewAcknowledgeParams,
   ReviewAcknowledgeResult,
@@ -510,6 +517,55 @@ export interface Settled<T = unknown> {
   readonly action_id: string | null
 }
 
+/** What a person's answer to a question came to. */
+export type AnswerOutcome =
+  /**
+   * The worker took it. `leftover` is true when an answer kept earlier for the question could not
+   * be removed afterwards; it stays kept, and is never sent again.
+   */
+  | {
+      readonly outcome: 'taken'
+      readonly resolution: QuestionResolveResult
+      readonly leftover: boolean
+    }
+  /** The worker could not take it, so it is kept on this device and nothing has been sent. */
+  | { readonly outcome: 'kept'; readonly draft: KeptAnswer }
+
+/** One answer a person gave that the worker has not taken. */
+export interface KeptAnswer {
+  /** Where the answer goes. */
+  readonly target: ActionTarget
+  readonly session_id: string
+  readonly question_id: string
+  /** The revision of the question the person was shown. */
+  readonly question_revision: string
+  readonly answer: QuestionAnswer
+  /** When it was given, which names this copy of the answer among any kept for the question. */
+  readonly drafted_at_ms: string
+}
+
+/** Where a kept answer stands against its question. */
+export type Standing =
+  /** The question is pending at the revision the person answered, so the answer can be sent. */
+  | { readonly standing: 'offered' }
+  /** The session lists no such question, and nothing says the session ended. */
+  | { readonly standing: 'unlisted' }
+  /** The question ended while the answer was kept. */
+  | { readonly standing: 'ended'; readonly state: Question['state'] }
+  /** The question is pending at a revision the person was not shown. */
+  | { readonly standing: 'moved'; readonly revision: string }
+  /** The session ended, and the question with it. */
+  | { readonly standing: 'gone' }
+
+/** A kept answer and where its question stands now. */
+export type SettledAnswer = { readonly draft: KeptAnswer } & Standing
+
+/** Names one kept answer, as the person was shown it. */
+export interface KeptRef {
+  readonly questionId: string
+  readonly draftedAtMs: string
+}
+
 /** The largest file the page may hand native code as bytes, as native code bounds it. */
 export const MAX_HANDED_BYTES = 64 * 1024 * 1024
 
@@ -708,8 +764,30 @@ export interface HostPort {
   reviewRead(params: ReviewReadParams): Promise<ReviewReadResult>
   /** Records that one exact version was reviewed. It approves nothing and changes no file. */
   reviewAcknowledge(params: ReviewAcknowledgeParams): Promise<Settled<ReviewAcknowledgeResult>>
-  questionRead(params: unknown): Promise<unknown>
-  questionAnswer(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * A session's questions, read on the session's own worker. What is read is what a later answer
+   * is checked against: an answer names a question and the revision the person was shown.
+   */
+  questionRead(params: QuestionReadParams): Promise<QuestionReadResult>
+  /**
+   * Answers a question, or keeps the answer on this device when the worker cannot be reached. A
+   * kept answer has not been sent, and nothing sends it but {@link HostPort.questionSendKept}.
+   */
+  questionAnswer(params: QuestionAnswerParams): Promise<AnswerOutcome>
+  /** Every answer kept on this device, oldest first, whatever host it was given to. */
+  questionKept(): Promise<readonly KeptAnswer[]>
+  /**
+   * Where each answer kept for one session stands against the questions the session lists now.
+   * Reads and says; it sends and removes nothing.
+   */
+  questionSettle(sessionId: string): Promise<readonly SettledAnswer[]>
+  /** Sends one kept answer, for a person who chose to, after the question is read again. */
+  questionSendKept(which: KeptRef): Promise<AnswerOutcome>
+  /**
+   * Dismisses one kept answer, if it is still the one the person was shown. Answers whether it was
+   * removed.
+   */
+  questionDismissKept(which: KeptRef): Promise<boolean>
   /** The devices paired with this host, which is who an invitation can go to. */
   deviceList(params: DeviceListParams): Promise<DeviceListResult>
   /**
