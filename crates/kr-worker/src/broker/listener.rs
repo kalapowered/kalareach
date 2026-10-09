@@ -35,13 +35,14 @@ use crate::broker::process::ManagedProcess;
 /// The headers a browser adds, any one of which disqualifies a connection.
 ///
 /// The list is deliberately generous: a header a browser sends and a native client does not is
-/// evidence enough, and refusing a native client that invented one costs nothing.
+/// evidence enough, and refusing a native client that invented one costs nothing. It does not
+/// list `sec-websocket-key`, which every WebSocket client sends, a native terminal included; a
+/// browser's WebSocket request always carries `origin` as well, and that is on the list.
 pub const BROWSER_HEADERS: &[&str] = &[
     "origin",
     "referer",
     "sec-fetch-site",
     "sec-fetch-mode",
-    "sec-websocket-key",
     "access-control-request-method",
 ];
 
