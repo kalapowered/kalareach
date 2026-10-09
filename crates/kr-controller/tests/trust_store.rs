@@ -42,7 +42,8 @@ async fn the_child_of_the_host_certificate_variable_test() {
         .await;
 
     // A repository file, fetched the way this host fetches one with no proxy selected.
-    let transport = kr_controller::catalogue::repository_transport(None);
+    let transport =
+        kr_controller::catalogue::repository_transport(&kr_controller::config::Outbound::Direct);
     let fetched = match tough::Transport::fetch(
         &transport,
         format!("https://127.0.0.1:{port}/1.root.json")

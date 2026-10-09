@@ -649,7 +649,10 @@ impl Controller {
                  confirmed ended.",
             ),
         ));
-        checks.push(self.descriptions.doctor_check(&self.description_settings()));
+        checks.push(self.descriptions.doctor_check(
+            &self.description_settings(),
+            self.in_force().unusable.as_ref(),
+        ));
         checks.extend(self.device_repository_checks().await);
         // The configuration, its precedence, its overrides and its ceilings. After the checks
         // above because those are about whether this host is working; these are about what it is
@@ -662,7 +665,7 @@ impl Controller {
         // says so.
         let network = crate::config::network_check(
             &self.started,
-            accepted.resolver.loaded().document.as_ref(),
+            accepted.resolver.loaded(),
             crate::config::Running {
                 network: self.network_guard().map(|guard| {
                     crate::config::RunningNetwork::of(guard.endpoint(), guard.bound_sockets().len())

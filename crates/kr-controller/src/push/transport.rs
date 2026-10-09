@@ -13,7 +13,7 @@
 //! that may have arrived, finite deadlines and a bounded answer. Every exchange goes through the
 //! proxy this host's configuration document selected when the daemon started, or directly when it
 //! selected none, so a webhook address that proxy cannot reach fails through it rather than going
-//! around it.
+//! around it. A document the host could not use leaves no route, and no exchange is made.
 //!
 //! A test attaches a recorder instead, which is how a test sees exactly what left the host.
 
@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::services::{HttpDeadlines, HttpService, ResponseLimits, ServiceHttp};
 use kr_protocol::service::GatewayOrigin;
-use kr_transport::config::ProxyUrl;
+
+use crate::config::Outbound;
 
 /// Where the delivery service's exchanges go.
 pub trait DeliveryTransports: std::fmt::Debug + Send + Sync {
@@ -38,20 +39,20 @@ pub trait DeliveryTransports: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub struct ManagedTransports {
     built: Mutex<BTreeMap<String, Arc<HttpService>>>,
-    /// The proxy every one of them goes through, or none.
-    proxy: Option<ProxyUrl>,
+    /// How every one of them leaves the host: through a proxy, directly, or not at all.
+    outbound: Outbound,
 }
 
 impl ManagedTransports {
-    /// Builds an empty set whose transports go through `proxy`, or directly when that is `None`;
-    /// each origin's transport is built the first time it is asked for.
+    /// Builds an empty set whose transports leave by `outbound`; each origin's transport is built
+    /// the first time it is asked for, and none is built when the route is closed.
     ///
-    /// A shipped daemon passes the proxy its configuration document selected when it started.
+    /// A shipped daemon passes the route its configuration document selected when it started.
     #[must_use]
-    pub fn new(proxy: Option<ProxyUrl>) -> Self {
+    pub fn new(outbound: Outbound) -> Self {
         Self {
             built: Mutex::default(),
-            proxy,
+            outbound,
         }
     }
 }
@@ -65,12 +66,16 @@ impl DeliveryTransports for ManagedTransports {
         if let Some(transport) = built.get(origin.as_str()) {
             return Ok(Arc::clone(transport) as Arc<dyn ServiceHttp>);
         }
+        let proxy = self
+            .outbound
+            .proxy()
+            .map_err(|refusal| format!("no transport reaches {origin}: {refusal}"))?;
         let transport = Arc::new(
             HttpService::through(
                 origin.clone(),
                 HttpDeadlines::default(),
                 ResponseLimits::default(),
-                self.proxy.as_ref(),
+                proxy,
             )
             .map_err(|error| format!("no transport reaches {origin}: {error}"))?,
         );
@@ -101,7 +106,7 @@ mod tests {
 
     #[test]
     fn one_origin_is_one_transport_and_two_origins_are_two() {
-        let transports = ManagedTransports::new(None);
+        let transports = ManagedTransports::new(Outbound::Direct);
         let gateway = GatewayOrigin::new("https://reach.invalid").expect("an origin");
         let hooks = GatewayOrigin::new("https://hooks.invalid").expect("an origin");
         let first = transports.to(&gateway).expect("a transport");

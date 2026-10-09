@@ -397,7 +397,7 @@ enum Member {
 
 /// Reads the version a JSON record states in `member`; `absent` where it states none. A record that
 /// cannot be read as a JSON object with a whole number there is refused, unless `lenient`, which is
-/// the configuration document: every release loads one it cannot read as defaults, so a document
+/// the configuration document: every release fails closed on one it cannot read, so a document
 /// that states no version it can make out has none to refuse a switch for. A whole number it can
 /// make out is a version like any other, and one outside the range, or too large to be any
 /// release's, is refused.
