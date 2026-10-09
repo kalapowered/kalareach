@@ -87,7 +87,7 @@ Either way the job starts only when a command asks for it, never at login, so af
 logout that ended it, nothing runs until the next `kr new`. A daemon that ends takes no session with
 it: every worker is a job of its own. A daemon the standalone start ran is in whatever login context
 the command that started it was in, and on Linux, started by a command of a session, it moves out
-of that session's service into a scope of its own.
+of that session's service into a scope of its own where the user's service manager answers.
 
 ### Enabling persistence on Linux
 
