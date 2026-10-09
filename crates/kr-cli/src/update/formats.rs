@@ -182,7 +182,7 @@ pub fn check(
 ) -> Checked {
     let mut refusals = unlookable(target);
     let mut unreached = Vec::new();
-    let registered = registered(install, environments, &mut unreached);
+    let registered = registered(install, environments, &mut refusals, &mut unreached);
     let documents = install.recorded_documents().unwrap_or_else(|error| {
         refusals.push(Refusal {
             store: "the configuration documents the store recorded".to_owned(),
@@ -230,20 +230,32 @@ pub fn check(
     }
 }
 
+/// Looks at the state root of every root a command registered, before anything is stopped, so that a
+/// place that hangs when it is looked at holds the update while nothing has been stopped. What it
+/// finds is not used: [`check`] looks again, under the writers' lock.
+pub fn look_ahead(install: &kr_ipc::install::Store) {
+    for roots in install.registered_roots().unwrap_or_default() {
+        let _ = std::fs::metadata(&roots.state_root);
+    }
+}
+
 /// The roots only a command registered, each looked at now: one that is not there holds nothing, and
-/// one that cannot be looked at is named and left.
+/// one that cannot be looked at is named and left. A registration that cannot be read refuses the
+/// switch, as an unreadable record of a document does: it names a root nobody can say is safe.
 fn registered(
     install: &kr_ipc::install::Store,
     environments: &[&Environment],
+    refusals: &mut Vec<Refusal>,
     unreached: &mut Vec<Unreached>,
 ) -> Vec<Registered> {
     let recorded = match install.registered_roots() {
         Ok(recorded) => recorded,
         Err(error) => {
-            unreached.push(Unreached {
-                runtime_root: PathBuf::new(),
-                state_root: install.roots(),
-                reason: super::said(&error),
+            refusals.push(Refusal {
+                store: "the roots the store's commands registered".to_owned(),
+                environment: None,
+                place: install.roots(),
+                why: Why::Unreadable(super::said(&error)),
             });
             return Vec::new();
         }
@@ -276,6 +288,14 @@ fn registered(
                 continue;
             }
         }
+        // A root that cannot be listed holds nothing that can be looked at: named, and left whole.
+        if let Err(error) = std::fs::read_dir(&roots.state_root) {
+            unreached.push(not_reached(shown!(
+                "it could not be listed: {}",
+                Shown::io(&error)
+            )));
+            continue;
+        }
         let Ok(host) = kr_ipc::paths::HostPaths::new(&roots.runtime_root, &roots.state_root) else {
             unreached.push(not_reached(Shown::said("its roots cannot be resolved")));
             continue;
@@ -291,12 +311,14 @@ fn registered(
                     })
             }
             Ok(None) => None,
+            // The records of the state root itself are still looked at; only the environment's own
+            // directory cannot be placed without its identity.
             Err(error) => {
                 unreached.push(not_reached(shown!(
                     "its environment identity could not be looked at: {}",
                     Shown::ipc(&error)
                 )));
-                continue;
+                None
             }
         };
         found.push(Registered { host, environment });
@@ -720,20 +742,48 @@ mod tests {
         // The command made the root and wrote its record after that: the check, which runs later,
         // finds it. A daemon's store in the same root, at a version the target does not read, is not
         // this store's to refuse a switch for.
-        std::fs::create_dir_all(&state).expect("the root");
-        std::fs::write(state.join("shell-entries.json"), r#"{"version": 5}"#).expect("a record");
-        std::fs::write(state.join("machine-group"), r#"{"version": 9}"#).expect("a daemon's");
+        kr_ipc::paths::create_private_directory(&state).expect("the root");
+        let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        kr_ipc::paths::write_owner_only_file(
+            &state.join("environment-id"),
+            format!("{environment_id}\n").as_bytes(),
+        )
+        .expect("an identity");
+        let paths = kr_ipc::paths::HostPaths::new(directory.path().join("run"), &state)
+            .expect("the roots")
+            .environment(environment_id);
+        kr_ipc::paths::create_private_directory(paths.state_dir()).expect("the environment");
         kr_ipc::paths::write_owner_only_file(
             &state.join("shell-entries.json"),
             br#"{"version": 5}"#,
         )
-        .expect("owner-only");
+        .expect("a record");
+        kr_ipc::paths::write_owner_only_file(
+            &paths.state_dir().join("machine-group"),
+            br#"{"version": 9}"#,
+        )
+        .expect("a daemon's");
         let checked = check(&target, &store, &[], &[], true, &writers);
         assert_eq!(checked.refusals.len(), 1, "one record is out of range");
         assert!(
             checked.refusals[0].place.ends_with("shell-entries.json"),
             "and it is the command's"
         );
+
+        // An identity that cannot be read puts the environment out of reach, named, and the records
+        // of the state root itself are still looked at.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                state.join("environment-id"),
+                std::fs::Permissions::from_mode(0o666),
+            )
+            .expect("wider than owner-only");
+        }
+        let checked = check(&target, &store, &[], &[], true, &writers);
+        assert_eq!(checked.refusals.len(), 1, "the state root's record is read");
+        assert!(checked.refusals[0].place.ends_with("shell-entries.json"));
+        assert_eq!(checked.unreached.len(), 1, "and the identity is named");
 
         // A root that is a file cannot be looked at: named, not refused.
         std::fs::remove_dir_all(&state).expect("the root goes");
@@ -742,6 +792,24 @@ mod tests {
         assert!(checked.refusals.is_empty());
         assert_eq!(checked.unreached.len(), 1);
         assert_eq!(checked.unreached[0].state_root, state);
+
+        // A registration that cannot be read refuses the switch, whatever the others say: the root
+        // it names is not known to be safe.
+        let damaged = store.roots().join("fedcba9876543210.registered");
+        std::fs::write(&damaged, &registration).expect("a registration");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o666))
+                .expect("wider than owner-only");
+        }
+        let checked = check(&target, &store, &[], &[], true, &writers);
+        assert_eq!(checked.refusals.len(), 1, "{:?}", checked.refusals.len());
+        assert!(checked.refusals[0].store.contains("registered"));
+        assert!(
+            checked.refusals[0].place.ends_with("roots"),
+            "and it names the records' directory"
+        );
+        assert!(matches!(&checked.refusals[0].why, Why::Unreadable(_)));
     }
 
     /// A JSON record states its version in its member; one that states none is at the version the
