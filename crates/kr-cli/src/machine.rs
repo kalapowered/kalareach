@@ -1647,6 +1647,7 @@ mod tests {
     /// KR-REQ-26.10: a plan is written only at the format the release `current` names lists for it.
     /// Where it lists the plan at another, neither the first write of a plan nor a later save writes
     /// anything; where it lists the same, or does not list it, both write.
+    #[cfg(unix)]
     #[test]
     fn a_plan_is_written_only_at_the_format_the_current_release_lists() {
         let host = kr_ipc::testing::TempHost::create();
