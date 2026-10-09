@@ -144,7 +144,8 @@ fn a_chain_that_does_not_verify_is_not_pinned() {
         .expect("the intact chain verifies");
     assert_eq!(verified.root(), organisation.link(1));
     assert_eq!(verified.anchor(), organisation.link(2));
-    host.enrol(verified).expect("the host enrols");
+    let revision = host.authority_revision();
+    host.enrol(verified, revision).expect("the host enrols");
     let enrolment = host
         .enrolment(organisation.organisation_id)
         .expect("enrolled");

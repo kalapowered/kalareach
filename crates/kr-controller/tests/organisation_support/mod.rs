@@ -203,7 +203,8 @@ impl Organisation {
         let verified = policy
             .verify_enrolment(&self.authority(at_ms), Some(&reading(at_ms)))
             .expect("the published chain verifies");
-        policy.enrol(verified).expect("the host enrols");
+        let revision = policy.authority_revision();
+        policy.enrol(verified, revision).expect("the host enrols");
     }
 }
 

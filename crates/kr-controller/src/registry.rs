@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -945,6 +945,7 @@ impl Registry {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -956,6 +957,7 @@ impl Registry {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -966,6 +968,7 @@ impl Registry {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -975,6 +978,7 @@ impl Registry {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -983,6 +987,7 @@ impl Registry {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
@@ -990,23 +995,31 @@ impl Registry {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
             Some(9) => {
                 self.migrate_9_to_10()?;
                 self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
             }
-            Some(10) => self.migrate_10_to_11()?,
+            Some(10) => {
+                self.migrate_10_to_11()?;
+                self.migrate_11_to_12()?;
+            }
+            Some(11) => self.migrate_11_to_12()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1340,6 +1353,24 @@ impl Registry {
     fn migrate_10_to_11(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 11", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 11 to 12: the host keeps organisation enrolments with an answer to the owner's
+    /// action, and the times exclusive management was turned off.
+    ///
+    /// The grants store keeps the answer of `organisation.enrol` beside the policy it changed, an
+    /// organisation's change that is still to be answered from its fence as a marker, and a table
+    /// of the times exclusive management was turned off, whichever way. None of those exists in a
+    /// file of version 11, the grants store creates the table when it opens the file, and no row
+    /// changes. A release that reads version 11 cannot read a retained answer of the new shapes.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_11_to_12(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 12", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -4427,6 +4458,49 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .expect("the version");
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The release before this one kept no table of the times exclusive management was turned off.
+    /// A registry of that release comes forward with the table made empty, and the policy the host
+    /// held is as it was.
+    #[test]
+    fn a_registry_of_the_release_before_is_brought_forward_with_the_policy_it_held() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let held = crate::grants::HostPolicy::personal(AuthorityRevision::new(5)).snapshot();
+        {
+            let _registry = Registry::open(&path, environment()).expect("a registry");
+            let grants = crate::grants::GrantDirectory::open(&path).expect("the grants store");
+            grants.store_policy(&held).expect("the policy is written");
+        }
+        let earlier = Connection::open(&path).expect("opens");
+        earlier
+            .execute_batch(
+                "DROP TABLE exclusive_management_events;
+                 UPDATE schema_version SET version = 11;",
+            )
+            .expect("sets the file back to the release before");
+        drop(earlier);
+
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(
+            carried,
+            Some(Carried {
+                from: 11,
+                to: SCHEMA_VERSION
+            })
+        );
+        let grants = crate::grants::GrantDirectory::open(&path).expect("the grants store");
+        assert_eq!(
+            grants.exclusive_management_events().expect("the table"),
+            Vec::new(),
+            "the table is there, and empty"
+        );
+        assert_eq!(
+            grants.stored_policy().expect("reads"),
+            Some(held),
+            "the policy is as it was"
+        );
     }
 
     /// A registry that is at this build's schema is not migrated, and one with no log to take in is
