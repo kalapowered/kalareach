@@ -9,9 +9,10 @@
  * and offers nothing to press.
  *
  * A request for a repository's root or an installation lists everything the confirmation covers
- * under its sentence. What this host says of a native bridge and what the publisher says of the
- * release are two texts: the host's notice comes first, and the publisher's words follow it, quoted
- * and named, so one is never read as the other.
+ * under its sentence. What this host says, what the publisher says of a native bridge and what the
+ * host reads of a command integration are separate texts: the host's notice comes first, then the
+ * publisher's words, quoted and named, then the host's reading, quoted and named as the host's, so
+ * one is never read as another.
  */
 
 import {
@@ -264,6 +265,14 @@ export function Confirmations(): ReactNode {
                 <figure className="confirmation-statement" data-testid="confirmation-statement">
                   <figcaption className="small muted">The publisher says</figcaption>
                   <blockquote className="small">{request.statement}</blockquote>
+                </figure>
+              ) : null}
+              {request.reading !== null ? (
+                <figure className="confirmation-statement" data-testid="confirmation-reading">
+                  <figcaption className="small muted">
+                    This host&apos;s exact reading of the command integration
+                  </figcaption>
+                  <blockquote className="small">{request.reading}</blockquote>
                 </figure>
               ) : null}
               {request.value !== null ? (

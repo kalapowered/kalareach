@@ -908,16 +908,20 @@ works out what an owner device is shown from that request and from what it holds
 that is the repository's name, kind and locations, the root's digest and key identifiers, its
 budgets and its ceiling. For an installation it is the repository's ceiling, the release, the
 package hash and the grant, and, if the grant holds `native_bridge.install`, the publisher's
-statement from the verified manifest of that exact package hash. The host then sets the challenge to
-the digest of the plan the effect builds from the same request, which covers everything shown on the
-owner device. The owner device builds the same plan again from what it is shown, and signs only when
-the digest matches the one sent by the host. The host's own notice that a native bridge runs outside
-the plugin sandbox is a separate text, shown apart from the publisher's. The terminal then repeats
-the same request without proof, and the host spends once the oldest answer an owner device recorded
-for exactly that request. The challenge has to be one the host described: it never spends an answer
-for a challenge a caller described, even one with the same digest, unless the proof is presented.
-Only the owner may ask, and that is decided before the host reads anything for the subject. On a
-host that is not on the network, the methods that need an owner device return `HOST_NOT_CONFIGURED`.
+statement from the verified manifest of that exact package hash. If the grant holds
+`command_integration.launch`, it also includes the host's own exact reading of the integration the
+manifest declares, written after a label that marks it as the host's. A bridge's statement cannot
+hold that label, so the first label in the text is always the host's. The host then sets the
+challenge to the digest of the plan the effect builds from the same request, which covers everything
+shown on the owner device. The owner device builds the same plan again from what it is shown, and
+signs only when the digest matches the one sent by the host. The host's own notices are separate
+texts, shown apart from the publisher's: that a native bridge runs outside the plugin sandbox, and
+that a command integration changes how a command starts. The terminal then repeats the same request
+without proof, and the host spends once the oldest answer an owner device recorded for exactly that
+request. The challenge has to be one the host described: it never spends an answer for a challenge a
+caller described, even one with the same digest, unless the proof is presented. Only the owner may
+ask, and that is decided before the host reads anything for the subject. On a host that is not on
+the network, the methods that need an owner device return `HOST_NOT_CONFIGURED`.
 
 Removing a repository stops trusting its root and uninstalls nothing. A package installed from it is
 still installed, on the hash it was installed at, and the answer names what is still there. What it
