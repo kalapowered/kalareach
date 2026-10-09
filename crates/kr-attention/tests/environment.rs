@@ -417,6 +417,7 @@ fn a_device_sees_what_its_grant_admits_and_nothing_else() {
         automation_manage: true,
         host_manage: false,
         admits_session: &admits_one,
+        history_from_ms: 0,
     });
     let seen = attention
         .read(
@@ -476,6 +477,7 @@ fn a_device_sees_what_its_grant_admits_and_nothing_else() {
         automation_manage: false,
         host_manage: true,
         admits_session: &admits_one,
+        history_from_ms: 0,
     });
     let host_only = attention
         .inbox(&actor("device:phone"), &viewer_only, true)
@@ -491,6 +493,7 @@ fn a_device_sees_what_its_grant_admits_and_nothing_else() {
         automation_manage: false,
         host_manage: false,
         admits_session: &admits_both,
+        history_from_ms: 0,
     });
     let across = attention
         .inbox(&actor("device:phone"), &both, true)
@@ -536,6 +539,7 @@ fn review_state_and_acknowledgement_keep_to_the_same_scope() {
         automation_manage: false,
         host_manage: false,
         admits_session: &admits_one,
+        history_from_ms: 0,
     });
     let phone = actor("device:phone");
 
@@ -915,6 +919,7 @@ fn a_reminder_belongs_to_the_session_whose_record_raised_it() {
         automation_manage: false,
         host_manage: false,
         admits_session: &admits_two,
+        history_from_ms: 0,
     });
     assert!(
         attention
@@ -948,6 +953,92 @@ fn unequal_backlogs_decide_only_the_origin_that_is_read() {
         .collect();
     assert_eq!(reminders.len(), 1);
     assert_eq!(reminders[0].session_id, Nullable::some(session(1)));
+}
+
+// ----- A device's history ---------------------------------------------------------------------
+
+/// KR-REQ-10.49 and KR-REQ-25.01: earlier history is opt-in. A device is shown an item that was
+/// first seen at or after the moment its grant's history reaches back to, and a reminder is dated
+/// by the question it is about: a question asked before that moment is not a future event because
+/// a reminder about it fires after it. The owner is shown every item, and a device that names an
+/// item it is not shown is told it is stale.
+#[test]
+fn a_device_is_shown_what_was_first_seen_at_or_after_its_history_and_a_reminder_by_its_question() {
+    let mut attention = engine();
+    feed(&mut attention, &[pending(session(1), 1, 0, question(1))], 0);
+    feed(
+        &mut attention,
+        &[pending(session(1), 2, 10_000, question(2))],
+        10_000,
+    );
+    let due = IDLE_REMINDER_MS + 1;
+    let outcomes = attention
+        .tick(reading(due), &all_read)
+        .expect("the store records the decision");
+    assert_eq!(raised(&outcomes), vec![AttentionRule::InputIdleReminder]);
+    assert_eq!(
+        owner_inbox(&attention).len(),
+        3,
+        "two questions and a reminder"
+    );
+
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let device = |history_from_ms: u64| {
+        Viewer::Device(DeviceScope {
+            grant_id: grant(1),
+            session_view: true,
+            automation_manage: false,
+            host_manage: false,
+            admits_session: &admits_one,
+            history_from_ms,
+        })
+    };
+    let first_seen = |viewer: &Viewer<'_>| -> Vec<u64> {
+        attention
+            .inbox(&actor("device:phone"), viewer, true)
+            .expect("the store is this owner's")
+            .iter()
+            .map(|item| item.first_seen_ms.get())
+            .collect()
+    };
+
+    assert_eq!(
+        first_seen(&device(NOON)),
+        vec![NOON, NOON + 10_000, NOON + due],
+        "a history that reaches back to the first question is shown all three"
+    );
+    assert_eq!(
+        first_seen(&device(NOON + 5_000)),
+        vec![NOON + 10_000],
+        "the first question and its reminder, which fired after this device's history began, are \
+         not shown: the reminder is dated by the question"
+    );
+    assert!(first_seen(&device(NOON + 20_000)).is_empty());
+    assert!(
+        first_seen(&device(u64::MAX)).is_empty(),
+        "a grant whose history reaches back to no moment reaches no item"
+    );
+
+    // The first question is not one this device is shown, so naming it tells the device nothing.
+    let hidden = owner_inbox(&attention)
+        .into_iter()
+        .find(|item| item.first_seen_ms.get() == NOON)
+        .expect("the first question");
+    let named = vec![at_revision(&attention, &hidden.key)];
+    let outcome = attention
+        .acknowledge(
+            &actor("device:phone"),
+            &device(NOON + 5_000),
+            &named,
+            reading(due),
+        )
+        .expect("the batch is decided");
+    assert!(outcome.acknowledged.is_empty(), "{outcome:?}");
+    assert_eq!(outcome.stale, vec![hidden.key.clone()]);
+    let outcome = attention
+        .acknowledge(&actor("device:phone"), &device(NOON), &named, reading(due))
+        .expect("the batch is decided");
+    assert_eq!(outcome.acknowledged, vec![hidden.key]);
 }
 
 // ----- Sessions that end ---------------------------------------------------------------------
@@ -1279,6 +1370,7 @@ fn an_adapter_failing_for_two_sessions_is_two_failures() {
         automation_manage: false,
         host_manage: false,
         admits_session: &admits_one,
+        history_from_ms: 0,
     });
     let seen = attention
         .inbox(&actor("device:phone"), &device, true)

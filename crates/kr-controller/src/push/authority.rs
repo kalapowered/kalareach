@@ -439,6 +439,8 @@ impl GrantedRecipients {
             // history cursor, or at or after its own start when it has none.
             history_from_ms: narrowed
                 .history
+                .clone()
+                .from_start(started_at_ms)
                 .lower_bound_ms
                 .as_ref()
                 .map_or(started_at_ms, |cursor| cursor.get()),

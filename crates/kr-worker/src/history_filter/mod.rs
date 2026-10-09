@@ -413,6 +413,11 @@ impl ViewerScope {
     /// no retained history and includes the live screen reaches what is recorded from `from_ms` on,
     /// and nothing older. A scope with a bound keeps its bound, and one without the live screen
     /// keeps reaching no retained content at all.
+    ///
+    /// A control daemon of this build sends a scope with its cursor resolved, a grant with none
+    /// reaching from its own start, so this serves a daemon of an earlier build, which sends a
+    /// stored grant's null cursor as it is; it stays while a rollback to such a build can leave a
+    /// worker of this one running under it.
     #[must_use]
     pub fn live_from(self, from_ms: u64) -> Self {
         if self.lower_bound_ms.is_none() && self.include_live_screen {

@@ -111,7 +111,13 @@ impl SessionSelector {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryScope {
-    /// The earliest content this grant may see. Null means no retained history at all.
+    /// The earliest content this grant may see: the moment its history cursor names.
+    ///
+    /// Null means the grant's own start, and nothing earlier: what a pairing grant reaches is what
+    /// was first recorded or seen at or after the moment the host committed the pairing. A host
+    /// reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
+    /// anything from this sees one moment. A reader that has no start to read it against reaches
+    /// no earlier history. A session share never holds a null: it takes the moment it was issued.
     pub lower_bound_ms: Nullable<TimestampMs>,
     /// Whether the currently visible screen is included. This exception never grants inactive
     /// screen buffers, scrollback or the backing transcript.
@@ -127,6 +133,19 @@ pub struct HistoryScope {
 }
 
 impl HistoryScope {
+    /// This scope for a grant that began at `started_at_ms`: a history cursor stands as it is, and
+    /// no cursor is the start.
+    ///
+    /// The grant is stored as it was given, so what a null cursor reaches follows from where the
+    /// host reads the grant, and every reader decides from this value.
+    #[must_use]
+    pub fn from_start(mut self, started_at_ms: u64) -> Self {
+        if self.lower_bound_ms.as_ref().is_none() {
+            self.lower_bound_ms = Nullable::some(TimestampMs::new(started_at_ms));
+        }
+        self
+    }
+
     /// Returns true when `self` sees no more than `parent`.
     #[must_use]
     pub fn narrows(&self, parent: &Self) -> bool {
