@@ -1476,6 +1476,8 @@ plain!(
     kr_protocol::ids::SyncObjectId,
     kr_protocol::ids::SyncRevisionId,
     kr_protocol::ids::AuthorityRevision,
+    kr_protocol::ids::OrganisationId,
+    kr_protocol::ids::PolicyKeyRevision,
     kr_protocol::ids::DraftRevision,
     kr_protocol::ids::QuestionRevision,
     kr_protocol::ids::SessionEpoch,

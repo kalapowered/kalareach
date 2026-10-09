@@ -45,13 +45,14 @@ use kr_protocol::confirmation::{
 };
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::grant::HistoryScope;
-use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, InvitationId};
+use kr_protocol::grant::{HistoryScope, OrganisationRequirement};
+use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, InvitationId, OrganisationId};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
     PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
 };
 use kr_protocol::method::Method;
+use kr_protocol::organisation::{OrganisationListParams, OrganisationListResult};
 use kr_protocol::pairing::{
     ConfirmationChannel, DevicePlatform, PairStatus, PairingConsumedReason, ProposedGrant,
     RendezvousOrigin,
@@ -111,11 +112,15 @@ async fn invite(
     json: bool,
     build_id: &BuildId,
 ) -> Result<()> {
-    let (grant_kind, proposed_grant) = proposal(arguments, kr_ipc::now_ms().get())?;
+    let (grant_kind, mut proposed_grant) = proposal(arguments, kr_ipc::now_ms().get())?;
     let (mode, mode_kind, origin) = offer(arguments)?;
     let environment = resolve::select(paths, arguments.environment.as_deref())?;
     let target = ActionTarget::environment(environment.environment_id);
     let mut client = resolve::open_controller(&environment.paths, build_id.clone()).await?;
+    if let Some(text) = &arguments.organisation {
+        proposed_grant.organisation =
+            Nullable::some(organisation_requirement(&mut client, text).await?);
+    }
     let subject = ConfirmationSubject::IssueInvitation {
         mode: mode_kind,
         rendezvous_origin: origin.map_or_else(Nullable::null, Nullable::some),
@@ -650,6 +655,35 @@ fn proposal(
     }
 }
 
+/// The requirement an invitation names for the organisation the person gave, at the enrolment
+/// revision this host holds for it. A host enrolled in no such organisation has none to name.
+async fn organisation_requirement(
+    client: &mut LocalClient,
+    text: &str,
+) -> Result<OrganisationRequirement> {
+    let organisation_id: OrganisationId = crate::daemon::identifier(text, "an organisation's")?;
+    let listed: OrganisationListResult = bind::read(
+        client,
+        Method::OrganisationList,
+        &OrganisationListParams::default(),
+    )
+    .await?;
+    let enrolment = listed
+        .enrolments
+        .iter()
+        .find(|enrolment| enrolment.organisation_id == organisation_id)
+        .ok_or_else(|| {
+            CliError::Usage(Shown::said(
+                "this host is not enrolled in that organisation: enrol it with `kr organisation \
+                 enrol` first",
+            ))
+        })?;
+    Ok(OrganisationRequirement {
+        organisation_id,
+        policy_revision: enrolment.enrolment_revision,
+    })
+}
+
 /// Returns how the invitation is offered.
 fn offer(
     arguments: &PairInviteArguments,
@@ -1093,6 +1127,7 @@ mod tests {
             view,
             direct: false,
             origin: None,
+            organisation: None,
             environment: None,
         }
     }

@@ -79,6 +79,8 @@ pub enum Request {
     /// The destinations notifications are sent to, as the owner named them: their identifiers,
     /// where they send and what the rule that sends to them is called: `kr destination`.
     Destinations,
+    /// The member accounts an organisation's leases name: `kr organisation`.
+    Organisations,
 }
 
 /// Content the person asked to read.
@@ -658,6 +660,8 @@ impl claim::Claimed for kr_protocol::project::ContentClass {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetId {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetVersion {}
 impl claim::Claimed for kr_protocol::ids::EnvironmentId {}
+impl claim::Claimed for kr_protocol::ids::OrganisationId {}
+impl claim::Claimed for kr_protocol::ids::PolicyKeyRevision {}
 impl claim::Claimed for kr_protocol::ids::MaterialisationId {}
 impl claim::Claimed for kr_protocol::ids::ProjectRepositoryId {}
 impl claim::Claimed for kr_protocol::ids::RepositoryGeneration {}
