@@ -66,6 +66,7 @@ use crate::grant::{
 };
 use crate::interpret::{
     DelegationInterpreter, GrammarInterpreter, SpokenDestination, VerifiedApprovalAnswer,
+    is_apostrophe,
 };
 
 /// What a person is told when this host has no voice service to broker a call through.
@@ -2118,17 +2119,18 @@ pub fn narrower_history(
 /// The vocabulary is short and closed on purpose. A host that accepted any string would accept
 /// silence and would accept a refusal, and a host that tried to interpret a sentence would be
 /// putting a language model between a person and their own authority — which is the thing section
-/// 15 ¶8 forbids in the case that matters most. So: an explicit refusal in the words is refused
-/// outright, and something that agrees has to be there.
+/// 15 ¶8 forbids in the case that matters most. So: a refusal the lists hold is refused outright,
+/// and something that agrees has to be there.
 ///
 /// What this is not. The words reach this host from the paired device, which hands over what the
 /// provider's transcript wrote, so they are content and never authority: the grant is what permits
 /// the effect, and this confirmation is the extra thing section 15 ¶13 asks for on top of it.
 ///
-/// A contraction of "not" refuses by its form: "n", one mark that is not a letter, a digit or a
-/// space, and "t" at the end of the word ("won't", "shan't", "wouldn't've", and the same with any
-/// other mark for the apostrophe). A contraction written with no mark at all is refused only for
-/// the spellings in the refusing words, which hold the usual ones.
+/// A contraction of "not" refuses by its form: a letter, "n", one mark and "t". The mark is an
+/// apostrophe in any of its forms ([`is_apostrophe`]), with anything after the "t" ("won't",
+/// "wouldn't've", "don'tcha"), or any other mark that is not a letter, a digit or a space, with the
+/// end of the word after the "t". A contraction written with no mark at all is refused only for the
+/// spellings in the refusing words, which hold the usual ones.
 ///
 /// **What this check is not.** It is a closed vocabulary: an agreeing word and no refusing word. It
 /// reads no question and no refusal in other words ("are you sure", "hold off"), and no list can,
@@ -2199,20 +2201,21 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "nevermind",
     ];
 
-    let spoken = spoken.to_lowercase();
+    // A transcript writes the apostrophe in several forms; some are letters to Unicode. Each is
+    // written as the plain one first, so that every rule below reads one mark.
+    let spoken: String = spoken
+        .to_lowercase()
+        .chars()
+        .map(|each| if is_apostrophe(each) { '\'' } else { each })
+        .collect();
     if has_negative_contraction(&spoken) {
         return false;
     }
-    // A transcript writes the apostrophe straight, curly, modified or as an accent; each is part of
-    // its word, and none is part of the spelling the lists hold.
+    // The apostrophe is part of its word and of none of the spellings the lists hold.
     let mut words = spoken
-        .split(|character: char| !(character.is_alphanumeric() || is_apostrophe(character)))
+        .split(|character: char| !(character.is_alphanumeric() || character == '\''))
         .filter(|word| !word.is_empty())
-        .map(|word| {
-            word.chars()
-                .filter(|each| !is_apostrophe(*each))
-                .collect::<String>()
-        })
+        .map(|word| word.replace('\'', ""))
         .peekable();
     if words.peek().is_none() {
         return false;
@@ -2229,9 +2232,10 @@ fn is_clear_affirmative(spoken: &str) -> bool {
     agrees
 }
 
-/// Whether `text` holds a word that ends in "n", one mark and "t": the form of a contraction of
-/// "not", whatever the mark. A mark between two letters of a longer word ("n" and "t" with a letter
-/// after) is not the form.
+/// Whether `text` (apostrophes written as the plain one) holds the form of a contraction of "not":
+/// a letter, "n", one mark and "t". After an apostrophe anything may follow the "t"; after any
+/// other mark that is not a letter, a digit or a space, the word has to end there, so that a
+/// hyphen in "main-thread" is not the form.
 fn has_negative_contraction(text: &str) -> bool {
     let characters: Vec<char> = text.chars().collect();
     characters.windows(3).enumerate().any(|(start, window)| {
@@ -2240,22 +2244,15 @@ fn has_negative_contraction(text: &str) -> bool {
         };
         *letter == 'n'
             && *last == 't'
-            && !mark.is_alphanumeric()
             && !mark.is_whitespace()
             && start > 0
             && characters[start - 1].is_alphabetic()
-            && characters
-                .get(start + 3)
-                .is_none_or(|after| !after.is_alphanumeric())
+            && (*mark == '\''
+                || (!mark.is_alphanumeric()
+                    && characters
+                        .get(start + 3)
+                        .is_none_or(|after| !after.is_alphanumeric())))
     })
-}
-
-/// Whether `character` is a mark a transcript writes for an apostrophe.
-const fn is_apostrophe(character: char) -> bool {
-    matches!(
-        character,
-        '\'' | '\u{2018}' | '\u{2019}' | '\u{02bc}' | '`' | '\u{00b4}' | '\u{2032}' | '\u{ff07}'
-    )
 }
 
 /// How far a provider's offset may fall outside this host's reading of the call's length.
@@ -2330,6 +2327,13 @@ mod tests {
         assert!(is_clear_affirmative("yes, send it to the build session"));
         assert!(is_clear_affirmative("Send it."));
         assert!(is_clear_affirmative("okay go ahead"));
+        // A mark between an "n" and a "t" that is no contraction of "not" is no refusal.
+        assert!(is_clear_affirmative(
+            "yes, send it to the main-thread session"
+        ));
+        assert!(is_clear_affirmative("yes, send it in turn"));
+        assert!(is_clear_affirmative("yes, send it, n/t is the session"));
+        assert!(is_clear_affirmative("sure, I'm in the tent, send it"));
 
         assert!(!is_clear_affirmative(""));
         assert!(!is_clear_affirmative("   \n  "));
@@ -2337,7 +2341,8 @@ mod tests {
         assert!(!is_clear_affirmative("do not send that"));
         assert!(!is_clear_affirmative("don't send it"));
         assert!(!is_clear_affirmative("no, cancel"));
-        // A contraction of "not" refuses whichever apostrophe the transcript writes, or none.
+        // A contraction of "not" refuses by its form, whichever mark the transcript writes for the
+        // apostrophe; only the spellings the list holds refuse with no mark.
         for refusal in [
             "I won't send it to the build session",
             "I wouldn't send it",
@@ -2361,6 +2366,11 @@ mod tests {
             "don?t send it",
             "I can\u{2019}t\u{2019}ve sent it, so send",
             "I usedn\u{ff07}t send it",
+            "I usedn\u{02bc}t send it",
+            "I usedn\u{02bb}t send it",
+            "I can\u{02bc}t\u{02bc}ve sent it, so send",
+            "Don't\u{02bc}cha send it yet",
+            "won'tcha send it",
         ] {
             assert!(!is_clear_affirmative(refusal), "{refusal:?}");
         }

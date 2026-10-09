@@ -77,7 +77,8 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["open session 6"], (Navigate, Some(6))),
         (&["show me session 6"], (Navigate, Some(6))),
         (&["take me to the session six"], (Navigate, Some(6))),
-        // Numbers: digits, words, and a ten with a unit, however the hyphen was written.
+        // Numbers: digits, words, and a ten with a unit, with its hyphen written as a hyphen or
+        // left out.
         (&["status session 0"], (Status, Some(0))),
         (&["status session twenty"], (Status, Some(20))),
         (&["status session twenty-three"], (Status, Some(23))),
@@ -85,6 +86,15 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["status session ninety nine"], (Status, Some(99))),
         (&["status session 104"], (Status, Some(104))),
         (&["status session twenty\u{2011}three"], (Status, Some(23))),
+        (&["status session twenty\u{2010}three"], (Status, Some(23))),
+        (
+            &["What\u{00b4}s the status of session 3"],
+            (Status, Some(3)),
+        ),
+        (
+            &["What\u{02bc}s the status of session 3"],
+            (Status, Some(3)),
+        ),
         // Said in pieces: the fragments are one utterance, and a piece may end in the hyphen.
         (&["status of", "session", "three"], (Status, Some(3))),
         (&["Go to", "session 5."], (Navigate, Some(5))),
@@ -194,6 +204,17 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["open session twenty\u{2026}"], Misread::UnreadableNumber),
         // A hyphen is no space: only a ten and a unit are written with one.
         (&["go-to session 3"], Misread::NotARequest),
+        // Only a ten, a hyphen and a unit from one to nine make a hyphenated number.
+        (&["open session -three"], Misread::UnreadableNumber),
+        (&["open session twenty-three-"], Misread::UnreadableNumber),
+        (
+            &["open session twenty-three-four"],
+            Misread::UnreadableNumber,
+        ),
+        (&["open session twenty-zero"], Misread::UnreadableNumber),
+        (&["open session twenty--three"], Misread::UnreadableNumber),
+        (&["open session 20-three"], Misread::UnreadableNumber),
+        (&["open session twenty-3"], Misread::UnreadableNumber),
         // Nothing inside a token is removed: an apostrophe in a number word leaves no number.
         (&["status session thr'ee"], Misread::UnreadableNumber),
         // Several marks together are no stop, and a mark after a number that is not one stays in it.
@@ -223,9 +244,9 @@ fn a_mark_in_or_beside_a_number_leaves_no_number() {
     const MARKS: &[&str] = &[
         "(", "\"", "'", "\u{201c}", "\u{2018}", "\u{201d}", "\u{2019}", ".", ",", ";", ":", "!",
         "?", "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}", "\u{2013}", "\u{2014}",
-        "\u{2011}", ")",
+        "\u{2011}", "\u{2010}", ")", "\u{00b4}", "\u{02bc}",
     ];
-    const HYPHENS: &[&str] = &["-", "\u{2011}"];
+    const HYPHENS: &[&str] = &["-", "\u{2010}", "\u{2011}"];
     for (first, second) in [("3", "3"), ("twenty", "three")] {
         for mark in MARKS {
             // "twenty-three" is the one number written across a mark.
