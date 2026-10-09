@@ -50,12 +50,6 @@ public final class VoiceCall: NSObject {
     /// The label the provider's protocol gives the channel its events arrive on.
     static let eventsLabel = "oai-events"
 
-    /// The longest the offer waits for candidate gathering to report itself done, in seconds.
-    ///
-    /// Gathering is continual, and WebRTC does not report continual gathering done, so in practice
-    /// every offer waits the whole bound and then offers the candidates it has.
-    static let gatheringBound: TimeInterval = 3
-
     /// Shared across calls, because building one is expensive and it holds the audio device.
     private static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
@@ -73,8 +67,6 @@ public final class VoiceCall: NSObject {
     private let queue: DispatchQueue
     /// The provider's events channel, which this end creates before the offer and only reads.
     private var events: RTCDataChannel?
-    /// The first round of candidate gathering, which the offer waits for.
-    private let gathering: GatheringWait
     /// What the provider's answer was read to say, once it was applied; guarded by ``negotiation``.
     private let negotiation = NSLock()
     private var answer: (applied: Bool, usesDtx: Bool) = (false, false)
@@ -116,14 +108,7 @@ public final class VoiceCall: NSObject {
     /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio,
     ///   ``VoiceAudioError/answerNotApplicable(_:)`` when the connection cannot be made, and
     ///   ``VoiceAudioError/eventChannelNotOpened`` when the provider's channel cannot be made.
-    public convenience init(observer: VoiceCallObserver) throws {
-        try self.init(observer: observer, gathering: IceGatheringWait())
-    }
-
-    /// The same, with the wait for candidate gathering supplied: a test holds it open to end the
-    /// call inside it.
-    init(observer: VoiceCallObserver, gathering: GatheringWait) throws {
-        self.gathering = gathering
+    public init(observer: VoiceCallObserver) throws {
         // Before the factory or any connection exists, so the audio unit cannot start by itself.
         AudioSession.shared.holdAudioUntilACallTurnsItOn()
 
@@ -249,11 +234,10 @@ public final class VoiceCall: NSObject {
     /// Makes this call's SDP offer.
     ///
     /// Section 15 ¶3: the client creates the offer. The host forwards it and never generates one.
-    /// The offer is returned after ``gatheringBound``, or earlier if gathering reports itself done,
-    /// which continual gathering does not do, so that it names the addresses this device can be
-    /// reached at: the provider is answered once, and a candidate found later is not sent. A call
-    /// that ends before the offer is complete makes none: this throws ``VoiceAudioError/callEnded``
-    /// when the call ended during the wait, and WebRTC's own error when it ended before.
+    /// The offer is returned as soon as it is this end's local description, with no candidate in
+    /// it: the provider answers with the addresses it can be reached at and never starts a check,
+    /// so it learns where the call is from the call's own checks, which are made to the candidates
+    /// in its answer. Gathering stays continual, for the networks that change during the call.
     public func offer() async throws -> String {
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
@@ -265,10 +249,7 @@ public final class VoiceCall: NSObject {
         do {
             let description = try await connection.offer(for: constraints)
             try await connection.setLocalDescription(description)
-            await gathering.wait(upTo: VoiceCall.gatheringBound)
-            // The wait ends with the call, and an offer for a call that ended would be sent on.
-            guard !control.isStopped else { throw VoiceAudioError.callEnded }
-            return connection.localDescription?.sdp ?? description.sdp
+            return description.sdp
         } catch {
             // A call that cannot make its offer has nothing to wait for, and gives the audio back.
             stop()
@@ -339,8 +320,6 @@ public final class VoiceCall: NSObject {
         func publish(_ state: VoiceCaptureState) { AudioSession.shared.publish(state, for: call) }
 
         func ended() {
-            // An offer still waiting for candidates has nothing left to wait for.
-            call.gathering.finish()
             call.watchRecorder(false)
             call.connection.close()
             call.events?.delegate = nil
@@ -424,9 +403,7 @@ extension VoiceCall: RTCPeerConnectionDelegate {
     public func peerConnection(_: RTCPeerConnection, didAdd _: RTCMediaStream) {}
     public func peerConnection(_: RTCPeerConnection, didRemove _: RTCMediaStream) {}
     public func peerConnection(_: RTCPeerConnection, didChange _: RTCIceConnectionState) {}
-    public func peerConnection(_: RTCPeerConnection, didChange state: RTCIceGatheringState) {
-        if state == .complete { gathering.finish() }
-    }
+    public func peerConnection(_: RTCPeerConnection, didChange _: RTCIceGatheringState) {}
     public func peerConnection(_: RTCPeerConnection, didGenerate _: RTCIceCandidate) {}
     public func peerConnection(_: RTCPeerConnection, didRemove _: [RTCIceCandidate]) {}
 }
@@ -441,51 +418,6 @@ extension VoiceCall: RTCDataChannelDelegate {
         queue.async { [weak self] in
             guard let self else { return }
             self.observer?.voiceCall(self, receivedProviderEvent: data)
-        }
-    }
-}
-
-/// How the offer waits for the first round of candidate gathering.
-protocol GatheringWait: AnyObject {
-    /// Returns when gathering is done or the wait was ended, and at the latest after `seconds`.
-    func wait(upTo seconds: TimeInterval) async
-
-    /// Gathering is done: whoever waits, and whoever waits later, is released.
-    func finish()
-}
-
-/// Waits for the first round of candidate gathering to finish, or for a bound.
-final class IceGatheringWait: GatheringWait {
-    private let lock = NSLock()
-    private var done = false
-    private var waiting: [CheckedContinuation<Void, Never>] = []
-
-    /// Gathering reported itself done, the bound passed or the call ended. Any number of times;
-    /// each waiter is resumed once.
-    func finish() {
-        lock.lock()
-        done = true
-        let waiters = waiting
-        waiting = []
-        lock.unlock()
-        waiters.forEach { $0.resume() }
-    }
-
-    /// Returns when gathering is done, which may be before this is called, and at the latest after
-    /// `seconds`.
-    func wait(upTo seconds: TimeInterval) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            lock.lock()
-            if done {
-                lock.unlock()
-                continuation.resume()
-                return
-            }
-            waiting.append(continuation)
-            lock.unlock()
-            DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [weak self] in
-                self?.finish()
-            }
         }
     }
 }

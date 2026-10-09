@@ -62,8 +62,6 @@ class VoiceCall private constructor(
     private val observer: Observer,
     /** This call's identity in the process, which the service's actions name. */
     val id: Long,
-    /** How the offer waits for the first round of candidate gathering. */
-    private val gathering: GatheringWait,
 ) {
     /** What a running call tells the application about. */
     interface Observer {
@@ -212,14 +210,6 @@ class VoiceCall private constructor(
         /** The label the provider's protocol gives the channel its events arrive on. */
         const val EVENTS_LABEL = "oai-events"
 
-        /**
-         * The longest the offer waits for candidate gathering to report itself done, in seconds.
-         *
-         * Gathering is continual, and WebRTC does not report continual gathering done, so in
-         * practice every offer waits the whole bound and then offers the candidates it has.
-         */
-        const val GATHERING_BOUND_SECONDS = 3L
-
         private val calls = AtomicLong()
 
         /**
@@ -230,17 +220,12 @@ class VoiceCall private constructor(
          * microphone: that waits for [permit], the foreground service and the recorder.
          */
         @JvmStatic
-        fun start(context: Context, observer: Observer): VoiceCall =
-            start(context, observer, LatchGatheringWait())
-
-        /** The same, with the wait for candidate gathering supplied: a test holds it open. */
-        @JvmStatic
-        internal fun start(context: Context, observer: Observer, gathering: GatheringWait): VoiceCall {
+        fun start(context: Context, observer: Observer): VoiceCall {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
                     .createInitializationOptions(),
             )
-            val call = VoiceCall(context.applicationContext, observer, calls.incrementAndGet(), gathering)
+            val call = VoiceCall(context.applicationContext, observer, calls.incrementAndGet())
             // One microphone, one call. A second call started over a running one would leave the
             // first one's track and connection live with nothing owning them.
             if (!VoiceCallHolder.claim(call)) {
@@ -321,10 +306,11 @@ class VoiceCall private constructor(
      * Makes this call's SDP offer.
      *
      * Section 15 paragraph 3: the client creates the offer. The host forwards it and never
-     * generates one. The offer is returned after [GATHERING_BOUND_SECONDS], or earlier if gathering
-     * reports itself done, which continual gathering does not do, so that it names the addresses
-     * this device can be reached at: the provider is answered once, and a candidate found later is
-     * not sent. A call that ends before the offer is complete makes none: this throws
+     * generates one. The offer is returned as soon as it is this end's local description, with no
+     * candidate in it: the provider answers with the addresses it can be reached at and never
+     * starts a check, so it learns where the call is from the call's own checks, which are made to
+     * the candidates in its answer. Gathering stays continual, for the networks that change during
+     * the call. A call that ends before the offer is complete makes none: this throws
      * [IllegalStateException].
      */
     fun offer(): String {
@@ -336,10 +322,7 @@ class VoiceCall private constructor(
             onOpenConnection { it.createOffer(observer, constraints) }
         }
         awaitSet { observer -> onOpenConnection { it.setLocalDescription(observer, made) } }
-        gathering.await(GATHERING_BOUND_SECONDS)
-        // Read through the connection only while the call cannot end under the read, and only if it
-        // has not: a connection disposed during the wait is freed memory.
-        return onOpenConnection { it.localDescription?.description } ?: made.description
+        return made.description
     }
 
     /**
@@ -480,8 +463,6 @@ class VoiceCall private constructor(
         }
 
         override fun ended() {
-            // An offer still waiting for candidates has nothing left to wait for.
-            gathering.finish()
             val (open, callback) = synchronized(lock) {
                 val held = connection to routeCallback
                 connection = null
@@ -575,9 +556,7 @@ class VoiceCall private constructor(
         override fun onSignalingChange(state: PeerConnection.SignalingState) {}
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {}
         override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-            if (state == PeerConnection.IceGatheringState.COMPLETE) gathering.finish()
-        }
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {}
         override fun onIceCandidate(candidate: org.webrtc.IceCandidate) {}
         override fun onIceCandidatesRemoved(candidates: Array<out org.webrtc.IceCandidate>) {}
         override fun onAddStream(stream: MediaStream) {}
@@ -641,26 +620,6 @@ class VoiceCall private constructor(
         override fun onCreateFailure(reason: String) {}
         override fun onSetFailure(reason: String) {}
     }
-}
-
-/** How the offer waits for the first round of candidate gathering. */
-internal interface GatheringWait {
-    /** Returns when gathering is done or the wait was ended, and at the latest after `seconds`. */
-    fun await(seconds: Long)
-
-    /** Gathering is done: whoever waits, and whoever waits later, is released. */
-    fun finish()
-}
-
-/** Waits for the first round of candidate gathering to finish, or for a bound. */
-internal class LatchGatheringWait : GatheringWait {
-    private val done = CountDownLatch(1)
-
-    override fun await(seconds: Long) {
-        done.await(seconds, TimeUnit.SECONDS)
-    }
-
-    override fun finish() = done.countDown()
 }
 
 /**

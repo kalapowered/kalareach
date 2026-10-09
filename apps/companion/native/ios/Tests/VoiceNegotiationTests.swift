@@ -34,61 +34,6 @@ private final class Told: VoiceCallObserver {
     func voiceCallReceivedFirstAudio(_: VoiceCall) {}
 }
 
-/// A wait for candidate gathering that the test holds open until the call, or the test, ends it.
-private final class HeldGatheringWait: GatheringWait {
-    private let lock = NSLock()
-    private var released = false
-    private var waiting: CheckedContinuation<Void, Never>?
-
-    /// Fulfilled when the offer has reached the wait.
-    let reached = XCTestExpectation(description: "the offer is waiting for candidate gathering")
-
-    func wait(upTo _: TimeInterval) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            lock.lock()
-            if released {
-                lock.unlock()
-                continuation.resume()
-                return
-            }
-            waiting = continuation
-            lock.unlock()
-            reached.fulfill()
-        }
-    }
-
-    func finish() {
-        lock.lock()
-        released = true
-        let waiter = waiting
-        waiting = nil
-        lock.unlock()
-        waiter?.resume()
-    }
-}
-
-/// How an offer ended, kept for the test to read.
-private final class Outcome: @unchecked Sendable {
-    private let lock = NSLock()
-    private var kept: Result<String, Error>?
-
-    /// Fulfilled when the offer has ended, one way or the other.
-    let ended = XCTestExpectation(description: "the offer ended")
-
-    var result: Result<String, Error>? {
-        lock.lock()
-        defer { lock.unlock() }
-        return kept
-    }
-
-    func keep(_ result: Result<String, Error>) {
-        lock.lock()
-        kept = result
-        lock.unlock()
-        ended.fulfill()
-    }
-}
-
 /// A peer in this process that answers an offer and reads the channel the offer names.
 private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelegate {
     /// How long the peer is given to gather, in seconds.
@@ -211,9 +156,6 @@ final class VoiceNegotiationTests: XCTestCase {
     /// wait that ends as soon as the connection does.
     private static let connectWithin: TimeInterval = 120
 
-    /// How long a call that ended is given to release what waits on it.
-    private static let endWithin: TimeInterval = 20
-
     /// A call and a peer that have exchanged an offer and an answer.
     private func negotiated(
         observer: VoiceCallObserver
@@ -263,15 +205,6 @@ final class VoiceNegotiationTests: XCTestCase {
         XCTAssertEqual(told.events, [Data("{\"type\":\"session.created\"}".utf8)])
     }
 
-    /// KR-REQ-15.03: the offer carries the candidates this device had gathered by the time it was
-    /// made, because the provider is answered once and the candidates that come later are not sent.
-    func testTheOfferCarriesTheCandidatesGatheredSoFar() async throws {
-        let call = try VoiceCall(observer: Told())
-        defer { call.stop() }
-        let offer = try await call.offer()
-        XCTAssertTrue(offer.contains("a=candidate:"), "the offer names at least one address to reach")
-    }
-
     /// KR-REQ-15.34: the call knows whether the provider's answer has been applied, and what it
     /// says of discontinuous transmission, only once it has been. A host's answer is taken only
     /// after that, which ``VoiceCallControl`` decides.
@@ -290,24 +223,5 @@ final class VoiceNegotiationTests: XCTestCase {
         try await call.accept(answerSdp: answer)
         XCTAssertTrue(call.answerIsApplied)
         XCTAssertEqual(call.answerUsesDtx, false)
-    }
-
-    /// KR-REQ-15.34: a call that ends while its offer waits for candidates makes no offer. The
-    /// owner would send it on, and the broker would reserve a provider session for a dead call.
-    func testACallEndedWhileItsOfferWaitsOffersNothing() async throws {
-        let held = HeldGatheringWait()
-        let call = try VoiceCall(observer: Told(), gathering: held)
-        defer { held.finish() }
-        let outcome = Outcome()
-        Task {
-            do { outcome.keep(.success(try await call.offer())) } catch { outcome.keep(.failure(error)) }
-        }
-
-        await fulfillment(of: [held.reached], timeout: Self.connectWithin)
-        call.stop()
-        await fulfillment(of: [outcome.ended], timeout: Self.endWithin)
-
-        guard let result = outcome.result else { return XCTFail("ending the call releases its offer") }
-        if case .success = result { XCTFail("an offer was handed on for a call that ended") }
     }
 }

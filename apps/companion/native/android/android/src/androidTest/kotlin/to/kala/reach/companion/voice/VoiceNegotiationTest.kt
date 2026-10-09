@@ -47,21 +47,6 @@ class VoiceNegotiationTest {
         override fun onFirstAudio() {}
     }
 
-    /** A wait for candidate gathering that the test holds open until the call ends it. */
-    private class HeldGatheringWait : GatheringWait {
-        private val released = CountDownLatch(1)
-
-        /** Counted down when the offer has reached the wait. */
-        val reached = CountDownLatch(1)
-
-        override fun await(seconds: Long) {
-            reached.countDown()
-            released.await()
-        }
-
-        override fun finish() = released.countDown()
-    }
-
     /** A peer in this process that answers an offer and reads the channel the offer names. */
     private class AnsweringPeer {
         private val factory = PeerConnectionFactory.builder().createPeerConnectionFactory()
@@ -237,19 +222,6 @@ class VoiceNegotiationTest {
     }
 
     /**
-     * KR-REQ-15.03: the offer carries the candidates this device had gathered by the time it was
-     * made, because the provider is answered once and the candidates that come later are not sent.
-     */
-    @Test
-    fun the_offer_carries_the_candidates_gathered_so_far() {
-        val started = VoiceCall.start(context, Told()).also { call = it }
-        assertTrue(
-            "the offer names at least one address to reach",
-            started.offer().contains("a=candidate:"),
-        )
-    }
-
-    /**
      * KR-REQ-15.34: the call knows whether the provider's answer has been applied, and what it says
      * of discontinuous transmission, only once it has been. A host's answer is taken only after
      * that, which the call's control decides.
@@ -270,31 +242,8 @@ class VoiceNegotiationTest {
         assertEquals(false, started.answerUsesDtx)
     }
 
-    /**
-     * KR-REQ-15.34: a call that ends while its offer waits for candidates makes no offer. The owner
-     * would send it on, and the broker would reserve a provider session for a dead call.
-     */
-    @Test
-    fun a_call_ended_while_its_offer_waits_offers_nothing() {
-        val held = HeldGatheringWait()
-        val started = VoiceCall.start(context, Told(), held).also { call = it }
-        val outcome = LinkedBlockingQueue<Result<String>>()
-        // A daemon, so a wait that nothing releases cannot keep the test process alive.
-        Thread { outcome.add(runCatching { started.offer() }) }.apply { isDaemon = true }.start()
-
-        assertTrue("the offer reached the wait", held.reached.await(SECONDS, TimeUnit.SECONDS))
-        started.stop()
-
-        val result = outcome.poll(END_SECONDS, TimeUnit.SECONDS)
-        assertNotNull("ending the call releases its offer", result)
-        assertTrue("an offer was handed on for a call that ended", result!!.isFailure)
-    }
-
     private companion object {
         /** How long the two ends are given to connect before a test calls it a failure. */
         const val SECONDS = 120L
-
-        /** How long a call that ended is given to release what waits on it. */
-        const val END_SECONDS = 20L
     }
 }
