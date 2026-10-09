@@ -156,6 +156,15 @@ pub struct OwnedProcesses {
     boot: Option<BootIdentity>,
     /// The control group the worker itself runs in, where the platform has one.
     cgroup: Option<String>,
+    /// The processes the worker started for the session besides its root shell, which are roots
+    /// of their own: an application's server, whose commands leave its process group and its
+    /// session. Each is a root of a tree that [`Self::observe`] reads by parentage.
+    backends: BTreeMap<(u64, u64), ProcessStartIdentity>,
+    /// Every recorded process that is a backend root or was read below one, with the root it is
+    /// below, that has not been read as ended. It is what the next reading of the trees starts
+    /// from, so a process whose parent has gone is still read for its own children, and it is
+    /// still below the root it was read below.
+    under_backends: BTreeMap<(u64, u64), (ProcessStartIdentity, (u64, u64))>,
 }
 
 /// The part of a session's record that one observation of its boundary works on, copied out of it.
@@ -198,8 +207,9 @@ pub struct OwnedRecord {
     pub boot: Option<BootIdentity>,
     /// The session's root shell.
     pub root: ProcessStartIdentity,
-    /// The root shell and every process seen below it that has not been read as ended, except one
-    /// that has left for a control daemon's own scope.
+    /// The root shell, every process seen below it, every backend root and every process seen
+    /// below one, that has not been read as ended, except one that has left for a control daemon's
+    /// own scope.
     pub processes: Vec<ProcessStartIdentity>,
     /// The control group the worker ran in, on a platform that has them.
     pub cgroup: Option<String>,
@@ -207,6 +217,12 @@ pub struct OwnedRecord {
     pub boundary: String,
     /// What this worker could not establish about the session's processes.
     pub limits: Vec<String>,
+    /// The processes of `processes` that are roots the worker started for the session besides its
+    /// root shell: an application's server. A later control daemon asks each to end with a
+    /// terminate and no hang-up, because a hang-up kills a server at once and leaves the commands
+    /// it started running, which a terminate lets it end first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<ProcessStartIdentity>,
 }
 
 /// Reads the control group this process is in, from the unified hierarchy's line.
@@ -261,6 +277,8 @@ impl OwnedProcesses {
             departed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             boot: kr_ipc::identity::boot_identity().ok(),
             cgroup: own_cgroup(),
+            backends: BTreeMap::new(),
+            under_backends: BTreeMap::new(),
         };
         owned.live.insert(key(&root), root.clone());
         owned.seen.insert(
@@ -313,6 +331,8 @@ impl OwnedProcesses {
                 departed: std::sync::Mutex::new(departed),
                 boot: self.boot.clone(),
                 cgroup: self.cgroup.clone(),
+                backends: self.backends.clone(),
+                under_backends: self.under_backends.clone(),
             },
             live_then: self.live.keys().copied().collect(),
         }
@@ -404,7 +424,55 @@ impl OwnedProcesses {
             cgroup: self.cgroup.clone(),
             boundary: self.boundary.describe(),
             limits: self.unestablished(),
+            backends: self
+                .backends
+                .iter()
+                .filter(|(key, _)| self.live.contains_key(key))
+                .map(|(_, identity)| identity.clone())
+                .collect(),
         }
+    }
+
+    /// Adds a root the worker started for the session besides its root shell, and records it.
+    ///
+    /// The root and everything the following observations read below it are the session's, and are
+    /// stopped with it. [`request_stop`] leaves the root to its owner, who asks it gently, and a
+    /// later daemon asks it with a terminate only, never a hang-up. A boundary that is complete
+    /// says so no longer: what this host reads below the root is read by parentage, and a process
+    /// that leaves between two readings is not seen.
+    pub fn add_backend(&mut self, root: ProcessStartIdentity) {
+        if self.boundary.is_complete_boundary() {
+            self.note_unestablished(
+                "a server the session started is outside its ownership boundary, and what it \
+                 started is read by parentage, so a process that left it between two readings \
+                 is not recorded",
+            );
+        }
+        self.backends.insert(key(&root), root.clone());
+        self.under_backends
+            .insert(key(&root), (root.clone(), key(&root)));
+        self.take([root]);
+    }
+
+    /// Returns whether `identity` is a backend root.
+    #[must_use]
+    pub fn is_backend(&self, identity: &ProcessStartIdentity) -> bool {
+        self.backends.contains_key(&key(identity))
+    }
+
+    /// Returns every process recorded below one backend root, not the root itself, that has not
+    /// been read as ended.
+    #[must_use]
+    pub fn below_backend(&self, root: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
+        if !self.backends.contains_key(&key(root)) {
+            return Vec::new();
+        }
+        self.under_backends
+            .iter()
+            .filter(|(below, (_, under))| **below != key(root) && *under == key(root))
+            .filter(|(below, _)| self.live.contains_key(*below))
+            .map(|(_, (identity, _))| identity.clone())
+            .collect()
     }
 
     /// Notes processes found in the boundary, each already tied to the boundary by the reading
@@ -643,6 +711,12 @@ impl OwnedProcesses {
     /// whose process ended after it was listed can belong to a stranger by the time its start is
     /// read; the stranger's reading does not agree with the list, and it is not recorded.
     pub fn observe(&mut self) {
+        self.observe_boundary();
+        self.observe_backends();
+    }
+
+    /// Reads what the boundary holds.
+    fn observe_boundary(&mut self) {
         #[cfg(windows)]
         if let OwnershipBoundary::JobObject { root } = self.boundary {
             self.observe_job(root);
@@ -701,6 +775,89 @@ impl OwnedProcesses {
             }
         }
         self.take(agreeing);
+    }
+
+    /// Reads every tree below a backend root, by parentage and start identity.
+    ///
+    /// The reading starts from every recorded process that is a backend root or was read below
+    /// one, so the children of a process whose own parent has gone are still found. A child is
+    /// taken only from one reading that names the process it was listed under as its parent, and
+    /// only if that parent is still the process that was recorded when the children had been read.
+    /// A kernel that keeps no list of a process's children cannot be read this way, and says so as
+    /// something this host could not establish.
+    fn observe_backends(&mut self) {
+        if self.backends.is_empty() {
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        {
+            let mut pending: Vec<(ProcessStartIdentity, (u64, u64))> =
+                self.under_backends.values().cloned().collect();
+            let mut found: Vec<ProcessStartIdentity> = Vec::new();
+            let mut walked = std::collections::BTreeSet::new();
+            while let Some((parent, under)) = pending.pop() {
+                if !walked.insert(key(&parent)) {
+                    continue;
+                }
+                let Ok(pid) = u32::try_from(parent.pid.get()) else {
+                    continue;
+                };
+                match kr_ipc::identity::process_state(&parent) {
+                    kr_ipc::identity::ProcessState::Running => {}
+                    kr_ipc::identity::ProcessState::Ended => continue,
+                    kr_ipc::identity::ProcessState::Unknown { detail } => {
+                        self.note_unestablished(format!(
+                            "whether process {pid}, below a server the session started, still \
+                             runs could not be read, so what it started is not recorded: {detail}"
+                        ));
+                        continue;
+                    }
+                }
+                let children = match kr_ipc::identity::children_of(pid) {
+                    Ok(children) => children,
+                    Err(error) => {
+                        self.note_unestablished(format!(
+                            "the children of process {pid}, below a server the session started, \
+                             could not be read: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                let mut batch = Vec::new();
+                for child in children {
+                    if let Ok(lineage) = kr_ipc::identity::process_lineage(child)
+                        && u64::from(lineage.parent) == parent.pid.get()
+                    {
+                        batch.push(lineage.identity);
+                    }
+                }
+                // The children are the parent's only if it is the same process after they were
+                // read as before: an identifier that passed to another process in between would
+                // otherwise agree with the children by number alone.
+                if matches!(
+                    kr_ipc::identity::process_state(&parent),
+                    kr_ipc::identity::ProcessState::Running
+                ) {
+                    for identity in batch {
+                        self.under_backends
+                            .insert(key(&identity), (identity.clone(), under));
+                        pending.push((identity.clone(), under));
+                        found.push(identity);
+                    }
+                }
+            }
+            self.take(found);
+            // What has ended is not read again. A process below it that is still running is itself
+            // in the set, so nothing is lost by forgetting its parent.
+            let live = &self.live;
+            self.under_backends
+                .retain(|below, _| live.contains_key(below));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        self.note_unestablished(
+            "this platform keeps no list of a process's children, so what a server the session \
+             started has itself started is not recorded",
+        );
     }
 
     /// Returns the session's processes as this worker's own process tree holds them: the root
@@ -1113,16 +1270,21 @@ pub fn adopt_orphans() {
 /// session's.
 #[cfg(unix)]
 pub fn request_stop(owned: &OwnedProcesses) {
-    signal_surviving(owned, kr_ipc::identity::Stop::Hangup);
+    // A backend root is asked by whoever owns it, and gently: a hang-up kills a server at once and
+    // leaves the commands it started running.
+    signal_surviving(owned, kr_ipc::identity::Stop::Hangup, |identity| {
+        !owned.is_backend(identity)
+    });
 }
 
 /// Forces every process the boundary still holds to stop.
 #[cfg(unix)]
 pub fn force_stop(owned: &OwnedProcesses) {
-    signal_surviving(owned, kr_ipc::identity::Stop::Kill);
+    signal_surviving(owned, kr_ipc::identity::Stop::Kill, |_| true);
 }
 
-/// Stops each recorded process that is still the one recorded, through the platform's hold on it.
+/// Stops each recorded process that is still the one recorded and that `chosen` says yes to,
+/// through the platform's hold on it.
 ///
 /// The identity is checked and the signal is sent against one hold, so a number that passes to
 /// another process between the two is never signalled: a process descriptor on Linux, the kernel's
@@ -1130,10 +1292,17 @@ pub fn force_stop(owned: &OwnedProcesses) {
 /// number, and stays in the record for the closure to name, with the reason; leaving a descendant
 /// running is better than signalling a stranger.
 #[cfg(unix)]
-fn signal_surviving(owned: &OwnedProcesses, how: kr_ipc::identity::Stop) {
+fn signal_surviving(
+    owned: &OwnedProcesses,
+    how: kr_ipc::identity::Stop,
+    chosen: impl Fn(&ProcessStartIdentity) -> bool,
+) {
     use kr_ipc::identity::Stopped;
 
     for identity in owned.surviving() {
+        if !chosen(&identity) {
+            continue;
+        }
         match kr_ipc::identity::stop_process(&identity, how) {
             Stopped::Signalled | Stopped::Gone | Stopped::Unsupported => {}
             Stopped::Refused(why) | Stopped::Unsafe(why) => owned.note_unestablished(format!(
