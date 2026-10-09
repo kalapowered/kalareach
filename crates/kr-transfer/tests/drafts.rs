@@ -1127,6 +1127,8 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
     }
     assert!(accepted > 1024, "the search found a limit near the budget");
 
+    // A second draft for the same session, small enough to take a binding.
+    let another = draft(&harness);
     let failed = harness
         .service
         .end_session_insertions(&std::collections::BTreeSet::from([session]))
@@ -1163,13 +1165,17 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
         .expect_err("a draft for an ended session is refused");
     assert_eq!(refused_draft.code(), ErrorCode::SessionClosed);
     let late = harness.publish(&pattern(65), "image/png", "later.png");
+    let ended_draft = harness
+        .service
+        .draft(&harness.actor, another.draft_id)
+        .expect("the second draft is readable");
     let refusal = harness
         .service
         .draft_add_attachment(
             &harness.actor,
             &AgentDraftAddAttachmentParams {
-                draft_id: read.draft_id,
-                expected_revision: read.revision,
+                draft_id: ended_draft.draft_id,
+                expected_revision: ended_draft.revision,
                 transfer_id: late.transfer_id,
                 contribution: contribution(&late, InsertionMethod::TypedSubmission),
             },
