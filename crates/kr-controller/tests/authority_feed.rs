@@ -1179,9 +1179,9 @@ async fn a_device_the_configuration_leaves_no_right_to_manage_the_host_has_no_au
         .expect("what the request named was not withdrawn");
 }
 
-/// A feed longer than a pass reads is not read through, so it is not a synchronisation: the host
-/// goes on at the cursor in the next pass, and shows the synchronisation only when it has read to
-/// the end.
+/// A feed longer than a pass reads is read on at its cursor at once, and nothing is a
+/// synchronisation until it is read through: a scan that fails half way shows the status stale and
+/// not read, and the next pass goes on where it stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_read_through() {
     let rig = Rig::start().await;
@@ -1218,41 +1218,51 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
             .await
             .expect("the feed stores the request");
     }
-    rig.poll().await;
-    assert_eq!(
-        rig.shown().await.list.feed_synchronised_at_ms.0,
-        synchronised,
-        "a pass that left records unread is no synchronisation"
+    // The first pass reads (1) and refuses 64 records (2 to 65); the scan then goes on at once with
+    // a second read (66), which the feed turns back.
+    rig.served.web().fail(
+        AUTHORITY,
+        66,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
     );
-    // A publisher reads what it published. The last six are the second page, which the pass did
-    // not reach.
+    rig.poll().await;
+    let shown = rig.shown().await;
+    assert_eq!(
+        shown.list.feed_synchronised_at_ms.0, synchronised,
+        "a scan that stopped half way is no synchronisation"
+    );
+    assert!(shown.list.feed_stale);
     let last_publisher = client_for(rig.served.origin(), strangers[1].clone());
-    let last = || async {
-        last_publisher
-            .read(rig.feed(), None, false)
-            .await
-            .expect("the last publisher reads its records")
-    };
-    let unread = last().await;
+    let unread = last_publisher
+        .read(rig.feed(), None, false)
+        .await
+        .expect("the last publisher reads its records");
     assert_eq!(unread.records.len(), 6);
     assert!(
         unread
             .records
             .iter()
             .all(|record| record.rejected.0.is_none()),
-        "the pass left the last records for the next"
+        "the scan stopped before the last page"
     );
 
-    rig.timer.release_held();
+    // The next pass goes on at the cursor and reads the feed through.
     rig.poll().await;
     assert!(
-        last()
+        last_publisher
+            .read(rig.feed(), None, false)
             .await
+            .expect("the last publisher reads its records")
             .records
             .iter()
             .all(|record| record.rejected.0.is_some()),
-        "the next pass went on at the cursor and read the feed through"
+        "the scan went on and read the feed through"
     );
+    assert!(!rig.shown().await.list.feed_stale);
 }
 
 /// A connection waits for the synchronisation section 10 asks for only as long as the bound: a feed
@@ -1372,13 +1382,16 @@ async fn a_pass_this_host_could_not_finish_leaves_what_is_shown_stale() {
     assert!(!rig.shown().await.list.feed_stale);
 }
 
-/// A request whose issuer's authority rests on a bound the synchronisation in progress renews is
-/// judged again by the next pass, and not refused for the bound: a host that was out of reach of
-/// its feed longer than the owner's bounded offline validity would otherwise refuse the one request
-/// that tells it who to revoke.
+/// A bounded offline validity stops personal remote access while the feed cannot be reached, and
+/// the host that judges a request has just read the feed: the issuer whose bound has lapsed is
+/// judged without it, and the request is carried out in the pass that read it. A device that holds
+/// no management right is not named as one that may remove the feed because of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_waits_for_the_synchronisation_that_renews_its_issuers_bound() {
+async fn a_request_from_an_issuer_under_a_lapsed_offline_bound_is_carried_out_in_the_pass_that_read_it()
+ {
     let rig = Rig::start().await;
+    // The viewer stays paired: the request names another device.
+    let (_viewer, _) = rig.pairs(&[ActionRight::SessionView]).await;
     let (_phone, device) = rig.pairs(&[ActionRight::SessionView]).await;
     // Every pass the pairing asked for has run, so none renews the bound before the request is
     // judged.
@@ -1401,17 +1414,22 @@ async fn a_request_waits_for_the_synchronisation_that_renews_its_issuers_bound()
 
     rig.poll().await;
     let held = rig.held(&request).await;
-    assert!(
-        held.acknowledgement.0.is_none() && held.rejected.0.is_none(),
-        "the pass that renews the bound neither carried the request out nor refused it"
-    );
-
-    rig.poll().await;
-    let held = rig.held(&request).await;
-    assert_eq!(held.rejected.0, None, "not refused for a bound that renews");
+    assert_eq!(held.rejected.0, None, "not refused for the bound");
     assert_eq!(
         held.acknowledgement.0.expect("carried out").completion,
         RevocationCompletion::Complete,
-        "carried out once the synchronisation had renewed the bound"
+        "carried out in the pass that read it"
+    );
+    let named = rig
+        .remote
+        .read(rig.feed(), None, true)
+        .await
+        .expect("the feed answers")
+        .summary
+        .removal_keys;
+    assert_eq!(
+        named,
+        vec![rig.owner.authorisation.key_id()],
+        "the owner is named, and a device that may only view a session is not, whatever its bound"
     );
 }
