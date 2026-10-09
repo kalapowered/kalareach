@@ -318,20 +318,22 @@ describe('while a call is running', () => {
     expect(delegated).toHaveBeenCalledTimes(1)
     // KR-REQ-15.17: admission is not execution, and the words beside it say so.
     expect(screen.getByText(/It is not evidence that a host action ran/)).toBeInTheDocument()
-    // The request is the protocol's own shape, carrying what the announcement named. The scripted
+    // The request is the protocol's own shape: the words the device vouched for and nothing that
+    // names an action, a session or a destination, which the host reads for itself. The scripted
     // host refuses a field the real one does not read, as the real one does.
     const [params] = delegated.mock.calls[0]
-    expect(params).toMatchObject({
+    expect(params).toEqual({
+      voice_session_id: (params as { voice_session_id: string }).voice_session_id,
       delegation_id: 'item_a1',
-      action: 'status',
       offset_ms: '1000',
-      turn_id: null
+      fragments: [{ start_ms: '800', end_ms: '1000', text: 'status' }],
+      confirmation: null
     })
   })
 
-  // Section 15 ¶7: what a delegation asks for is the provider's to name and the host's to check.
-  // One that named nothing is shown and never turned into a guess.
-  it('does not submit a delegation that named no action', async () => {
+  // Section 15 ¶7: what a delegation asks for is the host's to read from the words. One that
+  // carried no words is shown and never turned into a guess.
+  it('does not submit a delegation that carried no words', async () => {
     const person = userEvent.setup()
     const { controls, port } = start()
     await waitForChoice()
@@ -346,7 +348,7 @@ describe('while a call is running', () => {
     await waitFor(() => {
       expect(screen.getByText('Not sent to the host')).toBeInTheDocument()
     })
-    expect(screen.getByText(/named no action/)).toBeInTheDocument()
+    expect(screen.getByText(/said nothing the host could read/)).toBeInTheDocument()
     expect(delegated).not.toHaveBeenCalled()
   })
 })

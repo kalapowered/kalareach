@@ -350,10 +350,11 @@ export interface FakeHostControls {
   /** Puts the running call's microphone into one of the states a platform reports. */
   setVoiceCapture(state: string): void
   /**
-   * Announces one delegation to the running call, as a provider channel would: its identifier,
-   * where in the call it happened, and the action it named, or none when `action` is null.
+   * Announces one delegation to the running call, as the device's own record of the provider's
+   * channel would: its identifier, where in the call it happened, and the words the person said
+   * to it, or none when `words` is null.
    */
-  announceVoiceDelegation(delegationId: string, action?: string | null): void
+  announceVoiceDelegation(delegationId: string, words?: string | null): void
   /** Changes what the pairing screen shows, as native code would publish it. */
   setPairing(change: Partial<PairingView>): void
   /** The references the page asked to use as the host its commands go to, in order. */
@@ -1531,11 +1532,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         'voice_session_id',
         'delegation_id',
         'offset_ms',
-        'action',
-        'session_id',
-        'spoken_destination',
-        'approval',
-        'turn_id',
+        'fragments',
         'confirmation'
       ])
       const delegationId = typeof asked.delegation_id === 'string' ? asked.delegation_id : ''
@@ -1547,6 +1544,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         action_id: null,
         value: {
           delegation_id: delegationId,
+          action: 'status',
+          session_id: SESSION_MAIN,
           outcome: {
             admitted: {
               action_id: nextActionId(),
@@ -1808,16 +1807,20 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setVoiceCapture(state) {
       if (voice.call) voice.call.capture = state
     },
-    announceVoiceDelegation(delegationId, action = 'status') {
+    announceVoiceDelegation(delegationId, words = 'status') {
       voice.delegations.push(delegationId)
+      const offset = 1_000 * voice.delegations.length
       emit({
         stream_id: `voice:${VOICE_SESSION}`,
         sequence: String(voice.delegations.length),
         body: {
           kind: 'voice_delegation',
           delegation_id: delegationId,
-          offset_ms: String(1_000 * voice.delegations.length),
-          ...(action === null ? {} : { action })
+          offset_ms: String(offset),
+          fragments:
+            words === null
+              ? []
+              : [{ start_ms: String(offset - 200), end_ms: String(offset), text: words }]
         }
       })
     },

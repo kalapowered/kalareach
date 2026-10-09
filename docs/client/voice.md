@@ -83,6 +83,11 @@ selection and sends it nowhere. Both it and a cancellation need the host, and th
 when the host is unreachable. Whether the voice service is answering comes from the call's own
 report about its control channel and from nothing else.
 
+A delegation is submitted as the words the device vouched for, and nothing that names an action, a
+session or a destination: the host reads the words itself and answers with what it read them to ask
+for. A delegation that carried no words is shown and not sent, and one the host does not read as a
+request is shown with the host's sentence about what it does read.
+
 A delegation the host admits without performing it is shown as admitted, with the host's note that
 admission is not execution. One the host answers with a challenge for the unlocked screen is shown
 with the host's words and the fact that this screen has no way to sign a confirmation, so the host
