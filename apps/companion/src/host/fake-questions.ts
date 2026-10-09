@@ -22,7 +22,14 @@ import {
   decodeParams,
   KEPT_REF_PARAMS
 } from './fake-decode'
-import type { AnswerOutcome, KeptAnswer, KeptRef, SettledAnswer, Standing } from './port'
+import type {
+  AnswerOutcome,
+  KeptAnswer,
+  KeptAnswerList,
+  KeptRef,
+  SettledAnswer,
+  Standing
+} from './port'
 
 function refuse(code: string, message: string): never {
   // eslint-disable-next-line @typescript-eslint/only-throw-error -- a command's failure crosses as data
@@ -274,15 +281,19 @@ export class ScriptedQuestions implements FakeQuestions {
     }
   }
 
-  kept(): readonly KeptAnswer[] {
-    return this.#kept
+  kept(): KeptAnswerList {
+    return { answers: this.#kept, unreadable: 0 }
   }
 
   settle(sessionId: string): readonly SettledAnswer[] {
     this.#requireReachable()
     return this.#kept
       .filter((draft) => draft.session_id === sessionId)
-      .map((draft) => ({ draft, ...this.#standing(draft) }))
+      .map((draft) => ({
+        draft,
+        question: this.#questions.find((each) => each.question_id === draft.question_id) ?? null,
+        ...this.#standing(draft)
+      }))
   }
 
   #standing(draft: KeptAnswer): Standing {

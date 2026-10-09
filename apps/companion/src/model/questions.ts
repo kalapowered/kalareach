@@ -125,9 +125,9 @@ export function answerWords(answer: QuestionAnswer, question?: Question): string
 export function standingWords(standing: Standing): string {
   switch (standing.standing) {
     case 'offered':
-      return 'This question is still waiting, as it was when you answered. Nothing has been sent from here since.'
+      return 'This question is still waiting, as it was when you answered. This device has sent nothing since.'
     case 'unlisted':
-      return 'The session does not list this question, and nothing says the session ended. Nothing has been sent from here.'
+      return 'The session does not list this question, and nothing says the session ended. This device has sent nothing since.'
     case 'ended':
       return `This question was ${standing.state} while your answer was kept. This device will not send your answer.`
     case 'moved':
@@ -141,9 +141,9 @@ export function standingWords(standing: Standing): string {
 export function refusalWords(failure: unknown, fallback: string): string {
   switch (failureCode(failure)) {
     case 'QUESTION_RESOLVED':
-      return 'This question was already answered or withdrawn. Your answer was not recorded.'
+      return 'This question was already answered or withdrawn, so this attempt changed nothing.'
     case 'QUESTION_EXPIRED':
-      return 'This question expired. Your answer was not recorded.'
+      return 'This question expired, so this attempt changed nothing.'
     case 'DRAFT_CONFLICT':
       return 'This question changed since you saw it. Read it again before you answer.'
     case 'PERMISSION_DENIED':
@@ -161,4 +161,38 @@ export function expiryWords(question: Question, nowMs: number): string {
   if (minutes < 60) return `It expires in ${Math.max(1, minutes)} minute${minutes === 1 ? '' : 's'}.`
   const hours = Math.floor(minutes / 60)
   return `It expires in ${hours} hour${hours === 1 ? '' : 's'}.`
+}
+
+/**
+ * What a form held, in words, for a person whose question ended before they answered it: the answer
+ * it makes when it makes one, else what was typed or picked so far.
+ */
+export function typedWords(question: Question, form: Form): string {
+  const made = answerOf(question, form)
+  if ('answer' in made) return answerWords(made.answer, question)
+  if (form.text.trim().length > 0) return `“${form.text}”`
+  if (form.pick !== null) {
+    const label = question.choices.find((choice) => choice.choice_id === form.pick)?.label
+    return form.pick === 'yes' ? 'Yes' : form.pick === 'no' ? 'No' : `“${label ?? form.pick}”`
+  }
+  return 'nothing yet'
+}
+
+/** Whether a form holds anything a person would be sorry to lose. */
+export function holdsSomething(form: Form): boolean {
+  return form.text.trim().length > 0 || form.pick !== null
+}
+
+/** How a question that is no longer waiting ended, in words that claim only what the worker said. */
+export function endedWords(question: Question): string {
+  switch (question.state) {
+    case 'answered':
+      return 'This question was answered by someone else.'
+    case 'expired':
+      return 'This question expired.'
+    case 'cancelled':
+      return 'This question was withdrawn.'
+    default:
+      return 'This question is no longer waiting.'
+  }
 }

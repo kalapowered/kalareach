@@ -578,10 +578,10 @@ export type AnswerOutcome =
       readonly resolution: QuestionResolveResult
       readonly leftover: boolean
     }
-  /** The worker could not take it, so it is kept on this device and nothing has been sent. */
+  /** The host did not confirm that it took it, so a copy is kept on this device. */
   | { readonly outcome: 'kept'; readonly draft: KeptAnswer }
 
-/** One answer a person gave that the worker has not taken. */
+/** One answer a person gave that the host did not confirm it took. */
 export interface KeptAnswer {
   /** Where the answer goes. */
   readonly target: ActionTarget
@@ -607,8 +607,17 @@ export type Standing =
   /** The session ended, and the question with it. */
   | { readonly standing: 'gone' }
 
-/** A kept answer and where its question stands now. */
-export type SettledAnswer = { readonly draft: KeptAnswer } & Standing
+/** A kept answer, the question as the worker lists it now when it does, and where it stands. */
+export type SettledAnswer = {
+  readonly draft: KeptAnswer
+  readonly question: Question | null
+} & Standing
+
+/** The answers kept on this device, and how many environments' answers could not be read. */
+export interface KeptAnswerList {
+  readonly answers: readonly KeptAnswer[]
+  readonly unreadable: number
+}
 
 /** Names one kept answer, as the person was shown it. */
 export interface KeptRef {
@@ -825,7 +834,7 @@ export interface HostPort {
    */
   questionAnswer(params: QuestionAnswerParams): Promise<AnswerOutcome>
   /** Every answer kept on this device, oldest first, whatever host it was given to. */
-  questionKept(): Promise<readonly KeptAnswer[]>
+  questionKept(): Promise<KeptAnswerList>
   /**
    * Where each answer kept for one session stands against the questions the session lists now.
    * Reads and says; it sends and removes nothing.

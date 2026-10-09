@@ -97,13 +97,13 @@ for (const surface of ['ios', 'android'] as const) {
       await expect(send).toBeEnabled()
       expect(await page.evaluate(() => window.krTestHost?.questions.sent.length)).toBe(0)
 
-      // Contact goes before the press: the answer is kept, and nothing is sent.
+      // The session's worker goes before the press: the answer is kept, and nothing is sent.
       await page.evaluate(() => {
-        window.krTestHost?.setConnected(false)
+        window.krTestHost?.questions.setReachable(false)
       })
       await send.click()
       await expect(page.getByTestId('kept-answer')).toBeVisible()
-      await expect(page.getByTestId('kept-answer')).toContainText('Kept on this device')
+      await expect(page.getByTestId('kept-answer')).toContainText('Answers kept on this device')
       expect(await page.evaluate(() => window.krTestHost?.questions.sent.length)).toBe(0)
 
       const kept = await page.evaluate(() => {

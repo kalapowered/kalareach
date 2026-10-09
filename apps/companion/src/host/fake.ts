@@ -1132,7 +1132,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     questionRead: (params) =>
       reading('questionRead', () => {
-        requireConnection()
+        // A question is read from the session's worker over its own link, not through the daemon.
         return questions.read(params)
       }),
     questionAnswer: (params) => Promise.resolve(questions.answer(params)),
@@ -1664,8 +1664,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setConnected(next, reason = UNREACHABLE) {
       connected = next
       lostBecause = reason
-      // The sessions' workers are on the host: out of contact with it is out of contact with them.
-      questions.setReachable(next)
+      // A session's worker has a link of its own: losing the daemon's connection leaves it where it
+      // was, and `questions.setReachable` is what takes a worker away.
       for (const listener of connectionListeners) listener(connectionNow())
     },
     switchHost(environmentId, options) {
