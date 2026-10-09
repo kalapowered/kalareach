@@ -34,6 +34,19 @@ export function describeRecovery(view: RecoveryView): string {
   }
 }
 
+/**
+ * What a sync service setting that is not where the bundle is kept does to recovery: nothing yet.
+ * The bundle stays where it was made, because the kit names that service and that locator, and
+ * moving it is a step of its own. Null when the setting and the bundle agree, or there is no bundle.
+ */
+export function describeStaysAt(view: RecoveryView): string | null {
+  if (view.kept_at === null || view.kept_at === view.sync_service.host) return null
+  return (
+    `Recovery stays at ${view.kept_at}, where its kit points. Choosing another sync service does ` +
+    'not move it.'
+  )
+}
+
 /** What to do about a write that got no answer. */
 export const SETTLE_HELP = 'Nothing else is written until it is settled.'
 
