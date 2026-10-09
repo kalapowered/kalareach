@@ -1286,6 +1286,75 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_its_package_went_a
     );
 }
 
+/// A create token that already has a reservation is answered from it when the configuration document
+/// breaks afterwards, and a token the registry has not seen is refused.
+///
+/// The refusal for a document the host cannot use is for an action with no outcome yet: a retry of
+/// one that has one is answered from it, as section 9 says, whatever the host's conditions are now.
+/// This is the guard of the order in `session_create`, which a request that reaches the daemon as
+/// a retry does not show: the daemon answers a repeated token before `session_create` is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke() {
+    let (temp, controller, asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let request = create_request(environment_id);
+    let create: SessionCreateParams = super::parse(&request.params).expect("decodes");
+    let digest =
+        kr_protocol::digest::mutation_digest(&request, &actor_id).expect("a mutation digest");
+    let intent = kr_cbor::to_canonical_vec(&create).expect("encodes the intent");
+    {
+        let mut registry = controller.registry.lock().await;
+        registry
+            .reserve(
+                &actor_id,
+                request.action_id.get(),
+                digest,
+                &intent,
+                kr_ipc::now_ms(),
+            )
+            .expect("records the first attempt's reservation");
+    }
+    // The document breaks and the daemon accepts it, as any `kr doctor` makes it.
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&temp.environment()),
+        br#"{"version": 99}"#,
+    )
+    .expect("a document this build does not read");
+    let _ = controller.effective_configuration().await;
+
+    let retried = controller
+        .session_create(
+            &actor_id,
+            &request,
+            carried(&controller, connection_id, half_a_minute(&controller)),
+        )
+        .await
+        .expect_err("the reservation has no worker behind it in this test");
+    assert_ne!(
+        retried.code(),
+        ErrorCode::HostNotConfigured,
+        "a retry is answered from its own reservation, not refused for the document: {retried}"
+    );
+    assert!(
+        retried.to_string().contains("already recorded"),
+        "and the answer is the recorded one: {retried}"
+    );
+    let refused = controller
+        .session_create(
+            &actor_id,
+            &create_request(environment_id),
+            carried(&controller, connection_id, half_a_minute(&controller)),
+        )
+        .await
+        .expect_err("a token with no outcome yet is refused");
+    assert_eq!(refused.code(), ErrorCode::HostNotConfigured, "{refused}");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "and nothing was started for either"
+    );
+}
+
 /// A create request for a managed session whose shell no package can qualify.
 fn managed_request(environment_id: kr_protocol::ids::EnvironmentId) -> MutationRequest {
     let mut request = create_request(environment_id);

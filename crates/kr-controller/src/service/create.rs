@@ -257,7 +257,12 @@ impl Controller {
     /// Why this host creates no new session, when it cannot use its configuration document.
     ///
     /// The document is accepted again first, as every `kr doctor` does, so one put right since the
-    /// last acceptance lifts the refusal on the next create without anything else asking.
+    /// last acceptance lifts the refusal on the next create without anything else asking. That
+    /// acceptance is a whole one: a document that moves the rights ceiling, or owes a fence,
+    /// withdraws the authority this connection was admitted under, and the create that triggered it
+    /// is then refused as one made under withdrawn authority, to be made again on a new connection;
+    /// `kr new` asks the host what it is configured as first, which takes the acceptance before it
+    /// creates.
     async fn unusable_now(&self) -> Option<crate::config::Unusable> {
         self.in_force().unusable.as_ref()?;
         drop(self.accept_configuration().await);
@@ -319,6 +324,11 @@ impl Controller {
         // for an update of the host starts nothing new, and waits for what it has started.
         let _under_way = self.handover.admit()?;
         let mut create: SessionCreateParams = parse(&mutation.params)?;
+        // Before anything reads what is in force, the environment a host-context session is given
+        // among it: a document put right since the last acceptance is accepted first, so this
+        // create is made under what it now says. Before the registry is locked, because accepting
+        // the document takes that lock.
+        let unusable = self.unusable_now().await;
         // Before the reservation, because this is a request that can never be served rather than
         // one this environment happens to have no room for. The palette travels to the worker in
         // the launch specification and is recorded there; what cannot travel is a provenance
@@ -396,8 +406,6 @@ impl Controller {
             }
             kr_protocol::session::ShellMode::NativeCompat => None,
         };
-        // Read before the registry is locked, because accepting the document takes that lock.
-        let unusable = self.unusable_now().await;
         let admission = {
             let mut registry = self.registry.lock().await;
             // The token is looked at under the same lock the reservation is taken under, and the

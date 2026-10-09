@@ -216,7 +216,6 @@ async fn delivery_goes_through_the_proxy_the_daemon_started_with() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
-    let proxy = ConnectProxy::refusing(502).await;
     let documents: [(&str, Vec<u8>, u32); 4] = [
         (
             "a version it does not know",
@@ -236,6 +235,7 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
         ("a document too large", vec![b' '; 70_000], 0o600),
     ];
     for (what, bytes, mode) in documents {
+        let proxy = ConnectProxy::refusing(502).await;
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let mut accepted = ConfigurationDocument::empty();
@@ -248,22 +248,36 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
             panic!("{what}: a document the daemon cannot use leaves a route");
         };
         assert!(
-            refusal.contains("config.json") && refusal.contains("cannot be used"),
+            refusal.contains("config.json") && refusal.contains("could not use"),
             "{what}: the refusal names the document: {refusal}"
         );
-        controller
-            .attach_managed_delivery()
-            .expect("the shipped daemon attaches its delivery by this route");
+        assert!(
+            controller
+                .attach_managed_delivery()
+                .expect("the shipped daemon attaches its delivery by this route"),
+            "{what}: one transport is attached"
+        );
+        assert!(
+            matches!(controller.catalogue().outbound(), Outbound::Closed(_)),
+            "{what}: the catalogue was opened on the closed route"
+        );
 
+        // The transport the daemon attached, and not one the test builds: asked for an address a
+        // direct route would reach, it makes none.
         let hook = listening();
         let origin = format!(
             "http://127.0.0.1:{}",
             hook.local_addr().expect("an address").port()
         );
-        let transports = ManagedTransports::new(controller.started_outbound().expect("a route"));
-        let refused = transports
-            .to(&GatewayOrigin::new(origin).expect("a loopback origin"))
-            .expect_err("no transport reaches the address");
+        let attached = controller
+            .delivery_runtime()
+            .transports()
+            .expect("the daemon attached a transport");
+        let Err(refused) =
+            attached.to(&GatewayOrigin::new(origin.clone()).expect("a loopback origin"))
+        else {
+            panic!("{what}: a transport reaches the address");
+        };
         assert!(refused.contains("config.json"), "{what}: {refused}");
         heard_nothing(&hook);
         assert!(
@@ -284,6 +298,21 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
             Outbound::Through(proxy.url.parse().expect("a proxy address")),
             "{what}: and the next start takes the document's proxy"
         );
+        // The control, through the transport the restarted daemon attached: the message goes to the
+        // proxy and not around it.
+        assert!(restarted.attach_managed_delivery().expect("attaches"));
+        let transport = restarted
+            .delivery_runtime()
+            .transports()
+            .expect("attached")
+            .to(&GatewayOrigin::new(origin.clone()).expect("a loopback origin"))
+            .expect("a transport through the proxy");
+        let address = format!("{origin}/hook");
+        let _ = tokio::time::timeout(WATCHDOG, transport.post_json(&address, b"{}", &[]))
+            .await
+            .expect("the message ends");
+        assert_eq!(proxy.asked(), vec![format!("POST {address} HTTP/1.1")]);
+        heard_nothing(&hook);
     }
 }
 

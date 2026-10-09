@@ -13,9 +13,11 @@
 //!
 //! Nothing, except say so. An unreadable file, a file larger than the bound, a document at a
 //! version this build does not know and a document that does not validate all resolve to the
-//! product defaults, and the status travels with the resolver so `kr doctor` reports it. The file
-//! is never rewritten and never partially read: a host that repaired its owner's document would
-//! be deciding what the owner meant.
+//! product defaults here, and the status travels with the resolver so `kr doctor` reports it. The
+//! control daemon, which reads it, then fails closed: it turns descriptions off, creates no new
+//! session and closes its routes through a proxy, because some of the product defaults are wider
+//! than anything an owner could have chosen. The file is never rewritten and never partially
+//! read: a host that repaired its owner's document would be deciding what the owner meant.
 
 use std::path::{Path, PathBuf};
 
