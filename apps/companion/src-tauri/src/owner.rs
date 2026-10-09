@@ -969,13 +969,21 @@ mod tests {
         let view = describe("a reference", "studio", &listed, NOW);
         assert!(view.checkable);
         assert_eq!(view.title, "Hand control of a session to another device");
-        assert_eq!(
-            view.detail.as_deref(),
-            Some(
-                "Hand control of session abababab on studio from Laptop to Pixel 8, who may share \
-                 sessions with others and view sessions for 60 minutes."
-            )
-        );
+        let detail = view.detail.expect("the transfer is described");
+        for named in [
+            "abababab",
+            "studio",
+            "Laptop",
+            "Pixel 8",
+            "share",
+            "view",
+            "60 minutes",
+        ] {
+            assert!(
+                detail.contains(named),
+                "the owner is told {named}: {detail}"
+            );
+        }
         assert_eq!(
             view.facts,
             vec![

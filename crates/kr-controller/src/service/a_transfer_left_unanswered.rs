@@ -11,6 +11,8 @@ use std::sync::Arc;
 use kr_ipc::peer::PeerIdentity;
 use kr_protocol::confirmation::TransferControlPlan;
 use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue};
+use kr_protocol::error::ErrorCode;
+use kr_protocol::grant::Grant;
 use kr_protocol::ids::{
     ActionId, ActionWindowId, ActorId, ConnectionId, DeviceId, DeviceKeyRevision, GrantId,
     RequestId, SessionId,
@@ -28,7 +30,7 @@ use crate::sharing::{ConfirmedAction, ShareRequest};
 
 /// The clock the owner-confirmation ceremony reads, on this machine's own boot.
 #[derive(Debug)]
-struct Ceremony;
+pub(super) struct Ceremony;
 
 impl kr_pairing::platform::PairingClock for Ceremony {
     fn monotonic_ms(&self) -> u64 {
@@ -48,7 +50,7 @@ impl kr_pairing::platform::PairingClock for Ceremony {
 }
 
 /// A daemon on a tree of its own, with a supervisor that starts nothing.
-async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
+pub(super) async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
     let temp = kr_ipc::testing::TempHost::create();
     let controller = Controller::start_on_clocks(
         super::a_floor_owed_its_record::setup(&temp),
@@ -63,7 +65,7 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
 }
 
 /// The owner's confirmation of `plan`, accepted for the host `host_device_id`, as the ceremony does.
-fn confirmed(plan: &TransferControlPlan, host_device_id: DeviceId) -> ConfirmedAction {
+pub(super) fn confirmed(plan: &TransferControlPlan, host_device_id: DeviceId) -> ConfirmedAction {
     let clock = Ceremony;
     let endpoint = kr_protocol::scalars::EndpointKey::from_bytes([3; 32]);
     let request = kr_pairing::confirm::request_confirmation(
@@ -105,7 +107,7 @@ fn confirmed(plan: &TransferControlPlan, host_device_id: DeviceId) -> ConfirmedA
 }
 
 /// A `grant.transfer` under a fresh action, for the grant `from` and the device `to`.
-fn transfer_request(
+pub(super) fn transfer_request(
     temp: &kr_ipc::testing::TempHost,
     session_id: SessionId,
     from: GrantId,
@@ -134,6 +136,84 @@ fn transfer_request(
     }
 }
 
+/// The owner's share of `session_id` that the device `holder` has redeemed, as the grant it holds.
+pub(super) fn owner_share(
+    controller: &Controller,
+    session_id: SessionId,
+    holder: DeviceId,
+) -> Grant {
+    let environment_id = controller.paths().environment_id();
+    let host_device_id = DeviceId::new(environment_id.get());
+    let now_ms = kr_ipc::now_ms().get();
+    let selection = RoleSelection::plain(SessionRole::Owner);
+    let shared = controller
+        .sharing()
+        .share(
+            &ShareRequest {
+                invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes([1; 16])),
+                grant_id: GrantId::new(Uuid::from_bytes([2; 16])),
+                environment_id,
+                session_id,
+                issuer_device_id: host_device_id,
+                recipient_device_id: holder,
+                parent_grant_id: None,
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: None,
+                live_screen: None,
+                named_questions: Vec::new(),
+                named_approvals: Vec::new(),
+                authority_revision: controller.policy().authority_revision(),
+                owner_confirmed: false,
+                now_ms,
+            },
+            || Ok(()),
+        )
+        .expect("the host shares the session");
+    controller
+        .sharing()
+        .redeem(
+            shared.preview.invitation_id,
+            holder,
+            now_ms + 1,
+            || Ok(()),
+            None,
+        )
+        .expect("the device redeems it");
+    shared.grant
+}
+
+/// The plan that hands `source`, held by the device it was issued to, to `taker`.
+pub(super) fn plan_of(
+    controller: &Controller,
+    session_id: SessionId,
+    source: &Grant,
+    taker: DeviceId,
+    new_grant_id: GrantId,
+) -> TransferControlPlan {
+    TransferControlPlan {
+        environment_id: controller.paths().environment_id(),
+        session_id,
+        source_grant_id: source.grant_id,
+        parent_grant_id: source.parent_grant_id,
+        issuer_device_id: source.issuer_device_id,
+        from_device_id: source.recipient_device_id,
+        from_device_name: kr_protocol::pairing::DeviceName::new("a laptop").expect("a name"),
+        to_device_id: taker,
+        to_device_name: kr_protocol::pairing::DeviceName::new("a phone").expect("a name"),
+        to_keys: kr_crypto::keys::DeviceKeys::generate()
+            .expect("keys")
+            .public_keys(),
+        to_key_revision: DeviceKeyRevision::new(1),
+        new_grant_id,
+        environment_selector: source.environment_selector.clone(),
+        actions: crate::sharing::transfer::transferable_actions(source),
+        history: source.history.clone(),
+        expiry: source.expiry,
+        organisation: source.organisation,
+    }
+}
+
 /// KR-REQ-23.49: a transfer that committed and was never answered is answered to its retry from the
 /// grant it wrote and what it withdrew, and is not performed again. The control is an action that
 /// claimed and wrote nothing, which is told the outcome is not known.
@@ -159,69 +239,20 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
     let host_device_id = DeviceId::new(environment_id.get());
     let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
     let giver = DeviceId::new(Uuid::from_bytes([0xf1; 16]));
-    let taker = DeviceId::new(Uuid::from_bytes([0xf2; 16]));
+    let taker = super::a_voice_grant_on_the_floor::paired(&controller, 2, None).device_id;
 
     // A device holds an owner's share of the session.
     let now_ms = kr_ipc::now_ms().get();
-    let selection = RoleSelection::plain(SessionRole::Owner);
-    let shared = controller
-        .sharing()
-        .share(
-            &ShareRequest {
-                invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes([1; 16])),
-                grant_id: GrantId::new(Uuid::from_bytes([2; 16])),
-                environment_id,
-                session_id,
-                issuer_device_id: host_device_id,
-                recipient_device_id: giver,
-                parent_grant_id: None,
-                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
-                selection,
-                lifetime_ms: None,
-                live_screen: None,
-                named_questions: Vec::new(),
-                named_approvals: Vec::new(),
-                authority_revision: controller.policy().authority_revision(),
-                owner_confirmed: false,
-                now_ms,
-            },
-            || Ok(()),
-        )
-        .expect("the host shares the session");
-    controller
-        .sharing()
-        .redeem(
-            shared.preview.invitation_id,
-            giver,
-            now_ms + 1,
-            || Ok(()),
-            None,
-        )
-        .expect("the device redeems it");
-    let source = shared.grant;
+    let source = owner_share(&controller, session_id, giver);
 
     let mutation = transfer_request(&temp, session_id, source.grant_id, taker);
-    let plan = TransferControlPlan {
-        environment_id,
+    let plan = plan_of(
+        &controller,
         session_id,
-        source_grant_id: source.grant_id,
-        parent_grant_id: source.parent_grant_id,
-        issuer_device_id: source.issuer_device_id,
-        from_device_id: giver,
-        from_device_name: kr_protocol::pairing::DeviceName::new("a laptop").expect("a name"),
-        to_device_id: taker,
-        to_device_name: kr_protocol::pairing::DeviceName::new("a phone").expect("a name"),
-        to_keys: kr_crypto::keys::DeviceKeys::generate()
-            .expect("keys")
-            .public_keys(),
-        to_key_revision: DeviceKeyRevision::new(1),
-        new_grant_id: Controller::transfer_identity(&actor_id, mutation.action_id),
-        environment_selector: source.environment_selector.clone(),
-        actions: crate::sharing::transfer::transferable_actions(&source),
-        history: source.history.clone(),
-        expiry: source.expiry,
-        organisation: source.organisation,
-    };
+        &source,
+        taker,
+        Controller::transfer_identity(&actor_id, mutation.action_id),
+    );
     let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("a digest");
     let grants = controller.sharing().grants();
 
@@ -232,7 +263,7 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
     else {
         panic!("the first claim of an action is this attempt's");
     };
-    let (done, completed) = controller
+    let done = controller
         .transfer_control(
             &plan,
             &confirmed(&plan, host_device_id),
@@ -256,16 +287,16 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
         panic!("a committed transfer is answered: {response:?}");
     };
     let answered: GrantTransferResult = value.to_typed().expect("decodes");
-    assert_eq!(answered.replacement, done.issued);
+    assert_eq!(answered.replacement, done.replacement);
     assert_eq!(answered.replacement.grant_id, plan.new_grant_id);
     assert!(answered.revoked.revoked_grants.contains(&source.grant_id));
     // And it was not performed again: the revision, the grants withdrawn and the one grant the
     // receiving device holds are the first attempt's.
     assert_eq!(
         answered.revoked.authority_revision,
-        completed.authority_revision
+        done.revoked.authority_revision
     );
-    assert_eq!(answered.revoked.revoked_grants, completed.revoked_grants);
+    assert_eq!(answered.revoked.revoked_grants, done.revoked.revoked_grants);
     assert_eq!(
         grants
             .records_for_device(taker)
@@ -276,13 +307,9 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
         vec![plan.new_grant_id]
     );
 
-    // The control: an action that claimed and wrote nothing is told the outcome is not known.
-    let nothing = transfer_request(
-        &temp,
-        session_id,
-        GrantId::new(Uuid::from_bytes([9; 16])),
-        taker,
-    );
+    // The control: a new action that claimed and wrote nothing, for the source the first transfer
+    // gave up, is told the outcome is not known, and is not answered as a transfer.
+    let nothing = transfer_request(&temp, session_id, source.grant_id, taker);
     let digest = kr_protocol::digest::mutation_digest(&nothing, &actor_id).expect("a digest");
     let ActionClaim::Claimed { hold } = grants
         .claim_action(&actor_id, nothing.action_id, &digest, now_ms + 3)
@@ -298,8 +325,8 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
     else {
         panic!("a retry is answered with a response");
     };
-    assert!(
-        matches!(response.outcome, Outcome::Error(_)),
-        "an action that wrote nothing is not answered as a transfer: {response:?}"
-    );
+    let Outcome::Error(error) = response.outcome else {
+        panic!("an action that wrote nothing is not answered as a transfer: {response:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
 }

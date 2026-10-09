@@ -237,7 +237,10 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the transfer is refused or the registry cannot be written.
+    /// Returns an error when the transfer is refused or the registry cannot be written. It is
+    /// refused when the receiving device has been revoked since the plan was built: a device
+    /// revocation holds the registry lock across its writes, so the record read under that lock is
+    /// the one the grant is written against.
     pub async fn transfer_control(
         &self,
         plan: &kr_protocol::confirmation::TransferControlPlan,
@@ -245,10 +248,7 @@ impl Controller {
         clock: &(dyn kr_pairing::platform::PairingClock + Sync),
         carried: Option<&crate::authority::AdmittedMutation>,
         claim: Option<&crate::grants::ClaimHold>,
-    ) -> Result<(
-        crate::sharing::ControlTransfer,
-        kr_protocol::sharing::RevocationResult,
-    )> {
+    ) -> Result<kr_protocol::sharing::GrantTransferResult> {
         // Written down before anything is decided from it. The transfer decides the source's expiry
         // again at the moment it writes, and a lapse it finds there is owed its record, which is
         // written before the refusal goes back.
@@ -264,14 +264,17 @@ impl Controller {
             Some(carried) => {
                 let registry = self.registry.lock().await;
                 self.check_admission(&registry, carried)?;
-                self.sharing
-                    .transfer_control(plan, confirmation, clock, write, || {
-                        self.check_admission(&registry, carried)
-                    })
+                self.receiving_device_is_paired(plan).and_then(|()| {
+                    self.sharing
+                        .transfer_control(plan, confirmation, clock, write, || {
+                            self.check_admission(&registry, carried)
+                        })
+                })
             }
-            None => self
-                .sharing
-                .transfer_control(plan, confirmation, clock, write, || Ok(())),
+            None => self.receiving_device_is_paired(plan).and_then(|()| {
+                self.sharing
+                    .transfer_control(plan, confirmation, clock, write, || Ok(()))
+            }),
         };
         self.settle_floor();
         let transfer = transfer?;
@@ -279,10 +282,34 @@ impl Controller {
             transfer.revoked.debt,
             &transfer.revoked.revoked,
         ));
-        let completed = self
-            .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), own)
-            .await?;
-        Ok((transfer, completed))
+        self.complete_transfer(
+            transfer.issued,
+            transfer.revoked.revoked.iter().copied().collect(),
+            own,
+        )
+        .await
+    }
+
+    /// Whether the device a transfer hands control to is still paired with this host.
+    ///
+    /// The plan read the device when it was built, and a revocation of the device can have landed
+    /// since: it takes the registry lock this is read under, so a device revoked before this is
+    /// refused, and one revoked after it has the grant written here revoked with its others.
+    fn receiving_device_is_paired(
+        &self,
+        plan: &kr_protocol::confirmation::TransferControlPlan,
+    ) -> Result<()> {
+        let paired = self
+            .devices
+            .record_for_device(plan.to_device_id)?
+            .is_some_and(|record| record.is_paired());
+        if paired {
+            Ok(())
+        } else {
+            Err(crate::error::ControllerError::PermissionDenied {
+                detail: "the receiving device is not paired with this host".to_owned(),
+            })
+        }
     }
 
     /// Raises the one barrier after a revocation, and reports it.
@@ -311,12 +338,39 @@ impl Controller {
             barrier,
         );
         if !answer.fits_a_frame() {
-            eprintln!(
-                "kr-controller: the answer to a revocation is larger than one control frame can \
-                 carry even when cut, so its caller cannot read it; the revocation has taken effect"
-            );
+            Self::report_uncarriable_answer("a revocation");
         }
         Ok(answer)
+    }
+
+    /// The same, for a transfer: the grant written travels in the answer beside the revocation,
+    /// which is cut to what is left of a frame once the grant has its share.
+    pub(super) async fn complete_transfer(
+        &self,
+        replacement: kr_protocol::grant::Grant,
+        revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
+        own: OwnBarrier,
+    ) -> Result<kr_protocol::sharing::GrantTransferResult> {
+        let barrier = self.barrier(own).await?;
+        let answer = kr_protocol::sharing::GrantTransferResult::bounded(
+            replacement,
+            barrier.authority_revision,
+            revoked_grants.iter().copied(),
+            barrier,
+        );
+        if !answer.fits_a_frame() {
+            Self::report_uncarriable_answer("a transfer");
+        }
+        Ok(answer)
+    }
+
+    /// Says that an answer cannot be read by its caller although the change it reports has taken
+    /// effect.
+    fn report_uncarriable_answer(what: &str) {
+        eprintln!(
+            "kr-controller: the answer to {what} is larger than one control frame can carry even \
+             when cut, so its caller cannot read it; the change has taken effect"
+        );
     }
 
     /// Changes this host's policy and writes the result down.

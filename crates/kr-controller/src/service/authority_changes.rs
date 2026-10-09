@@ -233,9 +233,6 @@ impl Controller {
         else {
             return Err(unfinished_and_unknown());
         };
-        let revoked = self
-            .complete_revocation(withdrawn.into_iter().collect(), self.publish_debts(&[]))
-            .await?;
         if mutation.method.method() == Some(Method::GrantTransfer) {
             let replacement = self
                 .sharing
@@ -243,12 +240,21 @@ impl Controller {
                 .record(Self::transfer_identity(actor_id, mutation.action_id))?
                 .ok_or_else(unfinished_and_unknown)?
                 .grant;
-            return encode(&kr_protocol::sharing::GrantTransferResult {
-                replacement,
-                revoked,
-            });
+            return encode(
+                &self
+                    .complete_transfer(
+                        replacement,
+                        withdrawn.into_iter().collect(),
+                        self.publish_debts(&[]),
+                    )
+                    .await?,
+            );
         }
-        encode(&revoked)
+        encode(
+            &self
+                .complete_revocation(withdrawn.into_iter().collect(), self.publish_debts(&[]))
+                .await?,
+        )
     }
 
     /// Keeps what a claimed action came to, under the hold that claimed it.
@@ -845,8 +851,12 @@ impl Controller {
     /// The plan is built from this host's own records, so it is what an owner device was shown
     /// when the host described the transfer for the same action, and the answer an owner device
     /// recorded for exactly that plan is spent here, once, before anything is written. A transfer
-    /// that cannot be written is refused before the confirmation is spent. The grant written is the
-    /// one the plan builds, and the grant it gives up is revoked in the same commit.
+    /// whose grant is gone, not redeemed or revoked, whose devices are not paired, or whose plan
+    /// hands over more than the grant carries, is refused before the confirmation is spent. One
+    /// that fails at the write, because the grant ran out or a device was revoked after the plan
+    /// was built, has spent it and writes nothing, and the action keeps that refusal. The grant
+    /// written is the one the plan builds, and the grant it gives up is revoked in the same
+    /// commit.
     async fn grant_transfer(
         &self,
         actor_id: &ActorId,
@@ -878,19 +888,17 @@ impl Controller {
             destination: Some(&plan.to_keys),
             rights: &plan.actions,
         })?;
-        let (transfer, revoked) = self
-            .transfer_control(
-                &plan,
-                &confirmed,
-                pairing.clock(),
-                Some(&carried),
-                Some(hold),
-            )
-            .await?;
-        encode(&kr_protocol::sharing::GrantTransferResult {
-            replacement: transfer.issued,
-            revoked,
-        })
+        encode(
+            &self
+                .transfer_control(
+                    &plan,
+                    &confirmed,
+                    pairing.clock(),
+                    Some(&carried),
+                    Some(hold),
+                )
+                .await?,
+        )
     }
 
     /// What a transfer of control would do, as this host's records state it.

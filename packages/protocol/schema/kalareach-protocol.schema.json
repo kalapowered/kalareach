@@ -34873,7 +34873,7 @@
     },
     "TransferControlPlan": {
       "additionalProperties": false,
-      "description": "Handing a session's control to another device, as the owner is asked to confirm it.\n\nEvery member of what is written is a member of this plan, and the digest covers the whole of it:\nthe grant given up, the device it is taken from and the device and keys it goes to, the\nidentity of the grant written, and every right, history bound, lifetime, selector and\norganisation requirement the receiving device holds. A confirmation obtained for one transfer\nauthorises no other. The host writes the grant [`Self::replacement`] builds, so what is written\nis what was confirmed; an owner device builds the digest again from what it is shown.",
+      "description": "Handing a session's control to another device, as the owner is asked to confirm it.\n\nEvery member of the grant that is written is a member of this plan but the authority revision it\nis written under, and the digest covers the whole of the plan: the grant given up, the device it\nis taken from and the device and keys it goes to, the identity of the grant written, and every\nright, history bound, lifetime, selector and organisation requirement the receiving device\nholds. The host adds only what grants nothing: the revision the grant is written at, the time it\nis written, and the continuous-clock deadline copied from the grant given up, which can only\nshorten it. A confirmation obtained for one transfer authorises no other. The host writes the\ngrant [`Self::replacement`] builds, so what is written is what was confirmed; an owner device\nbuilds the digest again from what it is shown.",
       "properties": {
         "actions": {
           "description": "The rights handed over.",
