@@ -510,9 +510,12 @@ impl Controller {
             }
         };
         let outcome = match method {
-            Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
+            Method::GrantCreate => {
+                self.grant_create(caller, mutation, carried, claimed_at_ms)
+                    .await
+            }
             Method::GrantRedeem => self.grant_redeem(mutation, caller, carried, &hold).await,
-            Method::GrantRevoke => self.grant_revoke(mutation, carried, &hold).await,
+            Method::GrantRevoke => self.grant_revoke(caller, mutation, carried, &hold).await,
             Method::GrantTransfer => {
                 self.grant_transfer(actor_id, mutation, carried, &hold)
                     .await
@@ -580,9 +583,13 @@ impl Controller {
     /// Shares a session: compiles the role, previews it, and writes the grant and its invitation.
     ///
     /// The questions and approvals the share names are previewed as the session's worker holds
-    /// them now ([`Self::named_previews`]), before anything is written.
+    /// them now ([`Self::named_previews`]), before anything is written. The owner at this machine
+    /// shares as this host. A paired device shares as itself and only by delegation: from a share
+    /// it holds, to a grant that narrows it, and decided before the session's worker is asked for
+    /// anything, so what the device is shown never exceeds what the grant it delegates from reaches.
     async fn grant_create(
         &self,
+        caller: AuthorityCaller,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
         claimed_at_ms: u64,
@@ -595,30 +602,46 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let named = self
-            .named_previews(params.session_id, &params.selection)
-            .await?;
         let (grant_id, invitation_id) = Self::share_identities(mutation.action_id.get());
-        let request = crate::sharing::ShareRequest {
+        let mut request = crate::sharing::ShareRequest {
             invitation_id,
             grant_id,
             environment_id: self.paths.environment_id(),
             session_id: params.session_id,
-            issuer_device_id: self.host_device_id(),
+            issuer_device_id: match caller {
+                AuthorityCaller::Owner => self.host_device_id(),
+                AuthorityCaller::Device(device_id) => device_id,
+            },
             recipient_device_id: params.recipient_device_id,
             parent_grant_id: params.parent_grant_id.as_ref().copied(),
             selection: params.selection.clone(),
             lifetime_ms: params.lifetime_ms.as_ref().map(|lifetime| lifetime.get()),
             accepted_notices: params.accepted_notices.clone(),
-            live_screen: named.live_screen,
-            named_questions: named.questions,
-            named_approvals: named.approvals,
+            live_screen: None,
+            named_questions: Vec::new(),
+            named_approvals: Vec::new(),
             authority_revision: self.policy().authority_revision(),
             owner_confirmed: false,
             // The moment the claim was written, which is when this host accepted the action: the
             // invitation's lifetime runs from it.
             now_ms: claimed_at_ms,
         };
+        if matches!(caller, AuthorityCaller::Device(_)) {
+            // The floor goes down first, as for any delegation, so a parent that expired before
+            // this request is refused as expired. Then the delegation is decided from the grants
+            // alone: the session's worker is read for the preview only for a request its parent
+            // already allows.
+            self.settled_now_ms();
+            let allowed = self.sharing.delegation_allowed(&request);
+            self.settle_floor();
+            allowed?;
+        }
+        let named = self
+            .named_previews(params.session_id, &params.selection)
+            .await?;
+        request.live_screen = named.live_screen;
+        request.named_questions = named.questions;
+        request.named_approvals = named.approvals;
         // A delegation decides its parent's expiry at the moment it writes. The floor goes down
         // first, so a parent that expired before this request is refused as expired rather than
         // as a reading this host has not written down; a lapse found at the write itself is owed
@@ -754,14 +777,62 @@ impl Controller {
         })
     }
 
+    /// The live grant `device_id` holds that `grant_id` was delegated from, however far up.
+    ///
+    /// A grant is delegated from the grant its record names as its parent, and the parent's own
+    /// record names its parent in turn. The nearest ancestor that this device holds, active, not
+    /// revoked, is the one a revocation of `grant_id` is decided under. A grant the device holds
+    /// itself is not its own ancestor: a device does not revoke its own authority through this.
+    /// A grant that does not exist, and one with no such ancestor, are refused alike, so a refusal
+    /// says nothing of which grants exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] when this device holds no live grant that the
+    /// named one descends from, and a storage error when a record cannot be read.
+    pub(crate) fn delegating_ancestor(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        grant_id: kr_protocol::ids::GrantId,
+    ) -> Result<kr_protocol::ids::GrantId> {
+        // A parent link never leads back, so a chain this long is not one a host wrote.
+        const GENERATIONS: usize = 256;
+        let denied = || ControllerError::PermissionDenied {
+            detail: "this device holds no grant that this one was delegated from".to_owned(),
+        };
+        let grants = self.sharing.grants();
+        let mut below = grants.record(grant_id)?.ok_or_else(denied)?;
+        for _ in 0..GENERATIONS {
+            let Some(parent_id) = below.grant.parent_grant_id.as_ref().copied() else {
+                return Err(denied());
+            };
+            let parent = grants.record(parent_id)?.ok_or_else(denied)?;
+            if parent.grant.recipient_device_id == device_id
+                && parent.is_active()
+                && parent.revoked_at_ms.is_none()
+            {
+                return Ok(parent_id);
+            }
+            below = parent;
+        }
+        Err(denied())
+    }
+
     /// Revokes a grant, its descendants, and everything they were being used for.
     async fn grant_revoke(
         &self,
+        caller: AuthorityCaller,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
         hold: &crate::grants::ClaimHold,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
+        // A paired device revokes what it delegated, and what was delegated on from that: a grant
+        // below one it holds. Decided again here, where the revocation is made, because the grant
+        // it held when the request was admitted can have been revoked since.
+        if let AuthorityCaller::Device(device_id) = caller {
+            self.delegating_ancestor(device_id, params.grant_id)?;
+        }
         encode(
             &self
                 .revoke_grant(params.grant_id, Some(&carried), Some(hold))

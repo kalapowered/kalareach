@@ -213,11 +213,11 @@ A session shared with an already paired device reaches it as an invitation, and 
 it with `grant.redeem` over its own connection. Redeeming activates the grant the invitation
 carries, once, for the device the invitation names, and for nobody else.
 
-Control of a session moves to another paired device with `grant.transfer`, and only the person at
-this machine asks for it. The host describes the transfer, an owner device checks it and signs it,
-and `grant.transfer` spends that answer once. The receiving device is given an active grant over the
-session, with the issuer, parent, history and lifetime of the grant it replaces, and the giving
-device's grant is revoked together with everything delegated from it, in one commit.
+Control of a session moves to another paired device with `grant.transfer`. Only the person at this
+machine asks for it. The host describes the transfer, an owner device checks it and signs it, and
+`grant.transfer` spends that answer once. The receiving device is given an active grant over the
+session with the same issuer, parent, history, and lifetime as the grant it replaces, and the giving
+device's grant is revoked together with everything delegated from it, in the same commit.
 
 A remote owner publishes a signed revocation **request**, which carries no host revision: only the
 target host issues ordered authority revisions, and a device that could name one would be assigning
@@ -387,11 +387,12 @@ Comparing the rights by name alone would miss the most serious case, where a dev
 view of one session is handed a permanent view of every session. A bounded session invitation is not
 a persistent enlargement however wide it is.
 
-Transfer of control is separate, because it changes who holds authority rather than adding to what
-somebody has. The digest an owner confirms for a transfer covers the whole plan: the session, the
-grant given up, both devices with the receiving device's keys, the identity of the grant that is
-written, and every right, selector, history bound, lifetime and organisation requirement that grant
-carries. A confirmation obtained for one transfer therefore authorises no other, and it names the
-action that will spend it, since that action decides the new grant's identity. The evidence that
-acceptance produces is bound to the host it was accepted for, to the boot it was accepted in, and to
-the ceremony's monotonic deadline, and the transfer checks all three.
+Transfer, on the other hand, is a special case because it doesn't create new authority, it merely
+moves it from one place to another. The digest an owner confirms for a transfer covers the whole
+plan: the session, the grant given up, both devices with the receiving device's keys, the identity
+of the grant that is written, and every right, selector, history bound, lifetime and organisation
+requirement that grant carries. This makes the confirmation useless for anything but this exact
+transfer, and it names the action that will spend it, since that action decides the new grant's
+identity. Finally, the evidence that acceptance produces is bound to the host it was accepted for,
+the boot it was accepted in and the ceremony's monotonic deadline, and the transfer checks all
+three.

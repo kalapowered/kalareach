@@ -32,16 +32,23 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
 use kr_pairing::direct::CandidateIdentity;
+use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
-use kr_protocol::ids::{BuildId, DeviceId, DeviceKeyRevision, EnvironmentId};
+use kr_protocol::ids::{
+    ActionId, BuildId, DeviceId, DeviceKeyRevision, EnvironmentId, GrantId, SessionEpoch, SessionId,
+};
 use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{DeviceName, DevicePlatform, ProposedGrant};
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::CanonicalSet;
+use kr_protocol::scalars::{CanonicalSet, Nullable};
+use kr_protocol::sharing::{
+    AuthorityNotice, GrantCreateParams, GrantCreateResult, GrantRedeemParams, RoleSelection,
+    SessionRole,
+};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::LocalIdentity;
 use kr_transport::scheduler::SendLimits;
@@ -916,4 +923,138 @@ pub fn refusal<T>(outcome: std::result::Result<T, ProtocolError>) -> ProtocolErr
         Ok(_) => panic!("this call is refused"),
         Err(error) => error,
     }
+}
+
+/// A target that names this host and no session, which is what a redemption and a revocation act
+/// on.
+pub fn on_the_host(host: &Host) -> ActionTarget {
+    ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::null(),
+        session_epoch: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    }
+}
+
+/// A target that names a session, which is what a share and a transfer of it act on.
+pub fn on_the_session(host: &Host, session_id: SessionId) -> ActionTarget {
+    ActionTarget {
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        ..on_the_host(host)
+    }
+}
+
+/// A device paired under a grant that reaches no session: the way a person who was only ever asked
+/// to look at one session is paired.
+pub async fn recipient(host: &Host, owner: &DeviceKeys) -> (Device, DeviceRecord) {
+    let device = Device::create().await;
+    let mut grant = proposal(&[ActionRight::SessionView]);
+    grant.session_selector = SessionSelector::None;
+    let record = pair_with(host, &device, owner, grant).await;
+    (device, record)
+}
+
+/// Shares `session_id` with the device `record` names as an owner of it, as the person at this
+/// machine does, and has that device redeem it on a connection of its own, which is returned.
+pub async fn owned_by(
+    host: &Host,
+    session_id: SessionId,
+    device: &Device,
+    record: &DeviceRecord,
+) -> (GrantCreateResult, RawDevice) {
+    let selection = RoleSelection::plain(SessionRole::Owner);
+    let created: GrantCreateResult = host
+        .client()
+        .await
+        .mutate(
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(host, session_id),
+            &GrantCreateParams {
+                session_id,
+                recipient_device_id: record.device_id,
+                parent_grant_id: Nullable::null(),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Nullable::null(),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is written")
+        .to_typed()
+        .expect("decodes");
+    let connection = RawDevice::connect(host, device, record).await;
+    connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(host),
+            &GrantRedeemParams {
+                invitation_id: created.preview.invitation_id,
+            },
+        )
+        .await
+        .expect("the owner share is redeemed");
+    (created, connection)
+}
+
+/// Whether the host holds `grant_id` as active and not revoked.
+pub fn holds(host: &Host, grant_id: GrantId) -> bool {
+    host.controller()
+        .sharing()
+        .grants()
+        .record(grant_id)
+        .expect("readable")
+        .is_some_and(|record| record.is_active() && record.revoked_at_ms.is_none())
+}
+
+/// Delegates an owner's share of `session_id` from the grant `parent`, over the paired connection
+/// of the device that holds it, to the device `record` names, and has that device redeem it on a
+/// connection of its own, which is returned with the grant.
+pub async fn delegated(
+    host: &Host,
+    session_id: SessionId,
+    parent: &kr_protocol::grant::Grant,
+    issuing: &RawDevice,
+    device: &Device,
+    record: &DeviceRecord,
+) -> (kr_protocol::grant::Grant, RawDevice) {
+    let selection = RoleSelection::plain(SessionRole::Owner);
+    let created: GrantCreateResult = issuing
+        .mutate(
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(host, session_id),
+            &GrantCreateParams {
+                session_id,
+                recipient_device_id: record.device_id,
+                parent_grant_id: Nullable::some(parent.grant_id),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                // Shorter than the grant it is delegated from, which a delegation must be.
+                lifetime_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(600_000)),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the device delegates from the grant it holds")
+        .to_typed()
+        .expect("decodes");
+    let connection = RawDevice::connect(host, device, record).await;
+    connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(host),
+            &GrantRedeemParams {
+                invitation_id: created.preview.invitation_id,
+            },
+        )
+        .await
+        .expect("the delegated share is redeemed");
+    (created.grant, connection)
 }
