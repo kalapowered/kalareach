@@ -123,6 +123,10 @@ the person removes it. Nothing that needs a right is offered before the connecti
 may do. In a session, when the launch surface was read at an older prompt generation than the view
 has heard since, its buttons start disabled.
 
+Drafts are kept on this device as they are typed. The application writes each change to a store of its own that outlives the window, so a draft is still in its composer when the application is closed and opened again, when a tab is closed and opened again, and while the host is out of reach. The composer waits for the store to be read, so nothing typed can replace what was kept. If the device cannot open the store, drafts are kept in the window only, and the person is told. A draft is never replaced because another window of the application changed it first: the stored draft stays as that window left it, this window’s text is kept beside it as a separate draft, and a message says so. If a prompt is sent from a draft, the stored draft stays until the host has taken the prompt. It is removed then, and it stays if the host refuses the prompt or nobody knows what became of it. Files on a draft are kept as completed uploads, without their previews.
+
+A “Kept drafts” section appears under Sessions when there are drafts that no composer shows: one whose session has gone, one whose conversation changed so that the person has to say where it goes, a second draft of a session that already has one, and a copy kept beside another window’s draft. It appears on both the desktop and the phone, and on the phone the recovery banner leads to it. Each draft can be moved to a session the person chooses, or discarded; nothing there sends anything. It can be opened when the host is not available, although moving a draft needs the host’s list of sessions.
+
 Nothing claims contact, or its loss, before an answer says which. Until the first answer the
 desktop's bar and the phone's say they are checking the connection, with no status dot, and a phone
 session opened from a notification shows no banner about the host. A reason for a lost connection
