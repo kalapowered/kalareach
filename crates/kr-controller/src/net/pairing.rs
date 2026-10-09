@@ -56,7 +56,7 @@ use kr_protocol::preauth::{
 };
 use kr_protocol::rendezvous::{ClientFrame, encode_message};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable};
+use kr_protocol::scalars::{Bytes, Digest256, Nullable};
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 use tokio::sync::watch;
 
@@ -443,6 +443,17 @@ impl PairingHost {
             }
             ConfirmationSubject::EstablishClock => {
                 return self.owner.request_clock(caller, action, admission);
+            }
+            ConfirmationSubject::TransferControl(_) => {
+                // A transfer is described from the grant and the two devices this daemon holds,
+                // which only the daemon reads, so it resolves the subject and asks through
+                // [`Self::request_resolved`].
+                return Err(ControllerError::Refused {
+                    code: ErrorCode::InvalidArgument,
+                    detail: "a transfer of control is described by this host's daemon, not by the \
+                             pairing service"
+                        .to_owned(),
+                });
             }
             ConfirmationSubject::CatalogueAdd(_) | ConfirmationSubject::PluginInstall(_) => {
                 // These two are the catalogue's to describe: what an owner is shown comes from
@@ -1668,14 +1679,12 @@ impl PairingHost {
 impl crate::sharing::OwnerConfirmations for PairingHost {
     fn accept(
         &self,
-        action: SensitiveAction,
-        action_digest: Digest256,
+        what: &crate::sharing::ExactAction<'_>,
         proof: &kr_protocol::pairing::OwnerConfirmationProof,
     ) -> Result<crate::sharing::ConfirmedAction> {
-        // A catalogue action sends authority to no device and grants no session right. What it
-        // changes is what this host will trust or run.
-        let rights = CanonicalSet::new();
-        let expectation = self.owner.expectation(action, action_digest, None, &rights);
+        let expectation =
+            self.owner
+                .expectation(what.action, what.digest, what.destination, what.rights);
         self.owner
             .spend_presented(&expectation, proof, "catalogue")
             .map_err(|error| ControllerError::PermissionDenied {
@@ -1685,32 +1694,38 @@ impl crate::sharing::OwnerConfirmations for PairingHost {
 
     fn accept_recorded(
         &self,
-        action: SensitiveAction,
-        action_digest: Digest256,
+        what: &crate::sharing::ExactAction<'_>,
     ) -> Result<crate::sharing::ConfirmedAction> {
-        let rights = CanonicalSet::new();
-        let expectation = self.owner.expectation(action, action_digest, None, &rights);
-        // The two actions the catalogue spends from a recorded answer are the two it describes
-        // itself: an owner device was shown the repository, or the release and its grant, that
-        // the host resolved from the request. A challenge a caller described for the same action
-        // and digest was shown as the caller's words, and is never taken for either.
-        let shows: fn(&ConfirmationDisplay) -> bool = match action {
-            SensitiveAction::TrustRepositoryRoot => {
-                |display| matches!(display, ConfirmationDisplay::CatalogueAdd { .. })
-            }
-            SensitiveAction::GrantExecutableCapability => {
-                |display| matches!(display, ConfirmationDisplay::PluginInstall { .. })
-            }
-            _ => |_| false,
+        let expectation =
+            self.owner
+                .expectation(what.action, what.digest, what.destination, what.rights);
+        // The actions spent from a recorded answer are the ones this host describes itself: an
+        // owner device was shown the repository, or the release and its grant, or the transfer,
+        // that the host resolved from the request. A challenge a caller described for the same
+        // action and digest was shown as the caller's words, and is never taken for any of them.
+        let (shows, effect): (fn(&ConfirmationDisplay) -> bool, &str) = match what.action {
+            SensitiveAction::TrustRepositoryRoot => (
+                |display| matches!(display, ConfirmationDisplay::CatalogueAdd { .. }),
+                "catalogue",
+            ),
+            SensitiveAction::GrantExecutableCapability => (
+                |display| matches!(display, ConfirmationDisplay::PluginInstall { .. }),
+                "catalogue",
+            ),
+            SensitiveAction::ChangeHostAuthority => (
+                |display| matches!(display, ConfirmationDisplay::TransferControl(_)),
+                "transfer",
+            ),
+            _ => (|_| false, "catalogue"),
         };
-        self.owner.spend_answered(&expectation, &shows, "catalogue")
+        self.owner.spend_answered(&expectation, &shows, effect)
     }
 
     fn host_device_id(&self) -> DeviceId {
         self.identity.device_id
     }
 
-    fn clock(&self) -> &dyn kr_pairing::platform::PairingClock {
+    fn clock(&self) -> &(dyn kr_pairing::platform::PairingClock + Sync) {
         &self.clock
     }
 }

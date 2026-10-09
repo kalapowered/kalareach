@@ -564,6 +564,32 @@ pub struct GrantRedeemParams {
     pub invitation_id: InvitationId,
 }
 
+/// Parameters of `grant.transfer`.
+///
+/// The owner's confirmation is not carried here. It is asked for beforehand, through
+/// `owner.confirmation.request` naming the same parameters and the identifier of the action that
+/// will spend it, and answered on an owner device; `grant.transfer` spends that answer, once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantTransferParams {
+    /// The session whose control moves.
+    pub session_id: SessionId,
+    /// The grant the transferring device holds, which is revoked with its descendants.
+    pub from_grant_id: GrantId,
+    /// The paired device that receives the control.
+    pub to_device_id: DeviceId,
+}
+
+/// The result of `grant.transfer`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantTransferResult {
+    /// The grant the receiving device now holds, active from the moment of the transfer.
+    pub replacement: Grant,
+    /// What revoking the transferring device's grant did, with the per-worker barrier.
+    pub revoked: RevocationResult,
+}
+
 /// The result of `grant.redeem`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

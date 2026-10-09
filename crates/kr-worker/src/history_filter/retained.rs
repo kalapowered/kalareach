@@ -214,6 +214,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::OwnerConfirmationComplete
         | Method::GrantRevoke
         | Method::GrantRedeem
+        | Method::GrantTransfer
         | Method::PushInstallationRegister
         | Method::PushSenderIssue
         | Method::PushSenderRenew
