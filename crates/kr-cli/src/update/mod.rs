@@ -1664,7 +1664,17 @@ async fn hand_over(
             return Err(error);
         }
     };
-    formats::look_ahead(store);
+    // What a command registered, looked at before anything is stopped: a registration that cannot be
+    // read refuses the switch now, and a place that hangs hangs the update while nothing is stopped.
+    let unreadable = formats::look_ahead(store);
+    if !unreadable.is_empty() {
+        drop(install);
+        for (environment, daemon) in prepared {
+            handover::resume(daemon, environment, &target.release).await;
+        }
+        forget_update(store, record);
+        return Err(formats::refusal(&target, &unreadable));
+    }
     let every = every_environment(environments, &again);
     // From here the reading under the install lock is the one a person is told of. A pair of roots
     // through which an environment held below was found, at either reading, is not also one the

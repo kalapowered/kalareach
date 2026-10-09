@@ -184,12 +184,11 @@ pub fn check(
     let mut unreached = Vec::new();
     let registered = registered(install, environments, &mut refusals, &mut unreached);
     let documents = install.recorded_documents().unwrap_or_else(|error| {
-        refusals.push(Refusal {
-            store: "the configuration documents the store recorded".to_owned(),
-            environment: None,
-            place: install.roots(),
-            why: Why::Unreadable(super::said(&error)),
-        });
+        refusals.push(unreadable_records(
+            "the configuration documents the store recorded",
+            install,
+            &error,
+        ));
         Vec::new()
     });
     for listed in &target.stores {
@@ -230,12 +229,57 @@ pub fn check(
     }
 }
 
-/// Looks at the state root of every root a command registered, before anything is stopped, so that a
-/// place that hangs when it is looked at holds the update while nothing has been stopped. What it
-/// finds is not used: [`check`] looks again, under the writers' lock.
-pub fn look_ahead(install: &kr_ipc::install::Store) {
-    for roots in install.registered_roots().unwrap_or_default() {
-        let _ = std::fs::metadata(&roots.state_root);
+/// What can be known of the registrations and recorded documents before anything is stopped: the
+/// refusal for one that cannot be read, which the records, unchanged while the update holds the
+/// install lock, will give again under the writers' lock, and a first look at each place they name.
+///
+/// The first look moves a place that hangs when it is looked at to before the update has stopped
+/// anything. It is a look at the root and at the directory of each document and no more: a hang
+/// later, in listing the root or reading a record, is not bounded by it.
+#[must_use]
+pub fn look_ahead(install: &kr_ipc::install::Store) -> Vec<Refusal> {
+    let mut refusals = Vec::new();
+    match install.registered_roots() {
+        Ok(recorded) => {
+            for roots in recorded {
+                let _ = std::fs::metadata(&roots.state_root);
+            }
+        }
+        Err(error) => refusals.push(unreadable_records(
+            "the roots the store's commands registered",
+            install,
+            &error,
+        )),
+    }
+    match install.recorded_documents() {
+        Ok(documents) => {
+            for document in documents {
+                if let Some(directory) = document.path.parent() {
+                    let _ = std::fs::metadata(directory);
+                }
+            }
+        }
+        Err(error) => refusals.push(unreadable_records(
+            "the configuration documents the store recorded",
+            install,
+            &error,
+        )),
+    }
+    refusals
+}
+
+/// The refusal for records in `roots/` that cannot be read, named by what they record. The error
+/// names the file; the remedy is to remove it or make it owner-only.
+fn unreadable_records(
+    what: &str,
+    install: &kr_ipc::install::Store,
+    error: &kr_ipc::install::InstallError,
+) -> Refusal {
+    Refusal {
+        store: what.to_owned(),
+        environment: None,
+        place: install.roots(),
+        why: Why::Unreadable(super::said(error)),
     }
 }
 
@@ -251,12 +295,11 @@ fn registered(
     let recorded = match install.registered_roots() {
         Ok(recorded) => recorded,
         Err(error) => {
-            refusals.push(Refusal {
-                store: "the roots the store's commands registered".to_owned(),
-                environment: None,
-                place: install.roots(),
-                why: Why::Unreadable(super::said(&error)),
-            });
+            refusals.push(unreadable_records(
+                "the roots the store's commands registered",
+                install,
+                &error,
+            ));
             return Vec::new();
         }
     };
@@ -752,6 +795,8 @@ mod tests {
         let paths = kr_ipc::paths::HostPaths::new(directory.path().join("run"), &state)
             .expect("the roots")
             .environment(environment_id);
+        kr_ipc::paths::create_private_directory(&state.join("environments"))
+            .expect("the environments");
         kr_ipc::paths::create_private_directory(paths.state_dir()).expect("the environment");
         kr_ipc::paths::write_owner_only_file(
             &state.join("shell-entries.json"),
