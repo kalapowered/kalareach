@@ -58,6 +58,10 @@ use crate::broker::{Broker, settled};
 /// Section 9 bounds outstanding work, and section 11 bounds broker I/O. A count of frames bounds
 /// neither: two hundred and fifty-six frames of a megabyte each is a quarter of a gigabyte of
 /// buffer held for a peer that has stopped reading.
+///
+/// An empty queue takes one frame the connection may carry whatever its size, so the bound on
+/// bytes never refuses a frame at the frame bound for the newline or the identifier that come with
+/// it; a queue that already holds anything takes a frame only if the two together fit.
 pub const MAX_QUEUED_BYTES: usize = 1 << 20;
 
 /// How long one frame has to reach the socket before the connection cannot safely continue.
@@ -307,6 +311,13 @@ impl Sink {
     /// Returns what [`Sink::queue`] does. The work is not run when the frame is refused here,
     /// because nothing was taken.
     fn queue_then(&self, body: &[u8], after: Option<Completion>) -> Result<Queued> {
+        if body.len() > self.framing.largest_body() {
+            return Err(BrokerError::invalid(format!(
+                "this frame is {} bytes and this connection carries at most {}",
+                body.len(),
+                self.framing.largest_body()
+            )));
+        }
         let framed = self.framing.encode(body);
         self.reserve(framed.len())?;
         let (report, receiver) = tokio::sync::oneshot::channel();
@@ -389,7 +400,9 @@ impl Sink {
         let mut held = self.queued.load(Ordering::Acquire);
         loop {
             let wanted = held.saturating_add(bytes);
-            if wanted > self.limit {
+            // An empty queue takes one frame the connection may carry, so the bound on bytes is
+            // never the reason a frame at the frame bound cannot cross.
+            if wanted > self.limit && held != 0 {
                 return Err(BrokerError::UpstreamUnavailable {
                     detail: format!(
                         "this connection already holds {held} bytes waiting to be written and one \
@@ -2375,8 +2388,14 @@ impl Duplex {
                         }
                     }
                     Ok(None) => break,
-                    // The stream is no longer one this framing can read, so this end is done.
-                    Err(_) => return,
+                    // The stream is no longer one this framing can read, so this end is done and
+                    // so is the connection: the terminal is told about what it was waiting on.
+                    Err(error) => {
+                        self.fail(&format!(
+                            "the connection sent something unreadable: {error}"
+                        ));
+                        return;
+                    }
                 }
             }
             if self.stopped.load(Ordering::Acquire) {
