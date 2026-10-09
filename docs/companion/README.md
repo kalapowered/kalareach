@@ -269,10 +269,10 @@ that means, and each rule is a fact about a file here rather than a convention:
   grouped value both devices show, and a confirmation's description. It is never sent an
   invitation's text or secret, a key, a transcript, a challenge or a proof, and it cannot complete
   a confirmation: `owner.confirmation.complete` is a method only native code calls.
-
 - **Recovery's secrets stay native.** The page asks for recovery to be turned on and for the kit to
   be saved. The seed, the bundle's locator and the account's token stay in native code, and the kit
-  is written to a destination the save dialog returned.
+  is written to a destination the save dialog returned. `src-tauri/tests/recovery.rs` holds this
+  one.
 
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
@@ -391,25 +391,33 @@ sync service. `src-tauri/src/recovery.rs` does it with `kr-client`'s `BundleStor
 bundle's rules: writes that compare the revision they replace, a record of any write whose answer
 never came back, and a checkpoint that never moves back.
 
-- Turning recovery on makes the seed and keeps it in the device's secure store. It then writes
-  `recovery/recovery.json` (the service, the locator, and whether the first write landed) and puts
-  the first bundle at the service. A kit exists only once that write has landed. A start that did
-  not finish goes on with the locator it began with, and a bundle that landed unrecorded is read
-  and kept, never written over.
+- Turning recovery on writes `recovery/recovery.json` first (the service, a locator drawn for the
+  bundle, and whether the first write is known to have landed), flushed to disk before the first
+  request. It then makes the seed and keeps it in the device's secure store, and puts the first
+  bundle at the service. A kit exists only once that write has landed. A start that did not finish
+  goes on with the locator it began with, and a bundle that landed unrecorded is read with the
+  seed and kept; a bundle the seed does not open is left alone and no kit is offered for it.
+- Each step holds `recovery/recovery.lock` for as long as it runs. A second companion on the same
+  machine waits for the step in hand, so two of them never each draw a locator and commit a bundle
+  of their own.
 - A write whose answer never came back shows as unsettled, and nothing else is written until the
-  person settles it. Settling asks the service to fence the write's identity and reads the bundle
-  back. A restart keeps the write unsettled.
+  person settles it. Settling asks the service to fence the write's identity, and reads the bundle
+  back where the fence does not say what became of the write. A restart keeps the write unsettled.
 - Saving the kit writes the seed, the locator and the service to a file at a destination the save
-  dialog returned, readable by the user alone. The page is sent none of them.
+  dialog returned. The file is flushed to disk and, on Unix, has the owner-only mode (0600). On
+  Windows it has the permissions of the folder the person chose. The page is sent none of its
+  contents.
 - `Recovery::enable_writer` is how a backup writer is made recovery-enabled. It commits the bundle
   with the writer named in it, and returns the evidence that the writer is enabled only after that
   commit has landed.
 
 The bundle is reached with this device's signature and the account's token, and the token goes only
-to the service the account is signed in to. When the sync service setting names another service, no
-request is made and the refusal names the setting. A sign-in that does not carry the right to write
-the account's backup storage sends nothing either, and the person signs in again with that right.
-A phone shows the setting and offers no recovery.
+to the service the account is signed in to. When the sync service setting names another service,
+no request is made and the refusal names the setting. A sign-in that does not carry the right to
+write the account's backup storage sends nothing either, and the person signs in again with that
+right. The record names the service the bundle is kept at, so choosing another sync service later
+does not move the bundle; the kit still points at the service it was made for, and the Account
+sheet says so. A phone shows the setting and offers no recovery.
 
 ## The design system
 

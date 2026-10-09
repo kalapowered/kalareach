@@ -1,14 +1,15 @@
 /**
  * The sync service and recovery, in the Account sheet and on a phone.
  *
- * The sync service is a setting of its own, shown with a way to change it. Recovery is offered on a
- * desktop: it turns on, shows what stops it and what to do about that, settles a write that got no
- * answer, and saves the kit where the platform's dialog put it. The page never holds the seed, the
- * locator or a token, so nothing here can show one.
+ * The sync service is a setting of its own, shown with a way to change it. Recovery is offered on
+ * a desktop: it turns on, shows what stops it and what to do about that, settles a write that got
+ * no answer, and saves the kit where the platform's dialog put it. The page never holds the seed,
+ * the locator or a token, so nothing here can show one. The assertions are on the state each card
+ * reports, the controls it offers and the one fact a person needs (a host), not on whole sentences.
  */
 
 import { describe, expect, it } from 'vitest'
-import { act, render, screen, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
@@ -51,15 +52,23 @@ describe('the sync service setting', () => {
     await person.clear(input)
     await person.type(input, 'http://sync.example')
     await person.click(within(sheet).getByTestId('save-sync-service'))
-    expect(await within(sheet).findByText(/needs an https origin/)).toBeInTheDocument()
+    // The refusal is said in the card's status line, which takes focus, and the choice stands.
+    const status = within(sheet).getByTestId('sync-status')
+    await waitFor(() => {
+      expect(status).toHaveFocus()
+    })
+    expect(status).toHaveTextContent('https')
     expect(within(sheet).getByTestId('sync-service')).toHaveTextContent('reach.kala.to')
+    expect(within(sheet).getByLabelText('Sync service')).toBeInTheDocument()
 
     await person.clear(input)
     await person.type(input, 'https://sync.example/')
     await person.click(within(sheet).getByTestId('save-sync-service'))
-    expect(await within(sheet).findByText('Sync now goes through sync.example.')).toBeInTheDocument()
-    expect(within(sheet).getByTestId('sync-service')).toHaveTextContent('sync.example')
+    await waitFor(() => {
+      expect(within(sheet).getByTestId('sync-service')).toHaveTextContent('sync.example')
+    })
     expect(within(sheet).queryByLabelText('Sync service')).toBeNull()
+    expect(within(sheet).getByTestId('sync-status')).toHaveFocus()
   })
 
   it('is shown on a phone, which offers no recovery', async () => {
@@ -78,27 +87,31 @@ describe('the sync service setting', () => {
 })
 
 describe('recovery', () => {
-  it('turns on, then saves the kit where the dialog put it', async () => {
+  it('turns on, then saves the kit where the dialog put it, with focus on the result each time', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {
       controls.account.set(SIGNED_IN)
     })
     const recovery = await within(sheet).findByTestId('recovery')
-    expect(within(recovery).getByText('Recovery is off.')).toBeInTheDocument()
-    expect(within(recovery).queryByRole('button', { name: 'Save the recovery kit' })).toBeNull()
+    expect(recovery).toHaveAttribute('data-state', 'off')
+    expect(within(recovery).queryByTestId('recovery-save-kit')).toBeNull()
 
     await person.click(within(recovery).getByTestId('recovery-turn-on'))
-    expect(
-      await within(sheet).findByText('Recovery is on. The bundle is kept at reach.kala.to.')
-    ).toBeInTheDocument()
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
     expect(controls.recovery.turnedOn).toBe(1)
-    expect(within(sheet).queryByTestId('recovery-turn-on')).toBeNull()
+    expect(within(recovery).getByTestId('recovery-status')).toHaveTextContent('reach.kala.to')
+    expect(within(recovery).queryByTestId('recovery-turn-on')).toBeNull()
+    // The pressed control is gone, so focus is on the line that says what happened.
+    expect(within(recovery).getByTestId('recovery-status')).toHaveFocus()
 
-    await person.click(within(sheet).getByTestId('recovery-save-kit'))
-    expect(
-      await within(sheet).findByText('Recovery kit saved. Keep it where only you can reach it.')
-    ).toBeInTheDocument()
+    await person.click(within(recovery).getByTestId('recovery-save-kit'))
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-said')).toBeInTheDocument()
+    })
     expect(controls.recovery.kitsSaved).toEqual(['/tmp/kalareach-recovery-kit.txt'])
+    expect(within(recovery).getByTestId('recovery-status')).toHaveFocus()
   })
 
   it('says what stops it, and offers only what mends that', async () => {
@@ -113,20 +126,31 @@ describe('recovery', () => {
       controls.recovery.set({ blocker: { reason: 'signed_out' } })
       controls.account.set({ state: 'signed_out', outcome: 'signed_out' })
     })
-    expect(await within(recovery).findByText(/Sign in to use recovery/)).toBeInTheDocument()
+    expect(await within(recovery).findByTestId('recovery-blocker')).toHaveAttribute(
+      'data-reason',
+      'signed_out'
+    )
     expect(within(recovery).queryByRole('button')).toBeNull()
 
     act(() => {
       controls.recovery.set({ blocker: { reason: 'needs_sign_in' } })
       controls.account.set(SIGNED_IN)
     })
-    expect(await within(recovery).findByText(/Sign in again to allow it/)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-blocker')).toHaveAttribute(
+        'data-reason',
+        'needs_sign_in'
+      )
+    })
     expect(within(recovery).queryByTestId('recovery-turn-on')).toBeNull()
     await person.click(within(recovery).getByTestId('recovery-sign-in'))
     expect(controls.recovery.signedInForRecovery).toBe(1)
     act(() => {
       controls.account.finishSignIn({ ...SIGNED_IN, generation: 'bbbb' })
       controls.recovery.set({ blocker: null })
+    })
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-turn-on')).toBeInTheDocument()
     })
 
     act(() => {
@@ -135,29 +159,74 @@ describe('recovery', () => {
       })
       controls.account.set({ ...SIGNED_IN, generation: 'cccc' })
     })
-    const words = await within(recovery).findByTestId('recovery-blocker')
-    expect(words).toHaveTextContent(
-      'The sync service setting names sync.example, which is not the service this device is signed in to (reach.kala.to)'
-    )
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-blocker')).toHaveAttribute(
+        'data-reason',
+        'wrong_service'
+      )
+    })
+    // Both services are named, so the person knows which setting to change and to what.
+    const words = within(recovery).getByTestId('recovery-blocker')
+    expect(words).toHaveTextContent('sync.example')
+    expect(words).toHaveTextContent('reach.kala.to')
     expect(within(recovery).queryByRole('button')).toBeNull()
   })
 
-  it('settles a write that got no answer, and asks nothing else of the person first', async () => {
+  it('settles a write that got no answer, and offers no kit until it is settled', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {
       controls.recovery.set({ state: 'unsettled', kept_at: 'reach.kala.to' })
       controls.account.set(SIGNED_IN)
     })
     const recovery = await within(sheet).findByTestId('recovery')
-    expect(
-      await within(recovery).findByText(/got no answer, so it is not known whether it landed/)
-    ).toBeInTheDocument()
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'unsettled')
+    })
     expect(within(recovery).queryByTestId('recovery-save-kit')).toBeNull()
     await person.click(within(recovery).getByTestId('recovery-settle'))
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
     expect(controls.recovery.settled).toBe(1)
-    expect(
-      await within(sheet).findByText('Recovery is on. The bundle is kept at reach.kala.to.')
-    ).toBeInTheDocument()
+  })
+
+  it('says that a bundle stays where it was made when another sync service is chosen', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    expect(within(recovery).queryByTestId('recovery-stays-at')).toBeNull()
+
+    await person.click(within(sheet).getByTestId('change-sync-service'))
+    const input = within(sheet).getByLabelText('Sync service')
+    await person.clear(input)
+    await person.type(input, 'https://sync.example')
+    await person.click(within(sheet).getByTestId('save-sync-service'))
+    const stays = await within(recovery).findByTestId('recovery-stays-at')
+    expect(stays).toHaveTextContent('reach.kala.to')
+    expect(recovery).toHaveAttribute('data-state', 'on')
+  })
+
+  it('says when recovery cannot be read, and asks again on request', async () => {
+    const { person, controls, sheet } = await openSheet()
+    controls.recovery.failReads('this computer’s recovery record could not be read')
+    act(() => {
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    expect(await within(recovery).findByTestId('recovery-problem')).toHaveTextContent(
+      'recovery record could not be read'
+    )
+    expect(within(recovery).queryByTestId('recovery-turn-on')).toBeNull()
+
+    controls.recovery.failReads(null)
+    await person.click(within(recovery).getByRole('button', { name: 'Try again' }))
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'off')
+    })
+    expect(within(recovery).queryByTestId('recovery-problem')).toBeNull()
   })
 
   it('names nothing to buy in any state', async () => {
@@ -167,7 +236,10 @@ describe('recovery', () => {
         controls.recovery.set({ state, kept_at: state === 'off' ? null : 'reach.kala.to' })
         controls.account.set({ ...SIGNED_IN, generation: state })
       })
-      await within(sheet).findByTestId('recovery')
+      const recovery = await within(sheet).findByTestId('recovery')
+      await waitFor(() => {
+        expect(recovery).toHaveAttribute('data-state', state)
+      })
       const text = (sheet.textContent ?? '').toLowerCase()
       for (const word of PURCHASE_WORDS) {
         expect(text, `${state}: ${word}`).not.toContain(word)
