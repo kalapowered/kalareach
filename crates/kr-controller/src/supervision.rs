@@ -1063,6 +1063,159 @@ pub(crate) fn kill_unit(
     }
 }
 
+/// The service this host started that a process is in, when it is in one: the label of its
+/// transient unit and the reservation it was started for.
+///
+/// Read from the process's control group, which names the service the manager runs it in. A
+/// process in any other control group, or on a platform without them, is in none.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn host_started_service_of(pid: u32) -> Option<HostStartedService> {
+    let path = kr_ipc::identity::control_group_of(pid)?;
+    let leaf = path.rsplit('/').next()?;
+    let label = leaf.strip_suffix(".service")?;
+    SERVICE_LABEL_PREFIXES.iter().find_map(|prefix| {
+        let reservation_id: ReservationId = label.strip_prefix(prefix)?.parse().ok()?;
+        (format!("{prefix}{reservation_id}") == label).then(|| HostStartedService {
+            unit: leaf.to_owned(),
+            path: path.clone(),
+            worker: *prefix == SERVICE_LABEL_PREFIXES[0],
+            reservation_id,
+        })
+    })
+}
+
+/// A transient service this host started, and where it runs.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostStartedService {
+    /// The unit's name, `<label>.service`.
+    pub unit: String,
+    /// Its control group's path in the unified hierarchy.
+    pub path: String,
+    /// Whether it is a session's worker, and not a plugin host.
+    pub worker: bool,
+    /// The reservation it was started for.
+    pub reservation_id: ReservationId,
+}
+
+/// Moves this process, a control daemon a command started with `--own-session`, out of the service
+/// of a session when it was started inside one, so that the end of that service does not end it.
+///
+/// A command run by a session's shell starts its daemon as a child of the shell, which puts the
+/// daemon in the session's transient service: `setsid` changes the session and the process group
+/// and not the control group, and the manager's end of the service ends every process in it. The
+/// platform's way out is a transient scope of the daemon's own, which installs nothing, keeps
+/// nothing and takes no privilege (section 7 names a transient user unit or scope). It is taken only
+/// when the daemon's control group is a service this host started and the user manager answers
+/// about that very unit; anywhere else this does nothing and the daemon starts where it is.
+///
+/// The process replaces itself by `systemd-run --user --scope`, which makes the scope for its own
+/// process and then runs the daemon in that same process: the number, the parent, the session, the
+/// working directory and the first three descriptors stay what they were, so the command that
+/// started the daemon still holds the right child. The release hold is taken again by the new image
+/// as every start takes it. The daemon's arguments are passed as they are, `--own-session`
+/// included, because an update restarts a daemon with the arguments it was started with; the new
+/// image does not run this again, since it then leads its session and is in a scope.
+///
+/// On systemd from 254 the scope's command line is passed with environment expansion off: the
+/// default turned on for scopes in 258, and the arguments are paths the daemon must be given as they
+/// are.
+///
+/// Returns only when the process was not moved, with why when something failed on the way. Every
+/// call it makes of the manager is bounded, and the scope request itself has no bound of its own:
+/// a manager that takes the request and never finishes it leaves the process waiting as
+/// `systemd-run`, and the command that started it reports a daemon that did not answer.
+#[cfg(target_os = "linux")]
+pub fn leave_the_service_it_started_in() -> Option<String> {
+    use std::os::unix::process::CommandExt as _;
+
+    let service = host_started_service_of(std::process::id())?;
+    // The manager that answers must be the one that holds this unit: it says this process's
+    // control group is the unit's.
+    match command_within(
+        "systemctl",
+        &[
+            "--user",
+            "show",
+            "--property=ControlGroup",
+            "--value",
+            &service.unit,
+        ],
+        SERVICE_MANAGER_BOUND,
+    ) {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == service.path => {}
+        Ok(output) => {
+            return Some(format!(
+                "the user's service manager does not hold {} as this process's control group: {}",
+                service.unit,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(failure) => return Some(failure.detail()),
+    }
+    // One tool: the one whose version is read is the one that is run.
+    let Some(tool) = program_on_the_path("systemd-run") else {
+        return Some("systemd-run is not on the search path".to_owned());
+    };
+    let tool_name = tool.display().to_string();
+    let version = match command_within(&tool_name, &["--version"], SERVICE_MANAGER_BOUND) {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|word| word.parse::<u32>().ok()),
+        Ok(output) => {
+            return Some(format!(
+                "{tool_name} --version: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(failure) => return Some(failure.detail()),
+    };
+    let Some(version) = version else {
+        return Some(format!("the version {tool_name} reports could not be read"));
+    };
+    let image = match kr_ipc::install::image_path() {
+        Ok(image) => image,
+        Err(error) => {
+            return Some(format!(
+                "this program's own path could not be read: {error}"
+            ));
+        }
+    };
+    let mut command = std::process::Command::new(&tool);
+    command.args(["--user", "--scope", "--quiet", "--collect"]);
+    if version >= 254 {
+        command.arg("--expand-environment=no");
+    }
+    command
+        .arg(format!(
+            "--unit={}",
+            kr_ipc::identity::daemon_scope_name(kr_ipc::new_uuid())
+        ))
+        .arg("--")
+        .arg(image)
+        .args(std::env::args_os().skip(1));
+    // Returns only when the program could not be run.
+    let error = command.exec();
+    Some(format!("{tool_name} could not be run: {error}"))
+}
+
+/// The first executable file called `name` on the search path.
+#[cfg(target_os = "linux")]
+fn program_on_the_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|about| about.is_file() && about.permissions().mode() & 0o111 != 0)
+        })
+}
+
 /// The fallback supervisor: a detached process in its own process group.
 ///
 /// This is what a non-systemd Unix host uses, and what a macOS host without a GUI bootstrap domain
@@ -1088,7 +1241,11 @@ impl WorkerSupervisor for DetachedSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
         // A worker is given the selected desktop's own handles; nothing else this supervisor
         // starts belongs to a login session, so nothing else is given any.
-        self.spawn(&launch.service(), &launch.desktop_environment)
+        self.spawn(
+            &launch.service(),
+            &launch.desktop_environment,
+            Leads::ItsOwnSession,
+        )
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {

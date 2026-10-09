@@ -549,6 +549,46 @@ impl Controller {
         })
     }
 
+    /// The check that says where this daemon runs, when that is inside a service this host started.
+    ///
+    /// A daemon a command of a session started is in that session's service and ends with it, and
+    /// so do the sessions and the plugin runtime it starts through the detached start. The daemon
+    /// moves out of the service into a scope of its own wherever it can; one that is still in a
+    /// service did not, and this says what it found, not why. A daemon anywhere else has nothing to
+    /// say.
+    #[cfg(target_os = "linux")]
+    fn control_group_check(&self) -> Option<DoctorCheck> {
+        let service = crate::supervision::host_started_service_of(std::process::id())?;
+        use crate::supervision::WorkerSupervisor as _;
+
+        let detached =
+            self.supervisor.describe() == crate::supervision::DetachedSupervisor::new().describe();
+        let mut found = Sentence::new()
+            .stated("this daemon runs in the control group of the service of ")
+            .stated(if service.worker {
+                "the worker of session reservation "
+            } else {
+                "the plugin host of reservation "
+            })
+            .identifier(&service.reservation_id)
+            .stated(", which a command of this host started it from; ending that service ends this daemon");
+        if detached {
+            found = found.stated(
+                ", and the sessions and the plugin runtime it starts, which run in the same service",
+            );
+        }
+        Some(DoctorCheck::new(
+            "daemon-control-group",
+            "This daemon does not end with a session's service",
+            DoctorStatus::Warning,
+            found,
+            Some(
+                "Stop this daemon and run kr new again where the user's service manager answers, \
+                 or choose the service start with kr host startup --set service.",
+            ),
+        ))
+    }
+
     pub(super) async fn host_doctor(self: &Arc<Self>) -> Result<HostDoctorResult> {
         let mut checks = Vec::new();
         checks.push(DoctorCheck::new(
@@ -571,6 +611,8 @@ impl Controller {
             Sentence::new().stated(self.supervisor.describe()),
             None,
         ));
+        #[cfg(target_os = "linux")]
+        checks.extend(self.control_group_check());
         let directory = self.directory.lock().await;
         let quarantined = directory.quarantined.len();
         let verified = directory.verified.len();
