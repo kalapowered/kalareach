@@ -233,7 +233,7 @@ export function App(): ReactNode {
           setAccountOpen(false)
         }}
       >
-        <AccountPanel account={account} surface="desktop" />
+        <AccountPanel account={account} port={port} surface="desktop" />
       </Sheet>
 
       <Toast message={toast} onDismiss={dismissToast} />
