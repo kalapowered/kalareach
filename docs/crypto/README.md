@@ -8,7 +8,7 @@ calls a maintained library, and the libraries are the ones below.
 
 | What | Implementation |
 | --- | --- |
-| `crypto_box_easy`, Ed25519, X25519 agreement (`crypto_scalarmult`), `crypto_secretstream_xchacha20poly1305`, XChaCha20-Poly1305, `crypto_kdf`, the CSPRNG | libsodium, through the pinned `libsodium-sys-stable` binding, which builds the C library from source |
+| `crypto_box_easy`, Ed25519, X25519 agreement (`crypto_scalarmult`), `crypto_secretstream_xchacha20poly1305`, XChaCha20-Poly1305, `crypto_kdf`, the CSPRNG | libsodium, through the pinned `libsodium-sys-stable` binding |
 | HKDF-SHA256, HMAC-SHA256, SHA-256 | the maintained RustCrypto `hkdf`, `hmac` and `sha2` crates |
 | Canonical encoding and digests | `crates/kr-cbor`, over the RustCrypto `sha2` crate |
 | Wire shapes | `crates/kr-protocol` |

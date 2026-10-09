@@ -279,12 +279,6 @@ jobs:
           rustc --version
           cargo --version
 
-      # libsodium's prebuilt libraries come from the files this places, not from a download in the
-      # middle of the compile.
-      - name: Place libsodium's archives
-        timeout-minutes: 15
-        uses: ./.github/actions/libsodium-archive
-
       # The report reads the TypeScript tests with the packages' own compiler here too, to list them
       # as not run on this platform.
       - name: Install pnpm
@@ -317,6 +311,12 @@ jobs:
         timeout-minutes: 15
         shell: bash
         run: bash scripts/build-plugin-fixtures.sh
+
+      # libsodium's prebuilt libraries come from the files this places, not from a download in the
+      # middle of the compile.
+      - name: Place libsodium's archives
+        timeout-minutes: 15
+        uses: ./.github/actions/libsodium-archive
 
       # The suites qualified on Windows, as the landing workflow's Windows job runs them, started
       # from PowerShell as they are there: a POSIX shell's runtime would enable privileges in their

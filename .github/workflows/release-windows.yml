@@ -160,10 +160,13 @@ jobs:
           cargo --version
 
       # libsodium's prebuilt libraries come from files this places, not from a download in the
-      # middle of the compile. The crate's build script checks both against libsodium's public key,
-      # as it does for a download.
+      # middle of the compile. The crate's build script checks both archives against libsodium's
+      # public key, as it does for a download. This job signs what it builds, so it restores no
+      # cache that another job could have written: the files come from libsodium's host.
       - name: Place libsodium's archives
         uses: ./.github/actions/libsodium-archive
+        with:
+          restore: 'false'
 
       # What this release is, settled before anything is built, and on a tag held to the tag. A host
       # tag is `host/v<version>+<first twelve characters of the commit>`, so it names both the
