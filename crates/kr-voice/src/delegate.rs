@@ -2125,9 +2125,10 @@ pub fn narrower_history(
 /// provider's transcript wrote, so they are content and never authority: the grant is what permits
 /// the effect, and this confirmation is the extra thing section 15 ¶13 asks for on top of it.
 ///
-/// An apostrophe is no part of a word, however it is written, so a contraction of "not" is one
-/// word ("don't", "don’t" and "dont" are the same) and the refusing words hold every one of
-/// them.
+/// A contraction of "not" refuses by its form: a word with "n't" in it, whichever mark the
+/// transcript writes for the apostrophe, is a refusal ("won't", "shan't", "wouldn't've"). A
+/// transcript that leaves the apostrophe out writes "wont", and the refusing words hold the forms
+/// that are then written (a closed list, which a form such as "want" cannot be told from).
 fn is_clear_affirmative(spoken: &str) -> bool {
     /// Words that agree.
     const AGREEING: &[&str] = &[
@@ -2150,8 +2151,8 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "proceed",
         "please",
     ];
-    /// Words that refuse, whatever else is in the sentence, with the contractions of "not" written
-    /// without the apostrophe.
+    /// Words that refuse, whatever else is in the sentence. The contractions of "not" are here as
+    /// they are written without an apostrophe.
     const REFUSING: &[&str] = &[
         "no",
         "not",
@@ -2160,10 +2161,17 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "didnt",
         "wont",
         "wouldnt",
+        "wouldntve",
         "cant",
         "cannot",
         "couldnt",
+        "couldntve",
         "shouldnt",
+        "shouldntve",
+        "shant",
+        "oughtnt",
+        "darent",
+        "maynt",
         "mustnt",
         "mightnt",
         "neednt",
@@ -2184,14 +2192,10 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "nevermind",
     ];
 
-    // A transcript writes the apostrophe straight, curly or modified; none of them is part of a
-    // word.
-    let spoken: String = spoken
-        .chars()
-        .filter(|character| !matches!(character, '\'' | '\u{2018}' | '\u{2019}' | '\u{02bc}' | '`'))
-        .collect();
+    // A transcript writes the apostrophe straight, curly, modified or as an accent; each is one
+    // mark here, and part of its word.
     let mut words = spoken
-        .split(|character: char| !character.is_alphanumeric())
+        .split(|character: char| !(character.is_alphanumeric() || is_apostrophe(character)))
         .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
         .peekable();
@@ -2200,14 +2204,27 @@ fn is_clear_affirmative(spoken: &str) -> bool {
     }
     let mut agrees = false;
     for word in words {
-        if REFUSING.contains(&word.as_str()) {
+        let bare: String = word
+            .chars()
+            .filter(|character| !is_apostrophe(*character))
+            .collect();
+        let negated = word.replace(is_apostrophe, "'").contains("n't");
+        if negated || REFUSING.contains(&bare.as_str()) {
             return false;
         }
-        if AGREEING.contains(&word.as_str()) {
+        if AGREEING.contains(&bare.as_str()) {
             agrees = true;
         }
     }
     agrees
+}
+
+/// Whether `character` is a mark a transcript writes for an apostrophe.
+const fn is_apostrophe(character: char) -> bool {
+    matches!(
+        character,
+        '\'' | '\u{2018}' | '\u{2019}' | '\u{02bc}' | '`' | '\u{00b4}' | '\u{2032}' | '\u{ff07}'
+    )
 }
 
 /// How far a provider's offset may fall outside this host's reading of the call's length.
@@ -2300,6 +2317,15 @@ mod tests {
             "dont send it",
             "wont send it",
             "send it, shouldn't we?",
+            "I shan't send it",
+            "you oughtn't send it",
+            "I wouldn't've said send",
+            "I won\u{00b4}t send it",
+            "I won\u{2032}t send it",
+            "I daren't send it",
+            "she mayn't, but send",
+            "I can't've sent it, so send",
+            "I usedn't send it",
         ] {
             assert!(!is_clear_affirmative(refusal), "{refusal:?}");
         }

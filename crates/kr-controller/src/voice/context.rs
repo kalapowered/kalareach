@@ -180,8 +180,8 @@ pub trait SessionFacts: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns an error when the host's records cannot be read, which is no number and is not
-    /// the answer for a session without one.
+    /// Returns an error when the host's records cannot be read. A failed read is not a number, and
+    /// it is not the answer for a session without one.
     fn display_number<'a>(&'a self, session_id: SessionId) -> VoiceFuture<'a, Option<u64>>;
 
     /// The state of privacy mode as it stands now, which a reading is noted under before it is
