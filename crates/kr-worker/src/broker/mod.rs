@@ -77,6 +77,7 @@ pub mod profiles;
 pub mod semantic;
 pub mod tokens;
 pub mod volatile;
+pub mod websocket;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
