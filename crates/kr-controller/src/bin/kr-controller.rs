@@ -92,9 +92,30 @@ impl From<SecretStoreChoice> for StoreSelection {
 }
 
 fn main() -> ExitCode {
-    // First, before anything is read or started: a daemon of an installed release holds that
-    // release for as long as it runs, which covers the workers it starts from it until each holds
-    // the release itself, and does not start at all once the release is being removed.
+    let arguments = Arguments::parse();
+    // Before any thread exists, and before the release is held, which can take a while: a session is
+    // the calling process's to leave, and nothing the terminal does may reach the daemon from here
+    // on. A process that already leads its session is the image a start replaced itself with
+    // below, and has nothing to leave.
+    #[cfg(unix)]
+    if arguments.own_session
+        && !rustix::process::getsid(None).is_ok_and(|session| session == rustix::process::getpid())
+    {
+        if let Err(error) = rustix::process::setsid() {
+            eprintln!("kr-controller: could not start a session of its own: {error}");
+            return ExitCode::FAILURE;
+        }
+        // Started by a command of a session, the daemon is in that session's service, and the end
+        // of the service would end it. This replaces the process with itself in a scope of its own
+        // where the platform lets it, and returns only when it stays.
+        #[cfg(target_os = "linux")]
+        if let Some(why) = kr_controller::supervision::leave_the_service_it_started_in() {
+            eprintln!("kr-controller: stays in the service it was started in: {why}");
+        }
+    }
+    // Before anything is read or started: a daemon of an installed release holds that release for
+    // as long as it runs, which covers the workers it starts from it until each holds the release
+    // itself, and does not start at all once the release is being removed.
     let running = match kr_ipc::install::this_process() {
         Ok(running) => running,
         Err(error) => {
@@ -102,16 +123,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let arguments = Arguments::parse();
-    // Before any thread exists: a session is the calling process's to leave, and nothing the
-    // terminal does may reach the daemon from here on.
-    #[cfg(unix)]
-    if arguments.own_session
-        && let Err(error) = rustix::process::setsid()
-    {
-        eprintln!("kr-controller: could not start a session of its own: {error}");
-        return ExitCode::FAILURE;
-    }
     if arguments.starter {
         return starter(&arguments);
     }
