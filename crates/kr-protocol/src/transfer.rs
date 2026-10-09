@@ -520,8 +520,9 @@ impl InsertionMethod {
 
     /// Returns true when this method needs the agent to read the file from the filesystem.
     ///
-    /// Only these require an [`AttachmentReadGrant`]. A typed submission hands the bytes upstream
-    /// and needs no readable path at all.
+    /// Only these are given an [`AttachmentReadGrant`] when the attachment is added to a draft. A
+    /// typed submission is given one when an offer claims the attachment, and the request that
+    /// carries the offer names the grant's path.
     #[must_use]
     pub const fn needs_read_grant(self) -> bool {
         matches!(

@@ -9,9 +9,9 @@
 //! action is for; the daemon looks for the draft among that actor's.
 //!
 //! The claim and the report name an owner, which is the action the offer was made for. A repeat of
-//! a claim by its owner is answered with the same claim, so a reply that was lost does not leave a
-//! binding that nothing owns; a report names the owner it was claimed by, so a worker that did not
-//! claim a binding cannot settle it.
+//! a claim by its owner is answered with the same grant and the draft as it now stands, so a reply
+//! that was lost does not leave a binding that nothing owns; a report names the owner it was claimed
+//! by, so a worker that did not claim a binding cannot settle it.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
