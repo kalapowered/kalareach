@@ -30,6 +30,15 @@ check(handWrittenNativeSources.isDirectory) {
     "The application's hand-written Android sources are not at $handWrittenNativeSources"
 }
 
+/**
+ * The tests of those sources that need an Android device: the voice call against a peer in the same
+ * process. Checked for the same reason as the sources are.
+ */
+val handWrittenNativeDeviceTests = file("../../../../native/android/android/src/androidTest/kotlin")
+check(handWrittenNativeDeviceTests.isDirectory) {
+    "The application's hand-written Android device tests are not at $handWrittenNativeDeviceTests"
+}
+
 android {
     compileSdk = 36
     // Android 15 and later run with 16 KB memory pages, and a library linked for 4 KB pages is
@@ -44,6 +53,7 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
         getByName("debug") {
@@ -74,6 +84,7 @@ android {
     }
     sourceSets {
         getByName("main").java.srcDir(handWrittenNativeSources)
+        getByName("androidTest").java.srcDir(handWrittenNativeDeviceTests)
     }
 }
 
@@ -106,6 +117,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-process:2.10.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
+    androidTestImplementation("androidx.test:runner:1.5.2")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
 }
 
