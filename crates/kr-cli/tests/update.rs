@@ -10279,8 +10279,9 @@ const ACCEPTED_FOR_CONFIGURATION: [AcceptedLimit; 2] = [
             that holds the change to fail closed over a document it cannot read then creates no new \
             session until the document is put right. Each release before the first that holds it \
             reads the document with the product defaults: descriptions on, the platform's worker \
-            profile, no proxy and no network, and a restriction that only the document holds is not \
-            applied. An update to a release that reads the version restores every setting.",
+            profile, no proxy and no network. A restriction that only the unreadable document holds \
+            is not applied by any release. An update to a release that reads the version restores \
+            every setting.",
     },
     AcceptedLimit {
         what: "a daemon of an environment the update could not reach writes the configuration of its own release",
@@ -10469,8 +10470,8 @@ fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_whi
     );
     for limit in &ACCEPTED_FOR_CONFIGURATION {
         assert!(
-            COMMAND_WRITTEN.contains(&limit.record) && !limit.statement.is_empty(),
-            "{}: a limit is accepted for a record a command writes, and stated",
+            limit.record == "configuration" && !limit.statement.is_empty(),
+            "{}: a limit is accepted for the configuration document only, and stated",
             limit.what
         );
     }
