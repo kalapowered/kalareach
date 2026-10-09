@@ -148,6 +148,9 @@ class VoiceCallControl(
     fun permit(voiceSessionId: String, closesAtEpochMs: Long): Boolean =
         entered {
             if (stopped || asked != null || gate.current != null) return false
+            // Before the provider's answer is applied there is no call to open the microphone for.
+            // Nothing changes, so the same answer is taken once the provider's is.
+            if (!platform.answerApplied()) return false
             val now = platform.nowMs()
             val remaining = closesAtEpochMs - platform.epochMs()
             if (remaining <= 0) {

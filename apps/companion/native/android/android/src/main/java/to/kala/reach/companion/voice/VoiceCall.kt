@@ -21,6 +21,7 @@ import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.audio.JavaAudioDeviceModule
+import to.kala.reach.companion.mobile.VoiceAnswer
 import to.kala.reach.companion.mobile.VoiceCallControl
 import to.kala.reach.companion.mobile.VoiceCallPlatform
 import to.kala.reach.companion.mobile.VoiceCaptureState
@@ -41,7 +42,9 @@ import java.util.concurrent.atomic.AtomicLong
  * without passing through the interface or through KalaReach.
  *
  * Section 15 paragraph 6 is the other constraint: the provider's data channel is read-only. This
- * connection creates no channel of its own and sends zero bytes on the one the provider opens.
+ * connection creates the one channel the provider's protocol names, `oai-events`, before it makes
+ * the offer, because the offer has to describe it and the provider writes to it, and it sends zero
+ * bytes on that channel or on any other.
  *
  * Every decision about the microphone is [VoiceCallControl]'s; this class carries them out. The
  * platform's recorder is held off from the moment the connection exists, before anything is
@@ -77,6 +80,19 @@ class VoiceCall private constructor(
     private var connection: PeerConnection? = null
     private var microphone: AudioTrack? = null
     private var announcedFirstAudio = false
+
+    /** The provider's events channel, which this end creates before the offer and only reads. */
+    private var events: DataChannel? = null
+
+    /** Counted down when the first round of candidate gathering reports itself done. */
+    private val gathered = CountDownLatch(1)
+
+    /** Whether the provider's answer to the offer has been applied, and what it was read to say. */
+    @Volatile
+    private var answerDtx: Boolean? = null
+
+    @Volatile
+    private var answerApplied = false
     private var routeCallback: AudioDeviceCallback? = null
     private var audioDeviceOn: Boolean? = null
 
@@ -159,9 +175,31 @@ class VoiceCall private constructor(
     val isPlaybackMuted: Boolean
         get() = control.isPlaybackMuted
 
+    /** Whether the provider's answer to the offer has been applied to the connection. */
+    val answerIsApplied: Boolean
+        get() = answerApplied
+
+    /**
+     * Whether the provider's answer turns Opus discontinuous transmission on (`usedtx=1`), which
+     * stops the stream during silence. Null until the answer is applied.
+     */
+    val answerUsesDtx: Boolean?
+        get() = answerDtx
+
     companion object {
         /** How long a description may take to be created or applied before the call is closed. */
         private const val DESCRIPTION_TIMEOUT_SECONDS = 30L
+
+        /** The label the provider's protocol gives the channel its events arrive on. */
+        const val EVENTS_LABEL = "oai-events"
+
+        /**
+         * The longest the offer waits for candidate gathering to report itself done, in seconds.
+         *
+         * Gathering is continual, and nothing promises it ever reports done, so the wait is
+         * bounded: a device that has gathered nothing by then offers what it has.
+         */
+        const val GATHERING_BOUND_SECONDS = 3L
 
         private val calls = AtomicLong()
 
@@ -214,6 +252,11 @@ class VoiceCall private constructor(
             made.setAudioPlayout(false)
             audioDeviceOn = false
             connection = made
+            // Before any offer exists: an offer made first would not describe the channel, and the
+            // provider writes its events to this one.
+            events = made.createDataChannel(EVENTS_LABEL, DataChannel.Init())
+                ?.also { readOnly(it) }
+                ?: throw IllegalStateException("this device could not open the provider's event channel")
             val source = factory.createAudioSource(MediaConstraints())
             // Off until the control turns it on. The offer describes a track, and a described
             // track carries nothing until the control lets it.
@@ -252,7 +295,9 @@ class VoiceCall private constructor(
      * Makes this call's SDP offer.
      *
      * Section 15 paragraph 3: the client creates the offer. The host forwards it and never
-     * generates one.
+     * generates one. The offer is returned after the first round of candidate gathering, or after
+     * [GATHERING_BOUND_SECONDS], so that it names the addresses this device can be reached at: the
+     * provider is answered once, and a candidate found later is not sent.
      */
     fun offer(): String {
         val constraints = MediaConstraints().apply {
@@ -262,14 +307,20 @@ class VoiceCall private constructor(
         val open = openConnection()
         val made = awaitDescription { observer -> open.createOffer(observer, constraints) }
         awaitSet { observer -> open.setLocalDescription(observer, made) }
-        return made.description
+        gathered.await(GATHERING_BOUND_SECONDS, TimeUnit.SECONDS)
+        return open.localDescription?.description ?: made.description
     }
 
-    /** Applies the provider's SDP answer. It starts nothing: the recorder stays off until [permit]. */
+    /**
+     * Applies the provider's SDP answer. It starts nothing: the recorder stays off until [permit],
+     * and a permit before this has applied the answer is refused.
+     */
     fun accept(answerSdp: String) {
         val answer = SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
         val open = openConnection()
         awaitSet { observer -> open.setRemoteDescription(observer, answer) }
+        answerDtx = VoiceAnswer.usesDtx(answerSdp)
+        answerApplied = true
     }
 
     /** The connection, when the call is still open. */
@@ -352,7 +403,7 @@ class VoiceCall private constructor(
 
         override fun epochMs(): Long = System.currentTimeMillis()
 
-        override fun answerApplied(): Boolean = true
+        override fun answerApplied(): Boolean = answerIsApplied
 
         override fun acquireFocus(): Boolean = audioSession.activate()
 
@@ -398,6 +449,11 @@ class VoiceCall private constructor(
                 routeCallback = null
                 held
             }
+            events?.also {
+                it.unregisterObserver()
+                it.dispose()
+            }
+            events = null
             // Cleared only if this call is the one published: a call that was already replaced
             // must not take its replacement's place in the holder with it.
             VoiceCallHolder.claimStopped(this@VoiceCall)
@@ -435,21 +491,24 @@ class VoiceCall private constructor(
         }
     }
 
+    /** Reads a channel and writes nothing to it. */
+    private fun readOnly(channel: DataChannel) {
+        channel.registerObserver(object : DataChannel.Observer {
+            override fun onBufferedAmountChange(previous: Long) {}
+            override fun onStateChange() {}
+            override fun onMessage(buffer: DataChannel.Buffer) {
+                val bytes = ByteArray(buffer.data.remaining())
+                (buffer.data as ByteBuffer).get(bytes)
+                // Handed up as bytes. What is a known event is decided by the frozen provider
+                // profile, one level above this file, and an unknown one is dropped there.
+                observer.onProviderEvent(bytes)
+            }
+        })
+    }
+
     private inner class PeerObserver : PeerConnection.Observer {
-        override fun onDataChannel(channel: DataChannel) {
-            // The provider opened its channel. This end reads it and never writes to it.
-            channel.registerObserver(object : DataChannel.Observer {
-                override fun onBufferedAmountChange(previous: Long) {}
-                override fun onStateChange() {}
-                override fun onMessage(buffer: DataChannel.Buffer) {
-                    val bytes = ByteArray(buffer.data.remaining())
-                    (buffer.data as ByteBuffer).get(bytes)
-                    // Handed up as bytes. What is a known event is decided by the frozen provider
-                    // profile, one level above this file, and an unknown one is dropped there.
-                    observer.onProviderEvent(bytes)
-                }
-            })
-        }
+        // A channel the provider opened. This end reads it and never writes to it.
+        override fun onDataChannel(channel: DataChannel) = readOnly(channel)
 
         override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {
             if (receiver.track() !is AudioTrack) return
@@ -463,7 +522,9 @@ class VoiceCall private constructor(
         override fun onSignalingChange(state: PeerConnection.SignalingState) {}
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {}
         override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {}
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+            if (state == PeerConnection.IceGatheringState.COMPLETE) gathered.countDown()
+        }
         override fun onIceCandidate(candidate: org.webrtc.IceCandidate) {}
         override fun onIceCandidatesRemoved(candidates: Array<out org.webrtc.IceCandidate>) {}
         override fun onAddStream(stream: MediaStream) {}
