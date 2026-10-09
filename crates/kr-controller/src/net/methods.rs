@@ -252,12 +252,6 @@ impl Controller {
                 {
                     return Err(crate::grants::continuity_lost());
                 }
-                // An invitation proposes only access this host can answer for. A requirement the
-                // host cannot honour is refused before anyone is asked to confirm it.
-                if let ConfirmationSubject::IssueInvitation { proposed_grant, .. } = &params.subject
-                {
-                    self.check_organisation_proposal(proposed_grant)?;
-                }
                 if matches!(params.subject, ConfirmationSubject::EstablishClock) {
                     let owner = Arc::clone(&self.owner);
                     let on_the_network = self.network_guard().is_some();
@@ -278,6 +272,21 @@ impl Controller {
                     .await;
                 }
                 let pairing = self.pairing_service()?;
+                // An invitation proposes only access this host can answer for. A requirement the
+                // host cannot honour is refused before anyone is asked to confirm it, and only to
+                // the owner: what it refuses with says whether this host is enrolled in a named
+                // organisation, and at which revision.
+                if let ConfirmationSubject::IssueInvitation { proposed_grant, .. } = &params.subject
+                {
+                    let controller = Arc::clone(self);
+                    let proposed_grant = proposed_grant.clone();
+                    return blocking(move || {
+                        pairing.require_owner(&caller)?;
+                        controller.check_organisation_proposal(&proposed_grant)?;
+                        pairing.request_confirmation(&caller, &params, action, admission.as_ref())
+                    })
+                    .await;
+                }
                 // An organisation's enrolment is described by this host's policy: the chain is
                 // verified first, and an owner is shown the keys it pins.
                 if let ConfirmationSubject::EnrolOrganisation(enrol) = &params.subject {
@@ -330,12 +339,17 @@ impl Controller {
             Method::PairInvite => {
                 let pairing = self.pairing_service()?;
                 let params: PairInviteParams = decode(&mutation.params)?;
-                self.check_organisation_proposal(&params.proposed_grant)?;
                 let network_config = self
                     .network_guard()
                     .ok_or_else(not_on_network)?
                     .network_config()?;
+                let controller = Arc::clone(self);
                 blocking(move || {
+                    // The owner's alone, as the request for the confirmation is: the check is made
+                    // here as well because a confirmation covers the invitation's digest and not
+                    // what this host can answer for.
+                    pairing.require_owner(&caller)?;
+                    controller.check_organisation_proposal(&params.proposed_grant)?;
                     pairing.invite(&caller, &params, action, network_config, &admission)
                 })
                 .await
