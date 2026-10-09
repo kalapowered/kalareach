@@ -1115,6 +1115,43 @@ impl RemoteConnection {
                 });
                 settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
+            // A device presenting the lease its organisation signed for it: the daemon's own
+            // effect, on this device's standing and nothing else. The action claims its route like
+            // every other, so one identifier is one request per actor. The lease is installed and
+            // the fence it may owe published on a task that outlives this connection, so a
+            // connection that ends does not cut a presentation between its policy write and its
+            // fence; the device that was not answered presents the same lease again.
+            Method::MembershipPresent => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                if self.controller.clock.now() >= accepted.deadline {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "the deadline this action was admitted under passed before it could \
+                             run",
+                        ),
+                    );
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let device_id = self.device.device_id;
+                let proven_key = self.device.authorisation;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let effect = tokio::spawn(async move {
+                    controller
+                        .membership_present(device_id, &proven_key, &mutation, carried)
+                        .await
+                });
+                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
+            }
             Method::DevicePreviewKeyUpdate => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());

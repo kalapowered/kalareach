@@ -28,10 +28,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease, PolicyAuthority};
+use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, PolicyAuthority};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{Grant, GrantExpiry};
 use kr_protocol::ids::{AccountId, AuthorityRevision, DeviceId, OrganisationId};
+use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet};
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
@@ -1001,35 +1002,6 @@ impl HostPolicy {
             .get(&(organisation_id, account_id.clone(), *device_key))
     }
 
-    /// The lease installed for one member's device, when it is in force at both readings: before
-    /// its continuous deadline at `now`, and inside its signed window at `utc_ms`, this host's
-    /// reading of UTC through its floor.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MembershipRefusal::NoLease`] when this host holds no lease for that device in that
-    /// organisation, and [`MembershipRefusal::LeaseExpired`] when the one it holds has ended on
-    /// either clock.
-    pub fn lease_in_force(
-        &self,
-        organisation_id: OrganisationId,
-        account_id: &AccountId,
-        device_key: &AuthorisationKey,
-        now: ContinuousInstant,
-        utc_ms: u64,
-    ) -> std::result::Result<&MembershipLease, MembershipRefusal> {
-        let installed = self
-            .enrolments
-            .get(&organisation_id)
-            .and_then(|enrolment| enrolment.installed(account_id, device_key))
-            .ok_or(MembershipRefusal::NoLease)?;
-        if installed.in_force(now, utc_ms) {
-            Ok(installed.lease())
-        } else {
-            Err(MembershipRefusal::LeaseExpired)
-        }
-    }
-
     /// Records that this host is, or is no longer, exclusively organisation-managed.
     pub const fn set_exclusively_managed(&mut self, exclusively_managed: bool) {
         self.exclusively_managed = exclusively_managed;
@@ -1220,6 +1192,18 @@ impl HostPolicy {
                         refusal: MembershipRefusal::WrongAuthority,
                     });
                 }
+                // A device that has no lease yet presents the one it has: the lease cannot be the
+                // condition of presenting it. Everything about the grant itself has been decided
+                // by now, and what the device's standing in the organisation is, is decided where
+                // the lease is judged.
+                if request.method == Method::MembershipPresent {
+                    return Ok(PolicyIntersection {
+                        rights: grant.actions.clone(),
+                        organisation_id: Some(requirement.organisation_id),
+                        lease: None,
+                        offline: None,
+                    });
+                }
                 // Whose lease answers for this grant: the lease of the account and key its
                 // recipient device is bound to, and no other. Any other member's lease would
                 // sustain a disabled member's access, which is the whole of what section 17's
@@ -1256,15 +1240,16 @@ impl HostPolicy {
                 // Personal authority. It continues through an organisation outage, unless this
                 // host is exclusively organisation-managed, in which case there is no personal
                 // path left to continue on.
-                let lease = if self.exclusively_managed {
-                    Some(self.managed_lease(
-                        grant.recipient_device_id,
-                        request.continuous_now,
-                        now_ms,
-                    )?)
-                } else {
-                    None
-                };
+                let lease =
+                    if self.exclusively_managed && request.method != Method::MembershipPresent {
+                        Some(self.managed_lease(
+                            grant.recipient_device_id,
+                            request.continuous_now,
+                            now_ms,
+                        )?)
+                    } else {
+                        None
+                    };
                 // The bounded offline policy is for *remote* personal access. Section 10 puts it
                 // there in so many words, and a person at the keyboard of their own machine is not
                 // the case it is about: refusing them because a cloud feed is unreachable would be

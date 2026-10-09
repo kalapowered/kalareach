@@ -10,7 +10,7 @@ use super::{Controller, net};
 /// ([`Controller::present_membership_lease`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Standing {
-    /// It holds a live grant that requires the organisation, and its pairing stands.
+    /// It holds a live grant that answers to the organisation, and its pairing stands.
     Holds,
     /// It does not.
     Lacks,
@@ -32,38 +32,62 @@ impl Controller {
         self.before_presentation_lock.arm()
     }
 
-    /// Decides a membership lease a device presents to this host, and installs it when it is new.
+    /// Decides a membership lease a device presents to this host, with the organisation's chain
+    /// when it has moved, and installs the lease when it is new.
     ///
     /// A paired device presents on its pairing's standing: paired, and its grant in force on both
     /// clocks. The device has to hold a live grant on this host that requires the lease's
-    /// organisation: its pairing grant, or a redeemed grant naming it as recipient that is neither
-    /// revoked nor expired. Both are decided under the policy's lock, which is held until the lease
-    /// is published; a revocation records the device revoked before it removes the device's
-    /// bindings under the same lock, so a presentation either finds the device revoked or makes a
-    /// binding the revocation then removes. Everything the lease itself states is then
+    /// organisation at the revision this host enrolled at, and admits this host's environment: its
+    /// pairing grant, or a redeemed grant naming it as recipient that is neither revoked nor
+    /// expired. On a host that is exclusively organisation-managed a live personal grant stands as
+    /// well, since its owner's own access answers to a lease there and could never have one
+    /// otherwise. Standing is decided under the policy's lock, which is held until the lease is
+    /// published; a revocation records the device revoked before it removes the device's bindings
+    /// under the same lock, so a presentation either finds the device revoked or makes a binding the
+    /// revocation then removes. Everything the lease itself states is then
     /// [`crate::grants::HostPolicy::install_lease`]'s, at this host's reading of UTC while its
     /// clock is trusted and on the continuous clock every deadline here is measured on. The first
     /// lease a device presents in an organisation binds it to that lease's account and key; a lease
     /// for another member on a bound device is refused, and the attempt is logged.
     ///
-    /// The lease is decided on a copy of the policy, and the copy is written down before it is
-    /// published, so a lease's record and a new binding are on disk before anything decides from
-    /// them; a binding is written in the same transaction as its retained event. A repeat that
-    /// binds nothing writes nothing and publishes nothing. An expired lease is answered as expired
-    /// only once the floor it was found expired on is written down.
+    /// A chain beside the lease is followed on the same copy of the policy before the lease is
+    /// judged, so a lease signed by a revision the chain brings in is judged against it. A chain
+    /// that is not newer changes nothing, and a newer one that does not verify refuses the whole
+    /// presentation. The copy is written down before it is published, so a lease's record, a new
+    /// binding and a followed chain are on disk before anything decides from them; a binding is
+    /// written in the same transaction as its retained event. A repeat that binds nothing and
+    /// follows nothing writes nothing and publishes nothing. An expired lease is answered as
+    /// expired only once the floor it was found expired on is written down.
+    ///
+    /// A renewal that narrows a lease still in force, and a chain that drops a lease, restrict
+    /// access some copy may still hold, so each owes the fence of a restriction: the debt is
+    /// written before the policy, and published once the policy is in force or the write was
+    /// refused. A renewal's debt reaches the presenting device alone; a dropped lease may be
+    /// anyone's, and its debt reaches the host. The barrier that retires the debt is the debt
+    /// pass's, so the answer does not wait for it.
+    ///
+    /// `admission` is the admission of the mutation this serves, with the registry it was decided
+    /// against. It is asked again inside the transaction that writes the policy, once the store's
+    /// lock is held and before the first write, so the wait for that lock cannot outlast it. A
+    /// caller with no mutation window passes none.
     ///
     /// `proven_key` is the authorisation key the presenting connection proved.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the device's grants, the clock's record or the policy cannot be
-    /// read or written; nothing is installed or bound then. A lease a rule refuses is the inner
-    /// error.
+    /// read or written, what the admission refuses with, and why a newer chain does not verify;
+    /// nothing is installed or bound then. A lease a rule refuses is the inner error.
     pub fn present_membership_lease(
         &self,
         device_id: kr_protocol::ids::DeviceId,
         proven_key: &kr_protocol::scalars::AuthorisationKey,
         lease: &kr_protocol::account::MembershipLease,
+        chain: Option<&kr_protocol::account::PolicyAuthority>,
+        admission: Option<(
+            &crate::registry::Registry,
+            &crate::authority::AdmittedMutation,
+        )>,
     ) -> Result<
         std::result::Result<
             crate::grants::organisation::LeaseInstalled,
@@ -71,9 +95,15 @@ impl Controller {
         >,
     > {
         use crate::grants::LeaseRefused;
-        use crate::grants::organisation::{LeaseChange, LeasePresentation};
+        use crate::grants::organisation::{ChainOutcome, LeaseChange, LeasePresentation};
 
         let organisation_id = lease.payload.organisation_id;
+        if chain.is_some_and(|authority| authority.organisation_id != organisation_id) {
+            return Err(ControllerError::InvalidArgument(
+                "the chain presented beside a lease is another organisation's than the lease's"
+                    .to_owned(),
+            ));
+        }
         let reading = self.lifetimes.clock_trust().sample(&self.devices)?;
         #[cfg(feature = "testing")]
         self.before_presentation_lock.wait();
@@ -85,12 +115,29 @@ impl Controller {
         // one, raised into the floor its judgement reads, so a lease that ran out while this
         // waited is found run out.
         self.settled_utc_now();
-        match self.organisation_standing(device_id, organisation_id)? {
+        if held.enrolment(organisation_id).is_none() {
+            return Ok(Err(LeaseRefused::NotEnrolled));
+        }
+        match self.organisation_standing(&held, device_id, organisation_id)? {
             Standing::Holds => {}
             Standing::Lacks => return Ok(Err(LeaseRefused::NoOrganisationGrant)),
             Standing::Unrecorded => return Ok(Err(LeaseRefused::FloorUnrecorded)),
         }
         let mut candidate = held.clone();
+        let mut advanced = false;
+        let mut dropped_a_lease = false;
+        if let Some(authority) = chain {
+            match candidate
+                .accept_chain(authority, reading.as_ref())
+                .map_err(super::organisation::chain_refusal)?
+            {
+                ChainOutcome::Advanced { dropped, .. } => {
+                    advanced = true;
+                    dropped_a_lease = !dropped.is_empty();
+                }
+                ChainOutcome::Unchanged | ChainOutcome::Stale { .. } => {}
+            }
+        }
         let installed = match candidate.install_lease(LeasePresentation {
             lease,
             device_id,
@@ -122,9 +169,27 @@ impl Controller {
                 return Ok(Err(refused));
             }
         };
-        if !installed.bound && installed.change == LeaseChange::Repeat {
+        if !installed.bound && installed.change == LeaseChange::Repeat && !advanced {
             return Ok(Ok(installed));
         }
+        let narrowed = matches!(installed.change, LeaseChange::Installed { narrowed: true });
+        let reach = if dropped_a_lease {
+            Some(super::barrier::Reach::Host)
+        } else if narrowed {
+            Some(super::barrier::Reach::Device(device_id))
+        } else {
+            None
+        };
+        // The debt is on disk before the restriction it covers is.
+        let owed = reach
+            .map(|reach| {
+                self.owe_debt(
+                    &format!("a membership lease that narrows device {device_id}'s access"),
+                    reach,
+                )
+                .map(|debt| (debt, reach))
+            })
+            .transpose()?;
         let snapshot = candidate.snapshot();
         let binding = installed
             .bound
@@ -133,52 +198,77 @@ impl Controller {
                     .enrolment(organisation_id)
                     .and_then(|enrolment| enrolment.binding(device_id))
             })
-            .flatten();
-        match binding {
-            Some(binding) => self.sharing.grants().store_policy_with_event(
-                &snapshot,
-                &crate::grants::store::BindingEvent {
-                    organisation_id,
-                    device_id,
-                    account_id: binding.account_id.clone(),
-                    device_key: binding.device_key,
-                    lease_digest: binding.lease_digest,
-                    bound_at_ms: binding.bound_at_ms,
-                },
-            )?,
-            None => self.sharing.grants().store_policy(&snapshot)?,
+            .flatten()
+            .map(|binding| crate::grants::store::BindingEvent {
+                organisation_id,
+                device_id,
+                account_id: binding.account_id.clone(),
+                device_key: binding.device_key,
+                lease_digest: binding.lease_digest,
+                bound_at_ms: binding.bound_at_ms,
+            });
+        let written = self
+            .sharing
+            .grants()
+            .store_presentation(&snapshot, binding.as_ref(), || {
+                self.still_admitted(
+                    admission.map(|(registry, _)| registry),
+                    admission.map(|(_, carried)| carried),
+                )
+            });
+        if written.is_ok() {
+            self.utc_floor.wrote(snapshot.utc_floor_ms.get());
+            // The lease's snapshot in its cell, under the policy's lock, before the policy holding
+            // it is put in force.
+            candidate.publish_leases(&held);
+            *held = candidate;
+            // Published with the policy, under its lock, as every change of the policy is.
+            self.advance_authority_epoch();
         }
-        self.utc_floor.wrote(snapshot.utc_floor_ms.get());
-        // The lease's snapshot in its cell, under the policy's lock, before the policy holding it
-        // is put in force.
-        candidate.publish_leases(&held);
-        *held = candidate;
-        // Published with the policy, under its lock, as every change of the policy is.
-        self.advance_authority_epoch();
+        // Published whether or not the policy was written: a barrier for a restriction that did not
+        // land fences once more than it needed, and a debt left pending would never be retired.
+        // The barrier is the debt pass's, which dropping this hands the debt to.
+        if let Some(owed) = owed {
+            drop(self.publish_debts(&[owed]));
+        }
+        written?;
         Ok(Ok(installed))
     }
 
     /// Whether `device_id` may present a lease for `organisation_id`, decided while the caller holds
-    /// the policy's lock.
+    /// the policy's lock, which `held` is.
     ///
     /// A paired device needs its pairing to stand: paired, and its grant in force on both clocks
     /// (UTC through this host's floor, the continuous clock through the grant's anchor in this
-    /// boot). Then it needs a live grant that requires the organisation: its pairing grant, or a
-    /// redeemed grant naming it as recipient that is not revoked and is in force on both clocks by
-    /// its own anchor, and has no end on record. An end found here is written down before it is
-    /// answered, and answered as unrecorded until it is.
+    /// boot). Then it needs a live grant that answers to the organisation at the revision this host
+    /// enrolled at and admits this host's environment: its pairing grant, or a redeemed grant
+    /// naming it as recipient that is not revoked and is in force on both clocks by its own
+    /// anchor, and has no end on record. On a host that is exclusively organisation-managed a live
+    /// personal grant stands too, because it answers to a lease there. An end found here is
+    /// written down before it is answered, and answered as unrecorded until it is.
     fn organisation_standing(
         &self,
+        held: &crate::grants::HostPolicy,
         device_id: kr_protocol::ids::DeviceId,
         organisation_id: kr_protocol::ids::OrganisationId,
     ) -> Result<Standing> {
         use net::lifetimes::GrantStanding;
 
-        let requires = |grant: &kr_protocol::grant::Grant| {
-            grant
-                .organisation
-                .as_ref()
-                .is_some_and(|requirement| requirement.organisation_id == organisation_id)
+        let Some(enrolment) = held.enrolment(organisation_id) else {
+            return Ok(Standing::Lacks);
+        };
+        let revision = enrolment.enrolment_revision();
+        let environment_id = self.paths.environment_id();
+        let exclusive = held.is_exclusively_managed();
+        let answers = |grant: &kr_protocol::grant::Grant| {
+            grant.environment_selector.admits(environment_id)
+                && match grant.organisation.as_ref() {
+                    Some(requirement) => {
+                        requirement.organisation_id == organisation_id
+                            && requirement.policy_revision == revision
+                    }
+                    None => exclusive,
+                }
         };
         if let Some(record) = self.devices.record_for_device(device_id)? {
             if !record.is_paired() {
@@ -189,14 +279,14 @@ impl Controller {
                 GrantStanding::OutOfForce => return Ok(Standing::Lacks),
                 GrantStanding::Unrecorded => return Ok(Standing::Unrecorded),
             }
-            if requires(&record.grant) {
+            if answers(&record.grant) {
                 return Ok(Standing::Holds);
             }
         }
         let grants = self.sharing.grants();
         let mut unrecorded = false;
         for stored in grants.records_for_device(device_id)? {
-            if stored.revoked_at_ms.is_some() || !stored.is_active() || !requires(&stored.grant) {
+            if stored.revoked_at_ms.is_some() || !stored.is_active() || !answers(&stored.grant) {
                 continue;
             }
             match self.lifetimes.stored_standing(grants, &stored)? {

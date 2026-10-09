@@ -1970,42 +1970,52 @@ impl GrantDirectory {
             .collect()
     }
 
-    /// Writes this host's policy together with the retained event of the binding it made, in one
-    /// transaction, so neither is on disk without the other.
+    /// Writes this host's policy for a presented membership lease, with the retained event of the
+    /// binding the presentation made when it made one, in one transaction, so neither is on disk
+    /// without the other.
+    ///
+    /// `still_admitted` runs inside the transaction, once this call holds the store's lock and
+    /// before the first write. The wait for that lock can outlast the admission the presentation
+    /// carries, so a check made before it says only what was true before the wait.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when either row cannot be written; then neither is.
-    pub fn store_policy_with_event(
+    /// Returns what `still_admitted` refuses with, and a storage error when either row cannot be
+    /// written; then neither is.
+    pub fn store_presentation(
         &self,
         policy: &StoredPolicy,
-        event: &BindingEvent,
+        event: Option<&BindingEvent>,
+        still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(policy)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         self.in_transaction(|connection| {
+            still_admitted()?;
             connection
                 .execute(
                     "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
                     params![encoded],
                 )
                 .map_err(ControllerError::registry)?;
-            connection
-                .execute(
-                    "INSERT INTO organisation_events
-                         (organisation_id, device_id, account_id, device_key, lease_digest,
-                          bound_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        event.organisation_id.get().as_bytes().as_slice(),
-                        event.device_id.get().as_bytes().as_slice(),
-                        event.account_id.as_str(),
-                        event.device_key.as_bytes().as_slice(),
-                        event.lease_digest.as_bytes().as_slice(),
-                        i64::try_from(event.bound_at_ms).unwrap_or(i64::MAX),
-                    ],
-                )
-                .map_err(ControllerError::registry)?;
+            if let Some(event) = event {
+                connection
+                    .execute(
+                        "INSERT INTO organisation_events
+                             (organisation_id, device_id, account_id, device_key, lease_digest,
+                              bound_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            event.organisation_id.get().as_bytes().as_slice(),
+                            event.device_id.get().as_bytes().as_slice(),
+                            event.account_id.as_str(),
+                            event.device_key.as_bytes().as_slice(),
+                            event.lease_digest.as_bytes().as_slice(),
+                            i64::try_from(event.bound_at_ms).unwrap_or(i64::MAX),
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
             Ok(())
         })
     }

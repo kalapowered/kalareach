@@ -43,7 +43,8 @@ use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
 use kr_transport::clock::{ContinuousClock as _, ManualClock};
 
 use organisation_support::{
-    LEASE_MS, MINUTE_MS, Organisation, T, device, generation, member, presented, reading, sign,
+    LEASE_MS, MINUTE_MS, Organisation, T, device, device_of, generation, member, presented,
+    reading, sign,
 };
 
 const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
@@ -59,6 +60,73 @@ fn enrolled(host: &mut HostPolicy) -> Organisation {
     organisation.rotate(T - DAY_MS);
     organisation.enrol(host, T);
     organisation
+}
+
+/// What a request from `key`'s device is decided as under a grant that requires the organisation,
+/// the way a daemon decides it: the end in UTC of the lease that answers for the device, or why no
+/// lease does. The continuous clock reads `now` and UTC reads `utc_ms`. The leases are published in
+/// their cells first, as a daemon publishes them once the policy is written down.
+fn answered(
+    host: &mut HostPolicy,
+    organisation_id: OrganisationId,
+    key: &AuthorisationKey,
+    now: kr_transport::clock::ContinuousInstant,
+    utc_ms: u64,
+) -> Result<u64, MembershipRefusal> {
+    let revision = host
+        .enrolment(organisation_id)
+        .expect("this host is enrolled in the organisation")
+        .enrolment_revision();
+    let before = host.clone();
+    host.publish_unanchored(&before);
+    let grant = Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([0x77; 16])),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0; 16])),
+        recipient_device_id: device_of(key),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: VIEW.iter().copied().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::some(OrganisationRequirement {
+            organisation_id,
+            policy_revision: revision,
+        }),
+    };
+    let record = GrantRecord {
+        grant: grant.clone(),
+        session_id: None,
+        issued_at_ms: 1_000,
+        activated_at_ms: Some(1_000),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    };
+    let request = AccessRequest {
+        method: Method::SessionRead,
+        ingress: ActorIngress::PairedDevice,
+        environment_id: EnvironmentId::new(Uuid::from_bytes([0xe0; 16])),
+        session_id: None,
+        claims_geometry: false,
+        own_subject: None,
+        now_ms: utc_ms,
+        continuous_now: now,
+    };
+    match decide(&grant, &record, host, request) {
+        Ok(permitted) => Ok(permitted
+            .lease
+            .expect("a lease answered for the grant")
+            .utc_deadline_ms()
+            .expect("a lease ends in UTC")),
+        Err(Refusal::MembershipUnusable { refusal }) => Err(refusal),
+        Err(other) => panic!("the grant was refused for a reason of its own: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -238,7 +306,7 @@ fn rotation_is_followed_only_through_links_the_anchor_signed() {
         "revision 2 may still have signed a live lease before it was succeeded"
     );
     assert_eq!(
-        host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), at),
+        answered(&mut host, organisation_id, phone.public(), clock.now(), at),
         Err(MembershipRefusal::NoLease)
     );
 
@@ -277,7 +345,7 @@ fn the_anchor_and_lease_records_survive_a_restart_and_no_lease_is_installed() {
     host.install_lease(presented(&lease, phone.public(), T, clock.now(), 1))
         .expect("installed");
     // The control: before the restart the lease answers.
-    host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), T)
+    answered(&mut host, organisation_id, phone.public(), clock.now(), T)
         .expect("in force before the restart");
     store
         .store_policy(&host.snapshot())
@@ -306,7 +374,13 @@ fn the_anchor_and_lease_records_survive_a_restart_and_no_lease_is_installed() {
     assert_eq!(record.issued_at_ms, T);
     assert_eq!(record.installed_in, generation(1));
     assert_eq!(
-        restored.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), T),
+        answered(
+            &mut restored,
+            organisation_id,
+            phone.public(),
+            clock.now(),
+            T
+        ),
         Err(MembershipRefusal::NoLease),
         "no lease is installed after a restart"
     );
@@ -577,12 +651,12 @@ fn each_device_of_a_member_holds_its_own_lease() {
     // The control: each device's own lease answers for it.
     let at = T + 2 * MINUTE_MS;
     assert_eq!(
-        host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), at),
-        Ok(&refresh)
+        answered(&mut host, organisation_id, phone.public(), clock.now(), at),
+        Ok(refresh.payload.expires_at_ms.get())
     );
     assert_eq!(
-        host.lease_in_force(organisation_id, &ada, laptop.public(), clock.now(), at),
-        Ok(&laptop_lease)
+        answered(&mut host, organisation_id, laptop.public(), clock.now(), at),
+        Ok(laptop_lease.payload.expires_at_ms.get())
     );
     // And the laptop's lease does not answer for the phone: ten minutes on the laptop renews,
     // and once the phone's lease has run out the phone is refused while the laptop is not.
@@ -600,12 +674,24 @@ fn each_device_of_a_member_holds_its_own_lease() {
     clock.advance(Duration::from_millis(6 * MINUTE_MS));
     let late = T + 16 * MINUTE_MS;
     assert_eq!(
-        host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), late),
+        answered(
+            &mut host,
+            organisation_id,
+            phone.public(),
+            clock.now(),
+            late
+        ),
         Err(MembershipRefusal::LeaseExpired)
     );
     assert_eq!(
-        host.lease_in_force(organisation_id, &ada, laptop.public(), clock.now(), late),
-        Ok(&laptop_renewal)
+        answered(
+            &mut host,
+            organisation_id,
+            laptop.public(),
+            clock.now(),
+            late
+        ),
+        Ok(laptop_renewal.payload.expires_at_ms.get())
     );
 }
 
@@ -639,13 +725,25 @@ fn a_wall_clock_wound_back_does_not_lengthen_a_lease() {
 
     // The control: before the continuous deadline it answers.
     clock.advance(Duration::from_millis(LEASE_MS - 10_000));
-    host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), settled)
-        .expect("inside both deadlines");
+    answered(
+        &mut host,
+        organisation_id,
+        phone.public(),
+        clock.now(),
+        settled,
+    )
+    .expect("inside both deadlines");
 
     // Past it, the lease has ended however far back the wall clock reads.
     clock.advance(Duration::from_millis(5_000));
     assert_eq!(
-        host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), settled),
+        answered(
+            &mut host,
+            organisation_id,
+            phone.public(),
+            clock.now(),
+            settled
+        ),
         Err(MembershipRefusal::LeaseExpired)
     );
     assert_eq!(
@@ -692,8 +790,8 @@ fn a_lease_from_the_hosts_future_is_refused_beyond_five_seconds() {
 
     // In force at once, before this host's clock reaches the issue time.
     assert_eq!(
-        host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), T),
-        Ok(&near)
+        answered(&mut host, organisation_id, phone.public(), clock.now(), T),
+        Ok(near.payload.expires_at_ms.get())
     );
     let repeat = host
         .install_lease(presented(&near, phone.public(), T, clock.now(), 1))
@@ -703,9 +801,9 @@ fn a_lease_from_the_hosts_future_is_refused_beyond_five_seconds() {
     // It ends at its continuous deadline...
     clock.advance(Duration::from_millis(LEASE_MS - 5_000));
     assert_eq!(
-        host.lease_in_force(
+        answered(
+            &mut host,
             organisation_id,
-            &ada,
             phone.public(),
             clock.now(),
             T + 60_000
@@ -720,25 +818,26 @@ fn a_lease_from_the_hosts_future_is_refused_beyond_five_seconds() {
         .install_lease(presented(&near, phone.public(), T, early_clock.now(), 1))
         .expect("installed on another host");
     let expiry = near.payload.expires_at_ms.get();
+    // The control comes first: this host reads UTC through a floor that only rises, so once it
+    // has read the signed expiry it never reads a moment before it again.
+    answered(
+        &mut other,
+        organisation.organisation_id,
+        phone.public(),
+        early_clock.now(),
+        expiry - 1,
+    )
+    .expect("a millisecond before its signed expiry it is in force");
     assert_eq!(
-        other.lease_in_force(
+        answered(
+            &mut other,
             organisation.organisation_id,
-            &ada,
             phone.public(),
             early_clock.now(),
             expiry
         ),
         Err(MembershipRefusal::LeaseExpired)
     );
-    other
-        .lease_in_force(
-            organisation.organisation_id,
-            &ada,
-            phone.public(),
-            early_clock.now(),
-            expiry - 1,
-        )
-        .expect("the control: a millisecond before its signed expiry it is in force");
 }
 
 /// Nothing that reads the clock is decided while the floor it would stand on is owed its record:
@@ -1229,7 +1328,7 @@ async fn a_device_is_bound_to_the_account_and_key_of_its_first_verified_lease_an
 
     let first = organisation.lease(2, &ada, *phone.public(), now, VIEW);
     let installed = controller
-        .present_membership_lease(paired.device_id, phone.public(), &first)
+        .present_membership_lease(paired.device_id, phone.public(), &first, None, None)
         .expect("storage")
         .expect("the first verified lease installs");
     assert!(installed.bound, "and binds the device");
@@ -1269,7 +1368,7 @@ async fn a_device_is_bound_to_the_account_and_key_of_its_first_verified_lease_an
     let another = organisation.lease(2, &bea, *phone.public(), now + 1_000, VIEW);
     assert_eq!(
         controller
-            .present_membership_lease(paired.device_id, phone.public(), &another)
+            .present_membership_lease(paired.device_id, phone.public(), &another, None, None)
             .expect("storage"),
         Err(LeaseRefused::AccountMismatch),
         "a lease for another member on a bound device is refused"
@@ -1282,7 +1381,7 @@ async fn a_device_is_bound_to_the_account_and_key_of_its_first_verified_lease_an
     // The control: the same member's next lease installs, and binds nothing new.
     let next = organisation.lease(2, &ada, *phone.public(), now + 2_000, VIEW);
     let renewed = controller
-        .present_membership_lease(paired.device_id, phone.public(), &next)
+        .present_membership_lease(paired.device_id, phone.public(), &next, None, None)
         .expect("storage")
         .expect("the same member's next lease installs");
     assert!(!renewed.bound);
@@ -1313,7 +1412,7 @@ async fn a_device_without_an_organisation_grant_cannot_bind() {
     let lease = organisation.lease(2, &member("ada"), *laptop.public(), now, VIEW);
     assert_eq!(
         controller
-            .present_membership_lease(personal.device_id, laptop.public(), &lease)
+            .present_membership_lease(personal.device_id, laptop.public(), &lease, None, None)
             .expect("storage"),
         Err(LeaseRefused::NoOrganisationGrant)
     );
@@ -1338,7 +1437,7 @@ async fn a_device_without_an_organisation_grant_cannot_bind() {
     let lease = organisation.lease(2, &member("ada"), *tablet.public(), now, VIEW);
     assert_eq!(
         controller
-            .present_membership_lease(lapsed.device_id, tablet.public(), &lease)
+            .present_membership_lease(lapsed.device_id, tablet.public(), &lease, None, None)
             .expect("storage"),
         Err(LeaseRefused::NoOrganisationGrant)
     );
@@ -1346,7 +1445,7 @@ async fn a_device_without_an_organisation_grant_cannot_bind() {
 
     let lease = organisation.lease(2, &member("ada"), *phone.public(), now, VIEW);
     let installed = controller
-        .present_membership_lease(paired.device_id, phone.public(), &lease)
+        .present_membership_lease(paired.device_id, phone.public(), &lease, None, None)
         .expect("storage")
         .expect("the control: the device with one binds");
     assert!(installed.bound);
@@ -1392,7 +1491,7 @@ async fn a_lease_that_runs_out_while_its_presentation_waits_is_refused() {
             let controller = Arc::clone(&controller);
             tokio::task::spawn_blocking(move || {
                 controller
-                    .present_membership_lease(device_id, &key, &lease)
+                    .present_membership_lease(device_id, &key, &lease, None, None)
                     .expect("storage")
             })
         };
@@ -1459,7 +1558,7 @@ async fn a_device_revoked_while_its_presentation_waits_is_not_bound() {
             let controller = Arc::clone(&controller);
             tokio::task::spawn_blocking(move || {
                 controller
-                    .present_membership_lease(device_id, &key, &lease)
+                    .present_membership_lease(device_id, &key, &lease, None, None)
                     .expect("storage")
             })
         };
@@ -1514,7 +1613,7 @@ async fn one_device_racing_two_accounts_binds_exactly_one() {
         let lease = organisation.lease(2, &member(name), key, now, VIEW);
         tokio::task::spawn_blocking(move || {
             controller
-                .present_membership_lease(device_id, &key, &lease)
+                .present_membership_lease(device_id, &key, &lease, None, None)
                 .expect("storage")
         })
     };
@@ -1556,14 +1655,14 @@ async fn one_device_racing_two_accounts_binds_exactly_one() {
     let next = organisation.lease(2, &member("cai"), *laptop.public(), now + 1_000, VIEW);
     assert!(
         controller
-            .present_membership_lease(second.device_id, laptop.public(), &first)
+            .present_membership_lease(second.device_id, laptop.public(), &first, None, None)
             .expect("storage")
             .expect("the first installs")
             .bound
     );
     assert!(
         !controller
-            .present_membership_lease(second.device_id, laptop.public(), &next)
+            .present_membership_lease(second.device_id, laptop.public(), &next, None, None)
             .expect("storage")
             .expect("the next installs too")
             .bound
@@ -1727,7 +1826,7 @@ async fn a_stored_organisation_grant_that_ran_out_admits_no_lease() {
     for (index, (paired, key, _)) in presenting.iter().enumerate() {
         let lease = organisation.lease(2, &member("ada"), *key.public(), T, VIEW);
         let outcome = controller
-            .present_membership_lease(paired.device_id, key.public(), &lease)
+            .present_membership_lease(paired.device_id, key.public(), &lease, None, None)
             .expect("storage");
         if index < 2 {
             assert_eq!(
