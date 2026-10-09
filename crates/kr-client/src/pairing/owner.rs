@@ -543,18 +543,24 @@ fn duration(expiry: &GrantExpiry, now_ms: u64) -> String {
 
 /// What a grant that requires an organisation's membership says of it in a prompt, or nothing for
 /// a personal grant: the access answers to the organisation's lease, so a person who confirms it
-/// is told so, and which organisation and which enrolment of this host it names.
+/// is told so, with the start of the organisation's identifier and the enrolment of this host the
+/// grant names. A page with room for more shows the whole identifier beside it.
 fn membership(grant: &ProposedGrant) -> String {
     grant
         .organisation
         .as_ref()
         .map_or_else(String::new, |requirement| {
             format!(
-                ", only while the holder is a member of organisation {} (enrolment {})",
-                requirement.organisation_id,
+                ", only for members of organisation {} (enrolment {})",
+                organisation_start(&requirement.organisation_id),
                 requirement.policy_revision.get()
             )
         })
+}
+
+/// The first 32 bits of an organisation's identifier, grouped.
+fn organisation_start(organisation: &kr_protocol::ids::OrganisationId) -> String {
+    group_verification_value(&organisation.to_string().replace('-', "")[..8])
 }
 
 /// Where a repository's metadata is served from.
@@ -712,9 +718,15 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 utc_minute(plan.anchor.not_before_ms.get()).ok_or(CannotCheck::CannotShow)?,
             ),
             Subject::SetExclusiveManagement(plan) => {
-                let organisations = match plan.organisation_ids.len() {
-                    1 => "its organisation".to_owned(),
-                    more => format!("its {more} organisations"),
+                let (organisations, possessive) = match plan.organisation_ids.len() {
+                    1 => (
+                        "its organisation".to_owned(),
+                        "its organisation's".to_owned(),
+                    ),
+                    more => (
+                        format!("its {more} organisations"),
+                        format!("its {more} organisations'"),
+                    ),
                 };
                 if plan.exclusive {
                     format!(
@@ -723,7 +735,7 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                     )
                 } else {
                     format!(
-                        "end {organisations}'s exclusive management of {host}: your own access \
+                        "end {possessive} exclusive management of {host}: your own access \
                          then needs no lease"
                     )
                 }
@@ -1724,9 +1736,7 @@ mod tests {
             ),
         ] {
             assert!(
-                member_line.contains(&format!(
-                    "member of organisation {organisation} (enrolment 7)"
-                )),
+                member_line.contains(", only for members of organisation 2121 2121 (enrolment 7)"),
                 "{name}: {member_line}"
             );
             assert!(
