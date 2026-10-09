@@ -9,7 +9,7 @@
 //! | KR-REQ-15.01 | `a_call_runs_on_either_provider_through_one_interface`, `an_unknown_creation_is_a_state_and_leaves_no_grant`, `a_start_names_the_rate_the_person_was_shown`, `a_changed_rate_leaves_nothing_behind_and_carries_the_new_rate` |
 //! | KR-REQ-15.02 | `stopping_a_voice_session_leaves_the_terminal_sessions_running` |
 //! | KR-REQ-15.09 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `the_context_for_a_call_goes_under_the_services_words_for_it` |
-//! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_outside_this_calls_timeline_or_already_spent_is_refused`, `a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_one`, `a_delegation_carries_no_task_text`, `a_session_said_by_its_number_is_found_among_the_calls_own`, `a_number_the_call_does_not_reach_names_no_session`, `words_the_grammar_does_not_hold_reach_nothing`, `a_set_of_fragments_that_breaks_a_rule_is_refused_whole_and_spends_nothing` |
+//! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_outside_this_calls_timeline_or_already_spent_is_refused`, `a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_one`, `a_proposal_is_built_from_the_words_as_the_host_read_them`, `a_session_said_by_its_number_is_found_among_the_calls_own`, `a_number_the_call_does_not_reach_names_no_session`, `words_the_grammar_does_not_hold_reach_nothing`, `a_set_of_fragments_that_breaks_a_rule_is_refused_whole_and_spends_nothing` |
 //! | KR-REQ-15.13 | `the_five_unlocked_screen_classes_are_refused_without_a_confirmation`, `provider_text_cannot_create_a_confirmation`, `a_confirmation_for_one_action_does_not_authorise_another`, `a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_it`, `a_confirmation_for_one_utterance_does_not_confirm_another` |
 //! | KR-REQ-15.14 | `stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told` |
 //! | KR-REQ-15.17 | `a_result_that_was_admitted_and_not_performed_is_reported_as_admitted` |
@@ -2506,9 +2506,15 @@ async fn a_delegation_answered_before_is_answered_again_under_the_authority_that
         VoiceDelegationOutcome::Performed { .. }
     ));
 
-    // The answer records what the words were read to ask for, and a repeat is answered from that.
+    // The answer records what the words were read to ask for, and a repeat is answered from that:
+    // the words are not read again, so a reading that has changed since (here, the same words now
+    // read as another session) does not change what the repeat reads.
     assert_eq!(first.action.0, Some(VoiceAction::Status));
     assert_eq!(first.session_id.0, Some(session(SESSION_A)));
+    fixture.script.says(
+        VoiceAction::Status.as_str(),
+        Interpretation::of(VoiceAction::Brief, Some(2)),
+    );
 
     let again = fixture
         .coordinator
@@ -2519,6 +2525,17 @@ async fn a_delegation_answered_before_is_answered_again_under_the_authority_that
         matches!(again.outcome, VoiceDelegationOutcome::Performed { .. }),
         "{:?}",
         again.outcome
+    );
+    let read_again = fixture
+        .submitter
+        .proposals()
+        .pop()
+        .expect("the read made again");
+    assert_eq!(read_again.action, VoiceAction::Status);
+    assert_eq!(read_again.session_id, Some(session(SESSION_A)));
+    fixture.script.says(
+        VoiceAction::Status.as_str(),
+        Interpretation::of(VoiceAction::Status, Some(1)),
     );
     let refused = fixture
         .coordinator
@@ -2540,10 +2557,10 @@ async fn a_delegation_answered_before_is_answered_again_under_the_authority_that
     assert_eq!(narrowed.reason(), Some(VoiceRefusal::OutsideDeviceGrant));
 }
 
-/// KR-REQ-15.11: the delegation event supplies an identifier and a timeline offset, not task text.
-/// What the coordinator proposes is built from the host's own state.
+/// KR-REQ-15.11: the host reads what was said, and the device names nothing it acts on. What the
+/// coordinator proposes is built from the words as the host read them and from the host's own state.
 #[tokio::test]
-async fn a_delegation_carries_no_task_text() {
+async fn a_proposal_is_built_from_the_words_as_the_host_read_them() {
     let fixture = fixture();
     let voice_session_id = started(&fixture, Some(&[VoiceAction::Status])).await;
     fixture
@@ -2563,8 +2580,8 @@ async fn a_delegation_carries_no_task_text() {
     assert_eq!(proposal.action, VoiceAction::Status);
     assert_eq!(proposal.delegation_id, delegation("one"));
     assert_eq!(proposal.session_id, Some(session(SESSION_A)));
-    // The proposal carries the identifier, the action the device named and the host's own plan.
-    // There is no field on it for anything the model said, which is the point.
+    // The proposal carries the identifier, the action the host read and the host's own plan. There
+    // is no field on it for anything the model said, which is the point.
     assert_eq!(proposal.plan.action, VoiceAction::Status);
 }
 
@@ -3140,6 +3157,32 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
     let result = fixture
         .coordinator
         .delegate(device(PHONE), action(2), &wrong, 11_100)
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&result.outcome).0,
+        VoiceRefusal::DestinationNotNamed
+    );
+
+    // A refusal written with the apostrophe a transcript writes curly is still a refusal.
+    let mut curly = delegate_params(
+        voice_session_id,
+        delegation("p2b"),
+        VoiceAction::SubmitPrompt,
+    );
+    curly.fragments = fixture.script.says(
+        "don\u{2019}t send it to the build session",
+        Interpretation {
+            spoken_destination: Some(SpokenDestination {
+                session_id: session(SESSION_A),
+                spoken_text: "don\u{2019}t send it to the build session".to_owned(),
+            }),
+            ..Interpretation::of(VoiceAction::SubmitPrompt, Some(1))
+        },
+    );
+    let result = fixture
+        .coordinator
+        .delegate(device(PHONE), action(4), &curly, 11_150)
         .await
         .expect("an answer");
     assert_eq!(

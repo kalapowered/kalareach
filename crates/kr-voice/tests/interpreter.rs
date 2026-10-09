@@ -115,6 +115,14 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["close session three"], Misread::NotARequest),
         (&["run the tests in session three"], Misread::NotARequest),
         (&["status of the other session"], Misread::NotARequest),
+        // A sign or a point beside a number changes what it says, and is never dropped.
+        (&["open session -3"], Misread::UnreadableNumber),
+        (&["open session .3"], Misread::UnreadableNumber),
+        (&["status session 3.5"], Misread::UnreadableNumber),
+        (&["status session 1,000"], Misread::UnreadableNumber),
+        (&["status session +3"], Misread::UnreadableNumber),
+        (&["go to session 3/4"], Misread::UnreadableNumber),
+        (&["status session - 3"], Misread::UnreadableNumber),
         // A number that cannot be read.
         (&["status session"], Misread::UnreadableNumber),
         (&["status session banana"], Misread::UnreadableNumber),

@@ -188,8 +188,8 @@ impl VoiceModule {
     /// Checks that a voice mutation's envelope and its parameters name the same subject.
     ///
     /// A voice session belongs to this host rather than to one terminal session, so a voice
-    /// mutation names the environment. The session a delegation acts on is inside the parameters,
-    /// where the coordinator checks it against what the voice session may reach.
+    /// mutation names the environment. The session a delegation acts on is read by the coordinator
+    /// from the words in the parameters, and checked against what the voice session may reach.
     ///
     /// # Errors
     ///

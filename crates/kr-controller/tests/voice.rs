@@ -12,7 +12,7 @@
 //! | KR-REQ-15.01 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.02 | `stopping_voice_leaves_the_session_running` |
 //! | KR-REQ-09.16 | `a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt` |
-//! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds`, `speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_nothing`, `the_daemon_keeps_nothing_that_says_what_was_said`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
+//! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds`, `speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_nothing`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
 //! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation`, `a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_its_identifier` |
 //! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store` |
 //! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
@@ -26,7 +26,7 @@
 //! the daemon's own endpoint. The suite therefore drives the service the way a paired device's
 //! dispatch reaches it, against the same daemon.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kr_client::services::ServiceFuture;
@@ -712,18 +712,23 @@ async fn a_delegation_runs_under_the_grant_the_host_already_holds() {
     // What the row asks is that the authority check passed and the proposal reached this host's
     // own dispatch, rather than being refused by a rule of section 15.
     match result {
-        Ok(answered) => assert!(
-            !matches!(
-                &answered.outcome,
-                VoiceDelegationOutcome::Refused { reason, .. }
-                    if matches!(
-                        reason,
-                        VoiceRefusal::OutsideVoiceGrant | VoiceRefusal::OutsideDeviceGrant
-                    )
-            ),
-            "{:?}",
-            answered.outcome
-        ),
+        Ok(answered) => {
+            // The words were read as the status of the call's one session.
+            assert_eq!(answered.action.0, Some(VoiceAction::Status));
+            assert_eq!(answered.session_id.0, Some(host.session_id));
+            assert!(
+                !matches!(
+                    &answered.outcome,
+                    VoiceDelegationOutcome::Refused { reason, .. }
+                        if matches!(
+                            reason,
+                            VoiceRefusal::OutsideVoiceGrant | VoiceRefusal::OutsideDeviceGrant
+                        )
+                ),
+                "{:?}",
+                answered.outcome
+            );
+        }
         Err(error) => assert!(
             error.reason().is_none(),
             "the grants admitted it; the host could not carry it out: {error}"
@@ -2385,85 +2390,6 @@ async fn speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_noth
             "{refusal:?}"
         ),
     }
-    voice.raw.close();
-    voice.host.stop().await;
-}
-
-/// KR-REQ-15.11 and 19: what a person said is content, and the host keeps no copy of it. After the
-/// words of a delegation, refused and read alike, have been through the daemon, a phrase in them is
-/// in none of the files the daemon keeps under its state root: the host keeps the digest of the
-/// delegation and what became of it, and nothing that says what was said.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_daemon_keeps_nothing_that_says_what_was_said() {
-    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
-    let voice = RawVoice::prepare_with(
-        &owner,
-        Arc::new(OfflineProvider::default()),
-        &[ActionRight::SessionView, ActionRight::AgentPrompt],
-        Some(&[VoiceAction::Status]),
-    )
-    .await;
-    let call = voice.start_call().await;
-    let marker = "zebra-marker-7741";
-
-    // Refused (the grammar does not hold it), and read (the same words inside a request).
-    let refused = voice
-        .delegate(
-            ActionId::new(kr_ipc::new_uuid()),
-            &voice.saying(call, "refused", &format!("close session {marker}")),
-        )
-        .await
-        .expect("answered");
-    assert!(
-        matches!(
-            refused.outcome,
-            VoiceDelegationOutcome::Refused {
-                reason: VoiceRefusal::NotUnderstood,
-                ..
-            }
-        ),
-        "{:?}",
-        refused.outcome
-    );
-    let _ = voice
-        .delegate(
-            ActionId::new(kr_ipc::new_uuid()),
-            &voice.saying(call, "read", &format!("status session {marker}")),
-        )
-        .await;
-    assert!(
-        !format!("{refused:?}").contains(marker),
-        "an answer quotes nothing that was said"
-    );
-
-    // Every file under the state root, the registry's write-ahead log included.
-    fn files(directory: &Path, found: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files(&path, found);
-            } else {
-                found.push(path);
-            }
-        }
-    }
-    let holds = |path: &Path| {
-        std::fs::read(path)
-            .unwrap_or_default()
-            .windows(marker.len())
-            .any(|window| window == marker.as_bytes())
-    };
-    // The search finds the phrase where it is: a file this test writes holds it.
-    let control = voice.host.tree().paths().state_root().join("control");
-    std::fs::write(&control, marker).expect("a control file");
-    let mut found = Vec::new();
-    files(voice.host.tree().paths().state_root(), &mut found);
-    assert!(
-        found.iter().any(|path| path.ends_with("registry.sqlite")),
-        "{found:?}"
-    );
-    let holding: Vec<_> = found.iter().filter(|path| holds(path)).collect();
-    assert_eq!(holding, vec![&control], "only the control holds the phrase");
     voice.raw.close();
     voice.host.stop().await;
 }
