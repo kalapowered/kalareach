@@ -266,6 +266,20 @@ impl Host {
 
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
+        Self::start_unowned_on_clocks(Clocks::system()).await
+    }
+
+    /// Starts a daemon with `owner` as its first owner, on the clocks a suite moves by hand, by
+    /// the path a daemon takes on the machine's own.
+    pub async fn start_on_clocks(owner: &DeviceKeys, clocks: Clocks) -> Self {
+        let mut host = Self::start_unowned_on_clocks(clocks).await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
+    async fn start_unowned_on_clocks(clocks: Clocks) -> Self {
         Self::start_on(
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
@@ -275,7 +289,7 @@ impl Host {
             },
             AccountAt::Managed,
             Arc::new(MemoryStore::new()),
-            Clocks::system(),
+            clocks,
         )
         .await
     }

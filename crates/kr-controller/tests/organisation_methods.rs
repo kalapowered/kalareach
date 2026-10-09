@@ -11,6 +11,10 @@
 mod net_support;
 mod organisation_support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use kr_controller::service::{Clocks, WallClock};
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::account::PolicyAuthorityHead;
 use kr_protocol::confirmation::{
@@ -275,7 +279,27 @@ async fn an_enrolment_needs_the_owners_confirmation_of_exactly_this_chain() {
     .expect("the confirmation still enrols the chain it named");
     assert_eq!(list(&mut client).await.enrolments.len(), 1);
 
-    // The same action with other parameters is a conflict, not a second enrolment.
+    // The same action with other parameters is a conflict, not a second enrolment. The parameters
+    // are checked before a confirmation is looked for, so the conflict is the answer even though
+    // no confirmation stands for them.
+    let action = ActionId::new(kr_ipc::new_uuid());
+    calls::confirm_subject(
+        host.environment_id,
+        &mut client,
+        subject(&params),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("the owner confirms the first chain");
+    enrol(&host, &mut client, action, &params)
+        .await
+        .expect("the first chain enrols under the action");
+    let third = self::organisation(0x23).0;
+    let conflict = enrol(&host, &mut client, action, &enrol_params(&third, now))
+        .await
+        .expect_err("the action is taken by other parameters");
+    assert_eq!(conflict.code, ErrorCode::IdConflict, "{conflict:?}");
+    assert_eq!(list(&mut client).await.enrolments.len(), 2);
     host.stop().await;
 }
 
@@ -611,5 +635,153 @@ async fn an_invitation_proposes_only_an_organisation_this_host_is_enrolled_in() 
         .expect("the member's grant requires the organisation");
     assert_eq!(requirement.organisation_id, organisation.organisation_id);
     assert_eq!(requirement.policy_revision, revision);
+    host.stop().await;
+}
+
+/// A wall clock the suite moves by hand, in milliseconds either way from the machine's own, and
+/// the clocks a daemon runs on with it.
+fn moved_clocks() -> (Arc<AtomicI64>, Clocks) {
+    let moved = Arc::new(AtomicI64::new(0));
+    let read = Arc::clone(&moved);
+    let wall = WallClock::from_fn(move || {
+        kr_ipc::now_ms()
+            .get()
+            .saturating_add_signed(read.load(Ordering::SeqCst))
+    });
+    (
+        moved,
+        Clocks {
+            wall,
+            ..Clocks::system()
+        },
+    )
+}
+
+/// Asks for the enrolment under `action`, as the owner's client does, stops it where it has
+/// done everything but take the store's transaction, runs `meanwhile`, and lets it go.
+async fn enrol_while_it_waits(
+    host: &Host,
+    client: kr_ipc::client::LocalClient,
+    params: &OrganisationEnrolParams,
+    meanwhile: impl AsyncFnOnce(),
+) -> (
+    kr_ipc::client::LocalClient,
+    Result<OrganisationEnrolResult, kr_protocol::error::ProtocolError>,
+) {
+    let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
+    let environment_id = host.environment_id;
+    let params = params.clone();
+    let enrolment = tokio::spawn(async move {
+        let mut client = client;
+        let answer = calls::mutate_as(
+            environment_id,
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::OrganisationEnrol,
+            &params,
+        )
+        .await;
+        (client, answer)
+    });
+    tokio::task::spawn_blocking(move || arrived.recv())
+        .await
+        .expect("the wait ends")
+        .expect("the enrolment reaches the store");
+    meanwhile().await;
+    go.send(()).expect("the enrolment waits");
+    enrolment.await.expect("the enrolment ends")
+}
+
+/// KR-REQ-17.53: a chain is enrolled only while its head is current, to the moment the policy is
+/// written. The head is judged before the enrolment waits for the locks it writes under, and its
+/// lifetime is a bound that can pass during the wait: an enrolment that waits past it enrols
+/// nothing, and the same enrolment that does not wait past it enrols.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_head_that_runs_out_while_the_enrolment_waits_for_the_store_enrols_nothing() {
+    let owner = keys();
+    let (moved, clocks) = moved_clocks();
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let mut client = host.client().await;
+    let signer = Signer::OwnerDevice(&owner);
+
+    // The control: the pause alone, with the head current when the transaction opens, enrols.
+    let (organisation, now) = organisation(0x21);
+    let params = enrol_params(&organisation, now);
+    calls::confirm_subject(host.environment_id, &mut client, subject(&params), &signer)
+        .await
+        .expect("the owner confirms the chain");
+    let (mut client, answer) = enrol_while_it_waits(&host, client, &params, async || {}).await;
+    answer.expect("a head that is current when the policy is written enrols");
+    assert_eq!(list(&mut client).await.enrolments.len(), 1);
+
+    // The head ends during the wait. The owner's confirmation is still inside its own deadline.
+    let (late, now) = self::organisation(0x22);
+    let params = enrol_params(&late, now);
+    calls::confirm_subject(host.environment_id, &mut client, subject(&params), &signer)
+        .await
+        .expect("the owner confirms the second chain");
+    let passed = i64::try_from(2 * 60 * 60 * 1000).expect("fits");
+    let (mut client, answer) = enrol_while_it_waits(&host, client, &params, async || {
+        moved.fetch_add(passed, Ordering::SeqCst);
+    })
+    .await;
+    let refused = answer.expect_err("the head ran out before the policy was written");
+    assert!(
+        matches!(
+            refused.code,
+            ErrorCode::InvalidArgument | ErrorCode::StorageUnavailable
+        ),
+        "{refused:?}"
+    );
+    let listed = list(&mut client).await;
+    assert_eq!(
+        listed.enrolments.len(),
+        1,
+        "only the first chain is enrolled"
+    );
+    assert_ne!(listed.enrolments[0].organisation_id, late.organisation_id);
+    host.stop().await;
+}
+
+/// KR-REQ-17.53: a host that stops trusting its clock while the enrolment waits enrols nothing,
+/// and asks for no more confirmations of chains until an owner establishes the clock again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clock_distrusted_while_the_enrolment_waits_for_the_store_enrols_nothing() {
+    let owner = keys();
+    let (moved, clocks) = moved_clocks();
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let mut client = host.client().await;
+    let (organisation, now) = organisation(0x21);
+    let params = enrol_params(&organisation, now);
+    calls::confirm_subject(
+        host.environment_id,
+        &mut client,
+        subject(&params),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("the owner confirms the chain");
+
+    let mut reader = host.client().await;
+    let back = i64::try_from(kr_controller::service::net::devices::CLOCK_TOLERANCE_MS + 60_000)
+        .expect("fits");
+    let (mut client, answer) = enrol_while_it_waits(&host, client, &params, async || {
+        // The wall clock steps back, and the next reading of it is the host's finding.
+        moved.fetch_sub(back, Ordering::SeqCst);
+        assert!(
+            !list(&mut reader).await.clock_trusted,
+            "a reading after a step back distrusts the clock"
+        );
+    })
+    .await;
+    let refused = answer.expect_err("the clock was distrusted before the policy was written");
+    assert_eq!(refused.code, ErrorCode::ClockUntrusted, "{refused:?}");
+    assert!(list(&mut client).await.enrolments.is_empty());
+
+    // A host that distrusts its clock shows an owner no chain either.
+    let refused = calls::request(host.environment_id, &mut client, subject(&params))
+        .await
+        .expect_err("no chain is judged at a clock that is not trusted");
+    assert_eq!(refused.code, ErrorCode::ClockUntrusted, "{refused:?}");
     host.stop().await;
 }
