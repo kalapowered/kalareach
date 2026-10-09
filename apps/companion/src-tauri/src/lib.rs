@@ -295,35 +295,46 @@ fn open_recovery(app: &tauri::AppHandle) {
         tracing::warn!("no application data directory, so this computer keeps no sync setting");
         return;
     };
-    if let Err(error) = start_recovery(app, &data) {
+    start_sync_service(app, &data);
+    let opened = app
+        .state::<AppState>()
+        .device()
+        .and_then(|device| start_recovery(app, &data, device.identity()));
+    if let Err(error) = opened {
         tracing::warn!(%error, "this computer's recovery records could not be opened");
     }
 }
 
-/// Opens the sync service setting kept under `data`, and recovery on the keys and secret store of
-/// the device this computer opened as, when it did.
+/// Opens the sync service setting kept under `data`.
+pub fn start_sync_service<R: tauri::Runtime>(app: &tauri::AppHandle<R>, data: &std::path::Path) {
+    use tauri::Manager as _;
+
+    app.state::<AppState>()
+        .sync_service_opened(std::sync::Arc::new(sync_service::SyncService::open(data)));
+}
+
+/// Opens recovery over the records kept under `data`, with the seed in `identity`'s secret store
+/// and `identity`'s authorisation key signing for the sync service the setting names.
 ///
 /// # Errors
 ///
-/// Returns a local failure when recovery's directory cannot be made. The setting is open then.
+/// Returns a local failure when the setting was not opened first or recovery's directory cannot
+/// be made.
 pub fn start_recovery<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     data: &std::path::Path,
+    identity: &device::DeviceIdentity,
 ) -> Result<()> {
     use std::sync::Arc;
 
     use tauri::Manager as _;
 
-    let service = Arc::new(sync_service::SyncService::open(data));
     let state = app.state::<AppState>();
-    state.sync_service_opened(Arc::clone(&service));
-    let device = state.device()?;
-    let identity = device.identity();
     let recovery = recovery::Recovery::open(
         data,
         Arc::clone(&identity.secrets),
         identity.keys.authorisation.clone(),
-        service,
+        state.sync_service()?,
     )?;
     state.recovery_opened(Arc::new(recovery));
     Ok(())

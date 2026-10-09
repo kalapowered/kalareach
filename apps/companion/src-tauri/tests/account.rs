@@ -329,7 +329,7 @@ fn the_desktop_hands_the_ceremony_to_the_browser_at_the_fixed_origin() {
     hand_off(Client::Desktop, Redirect::Loopback);
 }
 
-/// KR-REQ-20.15: signing in for recovery asks for the application's scopes and the right to write
+/// KR-REQ-17.19: signing in for recovery asks for the application's scopes and the right to write
 /// the account's backup storage, which the application's ordinary sign-in does not ask for.
 #[test]
 fn signing_in_for_recovery_asks_for_the_right_to_write_backup_storage() {

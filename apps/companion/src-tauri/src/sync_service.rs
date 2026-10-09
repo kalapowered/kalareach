@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use kr_client::services::account::ACCOUNT_ORIGIN;
+use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
 use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 
@@ -21,6 +22,9 @@ use crate::error::{CommandError, Result};
 
 /// The file the choice is kept in, in the application's data directory.
 pub const FILE: &str = "sync-origin";
+
+/// The most the file may hold, in bytes: an origin is at most 128.
+const ORIGIN_LIMIT: u64 = 1024;
 
 /// What the page is shown of the choice.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -64,8 +68,10 @@ impl SyncService {
     #[must_use]
     pub fn open(data: &Path) -> Self {
         let file = data.join(FILE);
-        let origin = std::fs::read_to_string(&file)
+        let origin = read_owner_only_file(&file, ORIGIN_LIMIT)
             .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|text| GatewayOrigin::new(text.trim()).ok())
             .unwrap_or_else(managed);
         Self {
@@ -105,7 +111,7 @@ impl SyncService {
                  an http one on this computer: {error}"
             ))
         })?;
-        keep(&self.file, origin.as_str()).map_err(|error| {
+        write_owner_only_file(&self.file, origin.as_str().as_bytes()).map_err(|error| {
             CommandError::local_failure(format!(
                 "the sync service setting could not be kept: {error}"
             ))
@@ -118,12 +124,4 @@ impl SyncService {
 /// The managed service's origin, which the setting holds until the person chooses another.
 fn managed() -> GatewayOrigin {
     GatewayOrigin::new(ACCOUNT_ORIGIN).expect("the managed service's origin is one")
-}
-
-/// Writes `text` as the whole of `file`: to a file beside it, then renamed into place, so a crash
-/// leaves the earlier choice or the new one and never half of either.
-fn keep(file: &Path, text: &str) -> std::io::Result<()> {
-    let partial = file.with_extension("partial");
-    std::fs::write(&partial, text)?;
-    std::fs::rename(&partial, file)
 }
