@@ -944,12 +944,13 @@ async fn keeping_an_answer_refuses_a_lock_that_is_a_link() {
     if let Err(error) = link(&target_of_the_link, &lock) {
         // Windows lets an account make a link only when it holds the privilege to; a Unix account
         // always can.
-        assert!(
-            cfg!(windows),
-            "a link is made where the lock belongs: {error}"
-        );
-        eprintln!("skipped: this account cannot make a symbolic link here: {error}");
-        return;
+        #[cfg(windows)]
+        {
+            eprintln!("skipped: this account cannot make a symbolic link here: {error}");
+            return;
+        }
+        #[cfg(not(windows))]
+        panic!("a link is made where the lock belongs: {error}");
     }
     let error = drafts
         .keep(&draft, &permit)
