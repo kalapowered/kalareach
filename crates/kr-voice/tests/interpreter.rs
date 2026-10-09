@@ -92,13 +92,12 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         // Marks round the words: quotation marks, brackets, the stops of a sentence, an apostrophe
         // in a word written straight or curly, and a mark that closes the utterance on its own.
         (&["\u{201c}Status of session 3.\u{201d}"], (Status, Some(3))),
-        (&["\"Open session (6)\""], (Navigate, Some(6))),
+        (&["\"open session 6.\""], (Navigate, Some(6))),
         (
             &["What\u{2019}s the status of session 3"],
             (Status, Some(3)),
         ),
-        (&["what's the status of session 3?!"], (Status, Some(3))),
-        (&["status of session 3\u{2026}"], (Status, Some(3))),
+        (&["status of session twenty-three."], (Status, Some(23))),
         (&["status of session 3 ."], (Status, Some(3))),
         (&["status of session 3", "?"], (Status, Some(3))),
     ];
@@ -160,48 +159,77 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
             Misread::UnreadableNumber,
         ),
         (&["status session thirty zero"], Misread::NotARequest),
+        // A mark between a ten and its unit makes two numbers, never twenty-three.
+        (&["open session twenty.", "Three."], Misread::NotARequest),
+        (&["open session twenty, three"], Misread::NotARequest),
+        (&["open session twenty (three)"], Misread::NotARequest),
+        (&["open session twenty - three"], Misread::NotARequest),
+        // A number said in words and left unfinished is no number: a hyphen that runs on to
+        // nothing, or a trailing off.
+        (&["open session twenty-"], Misread::UnreadableNumber),
+        (&["go to session twenty- please"], Misread::UnreadableNumber),
+        (&["open session twenty\u{2026}"], Misread::UnreadableNumber),
+        // Several marks together are no stop, and a mark after a number that is not one stays in it.
+        (&["status session 3.."], Misread::UnreadableNumber),
+        (
+            &["what's the status of session 3?!"],
+            Misread::UnreadableNumber,
+        ),
+        (&["status of session 3\u{2026}"], Misread::UnreadableNumber),
+        (&["status session 3-"], Misread::UnreadableNumber),
+        (&["status session 3+"], Misread::UnreadableNumber),
+        (&["status session 3%"], Misread::UnreadableNumber),
+        // A bracket round a number sets it apart from the word before it.
+        (&["\"Open session (6)\""], Misread::UnreadableNumber),
     ];
     for (texts, expected) in refused {
         assert_eq!(read(texts), Err(*expected), "{texts:?}");
     }
 }
 
-/// KR-REQ-15.11: no mark disappears from the middle of a number or from between the words that
-/// name it, whatever the mark and however the transcript spaces it, so that the session read is
-/// never one the person did not say. Only a quotation mark or a bracket right before a number is set
-/// aside.
+/// KR-REQ-15.11: no mark disappears from between the words that name a session, whatever the mark,
+/// whatever number is said and however the transcript spaces it, so that the session read is never
+/// one the person did not say. The only thing joined across a mark is the hyphen of a ten and its
+/// unit.
 #[test]
 fn a_mark_in_or_beside_a_number_leaves_no_number() {
-    const QUOTATION: &[&str] = &[
-        "(", "\"", "'", "\u{201c}", "\u{2018}", "\u{201d}", "\u{2019}",
+    const MARKS: &[&str] = &[
+        "(", "\"", "'", "\u{201c}", "\u{2018}", "\u{201d}", "\u{2019}", ".", ",", ";", ":", "!",
+        "?", "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}", "\u{2013}", "\u{2014}",
+        "\u{2011}", ")",
     ];
-    const OTHER: &[&str] = &[
-        ".", ",", ";", ":", "!", "?", "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}",
-        "\u{2013}", "\u{2014}", "\u{2011}", ")",
-    ];
-    for mark in QUOTATION.iter().chain(OTHER) {
-        for utterance in [
-            format!("open session {mark} 3"),
-            format!("open session 3 {mark} 3"),
-            format!("open session 3{mark}3"),
-        ] {
+    const HYPHENS: &[&str] = &["-", "\u{2011}"];
+    for (first, second) in [("3", "3"), ("twenty", "three")] {
+        for mark in MARKS {
+            // "twenty-three" is the one number written across a mark.
+            let one_number = first == "twenty" && HYPHENS.contains(mark);
+            let mut utterances = vec![
+                format!("open session {mark}{first}"),
+                format!("open session {first} {mark} {second}"),
+                format!("open session {first}{mark} {second}"),
+                format!("open session {first} {mark}{second}"),
+            ];
+            if !one_number {
+                utterances.push(format!("open session {first}{mark}{second}"));
+            }
+            for utterance in utterances {
+                assert!(
+                    read(&[&utterance]).is_err(),
+                    "{utterance:?} names no session"
+                );
+            }
+            // The same across the boundary of two fragments.
+            if !one_number {
+                assert!(
+                    read(&[&format!("open session {first}{mark}"), second]).is_err(),
+                    "{first}{mark} then {second} names no session"
+                );
+            }
             assert!(
-                read(&[&utterance]).is_err(),
-                "{utterance:?} names no session"
+                read(&[&format!("open session {mark}"), first]).is_err(),
+                "{mark:?} then {first} names no session"
             );
         }
-        // The same across the boundary of two fragments.
-        assert!(
-            read(&[&format!("open session {mark}"), "3"]).is_err(),
-            "{mark:?} then 3 names no session"
-        );
-    }
-    for mark in OTHER {
-        let utterance = format!("open session {mark}3");
-        assert!(
-            read(&[&utterance]).is_err(),
-            "{utterance:?} names no session"
-        );
     }
 }
 

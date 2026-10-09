@@ -506,6 +506,26 @@ async fn a_sessions_number_is_found_in_the_registry_when_it_has_no_worker() {
     world.serving.abort();
 }
 
+/// KR-REQ-15.11: a registry that cannot be read is an error and not a session with no number, so
+/// that a failed read is not turned into a refusal the host keeps as its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registry_that_cannot_be_read_is_not_a_session_without_a_number() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    rusqlite::Connection::open(world._temp.environment().registry_database())
+        .expect("opens the registry's file")
+        .execute_batch("DROP TABLE reservations")
+        .expect("the registry's table goes");
+
+    let error = world
+        .controller
+        .voice_session_number(SessionId::new(kr_ipc::new_uuid()))
+        .await
+        .expect_err("a registry that cannot be read gives no answer");
+    assert_eq!(error.code(), ErrorCode::StorageUnavailable);
+    world.serving.abort();
+}
+
 /// KR-REQ-15.11 and 19: what a person said is content, and the host keeps no copy of it. After a
 /// read the words asked for and a request for a session the call does not reach have been through
 /// the daemon, a phrase of the first and the number of the second are in none of the files the

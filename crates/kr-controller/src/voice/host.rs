@@ -42,10 +42,7 @@ fn gone() -> VoiceError {
 
 /// A failure of this daemon's own, as the coordinator carries it.
 fn host_error(error: ControllerError) -> VoiceError {
-    VoiceError::Host(kr_protocol::error::ProtocolError::new(
-        error.code(),
-        error.to_string(),
-    ))
+    VoiceError::Host(error.to_protocol_error())
 }
 
 impl SessionFacts for ControllerFacts {
