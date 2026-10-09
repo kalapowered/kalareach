@@ -1209,7 +1209,10 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
     document.network.enabled = Nullable::some(true);
     document.network.relay_urls = Nullable::some(vec!["https://relay.example.com".to_owned()]);
     document.network.dns_origin = Nullable::some("discovery.example.com".to_owned());
-    let started = Started::of(Some(&document));
+    let read = |document: &ConfigurationDocument| {
+        configuration::load(Some(configuration::contents(document).as_bytes()))
+    };
+    let started = Started::of(&read(&document));
     let endpoint = crate::service::net::config::NetworkSettings::from_selection(&document.network)
         .expect("a usable selection")
         .expect("this host joins")
@@ -1219,7 +1222,7 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
         names_a_broker: false,
     };
 
-    let check = network_check(&started, Some(&document), running);
+    let check = network_check(&started, &read(&document), running);
     assert_eq!(check.id(), "configuration-network");
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
     assert_eq!(
@@ -1232,7 +1235,7 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
     let mut edited = document.clone();
     edited.network.enabled = Nullable::some(false);
     edited.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
-    let check = network_check(&started, Some(&edited), running);
+    let check = network_check(&started, &read(&edited), running);
     assert_eq!(check.status, DoctorStatus::Warning);
     assert!(
         check.detail().ends_with("which applies at the next start"),
@@ -1245,7 +1248,11 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
     );
 
     // A host on no network says so, and a document it cannot use selects nothing too.
-    let quiet = network_check(&Started::default(), None, Running::default());
+    let quiet = network_check(
+        &Started::default(),
+        &configuration::load(None),
+        Running::default(),
+    );
     assert_eq!(quiet.status, DoctorStatus::Ok);
     assert_eq!(
         quiet.detail(),

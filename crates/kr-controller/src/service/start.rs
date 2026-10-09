@@ -168,6 +168,9 @@ impl Controller {
 
     /// The owner's settings for descriptions, as the configuration document now says them: each
     /// is on, or off for battery, unless the document chooses otherwise.
+    ///
+    /// A document this host cannot use turns them off: on is the product default and wider than
+    /// anything the owner could have chosen, and the owner's choice is in that document.
     pub(crate) fn description_settings(&self) -> kr_describe::resource::ResourceSettings {
         let resolver = self.configuration();
         let loaded = resolver.loaded();
@@ -176,9 +179,10 @@ impl Controller {
             .as_ref()
             .map(|document| &document.descriptions);
         kr_describe::resource::ResourceSettings {
-            enabled: section
-                .and_then(|section| section.enabled())
-                .unwrap_or(true),
+            enabled: !loaded.fails_closed()
+                && section
+                    .and_then(|section| section.enabled())
+                    .unwrap_or(true),
             on_battery: section
                 .and_then(|section| section.on_battery())
                 .unwrap_or(false),
@@ -342,7 +346,7 @@ impl Controller {
         // The network and the voice broker come from this same reading, and from nothing a
         // process inherited: section 26 keeps a provider origin out of reach of an environment
         // variable. They apply for as long as this daemon runs.
-        let started = crate::config::Started::of(startup_configuration.loaded().document.as_ref());
+        let started = crate::config::Started::of(startup_configuration.loaded());
         drop(startup_configuration);
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
@@ -378,7 +382,7 @@ impl Controller {
         // sends it starts below, before the document is accepted.
         let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
             &setup.paths,
-            Self::proxy_of(&started)?.as_ref(),
+            &Self::outbound_of(&started)?,
             Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
             startup_budgets.or(accepted_budgets).unwrap_or_default(),
             startup_policy.or(accepted_policy),
@@ -622,7 +626,7 @@ impl Controller {
                 );
                 let clients = crate::backup::runtime::managed_clients(
                     &origin,
-                    Self::proxy_of(&started)?.as_ref(),
+                    Self::outbound_of(&started)?.proxy()?,
                     &writer,
                     &tokens,
                 )?;
@@ -1052,40 +1056,51 @@ impl Controller {
         });
     }
 
-    /// The proxy this host's outbound HTTPS goes through: the configuration document's
-    /// `network.proxy_url` as this daemon read it when it started, or `None` when it named none.
+    /// How this host's outbound HTTPS leaves it: through the configuration document's
+    /// `network.proxy_url` as this daemon read it when it started, directly when it named none,
+    /// and not at all when the document could not be used, because the proxy it may have named is
+    /// not known and nothing goes around it.
     ///
     /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
-    /// delivery and the plugin catalogue never go through two different proxies, and an edit
+    /// delivery and the plugin catalogue never go through two different routes, and an edit
     /// applies to all of them at the next start.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] naming `network.proxy_url` when the address it
     /// holds is not one this host can use as a proxy.
-    pub fn started_proxy(&self) -> Result<Option<kr_transport::config::ProxyUrl>> {
-        Self::proxy_of(&self.started)
+    pub fn started_outbound(&self) -> Result<crate::config::Outbound> {
+        Self::outbound_of(&self.started)
     }
 
-    /// The proxy `started` selects, read as the network endpoint reads it.
-    fn proxy_of(
-        started: &crate::config::Started,
-    ) -> Result<Option<kr_transport::config::ProxyUrl>> {
-        started
-            .network
-            .proxy_url()
-            .map(|value| {
-                value
-                    .parse()
-                    .map_err(|error: kr_transport::config::ProxyUrlError| {
-                        ControllerError::InvalidArgument(format!(
-                            "network.proxy_url in this host's configuration document ({}) is not \
-                             usable: {error}",
-                            kr_protocol::hostinfo::configuration::FILE_NAME
-                        ))
-                    })
-            })
-            .transpose()
+    /// The route `started` selects, read as the network endpoint reads it.
+    fn outbound_of(started: &crate::config::Started) -> Result<crate::config::Outbound> {
+        use crate::config::Outbound;
+
+        if let Some(unusable) = &started.unusable {
+            return Ok(Outbound::Closed(unusable.outbound_refusal()));
+        }
+        Ok(
+            match started
+                .network
+                .proxy_url()
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|error: kr_transport::config::ProxyUrlError| {
+                            ControllerError::InvalidArgument(format!(
+                                "network.proxy_url in this host's configuration document ({}) is \
+                                 not usable: {error}",
+                                kr_protocol::hostinfo::configuration::FILE_NAME
+                            ))
+                        })
+                })
+                .transpose()?
+            {
+                Some(proxy) => Outbound::Through(proxy),
+                None => Outbound::Direct,
+            },
+        )
     }
 
     /// Closes every session recorded in an earlier boot.

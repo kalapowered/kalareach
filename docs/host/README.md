@@ -120,12 +120,27 @@ configuration file this host reads.
 
 | Rule | What it means |
 | --- | --- |
-| `version` | The schema version, 2. A document at version 1 is read as one at version 2 with no `storage` section, and the next edit writes it at version 2. A document declaring any other version is left exactly as it is, nothing is read out of it, every value falls to the product default, and `kr doctor` reports the version it found |
+| `version` | The schema version, 2. A document at version 1 is read as one at version 2 with no `storage` section, and the next edit writes it at version 2. A document declaring any other version is left exactly as it is, nothing is read out of it, the host fails closed until it is put right, and `kr doctor` reports the version it found and what to do |
 | `revision` | Rises by one with each validated edit. An edit names the revision it was built on and is refused if another writer moved it first, so no edit silently erases another |
 | 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |
 | owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
 | unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
 | omitted fields | The product's own value, and reported as the product's own. Every budget inside `enrolment` is separate: the example above configures one of the eleven, and `kr doctor` names that one rather than reporting eleven choices nobody made |
+
+If the host cannot use a configuration document, it leaves the document alone and fails closed. The
+document might declare a version that this build does not know how to read. The document might be
+damaged, or otherwise invalid according to the schema. The document might be a file that this host
+is not allowed to read. Until the problem is fixed, descriptions will be turned off and the host
+will not create any new session. Because the two worker profiles are different kinds of thing, and
+which kind to use is determined by the document, the host cannot guess a sensible value. Even
+`kr new` with a profile argument will refuse. Any session that is already running will not be affected.
+From the next time the control daemon starts, the network, voice, storage and proxy selections will
+all fail closed: nothing goes through the proxy the document may name, and nothing goes around it. A
+restriction the host accepted from the document earlier stays in force. A restriction that only the
+unusable document holds is not applied. `kr doctor` and every refused edit say what was found and
+how to put it right: use a release that reads the version, or rewrite the document. When the problem
+is fixed, descriptions and new sessions return at the next create, and the closed selections return
+at the next start of the daemon.
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
 operating-system lock on `.config.lock` in the environment's state directory, reads, validates,
@@ -215,7 +230,7 @@ with no path. The proxy is an origin by the same rules, with nothing after its h
 proxy address that names a user or a password, even an empty one, is refused as a proxy that needs
 credentials, which is not supported; it is never used with the credential dropped. Every address
 the document accepts is therefore one the endpoint accepts. A value outside these rules makes the
-whole document invalid, as it would in any other section: the host keeps its product defaults,
+whole document invalid, as it would in any other section: the host fails closed,
 `kr doctor` names the key and withholds the value, and an edit to another section is refused until
 the document is fixed. The proxy is this machine's own choice, and no invitation or host bundle
 carries it.

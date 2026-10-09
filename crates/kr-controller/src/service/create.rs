@@ -254,6 +254,16 @@ impl Drop for CreateHold {
 }
 
 impl Controller {
+    /// Why this host creates no new session, when it cannot use its configuration document.
+    ///
+    /// The document is accepted again first, as every `kr doctor` does, so one put right since the
+    /// last acceptance lifts the refusal on the next create without anything else asking.
+    async fn unusable_now(&self) -> Option<crate::config::Unusable> {
+        self.in_force().unusable.as_ref()?;
+        drop(self.accept_configuration().await);
+        self.in_force().unusable
+    }
+
     /// The environment a session started with the host's is given: the daemon's own, as it was
     /// allowed when the daemon started, with the variables the host's owner has configured over
     /// it by name.
@@ -386,16 +396,24 @@ impl Controller {
             }
             kr_protocol::session::ShellMode::NativeCompat => None,
         };
+        // Read before the registry is locked, because accepting the document takes that lock.
+        let unusable = self.unusable_now().await;
         let admission = {
             let mut registry = self.registry.lock().await;
             // The token is looked at under the same lock the reservation is taken under, and the
-            // refusal above is applied only to a token this registry has never seen. A create this
-            // actor already made is a retry, and section 9 says a retry is answered from what its
-            // first attempt produced; refusing one because the package went away in between would
-            // be refusing an action that already has an outcome.
+            // refusals below are applied only to a token this registry has never seen. A create
+            // this actor already made is a retry, and section 9 says a retry is answered from what
+            // its first attempt produced; refusing one because the package went away, or the
+            // document broke, in between would be refusing an action that already has an outcome.
             let known = registry
                 .reservation_for_token(actor_id, mutation.action_id.get())?
                 .is_some();
+            // A host that cannot use its configuration document creates no new session: the
+            // owner's choice between the two execution contexts is in it, and neither is inside
+            // the other. The request cannot say it chose: a client fills in the host's default.
+            if !known && let Some(unusable) = &unusable {
+                return Err(ControllerError::NotConfigured(unusable.refusal()));
+            }
             if !known && let Some(qualified) = qualified {
                 // Nothing is reserved and nothing is spawned before this, so an unsupported shell
                 // costs the caller a named error rather than a session that closes itself a moment

@@ -191,7 +191,12 @@ impl Authority for Confirmed<'_> {
 /// verification cannot be set up still reads the repositories on its own disk, and says why
 /// whenever it is asked to fetch one.
 #[must_use]
-pub fn repository_transport(proxy: Option<&kr_transport::config::ProxyUrl>) -> RepositoryTransport {
+pub fn repository_transport(outbound: &crate::config::Outbound) -> RepositoryTransport {
+    let proxy = match outbound.proxy() {
+        Ok(proxy) => proxy,
+        // Nothing may leave: repositories on this host are still read where they are.
+        Err(refusal) => return RepositoryTransport::local_only(refusal.to_string()),
+    };
     match kr_client::services::http::client_builder(proxy) {
         Ok(builder) => RepositoryTransport::over(builder),
         Err(error) => {
@@ -270,9 +275,10 @@ impl CatalogueModule {
     /// one serves anything: its change may have been made, so it is never performed again and
     /// never reported as refused.
     ///
-    /// Its repositories are fetched with this product's trust and through `proxy`, the one this
-    /// host's configuration document selected when the daemon started, or directly when it
-    /// selected none; a directory on this host is read where it is.
+    /// Its repositories are fetched with this product's trust and by `outbound`: through the proxy
+    /// this host's configuration document selected when the daemon started, directly when it
+    /// selected none, and not at all when the document could not be used; a directory on this host
+    /// is read where it is.
     ///
     /// `budgets` and `policy` are what this host's configuration puts in force when the daemon
     /// starts: the limits the budgets set hold every package from the first check on, and the
@@ -290,7 +296,7 @@ impl CatalogueModule {
     /// put its administrator's policy in force does not start without saying so.
     pub fn open(
         paths: &kr_ipc::paths::EnvironmentPaths,
-        proxy: Option<&kr_transport::config::ProxyUrl>,
+        outbound: &crate::config::Outbound,
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
         policy: Option<kr_protocol::admission::RevocationPolicy>,
@@ -298,7 +304,7 @@ impl CatalogueModule {
     ) -> crate::Result<Self> {
         Self::open_with(
             paths,
-            proxy,
+            outbound,
             native_bridge::BridgeHost::discover(paths.state_dir()),
             broker,
             budgets,
@@ -320,7 +326,7 @@ impl CatalogueModule {
     /// Returns what [`Self::open`] returns.
     pub fn open_with(
         paths: &kr_ipc::paths::EnvironmentPaths,
-        proxy: Option<&kr_transport::config::ProxyUrl>,
+        outbound: &crate::config::Outbound,
         bridges: native_bridge::BridgeHost,
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
@@ -332,7 +338,7 @@ impl CatalogueModule {
             detail: error.to_string(),
         };
         let mut catalogue =
-            Catalogue::with_broker(&root, broker, Arc::new(repository_transport(proxy)))
+            Catalogue::with_broker(&root, broker, Arc::new(repository_transport(outbound)))
                 .map_err(unavailable)?;
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
@@ -2885,6 +2891,35 @@ mod tests {
         );
     }
 
+    /// KR-REQ-26.13: a host that could not use its configuration document fetches no repository
+    /// address, directly or through a proxy: the route is closed, and an address that is listened
+    /// on hears nothing.
+    #[tokio::test]
+    async fn a_closed_route_fetches_no_repository_address() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        listener.set_nonblocking(true).expect("a listener to ask");
+        let address = listener.local_addr().expect("an address");
+        let transport = repository_transport(&crate::config::Outbound::Closed(
+            "the document cannot be used".to_owned(),
+        ));
+        let Ok(stream) = tough::Transport::fetch(
+            &transport,
+            format!("https://{address}/1.root.json")
+                .parse()
+                .expect("an address"),
+        )
+        .await
+        else {
+            panic!("the fetch answered without a stream");
+        };
+        let fetched = futures_util::TryStreamExt::try_collect::<Vec<tough::Bytes>>(stream).await;
+        assert!(fetched.is_err(), "nothing is fetched");
+        match listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            heard => panic!("a closed route reached its destination: {heard:?}"),
+        }
+    }
+
     /// KR-REQ-26.14: a repository address is fetched through the proxy this host selected. The
     /// proxy is asked for a tunnel to the repository, and when it refuses, the fetch fails rather
     /// than going around it.
@@ -2930,8 +2965,8 @@ mod tests {
         let repository = unused.local_addr().expect("an address");
         drop(unused);
 
-        let transport = repository_transport(Some(
-            &format!("http://127.0.0.1:{proxy_port}")
+        let transport = repository_transport(&crate::config::Outbound::Through(
+            format!("http://127.0.0.1:{proxy_port}")
                 .parse()
                 .expect("a proxy address"),
         ));
@@ -3012,7 +3047,7 @@ mod tests {
         use futures_util::TryStreamExt as _;
 
         let Ok(stream) = tough::Transport::fetch(
-            &repository_transport(None),
+            &repository_transport(&crate::config::Outbound::Direct),
             address.parse().expect("an address"),
         )
         .await

@@ -1362,10 +1362,20 @@ impl ComposedBundle {
 ///
 /// # A version this build does not know
 ///
-/// The document is left exactly as it is, nothing is read out of it, every preference takes the
-/// product default, and `kr doctor` reports the version it found. Guessing at a newer document's
-/// meaning is how a host applies a setting its owner never chose, and rewriting it is how an older
-/// build destroys a newer one's choices.
+/// The document is left exactly as it is, nothing is read out of it, and `kr doctor` reports the
+/// version it found. Guessing at a newer document's meaning is how a host applies a setting its
+/// owner never chose, and rewriting it is how an older build destroys a newer one's choices.
+///
+/// Nor does the host fall back to the product defaults, because some of them are wider than
+/// anything the owner could have chosen: it takes the narrowest value of each preference and
+/// selection, and where none is narrowest it does the thing the preference governs for no one.
+/// Descriptions are off, no new session is created (the two worker profiles differ in kind, and
+/// the owner's choice between them is in the document), and the network, voice, storage and proxy
+/// selections are closed from the next start of the control daemon, so nothing goes around a proxy
+/// the owner chose. A restriction the host accepted from the document before stays in force. A
+/// document that cannot be used for being damaged or unreadable, not only for being newer, is
+/// treated the same way. Absent is not unusable: it is the ordinary first run, with the product
+/// defaults.
 ///
 /// # Precedence
 ///
@@ -2611,7 +2621,7 @@ pub mod configuration {
         /// A document this build wrote or understands.
         Loaded,
         /// A document declaring a version this build does not know. It is left alone and nothing
-        /// is read out of it.
+        /// is read out of it, and the host fails closed (see [`ConfigurationDocument`]).
         UnknownVersion,
         /// A document this host could not read: a link, another user's file, or one larger than
         /// [`MAX_LEN`].
@@ -2633,8 +2643,8 @@ pub mod configuration {
             }
         }
 
-        /// Returns true when this host is running on product defaults because it could not use the
-        /// document it found.
+        /// Returns true when this host is failing closed because it could not use the document it
+        /// found: the narrowest value of each preference and selection, and no new session.
         #[must_use]
         pub const fn is_a_problem(self) -> bool {
             matches!(
@@ -2668,6 +2678,13 @@ pub mod configuration {
     }
 
     impl Loaded {
+        /// Returns true when the host fails closed because it cannot use the document: the one
+        /// predicate every consumer asks, [`DocumentState::is_a_problem`].
+        #[must_use]
+        pub const fn fails_closed(&self) -> bool {
+            self.status.state.is_a_problem()
+        }
+
         /// Returns the preference set the host-configuration rung contributes.
         #[must_use]
         pub fn preferences(&self) -> Option<&PreferenceSet> {
@@ -2692,13 +2709,19 @@ pub mod configuration {
         }
     }
 
+    /// What a host does while it cannot use its configuration document, said in the detail of every
+    /// state that makes it so. Each state adds its own remedy after it.
+    const FAILS_CLOSED: &str = "and until it is put right, descriptions are off, no new session is \
+         created, the network, voice, storage and proxy selections are closed from the next start \
+         of the control daemon, and the restrictions accepted before stay in force";
+
     /// Reads the bytes of a configuration document.
     ///
     /// `bytes` is `None` when the file is not there, which is the ordinary first run rather than a
     /// fault. Everything else this build cannot use leaves the document exactly where it is and
-    /// falls back to the product defaults with a status that says why, because a host that
-    /// silently ran on defaults would be a host whose owner's choices had quietly stopped
-    /// applying.
+    /// makes the host fail closed with a status that says why and how to put it right, because a
+    /// host that silently ran on defaults would be a host whose owner's choices had quietly
+    /// stopped applying, and some defaults are wider than anything the owner could have chosen.
     #[must_use]
     pub fn load(bytes: Option<&[u8]>) -> Loaded {
         let Some(bytes) = bytes else {
@@ -2741,7 +2764,13 @@ pub mod configuration {
                         .number(OLDEST_VERSION)
                         .stated(" to ")
                         .number(VERSION)
-                        .stated("; it is left alone and every value is the product default"),
+                        .stated("; it is left alone, ")
+                        .stated(FAILS_CLOSED)
+                        .stated(if declared > VERSION {
+                            "; use a release that reads this version, or rewrite the document"
+                        } else {
+                            "; rewrite the document"
+                        }),
                 },
             };
         }
@@ -2793,7 +2822,12 @@ pub mod configuration {
             status: DocumentStatus {
                 state: DocumentState::Unreadable,
                 detail: detail
-                    .stated("; this document is left alone and every value is the product default"),
+                    .stated("; this document is left alone, ")
+                    .stated(FAILS_CLOSED)
+                    .stated(
+                        "; make it a regular file that only you can read and write, within the \
+                         size bound",
+                    ),
             },
         }
     }
@@ -2812,7 +2846,9 @@ pub mod configuration {
             status: DocumentStatus {
                 state: DocumentState::Invalid,
                 detail: detail
-                    .stated("; this document is left alone and every value is the product default"),
+                    .stated("; this document is left alone, ")
+                    .stated(FAILS_CLOSED)
+                    .stated("; rewrite the document so that it is valid against its schema"),
             },
         }
     }
@@ -9047,17 +9083,29 @@ mod tests {
         assert_eq!(spelled, configuration::WIRE_WORDS);
     }
 
-    /// KR-REQ-26.13: a document declaring a version this build does not know is left alone.
+    /// KR-REQ-26.13: a document declaring a version this build does not know is left alone, the host
+    /// fails closed, and the status says what happens meanwhile and how to put it right.
     #[test]
-    fn an_unknown_version_reads_as_defaults_and_says_so() {
+    fn an_unknown_version_fails_closed_and_says_how_to_put_it_right() {
         let below = configuration::load(Some(br#"{"version": 0, "preferences": {}}"#));
         assert_eq!(below.status.state, DocumentState::UnknownVersion);
         assert!(
             below.document.is_none(),
             "version 0 is below the oldest this build reads"
         );
+        assert!(
+            below
+                .status
+                .detail
+                .as_str()
+                .contains("rewrite the document")
+                && !below.status.detail.as_str().contains("use a release"),
+            "an older version is put right by rewriting it: {:?}",
+            below.status
+        );
         let loaded = configuration::load(Some(br#"{"version": 99, "preferences": {}}"#));
         assert_eq!(loaded.status.state, DocumentState::UnknownVersion);
+        assert!(loaded.fails_closed());
         assert!(loaded.document.is_none(), "nothing is read out of it");
         assert!(
             loaded.status.detail.as_str().contains("99"),
@@ -9065,13 +9113,85 @@ mod tests {
             loaded.status
         );
         assert!(
-            configuration::edit(
-                &loaded,
-                &Change::SleepInhibition(SleepInhibitionSetting::Off)
-            )
-            .is_err(),
-            "and this build never rewrites it"
+            loaded
+                .status
+                .detail
+                .as_str()
+                .contains("use a release that reads this version")
+                && loaded
+                    .status
+                    .detail
+                    .as_str()
+                    .contains("no new session is created"),
+            "a newer version is put right by a release that reads it, and the status says what \
+             the host does meanwhile: {:?}",
+            loaded.status
         );
+        let refused = configuration::edit(
+            &loaded,
+            &Change::SleepInhibition(SleepInhibitionSetting::Off),
+        )
+        .expect_err("and this build never rewrites it");
+        let configuration::EditRefused::NotOurs(said) = refused else {
+            panic!("the edit is refused as not ours: {refused:?}");
+        };
+        assert_eq!(
+            said, loaded.status.detail,
+            "so every refused edit carries the remedy"
+        );
+    }
+
+    /// KR-REQ-26.13: a document that is damaged, or that this host may not read, fails closed as
+    /// one of a version it does not know does, and says how to put it right; an absent one does not.
+    #[test]
+    fn a_damaged_or_unreadable_document_fails_closed_and_an_absent_one_does_not() {
+        let invalid = configuration::load(Some(br#"{"version": 2, "not_a_member": 1}"#));
+        assert_eq!(invalid.status.state, DocumentState::Invalid);
+        assert!(invalid.fails_closed());
+        assert!(
+            invalid
+                .status
+                .detail
+                .as_str()
+                .contains("rewrite the document so that it is valid against its schema"),
+            "{:?}",
+            invalid.status
+        );
+        let unreadable = configuration::unreadable(
+            export::Sentence::new().stated("configuration file is not owned by this user"),
+        );
+        assert_eq!(unreadable.status.state, DocumentState::Unreadable);
+        assert!(unreadable.fails_closed());
+        assert!(
+            unreadable
+                .status
+                .detail
+                .as_str()
+                .contains("only you can read and write"),
+            "{:?}",
+            unreadable.status
+        );
+        for loaded in [&invalid, &unreadable] {
+            assert!(
+                loaded
+                    .status
+                    .detail
+                    .as_str()
+                    .contains("descriptions are off")
+                    && loaded
+                        .status
+                        .detail
+                        .as_str()
+                        .contains("proxy selections are closed"),
+                "{:?}",
+                loaded.status
+            );
+        }
+        assert!(
+            !configuration::load(None).fails_closed(),
+            "absent is the first run"
+        );
+        assert!(!configuration::load(Some(br#"{"version": 2}"#)).fails_closed());
     }
 
     /// KR-REQ-26.13: an absent document is the ordinary first run, not a fault.

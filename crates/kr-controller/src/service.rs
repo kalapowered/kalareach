@@ -886,6 +886,20 @@ impl Controller {
         self.delivery_runtime.attach_transport(transports)
     }
 
+    /// Attaches the managed transport every delivery exchange goes through, by the route this
+    /// daemon started with: the proxy its configuration document selected, directly when it
+    /// selected none, and not at all when the document could not be used. What the shipped daemon
+    /// does at startup, so a test runs the same line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ControllerError::InvalidArgument`] when the proxy address cannot be used.
+    pub fn attach_managed_delivery(&self) -> crate::Result<bool> {
+        Ok(self.attach_delivery_transport(Arc::new(
+            crate::push::transport::ManagedTransports::new(self.started_outbound()?),
+        )))
+    }
+
     /// The environment's automation service.
     #[must_use]
     pub const fn automation(&self) -> &Arc<crate::automation::AutomationModule> {

@@ -216,7 +216,7 @@ fn host() -> Host {
     let environment_id = temp.environment_id();
     let module = CatalogueModule::open(
         &environment,
-        None,
+        &kr_controller::config::Outbound::Direct,
         Arc::new(kr_plugin_catalogue::UnboundBroker),
         kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
         None,
@@ -1210,7 +1210,7 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
     // claim, not derived again from whatever admits the next request.
     let reopened = CatalogueModule::open(
         &environment,
-        None,
+        &kr_controller::config::Outbound::Direct,
         Arc::new(kr_plugin_catalogue::UnboundBroker),
         kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
         None,
@@ -1855,7 +1855,7 @@ async fn the_startup_policy_is_recorded_before_the_first_snapshot_is_computed() 
     let open = |policy| {
         CatalogueModule::open(
             &environment,
-            None,
+            &kr_controller::config::Outbound::Direct,
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
             policy,
@@ -1959,7 +1959,7 @@ async fn a_policy_recorded_at_open_forgets_no_release_a_surviving_worker_may_hol
     let open = |broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>, policy| {
         CatalogueModule::open(
             &environment,
-            None,
+            &kr_controller::config::Outbound::Direct,
             broker,
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
             policy,
@@ -3633,7 +3633,7 @@ mod native_bridges {
         let environment_id = temp.environment_id();
         let module = CatalogueModule::open_with(
             &environment,
-            None,
+            &kr_controller::config::Outbound::Direct,
             site.bridges(&environment),
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
@@ -3659,7 +3659,7 @@ mod native_bridges {
         let environment = host._temp.environment();
         host.module = CatalogueModule::open_with(
             &environment,
-            None,
+            &kr_controller::config::Outbound::Direct,
             site.bridges(&environment),
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
@@ -4874,7 +4874,7 @@ mod native_bridges {
         let open = |allowed| {
             CatalogueModule::open_with(
                 &environment,
-                None,
+                &kr_controller::config::Outbound::Direct,
                 site.bridges(&environment),
                 Arc::new(kr_plugin_catalogue::UnboundBroker),
                 kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),

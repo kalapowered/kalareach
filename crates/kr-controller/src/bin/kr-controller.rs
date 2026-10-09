@@ -258,9 +258,7 @@ async fn run(
     // question and a renewal to the gateway its credential names, and a webhook message to the
     // address its owner configured. Each goes through the managed transport of that origin, and
     // through the proxy this daemon started with, the one its network endpoint uses.
-    controller.attach_delivery_transport(std::sync::Arc::new(
-        kr_controller::push::transport::ManagedTransports::new(controller.started_proxy()?),
-    ));
+    controller.attach_managed_delivery()?;
 
     let rendezvous = Listener::bind(&environment.rendezvous_endpoint()?)?;
     let clients = Listener::bind(&environment.controller_endpoint()?)?;

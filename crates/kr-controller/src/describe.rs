@@ -402,6 +402,7 @@ impl DescribeModule {
     pub(crate) fn doctor_check(
         &self,
         settings: &kr_describe::resource::ResourceSettings,
+        unusable: Option<&crate::config::Unusable>,
     ) -> kr_protocol::hostinfo::DoctorCheck {
         use kr_protocol::hostinfo::export::Sentence;
         use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
@@ -433,7 +434,13 @@ impl DescribeModule {
             (Some(_), None) if !settings.enabled => (
                 DoctorStatus::NotApplicable,
                 Sentence::new().stated("descriptions are off; nothing new is generated, and a session shows the title it has from metadata, a pin or an earlier description"),
-                Some("kr host descriptions --on turns them on."),
+                // A document this host cannot use turned them off, and every edit of it is refused,
+                // so the command that would turn them on cannot; the document is what to put right.
+                Some(if unusable.is_some() {
+                    "Descriptions are off because the configuration document cannot be used; the check of that document says how to put it right."
+                } else {
+                    "kr host descriptions --on turns them on."
+                }),
             ),
             (Some(snapshot), None) => match snapshot.paused {
                 Some(DescriptionPause::NotDownloaded) => (
@@ -1034,8 +1041,10 @@ impl crate::service::Controller {
         if host.snapshot().figures.assets_held {
             return Ok(());
         }
-        let proxy = self.started_proxy()?;
-        let client = assets::client(proxy.as_ref())?;
+        // A document this host could not use when the daemon started leaves no proxy it can name
+        // and none it may go around, so the download is refused rather than made directly.
+        let outbound = self.started_outbound()?;
+        let client = assets::client(outbound.proxy()?)?;
         let taken = self.under_registration(carried, || {
             self.descriptions
                 .fetches
