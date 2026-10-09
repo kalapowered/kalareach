@@ -127,10 +127,10 @@ become authority by arriving over a channel the host trusts for something else.
   breaks a rule, words the grammar does not hold and a number the call does not reach are refused
   before that and spend nothing.
 - Submitting a prompt needs a spoken confirmation that names the destination session. The host
-  checks the session against the one it is about to submit to, and checks the words themselves for
-  a clear agreement, so silence and "do not send that" both stop it. The words reach the host from
-  the paired device, which hands over what the provider's transcript wrote, so they are content:
-  the grant is what permits the effect and this is what section 15 ¶13 asks for on top of it.
+  checks the session the interpreter read against the one it is about to submit to; that the words
+  were a clear confirmation is for the interpreter, which gives a destination only for an utterance
+  that is one. The host's grammar reads status, briefing and going to a session, none of which
+  needs a destination, so what a person says cannot submit a prompt.
 - An approval decision needs the verified request's details and an explicit answer. Details the host
   does not hold are refused rather than believed.
 - Cancelling a coding task uses the agent's typed request and its current turn identifier.

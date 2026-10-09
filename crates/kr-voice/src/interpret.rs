@@ -27,26 +27,16 @@ use kr_protocol::ids::{AgentTurnId, ApprovalRequestId, SessionId};
 use kr_protocol::scalars::Digest256;
 use kr_protocol::voice::{TranscriptFragment, VoiceAction};
 
-/// A spoken confirmation that names the destination session.
+/// The session a person named in a clear spoken confirmation, for an action that needs one.
 ///
 /// Section 15 ¶13 requires the confirmation to name the destination, so the host checks the name
-/// against the session it is about to submit to rather than accepting that one was given.
-#[derive(Clone, PartialEq, Eq)]
+/// against the session it is about to submit to rather than accepting that one was given. Whether
+/// the words were a clear confirmation is the interpreter's to decide, and it gives a destination
+/// only for an utterance that is one.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpokenDestination {
     /// The session the speaker named.
     pub session_id: SessionId,
-    /// The words the speaker used, as the transcript recorded them. Data, never authority.
-    pub spoken_text: String,
-}
-
-impl fmt::Debug for SpokenDestination {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The words are what a person said, and print as nothing.
-        formatter
-            .debug_struct("SpokenDestination")
-            .field("session_id", &self.session_id)
-            .finish_non_exhaustive()
-    }
 }
 
 /// An approval answer, with the details of the request it answers.
