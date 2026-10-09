@@ -370,9 +370,14 @@ jobs:
       # The credential chain is narrowed to the one the login above leaves behind. Every other kind
       # is switched off, so a login that did not happen fails here in seconds instead of working its
       # way down a list of credentials that could never be present on a runner.
+      #
+      # The action keeps its own tools in the Actions cache unless it is told not to, and a run on a
+      # tag would save a copy of them that no other run can read. The tools are fetched on every
+      # run instead, which takes under a minute of a release.
       - name: Sign every Windows artefact
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
+          cache-dependencies: false
           endpoint: https://eus.codesigning.azure.net/
           signing-account-name: kalareach
           certificate-profile-name: kalareach-public-trust
