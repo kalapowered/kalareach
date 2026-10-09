@@ -638,9 +638,10 @@ impl Fate {
 /// The lines an external message carries for one announcement, in the host's own words.
 ///
 /// What a message names is what the host itself knows of the condition: which rule raised it, the
-/// session it belongs to and, for an automation paused by a limit, the host's own summary of it. A session's own words never enter: the attention store keeps none of
-/// them, and a message built here could not carry them if it tried. The lines are committed with
-/// the notice, so a recovery that produces from the event again composes from the same lines.
+/// session it belongs to and, for an automation paused by a limit, the host's own summary of it. A
+/// session's own words never enter: the attention store keeps none of them, and a message built
+/// here could not carry them if it tried. The lines are committed with the notice, so a recovery
+/// that produces from the event again composes from the same lines.
 ///
 /// Each line is dated by when the condition was first seen and names its session, which is what
 /// lets the message be checked against the grant of the rule that sends it, resource by resource
