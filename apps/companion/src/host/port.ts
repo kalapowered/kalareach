@@ -31,6 +31,7 @@ import type {
   AttentionAcknowledgeParams,
   AttentionAcknowledgeResult,
   ActionTarget,
+  AttachmentHandle,
   AttentionReadParams,
   AttentionReadResult,
   AuthorityNotice,
@@ -498,15 +499,7 @@ export interface ApprovedLink {
 }
 
 /** A completed, verified attachment, as `upload.finish` published it. */
-export interface AttachmentHandle {
-  readonly transfer_id: string
-  readonly environment_id: string
-  readonly byte_len: string
-  readonly content_digest: string
-  readonly declared_media_type: string
-  readonly original_file_name: string
-  readonly presented_as_image: boolean
-}
+export type { AttachmentHandle }
 
 /** One image the person explicitly imported. */
 export interface ImportedImage {
@@ -580,6 +573,69 @@ export type AnswerOutcome =
     }
   /** The host did not confirm that it took it, so a copy is kept on this device. */
   | { readonly outcome: 'kept'; readonly draft: KeptAnswer }
+
+/** Whether a stored draft still goes where it was written for, or waits for a person's choice. */
+export type StoredMark = 'open' | 'conflicted' | 'orphaned'
+
+/** A draft as this device's store keeps it. */
+export interface StoredDraft {
+  readonly id: string
+  /** The version of it that the next save names. */
+  readonly revision: string
+  readonly sessionId: string
+  readonly applicationInstanceId: string | null
+  readonly agentBindingRevision: string | null
+  readonly state: StoredMark
+  readonly text: string
+  /** The completed uploads on it, without their previews. */
+  readonly attachments: readonly AttachmentHandle[]
+  /** The draft this one was kept beside when two windows changed the same draft. */
+  readonly copyOf: string | null
+  readonly createdAtMs: string
+  readonly updatedAtMs: string
+}
+
+/** The drafts of the store, and how many of its files could not be read. */
+export interface StoredDrafts {
+  readonly drafts: readonly StoredDraft[]
+  readonly unreadable: number
+}
+
+/** A save: a new draft when `id` is null, else a replacement of the version `expectedRevision`. */
+export interface DraftSaveRequest {
+  readonly id: string | null
+  readonly expectedRevision: string | null
+  readonly sessionId: string
+  readonly applicationInstanceId: string | null
+  readonly agentBindingRevision: string | null
+  readonly state: StoredMark
+  readonly text: string
+  readonly attachments: readonly AttachmentHandle[]
+}
+
+/** What a save did: kept the draft, or kept this window's version as a copy beside another's. */
+export interface DraftSaved {
+  readonly outcome: 'stored' | 'copied'
+  /** For a copy, the draft it sits beside. */
+  readonly of: string | null
+  /** The draft as stored: the one saved, or the copy. */
+  readonly draft: StoredDraft
+}
+
+/** A retarget of the version `expectedRevision` of a draft. */
+export interface DraftRetargetRequest {
+  readonly id: string
+  readonly expectedRevision: string
+  readonly sessionId: string
+  readonly applicationInstanceId: string | null
+  readonly agentBindingRevision: string | null
+}
+
+/** A discard of the version `expectedRevision` of a draft. */
+export interface DraftDiscardRequest {
+  readonly id: string
+  readonly expectedRevision: string
+}
 
 /** One answer a person gave that the host did not confirm it took. */
 export interface KeptAnswer {
@@ -788,6 +844,20 @@ export interface HostPort {
   composerInterrupt(params: AgentCancelParams): Promise<Settled<AgentMutationResult>>
   approvalRespond(params: AgentApprovalRespondParams): Promise<Settled<AgentApprovalRespondResult>>
   pluginActionInvoke(params: unknown, subject: SessionSubject): Promise<Settled>
+
+  /**
+   * The drafts this device keeps, and how many files in its store could not be read.
+   *
+   * Native code keeps them in a store of its own that outlives the application. A store that
+   * cannot be opened refuses, and the page keeps its drafts in the window and says so.
+   */
+  deviceDrafts(): Promise<StoredDrafts>
+  /** Keeps a draft: makes it, or replaces the version the request names. */
+  deviceDraftSave(request: DraftSaveRequest): Promise<DraftSaved>
+  /** Points a draft at a session and conversation a person chose, which clears its mark. */
+  deviceDraftRetarget(request: DraftRetargetRequest): Promise<StoredDraft>
+  /** Throws away a draft, if it is still the version the request names. */
+  deviceDraftDiscard(request: DraftDiscardRequest): Promise<{ readonly removed: boolean }>
 
   draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
   draftUpdate(params: unknown, subject: SessionSubject): Promise<Settled>

@@ -14,7 +14,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import { HarnessStrip, TapAwayPutsTheKeyboardAway, applyPendingReset } from '../src/harness-strip'
 import { MobileApp } from '../src/mobile/MobileApp'
-import { DRAFTS_KEY } from '../src/mobile/model/store'
+import { FAKE_DRAFTS_KEY, FakeDraftStore } from '../src/host/fake-drafts'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -131,13 +131,13 @@ describe('the harness control strip', () => {
     const person = userEvent.setup()
     const reload = vi.fn()
     const storage = window.localStorage
-    storage.setItem('kr.mobile.drafts', '[]')
+    storage.setItem(FAKE_DRAFTS_KEY, '[]')
     storage.setItem('kr.mobile.submissions', '[]')
     storage.setItem('kalareach-theme', 'dark')
     open(storage, reload)
     await person.click(screen.getByRole('button', { name: 'Controls' }))
     await person.click(screen.getByRole('button', { name: 'Reset' }))
-    expect(storage.getItem('kr.mobile.drafts')).toBeNull()
+    expect(storage.getItem(FAKE_DRAFTS_KEY)).toBeNull()
     expect(storage.getItem('kr.mobile.submissions')).toBeNull()
     expect(storage.getItem('kalareach-theme')).toBe('dark')
     expect(reload).toHaveBeenCalledTimes(1)
@@ -148,7 +148,8 @@ describe('the harness control strip', () => {
     const person = userEvent.setup()
     const storage = fakeStorage()
     const session = fakeStorage()
-    const host = fakeHost()
+    // The device's drafts are kept in the page's storage, as the harness keeps them.
+    const host = fakeHost({ drafts: new FakeDraftStore(storage) })
     // A browser fires `pagehide` as the page goes, and the page writes what it holds then: the
     // reset has to survive that, whenever the next page starts.
     const reload = () => {
@@ -165,17 +166,17 @@ describe('the harness control strip', () => {
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
     await person.click(await screen.findByRole('button', { name: /Session 1/ }))
     await person.type(await screen.findByLabelText('Message this session'), 'a draft')
-    expect(storage.getItem(DRAFTS_KEY)).not.toBeNull()
+    expect(storage.getItem(FAKE_DRAFTS_KEY)).not.toBeNull()
 
     await person.click(screen.getByRole('button', { name: 'Controls' }))
     await person.click(screen.getByRole('button', { name: 'Reset' }))
     // The next page, before it shows anything.
     applyPendingReset(storage, session)
-    expect(storage.getItem(DRAFTS_KEY)).toBeNull()
+    expect(storage.getItem(FAKE_DRAFTS_KEY)).toBeNull()
     // And only once: a draft written after that is kept.
-    storage.setItem(DRAFTS_KEY, '[]')
+    storage.setItem(FAKE_DRAFTS_KEY, '[]')
     applyPendingReset(storage, session)
-    expect(storage.getItem(DRAFTS_KEY)).toBe('[]')
+    expect(storage.getItem(FAKE_DRAFTS_KEY)).toBe('[]')
   })
 
   it('puts the keyboard away when a finger lifts from text, and leaves it for a control', () => {

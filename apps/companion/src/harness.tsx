@@ -13,6 +13,7 @@ import { createRoot } from 'react-dom/client'
 
 import { AppProvider } from './app/state'
 import { fakeHost, type FakeHostControls } from './host/fake'
+import { FakeDraftStore } from './host/fake-drafts'
 // The same shell choice the shipped entry makes, with `?surface=` so a browser test can ask for
 // the phone's one without pretending to be a phone.
 import { Shell, surfaceOf } from './mobile/entry'
@@ -36,7 +37,9 @@ if (!root) throw new Error('The application has no root element.')
 // Before the shell reads what the page kept: a reset the strip asked for is done here.
 applyPendingReset(window.localStorage, window.sessionStorage)
 
-const { port, controls } = fakeHost()
+// The device's drafts are kept in the page's storage, which is what lets a reload stand for the
+// application being started again.
+const { port, controls } = fakeHost({ drafts: new FakeDraftStore(window.localStorage) })
 window.krTestHost = controls
 
 // `?sessions=` lengthens the host's list past a screen, for a test of what a scrolled list asks.

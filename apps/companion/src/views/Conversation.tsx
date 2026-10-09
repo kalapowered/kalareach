@@ -81,7 +81,6 @@ import {
   connectionLost,
   edit,
   notSubmittableBecause,
-  retarget,
   submittable,
   type Draft,
   type DraftAttachment,
@@ -102,6 +101,7 @@ import {
   wasRefused
 } from '../model/receipts'
 import type { LaunchSurface } from '../model/pending'
+import { useBook, useSessionDraft } from '../app/drafts'
 import { ApprovalRequests } from './Approvals'
 import { KeptAnswers, QuestionRequests } from './Questions'
 
@@ -147,9 +147,13 @@ export function Conversation({
   readonly shellMode?: 'managed' | 'native_compat' | null
   readonly onLaunched: () => void
 }): ReactNode {
-  const { port, say } = useApp()
+  const { port, say, drafts: book } = useApp()
   const rights = useConnectionRights()
   const { state, update } = useSession(sessionId)
+  // The draft belongs to the window, not to this view: it is kept on this device as it is typed,
+  // and it is the same draft whichever view of the session is open, and after the tab is closed.
+  const { draft, ready: draftsOpen, change: changeDraft } = useSessionDraft(sessionId)
+  const { problem: draftsProblem } = useBook()
   const { unread, refresh } = useSessionAgent(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
   // Why the host's event stream could not be followed, under the visit it was opened in: a failure
@@ -191,16 +195,19 @@ export function Conversation({
    */
   const returnRefusedText = useCallback(
     (localId: string) => {
+      const refused: { text: string | null } = { text: null }
       update((current) => {
-        const refused = current.submissions.find(
-          (submission) => submission.localId === localId
-        )
-        if (!refused || refused.text.length === 0) return current
-        if (current.draft.text.length > 0) return current
-        return { ...current, draft: edit(current.draft, refused.text, Date.now()) }
+        const found = current.submissions.find((submission) => submission.localId === localId)
+        if (found && found.text.length > 0) refused.text = found.text
+        return current
       })
+      const returned = refused.text
+      if (returned === null) return
+      changeDraft((current) =>
+        current.text.length > 0 ? current : edit(current, returned, Date.now())
+      )
     },
-    [update]
+    [update, changeDraft]
   )
 
   // The host's event stream carries a package's presentation nodes and late receipts. Each is
@@ -273,20 +280,17 @@ export function Conversation({
   // A draft written before the agent was read keeps the first conversation it learns, so that a
   // later move is a conflict rather than a new conversation the text follows.
   useEffect(() => {
-    update((current) => {
-      const adopted = adoptFirstTarget(current.draft, currentTarget)
-      return adopted === current.draft ? current : { ...current, draft: adopted }
-    })
-  }, [currentTarget, update])
+    changeDraft((current) => adoptFirstTarget(current, currentTarget))
+  }, [currentTarget, changeDraft, draftsOpen])
 
   // Losing contact removes the association, not the draft, and a moved conversation conflicts the
   // draft rather than taking it. Both are facts about the session now, so they are derived here
   // rather than written into the stored draft: the text, the revision and the attachments are
   // untouched, and a rebind or a retarget is still the explicit act it has to be.
   const presented = useMemo(() => {
-    const drafted = againstCurrent(state.draft, currentTarget)
+    const drafted = againstCurrent(draft, currentTarget)
     return connected ? drafted : connectionLost(drafted)
-  }, [connected, state.draft, currentTarget])
+  }, [connected, draft, currentTarget])
 
   // What a control's visibility is decided from: every fact this device has been told.
   const controlState: ControlState = useMemo(
@@ -329,13 +333,20 @@ export function Conversation({
       const local = queued(`s-${Date.now()}-${Math.random()}`, label, Date.now(), typed)
       const clears = action === 'submit' || action === 'queue'
 
+      // The stored draft is brought up to what is being sent and held as it is until the prompt
+      // ends, before the composer clears: a refusal or an outcome nobody knows leaves it kept.
+      const sending = clears ? book.beginSend(sessionId) : null
+      const ended = { done: false }
+      const end = (outcome: 'taken' | 'refused' | 'unknown') => {
+        if (sending === null || ended.done) return
+        ended.done = true
+        book.endSend(sending, outcome)
+      }
+
       // Local feedback first: the entry appears as queued and the composer clears. The completion
       // feedback below waits for the host's answer.
-      update((current) => ({
-        ...current,
-        submissions: [...current.submissions, local],
-        draft: clears ? edit(current.draft, '', Date.now()) : current.draft
-      }))
+      update((current) => ({ ...current, submissions: [...current.submissions, local] }))
+      if (clears) changeDraft((current) => edit(current, '', Date.now()))
 
       const now = targetOf(sessionId, instance, binding)
       const target =
@@ -371,6 +382,7 @@ export function Conversation({
           if (outcome === 'unknown') {
             say('The host could not confirm what became of that.', 'danger')
           }
+          end(wasRefused(outcome) ? 'refused' : outcome === 'unknown' ? 'unknown' : 'taken')
         })
         .catch((error: unknown) => {
           const code = failureCode(error) ?? 'UNKNOWN'
@@ -384,10 +396,23 @@ export function Conversation({
           }))
           returnRefusedText(local.localId)
           say(failureMessage(error), 'danger')
+          end('refused')
         })
         .finally(refresh)
     },
-    [port, sessionId, agent.binding, agent.instance, presented, update, say, returnRefusedText, refresh]
+    [
+      port,
+      sessionId,
+      agent.binding,
+      agent.instance,
+      presented,
+      update,
+      changeDraft,
+      book,
+      say,
+      returnRefusedText,
+      refresh
+    ]
   )
 
   /**
@@ -438,44 +463,39 @@ export function Conversation({
         const localId = `file-${Date.now()}-${Math.random()}`
         // Settles the file with what its upload said, and answers whether it is still on the
         // draft: one the person removed meanwhile is gone, and nothing is said about it.
-        const settle = (change: Partial<DraftAttachment>): boolean => {
-          let present = false
-          update((current) => {
-            present = current.draft.attachments.some((attachment) => attachment.localId === localId)
-            if (!present) return current
+        const settle = (patch: Partial<DraftAttachment>): boolean => {
+          const found = { present: false }
+          changeDraft((current) => {
+            found.present = current.attachments.some((attachment) => attachment.localId === localId)
+            if (!found.present) return current
             return {
               ...current,
-              draft: {
-                ...current.draft,
-                attachments: current.draft.attachments.map((attachment) =>
-                  attachment.localId === localId ? { ...attachment, ...change } : attachment
-                )
-              }
+              attachments: current.attachments.map((attachment) =>
+                attachment.localId === localId ? { ...attachment, ...patch } : attachment
+              )
             }
           })
-          return present
+          return found.present
         }
-        update((current) => ({
+        changeDraft((current) => ({
           ...current,
-          draft: {
-            ...current.draft,
-            attachments: [
-              ...current.draft.attachments,
-              {
-                localId,
-                transferId: null,
-                name,
-                byteLen: incoming.kind === 'dropped' ? incoming.file.byte_len : incoming.file.size,
-                mediaType:
-                  incoming.kind === 'dropped'
-                    ? incoming.file.media_type
-                    : incoming.file.type || 'application/octet-stream',
-                presentedAsImage: false,
-                upload: 'uploading',
-                acceptedUpstream: false
-              }
-            ]
-          }
+          attachments: [
+            ...current.attachments,
+            {
+              localId,
+              transferId: null,
+              name,
+              byteLen: incoming.kind === 'dropped' ? incoming.file.byte_len : incoming.file.size,
+              mediaType:
+                incoming.kind === 'dropped'
+                  ? incoming.file.media_type
+                  : incoming.file.type || 'application/octet-stream',
+              presentedAsImage: false,
+              upload: 'uploading',
+              acceptedUpstream: false,
+              handle: null
+            }
+          ]
         }))
         upload()
           .then((handle) => {
@@ -486,7 +506,8 @@ export function Conversation({
               byteLen: Number(handle.byte_len),
               mediaType: handle.declared_media_type,
               presentedAsImage: handle.presented_as_image,
-              upload: 'uploaded'
+              upload: 'uploaded',
+              handle
             })
             if (!kept) return
             setInsertion(
@@ -499,7 +520,7 @@ export function Conversation({
           })
       }
     },
-    [port, subject, update, offers.attach]
+    [port, subject, changeDraft, offers.attach]
   )
 
   const dropped = useCallback(
@@ -791,40 +812,37 @@ export function Conversation({
         />
       ) : null}
 
+      {draftsProblem === null ? null : (
+        <p className="banner warning" data-testid="drafts-not-kept">
+          This device is not keeping what you write: {draftsProblem}. The draft is here and can
+          still be sent; it will not survive this window being closed.
+        </p>
+      )}
+
       <Composer
         draft={presented}
+        opening={!draftsOpen}
         connected={connected}
         offers={offers}
         commands={agent.commands}
         insertion={insertion}
         onChange={(next) => {
-          update((current) => ({
-            ...current,
-            draft: edit(againstCurrent(current.draft, currentTarget), next, Date.now())
-          }))
+          changeDraft((current) => edit(againstCurrent(current, currentTarget), next, Date.now()))
         }}
         onRetarget={
           currentTarget === null
             ? null
             : () => {
-                update((current) => ({
-                  ...current,
-                  draft: retarget(current.draft, currentTarget, current.draft.attachmentId)
-                }))
+                book.retarget(sessionId, currentTarget)
               }
         }
         onPasteFiles={(files) => {
           attach(files.map((file) => ({ kind: 'handed', file })))
         }}
         onRemoveAttachment={(localId) => {
-          update((current) => ({
+          changeDraft((current) => ({
             ...current,
-            draft: {
-              ...current.draft,
-              attachments: current.draft.attachments.filter(
-                (attachment) => attachment.localId !== localId
-              )
-            }
+            attachments: current.attachments.filter((attachment) => attachment.localId !== localId)
           }))
           setInsertion(null)
         }}
@@ -1411,6 +1429,7 @@ function commandLine(argv: readonly string[]): string {
 /** The composer. */
 function Composer({
   draft,
+  opening,
   connected,
   offers,
   commands,
@@ -1422,6 +1441,8 @@ function Composer({
   onAction
 }: {
   readonly draft: Draft
+  /** True while the drafts kept on this device are being read: nothing typed yet could be kept. */
+  readonly opening: boolean
   readonly connected: boolean
   readonly offers: ComposerOffers
   readonly commands: readonly AgentCommand[]
@@ -1444,6 +1465,17 @@ function Composer({
     notSubmittableBecause(draft) ?? (offers.submit.offered ? null : offers.submit.reason)
   const canSubmit = offers.submit.offered && submittable(draft) && connected
   const canWrite = submittable(draft) && connected
+
+  if (opening) {
+    // Typing before the kept drafts are read would be typing over them, so the field waits.
+    return (
+      <div className="composer" data-testid="composer-opening">
+        <p className="faint small" role="status">
+          Opening your drafts…
+        </p>
+      </div>
+    )
+  }
 
   return (
     <div className="composer" data-testid="composer" data-draft-state={draft.state}>

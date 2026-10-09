@@ -12,6 +12,8 @@
  * offered when insertion is refused.
  */
 
+import type { AttachmentHandle } from '@kalareach/protocol'
+
 /** What a draft was written for. */
 export interface DraftTarget {
   readonly sessionId: string
@@ -42,6 +44,20 @@ export interface Draft {
   readonly attachmentId: string | null
   /** The attachment handles the person added, which survive a failed insertion. */
   readonly attachments: readonly DraftAttachment[]
+  /**
+   * The stored draft this one is kept in, once a write of it has been answered.
+   *
+   * It is the store's name for the draft and the version the next write replaces. It is not the
+   * draft's `revision`, which counts the edits made in this window and tells a late answer that
+   * the person has typed since.
+   */
+  readonly stored: StoredRef | null
+}
+
+/** A draft as the store names it. */
+export interface StoredRef {
+  readonly id: string
+  readonly revision: string
 }
 
 /** One attachment on a draft. */
@@ -58,6 +74,8 @@ export interface DraftAttachment {
   readonly upload: 'uploading' | 'uploaded' | 'failed'
   /** True once the agent accepted it upstream, which only upstream evidence sets. */
   readonly acceptedUpstream: boolean
+  /** The verified handle of a completed upload, which is what a store keeps of the file. */
+  readonly handle: AttachmentHandle | null
 }
 
 /** Starts a draft for a target. */
@@ -75,7 +93,8 @@ export function startDraft(
     state: 'bound',
     updatedAtMs: now,
     attachmentId: null,
-    attachments: []
+    attachments: [],
+    stored: null
   }
 }
 

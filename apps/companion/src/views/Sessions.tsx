@@ -14,6 +14,7 @@ import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@
 
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { useApp } from '../app/state'
+import { useBook } from '../app/drafts'
 import { useConnectionRights } from '../app/rights'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
@@ -67,6 +68,7 @@ export function sessionDescription(session: Session): string {
 export function Sessions(): ReactNode {
   const { port, go } = useApp()
   const rights = useConnectionRights()
+  const { kept: keptDrafts } = useBook()
   const [list, setList] = useState<SessionListResult | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [query, setQuery] = useState('')
@@ -147,6 +149,20 @@ export function Sessions(): ReactNode {
           </div>
         ) : null}
       </header>
+
+      {keptDrafts.length === 0 ? null : (
+        <p className="small" data-testid="kept-drafts-entry">
+          <Button
+            tone="quiet"
+            onClick={() => {
+              go({ view: 'drafts' })
+            }}
+          >
+            {keptDrafts.length === 1 ? 'One kept draft' : `${keptDrafts.length} kept drafts`}
+          </Button>{' '}
+          <span className="muted">are not in a composer.</span>
+        </p>
+      )}
 
       <NewSession
         open={creating}

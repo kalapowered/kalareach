@@ -11,6 +11,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   useSyncExternalStore,
@@ -21,6 +22,7 @@ import type { ActionRight } from '@kalareach/protocol'
 
 import type { HostPort } from '../host/port'
 import type { ToastAction, ToastMessage } from '../components/ui'
+import { DraftBook } from '../model/draft-book'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
 
@@ -33,6 +35,7 @@ export type Place =
   | { readonly view: 'plugins' }
   | { readonly view: 'pairing' }
   | { readonly view: 'setup' }
+  | { readonly view: 'drafts' }
   | {
       readonly view: 'session'
       readonly sessionId: string
@@ -44,6 +47,11 @@ interface AppValue {
   readonly port: HostPort
   /** What every session's views share, kept apart from every other session's. */
   readonly sessions: SessionStates
+  /**
+   * The drafts of this window, and the writer that keeps them on this device. It lives above both
+   * layouts and every tab, so closing a tab or switching views forgets no draft.
+   */
+  readonly drafts: DraftBook
   /**
    * The rights the connection last reported, kept while contact is out and for a screen that opens
    * after it ended. The shell writes it as it hears the connection; a control that only keeps what
@@ -102,6 +110,7 @@ export function AppProvider({
   // One store per window, created once. A store built during render would be a different store on
   // every render, and every session's state would go with the old one.
   const [sessions] = useState(() => new SessionStates())
+  const [drafts] = useState(() => new DraftBook(port))
   const [lastRights, setLastRights] = useState<readonly ActionRight[] | null>(null)
   const rememberRights = useCallback((rights: readonly ActionRight[]) => {
     setLastRights((held) =>
@@ -117,6 +126,28 @@ export function AppProvider({
     },
     []
   )
+
+  // The drafts kept on this device are read once, and written as the window is hidden or closed.
+  // A write is also made at every change, so these two are a second chance, not the only one.
+  useEffect(() => {
+    void drafts.hydrate()
+    const told = drafts.onNotice((words) => {
+      say(words, 'pending')
+    })
+    const write = () => {
+      drafts.writeAll()
+    }
+    const hidden = () => {
+      if (document.visibilityState === 'hidden') write()
+    }
+    window.addEventListener('pagehide', write)
+    document.addEventListener('visibilitychange', hidden)
+    return () => {
+      told()
+      window.removeEventListener('pagehide', write)
+      document.removeEventListener('visibilitychange', hidden)
+    }
+  }, [drafts, say])
 
   const openTab = useCallback((sessionId: string) => {
     setTabs((current) => (current.includes(sessionId) ? current : [...current, sessionId]))
@@ -169,6 +200,7 @@ export function AppProvider({
     () => ({
       port,
       sessions,
+      drafts,
       lastRights,
       rememberRights,
       place,
@@ -188,6 +220,7 @@ export function AppProvider({
     [
       port,
       sessions,
+      drafts,
       lastRights,
       rememberRights,
       place,

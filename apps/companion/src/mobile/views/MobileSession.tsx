@@ -38,7 +38,6 @@ import {
   againstCurrent,
   edit,
   notSubmittableBecause,
-  retarget,
   startDraft,
   submittable,
   type Draft,
@@ -93,6 +92,7 @@ import { ask } from '../model/call'
 import { describeMode } from '../model/gestures'
 import { putBack, restOn, type Position } from '../model/keyboard'
 import { admit, describeBytes, type Picked } from '../model/media'
+import { useBook } from '../../app/drafts'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
 
@@ -146,15 +146,19 @@ export function MobileSession({
   sessionId,
   surface,
   lifecycle,
-  connected
+  connected,
+  onOpenKept
 }: {
   readonly sessionId: string
   readonly surface: Surface
   readonly lifecycle: Lifecycle
+  /** Opens the list of kept drafts, where the shell has one. */
+  readonly onOpenKept?: () => void
   /** Whether the host is in contact, or null before the shell's first answer. */
   readonly connected: boolean | null
 }): ReactNode {
-  const { port, say } = useApp()
+  const { port, say, drafts: book } = useApp()
+  const { drafts: composers, kept: keptDrafts, status: draftsStatus, problem: draftsProblem } = useBook()
   const [pane, setPane] = useState<Pane>('semantic')
   // The session's agent, read from its own worker while this screen is open, into the session's
   // own store: nothing of another session is ever shown under this one.
@@ -192,7 +196,7 @@ export function MobileSession({
   // The clock is read once, when this screen opens. Reading it while rendering would make the
   // empty draft a different object on every render and the composer would lose what was typed.
   const [openedAtMs] = useState(() => Date.now())
-  const held = lifecycle.state.drafts.find((each) => each.target.sessionId === sessionId)
+  const held = composers.find((each) => each.target.sessionId === sessionId)
   // The conversation the session's agent is in now: what a draft is written for, and what it is
   // checked against before it is sent.
   const { instance: liveInstance, binding: liveBinding, capabilities } = session.agent
@@ -255,12 +259,12 @@ export function MobileSession({
 
   const setDraft = useCallback(
     (next: Draft) => {
-      lifecycle.setDrafts((drafts) => {
+      book.setDrafts((drafts) => {
         const without = drafts.filter((each) => each.draftId !== next.draftId)
         return [...without, next]
       })
     },
-    [lifecycle]
+    [book]
   )
 
   /**
@@ -274,27 +278,27 @@ export function MobileSession({
    */
   const typeInto = useCallback(
     (text: string) => {
-      lifecycle.setDrafts((drafts) => {
+      book.setDrafts((drafts) => {
         const stored = drafts.find((each) => each.draftId === draft.draftId)
         const base = stored === undefined ? draft : againstCurrent(stored, currentTarget)
         const next = edit(base, text, Date.now())
         return [...drafts.filter((each) => each.draftId !== draft.draftId), next]
       })
     },
-    [lifecycle, draft, currentTarget]
+    [book, draft, currentTarget]
   )
 
   /** Changes the files on this session's draft, whatever else changed it meanwhile. */
   const changeFiles = useCallback(
     (change: (files: readonly DraftAttachment[]) => readonly DraftAttachment[]) => {
-      lifecycle.setDrafts((drafts) => {
+      book.setDrafts((drafts) => {
         const stored = drafts.find((each) => each.draftId === draft.draftId)
         const base = stored ?? draft
         const next = { ...base, attachments: change(base.attachments) }
         return [...drafts.filter((each) => each.draftId !== draft.draftId), next]
       })
     },
-    [lifecycle, draft]
+    [book, draft]
   )
 
   /**
@@ -318,7 +322,8 @@ export function MobileSession({
           mediaType: picked.mediaType,
           presentedAsImage: false,
           upload: 'uploading',
-          acceptedUpstream: false
+          acceptedUpstream: false,
+          handle: null
         }
       ])
       const settle = (change: Partial<DraftAttachment>) => {
@@ -337,7 +342,8 @@ export function MobileSession({
             byteLen: Number(handle.byte_len),
             mediaType: handle.declared_media_type,
             presentedAsImage: handle.presented_as_image,
-            upload: 'uploaded'
+            upload: 'uploaded',
+            handle
           })
           if (removedFiles.current.has(localId)) return
           say(
@@ -573,6 +579,15 @@ export function MobileSession({
       // The revision the person submitted. Anything typed after it is a newer draft, and a late
       // answer about the older one must not take it away.
       const submittedRevision = draft.revision
+      // The stored draft is brought up to what is being sent and held as it is until the prompt
+      // ends, so a refusal or an outcome nobody knows leaves it kept.
+      const sending = book.beginSend(sessionId)
+      const ended = { done: false }
+      const end = (outcome: 'taken' | 'refused' | 'unknown') => {
+        if (ended.done) return
+        ended.done = true
+        book.endSend(sending, outcome)
+      }
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
       setBusy(true)
@@ -602,17 +617,19 @@ export function MobileSession({
           if (wasRefused(state)) {
             // The submission did not happen. The text stays exactly where it was.
             say(`The host refused it. What you wrote is still here.`, 'danger')
+            end('refused')
             return
           }
           // The composer is cleared only when it still holds what was submitted. A person who
           // typed the next thing while this one was in flight keeps what they typed.
-          lifecycle.setDrafts((drafts) =>
+          book.setDrafts((drafts) =>
             drafts.map((each) =>
               each.draftId === draft.draftId && each.revision === submittedRevision
                 ? edit(each, '', Date.now())
                 : each
             )
           )
+          end(state === 'unknown' ? 'unknown' : 'taken')
         })
         .catch((failure: unknown) => {
           lifecycle.setSubmissions((current) =>
@@ -628,12 +645,13 @@ export function MobileSession({
             )
           )
           say(failureMessage(failure), 'danger')
+          end('refused')
         })
         .finally(() => {
           setBusy(false)
         })
     },
-    [draft, lifecycle, port, say, sessionId]
+    [draft, lifecycle, book, port, say, sessionId]
   )
 
   // Focus that a terminal key, the program's keyboard or the mode button held when control or the
@@ -692,7 +710,11 @@ export function MobileSession({
   }, [asLine, sendId])
   const terminalWarnings = frame === null ? [] : warningsOf(frame, leftBlankOnPhone(frame))
 
-  const field = (
+  const field = draftsStatus === 'opening' ? (
+    <p className="m-hint" role="status" id={`composer-${sessionId}`}>
+      Opening your drafts…
+    </p>
+  ) : (
     <textarea
       id={`composer-${sessionId}`}
       rows={pane === 'terminal' ? 1 : undefined}
@@ -780,12 +802,17 @@ export function MobileSession({
             title={lifecycle.banner.title}
             detail={lifecycle.banner.detail}
             action={
-              <Button onClick={lifecycle.acknowledge}>Dismiss</Button>
+              <>
+                {keptDrafts.length === 0 || onOpenKept === undefined ? null : (
+                  <Button onClick={onOpenKept}>Kept drafts</Button>
+                )}
+                <Button onClick={lifecycle.acknowledge}>Dismiss</Button>
+              </>
             }
           />
         ) : null}
         {banner ? <Banner tone={banner.tone} title={banner.title} detail={banner.detail} /> : null}
-        {lifecycle.durable ? null : (
+        {draftsStatus !== 'memory-only' && draftsProblem === null && lifecycle.durable ? null : (
           <Banner
             tone="warning"
             title="This device will not keep what you write"
@@ -1102,7 +1129,7 @@ export function MobileSession({
                   data-testid="composer-retarget"
                   style={{ minBlockSize: target }}
                   onClick={() => {
-                    setDraft(retarget(draft, currentTarget, draft.attachmentId))
+                    book.retarget(sessionId, currentTarget)
                   }}
                 >
                   Keep it for the new conversation

@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
+import { FakeDraftStore } from '../../src/host/fake-drafts'
 import type { HostPort } from '../../src/host/port'
 import { MobileApp } from '../../src/mobile/MobileApp'
 
@@ -105,14 +106,15 @@ describe('a draft that came back is bound again when the host has said where it 
   it('binds a draft kept across a restart, and sends nothing to do it', async () => {
     const person = userEvent.setup()
     const storage = fakeStorage()
-    const first = fakeHost()
+    const device = new FakeDraftStore()
+    const first = fakeHost({ drafts: device })
     const run = render(shell(first.port, storage))
     await person.type(await openMainSession(person), 'half a thought')
     run.unmount()
 
     // The next run is a new process. The host is out of reach for its first read, so the draft is
     // kept and detached, and says so.
-    const second = fakeHost()
+    const second = fakeHost({ drafts: device })
     const { port, asked } = unreachableAtFirst(second.port, 1)
     render(shell(port, storage))
     expect(await openMainSession(person)).toHaveValue('half a thought')
@@ -175,7 +177,8 @@ describe('a draft that came back is bound again when the host has said where it 
   it('leaves a moved conversation to the person rather than sending the draft to it', async () => {
     const person = userEvent.setup()
     const storage = fakeStorage()
-    const first = fakeHost()
+    const device = new FakeDraftStore()
+    const first = fakeHost({ drafts: device })
     const run = render(shell(first.port, storage))
     await person.type(await openMainSession(person), 'for the old conversation')
     // The conversation is read once, so the draft learns which one it was written for.
@@ -184,7 +187,7 @@ describe('a draft that came back is bound again when the host has said where it 
     })
     run.unmount()
 
-    const second = fakeHost()
+    const second = fakeHost({ drafts: device })
     second.controls.records.moveBinding(SESSION_MAIN)
     render(shell(second.port, storage))
     await openMainSession(person)
@@ -200,12 +203,13 @@ describe('a draft that came back is bound again when the host has said where it 
   it('orphans a draft whose session the host no longer knows', async () => {
     const person = userEvent.setup()
     const storage = fakeStorage()
-    const first = fakeHost()
+    const device = new FakeDraftStore()
+    const first = fakeHost({ drafts: device })
     const run = render(shell(first.port, storage))
     await person.type(await openMainSession(person), 'for a session that went')
     run.unmount()
 
-    const second = fakeHost()
+    const second = fakeHost({ drafts: device })
     const gone: HostPort = {
       ...second.port,
       sessionRead: () =>
@@ -381,12 +385,13 @@ describe('a draft that came back is bound again when the host has said where it 
   it('orphans a draft whose session the host reports as closed', async () => {
     const person = userEvent.setup()
     const storage = fakeStorage()
-    const first = fakeHost()
+    const device = new FakeDraftStore()
+    const first = fakeHost({ drafts: device })
     const run = render(shell(first.port, storage))
     await person.type(await openMainSession(person), 'for a session that closed')
     run.unmount()
 
-    const second = fakeHost()
+    const second = fakeHost({ drafts: device })
     const closed: HostPort = {
       ...second.port,
       sessionRead: async (params) => {

@@ -18,6 +18,7 @@ import type { AttentionItem } from '@kalareach/protocol'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import { FakeDraftStore } from '../../src/host/fake-drafts'
 import type { HostPort } from '../../src/host/port'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
@@ -42,9 +43,13 @@ function start(
   return { controls }
 }
 
-/** The shell, ready to render, so a test can take one away and start another over one store. */
-function wrap(surface: MobilePlatform, storage: Storage) {
-  const { port } = fakeHost()
+/**
+ * The shell, ready to render, so a test can take one away and start another over one store. The
+ * drafts are the device's own, kept by native code, so the next run is given the store this one
+ * wrote to.
+ */
+function wrap(surface: MobilePlatform, storage: Storage, drafts = new FakeDraftStore()) {
+  const { port } = fakeHost({ drafts })
   return (
     <AppProvider port={port}>
       <MobileApp surface={surface} storage={storage} />
@@ -388,7 +393,8 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
   it('recovers a draft written before the process was taken away', async () => {
     const person = userEvent.setup()
     const storage = fakeStorage()
-    const first = render(wrap('ios', storage))
+    const device = new FakeDraftStore()
+    const first = render(wrap('ios', storage, device))
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
     await person.click(await screen.findByRole('button', { name: /Session 1/ }))
     await person.type(await screen.findByLabelText('Message this session'), 'half a thought')
@@ -400,7 +406,7 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
     first.unmount()
     // The host does not answer a read about the session, so the draft is kept and detached; a host
     // that did would bind it again, which is the recovery test's to prove.
-    const { port } = fakeHost()
+    const { port } = fakeHost({ drafts: device })
     const silent: HostPort = {
       ...port,
       sessionRead: () =>
@@ -548,20 +554,13 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
 
   it('says so when the device refuses to keep what was written', async () => {
     const person = userEvent.setup()
-    const refusing = {
-      getItem: () => null,
-      setItem: () => {
-        throw new Error('quota')
-      },
-      removeItem: () => undefined,
-      key: () => null,
-      clear: () => undefined,
-      length: 0
-    } as unknown as Storage
-    const { port } = fakeHost()
+    // The device's store will not keep a draft: native code's save is refused.
+    const drafts = new FakeDraftStore()
+    drafts.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    const { port } = fakeHost({ drafts })
     render(
       <AppProvider port={port}>
-        <MobileApp surface="ios" storage={refusing} />
+        <MobileApp surface="ios" storage={null} />
       </AppProvider>
     )
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))

@@ -80,6 +80,7 @@ import type {
 import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, decodeParams, STORAGE_OBJECT_DELETE_PARAMS } from './fake-decode'
+import { FakeDraftStore } from './fake-drafts'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
 
@@ -222,6 +223,8 @@ export interface FakeHostControls {
   readonly records: ScriptedRecords
   /** The questions the agents asked, and what can happen to them while a person decides. */
   readonly questions: FakeQuestions
+  /** The drafts this device keeps, which another window can write to. */
+  readonly drafts: FakeDraftStore
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
   /**
@@ -530,7 +533,13 @@ export interface HeldMutations {
 }
 
 /** The fake host, and the controls a test drives it with. */
-export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
+export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
+  port: HostPort
+  controls: FakeHostControls
+} {
+  // The device's drafts outlive a host: a test that starts the application again hands the next
+  // host the store the last one wrote to, as a device's disk would be.
+  const drafts = options.drafts ?? new FakeDraftStore()
   let connected = true
   /** Native code's words for the loss of the connection, while it is lost. */
   let lostBecause = UNREACHABLE
@@ -1046,12 +1055,19 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
+    deviceDrafts: () => Promise.resolve(drafts.list()),
+    deviceDraftSave: (request) => Promise.resolve(drafts.save(request)),
+    deviceDraftRetarget: (request) => Promise.resolve(drafts.retarget(request)),
+    deviceDraftDiscard: (request) => Promise.resolve(drafts.discard(request)),
+
     draftCreate: () =>
       Promise.resolve(settledAs('draft.create', 'applied')),
     draftUpdate: () =>
       Promise.resolve(settledAs('draft.update', 'applied')),
     attachmentUpload: (path) => {
       requireConnection()
+      // What `upload.finish` also says of a handle, which the scripted uploads do not vary.
+      const unpublished = { session_id: null, preview: null, published_at_ms: '1', expires_at_ms: '2', submitted: false }
       const name = path.split('/').pop() ?? path
       uploaded.push(path)
       return Promise.resolve({
@@ -1061,11 +1077,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         content_digest: 'a'.repeat(64),
         declared_media_type: 'image/png',
         original_file_name: name,
-        presented_as_image: true
+        presented_as_image: true,
+        ...unpublished
       })
     },
     attachmentUploadBytes: (file) => {
       requireConnection()
+      const unpublished = { session_id: null, preview: null, published_at_ms: '1', expires_at_ms: '2', submitted: false }
       if (file.bytes.length > MAX_HANDED_BYTES) {
         refuse('QUOTA_EXCEEDED', 'a pasted or picked file is at most 64 MiB; drop a larger one on the window')
       }
@@ -1079,7 +1097,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         content_digest: 'b'.repeat(64),
         declared_media_type: /\.png$/i.test(name) ? 'image/png' : 'application/octet-stream',
         original_file_name: name,
-        presented_as_image: /\.png$/i.test(name)
+        presented_as_image: /\.png$/i.test(name),
+        ...unpublished
       })
     },
     draftAddAttachment: (params) => {
@@ -1653,6 +1672,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     records,
     questions,
+    drafts,
     changePromptGeneration() {
       promptGeneration += 1
       emit({

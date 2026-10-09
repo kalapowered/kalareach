@@ -325,11 +325,12 @@ describe('what setup costs a person', () => {
     })
 
     // The shell's own connection watch, event subscription and watch for owner confirmations are
-    // the application's, not setup's, and so is its read of the account the sidebar names, which
-    // reaches no host.
+    // the application's, not setup's, and so are its read of the account the sidebar names and of
+    // the drafts kept on this device, which reach no host.
     const own = calls.filter(
       (name) =>
         ![
+          'deviceDrafts',
           'connectionState',
           'onConnection',
           'subscribe',

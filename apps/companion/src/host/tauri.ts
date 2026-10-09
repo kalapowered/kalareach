@@ -155,6 +155,10 @@ export function tauriPort(): HostPort {
     approvalRespond: (params) => call('agent_approval_respond', { params }),
     pluginActionInvoke: () => noAgreedShape("invoking a package's action"),
 
+    deviceDrafts: () => call('device_drafts', {}),
+    deviceDraftSave: (request) => read('device_draft_save', request),
+    deviceDraftRetarget: (request) => read('device_draft_retarget', request),
+    deviceDraftDiscard: (request) => read('device_draft_discard', request),
     draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
     draftUpdate: (params, subject) => mutate<Settled>('draft_update', params, subject),
     // The upload belongs to the same session the subject names; sending the subject without it

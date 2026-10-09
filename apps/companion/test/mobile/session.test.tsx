@@ -1760,7 +1760,7 @@ describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
           <OnSession sessionId={SESSION_MAIN} />
         </AppProvider>
       )
-      const field = screen.getByLabelText('Message this session')
+      const field = await screen.findByLabelText('Message this session')
       const send = () => screen.getByRole('button', { name: 'Send' })
       const line = () => send().closest('.m-composer-line')
       // The whole composer: Send under the pickers, and words for why an empty draft waits.
@@ -1823,7 +1823,7 @@ describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
           <OnSession sessionId={SESSION_MAIN} />
         </AppProvider>
       )
-      await person.type(screen.getByLabelText('Message this session'), 'hello')
+      await person.type(await screen.findByLabelText('Message this session'), 'hello')
       const before = screen.getByRole('button', { name: 'Send' })
       act(() => {
         before.focus()

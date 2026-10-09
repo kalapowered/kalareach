@@ -337,7 +337,8 @@ describe('drafts', () => {
       mediaType: 'text/plain',
       presentedAsImage: false,
       upload: 'uploaded' as const,
-      acceptedUpstream: false
+      acceptedUpstream: false,
+      handle: null
     }
     const withFile = connectionLost({ ...startDraft('d1', target, 0), attachments: [file] })
     expect(withFile.text).toBe('')
@@ -388,7 +389,8 @@ describe('drafts', () => {
       mediaType: 'image/png',
       presentedAsImage: true,
       upload: 'uploaded' as const,
-      acceptedUpstream: false
+      acceptedUpstream: false,
+      handle: null
     }
     const withFile = { ...edit(startDraft('d1', target, 0), 'look at this', 1), attachments: [file] }
     expect(submittable(withFile)).toBe(false)
