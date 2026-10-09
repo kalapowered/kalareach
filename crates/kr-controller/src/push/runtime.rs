@@ -92,6 +92,8 @@ pub const QUESTION_BUDGET: Duration = Duration::from_secs(30);
 /// What the loops reach the network through, built once a transport is attached.
 #[derive(Debug)]
 struct Adapters {
+    /// The transport every exchange below goes through.
+    transports: Arc<dyn DeliveryTransports>,
     sender: GatewayClient,
     /// The pass's status questions, within its share.
     receipts: GatewayStatus,
@@ -157,6 +159,12 @@ impl DeliveryRuntime {
         self.adapters.get().is_some()
     }
 
+    /// The transport every delivery exchange goes through, once one is attached.
+    #[must_use]
+    pub fn transports(&self) -> Option<&Arc<dyn DeliveryTransports>> {
+        self.adapters.get().map(|adapters| &adapters.transports)
+    }
+
     /// Attaches the transport every delivery exchange goes through.
     ///
     /// Once: the transport is the composition root's decision, made at startup, and a second one
@@ -166,6 +174,7 @@ impl DeliveryRuntime {
         let attached = self
             .adapters
             .set(Adapters {
+                transports: Arc::clone(&transports),
                 sender: GatewayClient::new(Arc::clone(&transports), self.runtime.clone()),
                 receipts: GatewayStatus::new(
                     Arc::clone(&transports),

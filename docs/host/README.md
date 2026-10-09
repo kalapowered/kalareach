@@ -133,14 +133,16 @@ damaged, or otherwise invalid according to the schema. The document might be a f
 is not allowed to read. Until the problem is fixed, descriptions will be turned off and the host
 will not create any new session. Because the two worker profiles are different kinds of thing, and
 which kind to use is determined by the document, the host cannot guess a sensible value. Even
-`kr new` with a profile argument will refuse. Any session that is already running will not be affected.
-From the next time the control daemon starts, the network, voice, storage and proxy selections will
-all fail closed: nothing goes through the proxy the document may name, and nothing goes around it. A
-restriction the host accepted from the document earlier stays in force. A restriction that only the
-unusable document holds is not applied. `kr doctor` and every refused edit say what was found and
-how to put it right: use a release that reads the version, or rewrite the document. When the problem
-is fixed, descriptions and new sessions return at the next create, and the closed selections return
-at the next start of the daemon.
+`kr new --headless` and `kr new --desktop` are refused as `kr new` is. A session that is already
+running keeps running. From the next time the control daemon starts, the network, voice, storage and
+proxy selections will all fail closed: nothing goes through the proxy the document may name, and
+nothing goes around it. A restriction the host accepted from the document earlier stays in force. A
+restriction that only the unusable document holds is not applied. `kr doctor` and every refused edit
+say what was found and how to put it right: use a release that reads the version, rewrite the
+document, or, for a file this host may not read, make it a regular file that only you can read and
+write, within the size bound. The refusal and the descriptions follow the document at the next
+acceptance, which every `kr doctor` and every create makes. When the problem is fixed, descriptions
+and new sessions return then, and the closed selections return at the next start of the daemon.
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
 operating-system lock on `.config.lock` in the environment's state directory, reads, validates,
@@ -243,7 +245,8 @@ included. Mail submission is SMTP and connects directly, and name lookups go dir
 a proxy every one of those connections goes directly, apart from iroh's relay latency probe and
 captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
 set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
-that one reading.
+that one reading. A daemon that starts over a document it cannot use makes no connection through
+delivery, plugin repositories or the model's files until it starts again over one it can use.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source

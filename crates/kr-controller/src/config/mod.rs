@@ -361,12 +361,14 @@ impl Unusable {
     }
 
     /// The refusal of a request that would leave this host through a proxy the document may have
-    /// named.
+    /// named. It is what the daemon says for as long as it runs: the route is read when it starts,
+    /// so a document put right since opens it at the next start and not before.
     #[must_use]
     pub fn outbound_refusal(&self) -> String {
         format!(
-            "this host's configuration document ({}) cannot be used ({}), so nothing is sent \
-             through the proxy it may name, and nothing is sent around it: {}",
+            "this host's control daemon started over a configuration document it could not use \
+             ({}, {}), so it sends nothing through the proxy that document may name and nothing \
+             around it, until it starts again over one it can use: {}",
             configuration::FILE_NAME,
             self.state.as_str(),
             self.detail
@@ -405,8 +407,10 @@ impl Outbound {
 ///
 /// The network endpoint, the voice service and the backup uploader are built once, at startup, from the document on disk
 /// then. A later edit applies at the next start, and `kr doctor` compares the two so an owner who
-/// changed one can see that it is not in force yet.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// changed one can see that it is not in force yet. Two readings are equal when they select the same
+/// and both leave the outbound route open or both close it: why a document could not be used is not
+/// a selection.
+#[derive(Clone, Debug, Default)]
 pub struct Started {
     /// The network section this daemon joined, or did not join, the network under.
     pub network: configuration::NetworkSelection,
@@ -417,6 +421,17 @@ pub struct Started {
     /// Why every outbound route the proxy governs is closed, when the document could not be used.
     pub unusable: Option<Unusable>,
 }
+
+impl PartialEq for Started {
+    fn eq(&self, other: &Self) -> bool {
+        self.network == other.network
+            && self.voice == other.voice
+            && self.storage == other.storage
+            && self.unusable.is_some() == other.unusable.is_some()
+    }
+}
+
+impl Eq for Started {}
 
 impl Started {
     /// Reads the selections from one reading of the document: its own when it is usable, and the
@@ -1267,11 +1282,24 @@ pub fn network_check(
     });
     // Compared with what the document says now.
     let moved = Started::of(loaded) != *started;
-    if moved {
+    let unusable_now = loaded.fails_closed();
+    if started.unusable.is_some() {
         detail = detail.stated(
-            "; the configuration document now selects a different network, voice broker or storage \
-             service from the one this host started with, which applies at the next start",
+            "; this host started over a configuration document it could not use, so nothing it \
+             sends goes through a proxy until it starts again over one it can use",
         );
+    }
+    if moved {
+        detail = detail.stated(if unusable_now {
+            "; the configuration document cannot be used now, so the next start closes the \
+             network, the voice broker, storage and every route through a proxy"
+        } else if started.unusable.is_some() {
+            "; the configuration document can be used now, so what it selects and the routes \
+             through a proxy open at the next start"
+        } else {
+            "; the configuration document now selects a different network, voice broker or storage \
+             service from the one this host started with, which applies at the next start"
+        });
     }
     DoctorCheck::new(
         "configuration-network",
@@ -1282,10 +1310,12 @@ pub fn network_check(
             DoctorStatus::Ok
         },
         detail,
-        moved.then_some(
-            "Restart this host to put the network and voice broker the document now selects into \
-             force.",
-        ),
+        moved.then_some(if unusable_now {
+            "Put the configuration document right before this host next starts; the check of that \
+             document says how."
+        } else {
+            "Restart this host to put what the document now selects into force."
+        }),
     )
 }
 

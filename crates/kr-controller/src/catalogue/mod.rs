@@ -187,9 +187,10 @@ impl Authority for Confirmed<'_> {
 /// How this host's catalogue reaches its repositories.
 ///
 /// A directory on this host is read where it is, and an address is fetched with this product's
-/// trust and through `proxy`, or directly when that is `None`. A host whose certificate
-/// verification cannot be set up still reads the repositories on its own disk, and says why
-/// whenever it is asked to fetch one.
+/// trust and through the proxy `outbound` names, directly when it names none, and not at all when
+/// the route is closed. A host whose certificate verification cannot be set up, or whose route is
+/// closed, still reads the repositories on its own disk, and says why whenever it is asked to
+/// fetch one.
 #[must_use]
 pub fn repository_transport(outbound: &crate::config::Outbound) -> RepositoryTransport {
     let proxy = match outbound.proxy() {
@@ -212,6 +213,8 @@ pub struct CatalogueModule {
     environment_id: EnvironmentId,
     /// The native bridges installed packages put in their applications' own directories.
     bridges: Arc<native_bridge::NativeBridges>,
+    /// How its repositories are fetched: what the daemon started with, for as long as it runs.
+    outbound: crate::config::Outbound,
     /// The last snapshot of admissions computed, with the revision and the live releases it was
     /// computed for: rounds at an unchanged revision reuse it. Nothing a snapshot carries moves
     /// without the revision moving, the bridges included (see [`Self::write`]).
@@ -362,6 +365,7 @@ impl CatalogueModule {
             catalogue: Arc::new(Mutex::new(catalogue)),
             environment_id,
             bridges,
+            outbound: outbound.clone(),
             snapshots: Arc::new(std::sync::Mutex::new(None)),
             budgets: std::sync::Mutex::new(budgets),
             limits,
@@ -372,6 +376,13 @@ impl CatalogueModule {
             #[cfg(feature = "testing")]
             policies_carried: Arc::default(),
         })
+    }
+
+    /// How this catalogue's repositories are fetched: through the proxy the daemon started with,
+    /// directly, or not at all when it started over a configuration document it could not use.
+    #[must_use]
+    pub const fn outbound(&self) -> &crate::config::Outbound {
+        &self.outbound
     }
 
     /// Returns the native bridges installed packages put in place, which say what each applied

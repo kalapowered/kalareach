@@ -398,6 +398,8 @@ struct Setup {
     /// The target the host believes it was built for and the instruction sets it believes its
     /// processor has, in place of this machine's own.
     machine: Option<(String, Features)>,
+    /// What the configuration document holds when the daemon starts, in place of none.
+    document: Option<Vec<u8>>,
 }
 
 /// The real description process, and the files linked in place of the model's.
@@ -417,6 +419,7 @@ impl Setup {
             held: true,
             real: None,
             machine: None,
+            document: None,
         }
     }
 }
@@ -755,6 +758,13 @@ impl Environment {
         let mut workers = Vec::new();
         for display in 1..=setup.sessions as u64 {
             workers.push(Worker::start(tree, display).await);
+        }
+        if let Some(document) = &setup.document {
+            kr_ipc::paths::write_owner_only_file(
+                &kr_worker::config::document_path(&tree.environment()),
+                document,
+            )
+            .expect("the configuration document");
         }
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
@@ -2976,6 +2986,37 @@ async fn the_display_shows_the_age_of_a_waiting_job_and_the_time_of_the_last_suc
 // ---------------------------------------------------------------------------------------------
 // The model's files: fetched on request, checked, kept, and found again
 // ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-26.13, KR-REQ-22.01: a daemon that started over a configuration document it cannot use
+/// fetches no model file. The proxy that document may name is not known, and nothing goes around
+/// it: the fetch is refused naming the document, and the address the profile names hears nothing.
+/// The control is the test below, with a document the daemon reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_started_over_a_document_it_cannot_use_fetches_no_model_file() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        document: Some(br#"{"version": 99}"#.to_vec()),
+        ..Setup::new()
+    })
+    .await;
+
+    let refused = environment
+        .download_refused(DescriptionDownloadAction::Start)
+        .await;
+    assert!(
+        refused.contains("config.json")
+            && refused.contains("started over a configuration document"),
+        "the refusal names the document: {refused}"
+    );
+    assert!(
+        fixture.requests().is_empty(),
+        "and the address the profile names heard nothing"
+    );
+    assert!(!environment.marker() && environment.partials().is_empty());
+}
 
 /// KR-REQ-22.01: nothing is fetched until the owner asks, and setup shows the exact size and the
 /// address first. A session is shown its title from metadata while the files are not here. The

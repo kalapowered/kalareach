@@ -1247,7 +1247,43 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
             .is_some_and(|remedy| remedy.contains("Restart"))
     );
 
-    // A host on no network says so, and a document it cannot use selects nothing too.
+    // A document that cannot be used selects nothing and closes the route through a proxy: the
+    // next start does that, and the check says so and does not tell the owner to restart. Which
+    // way it cannot be used is not a selection.
+    let unusable = |text: &str| configuration::load(Some(text.as_bytes()));
+    let check = network_check(&started, &unusable(r#"{"version": 99}"#), running);
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        check.detail().contains("the next start closes"),
+        "{check:?}"
+    );
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("Put the configuration document right")),
+        "{check:?}"
+    );
+    let closed = Started::of(&unusable(r#"{"version": 99}"#));
+    let check = network_check(&closed, &unusable(r#"{"version": 98}"#), Running::default());
+    assert_eq!(
+        check.status,
+        DoctorStatus::Ok,
+        "a daemon that started over a document it could not use, and still cannot: nothing moved"
+    );
+    assert!(
+        check
+            .detail()
+            .contains("nothing it sends goes through a proxy until it starts again"),
+        "{check:?}"
+    );
+    let check = network_check(&closed, &read(&document), Running::default());
+    assert_eq!(
+        check.status,
+        DoctorStatus::Warning,
+        "the document can be used now, and the routes open at the next start"
+    );
+
+    // A host on no network says so.
     let quiet = network_check(
         &Started::default(),
         &configuration::load(None),

@@ -397,8 +397,9 @@ enum Member {
 
 /// Reads the version a JSON record states in `member`; `absent` where it states none. A record that
 /// cannot be read as a JSON object with a whole number there is refused, unless `lenient`, which is
-/// the configuration document: every release fails closed on one it cannot read, so a document
-/// that states no version it can make out has none to refuse a switch for. A whole number it can
+/// the configuration document: no release can use one it cannot read (a release that holds the
+/// fail-closed rule fails closed on it, and an earlier one took the product defaults), so a
+/// document that states no version it can make out has none to refuse a switch for. A whole number it can
 /// make out is a version like any other, and one outside the range, or too large to be any
 /// release's, is refused.
 fn json(file: &Path, member: &str, absent: u32, lenient: bool) -> Result<Option<u32>, Shown> {
@@ -490,7 +491,7 @@ mod tests {
     /// A JSON record states its version in its member; one that states none is at the version the
     /// manifest gives for that, and one whose member is not a whole number, or that is not JSON or
     /// not an object, cannot be shown to be in range and is refused. The configuration document is
-    /// the exception, which every release loads as defaults when it cannot read it. A file that is
+    /// the exception, which no release can use when it cannot read it. A file that is
     /// not there is not checked.
     #[test]
     fn a_json_record_is_read_by_its_member_and_what_cannot_be_read_is_refused() {
