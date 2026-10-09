@@ -158,13 +158,6 @@ impl HeldTimer {
             .collect()
     }
 
-    /// Lets every wait held now end, and holds those to come.
-    pub fn release_held(&self) {
-        for held in self.waits.lock().expect("the waits").iter() {
-            held.release.notify_one();
-        }
-    }
-
     /// Lets every wait, those held and those to come, end at once.
     pub fn run_by_itself(&self) {
         let waits = self.waits.lock().expect("the waits");
