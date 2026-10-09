@@ -273,8 +273,11 @@ async fn answer_offline(drafts: &AnswerDrafts, question: &Question) -> AnswerDra
 
 /// Keeps `draft` as a client outside a store does, which holds nothing and may write any record.
 fn keep(drafts: &AnswerDrafts, draft: &AnswerDraft) {
-    let writers =
-        kr_ipc::install::hold_writers(&mut || {}).expect("a client outside a store holds nothing");
+    let writers = kr_ipc::install::hold_writers(
+        &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+        &mut || {},
+    )
+    .expect("a client outside a store holds nothing");
     let permit = writers
         .permit(&kr_client::answers::WRITTEN)
         .expect("a client outside a store may keep an answer");
@@ -836,8 +839,11 @@ async fn keeping_an_answer_does_not_replace_one_it_cannot_read() {
             CanonicalMap::from_entries(entries).expect("a map"),
         ))
     };
-    let writers =
-        kr_ipc::install::hold_writers(&mut || {}).expect("a client outside a store holds nothing");
+    let writers = kr_ipc::install::hold_writers(
+        &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+        &mut || {},
+    )
+    .expect("a client outside a store holds nothing");
     let permit = writers
         .permit(&kr_client::answers::WRITTEN)
         .expect("permitted");

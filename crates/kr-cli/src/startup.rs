@@ -320,7 +320,7 @@ fn changed(environment: &EnvironmentPaths, startup: Option<ControllerStartup>) -
     // The writers' lock before anything else, and the permit for each record this change writes
     // before any is: a release `current` names that reads either at another version than this kr
     // writes it refuses the change with the definition, the record and the document as they were.
-    let writers = crate::barrier::hold()?;
+    let writers = crate::barrier::hold_for_configuration(environment)?;
     let configuration = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)?;
     #[cfg(unix)]
     let service = (startup == Some(ControllerStartup::Service))
@@ -2673,7 +2673,8 @@ mod tests {
     fn a_choice_a_failed_write_published_is_written_back() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let writers = crate::barrier::hold().expect("a program outside a store holds nothing");
+        let writers = crate::barrier::hold_for_configuration(&environment)
+            .expect("a program outside a store holds nothing");
         let permit = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)
             .expect("permitted");
         assert_eq!(
