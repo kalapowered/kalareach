@@ -596,6 +596,7 @@ impl Journal {
                          root shell"
                             .to_owned(),
                     ],
+                    backends: Vec::new(),
                 };
                 (session_id, record)
             });
