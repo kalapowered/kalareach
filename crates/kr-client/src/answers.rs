@@ -5,8 +5,10 @@
 //!
 //! * **An answer the host could not take is kept, not queued.** [`answer`] sends an answer when the
 //!   host can be reached. When it cannot, including when the connection ended with the answer's
-//!   outcome unknown, the answer is kept on this device as an [`AnswerDraft`]: the answer, the
-//!   question and the revision of it the person was shown. Nothing retries it.
+//!   outcome unknown, it hands the answer back ([`Answered::Unconfirmed`]) to be kept on this device
+//!   as an [`AnswerDraft`]: the answer, the question and the revision of it the person was shown.
+//!   Keeping it is the caller's step ([`AnswerDrafts::keep`]), which is a write of a stored record.
+//!   Nothing retries it.
 //! * **A reconnect offers; only a person sends.** [`reconcile`] reads the questions as the host now
 //!   reports them and decides what each draft is: offered again when its question is still pending
 //!   at the revision the person answered, and retired unsent when the question ended or moved while
@@ -213,10 +215,11 @@ pub enum Answered {
     /// the question as it now stands, which the host leaves out of the answer to a device whose
     /// grant does not reach it ([`QuestionResolveResult::question`]).
     Sent(Box<QuestionResolveResult>),
-    /// The host could not be reached, or did not say whether it took the answer. The caller keeps it
-    /// on this device ([`AnswerDrafts::keep`]), which is a write of a stored record and is made
-    /// under the leave to write it.
-    NotSent(AnswerDraft),
+    /// The host did not confirm that it took the answer: it could not be reached, or the connection
+    /// ended with the outcome unknown. The caller keeps the answer on this device
+    /// ([`AnswerDrafts::keep`]), which is a write of a stored record and is made under the leave to
+    /// write it.
+    Unconfirmed(AnswerDraft),
 }
 
 impl std::fmt::Debug for Answered {
@@ -229,7 +232,7 @@ impl std::fmt::Debug for Answered {
                 .field("revision", &resolved.revision)
                 .field("state", &resolved.state)
                 .finish_non_exhaustive(),
-            Self::NotSent(draft) => formatter.debug_tuple("NotSent").field(draft).finish(),
+            Self::Unconfirmed(draft) => formatter.debug_tuple("Unconfirmed").field(draft).finish(),
         }
     }
 }
@@ -446,7 +449,11 @@ impl AnswerDrafts {
             path: stored(&path),
             fault: IoFault::from(error),
         };
-        let _lock = self.lock().map_err(store)?;
+        let lock_path = self.directory.join(LOCK_NAME);
+        let _lock = self.lock(&lock_path).map_err(|error| AnswerError::Store {
+            path: stored(&lock_path),
+            fault: IoFault::from(error),
+        })?;
         replaceable(&path)?;
         // A name of this write's own, so a second writer of the same question writes a file of its
         // own too, and the last rename is the answer that stays.
@@ -517,15 +524,23 @@ impl AnswerDrafts {
         self.directory.join(format!("{question_id}.{EXTENSION}"))
     }
 
-    /// Takes the store's lock for a write, waiting [`LOCK_PATIENCE`] for another that is under way.
-    /// Closing the file releases it.
-    fn lock(&self) -> std::io::Result<std::fs::File> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.directory.join(LOCK_NAME))?;
+    /// Takes the store's lock for a write, at `path`, waiting [`LOCK_PATIENCE`] for another that is
+    /// under way. Closing the file releases it.
+    ///
+    /// Only a regular file is opened, owner-only: a link planted at the lock's name would have the
+    /// open create its target, and a pipe would hold the open for ever.
+    fn lock(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        if std::fs::symlink_metadata(path).is_ok_and(|about| !about.file_type().is_file()) {
+            return Err(std::io::Error::other("the lock is not a regular file"));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
         let deadline = Instant::now() + LOCK_PATIENCE;
         loop {
             match file.try_lock() {
@@ -650,7 +665,8 @@ fn keeps_the_answer(error: &ClientError) -> bool {
     }
 }
 
-/// Sends a person's answer, or keeps it on this device when the host cannot be reached.
+/// Sends a person's answer, or hands it back to be kept on this device when the host cannot be
+/// reached or did not confirm that it took it.
 ///
 /// `host` is the connection this client has, or none while it has none. `question` is the question
 /// as the person was shown it, and the answer is checked against its form before anything else
@@ -660,7 +676,8 @@ fn keeps_the_answer(error: &ClientError) -> bool {
 ///
 /// Returns [`AnswerError::Form`] for an answer that does not fit the question,
 /// [`AnswerError::Host`] when the host refused it (the question already ended, or this device may
-/// not answer it), and [`AnswerError::Store`] when it had to be kept and could not be.
+/// not answer it), and [`AnswerError::Store`] when an answer kept earlier for the question, which
+/// this one supersedes, cannot be removed.
 pub async fn answer<H: QuestionHost>(
     host: Option<&H>,
     drafts: &AnswerDrafts,
@@ -681,7 +698,7 @@ pub async fn answer<H: QuestionHost>(
         drafted_at_ms: now,
     };
     let Some(host) = host else {
-        return Ok(Answered::NotSent(draft));
+        return Ok(Answered::Unconfirmed(draft));
     };
     let params = draft
         .submission(Some(question))
@@ -692,7 +709,7 @@ pub async fn answer<H: QuestionHost>(
             drafts.discard(draft.question_id)?;
             Ok(Answered::Sent(Box::new(resolved)))
         }
-        Err(error) if keeps_the_answer(&error) => Ok(Answered::NotSent(draft)),
+        Err(error) if keeps_the_answer(&error) => Ok(Answered::Unconfirmed(draft)),
         Err(error) => Err(AnswerError::Host(error)),
     }
 }
