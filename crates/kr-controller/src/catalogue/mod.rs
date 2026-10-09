@@ -2524,12 +2524,21 @@ fn confirm<'a>(
     subject: &str,
 ) -> Answer<(&'a dyn OwnerConfirmations, ConfirmedAction)> {
     let confirmations = confirmations.ok_or_else(|| off_the_network(subject))?;
+    // A catalogue action sends authority to no device and grants no session right. What it
+    // changes is what this host will trust or run.
+    let rights = kr_protocol::scalars::CanonicalSet::new();
+    let what = crate::sharing::ExactAction {
+        action,
+        digest: action_digest,
+        destination: None,
+        rights: &rights,
+    };
     let confirmed = match proof {
         // The owner's own proof, presented with the request.
-        Some(proof) => confirmations.accept(action, action_digest, proof),
+        Some(proof) => confirmations.accept(&what, proof),
         // None presented: the answer an owner device recorded to the challenge this host issued
         // for exactly this request, spent once.
-        None => confirmations.accept_recorded(action, action_digest),
+        None => confirmations.accept_recorded(&what),
     }
     .map_err(|error| error.to_protocol_error())?;
     Ok((confirmations, confirmed))

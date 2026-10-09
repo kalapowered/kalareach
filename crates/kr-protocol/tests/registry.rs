@@ -561,6 +561,41 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 18 lists transfer of control beside scoped invitations and delegation, section 23's
+    // sharing row names no method that makes one, and a transfer is not a delegation: it moves who
+    // holds a session, so the owner confirms it every time and the person at this machine asks for
+    // it. A paired device is told what it was given and asks for nothing of the kind.
+    let transfers = [("grant.transfer", EffectClass::Write)];
+    for (name, effect) in transfers {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::Sharing,
+            "{name} is a sharing method"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is the person at this machine's alone"
+        );
+        assert_eq!(
+            entry.confirmation,
+            ConfirmationRequirement::Always,
+            "{name} changes who holds the session, so the owner confirms it every time"
+        );
+        assert_eq!(
+            entry.freshness,
+            FreshnessRequirement::ActionWindow,
+            "{name} is a first admission under an action window"
+        );
+        assert_eq!(
+            entry.idempotency,
+            IdempotencyBehaviour::ActionDeduplicated,
+            "{name} is de-duplicated by actor and action"
+        );
+    }
+
     // Section 25 requires the preview of a shared live screen to show the text itself. The daemon
     // holds no screen, so it asks the session's worker, as the owner at this machine, for the lines
     // a viewer holding the share's scope would first see. Nothing but the owner is served it: a
@@ -795,6 +830,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + descriptions.len()
             + machines.len()
             + redemptions.len()
+            + transfers.len()
             + previews.len()
             + policy.len()
             + voice.len()
@@ -1131,7 +1167,12 @@ fn reading_a_retained_receipt_needs_present_view_authority() {
 
 #[test]
 fn sharing_needs_issuer_or_delegation_authority() {
-    for name in ["grant.create", "grant.revoke", "grant.list"] {
+    for name in [
+        "grant.create",
+        "grant.revoke",
+        "grant.list",
+        "grant.transfer",
+    ] {
         let entry = lookup(name).expect("listed");
         assert!(
             entry
@@ -1185,6 +1226,7 @@ fn owner_confirmation_covers_the_sensitive_operations() {
         "catalogue.add",
         "plugin.grant",
         "owner.confirmation.complete",
+        "grant.transfer",
     ] {
         assert_eq!(
             lookup(name).expect("listed").confirmation,

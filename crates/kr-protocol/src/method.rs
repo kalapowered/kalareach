@@ -1363,6 +1363,16 @@ methods! {
           the invitation names redeems it, and a withdrawn, expired or already redeemed \
           invitation activates nothing. The answer is the grant and carries no session text.";
 
+    GrantTransfer = "grant.transfer", Sharing,
+    effect: Write, ingress: [LocalIpc], rights: [req(SessionShare), basis(IssuerDelegation)],
+    selectors: [Session, Grant, Device],
+    history: NotApplicable, capability: cap("grant.parent", AuthorityRevision),
+    freshness: ActionWindow, confirmation: Always, idempotency: ACTION,
+    doc: "Hand a session's control to another paired device: the receiving device is given an \
+          active grant over the session and the transferring device's grant is revoked with \
+          its descendants, in one commit. The person at this machine asks for it, and it spends \
+          the owner confirmation an owner device recorded for exactly this transfer, once.";
+
     // ----- Services -------------------------------------------------------------------------
     PushInstallationRegister = "push.installation.register", Services,
     effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],

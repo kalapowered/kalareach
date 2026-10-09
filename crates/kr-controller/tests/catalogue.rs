@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use kr_controller::catalogue::{Admission, CatalogueModule, TestingPoint};
-use kr_controller::sharing::{ConfirmedAction, OwnerConfirmations};
+use kr_controller::sharing::{ConfirmedAction, ExactAction, OwnerConfirmations};
 use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, CatalogueError, CatalogueResult, Effect, Enrolment, Owner,
     RepositoryId, RepositoryKind,
@@ -149,18 +149,17 @@ impl Ceremony {
 impl OwnerConfirmations for Ceremony {
     fn accept(
         &self,
-        action: SensitiveAction,
-        action_digest: Digest256,
+        what: &ExactAction<'_>,
         proof: &OwnerConfirmationProof,
     ) -> kr_controller::Result<ConfirmedAction> {
         let accepted = ConfirmedAction::verify(
             &kr_pairing::confirm::ConfirmationExpectation {
-                action,
-                action_digest,
+                action: what.action,
+                action_digest: what.digest,
                 host_device_id: self.device_id,
                 host_endpoint_id: self.endpoint_id,
-                destination_keys: None,
-                destination_rights: &kr_protocol::scalars::CanonicalSet::new(),
+                destination_keys: what.destination,
+                destination_rights: what.rights,
             },
             &mut self.ledger.lock().expect("the ledger"),
             &self.clock,
@@ -176,20 +175,16 @@ impl OwnerConfirmations for Ceremony {
         accepted
     }
 
-    fn accept_recorded(
-        &self,
-        action: SensitiveAction,
-        action_digest: Digest256,
-    ) -> kr_controller::Result<ConfirmedAction> {
+    fn accept_recorded(&self, what: &ExactAction<'_>) -> kr_controller::Result<ConfirmedAction> {
         let proof = {
             let mut recorded = self.recorded.lock().expect("the answers");
             let position = recorded.iter().position(|proof| {
-                proof.request.action == action && proof.request.action_digest == action_digest
+                proof.request.action == what.action && proof.request.action_digest == what.digest
             });
             position.map(|position| recorded.remove(position))
         };
         match proof {
-            Some(proof) => self.accept(action, action_digest, &proof),
+            Some(proof) => self.accept(what, &proof),
             None => Err(kr_controller::ControllerError::Refused {
                 code: ErrorCode::OwnerConfirmationRequired,
                 detail: "this action needs a fresh owner confirmation naming it".to_owned(),
@@ -201,7 +196,7 @@ impl OwnerConfirmations for Ceremony {
         self.device_id
     }
 
-    fn clock(&self) -> &dyn kr_pairing::platform::PairingClock {
+    fn clock(&self) -> &(dyn kr_pairing::platform::PairingClock + Sync) {
         &self.clock
     }
 }
@@ -5093,8 +5088,12 @@ mod native_bridges {
             assert!(refused.message.contains("plugin.install"), "{refused:?}");
             host.confirmations()
                 .accept(
-                    SensitiveAction::GrantExecutableCapability,
-                    digest_of_plan,
+                    &ExactAction {
+                        action: SensitiveAction::GrantExecutableCapability,
+                        digest: digest_of_plan,
+                        destination: None,
+                        rights: &kr_protocol::scalars::CanonicalSet::new(),
+                    },
                     &proof,
                 )
                 .expect("the refusal did not spend the owner's proof");

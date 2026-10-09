@@ -25,14 +25,21 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ConfirmationId, EnvironmentId, InvitationId, PluginId};
+use crate::grant::{
+    EnvironmentSelector, Grant, GrantExpiry, HistoryScope, OrganisationRequirement, SessionSelector,
+};
+use crate::ids::{
+    ActionId, AuthorityRevision, ConfirmationId, DeviceId, DeviceKeyRevision, EnvironmentId,
+    GrantId, InvitationId, PluginId, SessionId,
+};
 use crate::invitation::{InviteGrantKind, InviteModeKind, PairCandidateView};
 use crate::pairing::{
-    ConfirmationChannel, DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest,
-    ProposedGrant, RendezvousOrigin, SensitiveAction,
+    ConfirmationChannel, DeviceName, DevicePublicKeys, OwnerConfirmationProof,
+    OwnerConfirmationRequest, ProposedGrant, RendezvousOrigin, SensitiveAction,
 };
 use crate::rights::ActionRight;
 use crate::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, TimestampMs};
+use crate::sharing::GrantTransferParams;
 
 /// What an owner confirms when it establishes a host's clock again.
 ///
@@ -82,6 +89,12 @@ pub enum ConfirmationSubject {
     PluginInstall(Box<crate::catalogue::PluginInstallParams>),
     /// Establishing this host's clock again after it was found to have gone backwards.
     EstablishClock,
+    /// Handing a session's control to another device, as this exact `grant.transfer` would.
+    ///
+    /// The host resolves the grant, both devices and the receiving device's keys from its own
+    /// records, so what an owner device shows and signs is what the transfer then writes. Only the
+    /// person at this machine asks for it: a paired device that asks is refused.
+    TransferControl(Box<TransferControlSubject>),
     /// An action its caller describes: enlarging a persistent grant, or trusting a repository
     /// root or granting an executable capability where the caller presents the answer's proof
     /// itself.
@@ -123,6 +136,122 @@ impl DescribedAction {
                 | SensitiveAction::TrustRepositoryRoot
                 | SensitiveAction::GrantExecutableCapability
         )
+    }
+}
+
+/// A transfer of control that an owner confirmation is asked for: the parameters of the
+/// `grant.transfer` that will spend it, and the action that will.
+///
+/// The grant the receiving device is given takes its identity from the action, so the plan the
+/// owner confirms names it, and a confirmation is for one action and no other.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransferControlSubject {
+    /// What the `grant.transfer` names.
+    pub params: GrantTransferParams,
+    /// The identifier of the action that will transfer.
+    pub action_id: ActionId,
+}
+
+/// Handing a session's control to another device, as the owner is asked to confirm it.
+///
+/// Every member of what is written is a member of this plan, and the digest covers the whole of it:
+/// the grant given up, the device it is taken from and the device and keys it goes to, the
+/// identity of the grant written, and every right, history bound, lifetime, selector and
+/// organisation requirement the receiving device holds. A confirmation obtained for one transfer
+/// authorises no other. The host writes the grant [`Self::replacement`] builds, so what is written
+/// is what was confirmed; an owner device builds the digest again from what it is shown.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransferControlPlan {
+    /// The environment the grants belong to.
+    pub environment_id: EnvironmentId,
+    /// The session whose control moves.
+    pub session_id: SessionId,
+    /// The grant that is given up, with the grants delegated from it.
+    pub source_grant_id: GrantId,
+    /// The grant the given-up one was delegated from, which the new grant is delegated from too.
+    pub parent_grant_id: Nullable<GrantId>,
+    /// The device that issued the given-up grant, which issues the new one.
+    pub issuer_device_id: DeviceId,
+    /// The device that gives up its control.
+    pub from_device_id: DeviceId,
+    /// What that device calls itself. Display text, never authority.
+    pub from_device_name: DeviceName,
+    /// The device that receives it.
+    pub to_device_id: DeviceId,
+    /// What that device calls itself. Display text, never authority.
+    pub to_device_name: DeviceName,
+    /// The keys the receiving device is paired with.
+    pub to_keys: DevicePublicKeys,
+    /// The revision of those keys.
+    pub to_key_revision: DeviceKeyRevision,
+    /// The grant that is written.
+    pub new_grant_id: GrantId,
+    /// The environments the new grant covers, as the given-up one's.
+    pub environment_selector: EnvironmentSelector,
+    /// The rights handed over.
+    pub actions: CanonicalSet<ActionRight>,
+    /// How far back the new grant sees, as the given-up one's.
+    pub history: HistoryScope,
+    /// When the new grant stops, as the given-up one's.
+    pub expiry: GrantExpiry,
+    /// The organisation membership the new grant requires, as the given-up one's.
+    pub organisation: Nullable<OrganisationRequirement>,
+}
+
+impl TransferControlPlan {
+    /// The sensitive action a confirmation for this plan is bound to.
+    #[must_use]
+    pub const fn sensitive_action() -> SensitiveAction {
+        SensitiveAction::ChangeHostAuthority
+    }
+
+    /// The digest an owner's confirmation for this exact transfer covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256, kr_cbor::CborError> {
+        digest_of(&("kr-transfer/2", self))
+    }
+
+    /// What an owner device is shown of this plan.
+    #[must_use]
+    pub fn display(&self) -> ConfirmationDisplay {
+        ConfirmationDisplay::TransferControl(Box::new(self.clone()))
+    }
+
+    /// The plan an owner device is shown, or `None` when the display is another subject's.
+    #[must_use]
+    pub fn of_display(display: &ConfirmationDisplay) -> Option<&Self> {
+        match display {
+            ConfirmationDisplay::TransferControl(plan) => Some(plan),
+            _ => None,
+        }
+    }
+
+    /// The grant this plan writes, active on the session it names and nothing else, under the
+    /// authority revision it is written at.
+    #[must_use]
+    pub fn replacement(&self, authority_revision: AuthorityRevision) -> Grant {
+        Grant {
+            grant_id: self.new_grant_id,
+            parent_grant_id: self.parent_grant_id,
+            issuer_device_id: self.issuer_device_id,
+            recipient_device_id: self.to_device_id,
+            authority_revision,
+            environment_selector: self.environment_selector.clone(),
+            // The plan names one session, so the new grant covers one session however wide the
+            // given-up one was.
+            session_selector: SessionSelector::These {
+                session_ids: [self.session_id].into_iter().collect(),
+            },
+            actions: self.actions.clone(),
+            history: self.history.clone(),
+            expiry: self.expiry,
+            organisation: self.organisation,
+        }
     }
 }
 
@@ -175,6 +304,8 @@ pub enum ConfirmationDisplay {
     },
     /// Establishing this host's clock again.
     EstablishClock,
+    /// Handing a session's control to another device.
+    TransferControl(Box<TransferControlPlan>),
     /// Adopting this repository's trust root.
     CatalogueAdd {
         /// The environment it is enrolled in.

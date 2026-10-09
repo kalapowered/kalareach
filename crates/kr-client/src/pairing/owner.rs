@@ -30,7 +30,7 @@ use kr_pairing::platform::PairingClock;
 use kr_protocol::confirmation::{
     CLOCK_PURPOSE, CatalogueTrustPlan, ConfirmationDisplay, DescribedAction,
     OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
-    OwnerConfirmationPendingResult, PendingConfirmation, PluginInstallPlan,
+    OwnerConfirmationPendingResult, PendingConfirmation, PluginInstallPlan, TransferControlPlan,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -212,6 +212,9 @@ pub enum Subject {
     /// Installing a release with a grant, as the host's catalogue described the installation: the
     /// plan whose digest this device recomputed from what it shows.
     PluginInstall(PluginInstallPlan),
+    /// Handing a session's control to another device, as the host described the transfer: the
+    /// plan whose digest this device recomputed from what it shows.
+    TransferControl(Box<TransferControlPlan>),
     /// An action its caller described by class, rights and digest only.
     Described(DescribedAction),
 }
@@ -235,6 +238,7 @@ impl std::fmt::Debug for Subject {
             Self::EstablishClock => formatter.write_str("EstablishClock"),
             Self::CatalogueAdd(_) => formatter.write_str("CatalogueAdd(..)"),
             Self::PluginInstall(_) => formatter.write_str("PluginInstall(..)"),
+            Self::TransferControl(_) => formatter.write_str("TransferControl(..)"),
             Self::Described(_) => formatter.write_str("Described(..)"),
         }
     }
@@ -382,6 +386,21 @@ pub fn check(pending: &PendingConfirmation, host: &PairedHost) -> Result<Subject
             no_destination()?;
             rights(&kr_protocol::scalars::CanonicalSet::new())?;
             Ok(Subject::CatalogueAdd(plan))
+        }
+        ConfirmationDisplay::TransferControl(plan) => {
+            expect(SensitiveAction::ChangeHostAuthority)?;
+            // The digest is built again from what the person is shown, so a host that shows one
+            // transfer and asks for the confirmation of another is found here. The device the
+            // control goes to and the rights it is given are the challenge's own members too.
+            let digest = plan.action_digest().map_err(|_| CannotCheck::Unreadable)?;
+            if digest != request.action_digest {
+                return Err(CannotCheck::DigestMismatch);
+            }
+            if request.destination_keys.as_ref() != Some(&plan.to_keys) {
+                return Err(CannotCheck::Destination);
+            }
+            rights(&plan.actions)?;
+            Ok(Subject::TransferControl(plan.clone()))
         }
         ConfirmationDisplay::PluginInstall { .. } => {
             expect(SensitiveAction::GrantExecutableCapability)?;
@@ -546,6 +565,16 @@ fn is_verification_value(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// The first eight hexadecimal characters of a session's identity, which is how a person tells
+/// sessions apart where no name is shown.
+#[must_use]
+pub fn session_label(session_id: kr_protocol::ids::SessionId) -> String {
+    session_id.get().as_bytes()[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// The first eight hexadecimal characters of a digest, grouped as a value is.
 fn digest_prefix(digest: &kr_protocol::scalars::Digest256) -> String {
     let hex: String = digest.as_bytes()[..4]
@@ -649,6 +678,14 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                     shown(&plan.catalogue_id, names)
                 )
             }
+            Subject::TransferControl(plan) => format!(
+                "hand control of session {} on {host} from {} to {}, who may {} {}",
+                session_label(plan.session_id),
+                shown(plan.from_device_name.as_str(), names),
+                shown(plan.to_device_name.as_str(), names),
+                authority(&plan.actions).ok_or(CannotCheck::CannotShow)?,
+                duration(&plan.expiry, now_ms)
+            ),
             Subject::Described(described) => {
                 let action = match described.action {
                     SensitiveAction::EnlargeGrant => "widen what devices may do",
@@ -1554,6 +1591,156 @@ mod tests {
             display,
         );
         assert_eq!(check(&pending, &host), Err(CannotCheck::Unreadable));
+    }
+
+    /// The transfer of control a host describes: a session handed from one device to another.
+    fn transfer_plan() -> TransferControlPlan {
+        TransferControlPlan {
+            environment_id: environment(),
+            session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([10; 16])),
+            source_grant_id: GrantId::new(Uuid::from_bytes([11; 16])),
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+            from_device_id: DeviceId::new(Uuid::from_bytes([12; 16])),
+            from_device_name: DeviceName::new("laptop").expect("a name"),
+            to_device_id: DeviceId::new(Uuid::from_bytes([13; 16])),
+            to_device_name: DeviceName::new("phone").expect("a name"),
+            to_keys: DeviceKeys::generate().expect("keys").public_keys(),
+            to_key_revision: DeviceKeyRevision::new(1),
+            new_grant_id: GrantId::new(Uuid::from_bytes([14; 16])),
+            environment_selector: EnvironmentSelector::Any,
+            actions: [ActionRight::SessionView, ActionRight::SessionShare]
+                .into_iter()
+                .collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(NOW + 3_600_000),
+            },
+            organisation: Nullable::null(),
+        }
+    }
+
+    /// The challenge a host issues for a transfer: the receiving device's keys and the rights it is
+    /// given are the challenge's own members.
+    fn transfer_challenge(host: &PairedHost, plan: &TransferControlPlan) -> PendingConfirmation {
+        let mut request = challenge_for(
+            host,
+            SensitiveAction::ChangeHostAuthority,
+            plan.action_digest().expect("a digest"),
+        );
+        request.destination_keys = Nullable::some(plan.to_keys);
+        request.destination_rights = plan.actions.clone();
+        PendingConfirmation {
+            request,
+            display: plan.display(),
+            answered: false,
+        }
+    }
+
+    /// KR-REQ-18.03, KR-REQ-10.05: an owner device shows the transfer a host describes, builds its
+    /// digest again from what it is shown, and takes the challenge only when that is the digest
+    /// the host issued, the keys of the device that receives the control and the rights it is
+    /// given. What the person is shown is what the confirmation covers, whichever member differs.
+    #[test]
+    fn a_transfer_the_host_describes_is_checked_against_its_digest_its_device_and_its_rights() {
+        let host = paired_host();
+        let plan = transfer_plan();
+        assert_eq!(
+            check(&transfer_challenge(&host, &plan), &host),
+            Ok(Subject::TransferControl(Box::new(plan.clone()))),
+            "the control: a transfer shown as it was confirmed"
+        );
+        let line = reason(
+            &Subject::TransferControl(Box::new(plan.clone())),
+            "studio",
+            NOW,
+        )
+        .expect("a line");
+        for named in ["studio", "laptop", "phone", "0a0a0a0a", "for 60 minutes"] {
+            assert!(line.contains(named), "{named}: {line}");
+        }
+
+        let confirmed = plan.action_digest().expect("a digest");
+        let edits: Edits<TransferControlPlan> = vec![
+            (
+                "the session",
+                Box::new(|plan| {
+                    plan.session_id = kr_protocol::ids::SessionId::new(Uuid::from_bytes([9; 16]))
+                }),
+            ),
+            (
+                "the grant given up",
+                Box::new(|plan| plan.source_grant_id = GrantId::new(Uuid::from_bytes([9; 16]))),
+            ),
+            (
+                "the device it is taken from",
+                Box::new(|plan| plan.from_device_id = DeviceId::new(Uuid::from_bytes([9; 16]))),
+            ),
+            (
+                "the device it goes to",
+                Box::new(|plan| plan.to_device_id = DeviceId::new(Uuid::from_bytes([9; 16]))),
+            ),
+            (
+                "the name it is shown under",
+                Box::new(|plan| plan.to_device_name = DeviceName::new("tablet").expect("a name")),
+            ),
+            (
+                "the revision of its keys",
+                Box::new(|plan| plan.to_key_revision = DeviceKeyRevision::new(2)),
+            ),
+            (
+                "the grant written",
+                Box::new(|plan| plan.new_grant_id = GrantId::new(Uuid::from_bytes([9; 16]))),
+            ),
+            (
+                "the issuer",
+                Box::new(|plan| plan.issuer_device_id = DeviceId::new(Uuid::from_bytes([9; 16]))),
+            ),
+            (
+                "the rights",
+                Box::new(|plan| {
+                    plan.actions.insert(ActionRight::TerminalInput);
+                }),
+            ),
+            (
+                "how long it lasts",
+                Box::new(|plan| plan.expiry = GrantExpiry::Never),
+            ),
+            (
+                "how far back it sees",
+                Box::new(|plan| plan.history.include_live_screen = true),
+            ),
+        ];
+        for (name, edit) in &edits {
+            let mut shown = plan.clone();
+            edit(&mut shown);
+            assert_ne!(shown, plan, "{name}: the edit changes the plan");
+            let mut pending = transfer_challenge(&host, &plan);
+            pending.display = shown.display();
+            assert_eq!(
+                check(&pending, &host),
+                Err(CannotCheck::DigestMismatch),
+                "{name}: {confirmed:?}"
+            );
+        }
+
+        // A challenge for the right plan that sends the authority to other keys, or grants other
+        // rights, is not the transfer the person is shown.
+        let mut elsewhere = transfer_challenge(&host, &plan);
+        elsewhere.request.destination_keys =
+            Nullable::some(DeviceKeys::generate().expect("keys").public_keys());
+        assert_eq!(check(&elsewhere, &host), Err(CannotCheck::Destination));
+        let mut wider = transfer_challenge(&host, &plan);
+        wider
+            .request
+            .destination_rights
+            .insert(ActionRight::TerminalInput);
+        assert_eq!(check(&wider, &host), Err(CannotCheck::Rights));
     }
 
     /// KR-REQ-11.42: the dialog's line names what an enrolment and an installation authorise: the

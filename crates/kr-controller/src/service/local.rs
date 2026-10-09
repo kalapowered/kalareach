@@ -198,6 +198,7 @@ impl Controller {
             Method::GrantCreate
                 | Method::GrantRedeem
                 | Method::GrantRevoke
+                | Method::GrantTransfer
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
                 | Method::DeliveryDestinationSecretSet
