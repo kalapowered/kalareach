@@ -33,7 +33,7 @@ import {
   watch
 } from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
-import type { VoiceAction, VoiceDelegateParams } from '@kalareach/protocol'
+import type { TranscriptFragment, VoiceDelegateParams } from '@kalareach/protocol'
 import type { Surface } from '../mobile/platform'
 
 /** The message to show for a failure, whatever shape it arrived in. */
@@ -280,21 +280,22 @@ export function VoiceRoute({
         kind?: string
         delegation_id?: string
         offset_ms?: string
-        action?: string
+        fragments?: TranscriptFragment[]
       } | null
       if (body?.kind !== 'voice_delegation' || !body.delegation_id) return
       const delegationId = body.delegation_id
       setCall((running) => (running ? withDelegation(running, delegationId, 'announced') : running))
-      // What the delegation asks for is the provider's to name and the host's to check. A
-      // delegation that named nothing is not turned into a guess: it is shown and not submitted.
-      if (!body.action) {
+      // What the delegation asks for is the host's to read: this screen hands it the words the
+      // device vouched for and names no action. A delegation that carried no words is not turned
+      // into a guess: it is shown and not submitted.
+      if (!body.fragments || body.fragments.length === 0) {
         setCall((running) =>
           running
             ? withDelegation(
                 running,
                 delegationId,
                 'not_sent',
-                'The voice named no action, so nothing was sent to the host.'
+                'The voice said nothing the host could read, so nothing was sent to the host.'
               )
             : running
         )
@@ -305,7 +306,7 @@ export function VoiceRoute({
         held,
         {
           delegationId,
-          action: body.action as VoiceAction,
+          fragments: body.fragments,
           offsetMs: body.offset_ms ?? '0'
         },
         setCall,
@@ -600,7 +601,11 @@ function withRequest(
 async function submitDelegation(
   port: HostPort,
   held: { readonly current: RunningCall | null },
-  announced: { readonly delegationId: string; readonly action: VoiceAction; readonly offsetMs: string },
+  announced: {
+    readonly delegationId: string
+    readonly fragments: readonly TranscriptFragment[]
+    readonly offsetMs: string
+  },
   setCall: (update: (call: RunningCall | null) => RunningCall | null) => void,
   setNotice: (text: string | null) => void
 ): Promise<void> {
@@ -612,11 +617,7 @@ async function submitDelegation(
     voice_session_id: running.voiceSessionId,
     delegation_id: delegationId,
     offset_ms: announced.offsetMs,
-    action: announced.action,
-    session_id: running.sessions[0] ?? null,
-    spoken_destination: null,
-    approval: null,
-    turn_id: null,
+    fragments: [...announced.fragments],
     confirmation: null
   }
   try {
