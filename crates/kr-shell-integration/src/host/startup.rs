@@ -1956,7 +1956,7 @@ mod tests {
     use super::*;
 
     /// Holds `record` as a program outside a store does, which holds nothing else.
-    fn hold(record: &EntryRecord) -> Result<HeldRecord<'_>, RecordError> {
+    fn hold_the_record(record: &EntryRecord) -> Result<HeldRecord<'_>, RecordError> {
         static WRITERS: std::sync::OnceLock<kr_ipc::install::Writers> = std::sync::OnceLock::new();
         static PERMIT: std::sync::OnceLock<Permit<'static>> = std::sync::OnceLock::new();
         let writers = WRITERS.get_or_init(|| {
@@ -4777,7 +4777,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(record.path()).expect("the record"))
                 .expect("JSON")
         };
-        hold(&record)
+        hold_the_record(&record)
             .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
@@ -4792,7 +4792,7 @@ mod tests {
                 .expect("an unstamped record is read"),
             vec![zshrc.clone()]
         );
-        drop(hold(&record).expect("holds"));
+        drop(hold_the_record(&record).expect("holds"));
         assert_eq!(
             written(&record)["version"],
             ENTRY_RECORD_VERSION,
@@ -4833,7 +4833,7 @@ mod tests {
         let zshrc = PathBuf::from("/home/the person's home/.zshrc");
         let bashrc = PathBuf::from("/home/the person's home/.bashrc");
         let profile = PathBuf::from("/home/the person's home/.bash_profile");
-        let held = hold(&record).expect("holds");
+        let held = hold_the_record(&record).expect("holds");
         held.add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
         held.add(ShellKind::Bash, &[bashrc.clone(), profile.clone()])
@@ -4875,7 +4875,7 @@ mod tests {
         let root = tempfile::tempdir().expect("a directory");
         let record = EntryRecord::in_state_directory(&root.path().join("state"));
         let name = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/h\xffme/.zshrc"));
-        hold(&record)
+        hold_the_record(&record)
             .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&name))
             .expect("records");
@@ -4927,11 +4927,11 @@ mod tests {
     fn a_second_holder_of_the_record_waits_for_the_first_to_let_go() {
         let root = tempfile::tempdir().expect("a directory");
         let record = EntryRecord::in_state_directory(&root.path().join("state"));
-        let first = hold(&record).expect("holds");
+        let first = hold_the_record(&record).expect("holds");
         let (held, second) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let holding = hold(&record).expect("holds once the first lets go");
+                let holding = hold_the_record(&record).expect("holds once the first lets go");
                 held.send(()).expect("says so");
                 drop(holding);
             });
