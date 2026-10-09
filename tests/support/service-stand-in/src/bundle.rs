@@ -23,16 +23,13 @@ use std::collections::BTreeMap;
 
 use kr_client::services::ServiceHttpAnswer;
 use kr_protocol::service::ServiceRequestSigner;
+use kr_protocol::sync::{MAX_SEALED_RECOVERY_BUNDLE_BYTES, MIN_SEALED_RECOVERY_BUNDLE_BYTES};
 use serde_json::{Value, json};
 
 use crate::web::{BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Token, answered, refusal};
 
 /// The bytes the service counts for the record around a sealed object, which the contract states.
 const RECORD_BYTES: u64 = 256;
-/// The fewest bytes a sealed bundle is.
-const MIN_SEALED_BYTES: usize = 24 + 17;
-/// The most bytes a sealed bundle is.
-const MAX_SEALED_BYTES: usize = 128 * 1024;
 /// The members a settings-sync request is exactly one of.
 const MEMBERS: [&str; 8] = [
     "exchange",
@@ -249,13 +246,23 @@ fn is_uuid(value: &Value) -> bool {
     })
 }
 
-/// A counter the contract reads exactly: decimal text of at most 16 digits, with no leading zero.
+/// The largest counter the service compares exactly: the largest whole number its own language
+/// holds without rounding.
+const MAX_SYNC_COUNTER: u64 = (1 << 53) - 1;
+
+/// A counter the contract reads: decimal text with no leading zero, no larger than
+/// [`MAX_SYNC_COUNTER`].
 fn counter(value: &Value) -> Option<u64> {
     let text = value.as_str()?;
-    if text.is_empty() || text.len() > 16 || (text.len() > 1 && text.starts_with('0')) {
+    if text.is_empty()
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+        || (text.len() > 1 && text.starts_with('0'))
+    {
         return None;
     }
-    text.parse().ok()
+    text.parse()
+        .ok()
+        .filter(|counter| *counter <= MAX_SYNC_COUNTER)
 }
 
 /// Reads one request against the closed shape its member has.
@@ -285,11 +292,11 @@ fn read(member: &str, value: &Value) -> Result<Asked, Unread> {
             ],
             "A fence at the recovery bundle",
         ),
-        other => {
-            return Err(invalid_request(&format!(
+        _ => {
+            return Err(invalid_request(
                 "A recovery bundle is written, read, asked about and fenced, and nothing else \
-                 names a locator, not {other}."
-            )));
+                 names a locator.",
+            ));
         }
     };
     let fields = value
@@ -335,9 +342,10 @@ fn read(member: &str, value: &Value) -> Result<Asked, Unread> {
         "exchange" => {
             let request_id = request_id()?;
             kind()?;
-            let expected = match &value["expected_revision"] {
-                Value::Null => None,
-                revision if is_uuid(revision) => revision.as_str().map(str::to_owned),
+            // Absent is not null: a write names the revision it replaces, or says it replaces none.
+            let expected = match value.get("expected_revision") {
+                Some(Value::Null) => None,
+                Some(revision) if is_uuid(revision) => revision.as_str().map(str::to_owned),
                 _ => {
                     return Err(invalid_request(&format!(
                         "{asked} names the revision it replaces, one this service issued, or null \
@@ -349,15 +357,17 @@ fn read(member: &str, value: &Value) -> Result<Asked, Unread> {
             let length = object["ciphertext"]
                 .as_str()
                 .and_then(decode)
-                .map(|bytes| bytes.len())
+                .map(|bytes| bytes.len() as u64)
                 .ok_or_else(|| {
                     invalid_request(
                         "A recovery bundle is never removed, so a write of it carries the bundle.",
                     )
                 })?;
-            if !(MIN_SEALED_BYTES..=MAX_SEALED_BYTES).contains(&length) {
+            if !(MIN_SEALED_RECOVERY_BUNDLE_BYTES..=MAX_SEALED_RECOVERY_BUNDLE_BYTES)
+                .contains(&length)
+            {
                 return Err(invalid_request(&format!(
-                    "A recovery bundle is {MIN_SEALED_BYTES} to {MAX_SEALED_BYTES} bytes of sealed stream."
+                    "A recovery bundle is {MIN_SEALED_RECOVERY_BUNDLE_BYTES} to {MAX_SEALED_RECOVERY_BUNDLE_BYTES} bytes of sealed stream."
                 )));
             }
             Ok(Asked::Exchange {
@@ -485,14 +495,16 @@ impl Collection {
         let recorded_at = instant(now_ms);
         let current = self.kept.clone();
         if current.as_ref().map(|kept| kept.revision.clone()) != expected {
+            // Where the bundle stands is its write sequence, and nought where it was never written.
+            let standing = current
+                .as_ref()
+                .map_or(0, |kept| kept.write_sequence)
+                .to_string();
             let answer = json!({
                 "state": "conflict",
                 "record": current.as_ref().map(|kept| kept.record(locator)),
                 "current_revision": current.as_ref().map(|kept| kept.revision.clone()),
-                "current_write_sequence": current
-                    .as_ref()
-                    .map_or(0, |kept| kept.write_sequence)
-                    .to_string(),
+                "current_write_sequence": standing,
                 "conflict": null,
                 "recovery_id": null,
                 "stored": stored(current.as_ref()),
@@ -505,9 +517,7 @@ impl Collection {
                     answer: Some(answer.clone()),
                     record: current.as_ref().map(|kept| kept.record(locator)),
                     current_revision: current.as_ref().map(|kept| kept.revision.clone()),
-                    current_write_sequence: current
-                        .as_ref()
-                        .map(|kept| kept.write_sequence.to_string()),
+                    current_write_sequence: Some(standing),
                     never_ran: false,
                     recorded_at,
                 },
