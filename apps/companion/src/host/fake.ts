@@ -81,6 +81,7 @@ import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArgume
 import { codeComplete } from '../pairing/words'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, decodeParams, STORAGE_OBJECT_DELETE_PARAMS } from './fake-decode'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
+import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
@@ -219,6 +220,8 @@ export interface FakeHostControls {
   appendNode(node: DocumentNode, sessionId?: string): void
   /** The records behind the published methods: each session's agent, attention and the rest. */
   readonly records: ScriptedRecords
+  /** The questions the agents asked, and what can happen to them while a person decides. */
+  readonly questions: FakeQuestions
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
   /**
@@ -482,6 +485,7 @@ export type HeldRead =
   | 'connectionState'
   | 'accountStatus'
   | 'attentionRead'
+  | 'questionRead'
   | 'sessionRead'
   | 'launchSurface'
   | 'sessionAgents'
@@ -591,6 +595,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   // written against the time the host starts, because a screen says how long ago each one was
   // against the time it reads them.
   const records = new ScriptedRecords({
+    environment: ENVIRONMENT,
+    sessions: { main: SESSION_MAIN, build: SESSION_BUILD, offline: SESSION_OFFLINE },
+    nowMs: Date.now()
+  })
+  const questions = new ScriptedQuestions({
     environment: ENVIRONMENT,
     sessions: { main: SESSION_MAIN, build: SESSION_BUILD, offline: SESSION_OFFLINE },
     nowMs: Date.now()
@@ -1121,19 +1130,16 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       requireConnection()
       return Promise.resolve(records.reviewAcknowledge(params))
     },
-    questionRead: () =>
-      Promise.resolve({
-        questions: [
-          {
-            question_id: 'q-1',
-            revision: '2',
-            prompt: 'Which branch should the release be cut from?',
-            options: ['main', 'release/2026-09']
-          }
-        ]
+    questionRead: (params) =>
+      reading('questionRead', () => {
+        requireConnection()
+        return questions.read(params)
       }),
-    questionAnswer: () =>
-      Promise.resolve(settledAs('question.answer', 'applied')),
+    questionAnswer: (params) => Promise.resolve(questions.answer(params)),
+    questionKept: () => Promise.resolve(questions.kept()),
+    questionSettle: (sessionId) => Promise.resolve(questions.settle(sessionId)),
+    questionSendKept: (which) => Promise.resolve(questions.sendKept(which)),
+    questionDismissKept: (which) => Promise.resolve(questions.dismissKept(which)),
     deviceList: (params) =>
       reading('deviceList', () => {
         requireConnection()
@@ -1646,6 +1652,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
     records,
+    questions,
     changePromptGeneration() {
       promptGeneration += 1
       emit({
@@ -1657,6 +1664,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setConnected(next, reason = UNREACHABLE) {
       connected = next
       lostBecause = reason
+      // The sessions' workers are on the host: out of contact with it is out of contact with them.
+      questions.setReachable(next)
       for (const listener of connectionListeners) listener(connectionNow())
     },
     switchHost(environmentId, options) {

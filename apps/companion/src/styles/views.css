@@ -126,6 +126,78 @@
   margin-top: 14px;
 }
 
+/* ---- Questions ------------------------------------------------------------------------------- */
+
+/*
+ * A question an agent is waiting on a person for, and an answer kept on this device until the person
+ * sends it. Sized in rem so a larger text size reflows it, and every choice is a whole row at least
+ * a target tall, so the row is what is pressed and not the small circle in it.
+ */
+.questions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 14px 0 4px;
+}
+
+.conversation > .questions {
+  margin: 8px 22px 14px;
+}
+
+.question {
+  padding: 16px 18px;
+  border: 1px solid var(--warning-line);
+  border-radius: 9px;
+  background: var(--raised);
+}
+
+.question.kept {
+  border-color: var(--line);
+}
+
+.question h3 {
+  font-size: 0.875rem;
+  line-height: 1.45;
+  margin: 4px 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.question p {
+  overflow-wrap: anywhere;
+}
+
+.question-context {
+  white-space: pre-wrap;
+}
+
+.question-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-inline-size: 0;
+  margin: 10px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.question-choice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--target);
+  overflow-wrap: anywhere;
+}
+
+.question-choice input {
+  flex-shrink: 0;
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+.question-send {
+  margin-top: 14px;
+}
+
 /* ---- Sessions -------------------------------------------------------------------------------- */
 
 .session-table {

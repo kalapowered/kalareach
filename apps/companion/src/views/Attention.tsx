@@ -32,6 +32,7 @@ import {
 import { outcomeMessage, outcomeTone } from '../model/receipts'
 import { Confirmations } from '../pairing/Confirmations'
 import { ApprovalRequests } from './Approvals'
+import { KeptAnswers, QuestionRequests } from './Questions'
 
 const FILTERS: readonly { readonly value: AttentionFilter; readonly label: string }[] = [
   { value: 'all', label: 'Everything' },
@@ -49,6 +50,14 @@ const BADGE_TONE = {
   success: 'success',
   muted: 'neutral'
 } as const
+
+/** Whether an inbox row is a question waiting for an answer. */
+function asksAQuestion(row: AttentionRow): boolean {
+  return (
+    row.item.rule === 'attention.pending_input' ||
+    row.item.rule === 'attention.input_idle_reminder'
+  )
+}
 
 /** The largest page of the inbox one read asks for. */
 const PAGE_ITEMS = '200'
@@ -155,6 +164,8 @@ export function Attention(): ReactNode {
 
       <Confirmations />
 
+      <KeptAnswers />
+
       {failure ? (
         <Banner
           tone="warning"
@@ -232,6 +243,9 @@ export function Attention(): ReactNode {
                     </p>
                     {approvals ? (
                       <ApprovalRequests sessionId={sessionId} onAnswered={readAgain} />
+                    ) : null}
+                    {asksAQuestion(row) && sessionId !== null ? (
+                      <QuestionRequests sessionId={sessionId} onAnswered={readAgain} />
                     ) : null}
                   </div>
                   <div className="card-footer">
