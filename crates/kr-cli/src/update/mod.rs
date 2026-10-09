@@ -1673,7 +1673,7 @@ async fn hand_over(
             handover::resume(daemon, environment, &target.release).await;
         }
         forget_update(store, record);
-        return Err(formats::refusal(&target, &unreadable));
+        return Err(formats::refusal(target, &unreadable));
     }
     let every = every_environment(environments, &again);
     // From here the reading under the install lock is the one a person is told of. A pair of roots
