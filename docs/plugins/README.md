@@ -209,12 +209,16 @@ declares it, holds the text `kr-hook` in any mix of upper and lower case, whatev
 
 The owner confirms `command_integration.launch` on every release, because the flags and variables
 are part of the release. The plan a `plugin.install` confirmation is bound to holds the capability
-names, the exact package hash, which covers the declaration, and, when the grant holds
-`native_bridge.install`, that bridge's statement. The plan of a `plugin.grant` confirmation holds
-the capability names and the package hash. Neither holds the integration's `grant_statement` or the
-list `CommandIntegration::statement` renders from the declaration (the command, each flag as a JSON
-string in order, and each variable as `NAME="value"`, nothing shortened), so no confirmation shows
-them.
+names, the exact package hash, which covers the declaration, and a statement. If the grant includes
+`native_bridge.install` the statement begins with that bridge's own words. If the grant includes
+`command_integration.launch` the statement ends with the host's own exact reading of the
+declaration, which describes the command and flags as JSON strings in order, variables in the form
+`NAME="value"`, arguments to pass to the application server if any, and when the integration
+applies. The host generates this reading from the signed manifest, and it is never shortened.
+Packages whose reading is longer than 4,000 characters will not be accepted. Any `grant_statement`
+included in the command integration itself will not be shown. `plugin.grant` does not add
+`command_integration.launch` to an installed release: it names `plugin.install`, where the owner is
+shown the reading.
 
 A host reads the integration only from the verified manifest, never from what an installation says
 about it, and applies it only while the installation holds `command_integration.launch`. The

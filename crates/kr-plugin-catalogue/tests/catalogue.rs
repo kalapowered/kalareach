@@ -2317,6 +2317,184 @@ async fn kr_req_11_11_a_release_that_changes_its_command_integration_asks_the_ow
     assert_eq!(installed.package_digest, second.manifest_digest());
 }
 
+/// An owner confirming a release is shown the host's exact reading of the command integration its
+/// manifest declares, taken from the signed generation's copy of that manifest, whenever the grant
+/// holds `command_integration.launch`, and nothing of it for a grant that does not. A statement
+/// longer than an owner is shown whole is refused rather than offered.
+#[tokio::test]
+async fn kr_req_11_11_an_owner_is_shown_the_reading_of_a_command_integration_the_grant_holds() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let packages = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            package: Some(integrating(
+                packages.path(),
+                "0.1.0",
+                &["--kalareach-channel", "first"],
+            )),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    let version = PackageVersion::parse("0.1.0").expect("a valid version");
+    let digest = generation.manifest_digest();
+
+    let launch = InstallationGrant::with([PluginCapability::CommandIntegrationLaunch]);
+    let statement = catalogue
+        .grant_statement(&repository(), &plugin(), &version, digest, &launch)
+        .await
+        .expect("the manifest the index pins is read")
+        .expect("a grant that holds the integration is shown it");
+    assert!(
+        statement.starts_with(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL),
+        "{statement}"
+    );
+    assert!(
+        statement.contains("\"--kalareach-channel\" \"first\""),
+        "every flag the host adds is in it: {statement}"
+    );
+    let without = catalogue
+        .grant_statement(
+            &repository(),
+            &plugin(),
+            &version,
+            digest,
+            &InstallationGrant::none(),
+        )
+        .await
+        .expect("the manifest the index pins is read");
+    assert_eq!(without, None, "a grant without the capability shows none");
+
+    // A reading longer than an owner is shown whole is refused, not shortened.
+    let long = "f".repeat(kr_plugin_sdk::integration::MAX_STATEMENT_CHARS);
+    let over = Generation::build(
+        &home.path().join("over"),
+        GenerationSpec {
+            generation: 2,
+            package: Some(integrating(packages.path(), "0.2.0", &[&long])),
+            keys: Some(generation.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    generation.replace_with(&over);
+    catalogue.sync(&repository()).await.expect("generation 2");
+    let refusal = catalogue
+        .grant_statement(
+            &repository(),
+            &plugin(),
+            &PackageVersion::parse("0.2.0").expect("a valid version"),
+            over.manifest_digest(),
+            &launch,
+        )
+        .await
+        .expect_err("a reading no device shows whole");
+    assert!(
+        matches!(refusal, CatalogueError::Integrity { .. }),
+        "{refusal:?}"
+    );
+}
+
+/// A command integration is granted to an installed release only by installing it, as a native
+/// bridge is: a later grant is not where the owner is shown the host's reading of what the
+/// integration does, so it refuses naming `plugin.install`. Withdrawing it, and widening by some
+/// other capability, stay possible.
+#[tokio::test]
+async fn kr_req_11_11_a_command_integration_is_granted_only_by_installing_it() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let packages = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            package: Some(integrating(packages.path(), "0.1.0", &["--flag"])),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    // A release that asks for the integration installs only with it granted; the owner then
+    // narrows the installation to nothing, which the grant path allows.
+    let launch = [PluginCapability::CommandIntegrationLaunch];
+    install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        generation.manifest_digest(),
+        &launch,
+        true,
+    )
+    .await
+    .expect("installed with the integration granted");
+    catalogue
+        .set_grant(environment(), &plugin(), InstallationGrant::none())
+        .expect("a grant narrows");
+
+    let refusal = catalogue
+        .set_grant(
+            environment(),
+            &plugin(),
+            InstallationGrant::with([PluginCapability::CommandIntegrationLaunch]),
+        )
+        .expect_err("a later grant shows the owner nothing of the integration");
+    assert!(
+        matches!(refusal, CatalogueError::GrantRequired { .. }),
+        "{refusal:?}"
+    );
+    assert!(refusal.to_string().contains("plugin.install"), "{refusal}");
+    assert!(
+        !catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("installed")
+            .grant
+            .holds(PluginCapability::CommandIntegrationLaunch)
+    );
+
+    // Controls: a later grant that adds some other capability is the grant path's as before, and
+    // the owner's confirmation of the release grants the integration again.
+    catalogue
+        .set_grant(
+            environment(),
+            &plugin(),
+            InstallationGrant::with([PluginCapability::MetadataMatch]),
+        )
+        .expect("a grant that adds something other than the integration");
+    install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        generation.manifest_digest(),
+        &launch,
+        true,
+    )
+    .await
+    .expect("the owner confirmed the release with its integration");
+    assert!(
+        catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("installed")
+            .grant
+            .holds(PluginCapability::CommandIntegrationLaunch)
+    );
+}
+
 /// A release that may do more than the installed one installs with the owner's confirmation, and
 /// the installation stays on the release it was on without it: a release that newly asks for
 /// something its repository's ceiling already permits, and one granted something past the

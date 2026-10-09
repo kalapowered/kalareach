@@ -274,10 +274,15 @@ pub fn install_package(
         .collect();
     grant.sort();
     grant.dedup();
-    let grant_statement = grant
-        .iter()
-        .any(|capability| capability == "native_bridge.install")
-        .then(|| native_bridge_statement(copy, entry));
+    let holds = |name: &str| grant.iter().any(|capability| capability == name);
+    let grant_statement = kr_protocol::confirmation::install_statement(
+        holds("native_bridge.install")
+            .then(|| native_bridge_statement(copy, entry))
+            .as_deref(),
+        holds("command_integration.launch")
+            .then(|| integration_statement(copy, entry))
+            .as_deref(),
+    );
 
     let environment_id = owner.remote.environment_id();
     let listed: CatalogueListResult = runtime
@@ -345,6 +350,32 @@ pub fn install_package(
 /// Panics when the generation's copy holds no manifest for the entry or the manifest names no
 /// native bridge statement.
 fn native_bridge_statement(copy: &Path, entry: &serde_json::Value) -> String {
+    release_manifest(copy, entry)["native_bridge"]["grant_statement"]
+        .as_str()
+        .expect("a native bridge release's manifest carries its grant statement")
+        .to_owned()
+}
+
+/// The host's reading of the command integration the generation's manifest for `entry` declares,
+/// which is what an owner device is shown for it.
+///
+/// # Panics
+///
+/// Panics when the generation's copy holds no manifest for the entry or the manifest declares no
+/// command integration.
+fn integration_statement(copy: &Path, entry: &serde_json::Value) -> String {
+    let declared = release_manifest(copy, entry)["command_integration"].clone();
+    serde_json::from_value::<kr_plugin_sdk::integration::CommandIntegration>(declared)
+        .expect("a command integration release's manifest declares one")
+        .statement()
+}
+
+/// The manifest the generation's copy holds for the release `entry` names.
+///
+/// # Panics
+///
+/// Panics when the copy holds no manifest for the entry.
+fn release_manifest(copy: &Path, entry: &serde_json::Value) -> serde_json::Value {
     let text = |name: &str| entry[name].as_str().unwrap_or_default();
     let manifest = copy
         .join("targets/packages")
@@ -352,14 +383,10 @@ fn native_bridge_statement(copy: &Path, entry: &serde_json::Value) -> String {
         .join(text("plugin_name"))
         .join(text("version"))
         .join("plugin.json");
-    let manifest: serde_json::Value = serde_json::from_slice(
+    serde_json::from_slice(
         &std::fs::read(&manifest).unwrap_or_else(|error| panic!("{}: {error}", manifest.display())),
     )
-    .expect("the manifest is JSON");
-    manifest["native_bridge"]["grant_statement"]
-        .as_str()
-        .expect("a native bridge release's manifest carries its grant statement")
-        .to_owned()
+    .expect("the manifest is JSON")
 }
 
 /// A loopback port nothing listens on: one the operating system handed out and took back.

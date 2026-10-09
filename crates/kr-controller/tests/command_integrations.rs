@@ -58,6 +58,10 @@ fn gemini() -> PluginId {
     PluginId::new("kalareach/gemini-cli").expect("a plugin identifier")
 }
 
+fn codex() -> PluginId {
+    PluginId::new("kalareach/codex").expect("a plugin identifier")
+}
+
 /// A supervisor that starts nothing and reports this process as the worker it started, so this
 /// process can perform the worker's side of the rendezvous.
 #[derive(Debug)]
@@ -91,6 +95,8 @@ struct Daemon {
     environment_id: EnvironmentId,
     launches: std::sync::mpsc::Receiver<WorkerLaunch>,
     controller: Arc<Controller>,
+    /// The hash of the installed package's manifest, as the signed index pins it.
+    package_digest: String,
 }
 
 /// Starts a daemon whose environment has the package installed, with its configuration turning on
@@ -101,6 +107,28 @@ async fn daemon(enabled: Option<&[&str]>) -> Daemon {
 
 /// Starts a daemon as [`daemon`] does, whose package's integration declares `flags`.
 async fn daemon_declaring(enabled: Option<&[&str]>, flags: &[&str]) -> Daemon {
+    daemon_of(
+        &fixture::Shape::gemini_cli(flags),
+        &gemini(),
+        &[
+            PluginCapability::UpstreamAction,
+            PluginCapability::ApprovalDecode,
+            PluginCapability::ApprovalRespond,
+            PluginCapability::CommandIntegrationLaunch,
+        ],
+        enabled,
+    )
+    .await
+}
+
+/// Starts a daemon whose environment has the package of `shape` installed, enabled and granted
+/// `grant`, with its configuration turning on the command integrations of `enabled`.
+async fn daemon_of(
+    shape: &fixture::Shape,
+    plugin: &PluginId,
+    grant: &[PluginCapability],
+    enabled: Option<&[&str]>,
+) -> Daemon {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -108,12 +136,8 @@ async fn daemon_declaring(enabled: Option<&[&str]>, flags: &[&str]) -> Daemon {
 
     // The package, published in a signed generation of its own.
     let written = temp.root().join("written");
-    let source = fixture::package(
-        &written,
-        &temp.root().join("bin").join("kr-hook"),
-        &fixture::Shape::gemini_cli(flags),
-    )
-    .expect("the package is written");
+    let source = fixture::package(&written, &temp.root().join("bin").join("kr-hook"), shape)
+        .expect("the package is written");
     let generation_home = tempfile::tempdir().expect("a directory on the internal disk");
     let generation = generations::Generation::build(
         generation_home.path(),
@@ -154,29 +178,24 @@ async fn daemon_declaring(enabled: Option<&[&str]>, flags: &[&str]) -> Daemon {
     let digest = catalogue
         .index(&id)
         .expect("activated")
-        .find(&gemini(), &version)
+        .find(plugin, &version)
         .expect("the package")
         .manifest_digest;
     catalogue
         .install_with(
             &id,
             environment_id,
-            &gemini(),
+            plugin,
             &version,
             digest,
-            InstallationGrant::with([
-                PluginCapability::UpstreamAction,
-                PluginCapability::ApprovalDecode,
-                PluginCapability::ApprovalRespond,
-                PluginCapability::CommandIntegrationLaunch,
-            ]),
+            InstallationGrant::with(grant.iter().copied()),
             None,
             &mut Change::new(&Owner::confirming()),
         )
         .await
         .expect("installed");
     catalogue
-        .set_enabled(environment_id, &gemini(), true)
+        .set_enabled(environment_id, plugin, true)
         .await
         .expect("enabled");
     drop(catalogue);
@@ -240,6 +259,7 @@ async fn daemon_declaring(enabled: Option<&[&str]>, flags: &[&str]) -> Daemon {
         environment_id,
         launches,
         controller,
+        package_digest: digest.to_string(),
     }
 }
 
@@ -569,4 +589,91 @@ async fn kr_req_12_07_a_launch_without_room_for_an_integration_is_named_for_the_
         }),
         "{warnings:?}"
     );
+}
+
+/// KR-REQ-12.07: the owner is asked to confirm a release that declares a command integration
+/// against the host's exact reading of it, taken from the release's signed manifest: the command,
+/// every flag the host adds and the application server's whole argument vector, with the words
+/// that say when the declaration applies. The digest the owner's device checks covers it. The
+/// control is a grant that does not hold the integration, which has no such reading and a digest
+/// of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_07_the_owner_confirms_an_integration_with_its_servers_arguments_in_view() {
+    use kr_protocol::catalogue::PluginInstallParams;
+    use kr_protocol::confirmation::{
+        COMMAND_INTEGRATION_NOTICE, ConfirmationDisplay, ConfirmationSubject,
+        INTEGRATION_STATEMENT_LABEL, PluginInstallPlan, install_notices,
+    };
+    let daemon = daemon_of(
+        &fixture::Shape::codex_backend(),
+        &codex(),
+        &[PluginCapability::CommandIntegrationLaunch],
+        None,
+    )
+    .await;
+    let resolve = |grant: &[&str]| {
+        let daemon = &daemon;
+        let subject = ConfirmationSubject::PluginInstall(Box::new(PluginInstallParams {
+            environment_id: daemon.environment_id,
+            catalogue_id: "development".to_owned(),
+            plugin_id: codex(),
+            version: "0.3.0".to_owned(),
+            package_digest: daemon.package_digest.clone(),
+            grant: grant.iter().map(|name| (*name).to_owned()).collect(),
+            owner_confirmation: Nullable::null(),
+        }));
+        async move {
+            daemon
+                .controller
+                .catalogue()
+                .resolve_confirmation(&subject)
+                .await
+                .expect("the daemon describes the installation")
+        }
+    };
+
+    let launch = resolve(&["command_integration.launch"]).await;
+    let ConfirmationDisplay::PluginInstall {
+        grant,
+        grant_statement,
+        ..
+    } = &launch.display
+    else {
+        panic!("an installation is shown as one: {:?}", launch.display);
+    };
+    let statement = grant_statement
+        .0
+        .as_deref()
+        .expect("the owner is shown what the integration does");
+    assert!(
+        statement.starts_with(INTEGRATION_STATEMENT_LABEL),
+        "the host's reading is labelled as the host's: {statement}"
+    );
+    for shown in [
+        "\"codex\"",
+        "\"--remote\" \"{gateway}\"",
+        "\"app-server\" \"--listen\" \"stdio://\"",
+        "\"resume\" or \"fork\"",
+        "any other invocation runs as typed",
+    ] {
+        assert!(statement.contains(shown), "{shown}: {statement}");
+    }
+    assert_eq!(install_notices(grant), [COMMAND_INTEGRATION_NOTICE]);
+    // The device builds the digest from what it is shown, and it is the one the host asks to be
+    // confirmed.
+    let shown = PluginInstallPlan::of_display(&launch.display).expect("a display of a plan");
+    assert_eq!(shown.action_digest().expect("a digest"), launch.digest);
+
+    let bare = resolve(&[]).await;
+    let ConfirmationDisplay::PluginInstall {
+        grant_statement, ..
+    } = &bare.display
+    else {
+        panic!("an installation is shown as one: {:?}", bare.display);
+    };
+    assert_eq!(
+        grant_statement.0, None,
+        "no integration is granted, none is read"
+    );
+    assert_ne!(bare.digest, launch.digest);
 }
