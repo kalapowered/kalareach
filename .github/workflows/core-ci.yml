@@ -1164,14 +1164,17 @@ jobs:
       # is named by those digests: a run that restores it fetches nothing, and a run that does not
       # has each archive placed from the URL its manifest names or from a listed mirror. The build
       # script checks every archive against its pin before it uses it, so a mirror that serves any
-      # other bytes fails the job there. The cache is saved only by a run that built the packages.
+      # other bytes fails the job there. The cache is restored by every run and saved by a green run
+      # on the default branch only, as the last step: a cache saved from another branch is used by
+      # that branch alone and takes the room of one every branch uses.
       - name: Name the pinned upstream archives
         id: shell-sources
         run: |
           echo "key=shell-sources-$(bash scripts/place-shell-sources.sh --all --key)" >> "$GITHUB_OUTPUT"
 
       - name: Restore the upstream archives
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: shell-archives
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/kalareach/shells/sources
           key: ${{ steps.shell-sources.outputs.key }}
@@ -1301,6 +1304,13 @@ jobs:
           cargo build --locked -p kr-cli --bin kr
           cargo test --locked -p kr-shell-integration --test install_homes -- \
             --test-threads=1 --include-ignored
+
+      - name: Save the upstream archives
+        if: github.ref == 'refs/heads/main' && steps.shell-archives.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/shells/sources
+          key: ${{ steps.shell-sources.outputs.key }}
 
   typescript:
     name: typescript
