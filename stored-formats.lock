@@ -391,6 +391,8 @@
         "MachineStepResult",
         "VoiceGrantResult",
         "VoiceDelegateResult",
+        "VoiceStartResult",
+        "VoiceStopResult",
         "OrganisationEnrolResult",
         "OrganisationExclusiveSetResult",
         "OrganisationChangeMarker",
