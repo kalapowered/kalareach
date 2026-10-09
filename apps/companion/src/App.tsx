@@ -21,6 +21,8 @@ import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
 import { Setup } from './setup/Setup'
+import { KeptDrafts } from './views/KeptDrafts'
+import { useRebind } from './app/drafts'
 import { failureMessage, follow } from './host/port'
 import { useConfirmations } from './pairing/Confirmations'
 
@@ -46,6 +48,9 @@ export function App(): ReactNode {
   } | null>(null)
   const account = useAccount(port)
   const [accountOpen, setAccountOpen] = useState(false)
+  // Drafts the application was started or disconnected with are bound to their conversations again
+  // once the host says where those stand.
+  useRebind(connection?.connected === true)
 
   // A sign-in carries on while the sheet is closed. When it finishes then, the toast says so.
   const lastAccount = useRef<AccountView | null>(null)
@@ -189,6 +194,13 @@ export function App(): ReactNode {
           {place.view === 'plugins' ? <Plugins /> : null}
           {place.view === 'pairing' ? <Pairing /> : null}
           {place.view === 'setup' ? <Setup /> : null}
+          {place.view === 'drafts' ? (
+            <KeptDrafts
+              onBack={() => {
+                go({ view: 'sessions' })
+              }}
+            />
+          ) : null}
           {place.view === 'session' ? (
             <Session sessionId={place.sessionId} pane={place.pane} />
           ) : null}

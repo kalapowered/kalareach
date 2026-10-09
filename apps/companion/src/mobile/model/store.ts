@@ -151,8 +151,5 @@ export function writeRecord<T>(store: DurableStore, key: string, value: T): bool
   return true
 }
 
-/** The key one session's drafts are kept under. */
-export const DRAFTS_KEY = 'kr.mobile.drafts'
-
 /** The key the unresolved submissions are kept under. */
 export const SUBMISSIONS_KEY = 'kr.mobile.submissions'

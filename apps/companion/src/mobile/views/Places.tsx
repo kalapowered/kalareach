@@ -10,6 +10,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import type { EnvironmentListResult, SessionListResult } from '@kalareach/protocol'
 
 import { useApp } from '../../app/state'
+import { useBook } from '../../app/drafts'
 import { failureMessage, watch, type Watch } from '../../host/port'
 import { Banner } from '../../components/ui'
 import { PairingFlow } from '../../pairing/PairingFlow'
@@ -62,6 +63,7 @@ export function MobileSessions({
   surface,
   onOpen,
   onOpenVoice,
+  onOpenDrafts,
   connected,
   environmentId
 }: {
@@ -69,12 +71,15 @@ export function MobileSessions({
   readonly onOpen: (sessionId: string) => void
   /** Opens the voice screen. Absent while no host is reached, when there is no one to talk to. */
   readonly onOpenVoice?: () => void
+  /** Opens the list of kept drafts, which is shown only while there are some. */
+  readonly onOpenDrafts?: () => void
   /** Whether a host is being reached now, or null before anything has said. */
   readonly connected?: boolean | null
   /** The environment the connection belongs to, which says which host is reached. */
   readonly environmentId?: string | null
 }): ReactNode {
   const { port } = useApp()
+  const { kept: keptDrafts } = useBook()
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)
@@ -143,6 +148,19 @@ export function MobileSessions({
           {/* One line, and nothing under it: at the largest text size the sessions below it must
               still come within reach of the screen, and the voice screen says what a call is. */}
           <span className="m-row-title">Talk to your host</span>
+        </button>
+      )}
+      {onOpenDrafts === undefined || keptDrafts.length === 0 ? null : (
+        <button
+          type="button"
+          className="m-row"
+          data-testid="kept-drafts-entry"
+          style={{ minBlockSize: target }}
+          onClick={onOpenDrafts}
+        >
+          <span className="m-row-title">
+            {keptDrafts.length === 1 ? 'One kept draft' : `${keptDrafts.length} kept drafts`}
+          </span>
         </button>
       )}
       {error ? (

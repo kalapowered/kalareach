@@ -5,7 +5,9 @@
  * KR-ACC-012 asks for all four to recover without a lost draft and without a false claim that an
  * action succeeded. Those are two different duties and this module keeps them apart.
  *
- * The draft is durable and the association is not. A draft is this device's own record with its
+ * The drafts are kept by native code on this device, in the book the window holds
+ * (`model/draft-book.ts`); what this module keeps in the WebView is the unresolved submissions. The
+ * draft is durable and the association is not. A draft is this device's own record with its
  * own identity and revision; the attachment that presents it in an editor is a binding that the
  * connection owns. Losing the connection removes the binding and leaves the draft exactly as it
  * was. Coming back offers a rebind to a detached draft. The same authorised device against an
@@ -19,9 +21,9 @@
  * one thing this must never do is treat reconnection, or a network acknowledgement, as success.
  */
 
-import { connectionLost, rebind, type Draft, type DraftTarget } from '../../model/drafts'
+import { rebind, type Draft, type DraftTarget } from '../../model/drafts'
 import { unresolved, type Submission } from '../../model/receipts'
-import { DRAFTS_KEY, SUBMISSIONS_KEY, readRecord, writeRecord, type DurableStore } from './store'
+import { SUBMISSIONS_KEY, readRecord, writeRecord, type DurableStore } from './store'
 
 /** What put the application back in front of the person. */
 export type Resumption =
@@ -48,46 +50,32 @@ export function describeResumption(resumption: Resumption): string {
   }
 }
 
-/** Everything that has to survive a restart. */
+/** Everything the WebView keeps across a restart. */
 export interface DurableState {
-  readonly drafts: readonly Draft[]
   readonly submissions: readonly Submission[]
 }
 
 /** Nothing kept. */
-export const EMPTY_DURABLE_STATE: DurableState = { drafts: [], submissions: [] }
+export const EMPTY_DURABLE_STATE: DurableState = { submissions: [] }
 
 /**
  * Writes the state a restart must find. Only what is unresolved is worth keeping.
  *
- * Answers false when either record could not be written, which is this run having no durability
+ * Answers false when the record could not be written, which is this run having no durability
  * rather than having lost anything: what is in memory is still exactly what the person typed.
  */
 export function persist(store: DurableStore, state: DurableState): boolean {
-  const drafts = writeRecord(store, DRAFTS_KEY, state.drafts)
   const submissions = writeRecord(store, SUBMISSIONS_KEY, unresolved(state.submissions))
-  return drafts && submissions && store.isDurable(DRAFTS_KEY) && store.isDurable(SUBMISSIONS_KEY)
+  return submissions && store.isDurable(SUBMISSIONS_KEY)
 }
 
 /**
  * Reads what the last run left, and puts it in the state a fresh process is actually in.
  *
- * Nothing is connected yet, so every draft is detached and every submission that was in flight is
- * of unknown outcome. Both are recoveries, not failures, and neither is a claim.
+ * Nothing is connected yet, so every submission that was in flight is of unknown outcome. That is a
+ * recovery, not a failure, and not a claim.
  */
 export function restore(store: DurableStore): DurableState {
-  const drafts = readList<Draft>(
-    store,
-    DRAFTS_KEY,
-    (each) =>
-      typeof each.draftId === 'string' &&
-      typeof each.text === 'string' &&
-      typeof each.revision === 'number' &&
-      typeof each.target === 'object' &&
-      each.target !== null &&
-      typeof (each.target as { sessionId?: unknown }).sessionId === 'string' &&
-      Array.isArray(each.attachments)
-  )
   const submissions = readList<Submission>(
     store,
     SUBMISSIONS_KEY,
@@ -97,7 +85,6 @@ export function restore(store: DurableStore): DurableState {
       typeof each.state === 'string'
   )
   return {
-    drafts: drafts.map(connectionLost),
     submissions: submissions.map((submission) =>
       submission.state === 'queued' ? submission : { ...submission, state: 'unknown' as const }
     )
@@ -127,9 +114,9 @@ function readList<T>(
 /**
  * What a resumption does to the state in memory.
  *
- * A suspension and a network change keep the process, so the drafts are already here; what they
- * lose is the connection, and with it every attachment binding. A cold start and a termination
- * have nothing in memory, so they read what was written.
+ * A suspension and a network change keep the process, so the submissions are already here. A cold
+ * start and a termination have nothing in memory, so they read what was written. Every resumption
+ * takes the drafts' associations away, which the window's book is told separately.
  */
 export function onResume(
   resumption: Resumption,
@@ -137,10 +124,7 @@ export function onResume(
   store: DurableStore
 ): DurableState {
   if (resumption === 'cold_start' || resumption === 'restarted') return restore(store)
-  return {
-    drafts: current.drafts.map(connectionLost),
-    submissions: current.submissions
-  }
+  return current
 }
 
 /** What the host reported about one draft's target when contact came back. */
@@ -188,11 +172,11 @@ export interface RecoverySummary {
  * person has not yet been told about, so those are the only things counted. A run in which
  * nothing broke therefore summarises to nothing and shows no banner.
  */
-export function summarise(state: DurableState): RecoverySummary {
+export function summarise(state: DurableState, drafts: readonly Draft[]): RecoverySummary {
   return {
-    kept: state.drafts.filter((draft) => draft.state === 'detached').length,
-    conflicted: state.drafts.filter((draft) => draft.state === 'conflicted').length,
-    orphaned: state.drafts.filter((draft) => draft.state === 'orphaned').length,
+    kept: drafts.filter((draft) => draft.state === 'detached').length,
+    conflicted: drafts.filter((draft) => draft.state === 'conflicted').length,
+    orphaned: drafts.filter((draft) => draft.state === 'orphaned').length,
     unresolvedActions: unresolved(state.submissions).length
   }
 }

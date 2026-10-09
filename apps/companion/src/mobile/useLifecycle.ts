@@ -13,7 +13,8 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { Draft } from '../model/drafts'
+import { useBook } from '../app/drafts'
+import { useApp } from '../app/state'
 import type { Submission } from '../model/receipts'
 import {
   EMPTY_DURABLE_STATE,
@@ -55,7 +56,6 @@ export interface Lifecycle {
   readonly resumedNow: () => number
   /** The banner to show, or null. */
   readonly banner: RecoveryBanner | null
-  readonly setDrafts: (change: (drafts: readonly Draft[]) => readonly Draft[]) => void
   readonly setSubmissions: (
     change: (submissions: readonly Submission[]) => readonly Submission[]
   ) => void
@@ -64,16 +64,18 @@ export interface Lifecycle {
   /** Dismisses the banner without changing anything it described. */
   readonly acknowledge: () => void
   /**
-   * True when this device refused to keep what was written.
+   * True when this device refused to keep the unresolved submissions.
    *
-   * The draft is still here and still editable; what it will not do is survive the application
-   * being taken away. A person deserves to know that before they rely on it.
+   * What it will not do is survive the application being taken away. A person deserves to know that
+   * before they rely on it. The drafts say the same of themselves, through the window's book.
    */
   readonly durable: boolean
 }
 
 /** Holds the durable state across a suspension, a termination, a network change and a restart. */
 export function useLifecycle(storage?: Storage | null): Lifecycle {
+  const { drafts: book } = useApp()
+  const { drafts } = useBook()
   // One store per run, created once. A store built during render would be a new store on every
   // render, and the records the last one held would go with it.
   const [store] = useState<DurableStore>(() =>
@@ -89,9 +91,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
   )
   const [state, setState] = useState<DurableState>(() => {
     const restored = restore(store)
-    return restored.drafts.length === 0 && restored.submissions.length === 0
-      ? EMPTY_DURABLE_STATE
-      : restored
+    return restored.submissions.length === 0 ? EMPTY_DURABLE_STATE : restored
   })
   const [resumed, setResumed] = useState(0)
   const resumptions = useRef(0)
@@ -129,8 +129,10 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
       setResumed((count) => count + 1)
       setDismissed(false)
       setState((current) => onResume(next, current, store))
+      // Whatever brought the application back took every draft's association with it.
+      book.connectionLost()
     },
-    [store]
+    [store, book]
   )
 
   useEffect(() => {
@@ -150,19 +152,6 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
     }
   }, [resume])
 
-  const setDrafts = useCallback(
-    (change: (drafts: readonly Draft[]) => readonly Draft[]) => {
-      setState((current) => {
-        const next = { ...current, drafts: change(current.drafts) }
-        // Written straight away rather than on the way out as well: a draft a person typed one
-        // keystroke before the system reclaimed the process is a draft that has to be there.
-        setDurable(persist(store, next))
-        return next
-      })
-    },
-    [store]
-  )
-
   const setSubmissions = useCallback(
     (change: (submissions: readonly Submission[]) => readonly Submission[]) => {
       setState((current) => {
@@ -174,7 +163,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
     [store]
   )
 
-  const banner = dismissed ? null : recoveryBanner(resumption, summarise(state))
+  const banner = dismissed ? null : recoveryBanner(resumption, summarise(state, drafts))
 
   return {
     state,
@@ -182,7 +171,6 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
     resumed,
     resumedNow,
     banner,
-    setDrafts,
     setSubmissions,
     resume,
     acknowledge: () => {

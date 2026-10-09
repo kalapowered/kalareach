@@ -5,19 +5,18 @@
  * An answer belongs to the question it was read for: one read before the application came back to
  * the front again, or before contact was lost, says nothing about the draft as it is now, and it
  * must be dropped even when the page has not yet rendered what changed. These drive the hook with
- * a lifecycle of their own, so that moment can be held still.
+ * a resumption count of their own, so that moment can be held still.
  */
 
 import { act, cleanup, renderHook } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ReactNode } from 'react'
+import { afterEach, describe, expect, it } from 'vitest'
+import { useState, type ReactNode } from 'react'
 
-import { AppProvider } from '../../src/app/state'
+import { useRebind } from '../../src/app/drafts'
+import { AppProvider, useApp } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
 import { connectionLost, edit, startDraft, type Draft } from '../../src/model/drafts'
-import type { Lifecycle } from '../../src/mobile/useLifecycle'
-import { useRebind } from '../../src/mobile/useRebind'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -28,7 +27,7 @@ function detachedDraft(): Draft {
   return connectionLost(
     edit(
       startDraft(
-        'd-1',
+        `draft-${SESSION_MAIN}`,
         { sessionId: SESSION_MAIN, applicationInstanceId: null, agentBindingRevision: null },
         0
       ),
@@ -38,21 +37,13 @@ function detachedDraft(): Draft {
   )
 }
 
-/** A lifecycle holding `draft`, whose resumptions the test declares by hand. */
-function lifecycleOf(draft: Draft) {
-  let resumptions = 0
-  const setDrafts = vi.fn()
-  const lifecycle = {
-    state: { drafts: [draft], submissions: [] },
-    resumed: 0,
-    resumedNow: () => resumptions,
-    setDrafts
-  } as unknown as Lifecycle
+/** The resumptions of the application, which the test declares by hand. */
+function resumptions() {
+  let count = 0
   return {
-    lifecycle,
-    setDrafts,
+    resumption: { resumed: 0, resumedNow: () => count },
     resume: () => {
-      resumptions += 1
+      count += 1
     }
   }
 }
@@ -76,10 +67,24 @@ function holdingTheSessionRead(): { port: HostPort; release: () => void } {
   }
 }
 
+/** The application, with the detached draft already in its book. */
 const wrapperFor = (port: HostPort) =>
   function Wrapper({ children }: { readonly children: ReactNode }): ReactNode {
-    return <AppProvider port={port}>{children}</AppProvider>
+    return (
+      <AppProvider port={port}>
+        <Seeded>{children}</Seeded>
+      </AppProvider>
+    )
   }
+
+function Seeded({ children }: { readonly children: ReactNode }): ReactNode {
+  const { drafts } = useApp()
+  useState(() => {
+    drafts.setDrafts(() => [detachedDraft()])
+    return null
+  })
+  return children
+}
 
 /** Lets the answer's chain of reads run to its end, which takes the scripted host a few turns. */
 async function untilAnswered(): Promise<void> {
@@ -93,42 +98,54 @@ async function untilAnswered(): Promise<void> {
 describe('an answer about where a draft stands (KR-ACC-012)', () => {
   it('binds the draft it was read for when nothing came in between', async () => {
     const { port, release } = holdingTheSessionRead()
-    const { lifecycle, setDrafts } = lifecycleOf(detachedDraft())
-    renderHook(() => {
-      useRebind(lifecycle, true)
-    }, { wrapper: wrapperFor(port) })
+    const { resumption } = resumptions()
+    const { result } = renderHook(
+      () => {
+        useRebind(true, resumption)
+        return useApp().drafts
+      },
+      { wrapper: wrapperFor(port) }
+    )
 
     release()
     await untilAnswered()
 
-    expect(setDrafts).toHaveBeenCalledTimes(1)
+    expect(result.current.snapshot().drafts[0]?.state).toBe('bound')
   })
 
   it('drops an answer read before the application came back again, though the page has not rendered that', async () => {
     const { port, release } = holdingTheSessionRead()
-    const { lifecycle, setDrafts, resume } = lifecycleOf(detachedDraft())
-    renderHook(() => {
-      useRebind(lifecycle, true)
-    }, { wrapper: wrapperFor(port) })
+    const { resumption, resume } = resumptions()
+    const { result } = renderHook(
+      () => {
+        useRebind(true, resumption)
+        return useApp().drafts
+      },
+      { wrapper: wrapperFor(port) }
+    )
 
     // The application comes back to the front again; the page has rendered nothing yet.
     resume()
     release()
     await untilAnswered()
 
-    expect(setDrafts).not.toHaveBeenCalled()
+    expect(result.current.snapshot().drafts[0]?.state).toBe('detached')
   })
 
   it('asks nothing while the host is out of contact', async () => {
     const { port, release } = holdingTheSessionRead()
-    const { lifecycle, setDrafts } = lifecycleOf(detachedDraft())
-    renderHook(() => {
-      useRebind(lifecycle, false)
-    }, { wrapper: wrapperFor(port) })
+    const { resumption } = resumptions()
+    const { result } = renderHook(
+      () => {
+        useRebind(false, resumption)
+        return useApp().drafts
+      },
+      { wrapper: wrapperFor(port) }
+    )
 
     release()
     await untilAnswered()
 
-    expect(setDrafts).not.toHaveBeenCalled()
+    expect(result.current.snapshot().drafts[0]?.state).toBe('detached')
   })
 })

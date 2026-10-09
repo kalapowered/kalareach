@@ -47,7 +47,13 @@ import {
   restore,
   summarise
 } from '../../src/mobile/model/lifecycle'
-import { DRAFTS_KEY, deviceStore, memoryStore, readRecord, writeRecord } from '../../src/mobile/model/store'
+import {
+  SUBMISSIONS_KEY,
+  deviceStore,
+  memoryStore,
+  readRecord,
+  writeRecord
+} from '../../src/mobile/model/store'
 import { commercialSurface, describeAccount, usageFraction } from '../../src/model/account'
 import { detectSurface, minimumTarget, showsBackControl, TOUCH_TARGET } from '../../src/mobile/platform'
 
@@ -406,8 +412,8 @@ describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
 describe('the durable store (KR-ACC-012)', () => {
   it('keeps a record across a restart', () => {
     const store = memoryStore()
-    expect(writeRecord(store, DRAFTS_KEY, [{ draftId: 'd-1' }])).toBe(true)
-    expect(readRecord<{ draftId: string }[]>(store, DRAFTS_KEY)).toEqual({
+    expect(writeRecord(store, SUBMISSIONS_KEY, [{ draftId: 'd-1' }])).toBe(true)
+    expect(readRecord<{ draftId: string }[]>(store, SUBMISSIONS_KEY)).toEqual({
       kind: 'read',
       value: [{ draftId: 'd-1' }]
     })
@@ -415,33 +421,33 @@ describe('the durable store (KR-ACC-012)', () => {
 
   it('leaves a record it does not understand where it is, and never replaces it', () => {
     const store = memoryStore()
-    store.write(DRAFTS_KEY, JSON.stringify({ version: 99, value: ['keep me'] }))
-    expect(readRecord(store, DRAFTS_KEY)).toEqual({ kind: 'unsupported', version: 99 })
-    expect(writeRecord(store, DRAFTS_KEY, [])).toBe(false)
-    expect(store.read(DRAFTS_KEY)).toContain('keep me')
+    store.write(SUBMISSIONS_KEY, JSON.stringify({ version: 99, value: ['keep me'] }))
+    expect(readRecord(store, SUBMISSIONS_KEY)).toEqual({ kind: 'unsupported', version: 99 })
+    expect(writeRecord(store, SUBMISSIONS_KEY, [])).toBe(false)
+    expect(store.read(SUBMISSIONS_KEY)).toContain('keep me')
   })
 
   it('tells an unreadable record from an absent one', () => {
     const store = memoryStore()
-    store.write(DRAFTS_KEY, 'not json at all')
-    expect(readRecord(store, DRAFTS_KEY)).toEqual({ kind: 'invalid' })
+    store.write(SUBMISSIONS_KEY, 'not json at all')
+    expect(readRecord(store, SUBMISSIONS_KEY)).toEqual({ kind: 'invalid' })
   })
 
   it('still runs when the device will not store anything', () => {
     const store = deviceStore(refusingStorage())
-    expect(writeRecord(store, DRAFTS_KEY, ['a'])).toBe(true)
-    expect(readRecord<string[]>(store, DRAFTS_KEY)).toEqual({ kind: 'read', value: ['a'] })
-    expect(store.isDurable(DRAFTS_KEY)).toBe(false)
+    expect(writeRecord(store, SUBMISSIONS_KEY, ['a'])).toBe(true)
+    expect(readRecord<string[]>(store, SUBMISSIONS_KEY)).toEqual({ kind: 'read', value: ['a'] })
+    expect(store.isDurable(SUBMISSIONS_KEY)).toBe(false)
   })
 
   it('never answers with what the device held before a write it refused', () => {
     // The device keeps the older value: reading it back would show the person a draft older than
     // the one they typed, which is worse than saying the run has no durability.
-    const values = new Map<string, string>([[DRAFTS_KEY, JSON.stringify({ version: 1, value: ['old'] })]])
+    const values = new Map<string, string>([[SUBMISSIONS_KEY, JSON.stringify({ version: 1, value: ['old'] })]])
     const failing = {
       getItem: (key: string) => values.get(key) ?? null,
       setItem: (key: string, value: string) => {
-        if (key === DRAFTS_KEY) throw new Error('quota')
+        if (key === SUBMISSIONS_KEY) throw new Error('quota')
         values.set(key, value)
       },
       removeItem: (key: string) => {
@@ -452,9 +458,9 @@ describe('the durable store (KR-ACC-012)', () => {
       length: 0
     } as unknown as Storage
     const store = deviceStore(failing)
-    expect(writeRecord(store, DRAFTS_KEY, ['new'])).toBe(true)
-    expect(readRecord<string[]>(store, DRAFTS_KEY)).toEqual({ kind: 'read', value: ['new'] })
-    expect(store.isDurable(DRAFTS_KEY)).toBe(false)
+    expect(writeRecord(store, SUBMISSIONS_KEY, ['new'])).toBe(true)
+    expect(readRecord<string[]>(store, SUBMISSIONS_KEY)).toEqual({ kind: 'read', value: ['new'] })
+    expect(store.isDurable(SUBMISSIONS_KEY)).toBe(false)
   })
 })
 
@@ -489,22 +495,20 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
     expect(after.attachmentId).toBeNull()
   })
 
-  it('reads back a cold start with the drafts intact and no outcome claimed', () => {
+  it('reads back a cold start with no outcome claimed', () => {
+    // The drafts are kept by native code and read back by the window's book; what the WebView keeps
+    // is the submissions whose outcome nobody knew.
     const store = memoryStore()
-    persist(store, { drafts: [draft], submissions: [submission] })
+    persist(store, { submissions: [submission] })
     const restored = restore(store)
-    expect(restored.drafts[0]?.text).toBe('half a sentence')
-    expect(restored.drafts[0]?.state).toBe('detached')
     expect(restored.submissions[0]?.state).toBe('unknown')
   })
 
   it('treats a suspension and a network change as a lost connection, not a restart', () => {
     const store = memoryStore()
-    const current = { drafts: [draft], submissions: [submission] }
+    const current = { submissions: [submission] }
     for (const resumption of ['suspended', 'network_changed'] as const) {
       const after = onResume(resumption, current, store)
-      expect(after.drafts[0]?.text).toBe('half a sentence')
-      expect(after.drafts[0]?.state).toBe('detached')
       expect(after.submissions[0]?.state).toBe('sent')
     }
   })
@@ -547,9 +551,9 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
 
   it('reports what recovered without reporting an action as done', () => {
     const store = memoryStore()
-    persist(store, { drafts: [draft], submissions: [submission] })
+    persist(store, { submissions: [submission] })
     const restored = restore(store)
-    const summary = summarise(restored)
+    const summary = summarise(restored, [connectionLost(draft)])
     expect(summary.kept).toBe(1)
     expect(summary.unresolvedActions).toBe(1)
     const banner = recoveryBanner('restarted', summary)
@@ -562,9 +566,9 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
   })
 
   it('says nothing when there is nothing to recover', () => {
-    expect(recoveryBanner('cold_start', summarise(EMPTY_DURABLE_STATE))).toBeNull()
+    expect(recoveryBanner('cold_start', summarise(EMPTY_DURABLE_STATE, []))).toBeNull()
     // A draft written in this run is a draft, not a consequence of a break.
-    expect(recoveryBanner('cold_start', summarise({ drafts: [draft], submissions: [] }))).toBeNull()
+    expect(recoveryBanner('cold_start', summarise({ submissions: [] }, [draft]))).toBeNull()
   })
 })
 

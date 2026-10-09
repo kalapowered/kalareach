@@ -34,9 +34,10 @@ import { MobileHosts, MobileSessions } from './views/Places'
 import { MobileSession } from './views/MobileSession'
 import { MobileSettings } from './views/Settings'
 import { VoiceRoute } from '../voice/VoiceRoute'
+import { useRebind } from '../app/drafts'
+import { KeptDrafts } from '../views/KeptDrafts'
 import type { Channel } from '../model/account'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
-import { useRebind } from './useRebind'
 import { detectSurface, type Surface } from './platform'
 import './mobile.css'
 
@@ -53,6 +54,8 @@ interface Place {
   readonly settings?: boolean
   /** The voice screen, over the sessions list: opened from it, and left the way a session is. */
   readonly voice?: boolean
+  /** The list of kept drafts, over the sessions list, and left the way the voice screen is. */
+  readonly drafts?: boolean
 }
 
 const TABS: readonly Tab[] = ['attention', 'sessions', 'hosts', 'account']
@@ -115,7 +118,7 @@ export function MobileApp({
   } | null>(null)
   const [actionable, setActionable] = useState(0)
   const lifecycle = useLifecycle(storage)
-  useRebind(lifecycle, connection?.connected === true)
+  useRebind(connection?.connected === true, lifecycle)
   useKeyboardInset()
 
   useEffect(() => {
@@ -187,10 +190,13 @@ export function MobileApp({
 
   const inSession = place.tab === 'sessions' && place.sessionId !== undefined
   const inVoice = place.tab === 'sessions' && place.voice === true && !inSession
+  const inDrafts = place.tab === 'sessions' && place.drafts === true && !inSession && !inVoice
   const settingsOpen = inSession && place.settings === true
   const title = inVoice
     ? 'Voice'
-    : inSession
+    : inDrafts
+      ? 'Kept drafts'
+      : inSession
       ? 'Session'
       : place.tab === 'attention'
         ? 'Attention'
@@ -205,6 +211,9 @@ export function MobileApp({
   }, [])
   const openVoice = useCallback(() => {
     setPlace({ tab: 'sessions', voice: true })
+  }, [])
+  const openDrafts = useCallback(() => {
+    setPlace({ tab: 'sessions', drafts: true })
   }, [])
 
   // Android's system back leaves a session the same way the bar's control does, so the two are one
@@ -230,10 +239,11 @@ export function MobileApp({
     }
   }, [inSession, settingsOpen, setSettings])
 
-  // The voice screen is left the way a session is: by the bar's control and by the system's back.
+  // The voice screen and the kept drafts are left the way a session is: by the bar's control and by
+  // the system's back.
   useEffect(() => {
-    if (!inVoice) return
-    window.history.pushState({ kr: 'voice' }, '')
+    if (!inVoice && !inDrafts) return
+    window.history.pushState({ kr: inVoice ? 'voice' : 'drafts' }, '')
     const onPop = () => {
       setPlace({ tab: 'sessions' })
     }
@@ -241,7 +251,7 @@ export function MobileApp({
     return () => {
       window.removeEventListener('popstate', onPop)
     }
-  }, [inVoice])
+  }, [inVoice, inDrafts])
 
   const shell = (
     <div className="m-shell" data-surface={resolved}>
@@ -250,7 +260,7 @@ export function MobileApp({
         surface={resolved}
         connection={connection}
         onBack={
-          inSession || inVoice
+          inSession || inVoice || inDrafts
             ? () => {
                 setPlace({ tab: 'sessions' })
               }
@@ -273,22 +283,25 @@ export function MobileApp({
         {place.tab === 'attention' ? (
           <Inbox surface={resolved} onOpenSession={openSession} onCounts={setActionable} />
         ) : null}
-        {place.tab === 'sessions' && !inSession && !inVoice ? (
+        {place.tab === 'sessions' && !inSession && !inVoice && !inDrafts ? (
           <MobileSessions
             surface={resolved}
             onOpen={openSession}
             onOpenVoice={connection?.connected === true ? openVoice : undefined}
+            onOpenDrafts={openDrafts}
             connected={connection?.connected ?? null}
             environmentId={connection?.environmentId ?? null}
           />
         ) : null}
         {inVoice ? <VoiceRoute surface={resolved} embedded /> : null}
+        {inDrafts ? <KeptDrafts /> : null}
         {inSession && place.sessionId ? (
           <MobileSession
             sessionId={place.sessionId}
             surface={resolved}
             lifecycle={lifecycle}
             connected={connection?.connected ?? null}
+            onOpenKept={openDrafts}
           />
         ) : null}
         {place.tab === 'hosts' ? (

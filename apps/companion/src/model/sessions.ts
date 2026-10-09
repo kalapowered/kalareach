@@ -22,7 +22,6 @@ import type { WithheldCount } from './agent'
 import { emptyConversation, type ConversationState } from './conversation'
 import { emptyOutput, type OutputWindow } from './output'
 import { emptyRecording, type Recording } from './recording'
-import { startDraft, type Draft } from './drafts'
 import type { Submission } from './receipts'
 
 /**
@@ -90,8 +89,6 @@ export interface SessionState {
   readonly recording: Recording
   /** What this device has sent, and what became of it. */
   readonly submissions: readonly Submission[]
-  /** The draft for this session. */
-  readonly draft: Draft
   /** Images the person explicitly imported, by URL. */
   readonly images: ReadonlyMap<string, string>
   /** True once a snapshot has been folded in, so a view knows the difference from empty. */
@@ -99,18 +96,13 @@ export interface SessionState {
 }
 
 /** The state of a session nothing has happened in yet. */
-export function emptySessionState(sessionId: string, now: number): SessionState {
+export function emptySessionState(): SessionState {
   return {
     conversation: emptyConversation(),
     agent: unreadAgent(),
     output: emptyOutput(),
     recording: emptyRecording(),
     submissions: [],
-    draft: startDraft(
-      `draft-${sessionId}`,
-      { sessionId, applicationInstanceId: null, agentBindingRevision: null },
-      now
-    ),
     images: new Map(),
     loaded: false
   }
@@ -125,7 +117,7 @@ export class SessionStates {
   get(sessionId: string): SessionState {
     const held = this.#states.get(sessionId)
     if (held) return held
-    const fresh = emptySessionState(sessionId, Date.now())
+    const fresh = emptySessionState()
     this.#states.set(sessionId, fresh)
     return fresh
   }

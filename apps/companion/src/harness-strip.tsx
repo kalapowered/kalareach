@@ -14,7 +14,8 @@
 import { useEffect, useState, type ReactNode } from 'react'
 
 import type { FakeHostControls, HeldMutations } from './host/fake'
-import { DRAFTS_KEY, SUBMISSIONS_KEY } from './mobile/model/store'
+import { FAKE_DRAFTS_KEY } from './host/fake-drafts'
+import { SUBMISSIONS_KEY } from './mobile/model/store'
 
 /** What tells the next page that a reset was asked for. */
 const RESET_KEY = 'kr.harness.reset'
@@ -30,7 +31,7 @@ const RESET_KEY = 'kr.harness.reset'
 export function applyPendingReset(storage: Storage, session: Storage): void {
   if (session.getItem(RESET_KEY) === null) return
   session.removeItem(RESET_KEY)
-  storage.removeItem(DRAFTS_KEY)
+  storage.removeItem(FAKE_DRAFTS_KEY)
   storage.removeItem(SUBMISSIONS_KEY)
 }
 
@@ -119,7 +120,7 @@ export function HarnessStrip({
             id="kr-strip-reset"
             onClick={choose(() => {
               // Cleared now, so that nothing reads it meanwhile, and again by the next page.
-              storage.removeItem(DRAFTS_KEY)
+              storage.removeItem(FAKE_DRAFTS_KEY)
               storage.removeItem(SUBMISSIONS_KEY)
               session.setItem(RESET_KEY, '1')
               reload()
