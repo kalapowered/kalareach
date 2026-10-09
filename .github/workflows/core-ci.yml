@@ -1533,9 +1533,10 @@ jobs:
           - name: macos-demonstrations
             part: demonstrations
     # Every step has a limit of its own, and the limits add up to less than this one, so a step that
-    # hangs is ended and the steps after it still report. A step's limit is at least twice the
-    # longest it has taken, so that its work can grow before the limit is reached. This one is under
-    # GitHub's six hours.
+    # hangs is ended and the steps after it still report. A step that builds or runs tests, other
+    # than the measurement step, has a limit of at least twice the longest it has taken, so that
+    # its work can grow before the limit is reached. The measurement step's limit is set by its own
+    # waits. The job's own limit is under GitHub's six hours.
     timeout-minutes: 355
     steps:
       - name: Check out
@@ -1735,8 +1736,8 @@ jobs:
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
       #   the two steps after this one run.
       #
-      # The step builds the workspace's tests and then runs them. At its longest it took 71 minutes,
-      # 19 to build and 52 to run, and it grows with the tests.
+      # The step builds the workspace's tests and then runs them. At its longest it needed about 71
+      # minutes, 19 to build and 52 to run, and it grows with the tests.
       - name: Test
         if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 145
@@ -1922,7 +1923,7 @@ jobs:
       # build is still winding down is a figure about the build.
       - name: Build what the measurements run
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 85
+        timeout-minutes: 110
         run: |
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
@@ -1988,7 +1989,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15-intel
     # The build alone is about an hour on this runner. Every step has a limit of its own, and the
-    # limits add up to less than this one. A step's limit is at least twice the longest it has
+    # limits add up to less than this one. The build's limit is at least twice the longest it has
     # taken, so that its work can grow before the limit is reached.
     timeout-minutes: 300
     steps:
@@ -2026,7 +2027,7 @@ jobs:
       # Everything the script below builds before it measures, so that the script has as little
       # left to build as it can.
       - name: Build what the measurements run
-        timeout-minutes: 150
+        timeout-minutes: 160
         run: |
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
