@@ -3225,6 +3225,9 @@ not enrolled and the question that follows is turned back with a delay. The pass
 and the daemon keeps the person's refusal for `kr doctor`. A refusal that names no delay may be about
 one attempt alone, an object the service already holds for example, and the pass goes on to the next.
 
+A publication whose outcome the service says it cannot settle (`OUTCOME_UNKNOWN`) is not such a
+refusal: it stays listed as unanswered, and the next pass asks the service for the manifest to find
+out whether it took effect, and does not send it again.
 A part is 8 MiB and its answer begins only after the whole part has been sent, so storage exchanges
 get 60 seconds to start answering and 90 in all. That is the time the slowest supported uplink needs
 to send one: about 1.1 Mbit/s. The carrier is a task of its own, so a service that never answers
@@ -3242,7 +3245,10 @@ token is usable and when it stops being accepted, whether backup storage is on f
 what allowance the service reports, what the last pass did, and what the service turned back,
 whether a status read or a pass met it. The check reads well only when the token is usable, backup
 storage is on, and neither the last status read nor the last pass that carried work was turned back.
-When the service
+When the last status read and the last pass were each turned back for something only a person can
+mend, the remedy shown is the one for the question asked last. When the host's own token is what a
+pass was turned back for, the check says the token and not a refusal, under a privacy fence as well,
+and the fence keeps the wait it asked for. When the service
 refused the writer, the detail gives the start of the writer key's identifier for the owner to
 enrol. With no origin configured the check is not applicable. The status read happens once, for five
 seconds at most, and not at all while the service has asked to be left alone or the host has no
@@ -4889,18 +4895,36 @@ the feed holds a revocation for is refused on its first request and not at the n
 that does not answer in that time leaves the status stale and the connection served.
 
 The host judges each request from its own records. A request addressed to another host, or that
-names nothing this host knows, is refused to the feed as an unknown target; one signed by a key that
-is not a paired device whose grant lets it manage this host is refused as lacking owner authority;
-a different request under an identity this host already took is refused as superseded. A request
-that passes is written down before it takes effect, carried out through the same revocation the
-owner at the machine makes, issued the revision the daemon's registry allocated, and acknowledged
-with the completion the barrier reports. A host that stops anywhere in that finishes the same
-request the same way and takes it once. A request for what the owner at the machine had already
-withdrawn changes nothing and is refused as covered, because there is no revision to issue for it.
-The host also tells the feed which keys may remove it: the owners it is paired with, the eight
-oldest pairings if there are more, and `kr doctor` says how many owners are beyond that. The feed
-takes the whole list at once, so the host compares it with what the feed lists on every answer and
-sends it again whenever they differ.
+names nothing this host knows, is refused to the feed as an unknown target; one signed by a key
+that is not a paired device, or by a paired device this host would not let manage it, is refused as
+lacking owner authority; a different request under an identity this host already took is refused
+as superseded. Whether a device may manage the host is decided as the same device's own
+`device.revoke` is: by its grant, by this host's policy (an organisation's lease and member
+binding, a bounded offline validity) and by the rights ceiling the configuration puts in force. A
+bound that the synchronisation under way renews does not refuse the request: it waits, and the next
+pass judges it again.
+
+A request that passes is written down before it takes effect, carried out through the same
+revocation the owner at the machine makes, issued the revision the daemon's registry allocated, and
+acknowledged with the completion the barrier reports. A host that stops anywhere in that finishes
+the same request the same way and takes it once, and a request is numbered once: if the feed holds
+the same request again after it dropped the original, the host acknowledges it under the revision it
+first issued, however many revisions it has issued since. A request for what the owner at the
+machine, or an earlier request, had already withdrawn changes nothing and is refused as covered,
+because there is no revision to issue for it; a refusal that never reached the feed is made again
+by the next pass.
+
+A pass reads the feed in pages and goes on until it has read it through. At most 32 pages make one
+pass, and a pass that stopped short of the end is not a synchronisation: the status is not shown as
+read, the bounded offline validity is not extended from it, and the next pass goes on at the
+cursor. A pass that stopped for a reason of this host's own, such as a record it could not write
+down, leaves the status stale as an unreachable feed does. The revocations the carrier makes do not
+wake it: a pass that failed waits out its backoff.
+
+The host also tells the feed which keys may remove it: the owners it is paired with that it would
+let manage it, the eight oldest pairings if there are more, and `kr doctor` says how many owners are
+beyond that. The feed takes the whole list at once, so the host compares it with what the feed lists
+on every answer and sends it again whenever they differ.
 
 A feed can also answer that this host was removed from it. A removal ends the feed's retention of
 everything addressed to the host, so the host learns no revocation from it again, and a revocation
@@ -4909,10 +4933,14 @@ origin that gave it, and from then on `device.list` and `kr doctor` say the feed
 the last time it was synchronised, and the attention inbox holds an urgent item for the owner and
 for every device that manages the host. The grants that do not rest on the feed carry on: the
 default non-expiring owner grant is account-free and stays usable. The grants that do rest on it are
-refused until an owner acts at the host: an organisation's, and personal remote access under a
-bounded offline-validity policy the owner chose. The person at the machine is never refused. The
-owner acts by changing `authority.origin` in the configuration document to another feed or to none
-and starting the daemon again, which ends the removal and the item; a removal from one origin is no
+refused until an owner acts at the host: an organisation's, personal remote access under a bounded
+offline-validity policy the owner chose, and personal remote access on a host that is exclusively
+organisation-managed. The person at the machine is never refused. The refusal is in force from the
+moment the answer is read, whether or not the registry can take the record of it; the carrier asks
+again until the record is written, and a host that starts again reads the answer from the feed that
+gave it. The daemon puts the removal right before it serves a push or a connection. The owner acts
+by changing `authority.origin` in the configuration document to another feed or to none and
+starting the daemon again, which ends the removal and the item; a removal from one origin is no
 removal from another.
 
 ### What the host policy holds

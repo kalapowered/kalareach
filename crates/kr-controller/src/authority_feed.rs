@@ -43,7 +43,7 @@
 //! rest, as section 10 asks: the default non-expiring owner grant is account-free. An owner who
 //! changes `authority.origin` clears it at the next start.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -87,8 +87,17 @@ pub const FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
 pub const GATE_WAIT: Duration = Duration::from_secs(5);
 
 /// The most pages of a feed one pass reads, so a feed that never stops saying there is more cannot
-/// hold the carrier.
+/// hold the carrier. A pass that stops there has not read the feed through, and the next goes on at
+/// the cursor.
 const MOST_PAGES: usize = 32;
+
+tokio::task_local! {
+    /// Set while the carrier carries a request out. The revocation it makes wakes whatever
+    /// watches the owners this host is paired with, and the carrier is one of those; but it names
+    /// the owners itself when its pass ends, and a wake it made for itself would end the wait a
+    /// failed pass asked for.
+    static CARRYING_OUT: ();
+}
 
 /// The feed's client for `origin`, signing as the host.
 ///
@@ -176,7 +185,10 @@ struct Shared {
     host_device_id: DeviceId,
     key: AuthorisationKeyPair,
     quiet: Quiet,
-    gate_wait: Duration,
+    /// How long a connection waits for a synchronisation, in milliseconds.
+    gate_wait_ms: AtomicU64,
+    /// How many pages of the feed one pass reads before it goes on at the cursor in the next.
+    most_pages: AtomicUsize,
     /// How many times a synchronisation has been asked for, by a connection or by the carrier.
     requested: AtomicU64,
     /// The newest request count that a pass which began after the request was made has finished.
@@ -233,7 +245,10 @@ impl FeedRuntime {
                 host_device_id,
                 key,
                 quiet: Quiet::new(Arc::clone(&timer)),
-                gate_wait: GATE_WAIT,
+                gate_wait_ms: AtomicU64::new(
+                    u64::try_from(GATE_WAIT.as_millis()).unwrap_or(u64::MAX),
+                ),
+                most_pages: AtomicUsize::new(MOST_PAGES),
                 requested: AtomicU64::new(0),
                 completed: tokio::sync::watch::channel(0).0,
                 wake: tokio::sync::Notify::new(),
@@ -294,14 +309,35 @@ impl FeedRuntime {
         }
     }
 
+    /// Shortens what a connection waits for a synchronisation, for a suite that holds the feed's
+    /// answer and needs the bound to end without waiting out [`GATE_WAIT`].
+    #[cfg(feature = "testing")]
+    pub fn wait_for_a_synchronisation_at_most(&self, bound: Duration) {
+        self.shared.gate_wait_ms.store(
+            u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Lowers the pages one pass reads, for a suite that needs a feed longer than a pass reads
+    /// without publishing the thousands of records it takes to fill that many pages.
+    #[cfg(feature = "testing")]
+    pub fn read_at_most_pages(&self, pages: usize) {
+        self.shared.most_pages.store(pages, Ordering::SeqCst);
+    }
+
     /// A count of the passes the carrier has finished, which changes each time one ends.
     #[must_use]
     pub fn passes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.shared.passes.subscribe()
     }
 
-    /// Tells the carrier to look again now, without anything waiting for it.
+    /// Tells the carrier to look again now, without anything waiting for it. A wake made by the
+    /// carrier's own revocation is not kept: the pass that makes it names the owners when it ends.
     pub fn wake(&self) {
+        if CARRYING_OUT.try_with(|()| ()).is_ok() {
+            return;
+        }
         self.shared.wake.notify_one();
     }
 
@@ -318,9 +354,12 @@ impl FeedRuntime {
             return;
         }
         let ticket = shared.requested.fetch_add(1, Ordering::SeqCst) + 1;
-        shared.wake.notify_one();
+        // A carrier in the middle of a pass reads the count when it ends, so this wakes only one
+        // that is waiting, and keeps nothing for one that is not.
+        shared.wake.notify_waiters();
         let mut completed = shared.completed.subscribe();
-        let _ = tokio::time::timeout(shared.gate_wait, async {
+        let gate_wait = Duration::from_millis(shared.gate_wait_ms.load(Ordering::SeqCst));
+        let _ = tokio::time::timeout(gate_wait, async {
             while *completed.borrow_and_update() < ticket {
                 if completed.changed().await.is_err() {
                     return;
@@ -468,9 +507,7 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
                 Ok(Pass::Unfinished) => Some(backoff.next_delay()),
                 Ok(Pass::Removed) => None,
                 Err(stopped) => {
-                    if stopped != Stopped::Local {
-                        controller.authority_feed_unreachable();
-                    }
+                    controller.authority_feed_unreachable();
                     shared.observed().stopped = Some(stopped);
                     Some(
                         backoff
@@ -483,17 +520,22 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
         drop(controller);
         shared.completed.send_replace(target);
         shared.passes.send_modify(|passes| *passes += 1);
+        // Interest in a wake is registered before the count of questions is read again, so a
+        // question asked in between is either seen by the read or wakes the wait: none is lost.
+        let woken = shared.wake.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
         if shared.requested.load(Ordering::SeqCst) > target {
             continue;
         }
         match wait {
             Some(duration) => {
                 tokio::select! {
-                    () = shared.wake.notified() => {}
+                    () = &mut woken => {}
                     () = timer.sleep(duration) => {}
                 }
             }
-            None => shared.wake.notified().await,
+            None => woken.await,
         }
     }
 }
@@ -541,14 +583,18 @@ async fn pass(
     let mut through = cursor;
     let mut contiguous = true;
     let mut latest = None;
-    for _ in 0..MOST_PAGES {
+    let mut read_through = false;
+    for _ in 0..shared.most_pages.load(Ordering::SeqCst) {
         let state = shared
             .client
             .read(shared.own_feed, (cursor > 0).then_some(cursor), false)
             .await
             .map_err(|error| Stopped::of(&error, &shared.quiet))?;
         if state.summary.removed {
-            controller.authority_feed_removed(&shared.origin).await;
+            controller
+                .authority_feed_removed(&shared.origin)
+                .await
+                .map_err(Stopped::local)?;
             shared.removed.store(true, Ordering::SeqCst);
             return Ok(Pass::Removed);
         }
@@ -566,14 +612,21 @@ async fn pass(
         cursor = state.next_after_sequence.get();
         latest = Some(now);
         if !state.more {
+            read_through = true;
             break;
         }
     }
     shared.settled_through.store(through, Ordering::SeqCst);
+    if !read_through {
+        // The feed holds more than a pass reads, so this is no synchronisation: nothing is shown
+        // as read, the bounded offline validity is not extended from it, and the next pass goes
+        // on at the cursor.
+        return Ok(Pass::Unfinished);
+    }
     if let Some(latest) = latest {
         name_owners(shared, controller, &latest).await?;
     }
-    controller.authority_feed_synchronised(&shared.origin);
+    controller.authority_feed_synchronised();
     shared.observed().stopped = None;
     Ok(if unfinished {
         Pass::Unfinished
@@ -618,6 +671,9 @@ async fn settle(
     let request = &record.request;
     let id = request.request_id;
     if record.rejected.0.is_some() {
+        // Only this host refuses a request, so a note it kept of this one has nothing more to
+        // wait for.
+        controller.authority_feed_settled(id, shared.host_device_id);
         return Ok(true);
     }
     if let Some(held) = record.acknowledgement.0.as_ref()
@@ -637,6 +693,9 @@ async fn settle(
             .map_err(Stopped::local)?
         {
             Judged::Refuse(reason) => return refuse(shared, controller, id, reason, latest).await,
+            // What its issuer's authority stands on is renewed by the synchronisation this pass
+            // makes, so the next pass judges it again.
+            Judged::Later => return Ok(false),
             Judged::Apply(plan) => plan,
         },
     };
@@ -647,8 +706,8 @@ async fn settle(
             now,
         )
         .map_err(Stopped::local)?;
-    let applied = controller
-        .apply_feed_plan(&plan)
+    let applied = CARRYING_OUT
+        .scope((), controller.apply_feed_plan(&plan))
         .await
         .map_err(Stopped::local)?;
     #[cfg(feature = "testing")]
@@ -658,16 +717,22 @@ async fn settle(
         // issue for a request that changed nothing, and the registry is the one allocator.
         return refuse(shared, controller, id, RejectionReason::Superseded, latest).await;
     }
-    let held = controller
-        .authority_feed_took_effect(id, applied.revision)
-        .map_err(Stopped::local)?;
-    let number = held.authority_revision.unwrap_or(applied.revision);
-    if latest.revision > number.get() {
+    // The feed must not hold a higher revision than the registry has reached: this host numbers
+    // what it issues from the registry, and a number at or below one the feed holds is not one it
+    // can issue.
+    if latest.revision > applied.revision.get() {
         shared.observed().unissued = true;
         return Err(Stopped::Local);
     }
     shared.observed().unissued = false;
-    let revision = revision_record(shared, &held, number, id);
+    // A request is numbered once, by the registry's revision when it took effect, and issued under
+    // that number whatever the feed has been issued since: the feed takes the same record again as
+    // the revision that already stands.
+    let held = controller
+        .authority_feed_took_effect(id, applied.revision)
+        .map_err(Stopped::local)?;
+    let number = held.authority_revision.unwrap_or(applied.revision);
+    let revision = revision_record(shared, &held, number, id)?;
     let state = shared
         .client
         .revise(&revision, None)
@@ -720,7 +785,7 @@ fn revision_record(
     held: &RetainedRevocation,
     number: AuthorityRevision,
     id: RevocationRequestId,
-) -> AuthorityRevisionRecord {
+) -> std::result::Result<AuthorityRevisionRecord, Stopped> {
     let mut record = AuthorityRevisionRecord {
         host_device_id: shared.host_device_id,
         authority_revision: number,
@@ -730,9 +795,79 @@ fn revision_record(
         host_key_id: shared.key.key_id(),
         signature: Signature64::from_bytes([0; 64]),
     };
-    let input = record.signing_input().expect("a revision record encodes");
-    let transcript = SigningTranscript::from_canonical_bytes(AUTHORITY_REVISION_DOMAIN, input)
-        .expect("a transcript");
-    record.signature = sign(&shared.key, &transcript).expect("a signature");
-    record
+    let signed = record
+        .signing_input()
+        .map_err(|error| error.to_string())
+        .and_then(|input| {
+            SigningTranscript::from_canonical_bytes(AUTHORITY_REVISION_DOMAIN, input)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|transcript| sign(&shared.key, &transcript).map_err(|error| error.to_string()));
+    match signed {
+        Ok(signature) => {
+            record.signature = signature;
+            Ok(record)
+        }
+        Err(error) => Err(Stopped::local(ControllerError::Storage {
+            operation: "sign a revision record",
+            detail: error,
+        })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt as _;
+
+    #[derive(Debug)]
+    struct NoSigner(kr_crypto::keys::AuthorisationKeyPair);
+
+    impl kr_client::services::ServiceSigner for NoSigner {
+        fn signer(&self) -> kr_protocol::service::ServiceRequestSigner {
+            kr_protocol::service::ServiceRequestSigner::Host
+        }
+
+        fn public_key(&self) -> kr_protocol::scalars::AuthorisationKey {
+            *self.0.public()
+        }
+
+        fn sign(&self, _message: &[u8]) -> kr_client::Result<Signature64> {
+            Ok(Signature64::from_bytes([0; 64]))
+        }
+    }
+
+    /// A carrier that has made no request, for a suite of its waking.
+    fn carrier() -> FeedRuntime {
+        let key = AuthorisationKeyPair::generate().expect("a key");
+        let origin = GatewayOrigin::new("http://127.0.0.1:9").expect("an origin");
+        let client =
+            managed_client(&origin, None, Arc::new(NoSigner(key.clone()))).expect("a client");
+        FeedRuntime::new(
+            client,
+            &origin,
+            DeviceId::new(kr_ipc::new_uuid()),
+            key,
+            Arc::new(crate::quiet::RealTimer),
+        )
+    }
+
+    /// A revocation the carrier carries out wakes whatever watches the owners this host is paired
+    /// with, and the carrier is one of those. It is not woken by its own: a wake it kept would end
+    /// the wait a failed pass asked for, and a feed that keeps failing would be asked again
+    /// without one. A wake from anything else is kept.
+    #[tokio::test]
+    async fn the_carriers_own_revocation_does_not_wake_it_and_anothers_does() {
+        let runtime = carrier();
+        CARRYING_OUT.scope((), async { runtime.wake() }).await;
+        assert!(
+            runtime.shared.wake.notified().now_or_never().is_none(),
+            "a wake made while the carrier carries a request out is not kept"
+        );
+        runtime.wake();
+        assert!(
+            runtime.shared.wake.notified().now_or_never().is_some(),
+            "a wake from anywhere else is"
+        );
+    }
 }

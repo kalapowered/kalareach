@@ -1056,6 +1056,9 @@ mod a_read_that_meets_a_worker_on_its_way_out;
 mod a_floor_owed_its_record;
 
 #[cfg(test)]
+mod a_feed_request_written_down_before_it_takes_effect;
+
+#[cfg(test)]
 mod one_fence_for_one_debt;
 
 #[cfg(test)]

@@ -1002,6 +1002,14 @@ impl Controller {
         controller.start_descriptions().await?;
         // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
         // what is still authorised goes back in hand, what is not is cancelled, and a publication
+        // What the authority feed answered an earlier run, put right for the feed this host reads
+        // now: a removal stands for the feed that answered it and for no other, so an owner who
+        // pointed the host at another feed, or at none, has the grants that rest on the feed back
+        // before anything remote is decided, and a host whose feed removed it refuses them before
+        // delivery decides anything on them.
+        let removed = controller
+            .authority_feed_at_start(controller.started.authority.origin())
+            .await?;
         // that left this host and was never answered is recorded as unknown rather than guessed at.
         {
             // What an earlier run sent to the storage service and never saw answered is asked
@@ -1042,14 +1050,8 @@ impl Controller {
         // client to ask before it looked would leave an enabled setting doing nothing until
         // somebody happened to run a command.
         let _ = controller.power_state().await;
-        // What the authority feed answered an earlier run, put right for the feed this host reads
-        // now: a removal stands for the feed that answered it and for no other, so an owner who
-        // pointed the host at another feed, or at none, has the grants that rest on the feed back
-        // before anything remote is decided. The carrier starts before the network does, so the
-        // first connection to arrive finds a synchronisation to wait for.
-        let removed = controller
-            .authority_feed_at_start(controller.started.authority.origin())
-            .await?;
+        // The carrier of the authority feed starts before the network does, so the first
+        // connection to arrive finds a synchronisation to wait for.
         if let Some(runtime) = &controller.feed_runtime {
             if removed {
                 runtime.found_removed();

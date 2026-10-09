@@ -143,6 +143,26 @@ impl HeldTimer {
         }
     }
 
+    /// The next wait the daemon asked for that is shorter than `bound` and that the test has not
+    /// looked at, with the means to let it end: what a suite reads to learn that the daemon backs
+    /// off after a failure, whatever longer waits it also holds.
+    pub async fn next_wait_under(&self, bound: Duration) -> (Duration, Arc<Notify>) {
+        loop {
+            let asked = self.asked.notified();
+            if let Some(held) = self
+                .waits
+                .lock()
+                .expect("the waits")
+                .iter_mut()
+                .find(|held| !held.taken && held.duration < bound)
+            {
+                held.taken = true;
+                return (held.duration, Arc::clone(&held.release));
+            }
+            asked.await;
+        }
+    }
+
     /// Moves the clock a delay is counted against.
     pub fn advance(&self, by: Duration) {
         *self.now.lock().expect("the clock") += by;

@@ -26,8 +26,8 @@
 //! * **When the feed is unavailable, the status is stale and says so.** It is never reported as
 //!   up to date because nothing contradicted it.
 //! * **A feed that answered that this host was removed from it says so.** The status shows
-//!   the removal and the last synchronisation before it, and [`AuthorityFeed::is_removed`] is what
-//!   the grants that rest on the feed ask.
+//!   the removal and the last synchronisation before it. What the grants that rest on the feed ask
+//!   is the host's policy, which the daemon sets from the same answer.
 //!
 //! # What this type is, and is not
 //!
@@ -57,7 +57,8 @@ pub const FEED_POLL_INTERVAL_MS: u64 = 30_000;
 pub struct RetainedRevocation {
     /// The request a remote owner published.
     pub request: RevocationRequest,
-    /// The revision this host issued for it, once the revocation has taken effect.
+    /// The revision this host issued for it, once the revocation has taken effect. A request that
+    /// was refused, or has not yet taken effect, has none.
     pub authority_revision: Option<AuthorityRevision>,
     /// The revision the feed held when this host began to apply the request. The revision record
     /// it issues for it follows this one, so a crash between applying and acknowledging reissues
@@ -69,10 +70,10 @@ pub struct RetainedRevocation {
     pub acknowledged_by: BTreeSet<DeviceId>,
     /// True once every enrolled host had acknowledged it.
     ///
-    /// A settled record is kept rather than deleted. Its revision is what the device list reports
-    /// as a host's last acknowledgement, and its identity is what stops the same request being
-    /// applied a second time under a new revision. Deleting it would make a republished request
-    /// look new and a settled acknowledgement look like one that never happened.
+    /// A settled record is kept rather than deleted. Its identity is what stops the same request
+    /// being applied a second time under a new revision, and its revision is what a request the
+    /// feed holds again is acknowledged under. Deleting it would make a republished request look
+    /// new and a settled acknowledgement look like one that never happened.
     pub settled: bool,
 }
 
@@ -384,14 +385,6 @@ impl AuthorityFeed {
     #[must_use]
     pub const fn is_removed(&self) -> bool {
         self.removal.is_some()
-    }
-
-    /// Forgets a removal, because the feed this host reads is no longer the one that answered it,
-    /// and enrols this host with whatever it reads next.
-    pub fn clear_removal(&mut self) {
-        if self.removal.take().is_some() {
-            self.enrol(self.host_device_id);
-        }
     }
 
     /// What this host shows about the feed.

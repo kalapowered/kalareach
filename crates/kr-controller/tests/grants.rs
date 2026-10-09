@@ -3099,11 +3099,6 @@ fn a_removal_the_feed_answered_is_shown_kept_across_a_restart_and_forgotten_for_
         restored.status().removed_at_ms,
         Nullable::some(TimestampMs::new(6_000))
     );
-
-    let mut elsewhere = restored;
-    elsewhere.clear_removal();
-    assert!(!elsewhere.is_removed());
-    assert_eq!(elsewhere.status().removed_at_ms, Nullable::null());
 }
 
 /// A host that stored its feed before the feed's removal was kept reads it back. The host's data on

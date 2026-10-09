@@ -2,23 +2,28 @@
 //!
 //! Section 10 makes the target host the judge of owner authority: the feed stores the request and
 //! decides nothing about who may make it. So the host checks, from its own records, that the
-//! request is addressed to it, that the device that signed it is paired, still holds a grant that
-//! lets it manage this host and signed what it published, and that it names something this host
-//! knows. A request that passes is carried out as the owner at this machine's own revocation is,
-//! through the same barrier, so the revision it takes is the one the registry allocates and the
-//! completion it reports is the barrier's.
+//! request is addressed to it, that the device that signed it is paired, signed what it published
+//! and is, now, a device this host would let manage it (decided as the same device's own
+//! `device.revoke` is, by its grant, this host's policy and its configuration), and that it names
+//! something this host knows and has not withdrawn. A request that passes is carried out as the
+//! owner at this machine's own revocation is, through the same barrier, so the revision it takes
+//! is the one the registry allocates and the completion it reports is the barrier's.
 
 use kr_client::services::authority::RejectionReason;
 use std::sync::Arc;
 
-use kr_protocol::grant::GrantExpiry;
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId};
+use kr_protocol::method::Method;
 use kr_protocol::pairing::{KeyPurpose, RevocationCompletion, RevocationRequest, RevocationTarget};
-use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{KeyId, U64};
+use kr_protocol::sharing::MembershipRefusal;
 
 use super::Controller;
+use crate::config::ceilings::CeilingRefusal;
 use crate::error::Result;
+use crate::grants::{AccessRequest, GrantRecord, Refusal};
+use crate::service::net::devices::DeviceRecord;
 
 /// The most keys a host may name as permitted to remove its feed.
 pub const MOST_REMOVAL_KEYS: usize = kr_client::services::authority::MAX_REMOVAL_KEYS;
@@ -35,8 +40,24 @@ pub(crate) struct Plan {
 pub(crate) enum Judged {
     /// This host will not apply it, for a reason the feed's publisher can read.
     Refuse(RejectionReason),
+    /// This host cannot decide it yet. What its issuer's authority stands on is a bound that the
+    /// synchronisation in progress renews, or a clock reading not written down yet. The request
+    /// stays in the feed and is judged again by the next pass.
+    Later,
     /// This host applies it.
     Apply(Plan),
+}
+
+/// Whether a paired device may, now, manage this host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// It may.
+    Holds,
+    /// It may not, and nothing that passes with time changes that.
+    Not,
+    /// It may not yet: the bound its authority stands on ends with the synchronisation in
+    /// progress, or the clock reading the decision stands on is not written down yet.
+    Later,
 }
 
 /// What carrying a request out came to.
@@ -68,26 +89,101 @@ impl Controller {
         let Some(issuer) = self
             .devices
             .record_for_device(request.issuer_device_id)?
-            .filter(crate::service::net::devices::DeviceRecord::is_paired)
+            .filter(DeviceRecord::is_paired)
         else {
             return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
         };
-        let in_force = match issuer.grant.expiry {
-            GrantExpiry::Never => true,
-            GrantExpiry::At { expires_at_ms } => expires_at_ms.get() > now_ms,
-        };
-        if !issuer.grant.actions.contains(&ActionRight::HostManage)
-            || !in_force
-            || kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
-                .is_err()
+        if kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
+            .is_err()
         {
             return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
+        }
+        match self.standing_to_manage(&issuer, now_ms) {
+            Standing::Not => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
+            Standing::Later => return Ok(Judged::Later),
+            Standing::Holds => {}
         }
         let plan = self.plan_of(request)?;
         if plan.devices.is_empty() && plan.grants.is_empty() {
             return Ok(Judged::Refuse(RejectionReason::UnknownTarget));
         }
+        if !self.plan_has_something_to_withdraw(&plan)? {
+            // The owner at this machine, or an earlier request, withdrew all of it. There is no
+            // revision to issue for a request that changes nothing, and the registry is the one
+            // allocator.
+            return Ok(Judged::Refuse(RejectionReason::Superseded));
+        }
         Ok(Judged::Apply(plan))
+    }
+
+    /// Whether `device` may manage this host now, decided as its own `device.revoke` is: by its
+    /// grant, this host's policy and the rights ceiling this host's configuration put in force.
+    fn standing_to_manage(&self, device: &DeviceRecord, now_ms: u64) -> Standing {
+        let record = GrantRecord {
+            grant: device.grant.clone(),
+            session_id: None,
+            issued_at_ms: device.paired_at_ms.get(),
+            activated_at_ms: Some(device.paired_at_ms.get()),
+            revoked_at_ms: device.revoked_at_ms.map(|at| at.get()),
+            revoked_by_parent: None,
+        };
+        let request = AccessRequest {
+            method: Method::DeviceRevoke,
+            ingress: ActorIngress::PairedDevice,
+            environment_id: self.paths().environment_id(),
+            session_id: None,
+            claims_geometry: false,
+            own_subject: None,
+            now_ms: now_ms.max(self.wall_now_ms()),
+            continuous_now: self.clock.now(),
+        };
+        match self.decide_for_device(&device.grant, &record, request) {
+            Ok(_) => Standing::Holds,
+            Err(CeilingRefusal::RemovedByConfiguration { .. }) => Standing::Not,
+            Err(CeilingRefusal::Refused(refusal)) => match refusal {
+                // These end, or are written down, with the pass in progress: the bound is renewed
+                // by the synchronisation it makes, and the floor is written by the next decision.
+                Refusal::OfflineValidityLapsed { .. }
+                | Refusal::MembershipUnusable {
+                    refusal: MembershipRefusal::LeaseExpired,
+                }
+                | Refusal::FloorUnrecorded
+                | Refusal::ExpiryUnrecorded { .. }
+                | Refusal::ClockUnproven => Standing::Later,
+                _ => Standing::Not,
+            },
+        }
+    }
+
+    /// Whether carrying a plan out would withdraw anything: a device not yet revoked, a grant a
+    /// device holds in the grant store that is not yet revoked, or a grant not yet revoked.
+    fn plan_has_something_to_withdraw(&self, plan: &Plan) -> Result<bool> {
+        let held = self.devices.devices()?;
+        for device_id in &plan.devices {
+            if held
+                .iter()
+                .any(|record| record.device_id == *device_id && record.revoked_at_ms.is_none())
+                || self
+                    .sharing
+                    .grants()
+                    .records_for_device(*device_id)?
+                    .iter()
+                    .any(|record| record.revoked_at_ms.is_none())
+            {
+                return Ok(true);
+            }
+        }
+        for grant_id in &plan.grants {
+            if self
+                .sharing
+                .grants()
+                .record(*grant_id)?
+                .is_some_and(|record| record.revoked_at_ms.is_none())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// What a request names that this host knows.
@@ -172,12 +268,13 @@ impl Controller {
     ///
     /// Returns an error when the device directory cannot be read.
     pub(crate) fn owner_key_ids(&self) -> Result<(Vec<KeyId>, usize)> {
+        let now_ms = kr_ipc::now_ms().get();
         let mut owners: Vec<_> = self
             .devices
             .devices()?
             .into_iter()
             .filter(|record| {
-                record.is_paired() && record.grant.actions.contains(&ActionRight::HostManage)
+                record.is_paired() && self.standing_to_manage(record, now_ms) != Standing::Not
             })
             .collect();
         owners.sort_by_key(|record| (record.paired_at_ms, record.device_id));
@@ -284,14 +381,11 @@ impl Controller {
 
     /// Writes down a successful synchronisation, and, for a host under a bounded offline-validity
     /// policy, extends the bound from it.
-    pub(crate) fn authority_feed_synchronised(&self, origin: &str) {
+    pub(crate) fn authority_feed_synchronised(&self) {
         let now = kr_ipc::now_ms().get();
         {
             let mut feed = self.authority_feed();
             feed.synchronised(now);
-            if feed.is_removed() && !feed.is_removed_from(origin) {
-                feed.clear_removal();
-            }
             if let Err(error) = self.keep_feed(&feed) {
                 eprintln!(
                     "kr-controller: could not write the authority feed's record down: {error}"
@@ -307,15 +401,34 @@ impl Controller {
         }
     }
 
-    /// Notes that the feed could not be reached, so what is shown is stale.
+    /// Notes that the feed could not be reached or read through, so what is shown is stale.
     pub(crate) fn authority_feed_unreachable(&self) {
         self.authority_feed().unreachable();
     }
 
-    /// Records that the feed at `origin` answered that this host was removed from it: writes it
-    /// down, refuses the grants that rest on the feed, and tells the owner.
-    pub(crate) async fn authority_feed_removed(&self, origin: &str) {
+    /// Refuses the grants that rest on the authority feed, from this moment: an organisation's
+    /// lease, and personal remote access under a bounded offline-validity policy. A restriction
+    /// does not wait for its record to be written, so a registry that cannot take a write
+    /// restricts all the same.
+    fn refuse_the_grants_that_rest_on_the_feed(&self) {
+        self.policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_feed_removed(true);
+        self.advance_authority_epoch();
+    }
+
+    /// Records that the feed at `origin` answered that this host was removed from it: refuses the
+    /// grants that rest on the feed at once, writes the removal down, and tells the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the removal or the notice to the owner could not be written. The
+    /// grants are refused whatever happens, and the caller asks again, so the removal reaches the
+    /// registry when it can take it.
+    pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
         let now = kr_ipc::now_ms().get();
+        self.refuse_the_grants_that_rest_on_the_feed();
         let removal = {
             let mut feed = self.authority_feed();
             feed.removed_from(origin, now);
@@ -327,21 +440,14 @@ impl Controller {
             feed.removal()
         };
         let Some(removal) = removal else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = self.sharing.grants().store_feed_removal(Some(&removal)) {
-            eprintln!("kr-controller: could not write the authority feed's removal down: {error}");
-        }
-        if let Err(error) = self.update_policy(|policy| policy.set_feed_removed(true)) {
-            eprintln!(
-                "kr-controller: could not refuse the grants that rest on the removed feed: {error}"
-            );
-        }
+        self.sharing.grants().store_feed_removal(Some(&removal))?;
         self.tell_the_owner_of_the_feed(
             kr_attention::EventKind::AuthorityFeedRemoved,
             removal.at_ms.get(),
         )
-        .await;
+        .await
     }
 
     /// Puts the authority feed's removal right at start: kept for the origin that answered it,
@@ -352,12 +458,12 @@ impl Controller {
         };
         if configured == Some(removal.origin.as_str()) {
             self.authority_feed().restore_removal(&removal);
-            self.update_policy(|policy| policy.set_feed_removed(true))?;
+            self.refuse_the_grants_that_rest_on_the_feed();
             self.tell_the_owner_of_the_feed(
                 kr_attention::EventKind::AuthorityFeedRemoved,
                 removal.at_ms.get(),
             )
-            .await;
+            .await?;
             return Ok(true);
         }
         // The owner pointed the host at another feed, or at none: the removal is no removal from
@@ -367,12 +473,16 @@ impl Controller {
             kr_attention::EventKind::AuthorityFeedLeft,
             kr_ipc::now_ms().get(),
         )
-        .await;
+        .await?;
         Ok(false)
     }
 
     /// Gives the attention store one notice about the feed, numbered by the moment it concerns.
-    async fn tell_the_owner_of_the_feed(&self, kind: kr_attention::EventKind, at_ms: u64) {
+    async fn tell_the_owner_of_the_feed(
+        &self,
+        kind: kr_attention::EventKind,
+        at_ms: u64,
+    ) -> Result<()> {
         let event = kr_attention::SourceEvent::new(
             kr_attention::EventCursor::new(
                 kr_protocol::attention::AttentionSource::Authority,
@@ -382,9 +492,12 @@ impl Controller {
             kind,
         );
         let attention = Arc::clone(self.attention());
-        let told = tokio::task::spawn_blocking(move || attention.observe(&[event])).await;
-        if !matches!(told, Ok(Ok(()))) {
-            eprintln!("kr-controller: the attention store could not take the feed's notice");
+        match tokio::task::spawn_blocking(move || attention.observe(&[event])).await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(crate::error::ControllerError::Storage {
+                operation: "tell the owner of the authority feed",
+                detail: "the attention store could not take the notice".to_owned(),
+            }),
         }
     }
 }
