@@ -106,20 +106,6 @@ jobs:
           cache: ${{ (inputs.groups == '' || contains(inputs.groups, 'typescript')) && 'pnpm' || '' }}
           package-manager-cache: ${{ inputs.groups == '' || contains(inputs.groups, 'typescript') }}
 
-      # The registry is restored by every run and saved, at the end of the job, by a green run on
-      # the default branch only: a cache saved from another branch is used by that branch alone and
-      # takes the room of one every branch uses.
-      - name: Restore the cargo registry
-        id: cargo-cache
-        timeout-minutes: 10
-        uses: ./.github/actions/cargo-cache-restore
-        with:
-          name: conformance-linux
-          paths: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-
       - name: Build the test components
         timeout-minutes: 15
         run: bash scripts/build-plugin-fixtures.sh
@@ -146,17 +132,6 @@ jobs:
           name: conformance-linux
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
-
-      - name: Save the cargo registry
-        timeout-minutes: 10
-        uses: ./.github/actions/cargo-cache-save
-        with:
-          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
-          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
-          paths: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
 
   macos:
     name: macos
@@ -254,20 +229,6 @@ jobs:
           cache: ${{ (inputs.groups == '' || contains(inputs.groups, 'typescript')) && 'pnpm' || '' }}
           package-manager-cache: ${{ inputs.groups == '' || contains(inputs.groups, 'typescript') }}
 
-      # The registry is restored by every run and saved, at the end of the job, by a green run on
-      # the default branch only: a cache saved from another branch is used by that branch alone and
-      # takes the room of one every branch uses.
-      - name: Restore the cargo registry
-        id: cargo-cache
-        timeout-minutes: 10
-        uses: ./.github/actions/cargo-cache-restore
-        with:
-          name: conformance-macos
-          paths: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-
       - name: Build the test components
         timeout-minutes: 15
         run: bash scripts/build-plugin-fixtures.sh
@@ -293,17 +254,6 @@ jobs:
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
 
-      - name: Save the cargo registry
-        timeout-minutes: 10
-        uses: ./.github/actions/cargo-cache-save
-        with:
-          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
-          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
-          paths: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-
   windows:
     name: windows
     if: github.event_name != 'workflow_dispatch' || inputs.windows
@@ -328,20 +278,6 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
           cargo --version
-
-      # The registry is restored by every run and saved, at the end of the job, by a green run on
-      # the default branch only: a cache saved from another branch is used by that branch alone and
-      # takes the room of one every branch uses.
-      - name: Restore the cargo registry
-        id: cargo-cache
-        timeout-minutes: 10
-        uses: ./.github/actions/cargo-cache-restore
-        with:
-          name: conformance-windows
-          paths: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
 
       # The report reads the TypeScript tests with the packages' own compiler here too, to list them
       # as not run on this platform.
@@ -405,14 +341,3 @@ jobs:
           name: conformance-windows
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
-
-      - name: Save the cargo registry
-        timeout-minutes: 10
-        uses: ./.github/actions/cargo-cache-save
-        with:
-          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
-          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
-          paths: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
