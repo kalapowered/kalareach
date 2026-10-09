@@ -1664,6 +1664,7 @@ async fn hand_over(
             return Err(error);
         }
     };
+    formats::look_ahead(store);
     let every = every_environment(environments, &again);
     // From here the reading under the install lock is the one a person is told of. A pair of roots
     // through which an environment held below was found, at either reading, is not also one the
