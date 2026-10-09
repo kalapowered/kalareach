@@ -8250,16 +8250,30 @@ async fn no_file_of_a_state_root_goes_unnamed() {
     assert_eq!(unnamed.len(), 4, "and nothing else: {unnamed:?}");
 }
 
-/// KR-REQ-26.10: no record a command writes is raised past version 1 while nothing holds a command
+/// For a record a command writes, the highest version that every release that lists its stores reads,
+/// where that is not 1.
+///
+/// The premise is that a host switches only to a release whose manifest lists its stores: `kr host
+/// rollback` refuses one that lists none, and `a_rollback_is_refused_to_a_release_that_lists_no_store`
+/// holds that, so that a later change which allows such a rollback fails beside this floor. The first
+/// release that lists its stores reads the configuration document at versions 1 and 2, because the
+/// document gained its `storage` section before it, so every release a host can switch to reads
+/// version 2 of it, and a document a command writes at 2 never leaves the range of the release
+/// switched to. Every other record a command writes is at version 1.
+const READ_BY_EVERY_LISTED_RELEASE: [(&str, u32); 1] = [("configuration", 2)];
+
+/// KR-REQ-26.10: no record a command writes is raised past the highest version that every release that
+/// lists its stores reads, which is version 1 but for the entries above, while nothing holds a command
 /// off between an update's check of the stores and its switch.
 ///
 /// A switch is checked against every version on disk, and a `kr` command that is not held off can
 /// write a record after the check and before the switch, or a program of a newer release that a
 /// rollback left running can write one after it. Neither can put a record out of the range of the
-/// release switched to while every record a command writes is at version 1, which every release
-/// reads. Raising such a record's version needs the writer barrier first: every writer of the record
-/// takes a lock the update holds exclusively across its check and its switch, and refuses to write a
-/// version that the current release does not write.
+/// release switched to while every record a command writes is at a version every release that lists
+/// its stores reads. The next raise of any record a command writes, past what the entries above
+/// give, needs the writer barrier first: every writer of the record takes a lock the update holds
+/// exclusively across its check and its switch, and refuses to write a version that the current
+/// release does not write.
 ///
 /// Remove this test once all of these hold: the barrier and the rule for a pinned program have
 /// landed; a state root names the store that serves it, and a `kr` outside a store takes that
@@ -8268,11 +8282,16 @@ async fn no_file_of_a_state_root_goes_unnamed() {
 /// for as long as a supported release has no barrier, the `migrates_from` of each record a command
 /// writes stays at or below the version that release writes.
 #[test]
-fn no_record_a_command_writes_is_raised_past_version_one_while_no_barrier_exists() {
+fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_while_no_barrier_exists()
+ {
     let past: Vec<String> = stored_formats::table::table()
         .into_iter()
         .filter(|store| {
-            store.writers == stored_formats::Writers::Commands && store.entry.version != 1
+            let floor = READ_BY_EVERY_LISTED_RELEASE
+                .iter()
+                .find(|(name, _)| *name == store.entry.store)
+                .map_or(1, |(_, version)| *version);
+            store.writers == stored_formats::Writers::Commands && store.entry.version > floor
         })
         .map(|store| {
             format!(
@@ -8283,9 +8302,49 @@ fn no_record_a_command_writes_is_raised_past_version_one_while_no_barrier_exists
         .collect();
     assert!(
         past.is_empty(),
-        "a record a command writes cannot be raised past version 1 until every writer of it \
-         takes the lock an update holds exclusively across its check and its switch: {}",
+        "a record a command writes cannot be raised past the highest version every release that \
+         lists its stores reads until every writer of it takes the lock an update holds \
+         exclusively across its check and its switch: {}",
         past.join("; ")
+    );
+}
+
+/// KR-REQ-26.10: a rollback to a release whose manifest lists no store is refused, naming that, and
+/// nothing is switched. This is the premise of the floor of the guard above: every release a host
+/// can switch to lists its stores, and so reads the configuration document at version 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_is_refused_to_a_release_that_lists_no_store() {
+    let host = Host::create();
+    let unlisted = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).without_stores();
+    let listed = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.put(&unlisted);
+    host.put(&listed);
+    host.switch(listed.name());
+
+    let (output, said) = host.kr_json(&[
+        "host",
+        "rollback",
+        "--to",
+        unlisted.name().as_str(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lists no store"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(listed.name().clone()),
+        "nothing was switched"
     );
 }
 
