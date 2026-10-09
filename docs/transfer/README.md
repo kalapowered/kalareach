@@ -204,7 +204,7 @@ migrations. Every state change commits together with the outbox row that announc
 | `snapshots`, `snapshot_chunks` | download snapshots, their chunk layout and the source facts they were taken against |
 | `scopes` | registered read scopes, with the stable filesystem identity each one was recorded for |
 | `drafts`, `draft_attachments` | drafts, the attachments bound to them and what became of each offer |
-| `ended_sessions` | the sessions whose workers have ended, which a binding or a prompt for one of their drafts is refused against |
+| `ended_sessions` | the sessions whose workers have ended, which a draft, a binding or a prompt for one of them is refused against |
 | `grants` | narrow read grants over one attachment each |
 | `actions` | retained mutation outcomes, keyed by actor and action identifier |
 | `events`, `cursors` | the outbox and its consumers' positions |
@@ -638,13 +638,13 @@ session will be marked as `orphaned`. Orphaned drafts are not purged, but nothin
 from them. A draft that was only sent to the session, or that holds an upload of it, has its
 bindings failed and is not orphaned. A draft takes one revision for the whole closure. Bindings in
 the `accepted_by_agent` or `unknown` state will not be modified, because the first is evidence and
-the second is not known. From then on `SESSION_CLOSED` refuses a binding, the record of a new prompt
-or a worker's report for a draft of that session, and a binding of an upload that belongs to it.
-Receipts will however still be generated for exact re-prompts that the worker can answer. The write
-is queued after the registry records the closure, and the refusal starts when that write commits. If
-the daemon is stopped before it has had a chance to act on the session being closed, it will do so
-when next started, before serving any transfer. It will also be attempted as part of the hourly
-sweep if it has not succeeded.
+the second is not known. From then on `SESSION_CLOSED` refuses a new draft for that session, a
+binding, the record of a new prompt or a worker's report for a draft of that session, and a binding
+of an upload that belongs to it. Receipts will however still be generated for exact re-prompts that
+the worker can answer. The write is queued after the registry records the closure, and the refusal
+starts when that write commits. If the daemon is stopped before it has had a chance to act on the
+session being closed, it will do so when next started, before serving any transfer. It will also be
+attempted as part of the hourly sweep if it has not succeeded.
 
 The attachment and the draft must belong to the same principal, and to the same session where both
 name one. An attachment bound to one session would otherwise be retained against that session while
@@ -702,8 +702,8 @@ deadline is refused. It also checks that the draft would still fit its reply wit
 that each offer in flight can still receive. If all of that holds, the transfer service sets the
 binding's state to `inserting` for its owner, which is the actor and the action together, issues a
 read grant over the one file, and increments the draft's revision. The same claim by the same owner
-at the same attempt returns the same claim and grant, so a reply that was lost leaves nothing
-behind. No claim is made while the journal still holds sessions of an earlier build.
+at the same attempt returns the same grant and the draft as it now stands, so a reply that was lost
+leaves nothing behind. No claim is made while the journal still holds sessions of an earlier build.
 
 Last, the worker reports that the attachment was `accepted_by_agent`, providing provenance and
 evidence, or that it `failed`, providing a reason, or that the attachment was `unknown`, providing a
@@ -711,7 +711,8 @@ reason. The transfer service accepts the report only from the owner of the claim
 claim's attempt, and only if the binding's state is `inserting`. Bytes written into the terminal are
 not evidence, so it refuses a report of acceptance with that provenance. It truncates the evidence
 or reason to 512 bytes at a character boundary, and it revokes the claim's grant. A report repeated
-unchanged returns the state that was recorded. The service refuses a report, whether from the owner
+unchanged, with the same state and the same text, returns the state that was recorded; the
+provenance is not stored, and is not compared. The service refuses a report, whether from the owner
 or another process, with a reason of `SESSION_CLOSED`, if the session has been closed.
 
 As long as a binding is `inserting` no prompt may mention the draft, and the draft's attachment may
@@ -809,7 +810,7 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `ID_CONFLICT` | one action identifier used for two different payloads |
 | `INVALID_ARGUMENT` | a malformed request, or an identifier that names nothing this caller owns |
 | `STORAGE_UNAVAILABLE` | the journal or the staging area could not be used, including a name the storage would not answer about |
-| `SESSION_CLOSED` | a binding, the record of a new prompt or an adapter's report for a draft of a session whose closure is recorded, or a binding of an upload that belongs to one |
+| `SESSION_CLOSED` | a new draft for a session whose closure is recorded, a binding, the record of a new prompt or an adapter's report for a draft of such a session, or a binding of an upload that belongs to one |
 
 An identifier that names nothing is `INVALID_ARGUMENT` rather than a code of its own, and an
 identifier that names another principal's transfer or draft gets the same refusal with the same

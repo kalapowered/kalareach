@@ -194,11 +194,13 @@ impl Asked {
                 detail: format!("the control daemon could not be asked about the draft: {why}"),
             },
             Self::Refused(error) => match error.code {
-                ErrorCode::ResourceUnavailable | ErrorCode::StorageUnavailable => {
-                    BrokerError::ResourceUnavailable {
-                        detail: error.message,
-                    }
-                }
+                // What cannot be said is asked again, and a person is told the daemon could not be
+                // asked, not that the request was wrong.
+                ErrorCode::ResourceUnavailable
+                | ErrorCode::StorageUnavailable
+                | ErrorCode::OutcomeUnknown => BrokerError::ResourceUnavailable {
+                    detail: error.message,
+                },
                 ErrorCode::DraftConflict | ErrorCode::SessionClosed | ErrorCode::StaleSession => {
                     BrokerError::PreconditionFailed {
                         detail: error.message,
@@ -583,5 +585,206 @@ async fn deliver(
         delay = FIRST_RETRY;
         pending.pop_front();
         waiting.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use kr_protocol::hello::ActionWindow;
+    use kr_protocol::identity::{BootIdentity, BootIdentitySource};
+    use kr_protocol::ids::{
+        ActionId, ActionWindowId, BootEpoch, ConnectionId, EnvironmentId, TransferId,
+    };
+    use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
+    use kr_protocol::scalars::{Bytes, DurationMs, Nullable, TimestampMs, U64, Uuid};
+    use kr_protocol::transfer::InsertionState;
+
+    /// What a scripted control daemon does with a claim it is asked.
+    #[derive(Clone, Copy)]
+    enum Claim {
+        /// Reads it and closes the connection: the worker hears nothing.
+        Closes,
+        /// Answers that it cannot say what became of it.
+        CannotSay,
+        /// Answers that it will not, for good.
+        Refuses,
+    }
+
+    /// A control daemon's rendezvous endpoint, scripted: it acknowledges every hello, deals with a
+    /// claim as `claim` says, and records the boot-clock reading at which each report arrives.
+    fn scripted(
+        path: &Path,
+        claim: Claim,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<u64>,
+    ) {
+        let endpoint = Endpoint::from_path(path).expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds");
+        let (reports, arrived) = tokio::sync::mpsc::unbounded_channel();
+        let serving = tokio::spawn(async move {
+            loop {
+                let Ok((connection, _peer)) = listener.accept().await else {
+                    return;
+                };
+                let reports = reports.clone();
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                    let Ok(ControlFrame::Hello(_)) = reader.read_message().await else {
+                        return;
+                    };
+                    let acknowledgement = LocalHelloAck {
+                        selected_version: PROTOCOL_VERSION,
+                        role: LocalRole::Controller,
+                        connection_id: ConnectionId::new(Uuid::from_bytes([1; 16])),
+                        environment_id: EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                        boot_identity: BootIdentity {
+                            source: BootIdentitySource::BootTime,
+                            value: Bytes::from(vec![3; 8]),
+                        },
+                        peer: LocalPeer {
+                            uid: U64::new(0),
+                            gid: U64::new(0),
+                            pid: Nullable::null(),
+                        },
+                        action_window: ActionWindow {
+                            action_window_id: ActionWindowId::new("window").expect("an id"),
+                            connection_id: ConnectionId::new(Uuid::from_bytes([1; 16])),
+                            boot_epoch: BootEpoch::new(1),
+                            issued_at_ms: TimestampMs::new(1),
+                            valid_for_ms: DurationMs::new(1000),
+                        },
+                        capabilities: CanonicalSet::new(),
+                        max_receive: ReceiveLimits::default(),
+                        build: None,
+                    };
+                    if writer
+                        .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(ControlFrame::DraftWanted(wanted)) = reader.read_message().await else {
+                        return;
+                    };
+                    let answer = match wanted.step {
+                        DraftStep::Report(_) => {
+                            let _ = reports.send(kr_ipc::clock::boot_elapsed_ms());
+                            DraftAnswer::Reported(InsertionState::Failed)
+                        }
+                        DraftStep::Begin(_) => match claim {
+                            Claim::Closes => return,
+                            Claim::CannotSay => DraftAnswer::Refused(ProtocolError::new(
+                                ErrorCode::OutcomeUnknown,
+                                "the claim may have been made",
+                            )),
+                            Claim::Refuses => DraftAnswer::Refused(ProtocolError::new(
+                                ErrorCode::DraftConflict,
+                                "no",
+                            )),
+                        },
+                        DraftStep::Facts { .. } => return,
+                    };
+                    let _ = writer
+                        .write_message(&ControlFrame::DraftAnswer(Box::new(answer)))
+                        .await;
+                });
+            }
+        });
+        (serving, arrived)
+    }
+
+    fn claim_with_deadline(deadline_boot_ms: u64) -> InsertionBegin {
+        InsertionBegin {
+            action_id: ActionId::new(Uuid::from_bytes([4; 16])),
+            draft_id: DraftId::new(Uuid::from_bytes([5; 16])),
+            transfer_id: TransferId::new(Uuid::from_bytes([6; 16])),
+            attempt: U64::new(0),
+            max_count: U64::new(4),
+            deadline_boot_ms: U64::new(deadline_boot_ms),
+        }
+    }
+
+    /// Asks `daemon` for a claim whose deadline is `after_ms` from now, and says when the report
+    /// that follows arrives, if one does, together with the deadline.
+    async fn claim_and_wait_for_the_report(claim: Claim, after_ms: u64) -> (u64, Option<u64>) {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host
+            .environment()
+            .rendezvous_endpoint()
+            .expect("an endpoint")
+            .as_path()
+            .to_path_buf();
+        let (_serving, mut arrived) = scripted(&path, claim);
+        let drafts = Drafts::new();
+        drafts.connect(DaemonLink::new(
+            SessionId::new(Uuid::from_bytes([7; 16])),
+            path,
+        ));
+        let deadline = kr_ipc::clock::boot_elapsed_ms() + after_ms;
+        let actor = ActorId::new("local:test").expect("a principal");
+        let slot = drafts.reserve().expect("a place for the report");
+        let error = drafts
+            .begin(
+                &actor,
+                slot,
+                claim_with_deadline(deadline),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("the claim was not answered with a claim");
+        drop(error);
+        let report = if drafts.reports_waiting() == 0 {
+            None
+        } else {
+            tokio::time::timeout(Duration::from_secs(60), arrived.recv())
+                .await
+                .ok()
+                .flatten()
+        };
+        (deadline, report)
+    }
+
+    /// A claim the daemon was asked for and did not answer, because the connection ended or the
+    /// answer says it cannot tell, may still be committed by a daemon that was slow to get to it. A
+    /// report that the offer failed is made only once the claim's deadline has passed, after which
+    /// a daemon commits no claim, so the report cannot meet a claim that commits after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_report_of_a_claim_nobody_answered_is_made_only_after_the_claims_deadline() {
+        for claim in [Claim::Closes, Claim::CannotSay] {
+            let (deadline, report) = claim_and_wait_for_the_report(claim, 1500).await;
+            let at = report.expect("the report is made");
+            assert!(
+                at > deadline,
+                "the report arrived at {at}, the deadline was {deadline}"
+            );
+        }
+    }
+
+    /// A claim the daemon refused for good was not made, and nothing is reported for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_claim_the_daemon_refused_for_good_leaves_no_report_to_make() {
+        let (_, report) = claim_and_wait_for_the_report(Claim::Refuses, 1500).await;
+        assert_eq!(report, None);
+    }
+
+    #[test]
+    fn a_refusal_that_cannot_say_what_became_of_the_question_is_no_answer() {
+        let cannot_say = Asked::Refused(ProtocolError::new(ErrorCode::OutcomeUnknown, "maybe"));
+        assert!(cannot_say.is_unanswered());
+        assert!(cannot_say.can_be_asked_again());
+        let no = Asked::Refused(ProtocolError::new(ErrorCode::DraftConflict, "no"));
+        assert!(!no.is_unanswered());
+        assert!(!no.can_be_asked_again());
+        let later = Asked::Refused(ProtocolError::new(ErrorCode::ResourceUnavailable, "later"));
+        assert!(!later.is_unanswered());
+        assert!(later.can_be_asked_again());
+        assert!(Asked::Unreached("down".to_owned()).is_unanswered());
+        assert!(matches!(
+            cannot_say.into_error(),
+            crate::broker::BrokerError::ResourceUnavailable { .. }
+        ));
     }
 }

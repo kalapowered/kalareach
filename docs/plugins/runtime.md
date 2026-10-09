@@ -585,8 +585,9 @@ The preparation runs in a fixed order: read, ask, compare, claim.
    and no other.
 4. The worker reads the action's receipt again. An action that was cancelled or fenced in the
    meantime claims nothing.
-5. The worker claims the binding. This is the last thing it does, so that it doesn't claim the
-   binding until it has done everything else that might refuse the action.
+5. The worker claims the binding, at the attempt step 1 read, so that a binding bound again since
+   is refused. This is the last thing it does, so that it doesn't claim the binding until it has
+   done everything else that might refuse the action.
 
 One bound covers all of it, from the read of the draft to the claim: five seconds, or the action's
 accepted deadline if that is sooner.

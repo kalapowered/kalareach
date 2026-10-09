@@ -188,45 +188,46 @@ async fn kr_req_23_30_a_draft_the_store_does_not_hold_is_refused_before_anything
     assert_eq!(state_of(&after, &handle), InsertionState::Recorded);
 }
 
-/// Waits until the daemon holds a worker's claim at its pause, which the claim reaches after the
-/// worker has read the draft and the component has prepared the plan.
-async fn until_a_claim_is_held(held: std::sync::mpsc::Receiver<()>) {
+/// Waits until the daemon holds a worker's question at one of its testing pauses: the answer to a
+/// read of a draft, or a claim before or after the transfer service decides it.
+async fn until_the_daemon_holds(held: std::sync::mpsc::Receiver<()>) {
     let arrived = tokio::task::spawn_blocking(move || held.recv_timeout(PATIENCE).is_ok())
         .await
         .expect("the waiting thread finishes");
-    assert!(arrived, "the claim never reached the daemon");
+    assert!(arrived, "the question never reached the daemon's pause");
 }
 
-/// KR-REQ-23.30: a claim at an attempt the binding has moved past transmits nothing. The draft is
-/// read, the component has prepared its plan, and the attachment is bound again before the claim
-/// is made: the claim names the attempt that was read, the daemon refuses it, the action is
-/// rejected and the new attempt is as it was left.
+/// KR-REQ-23.30: a claim is made at the attempt the worker read before it asked the component. The
+/// attachment is bound again after the daemon answered the read and before the worker has it: the
+/// worker claims the attempt it read, the daemon refuses it because the binding has moved, the
+/// action is rejected and the new attempt is as it was left. A worker that read the draft again
+/// before it claimed would claim the new attempt and carry the offer on the strength of facts it
+/// had checked against the old.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_claim_at_a_moved_attempt_transmits_nothing() {
     let Some((acting, draft, handle)) = offering().await else {
         return;
     };
     let mut client = acting.client().await;
-    let (held, release) = acting
+    let (read, go_on) = acting
         .hosted
         .controller
         .as_ref()
         .expect("a daemon")
         .transfer()
-        .pause_before_a_claim();
+        .pause_after_a_read();
     let mutation = acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
     write(&mut client, mutation).await;
-    until_a_claim_is_held(held).await;
+    until_the_daemon_holds(read).await;
 
-    // The same attachment, bound again before the claim is made: a new attempt.
+    // The same attachment, bound again while the answer to the read is on its way: a new attempt.
     let moved = acting.bind(&acting.draft(draft.draft_id), &handle);
-    release.send(()).expect("lets the claim go");
-    let finished = answer(&mut client, Some(1)).await;
-    assert!(
-        matches!(finished, Outcome::Error(_)),
-        "the action is refused: {finished:?}"
-    );
+    go_on.send(()).expect("lets the answer go");
+    let Outcome::Error(refusal) = answer(&mut client, Some(1)).await else {
+        panic!("the claim at the old attempt was carried");
+    };
+    assert_eq!(refusal.code, ErrorCode::DraftConflict, "{refusal:?}");
     let receipt = until_settled(&mut client, action_id).await;
     assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
     assert!(
@@ -237,6 +238,52 @@ async fn kr_req_23_30_a_claim_at_a_moved_attempt_transmits_nothing() {
     let after = acting.draft(draft.draft_id);
     assert_eq!(after.revision, moved.revision, "no claim moved the draft");
     assert_eq!(state_of(&after, &handle), InsertionState::Recorded);
+}
+
+/// KR-REQ-24.09: a claim the daemon committed and did not answer in time is settled by the report
+/// of the worker, so the binding is not left `inserting` with nobody to settle it. The daemon holds
+/// the answer; the worker runs out of the time the action was given, rejects the action and, once
+/// the claim's deadline has passed, reports that the offer failed. The binding is `failed`, the
+/// draft took the claim's revision and the report's, nothing was written to the upstream, and the
+/// daemon's answer, let go afterwards, reaches nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_09_a_claim_that_committed_without_an_answer_is_settled_by_the_workers_report() {
+    let Some((acting, draft, handle)) = offering().await else {
+        return;
+    };
+    let mut client = acting.client().await;
+    let (decided, answer_now) = acting
+        .hosted
+        .controller
+        .as_ref()
+        .expect("a daemon")
+        .transfer()
+        .pause_after_a_claim();
+    let mutation = acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
+    let action_id = mutation.action_id;
+    write(&mut client, mutation).await;
+    until_the_daemon_holds(decided).await;
+    assert_eq!(
+        state_of(&acting.draft(draft.draft_id), &handle),
+        InsertionState::Inserting,
+        "the claim committed and the answer is on hold"
+    );
+
+    let finished = answer(&mut client, Some(1)).await;
+    assert!(
+        matches!(finished, Outcome::Error(_)),
+        "the action is refused: {finished:?}"
+    );
+    let failed = until_binding(&acting, draft.draft_id, &handle, InsertionState::Failed).await;
+    assert_eq!(failed.revision.get(), draft.revision.get() + 2);
+    until("the report to be recorded", || async {
+        (acting.hosted._service.broker().drafts().reports_waiting() == 0).then_some(())
+    })
+    .await;
+    let receipt = until_settled(&mut client, action_id).await;
+    assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+    assert!(acting.frames().is_empty());
+    answer_now.send(()).expect("lets the daemon answer");
 }
 
 /// KR-REQ-24.09: a claim that reaches the daemon after its action gave up on it commits nothing.
@@ -262,7 +309,7 @@ async fn kr_req_24_09_a_claim_let_go_after_its_deadline_commits_nothing_and_the_
     let mutation = acting.offering(&client, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
     write(&mut client, mutation).await;
-    until_a_claim_is_held(held).await;
+    until_the_daemon_holds(held).await;
 
     // The worker runs out of time for the claim and rejects the action, with the daemon still
     // holding it. Its report that the offer failed waits for the claim's deadline, and is then
@@ -284,7 +331,7 @@ async fn kr_req_24_09_a_claim_let_go_after_its_deadline_commits_nothing_and_the_
 
     // The claim is let go, and decided: refused for its deadline, so the draft is as it was.
     release.send(()).expect("lets the claim go");
-    until_a_claim_is_held(decided).await;
+    until_the_daemon_holds(decided).await;
     let after = acting.draft(draft.draft_id);
     assert_eq!(
         after.revision, draft.revision,
@@ -933,9 +980,10 @@ async fn kr_req_23_30_a_repeat_of_an_offer_claims_nothing_again_and_a_changed_on
 
 /// KR-REQ-23.30: an offer is refused before anything is claimed when the package's declaration does
 /// not admit it, one row for each thing the declaration decides: the media type and its family, the
-/// size, the destination, the number of attachments, the way the binding was recorded to be
-/// inserted, and the application instance the draft is for. The control is a declaration that
-/// admits it, which is carried.
+/// size, the destination and the application instance the draft is for, which the worker checks
+/// against what it read; and two the control daemon decides when it claims, given the declaration's
+/// figure, the number of attachments and the way the binding was recorded to be inserted. The
+/// control is a declaration that admits it, which is carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_the_packages_declaration_does_not_admit_is_refused_before_a_claim() {
     use kr_plugin_sdk::effect::AttachmentContribution;
