@@ -9,9 +9,9 @@
 //
 //  Section 15 ¶6 is the other constraint: the provider's data channel is read-only. This
 //  connection creates the one channel the provider's protocol names, `oai-events`, before it makes
-//  the offer, because the offer has to describe it and the provider writes to it, and it sends
-//  **zero** bytes on that channel or on any other. What arrives is handed to the caller as bytes
-//  with a type, and an event the caller does not recognise is dropped rather than reflected into
+//  the offer, because the offer has to describe it and the provider writes to it, and it writes
+//  nothing to that channel or to any other. What arrives is handed to the caller as bytes with a
+//  type, and an event the caller does not recognise is dropped rather than reflected into
 //  anything.
 //
 
@@ -19,6 +19,9 @@ import Foundation
 import WebRTC
 
 /// What a running call tells the application about.
+///
+/// Everything is reported on the call's own queue, never on WebRTC's thread: a call that ended itself
+/// from a report would otherwise close the connection that is reporting to it.
 public protocol VoiceCallObserver: AnyObject {
     /// The connection's own state changed.
     func voiceCall(_ call: VoiceCall, connectionChanged state: RTCPeerConnectionState)
@@ -30,8 +33,9 @@ public protocol VoiceCallObserver: AnyObject {
 
 /// One native voice call.
 ///
-/// It owns exactly three things: the peer connection, the local microphone track, and the remote
-/// audio track the provider sends. Everything about *who* is on the other end — the broker, the
+/// It owns exactly four things: the peer connection, the local microphone track, the remote audio
+/// track the provider sends, and the one channel the provider writes its events to. Everything about
+/// *who* is on the other end — the broker, the
 /// account, the control socket — is outside it, which is what keeps the provider interface modular
 /// in §15 ¶1's sense: a different provider replaces the signalling around this object and replaces
 /// nothing inside it.
@@ -48,8 +52,8 @@ public final class VoiceCall: NSObject {
 
     /// The longest the offer waits for candidate gathering to report itself done, in seconds.
     ///
-    /// Gathering is continual, and nothing promises it ever reports done, so the wait is bounded: a
-    /// device that has gathered nothing by then offers what it has.
+    /// Gathering is continual, and WebRTC does not report continual gathering done, so in practice
+    /// every offer waits the whole bound and then offers the candidates it has.
     static let gatheringBound: TimeInterval = 3
 
     /// Shared across calls, because building one is expensive and it holds the audio device.
@@ -109,7 +113,8 @@ public final class VoiceCall: NSObject {
     /// process's audio before anything it does can reach it, and a second call, while one holds it,
     /// is refused without touching the first.
     ///
-    /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio.
+    /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio, and
+    ///   ``VoiceAudioError/eventChannelNotOpened`` when the provider's channel cannot be made.
     public convenience init(observer: VoiceCallObserver) throws {
         try self.init(observer: observer, gathering: IceGatheringWait())
     }
@@ -130,8 +135,8 @@ public final class VoiceCall: NSObject {
 
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: nil,
-            // The one place the caller could have asked for a data channel of its own. It does
-            // not: §15 ¶6 makes the provider's channel read-only and this end creates none.
+            // No constraint asks for a data channel of its own: §15 ¶6 makes the provider's channel
+            // read-only, and the one channel this end makes is the provider's, made below.
             optionalConstraints: nil
         )
         guard
@@ -230,7 +235,9 @@ public final class VoiceCall: NSObject {
     /// or not anything else happened.
     ///
     /// - Returns: false, and the call ended, when the moment has passed or the audio session was
-    ///   refused; false and nothing changed when this call is stopped or already permitted.
+    ///   refused; false and nothing changed when this call is stopped or already permitted, or when
+    ///   the provider's answer to the offer is not applied yet: the owner asks again once
+    ///   ``accept(answerSdp:)`` has returned, or stops the call.
     public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
         control.permit(voiceSessionId: voiceSessionId, closesAtEpochMs: closesAtEpochMs)
     }
@@ -243,7 +250,8 @@ public final class VoiceCall: NSObject {
     /// Section 15 ¶3: the client creates the offer. The host forwards it and never generates one.
     /// The offer is returned after the first round of candidate gathering, or after
     /// ``gatheringBound``, so that it names the addresses this device can be reached at: the
-    /// provider is answered once, and a candidate found later is not sent.
+    /// provider is answered once, and a candidate found later is not sent. A call that ends before
+    /// the offer is complete makes none: this throws ``VoiceAudioError/callEnded``.
     public func offer() async throws -> String {
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
@@ -256,6 +264,8 @@ public final class VoiceCall: NSObject {
             let description = try await connection.offer(for: constraints)
             try await connection.setLocalDescription(description)
             await gathering.wait(upTo: VoiceCall.gatheringBound)
+            // The wait ends with the call, and an offer for a call that ended would be sent on.
+            guard !control.isStopped else { throw VoiceAudioError.callEnded }
             return connection.localDescription?.sdp ?? description.sdp
         } catch {
             // A call that cannot make its offer has nothing to wait for, and gives the audio back.
@@ -327,8 +337,12 @@ public final class VoiceCall: NSObject {
         func publish(_ state: VoiceCaptureState) { AudioSession.shared.publish(state, for: call) }
 
         func ended() {
+            // An offer still waiting for candidates has nothing left to wait for.
+            call.gathering.finish()
             call.watchRecorder(false)
             call.connection.close()
+            call.events?.delegate = nil
+            call.events = nil
             AudioSession.shared.release(call)
         }
     }
@@ -379,7 +393,10 @@ extension VoiceCall: RTCPeerConnectionDelegate {
         _: RTCPeerConnection,
         didChange state: RTCPeerConnectionState
     ) {
-        observer?.voiceCall(self, connectionChanged: state)
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.observer?.voiceCall(self, connectionChanged: state)
+        }
     }
 
     public func peerConnection(_: RTCPeerConnection, didAdd receiver: RTCRtpReceiver, streams _: [RTCMediaStream]) {
@@ -388,7 +405,10 @@ extension VoiceCall: RTCPeerConnectionDelegate {
         queue.async { [weak self] in self?.control.refresh() }
         guard !announcedFirstAudio else { return }
         announcedFirstAudio = true
-        observer?.voiceCallReceivedFirstAudio(self)
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.observer?.voiceCallReceivedFirstAudio(self)
+        }
     }
 
     public func peerConnection(_: RTCPeerConnection, didOpen channel: RTCDataChannel) {
@@ -414,7 +434,11 @@ extension VoiceCall: RTCDataChannelDelegate {
     public func dataChannel(_: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
         // Handed up as bytes. What is a known event and what is not is decided by the frozen
         // provider profile, one level above this file, and an unknown one is dropped there.
-        observer?.voiceCall(self, receivedProviderEvent: buffer.data)
+        let data = buffer.data
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.observer?.voiceCall(self, receivedProviderEvent: data)
+        }
     }
 }
 
@@ -431,17 +455,17 @@ protocol GatheringWait: AnyObject {
 final class IceGatheringWait: GatheringWait {
     private let lock = NSLock()
     private var done = false
-    private var waiting: CheckedContinuation<Void, Never>?
+    private var waiting: [CheckedContinuation<Void, Never>] = []
 
-    /// Gathering reported itself done, or the bound passed. Any number of times; the waiter is
-    /// resumed once.
+    /// Gathering reported itself done, the bound passed or the call ended. Any number of times;
+    /// each waiter is resumed once.
     func finish() {
         lock.lock()
         done = true
-        let waiter = waiting
-        waiting = nil
+        let waiters = waiting
+        waiting = []
         lock.unlock()
-        waiter?.resume()
+        waiters.forEach { $0.resume() }
     }
 
     /// Returns when gathering is done, which may be before this is called, and at the latest after
@@ -454,7 +478,7 @@ final class IceGatheringWait: GatheringWait {
                 continuation.resume()
                 return
             }
-            waiting = continuation
+            waiting.append(continuation)
             lock.unlock()
             DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [weak self] in
                 self?.finish()

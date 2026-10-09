@@ -43,15 +43,17 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * Section 15 paragraph 6 is the other constraint: the provider's data channel is read-only. This
  * connection creates the one channel the provider's protocol names, `oai-events`, before it makes
- * the offer, because the offer has to describe it and the provider writes to it, and it sends zero
- * bytes on that channel or on any other.
+ * the offer, because the offer has to describe it and the provider writes to it, and this class
+ * writes nothing to that channel or to any other.
  *
  * Every decision about the microphone is [VoiceCallControl]'s; this class carries them out. The
  * platform's recorder is held off from the moment the connection exists, before anything is
  * negotiated, so applying an answer starts nothing on its own. The control turns it on only for a
  * call the host permitted whose foreground service holds the foreground, and every frame the
  * recorder produces is asked about separately and silenced unless the control says it may be
- * carried. Timers and the platform's reports run on this call's own thread, never the main one.
+ * carried. Timers and the platform's reports run on this call's own thread, never the main one, and
+ * so does everything the [Observer] is told: no observer code runs on WebRTC's own thread, where a
+ * call that ended itself from a callback would dispose the connection that is calling it.
  */
 class VoiceCall private constructor(
     private val context: Context,
@@ -61,7 +63,7 @@ class VoiceCall private constructor(
     /** How the offer waits for the first round of candidate gathering. */
     private val gathering: GatheringWait,
 ) {
-    /** What a running call tells the application about. */
+    /** What a running call tells the application about, on the call's own thread. */
     interface Observer {
         /** The microphone's state changed, for the screen and for the authority gate. */
         fun onCaptureState(state: VoiceCaptureState)
@@ -85,6 +87,13 @@ class VoiceCall private constructor(
 
     /** The provider's events channel, which this end creates before the offer and only reads. */
     private var events: DataChannel? = null
+
+    /**
+     * Channels the provider opened itself, which are read the same way. Guarded by its own lock,
+     * not [lock]: they arrive on WebRTC's thread, which must never wait for [lock].
+     */
+    private val providerChannels = mutableListOf<DataChannel>()
+    private var acceptingChannels = true
 
     /** Whether the provider's answer to the offer has been applied, and what it was read to say. */
     @Volatile
@@ -195,8 +204,8 @@ class VoiceCall private constructor(
         /**
          * The longest the offer waits for candidate gathering to report itself done, in seconds.
          *
-         * Gathering is continual, and nothing promises it ever reports done, so the wait is
-         * bounded: a device that has gathered nothing by then offers what it has.
+         * Gathering is continual, and WebRTC does not report continual gathering done, so in
+         * practice every offer waits the whole bound and then offers the candidates it has.
          */
         const val GATHERING_BOUND_SECONDS = 3L
 
@@ -280,7 +289,9 @@ class VoiceCall private constructor(
      * for the service to hold the foreground and then for the recorder itself to report running.
      *
      * @return false, and the call ended, when the moment has passed or the platform refused focus
-     * or the service; false and nothing changed when this call is stopped or already permitted.
+     * or the service; false and nothing changed when this call is stopped or already permitted, or
+     * when the provider's answer to the offer is not applied yet: the owner asks again once
+     * [accept] has returned, or stops the call.
      */
     fun permit(voiceSessionId: String, closesAtEpochMs: Long): Boolean =
         control.permit(voiceSessionId, closesAtEpochMs)
@@ -301,18 +312,22 @@ class VoiceCall private constructor(
      * Section 15 paragraph 3: the client creates the offer. The host forwards it and never
      * generates one. The offer is returned after the first round of candidate gathering, or after
      * [GATHERING_BOUND_SECONDS], so that it names the addresses this device can be reached at: the
-     * provider is answered once, and a candidate found later is not sent.
+     * provider is answered once, and a candidate found later is not sent. A call that ends before
+     * the offer is complete makes none: this throws [IllegalStateException].
      */
     fun offer(): String {
         val constraints = MediaConstraints().apply {
             mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
             mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
         }
-        val open = openConnection()
-        val made = awaitDescription { observer -> open.createOffer(observer, constraints) }
-        awaitSet { observer -> open.setLocalDescription(observer, made) }
+        val made = awaitDescription { observer ->
+            onOpenConnection { it.createOffer(observer, constraints) }
+        }
+        awaitSet { observer -> onOpenConnection { it.setLocalDescription(observer, made) } }
         gathering.await(GATHERING_BOUND_SECONDS)
-        return open.localDescription?.description ?: made.description
+        // Read through the connection only while the call cannot end under the read, and only if it
+        // has not: a connection disposed during the wait is freed memory.
+        return onOpenConnection { it.localDescription?.description } ?: made.description
     }
 
     /**
@@ -321,17 +336,23 @@ class VoiceCall private constructor(
      */
     fun accept(answerSdp: String) {
         val answer = SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
-        val open = openConnection()
-        awaitSet { observer -> open.setRemoteDescription(observer, answer) }
+        awaitSet { observer -> onOpenConnection { it.setRemoteDescription(observer, answer) } }
         answerDtx = VoiceAnswer.usesDtx(answerSdp)
         answerApplied = true
     }
 
-    /** The connection, when the call is still open. */
-    private fun openConnection(): PeerConnection =
+    /**
+     * Runs `use` on the connection while the call cannot end under it, or throws when it has ended.
+     *
+     * The connection is disposed when the call ends, after the lock that this holds, so a call made
+     * through it here reaches live memory. Nothing that runs on WebRTC's thread waits for the lock,
+     * which keeps a call into the connection that waits for that thread from waiting for it.
+     */
+    private fun <T> onOpenConnection(use: (PeerConnection) -> T): T =
         synchronized(lock) {
-            connection.takeIf { !control.isStopped }
+            val open = connection.takeIf { !control.isStopped }
                 ?: throw IllegalStateException("this voice call has ended")
+            use(open)
         }
 
     /**
@@ -446,6 +467,8 @@ class VoiceCall private constructor(
         }
 
         override fun ended() {
+            // An offer still waiting for candidates has nothing left to wait for.
+            gathering.finish()
             val (open, callback) = synchronized(lock) {
                 val held = connection to routeCallback
                 connection = null
@@ -453,7 +476,11 @@ class VoiceCall private constructor(
                 routeCallback = null
                 held
             }
-            events?.also {
+            val channels = synchronized(providerChannels) {
+                acceptingChannels = false
+                providerChannels.toList().also { providerChannels.clear() }
+            }
+            (listOfNotNull(events) + channels).forEach {
                 it.unregisterObserver()
                 it.dispose()
             }
@@ -503,16 +530,25 @@ class VoiceCall private constructor(
             override fun onMessage(buffer: DataChannel.Buffer) {
                 val bytes = ByteArray(buffer.data.remaining())
                 (buffer.data as ByteBuffer).get(bytes)
-                // Handed up as bytes. What is a known event is decided by the frozen provider
-                // profile, one level above this file, and an unknown one is dropped there.
-                observer.onProviderEvent(bytes)
+                // Handed up as bytes, on the call's own thread. What is a known event is decided
+                // by the frozen provider profile, one level above this file, and an unknown one is
+                // dropped there.
+                handler.post { observer.onProviderEvent(bytes) }
             }
         })
     }
 
     private inner class PeerObserver : PeerConnection.Observer {
-        // A channel the provider opened. This end reads it and never writes to it.
-        override fun onDataChannel(channel: DataChannel) = readOnly(channel)
+        // A channel the provider opened. This end reads it and never writes to it, and gives it
+        // back with the call.
+        override fun onDataChannel(channel: DataChannel) {
+            readOnly(channel)
+            val kept = synchronized(providerChannels) { acceptingChannels && providerChannels.add(channel) }
+            if (!kept) {
+                channel.unregisterObserver()
+                channel.dispose()
+            }
+        }
 
         override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {
             if (receiver.track() !is AudioTrack) return
@@ -520,7 +556,7 @@ class VoiceCall private constructor(
             handler.post { control.refresh() }
             if (announcedFirstAudio) return
             announcedFirstAudio = true
-            observer.onFirstAudio()
+            handler.post { observer.onFirstAudio() }
         }
 
         override fun onSignalingChange(state: PeerConnection.SignalingState) {}
