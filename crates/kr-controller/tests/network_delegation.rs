@@ -445,8 +445,7 @@ async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes
 
 /// KR-REQ-23.49 and 26.15: a delegation hands on no right this host's configuration removes from
 /// the grant it is made from. A delegation of viewing from a share whose viewing the configuration
-/// removed is refused, before the session is asked for any text of it; the same delegation under a
-/// ceiling that keeps viewing is written.
+/// removed is refused; the same delegation under a ceiling that keeps viewing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_49_a_delegation_hands_on_no_right_the_configuration_removed() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -492,8 +491,8 @@ async fn kr_req_23_49_a_delegation_hands_on_no_right_the_configuration_removed()
         .expect_err("viewing is outside the ceiling, so it is not delegated");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(
-        refused.message.contains("configuration"),
-        "the refusal says the configuration removed it: {refused:?}"
+        refused.message.contains("policy removes"),
+        "the refusal says this host's policy removed it: {refused:?}"
     );
     assert_eq!(
         host.controller()

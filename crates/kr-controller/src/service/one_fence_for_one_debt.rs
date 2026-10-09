@@ -27,7 +27,7 @@ async fn two_settlements_of_one_debt_fence_once() {
         tokio::spawn(async move {
             let own = controller.publish_debts(&[(debt, super::Reach::Host)]);
             controller
-                .complete_revocation(Audience::Host, [withdrawn].into_iter().collect(), own)
+                .complete_revocation(Audience::Host, None, [withdrawn].into_iter().collect(), own)
                 .await
                 .map(|result| result.authority_revision)
         })
