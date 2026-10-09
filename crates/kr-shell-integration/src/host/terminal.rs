@@ -224,23 +224,13 @@ pub fn save_preference(
         .map_err(SaveRefused::Barred)?;
     let file = state_dir.join(PREFERENCE_FILE);
     if std::fs::symlink_metadata(&file).is_ok_and(|about| about.file_type().is_file()) {
-        let bytes = kr_ipc::paths::read_owner_only_file(&file, PREFERENCE_MAX_LEN)
-            .map_err(SaveRefused::Store)?;
-        if let Some(bytes) = bytes {
-            let read = serde_json::from_slice::<
-                std::collections::BTreeMap<String, serde_json::Value>,
-            >(&bytes)
-            .ok();
-            let readable = read.is_some_and(|members| {
-                members.get(PREFERENCE_VERSION_KEY).is_none_or(|stated| {
-                    stated
-                        .as_u64()
-                        .is_some_and(|stated| stated <= PREFERENCE_VERSION)
-                })
-            });
-            if !readable {
-                return Err(SaveRefused::NotOurs);
-            }
+        // A file that cannot be read, or is not a preference this build reads, is not replaced.
+        let readable = kr_ipc::paths::read_owner_only_file(&file, PREFERENCE_MAX_LEN)
+            .ok()
+            .flatten()
+            .is_some_and(|bytes| parse_preference(&bytes).is_some());
+        if !readable {
+            return Err(SaveRefused::NotOurs);
         }
     }
     kr_ipc::paths::write_owner_only_file(&file, preference_document(chosen).as_bytes())
@@ -843,6 +833,9 @@ mod tests {
         for unreadable in [
             br#"{"terminal": "iterm2", "version": 2}"#.to_vec(),
             br#"{"terminal": "iterm2", "version": "one"}"#.to_vec(),
+            br#"{"terminal": 7, "version": 1}"#.to_vec(),
+            br#"{"version": 1}"#.to_vec(),
+            b"{}".to_vec(),
             b"not a document".to_vec(),
         ] {
             kr_ipc::paths::write_owner_only_file(&file, &unreadable).expect("planted");
