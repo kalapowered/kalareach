@@ -139,10 +139,10 @@
           "member": "version",
           "absent": 1
         },
-        "version": 2,
+        "version": 3,
         "migrates_from": 1
       },
-      "digest": "3ab5cb547eb0cc1a0de8e94452f5094b985c5fe86b8d564ceb55cdad3b0761e6",
+      "digest": "8f38c3829d54913a513c16f9ee87f9aa7999a780731e6cda25d0baed1f65da02",
       "kept": [
         "ConfigurationDocument"
       ]

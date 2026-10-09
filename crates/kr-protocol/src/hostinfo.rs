@@ -1331,7 +1331,7 @@ impl ComposedBundle {
 ///
 /// ```json
 /// {
-///   "version": 2,
+///   "version": 3,
 ///   "revision": 3,
 ///   "preferences": { "sleep_inhibition": "mains_only" },
 ///   "profiles": { "review": { "worker_profile": "headless_user" } },
@@ -1657,18 +1657,19 @@ pub mod configuration {
 
     /// The version this build writes.
     ///
-    /// Version 2 is where the managed storage service's selection arrived (`storage`). A release
-    /// that reads version 1 only refuses a document with a section it does not know, so the version
-    /// rose with the section, and a switch back to such a release is refused while the document is
-    /// at 2.
-    pub const VERSION: u64 = 2;
+    /// Version 2 is where the managed storage service's selection arrived (`storage`), and version
+    /// 3 where the authority feed's did (`authority`). A release that reads an earlier version only
+    /// refuses a document with a section it does not know, so the version rose with each section,
+    /// and a switch back to such a release is refused while the document is at the later version.
+    pub const VERSION: u64 = 3;
 
     /// The oldest version this build reads and brings forward.
     ///
-    /// A document at version 1 has no `storage` section, which reads as a selection of none; it is
-    /// read as a document at [`VERSION`], and the next edit writes it at that version. The file is
-    /// not rewritten by anything else, so a document its owner never edits stays at version 1, and
-    /// so does the copy of it that the registry holds until the next acceptance.
+    /// A document at version 1 or 2 lacks the `storage` section or the `authority` section, which
+    /// read as a selection of none; it is read as a document at [`VERSION`], and the next edit
+    /// writes it at that version. The file is not rewritten by anything else, so a document its
+    /// owner never edits stays at its version, and so does the copy of it that the registry holds
+    /// until the next acceptance.
     ///
     /// Raise this, and remove the step in [`load`] that brings an earlier document forward, once no
     /// supported upgrade starts from a document at version 1. A release that does so refuses a

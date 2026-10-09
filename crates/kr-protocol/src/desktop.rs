@@ -1067,7 +1067,7 @@ mod tests {
             b"not a document".as_slice(),
             br#"{"preferences": {"sleep_inhibition": "always"}}"#.as_slice(),
             br#"{"preferences": {"sleep_inhibition": true}}"#.as_slice(),
-            br#"{"version": 3, "preferences": {"sleep_inhibition": "battery_too"}}"#.as_slice(),
+            br#"{"version": 4, "preferences": {"sleep_inhibition": "battery_too"}}"#.as_slice(),
         ] {
             let loaded = configuration::load(Some(damaged));
             assert_eq!(
