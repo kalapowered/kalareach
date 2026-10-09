@@ -2085,7 +2085,8 @@ fn a_released_announcement_keeps_the_time_it_was_decided() {
 
 /// A store written under the schema before the time of decision was kept is brought forward once,
 /// as it opens: every item it holds is given the time of its last announcement, and the store
-/// records the schema it now is. One older than that is refused, as any store of another schema is.
+/// records the schema it now is. So is one written under the schema after that, which differs in no
+/// table. One older than that is refused, as any store of another schema is.
 #[test]
 fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
     let directory = tempfile::tempdir().expect("a temporary directory");
@@ -2128,7 +2129,21 @@ fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
         .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
         .expect("a version");
     assert_eq!(version, kr_attention::store::SCHEMA_VERSION);
-    // The next open reads it as it is, and one older than the previous is refused.
+    // A store from the build before the approvals source was read has the tables of this one and
+    // is brought forward the same way, keeping what it holds.
+    raw.execute("UPDATE attention_schema SET version = 10", [])
+        .expect("the schema before the approvals source");
+    drop(raw);
+    let attention =
+        Attention::open(&path, reading(2_500), &opener()).expect("the previous schema opens");
+    assert_eq!(only_item(&attention).decided_at_ms, announced);
+    drop(attention);
+    let raw = rusqlite::Connection::open(&path).expect("the file opens");
+    let version: i64 = raw
+        .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+        .expect("a version");
+    assert_eq!(version, kr_attention::store::SCHEMA_VERSION);
+    // The next open reads it as it is, and one older than the oldest is refused.
     raw.execute("UPDATE attention_schema SET version = 8", [])
         .expect("an older schema");
     drop(raw);
