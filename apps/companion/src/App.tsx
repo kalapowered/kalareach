@@ -34,7 +34,7 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
 
 /** The application. */
 export function App(): ReactNode {
-  const { place, go, toast, dismissToast, port, say } = useApp()
+  const { place, go, toast, dismissToast, port, say, rememberRights } = useApp()
   const confirmations = useConfirmations()
   const waiting = confirmations?.requests.length ?? 0
   // Where the connection stands, as its first answer or a change since said it: null until then,
@@ -66,6 +66,7 @@ export function App(): ReactNode {
         (listener) => port.onConnection(listener),
         () => port.connectionState(),
         (state) => {
+          if (state.connected && state.rights !== null) rememberRights(state.rights)
           setConnection({
             connected: state.connected,
             reason: state.reason,
@@ -77,7 +78,7 @@ export function App(): ReactNode {
           setConnection({ connected: false, reason: failureMessage(failure), rights: null })
         }
       ),
-    [port]
+    [port, rememberRights]
   )
 
   // The last input device decides whether anything animates. A keyboard-driven change is instant;

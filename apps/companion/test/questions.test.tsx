@@ -14,6 +14,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
+import type { HostPort } from '../src/host/port'
 import { QUESTION_CONFIRM, QUESTION_SELECT } from '../src/host/fake-questions'
 
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
@@ -53,7 +54,41 @@ describe('who asked, and what', () => {
   })
 })
 
-describe('answering on a completed press (KR-REQ-13.07, 11.60)', () => {
+describe('the inbox lists a session’s questions once', () => {
+  it('shows one panel of questions for a session, however many rows the host raised for them', async () => {
+    const { port } = fakeHost()
+    // The host raises a row for each question, and another for the same question when it has waited
+    // for a while: two rows, one session.
+    const doubled: HostPort = {
+      ...port,
+      attentionRead: async (params) => {
+        const read = await port.attentionRead(params)
+        const asked = read.items.find((item) => item.rule === 'attention.pending_input')
+        if (asked === undefined) return read
+        return {
+          ...read,
+          items: [
+            ...read.items,
+            { ...asked, key: `${asked.key}|idle`, rule: 'attention.input_idle_reminder' as const }
+          ]
+        }
+      }
+    }
+    render(
+      <AppProvider port={doubled}>
+        <App />
+      </AppProvider>
+    )
+    await questionAbout(WHICH_BRANCH)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('attention-pending_decision').length).toBeGreaterThan(1)
+    })
+    expect(screen.getAllByTestId('questions')).toHaveLength(1)
+    expect(screen.getAllByRole('radio', { name: 'main' })).toHaveLength(1)
+  })
+})
+
+describe('answering on a completed press (KR-REQ-13.07)', () => {
   it('sends nothing on pointer-down, and one answer naming the revision shown on the release', async () => {
     const { controls } = start()
     const question = await questionAbout(WHICH_BRANCH)
@@ -123,7 +158,7 @@ describe('answering on a completed press (KR-REQ-13.07, 11.60)', () => {
 })
 
 describe('a question that changed or ended while a person was answering', () => {
-  it('keeps what was typed when another device answered first, and says so', async () => {
+  it('keeps what was chosen when another device answered first, without a press, and says so', async () => {
     const { controls } = start()
     const question = await questionAbout(WHICH_BRANCH)
     const person = userEvent.setup()
@@ -131,16 +166,31 @@ describe('a question that changed or ended while a person was answering', () => 
     act(() => {
       controls.questions.answerElsewhere(QUESTION_SELECT)
     })
-    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
-    // The worker no longer lists the question, and the page keeps what it was and what was chosen.
-    const closed = await screen.findByTestId('question-ended')
+    // The next read stops listing the question. Its form must not go with it: the page says how it
+    // ended and what had been chosen, whether or not the person pressed Send first.
+    const closed = await screen.findByTestId('question-ended', undefined, { timeout: 20_000 })
     expect(within(closed).getByTestId('question-refusal')).toHaveTextContent(
-      'already answered or withdrawn'
+      'answered by someone else'
     )
     expect(closed).toHaveTextContent('You had chosen “main”.')
     expect(controls.questions.sent).toHaveLength(0)
     await person.click(within(closed).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByTestId('question-ended')).toBeNull()
+  })
+
+  it('says the same when the press comes after the question has gone', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    const send = within(question).getByRole('button', { name: 'Send answer' })
+    act(() => {
+      controls.questions.answerElsewhere(QUESTION_SELECT)
+    })
+    await person.click(send)
+    const closed = await screen.findByTestId('question-ended', undefined, { timeout: 20_000 })
+    expect(closed).toHaveTextContent('You had chosen “main”.')
+    expect(controls.questions.sent).toHaveLength(0)
   })
 
   it('does not answer a revised question until the person has seen it', async () => {
@@ -185,22 +235,22 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     const question = await questionAbout(WHICH_BRANCH)
     const person = userEvent.setup()
     await person.click(within(question).getByRole('radio', { name: 'main' }))
-    // Contact goes while the form is open: the last rights this device was told still hold, so
-    // the answer can still be given, and the host checks them again when it is sent.
+    // The session's worker goes while the form is open: the last rights this device was told still
+    // hold, so the answer can still be given, and the host checks them again when it is sent.
     act(() => {
-      controls.setConnected(false)
+      controls.questions.setReachable(false)
     })
     await person.click(within(question).getByRole('button', { name: 'Send answer' }))
     expect(
-      await screen.findByText(/Your answer is kept on this device, and it is sent again only if you send it/)
+      await screen.findByText(/A copy of your answer is kept on this device, and it is sent again only if you send it/)
     ).toBeInTheDocument()
     const kept = await screen.findByTestId('kept-answer')
-    expect(kept).toHaveTextContent('Kept on this device')
+    expect(kept).toHaveTextContent('Answers kept on this device')
     expect(controls.questions.sent).toHaveLength(0)
 
     // Contact is back. Nothing is sent: the answer is offered, and the person sends it.
     act(() => {
-      controls.setConnected(true)
+      controls.questions.setReachable(true)
     })
     await waitFor(() => {
       expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'offered')
@@ -220,20 +270,35 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     })
   })
 
+  it('is taken by the worker when only the connection to the daemon is lost', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    // The worker has a link of its own: the answer reaches it, and it is recorded.
+    act(() => {
+      controls.setConnected(false)
+    })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    expect(await screen.findByText('Your answer was recorded.')).toBeInTheDocument()
+    expect(controls.questions.sent).toHaveLength(1)
+    expect(screen.queryByTestId('kept-answer')).toBeNull()
+  })
+
   it('stays kept, with what became of the question, when the question ended meanwhile', async () => {
     const { controls } = start()
     const question = await questionAbout(PUSH_ANYWAY)
     const person = userEvent.setup()
     await person.click(within(question).getByRole('radio', { name: 'Yes' }))
     act(() => {
-      controls.setConnected(false)
+      controls.questions.setReachable(false)
     })
     await person.click(within(question).getByRole('button', { name: 'Send answer' }))
     await screen.findByTestId('kept-answer')
 
     act(() => {
       controls.questions.expire(QUESTION_CONFIRM)
-      controls.setConnected(true)
+      controls.questions.setReachable(true)
     })
     await waitFor(() => {
       expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'ended')

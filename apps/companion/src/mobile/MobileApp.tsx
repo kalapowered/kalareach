@@ -95,7 +95,7 @@ export function MobileApp({
   readonly build?: MobileBuild
   readonly storage?: Storage | null
 }): ReactNode {
-  const { port, toast, dismissToast } = useApp()
+  const { port, toast, dismissToast, rememberRights } = useApp()
   const resolved =
     surface ??
     detectSurface(
@@ -151,6 +151,7 @@ export function MobileApp({
         (listener) => port.onConnection(listener),
         () => port.connectionState(),
         (state) => {
+          if (state.connected && state.rights !== null) rememberRights(state.rights)
           setConnection({
             connected: state.connected,
             environmentId: state.environment_id,
@@ -167,7 +168,7 @@ export function MobileApp({
           })
         }
       ),
-    [port]
+    [port, rememberRights]
   )
 
   const destinations = useMemo<readonly Destination[]>(

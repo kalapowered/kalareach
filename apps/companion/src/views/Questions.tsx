@@ -35,11 +35,14 @@ import {
   answerOf,
   answerWords,
   askerOf,
+  endedWords,
   expiryWords,
+  holdsSomething,
   listedChoices,
   offersSomethingElse,
   refusalWords,
   standingWords,
+  typedWords,
   type Form
 } from '../model/questions'
 
@@ -95,6 +98,16 @@ export function QuestionRequests({
   const [closed, setClosed] = useState<Readonly<Record<string, Closed>>>({})
   const reads = useRef<Watch | null>(null)
   const again = useRef<() => void>(() => undefined)
+  // What the last read listed, and what the person had typed, as the read that follows sees them: a
+  // question that stops being listed with an answer half made in it is not lost with its form.
+  const listed = useRef<readonly Question[]>([])
+  const typed = useRef<Readonly<Record<string, Form>>>({})
+  useEffect(() => {
+    typed.current = forms
+  }, [forms])
+  // The questions this person has answered here: they stop being listed because they were answered,
+  // and the form that made the answer is not one to keep.
+  const answeredHere = useRef(new Set<string>())
 
   const load = useCallback((): Promise<void> => {
     const current = reads.current?.read() ?? null
@@ -102,8 +115,38 @@ export function QuestionRequests({
     return ask(() => port.questionRead({ session_id: sessionId, question_id: null, include_resolved: false }))
       .then((result) => {
         if (!current()) return
+        const before = listed.current
+        listed.current = result.questions
         setWaiting({ visit, questions: result.questions, atMs: Date.now() })
         setFailure(null)
+        for (const gone of before) {
+          if (result.questions.some((each) => each.question_id === gone.question_id)) continue
+          if (answeredHere.current.has(gone.question_id)) continue
+          const form = typed.current[gone.question_id]
+          if (form === undefined || !holdsSomething(form)) continue
+          // Another device answered it, or it expired or was withdrawn: say how it ended, with
+          // what the person had chosen, and keep that until they dismiss it.
+          void ask(() =>
+            port.questionRead({
+              session_id: sessionId,
+              question_id: gone.question_id,
+              include_resolved: true
+            })
+          )
+            .catch(() => undefined)
+            .then((final) => {
+              const ended = final?.questions.find((each) => each.question_id === gone.question_id)
+              setClosed((held) => ({
+                ...held,
+                [gone.question_id]: {
+                  question: ended ?? gone,
+                  words: ended === undefined ? 'This question is no longer waiting.' : endedWords(ended),
+                  chosen: typedWords(gone, form)
+                }
+              }))
+              setForms((held) => without(held, gone.question_id))
+            })
+        }
       })
       .catch((error: unknown) => {
         if (!current()) return
@@ -171,6 +214,7 @@ export function QuestionRequests({
       })
     )
       .then((outcome) => {
+        answeredHere.current.add(question.question_id)
         setForms((current) => without(current, question.question_id))
         if (outcome.outcome === 'taken') {
           say(
@@ -180,7 +224,7 @@ export function QuestionRequests({
           )
         } else {
           say(
-            'The host did not confirm that. Your answer is kept on this device, and it is sent again only if you send it.',
+            'The host did not confirm that. A copy of your answer is kept on this device, and it is sent again only if you send it.',
             'pending'
           )
         }
@@ -234,7 +278,7 @@ export function QuestionRequests({
         <Banner
           tone="warning"
           title="These questions were last read some time ago"
-          detail={`${refusal} An answer you give now is kept on this device until you send it.`}
+          detail={`${refusal} If the host does not confirm an answer you give now, this device keeps a copy, and sends it again only if you send it.`}
           action={<Button onClick={readAgain}>Try again</Button>}
         />
       ) : null}
@@ -257,9 +301,7 @@ export function QuestionRequests({
             <p className="eyebrow">Waiting for your answer</p>
             <p className="small muted" data-testid="question-asker">
               Asked by{' '}
-              <strong title={asker.path ?? undefined}>
-                {asker.executable ?? 'a program the host could not name'}
-              </strong>{' '}
+              <strong>{asker.executable ?? 'a program the host could not name'}</strong>{' '}
               ({asker.process})
               {asker.label !== null ? (
                 <>
@@ -268,6 +310,11 @@ export function QuestionRequests({
                 </>
               ) : null}
             </p>
+            {asker.path !== null ? (
+              <p className="small faint question-path" data-testid="question-asker-path">
+                {asker.path}
+              </p>
+            ) : null}
             <h3 data-testid="question-text">{question.question}</h3>
             {question.context.length > 0 ? (
               <p className="small muted question-context" data-testid="question-context">
@@ -404,16 +451,20 @@ export function QuestionRequests({
 function KeptRow({
   kept,
   settled,
+  where,
   busy,
   onSend,
   onDismiss
 }: {
   readonly kept: KeptAnswer
   readonly settled: SettledAnswer | null
+  /** The session it was given in, as a person names it, or null when it cannot be named now. */
+  readonly where: string | null
   readonly busy: boolean
   readonly onSend: () => void
   readonly onDismiss: () => void
 }): ReactNode {
+  const question = settled?.question ?? null
   return (
     <article
       className="question kept"
@@ -421,14 +472,23 @@ function KeptRow({
       data-standing={settled?.standing ?? 'unchecked'}
       data-testid="kept-answer"
     >
-      <p className="eyebrow">Kept on this device</p>
+      <p className="eyebrow">Answers kept on this device</p>
+      <p className="small muted" data-testid="kept-answer-where">
+        {where ?? 'A session this device cannot name now'}
+      </p>
+      {question !== null ? (
+        <p data-testid="kept-answer-question">
+          The question: <strong>{question.question}</strong>
+        </p>
+      ) : null}
       <p data-testid="kept-answer-text">
-        You answered {answerWords(kept.answer)} to a question in this session, and the host did not
-        confirm it took the answer. It is kept here.
+        You answered {answerWords(kept.answer, question ?? undefined)}
+        {question === null ? ' to a question in this session' : ''}, and the host did not confirm it
+        took the answer. A copy is kept here.
       </p>
       <p className="small muted" data-testid="kept-answer-standing">
         {settled === null
-          ? 'This session has not been checked since. Nothing has been sent.'
+          ? 'This session has not been checked since. This device has sent nothing since.'
           : standingWords(settled)}
       </p>
       <div className="row wrap">
@@ -437,9 +497,14 @@ function KeptRow({
             Send it now
           </CommitButton>
         ) : null}
-        <Button tone="quiet" data-testid="kept-answer-dismiss" disabled={busy} onClick={onDismiss}>
+        <CommitButton
+          tone="quiet"
+          data-testid="kept-answer-dismiss"
+          disabled={busy}
+          onCommit={onDismiss}
+        >
           Discard
-        </Button>
+        </CommitButton>
       </div>
     </article>
   )
@@ -448,13 +513,17 @@ function KeptRow({
 /**
  * The answers kept on this device, for one session or for all of them.
  *
- * Listing them needs no host. Where a session can be reached, it is asked where each answer's
- * question stands; where it cannot, they are shown as they are kept, unchecked.
+ * The list needs no host and is shown first. Where a session can be reached, it is asked where each
+ * answer's question stands, and each session's answer is applied when it arrives; where it cannot,
+ * the answers are shown as they are kept, unchecked.
  */
 export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): ReactNode {
   const { port, say, keptVersion, keptChanged } = useApp()
   const [kept, setKept] = useState<readonly KeptAnswer[]>([])
+  const [unreadable, setUnreadable] = useState(0)
+  const [failure, setFailure] = useState<string | null>(null)
   const [settled, setSettled] = useState<ReadonlyMap<string, SettledAnswer>>(new Map())
+  const [named, setNamed] = useState<ReadonlyMap<string, string>>(new Map())
   const [busy, setBusy] = useState<string | null>(null)
   const reads = useRef<Watch | null>(null)
   const again = useRef<() => void>(() => undefined)
@@ -462,31 +531,39 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
   const load = useCallback((): Promise<void> => {
     const current = reads.current?.read() ?? null
     if (current === null) return Promise.resolve()
-    return ask(async () => {
-      const all = (await port.questionKept()).filter(
-        (each) => sessionId === undefined || each.session_id === sessionId
-      )
-      const sessions = [...new Set(all.map((each) => each.session_id))]
-      const standing = new Map<string, SettledAnswer>()
-      await Promise.all(
-        sessions.map(async (session) => {
-          try {
-            for (const each of await port.questionSettle(session)) {
-              standing.set(each.draft.question_id, each)
-            }
-          } catch {
-            // Not checked: a session that cannot be reached says nothing, and nothing is retired.
-          }
-        })
-      )
-      return { all, standing }
-    })
-      .then(({ all, standing }) => {
+    return ask(() => port.questionKept())
+      .then(async (list) => {
         if (!current()) return
+        const all = list.answers.filter(
+          (each) => sessionId === undefined || each.session_id === sessionId
+        )
         setKept(all)
-        setSettled(standing)
+        setUnreadable(list.unreadable)
+        setFailure(null)
+        const here = new Set(all.map((each) => each.question_id))
+        setSettled((held) => new Map([...held].filter(([id]) => here.has(id))))
+        const sessions = [...new Set(all.map((each) => each.session_id))]
+        // Each session's answer is applied as it arrives, so one that does not answer holds nothing.
+        await Promise.all(
+          sessions.map(async (session) => {
+            try {
+              const standing = await port.questionSettle(session)
+              if (!current()) return
+              setSettled((held) => {
+                const next = new Map(held)
+                for (const each of standing) next.set(each.draft.question_id, each)
+                return next
+              })
+            } catch {
+              // Not checked: a session that cannot be reached says nothing, and nothing is retired.
+            }
+          })
+        )
       })
-      .catch(() => undefined)
+      .catch((error: unknown) => {
+        if (!current()) return
+        setFailure(failureMessage(error))
+      })
   }, [port, sessionId])
 
   useEffect(() => {
@@ -507,15 +584,58 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
     again.current()
   }, [keptVersion])
 
-  if (kept.length === 0) return null
+  // The sessions the answers were given in are named when the host can name them. A host out of
+  // reach leaves the names out, and the answers are shown without them.
+  useEffect(() => {
+    if (kept.length === 0) return undefined
+    let current = true
+    ask(() => port.sessionList({ environment_id: null, include_closed: true }))
+      .then((result) => {
+        if (!current) return
+        setNamed(
+          new Map(
+            result.sessions.map((each) => [
+              each.session_id,
+              `Session ${each.display_number} · ${each.cwd}`
+            ])
+          )
+        )
+      })
+      .catch(() => undefined)
+    return () => {
+      current = false
+    }
+  }, [port, kept.length])
+
+  if (kept.length === 0 && unreadable === 0 && failure === null) return null
 
   return (
-    <section className="questions" aria-label="Answers not sent" data-testid="kept-answers">
+    <section
+      className="questions"
+      aria-label="Answers kept on this device"
+      data-testid="kept-answers"
+    >
+      {failure !== null ? (
+        <Banner
+          tone="warning"
+          title="The answers kept on this device could not be read"
+          detail={failure}
+          action={<Button onClick={() => again.current()}>Try again</Button>}
+        />
+      ) : null}
+      {unreadable > 0 ? (
+        <Banner
+          tone="warning"
+          title="Some answers kept on this device could not be read"
+          detail="They are left where they are, and nothing has been done with them."
+        />
+      ) : null}
       {kept.map((each) => (
         <KeptRow
           key={each.question_id}
           kept={each}
           settled={settled.get(each.question_id) ?? null}
+          where={named.get(each.session_id) ?? null}
           busy={busy === each.question_id}
           onSend={() => {
             setBusy(each.question_id)

@@ -151,6 +151,7 @@ export function Attention(): ReactNode {
   // A session's approvals are listed once, under its first approval item, whatever number of items
   // the host raised for them.
   const approvalsShown = new Set<string>()
+  const questionsShown = new Set<string>()
 
   return (
     <>
@@ -213,9 +214,16 @@ export function Attention(): ReactNode {
           {rows.map((row) => {
             const sessionId = row.item.session_id
             const number = sessionId === null ? undefined : numbers.get(sessionId)
+            // A session's approvals, and its questions, are listed once however many rows the host
+            // raised for them: each row is for one request, and a panel lists the session's all.
             const approvals =
-              row.actionable && sessionId !== null && !approvalsShown.has(sessionId)
+              row.item.rule === 'attention.pending_approval' &&
+              sessionId !== null &&
+              !approvalsShown.has(sessionId)
             if (approvals) approvalsShown.add(sessionId)
+            const questions =
+              asksAQuestion(row) && sessionId !== null && !questionsShown.has(sessionId)
+            if (questions) questionsShown.add(sessionId)
             return (
               <li key={row.item.key}>
                 <Card
@@ -244,7 +252,7 @@ export function Attention(): ReactNode {
                     {approvals ? (
                       <ApprovalRequests sessionId={sessionId} onAnswered={readAgain} />
                     ) : null}
-                    {asksAQuestion(row) && sessionId !== null ? (
+                    {questions && sessionId !== null ? (
                       <QuestionRequests sessionId={sessionId} onAnswered={readAgain} />
                     ) : null}
                   </div>

@@ -17,6 +17,8 @@ import {
   type ReactNode
 } from 'react'
 
+import type { ActionRight } from '@kalareach/protocol'
+
 import type { HostPort } from '../host/port'
 import type { ToastAction, ToastMessage } from '../components/ui'
 import { SessionStates, type SessionState } from '../model/sessions'
@@ -42,6 +44,14 @@ interface AppValue {
   readonly port: HostPort
   /** What every session's views share, kept apart from every other session's. */
   readonly sessions: SessionStates
+  /**
+   * The rights the connection last reported, kept while contact is out and for a screen that opens
+   * after it ended. The shell writes it as it hears the connection; a control that only keeps what
+   * a person typed reads it.
+   */
+  readonly lastRights: readonly ActionRight[] | null
+  /** Notes the rights the connection has just reported. */
+  readonly rememberRights: (rights: readonly ActionRight[]) => void
   readonly place: Place
   readonly go: (place: Place) => void
   readonly toast: ToastMessage | null
@@ -92,6 +102,14 @@ export function AppProvider({
   // One store per window, created once. A store built during render would be a different store on
   // every render, and every session's state would go with the old one.
   const [sessions] = useState(() => new SessionStates())
+  const [lastRights, setLastRights] = useState<readonly ActionRight[] | null>(null)
+  const rememberRights = useCallback((rights: readonly ActionRight[]) => {
+    setLastRights((held) =>
+      held !== null && held.length === rights.length && held.every((each, i) => each === rights[i])
+        ? held
+        : rights
+    )
+  }, [])
 
   const say = useCallback(
     (text: string, tone: 'success' | 'danger' | 'pending' = 'success', action?: ToastAction) => {
@@ -151,6 +169,8 @@ export function AppProvider({
     () => ({
       port,
       sessions,
+      lastRights,
+      rememberRights,
       place,
       go,
       toast,
@@ -168,6 +188,8 @@ export function AppProvider({
     [
       port,
       sessions,
+      lastRights,
+      rememberRights,
       place,
       go,
       toast,

@@ -26,7 +26,7 @@ export const ShellRights = createContext<readonly ActionRight[] | null | undefin
 /** The rights the connection holds now, or null while they are not known. */
 export function useConnectionRights(): readonly ActionRight[] | null {
   const shared = useContext(ShellRights)
-  const { port } = useApp()
+  const { port, rememberRights } = useApp()
   const [own, setOwn] = useState<readonly ActionRight[] | null>(null)
   useEffect(() => {
     if (shared !== undefined) return
@@ -34,13 +34,14 @@ export function useConnectionRights(): readonly ActionRight[] | null {
       (listener) => port.onConnection(listener),
       () => port.connectionState(),
       (state) => {
+        if (state.connected && state.rights !== null) rememberRights(state.rights)
         setOwn(state.connected ? state.rights : null)
       },
       () => {
         setOwn(null)
       }
     )
-  }, [port, shared])
+  }, [port, shared, rememberRights])
   return shared === undefined ? own : shared
 }
 
@@ -53,9 +54,8 @@ export function useConnectionRights(): readonly ActionRight[] | null {
  */
 export function useLastKnownRights(): readonly ActionRight[] | null {
   const now = useConnectionRights()
-  const [last, setLast] = useState<readonly ActionRight[] | null>(null)
-  // Remembered as the connection reports, not after it: the render that loses contact already
-  // has the rights it last held.
-  if (now !== null && now !== last) setLast(now)
-  return now ?? last
+  const { lastRights } = useApp()
+  // Held above every screen, so a screen opened after contact ended has them too: the shell notes
+  // them as it hears the connection, and a view with no shell around it notes them itself.
+  return now ?? lastRights
 }
