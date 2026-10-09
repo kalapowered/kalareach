@@ -2599,8 +2599,9 @@ pub fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// Opens the lock file at `path`, creating it when it is not there, without following a link, and
 /// checks that the handle it opened is a regular file.
 ///
-/// A symbolic link or a junction under the name is opened as the link itself and refused by its
-/// attributes, so the open creates nothing at its target.
+/// A symbolic link under the name is opened as the link itself and refused by its attributes, so
+/// the open creates nothing at its target. A junction or a directory is not a file the open can
+/// make, and fails.
 ///
 /// # Errors
 ///
