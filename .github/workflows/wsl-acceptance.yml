@@ -116,6 +116,11 @@ jobs:
           rustc --version
           cargo --version
 
+      # libsodium's prebuilt libraries come from the files this places, not from a download in the
+      # middle of the compile.
+      - name: Place libsodium's archives
+        uses: ./.github/actions/libsodium-archive
+
       # What the acceptance reaches the distributions with. The script looks for them in
       # `target/debug` of the checkout.
       - name: Build the Windows set

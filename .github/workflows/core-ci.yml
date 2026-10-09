@@ -480,29 +480,10 @@ jobs:
       # from a host of libsodium's own, in the middle of the compile, unless it is handed them. A
       # lookup of that host that failed has stopped this job before any test ran. The archives are
       # placed here instead, from the cache or once from that host, and the build reads them from
-      # disk. The route to the host is then closed for the rest of the job: a step that goes back
-      # to downloading fails at once and by name, on every run, rather than on a runner whose
-      # resolver is having a bad minute.
+      # disk. The action then closes the route to the host for the rest of the job.
       - name: Place libsodium's archives
         id: libsodium
         uses: ./.github/actions/libsodium-archive
-
-      - name: Close the route to libsodium's download host
-        run: |
-          Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n0.0.0.0 download.libsodium.org"
-          ipconfig /flushdns | Out-Null
-          # The resolver answers a name that the hosts file sends to 0.0.0.0 with "no data", and
-          # an answer of 0.0.0.0 would close the route as well. Any other address leaves it open.
-          $open = @()
-          try {
-            $open = @([System.Net.Dns]::GetHostAddresses('download.libsodium.org') |
-              Where-Object { $_.ToString() -notin @('0.0.0.0', '::') })
-          } catch [System.Net.Sockets.SocketException] {
-            Write-Host "download.libsodium.org no longer resolves: $($_.Exception.Message)"
-          }
-          if ($open.Count -gt 0) {
-            throw "The route to libsodium's download host is still open: $($open -join ', ')"
-          }
 
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
       # names the Windows build, the console host, the shells it happened on and the privileges its

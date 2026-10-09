@@ -593,8 +593,9 @@ Pin these in the release manifest, with their exact versions and the resolved de
 | `keyring` | 4.2.0 |
 | `spake2` | 0.4.0 |
 
-`libsodium-sys-stable` builds libsodium from the source archive it ships, so the manifest records
-the crate version rather than a system library version. Compile and verify it on every Tauri target.
+`libsodium-sys-stable` builds libsodium from its source archive on Linux and macOS and links
+libsodium's signed prebuilt libraries on Windows, so the manifest records the crate version, not a
+system library version. Compile and verify it on every Tauri target.
 
 `hmac` and `sha2` are built with their `zeroize` features, so their internal buffers are cleared.
 `hkdf` 0.13.0 has no such feature; its pseudorandom key and expansion buffers are not cleared, which

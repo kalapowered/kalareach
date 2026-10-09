@@ -144,6 +144,13 @@ jobs:
           rustc --version
           cargo --version
 
+      # On Windows libsodium's prebuilt libraries come from files this places, not from a download
+      # in the middle of the compile. The other targets build libsodium from the source archive the
+      # crate ships and fetch nothing.
+      - name: Place libsodium's archives
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/libsodium-archive
+
       # The check is put through binaries whose floors are known before it is trusted with the
       # release's. On macOS that includes a program built at Rust's default target, which it has to
       # refuse, and one built at 14.0, which it has to pass.
