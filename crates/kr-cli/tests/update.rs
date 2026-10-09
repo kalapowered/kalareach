@@ -8163,6 +8163,53 @@ async fn a_document_a_daemon_reads_under_its_own_configuration_home_is_checked()
     );
 }
 
+/// KR-REQ-26.10: the document a daemon read is recorded when it starts, so that a daemon that has
+/// stopped is covered too. The daemon is ended; the document it read, under a configuration home of
+/// its own, is put at a version the release switched to cannot read; the update names it. With the
+/// document in range, the control, the update goes ahead.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_a_stopped_daemon_read_under_its_own_configuration_home_is_checked() {
+    let (mut host, one, document) =
+        a_daemon_that_finds_its_document_under_its_own_configuration_home().await;
+    for mut daemon in host.daemons.drain(..) {
+        daemon.kill().expect("stops");
+        daemon.wait().expect("ends");
+    }
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let archive = archive.display().to_string();
+    let update = || host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 99}"#).expect("a document");
+    let (output, said) = update();
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&document.display().to_string()),
+        "the document the stopped daemon read is named: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 1}"#).expect("a document");
+    let (output, said) = update();
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+}
+
 /// KR-REQ-26.10: a daemon is started again as its own document chose, and not as the document of the
 /// environment of the command that starts it: this command's environment chooses the service start
 /// and finds no service definition, and the daemon in front of the update was started by hand and reads
@@ -8443,8 +8490,8 @@ impl Host {
         Writing {
             child,
             notices,
-            said,
-            lines,
+            said: Some(said),
+            lines: Some(lines),
         }
     }
 
@@ -8459,8 +8506,16 @@ struct Writing {
     child: std::process::Child,
     /// Each line it prints on standard error, as it prints it.
     notices: std::sync::mpsc::Receiver<String>,
-    said: std::thread::JoinHandle<String>,
-    lines: std::thread::JoinHandle<String>,
+    said: Option<std::thread::JoinHandle<String>>,
+    lines: Option<std::thread::JoinHandle<String>>,
+}
+
+impl Drop for Writing {
+    /// A command a failed test left running holds the store's locks until it ends: it ends here.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Writing {
@@ -8478,23 +8533,26 @@ impl Writing {
 
     /// Waits for the command to end, and returns its exit status and what it printed on standard
     /// output as JSON.
-    fn finish(self) -> (Option<i32>, Value) {
-        let Self {
-            mut child,
-            notices: _,
-            said,
-            lines,
-        } = self;
+    fn finish(mut self) -> (Option<i32>, Value) {
         let deadline = Instant::now() + Duration::from_secs(300);
         let status = loop {
-            if let Some(status) = child.try_wait().expect("asks") {
+            if let Some(status) = self.child.try_wait().expect("asks") {
                 break status;
             }
             assert!(Instant::now() < deadline, "the command did not end");
             std::thread::sleep(Duration::from_millis(50));
         };
-        let said = said.join().expect("stdout is read");
-        lines.join().expect("stderr is read");
+        let said = self
+            .said
+            .take()
+            .expect("stdout is read once")
+            .join()
+            .expect("stdout is read");
+        self.lines
+            .take()
+            .expect("stderr is read once")
+            .join()
+            .expect("stderr is read");
         (
             status.code(),
             serde_json::from_str(&said).unwrap_or(Value::Null),
