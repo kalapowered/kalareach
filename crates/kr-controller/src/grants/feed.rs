@@ -83,6 +83,14 @@ impl RetainedRevocation {
     pub fn is_settled(&self, enrolled: &BTreeSet<DeviceId>) -> bool {
         enrolled.is_subset(&self.acknowledged_by)
     }
+
+    /// Whether `host` refused this request after it began to take it: a request is numbered when
+    /// it takes effect, so one that was acknowledged and never numbered was refused. The feed
+    /// takes the same request again after it dropped the original, and the host refuses it again.
+    #[must_use]
+    pub fn is_refused_by(&self, host: DeviceId) -> bool {
+        self.authority_revision.is_none() && self.acknowledged_by.contains(&host)
+    }
 }
 
 /// What beginning to apply a request found.
@@ -281,6 +289,19 @@ impl AuthorityFeed {
         }
         self.accepted = record.authority_revision;
         Ok(())
+    }
+
+    /// Notes that `host` refused a request it began to take, before the refusal is sent, so a
+    /// refusal that never arrives is made again and a request published again is refused again.
+    /// A request that took effect is not refused: it has a revision.
+    pub fn note_refusal(&mut self, request_id: RevocationRequestId, host: DeviceId) {
+        if self
+            .records
+            .get(&request_id)
+            .is_some_and(|record| record.authority_revision.is_none())
+        {
+            self.acknowledge(request_id, host);
+        }
     }
 
     /// Records one enrolled host's acknowledgement of one revocation record.

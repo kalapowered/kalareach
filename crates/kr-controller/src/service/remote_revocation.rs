@@ -17,7 +17,6 @@ use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{KeyPurpose, RevocationCompletion, RevocationRequest, RevocationTarget};
 use kr_protocol::scalars::{KeyId, U64};
-use kr_protocol::sharing::MembershipRefusal;
 
 use super::Controller;
 use crate::config::ceilings::CeilingRefusal;
@@ -40,24 +39,21 @@ pub(crate) struct Plan {
 pub(crate) enum Judged {
     /// This host will not apply it, for a reason the feed's publisher can read.
     Refuse(RejectionReason),
-    /// This host cannot decide it yet. What its issuer's authority stands on is a bound that the
-    /// synchronisation in progress renews, or a clock reading not written down yet. The request
-    /// stays in the feed and is judged again by the next pass.
-    Later,
     /// This host applies it.
     Apply(Plan),
 }
 
 /// Whether a paired device may, now, manage this host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Standing {
     /// It may.
     Holds,
-    /// It may not, and nothing that passes with time changes that.
+    /// It may not.
     Not,
-    /// It may not yet: the bound its authority stands on ends with the synchronisation in
-    /// progress, or the clock reading the decision stands on is not written down yet.
-    Later,
+    /// This host cannot say: the clock reading the decision stands on is not written down, or this
+    /// boot's clock is not proven. Nothing about the device decides it, so the pass stops and asks
+    /// again, and a device is not named as one that may remove the feed meanwhile.
+    Undecided(Refusal),
 }
 
 /// What carrying a request out came to.
@@ -99,25 +95,33 @@ impl Controller {
             return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
         }
         match self.standing_to_manage(&issuer, now_ms) {
-            Standing::Not => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
-            Standing::Later => return Ok(Judged::Later),
             Standing::Holds => {}
+            Standing::Not => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
+            Standing::Undecided(Refusal::ClockUnproven) => {
+                return Err(crate::grants::continuity_lost());
+            }
+            Standing::Undecided(refusal) => {
+                return Err(crate::error::ControllerError::Storage {
+                    operation: "decide who may manage this host",
+                    detail: refusal.detail(),
+                });
+            }
         }
         let plan = self.plan_of(request)?;
         if plan.devices.is_empty() && plan.grants.is_empty() {
             return Ok(Judged::Refuse(RejectionReason::UnknownTarget));
-        }
-        if !self.plan_has_something_to_withdraw(&plan)? {
-            // The owner at this machine, or an earlier request, withdrew all of it. There is no
-            // revision to issue for a request that changes nothing, and the registry is the one
-            // allocator.
-            return Ok(Judged::Refuse(RejectionReason::Superseded));
         }
         Ok(Judged::Apply(plan))
     }
 
     /// Whether `device` may manage this host now, decided as its own `device.revoke` is: by its
     /// grant, this host's policy and the rights ceiling this host's configuration put in force.
+    ///
+    /// One thing differs. A bounded offline validity is what stops personal remote access while
+    /// the authority feed cannot be reached, and the caller has just read the feed, so the bound is
+    /// left out of this decision. Everything else, the rights, the selectors, an organisation's
+    /// lease, an exclusive management, the ceiling and the clock, is decided as it is for the
+    /// device's own request.
     fn standing_to_manage(&self, device: &DeviceRecord, now_ms: u64) -> Standing {
         let record = GrantRecord {
             grant: device.grant.clone(),
@@ -137,53 +141,48 @@ impl Controller {
             now_ms: now_ms.max(self.wall_now_ms()),
             continuous_now: self.clock.now(),
         };
-        match self.decide_for_device(&device.grant, &record, request) {
+        let ceiling = self
+            .rights_ceiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let live = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A floor still owed its record is written before anything is decided on it.
+        self.write_owed_floor(&live);
+        let mut policy = live.clone();
+        policy.set_offline_validity(None);
+        let decided = crate::config::ceilings::decide_with_ceiling(
+            ceiling.as_ref(),
+            &device.grant,
+            &record,
+            &mut policy,
+            request,
+        );
+        match decided {
             Ok(_) => Standing::Holds,
             Err(CeilingRefusal::RemovedByConfiguration { .. }) => Standing::Not,
-            Err(CeilingRefusal::Refused(refusal)) => match refusal {
-                // These end, or are written down, with the pass in progress: the bound is renewed
-                // by the synchronisation it makes, and the floor is written by the next decision.
-                Refusal::OfflineValidityLapsed { .. }
-                | Refusal::MembershipUnusable {
-                    refusal: MembershipRefusal::LeaseExpired,
+            Err(CeilingRefusal::Refused(refusal)) => {
+                if refusal.is_clock_decided() {
+                    // A refusal the clock decided stands only once the floor it stood on is on
+                    // disk: before that, a clock wound back before the next start would decide
+                    // the other way.
+                    let floor = live.utc_floor_ms();
+                    self.sharing.grants().record_floor(&live);
+                    if self.utc_floor.written() < floor {
+                        return Standing::Undecided(Refusal::FloorUnrecorded);
+                    }
                 }
-                | Refusal::FloorUnrecorded
-                | Refusal::ExpiryUnrecorded { .. }
-                | Refusal::ClockUnproven => Standing::Later,
-                _ => Standing::Not,
-            },
-        }
-    }
-
-    /// Whether carrying a plan out would withdraw anything: a device not yet revoked, a grant a
-    /// device holds in the grant store that is not yet revoked, or a grant not yet revoked.
-    fn plan_has_something_to_withdraw(&self, plan: &Plan) -> Result<bool> {
-        let held = self.devices.devices()?;
-        for device_id in &plan.devices {
-            if held
-                .iter()
-                .any(|record| record.device_id == *device_id && record.revoked_at_ms.is_none())
-                || self
-                    .sharing
-                    .grants()
-                    .records_for_device(*device_id)?
-                    .iter()
-                    .any(|record| record.revoked_at_ms.is_none())
-            {
-                return Ok(true);
+                match refusal {
+                    Refusal::FloorUnrecorded
+                    | Refusal::ExpiryUnrecorded { .. }
+                    | Refusal::ClockUnproven => Standing::Undecided(refusal),
+                    _ => Standing::Not,
+                }
             }
         }
-        for grant_id in &plan.grants {
-            if self
-                .sharing
-                .grants()
-                .record(*grant_id)?
-                .is_some_and(|record| record.revoked_at_ms.is_none())
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// What a request names that this host knows.
@@ -274,7 +273,7 @@ impl Controller {
             .devices()?
             .into_iter()
             .filter(|record| {
-                record.is_paired() && self.standing_to_manage(record, now_ms) != Standing::Not
+                record.is_paired() && self.standing_to_manage(record, now_ms) == Standing::Holds
             })
             .collect();
         owners.sort_by_key(|record| (record.paired_at_ms, record.device_id));
@@ -364,15 +363,29 @@ impl Controller {
         })
     }
 
+    /// Writes down that this host refuses a request it began to take, before it says so to the feed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be written.
+    pub(crate) fn authority_feed_refusal_noted(
+        &self,
+        request_id: kr_protocol::ids::RevocationRequestId,
+        host: DeviceId,
+    ) -> Result<()> {
+        let mut feed = self.authority_feed();
+        feed.note_refusal(request_id, host);
+        self.keep_feed(&feed)
+    }
+
     /// Writes down that this host has nothing more to do for a request the feed holds: it was
-    /// refused, or acknowledged as complete.
+    /// acknowledged as complete.
     pub(crate) fn authority_feed_settled(
         &self,
         request_id: kr_protocol::ids::RevocationRequestId,
         host: DeviceId,
     ) {
         let mut feed = self.authority_feed();
-        // A refused request may have no note of ours, and then there is nothing to settle here.
         feed.acknowledge(request_id, host);
         if let Err(error) = self.keep_feed(&feed) {
             eprintln!("kr-controller: could not write the authority feed's record down: {error}");
@@ -411,11 +424,14 @@ impl Controller {
     /// does not wait for its record to be written, so a registry that cannot take a write
     /// restricts all the same.
     fn refuse_the_grants_that_rest_on_the_feed(&self) {
-        self.policy
+        let mut policy = self
+            .policy
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_feed_removed(true);
-        self.advance_authority_epoch();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !policy.feed_removed() {
+            policy.set_feed_removed(true);
+            self.advance_authority_epoch();
+        }
     }
 
     /// Records that the feed at `origin` answered that this host was removed from it: refuses the
@@ -459,21 +475,31 @@ impl Controller {
         if configured == Some(removal.origin.as_str()) {
             self.authority_feed().restore_removal(&removal);
             self.refuse_the_grants_that_rest_on_the_feed();
-            self.tell_the_owner_of_the_feed(
-                kr_attention::EventKind::AuthorityFeedRemoved,
-                removal.at_ms.get(),
-            )
-            .await?;
+            // A notice the attention store cannot take is not a reason to stop the start; the
+            // item stands in the inbox from the earlier run.
+            if let Err(error) = self
+                .tell_the_owner_of_the_feed(
+                    kr_attention::EventKind::AuthorityFeedRemoved,
+                    removal.at_ms.get(),
+                )
+                .await
+            {
+                eprintln!("kr-controller: {error}");
+            }
             return Ok(true);
         }
         // The owner pointed the host at another feed, or at none: the removal is no removal from
         // that one.
         self.sharing.grants().store_feed_removal(None)?;
-        self.tell_the_owner_of_the_feed(
-            kr_attention::EventKind::AuthorityFeedLeft,
-            kr_ipc::now_ms().get(),
-        )
-        .await?;
+        if let Err(error) = self
+            .tell_the_owner_of_the_feed(
+                kr_attention::EventKind::AuthorityFeedLeft,
+                kr_ipc::now_ms().get(),
+            )
+            .await
+        {
+            eprintln!("kr-controller: {error}");
+        }
         Ok(false)
     }
 

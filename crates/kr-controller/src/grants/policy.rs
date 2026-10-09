@@ -1102,6 +1102,12 @@ impl HostPolicy {
         self.feed_removed = removed;
     }
 
+    /// Whether the feed this host reads answered that it was removed from it.
+    #[must_use]
+    pub const fn feed_removed(&self) -> bool {
+        self.feed_removed
+    }
+
     /// Chooses a bounded offline-validity policy for personal remote access.
     pub const fn set_offline_validity(&mut self, offline: Option<OfflineValidityPolicy>) {
         self.offline = offline;
