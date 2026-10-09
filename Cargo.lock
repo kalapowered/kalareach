@@ -1260,6 +1260,7 @@ dependencies = [
  "kr-loopback",
  "kr-pairing",
  "kr-protocol",
+ "kr-service-stand-in",
  "kr-transport",
  "kr-width",
  "kr-worker",
