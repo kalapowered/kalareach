@@ -768,9 +768,9 @@ async fn kr_req_25_01_an_approval_that_ends_while_the_journal_is_out_is_carried_
 
 /// KR-REQ-25.01: whoever follows a session's approvals is woken by each transition the broker
 /// commits, on the connection that writes it, and by the event a recovery writes for a transition
-/// made while the journal was out, so that a held request for the session's sources answers at
-/// once. The signal is subscribed to before each is made, so a commit that lands before the wait
-/// begins is still seen.
+/// made while the journal was out. The worker reads the page again at once; whether it answers a
+/// held request is the worker's own rule for the page. The signal is subscribed to before each is
+/// made, so a commit that lands before the wait begins is still seen.
 #[tokio::test]
 async fn kr_req_25_01_a_relayed_approval_wakes_whoever_follows_the_approvals() {
     let mut store = common::SharedStore::open();
