@@ -341,7 +341,7 @@ fn a_record_is_permitted_only_at_the_version_the_current_release_lists() {
     );
     drop(writers);
 
-    // A program outside a store holds nothing and is permitted every record.
-    let outside = kr_ipc::install::Writers::outside_a_store();
+    // A program outside a store, as this test binary is, holds nothing and is permitted every record.
+    let outside = kr_ipc::install::hold_writers(&mut || {}).expect("holds nothing");
     assert!(outside.permit(&Written::new("registry", 8)).is_ok());
 }

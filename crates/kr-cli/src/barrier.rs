@@ -12,7 +12,7 @@
 
 use kr_client::shown;
 use kr_client::shown::Shown;
-use kr_ipc::install::{Permit, WRITERS_WAIT_SECONDS, WriteRefused, Writers, Written};
+use kr_ipc::install::{InstallError, Permit, WRITERS_WAIT_SECONDS, WriteRefused, Writers, Written};
 
 use crate::error::{CliError, Result};
 
@@ -46,6 +46,12 @@ pub fn permit<'a>(writers: &'a Writers, record: &Written) -> Result<Permit<'a>> 
 
 impl From<WriteRefused> for CliError {
     fn from(refused: WriteRefused) -> Self {
+        Self::from(&refused)
+    }
+}
+
+impl From<&WriteRefused> for CliError {
+    fn from(refused: &WriteRefused) -> Self {
         match refused {
             WriteRefused::Switching => Self::UpdateDeferred(shown!(
                 "an update of this host is switching releases, and this command waited {} seconds \
@@ -53,8 +59,14 @@ impl From<WriteRefused> for CliError {
                 WRITERS_WAIT_SECONDS
             )),
             WriteRefused::Store(error) => Self::Other(shown!(
-                "nothing was written, because the store of releases could not be used: {}",
-                crate::update::said(&error)
+                "nothing was written, because the store of releases could not be used: {}{}",
+                crate::update::said(error),
+                match error {
+                    // A pinned program of another release meets a manifest it does not read.
+                    InstallError::Manifest { .. } =>
+                        Shown::said("; run the command again with the kr of the current release"),
+                    _ => Shown::said(""),
+                }
             )),
             WriteRefused::Process(error) => Self::Other(crate::update::said(error)),
             WriteRefused::NotWhatCurrentReads {
@@ -68,7 +80,7 @@ impl From<WriteRefused> for CliError {
                     Some(own) if own != current => shown!(
                         "this kr is of release {}; run the command again with the kr of the \
                          current release",
-                        crate::shown::release(&own)
+                        crate::shown::release(own)
                     ),
                     _ => Shown::said(
                         "the programs of that release write another version than its manifest \
@@ -78,10 +90,10 @@ impl From<WriteRefused> for CliError {
                 Self::Other(shown!(
                     "nothing was written: the current release {} lists {} at version {}, and this \
                      kr writes version {}; {}",
-                    crate::shown::release(&current),
+                    crate::shown::release(current),
                     crate::shown::store_name(store),
-                    reads,
-                    writes,
+                    *reads,
+                    *writes,
                     run
                 ))
             }

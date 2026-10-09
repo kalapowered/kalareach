@@ -317,6 +317,7 @@ fn changed(environment: &EnvironmentPaths, startup: Option<ControllerStartup>) -
     // writes it refuses the change with the definition, the record and the document as they were.
     let writers = crate::barrier::hold()?;
     let configuration = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)?;
+    #[cfg(unix)]
     let service = (startup == Some(ControllerStartup::Service))
         .then(|| crate::barrier::permit(&writers, &service_manager::WRITTEN))
         .transpose()?;
@@ -331,38 +332,35 @@ fn changed(environment: &EnvironmentPaths, startup: Option<ControllerStartup>) -
     // written, so no other change or start request sees one without the other. The document's
     // own lock is taken inside, after this one, as everywhere.
     let held = service_manager::lock(environment)?;
+    #[cfg(unix)]
     let changed = changed_under(
         environment,
-        startup,
         &change,
         &held,
         (&configuration, service.as_ref()),
     )?;
+    #[cfg(windows)]
+    let changed = changed_under(environment, startup, &change, &held, &configuration)?;
     drop(held);
     drop(writers);
     Ok(changed)
 }
 
-/// Brings the service manager's definition in line with `startup`, then writes the document.
+/// Brings the service manager's definition in line with the choice, then writes the document.
 ///
 /// `permits` are the leave to write the document, and the leave to write the service record, which
-/// is asked for only when the service start is chosen.
+/// is asked for when, and only when, the service start is chosen: with it the definition is
+/// written, and without it what the service start wrote is removed.
 #[cfg(unix)]
 fn changed_under(
     environment: &EnvironmentPaths,
-    startup: Option<ControllerStartup>,
     change: &Change,
     held: &service_manager::Lock,
     permits: (&Permit<'_>, Option<&Permit<'_>>),
 ) -> Result<Changed> {
     let (configuration, service) = permits;
     let mut changed = Changed::default();
-    if startup == Some(ControllerStartup::Service) {
-        let service = service.ok_or_else(|| {
-            CliError::Other(Shown::said(
-                "nothing was written: no permit was asked for the service record",
-            ))
-        })?;
+    if let Some(service) = service {
         changed.notes = service_manager::install(environment, held, service)?.notes;
     } else {
         changed.removal = service_manager::remove(environment, held)?;
@@ -380,10 +378,15 @@ fn changed_under(
     startup: Option<ControllerStartup>,
     change: &Change,
     _held: &service_manager::Lock,
-    permits: (&Permit<'_>, Option<&Permit<'_>>),
+    configuration: &Permit<'_>,
 ) -> Result<Changed> {
     Ok(Changed {
-        task: Some(windows::change(environment, startup, change, permits.0)?),
+        task: Some(windows::change(
+            environment,
+            startup,
+            change,
+            configuration,
+        )?),
         ..Changed::default()
     })
 }
