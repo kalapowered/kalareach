@@ -605,16 +605,36 @@ uses a task to keep asking the daemon until it either records the report or refu
 that ends first is a closed session, and the closure fails every offer in flight, so nothing needs
 to survive the worker.
 
-When making this request upstream, the attachment is identified by its identifiers and by the grant
-that gives access to the actual file. These are the transfer identifier, the media type, the exact
-size of the file and the digest of its bytes, and the grant's path, expiry and environment. Note
-that the path is based solely on the ID of the transfer. The original file name is considered
-metadata and is never sent, so a name with spaces, quotes or non-ASCII letters, one that looks like
-a relative path, a WSL path or a Windows drive path, reaches the upstream as none of those. It is
-expected that any receiver of such a request would open the provided path and confirm that the file
-at this path matches the provided size and digest before acknowledging the request. If the file is
-not what the request says, the receiver refuses, and the offer fails with the draft and the upload
-kept for a retry.
+An attachment to an upstream is referenced by a worker both via its identifiers and the grant which
+gives access to the attachment file. It is never referenced by its name. The grant's path ends in
+the transfer's identifier in hexadecimal and, at most, one extension from a closed list that the
+storage keeps. For instance, an uploaded file `shot.PNG` is staged with the extension `.png`, a file
+`page.html` is staged with the extension `.html`, but a file `tool.exe`, a file `shot.png.exe` or a
+file without an extension keeps none. As a consequence, a name with spaces, quotes or non-ASCII
+letters, one that looks like a relative path, a WSL path or a Windows drive path, reaches the
+upstream as none of those. Also note that there is no check whatsoever that the extension matches
+the media type declared by the uploader, which means that if the receiving party needs to ensure
+that the media type is correct, it needs to read the file.
+
+The request names the attachment in these members of its parameters:
+
+| Member | Holds |
+| --- | --- |
+| `attachment.transfer_id` | the transfer's identifier |
+| `attachment.media_type` | the media type the upload declared |
+| `attachment.byte_len` | the exact size of the file, in bytes |
+| `attachment.content_digest` | the SHA-256 digest of the file's bytes, as unpadded base64url |
+| `attachment.read_grant.path` | the path on the environment's host that the grant lets the receiver read |
+| `attachment.read_grant.expires_at_ms` | when the grant expires, in milliseconds on the wall clock |
+| `attachment.read_grant.environment_id` | the environment the grant is valid in |
+
+It is expected that the receiver opens the path, checks that the file at that path has the given
+size and digest, and only then acknowledges the request. The host has no way of knowing whether the
+receiver actually does this. If the file is not what the request says, the receiver refuses the
+request with the invalid-parameters error (-32602), and the offer then fails, with the draft and the
+upload kept for a retry. If the upstream returns any other error, the worker records the outcome of
+the action as unknown, because such an error does not prove that nothing happened, so the next offer
+of the attachment names the action it supersedes.
 
 `accepted_by_agent` therefore records that the receiver of this typed request acknowledged it after
 the file named by the grant was available to it. It does not record that the agent used or

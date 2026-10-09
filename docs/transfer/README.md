@@ -724,10 +724,11 @@ will never be made that would prevent a report from being made, and a draft that
 still be read when its session closes.
 
 The request that carries the offer to the upstream holds the grant's path, the file's size and its
-digest, and not the file's name. The receiver reads the file and checks it against the size and the
-digest before it answers. `accepted_by_agent` therefore means that the receiver of the typed request
-acknowledged it when the file the grant refers to was available to it. It doesn't mean that the
-agent used the file, or knows what it is.
+digest, and not the file's name. It is up to the receiver to read the file and check it against the
+size and the digest before answering the request (the host cannot tell whether the receiver has done
+so). `accepted_by_agent` therefore means that the receiver of the typed request acknowledged it when
+the file the grant refers to was available to it. It does not mean the agent has used the file, or
+even knows what it is.
 
 ## Previews
 
