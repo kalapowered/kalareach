@@ -29,8 +29,8 @@
 //! **Coverage** is complete only for a boundary this pass confirmed: a control group it proved the
 //! worker ran in and read empty at the end, or a job that needed no help. Everywhere else it is
 //! incomplete, always on macOS and on a Linux host with no service manager, because a process the
-//! record does not name (one that began after its last write, or that left the session and lost
-//! its parent before an observation saw it) is not found there.
+//! record does not name is not found there: one that began after its last write, one the worker
+//! started outside the session, and one that left the session before an observation recorded it.
 
 use std::time::{Duration, Instant};
 
@@ -57,8 +57,11 @@ pub struct Ended {
     pub identity: ProcessStartIdentity,
     /// Whether this pass had to end it with no chance to refuse, or the platform's job had to be
     /// helped, or the service manager's delivered kill found it in the unit's group. False for one
-    /// that was already gone, ended after it was asked, or ended with the worker; and for one the
-    /// manager may have ended after this pass stopped waiting for its answer.
+    /// that was already gone, ended after it was asked, or ended with the worker. It is the host's
+    /// best reading, not a proof of cause: it stays false for one the manager may have ended after
+    /// this pass stopped waiting for its answer, or when the kill was reported as failed or the
+    /// group could not be read beforehand, and it is true for one that ended by itself between
+    /// that reading and the kill.
     pub forced: bool,
     /// Whether it is the session's root shell.
     pub root: bool,
@@ -120,11 +123,11 @@ enum Standing {
     Refused(String),
 }
 
-/// Asks the platform to stop a recorded process, or refuses on the test's behalf.
+/// Asks the platform to stop a recorded process, or answers on the test's behalf.
 fn stop(identity: &ProcessStartIdentity, how: kr_ipc::identity::Stop) -> kr_ipc::identity::Stopped {
     #[cfg(any(test, feature = "testing"))]
-    if crate::testing::stop_is_refused(identity) {
-        return kr_ipc::identity::Stopped::Refused("Operation not permitted".to_owned());
+    if let Some(answer) = crate::testing::supplied_stop(identity) {
+        return answer;
     }
     kr_ipc::identity::stop_process(identity, how)
 }
@@ -373,9 +376,9 @@ impl ArchiveService {
                      host"
                 } else if cfg!(target_os = "linux") {
                     "a process that left the session and lost its parent before an observation \
-                     saw it, what such a process starts, a process the worker started outside \
-                     the session and a process that began after the last record was written are \
-                     not found on this host"
+                     recorded it, what such a process starts, a process the worker started \
+                     outside the session and a process that began after the last record was \
+                     written are not found on this host"
                 } else {
                     "a process that left the terminal's session, a process the worker started \
                      outside it and a process that began after the last record was written are \
@@ -616,6 +619,39 @@ impl Group {
     }
 }
 
+/// How many levels of groups below a unit's are read for who is in them.
+#[cfg(target_os = "linux")]
+const GROUP_DEPTH: usize = 8;
+
+/// Adds the identity of every process in the group at `directory` and in the groups below it, to
+/// `depth` levels.
+#[cfg(target_os = "linux")]
+fn members_below(directory: &std::path::Path, held: &mut Vec<ProcessStartIdentity>, depth: usize) {
+    if let Ok(procs) = std::fs::read_to_string(directory.join("cgroup.procs")) {
+        for pid in procs
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+        {
+            if let Ok(identity) = kr_ipc::identity::process_start_identity(pid)
+                && !held.contains(&identity)
+            {
+                held.push(identity);
+            }
+        }
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            members_below(&entry.path(), held, depth - 1);
+        }
+    }
+}
+
 /// Reads a control group from the unified hierarchy's files.
 #[cfg(target_os = "linux")]
 fn read_group(path: &str) -> Holders {
@@ -633,6 +669,13 @@ fn read_group(path: &str) -> Holders {
             return Holders::Unreadable(format!("/sys/fs/cgroup could not be read: {error}"));
         }
     }
+    read_group_under(root, path)
+}
+
+/// Reads a control group from the unified hierarchy's files under `root`: whether it is populated,
+/// and who is in it and in every group below it, which is what the manager's kill reaches.
+#[cfg(target_os = "linux")]
+fn read_group_under(root: &std::path::Path, path: &str) -> Holders {
     let directory = root.join(path.trim_start_matches('/'));
     match std::fs::read_to_string(directory.join("cgroup.events")) {
         Ok(events) => {
@@ -644,16 +687,7 @@ fn read_group(path: &str) -> Holders {
                 Some("0") => Holders::None,
                 Some("1") => {
                     let mut held = Vec::new();
-                    if let Ok(procs) = std::fs::read_to_string(directory.join("cgroup.procs")) {
-                        for pid in procs
-                            .lines()
-                            .filter_map(|line| line.trim().parse::<u32>().ok())
-                        {
-                            if let Ok(identity) = kr_ipc::identity::process_start_identity(pid) {
-                                held.push(identity);
-                            }
-                        }
-                    }
+                    members_below(&directory, &mut held, GROUP_DEPTH);
                     if held.is_empty() {
                         Holders::Unreadable(format!(
                             "the control group {path} holds processes this host could not describe"
@@ -678,5 +712,47 @@ fn read_group(path: &str) -> Holders {
         Err(error) => Holders::Unreadable(format!(
             "the control group {path} could not be read: {error}"
         )),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{Holders, read_group_under};
+
+    /// A unit's control group holds what is directly in it and what is in the groups below it, and
+    /// the manager's kill reaches both: a populated group whose own list is empty but whose child
+    /// group holds a process is not unreadable, and names that process.
+    ///
+    /// The files are the kernel's own format, written to a directory: a test cannot create a group
+    /// below a unit it does not own.
+    #[test]
+    fn a_group_names_the_processes_in_the_groups_below_it() {
+        let root = tempfile::tempdir().expect("a directory");
+        let unit = root.path().join("kr-worker-example.service");
+        std::fs::create_dir_all(unit.join("child/grandchild")).expect("the groups");
+        std::fs::write(unit.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
+        std::fs::write(unit.join("cgroup.procs"), "").expect("the unit's own list");
+        let here = std::process::id();
+        std::fs::write(unit.join("child/cgroup.procs"), "").expect("the child's list");
+        std::fs::write(
+            unit.join("child/grandchild/cgroup.procs"),
+            format!("{here}\n"),
+        )
+        .expect("the grandchild's list");
+
+        match read_group_under(root.path(), "/kr-worker-example.service") {
+            Holders::Some(held) => {
+                assert_eq!(held.len(), 1, "{held:?}");
+                assert_eq!(held[0].pid.get(), u64::from(here));
+            }
+            Holders::None => panic!("a populated group read as empty"),
+            Holders::Unreadable(why) => panic!("a group with a process below it: {why}"),
+        }
+
+        std::fs::write(unit.join("cgroup.events"), "populated 0\n").expect("events");
+        assert!(matches!(
+            read_group_under(root.path(), "/kr-worker-example.service"),
+            Holders::None
+        ));
     }
 }
