@@ -99,7 +99,8 @@ tempfile.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 # A test that needs a process held while it is ending attaches a debugger to it, which holds the
-# process at the event that says it has exited.
+# process at the event that says it has exited, and one that needs to know a thread is waiting for
+# a process reads the thread's wait chain.
 windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug"] }
 
 # The workspace forbids unsafe code, which a crate that waits on the terminal's own descriptor

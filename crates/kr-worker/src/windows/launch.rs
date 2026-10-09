@@ -829,10 +829,11 @@ mod platform {
         })
     }
 
-    /// The system refuses to end a process for which it has no sign yet that another thread is
-    /// ending it, and the end of a process cannot be held between its refusal and its first sign,
-    /// so the refusal is made here by a handle that has no right to end the process. What the
-    /// system says of the process is the same, and so is what is waited for.
+    /// The moment in which a process refuses to be ended and shows no sign of ending, which is
+    /// the moment another thread takes its end in hand and has not yet recorded its status, cannot
+    /// be held for a test. The refusal here comes from a handle that has no right to end the
+    /// process, and the system answers it as it answers that moment: access is denied, and the
+    /// process is neither signalled nor carries a status.
     #[cfg(test)]
     mod tests {
         use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
