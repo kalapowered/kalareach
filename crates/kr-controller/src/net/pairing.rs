@@ -456,6 +456,19 @@ impl PairingHost {
                         .to_owned(),
                 });
             }
+            ConfirmationSubject::EnrolOrganisation(_)
+            | ConfirmationSubject::SetExclusiveManagement { .. } => {
+                // The organisation policy is the daemon's, not the pairing service's: what an
+                // owner is shown comes from the chain this host verified and the policy it
+                // holds, which only the daemon reads, so the daemon resolves them and asks
+                // through [`Self::request_resolved`].
+                return Err(ControllerError::Refused {
+                    code: ErrorCode::InvalidArgument,
+                    detail: "an organisation's enrolment and exclusive management are described \
+                             by this host's policy, not by the pairing service"
+                        .to_owned(),
+                });
+            }
             ConfirmationSubject::Described(described) => {
                 if !described.is_describable() {
                     return Err(ControllerError::Refused {

@@ -450,6 +450,14 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         Subject::EstablishClock => "Trust this host's clock again",
         Subject::CatalogueAdd(_) => "Trust a plugin repository",
         Subject::PluginInstall(_) => "Install a plugin",
+        Subject::EnrolOrganisation(_) => "Enrol this host in an organisation",
+        Subject::SetExclusiveManagement(plan) => {
+            if plan.exclusive {
+                "Make this host answer to its organisations for your own access too"
+            } else {
+                "End its organisations' exclusive management of this host"
+            }
+        }
         Subject::Described(described) => match described.action {
             SensitiveAction::EnlargeGrant => "Widen what devices may do",
             SensitiveAction::TrustRepositoryRoot => "Trust a plugin repository",
@@ -522,12 +530,42 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
                 },
             })
         }
+        Subject::EnrolOrganisation(plan) => Some(Particulars {
+            facts: vec![
+                exact("Organisation", plan.organisation_id.to_string()),
+                exact("First key", organisation_key(&plan.root)),
+                exact("Key signing now", organisation_key(&plan.anchor)),
+            ],
+            notice: None,
+            statement: None,
+        }),
         _ => Some(Particulars {
             facts: Vec::new(),
             notice: None,
             statement: None,
         }),
     }
+}
+
+/// A policy-signing key as an owner reads it out: its revision and its public key in hexadecimal,
+/// which are what the confirmation covers.
+fn organisation_key(key: &kr_protocol::confirmation::PolicyKeyShown) -> String {
+    let hex: String = key
+        .public_key
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("revision {}, {}", key.revision, grouped_hex(&hex))
+}
+
+/// Hexadecimal digits as groups of eight, which a person reads and compares by group.
+fn grouped_hex(hex: &str) -> String {
+    hex.as_bytes()
+        .chunks(8)
+        .map(|group| String::from_utf8_lossy(group).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `text` as written when it is one plain line of at most `limit` characters, and `None` otherwise.

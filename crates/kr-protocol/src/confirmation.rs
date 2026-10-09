@@ -25,7 +25,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ConfirmationId, EnvironmentId, InvitationId, PluginId};
+use crate::account::PolicyAuthority;
+use crate::ids::{
+    ConfirmationId, EnvironmentId, InvitationId, OrganisationId, PluginId, PolicyKeyRevision,
+};
 use crate::invitation::{InviteGrantKind, InviteModeKind, PairCandidateView};
 use crate::pairing::{
     ConfirmationChannel, DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest,
@@ -82,6 +85,18 @@ pub enum ConfirmationSubject {
     PluginInstall(Box<crate::catalogue::PluginInstallParams>),
     /// Establishing this host's clock again after it was found to have gone backwards.
     EstablishClock,
+    /// Opting this host into an organisation's policy and pinning the chain of keys that signs
+    /// it, as this exact `organisation.enrol` would.
+    ///
+    /// The host verifies the whole chain first and shows the owner the root and the key signing
+    /// now. The request carries the chain and no proof.
+    EnrolOrganisation(Box<crate::organisation::OrganisationEnrolParams>),
+    /// Making this host exclusively organisation-managed, or ending that, as this exact
+    /// `organisation.exclusive.set` would.
+    SetExclusiveManagement {
+        /// True to make the host exclusively organisation-managed, false to end that.
+        exclusive: bool,
+    },
     /// An action its caller describes: enlarging a persistent grant, or trusting a repository
     /// root or granting an executable capability where the caller presents the answer's proof
     /// itself.
@@ -175,6 +190,22 @@ pub enum ConfirmationDisplay {
     },
     /// Establishing this host's clock again.
     EstablishClock,
+    /// Opting this host into this organisation's policy, pinned to these keys.
+    EnrolOrganisation {
+        /// The organisation.
+        organisation_id: OrganisationId,
+        /// The first key of its chain, which is its identity.
+        root: PolicyKeyShown,
+        /// The key signing now, which the host follows rotation from.
+        anchor: PolicyKeyShown,
+    },
+    /// Making this host exclusively organisation-managed, or ending that.
+    ExclusiveManagement {
+        /// True to make the host exclusively organisation-managed, false to end that.
+        exclusive: bool,
+        /// The organisations the host is enrolled in, in ascending order.
+        organisation_ids: Vec<OrganisationId>,
+    },
     /// Adopting this repository's trust root.
     CatalogueAdd {
         /// The environment it is enrolled in.
@@ -498,6 +529,172 @@ impl PluginInstallPlan {
             package_digest: package_digest.clone(),
             grant: canonical(grant)?,
             grant_statement: grant_statement.0.clone(),
+        })
+    }
+}
+
+/// One key of an organisation's chain, as an owner is shown it and as the confirmation covers it.
+///
+/// The whole key is shown, not a fingerprint of it, because the owner device builds the digest
+/// again from what it is shown. The moment the revision took over signing is covered too: the host
+/// keeps the link it pins byte for byte and decides every later lease against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyKeyShown {
+    /// The revision of the key.
+    pub revision: PolicyKeyRevision,
+    /// The Ed25519 public key.
+    pub public_key: AuthorisationKey,
+    /// When this revision took over signing, in UTC milliseconds.
+    pub not_before_ms: TimestampMs,
+}
+
+/// Opting a host into an organisation's policy, as the owner is asked to confirm it.
+///
+/// The digest covers the organisation, its first key and the key signing now. A confirmation
+/// obtained for one chain cannot enrol another organisation, cannot swap the key the host will
+/// follow rotation from, and goes stale when the organisation rotates in between: the chain is
+/// then another chain and needs a new confirmation. The host builds the digest from the chain it
+/// verified, and an owner device builds it again from what it is shown, so both come from this one
+/// definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrganisationEnrolPlan {
+    /// The organisation.
+    pub organisation_id: OrganisationId,
+    /// The first key of its chain.
+    pub root: PolicyKeyShown,
+    /// The key signing now.
+    pub anchor: PolicyKeyShown,
+}
+
+impl OrganisationEnrolPlan {
+    /// The sensitive action a confirmation for this plan is bound to.
+    #[must_use]
+    pub const fn sensitive_action() -> SensitiveAction {
+        SensitiveAction::ChangeHostAuthority
+    }
+
+    /// The plan a published chain states, or `None` when the chain has no link. The chain's own
+    /// signatures are the host's to verify before it asks anything of an owner.
+    #[must_use]
+    pub fn of_authority(authority: &PolicyAuthority) -> Option<Self> {
+        let shown = |link: &crate::account::PolicyAuthorityLink| PolicyKeyShown {
+            revision: link.payload.key_revision,
+            public_key: link.payload.public_key,
+            not_before_ms: link.payload.not_before_ms,
+        };
+        Some(Self {
+            organisation_id: authority.organisation_id,
+            root: shown(authority.chain.first()?),
+            anchor: shown(authority.chain.last()?),
+        })
+    }
+
+    /// The digest an owner's confirmation for this exact enrolment covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256, kr_cbor::CborError> {
+        digest_of(&(
+            "kr-organisation/enrol/1",
+            self.organisation_id,
+            self.root.revision,
+            self.root.public_key,
+            self.root.not_before_ms,
+            self.anchor.revision,
+            self.anchor.public_key,
+            self.anchor.not_before_ms,
+        ))
+    }
+
+    /// What an owner device is shown of this plan.
+    #[must_use]
+    pub const fn display(&self) -> ConfirmationDisplay {
+        ConfirmationDisplay::EnrolOrganisation {
+            organisation_id: self.organisation_id,
+            root: self.root,
+            anchor: self.anchor,
+        }
+    }
+
+    /// The plan an owner device is shown, or `None` when the display is another subject's.
+    #[must_use]
+    pub const fn of_display(display: &ConfirmationDisplay) -> Option<Self> {
+        let ConfirmationDisplay::EnrolOrganisation {
+            organisation_id,
+            root,
+            anchor,
+        } = display
+        else {
+            return None;
+        };
+        Some(Self {
+            organisation_id: *organisation_id,
+            root: *root,
+            anchor: *anchor,
+        })
+    }
+}
+
+/// Making a host exclusively organisation-managed, or ending that, as the owner is asked to
+/// confirm it.
+///
+/// The digest covers the new value and the organisations the host is enrolled in, so a
+/// confirmation for one state of the host is not carried to another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExclusiveManagementPlan {
+    /// True to make the host exclusively organisation-managed, false to end that.
+    pub exclusive: bool,
+    /// The organisations the host is enrolled in.
+    pub organisation_ids: CanonicalSet<OrganisationId>,
+}
+
+impl ExclusiveManagementPlan {
+    /// The sensitive action a confirmation for this plan is bound to.
+    #[must_use]
+    pub const fn sensitive_action() -> SensitiveAction {
+        SensitiveAction::ChangeHostAuthority
+    }
+
+    /// The digest an owner's confirmation for this exact change covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256, kr_cbor::CborError> {
+        digest_of(&(
+            "kr-organisation/exclusive/1",
+            self.exclusive,
+            &self.organisation_ids,
+        ))
+    }
+
+    /// What an owner device is shown of this plan.
+    #[must_use]
+    pub fn display(&self) -> ConfirmationDisplay {
+        ConfirmationDisplay::ExclusiveManagement {
+            exclusive: self.exclusive,
+            organisation_ids: self.organisation_ids.iter().copied().collect(),
+        }
+    }
+
+    /// The plan an owner device is shown, or `None` when the display is another subject's or
+    /// lists the organisations in an order that is not ascending, which no host that follows this
+    /// definition sends.
+    #[must_use]
+    pub fn of_display(display: &ConfirmationDisplay) -> Option<Self> {
+        let ConfirmationDisplay::ExclusiveManagement {
+            exclusive,
+            organisation_ids,
+        } = display
+        else {
+            return None;
+        };
+        let set: CanonicalSet<OrganisationId> = organisation_ids.iter().copied().collect();
+        set.iter().eq(organisation_ids.iter()).then_some(Self {
+            exclusive: *exclusive,
+            organisation_ids: set,
         })
     }
 }
@@ -982,6 +1179,132 @@ mod tests {
         assert_eq!(digest, expected);
     }
 
+    fn organisation_plan() -> OrganisationEnrolPlan {
+        let key = |revision: u64, byte: u8, at: u64| PolicyKeyShown {
+            revision: PolicyKeyRevision::new(revision),
+            public_key: AuthorisationKey::from_bytes([byte; 32]),
+            not_before_ms: TimestampMs::new(at),
+        };
+        OrganisationEnrolPlan {
+            organisation_id: OrganisationId::new(Uuid::from_bytes([4; 16])),
+            root: key(1, 0x11, 1_000),
+            anchor: key(3, 0x33, 3_000),
+        }
+    }
+
+    /// An owner confirms an enrolment by its digest, and every owner device builds that digest
+    /// again from what it is shown. The digest of a fixed plan is pinned, so a change to the
+    /// domain, the members or their order would show here; and each member is covered, so a
+    /// confirmation for one chain is not carried to another organisation, another key, or the same
+    /// key with another activation, which the host decides every later lease against.
+    #[test]
+    fn an_enrolment_confirmation_covers_the_chain_and_an_owner_device_rebuilds_it() {
+        let plan = organisation_plan();
+        let confirmed = plan.action_digest().expect("encodes");
+        assert_eq!(
+            confirmed,
+            Digest256::from_bytes([
+                0xc7, 0xd9, 0xdd, 0x9d, 0xf9, 0x2b, 0xbd, 0x40, 0x53, 0xc1, 0xd1, 0x9a, 0x30, 0xa3,
+                0x64, 0x6b, 0x09, 0xdd, 0x28, 0xf3, 0xa5, 0x79, 0x20, 0xee, 0x26, 0x35, 0x0d, 0x93,
+                0x05, 0xab, 0x22, 0x32,
+            ]),
+            "the digest of the fixed plan, computed apart from this code as the SHA-256 of the \
+             KR-CBOR-1 array of the domain, the organisation, and each key's revision, public key \
+             and activation"
+        );
+        assert_eq!(
+            OrganisationEnrolPlan::sensitive_action(),
+            SensitiveAction::ChangeHostAuthority
+        );
+        let shown = OrganisationEnrolPlan::of_display(&plan.display()).expect("the same plan");
+        assert_eq!(shown, plan);
+        assert_eq!(shown.action_digest().expect("encodes"), confirmed);
+        assert_eq!(
+            OrganisationEnrolPlan::of_display(&ConfirmationDisplay::EstablishClock),
+            None
+        );
+        for (name, edit) in [
+            ("organisation", {
+                let mut other = plan;
+                other.organisation_id = OrganisationId::new(Uuid::from_bytes([5; 16]));
+                other
+            }),
+            ("root key", {
+                let mut other = plan;
+                other.root.public_key = AuthorisationKey::from_bytes([0x12; 32]);
+                other
+            }),
+            ("root activation", {
+                let mut other = plan;
+                other.root.not_before_ms = TimestampMs::new(1_001);
+                other
+            }),
+            ("anchor revision", {
+                let mut other = plan;
+                other.anchor.revision = PolicyKeyRevision::new(4);
+                other
+            }),
+            ("anchor key", {
+                let mut other = plan;
+                other.anchor.public_key = AuthorisationKey::from_bytes([0x34; 32]);
+                other
+            }),
+            ("anchor activation", {
+                let mut other = plan;
+                other.anchor.not_before_ms = TimestampMs::new(3_001);
+                other
+            }),
+        ] {
+            assert_ne!(edit.action_digest().expect("encodes"), confirmed, "{name}");
+        }
+    }
+
+    /// The same for making a host exclusively organisation-managed: the new value and the
+    /// organisations are covered, and a display that lists them out of order is not one a host
+    /// that follows this definition sends.
+    #[test]
+    fn an_exclusive_management_confirmation_covers_the_value_and_the_organisations() {
+        let first = OrganisationId::new(Uuid::from_bytes([1; 16]));
+        let second = OrganisationId::new(Uuid::from_bytes([2; 16]));
+        let plan = ExclusiveManagementPlan {
+            exclusive: true,
+            organisation_ids: [second, first].into_iter().collect(),
+        };
+        let confirmed = plan.action_digest().expect("encodes");
+        let shown = ExclusiveManagementPlan::of_display(&plan.display()).expect("the same plan");
+        assert_eq!(shown, plan);
+        assert_eq!(shown.action_digest().expect("encodes"), confirmed);
+        assert_ne!(
+            ExclusiveManagementPlan {
+                exclusive: false,
+                ..plan.clone()
+            }
+            .action_digest()
+            .expect("encodes"),
+            confirmed,
+            "turning it off is another confirmation"
+        );
+        assert_ne!(
+            ExclusiveManagementPlan {
+                organisation_ids: [first].into_iter().collect(),
+                ..plan.clone()
+            }
+            .action_digest()
+            .expect("encodes"),
+            confirmed,
+            "another set of organisations is another confirmation"
+        );
+        let unordered = ConfirmationDisplay::ExclusiveManagement {
+            exclusive: true,
+            organisation_ids: vec![second, first],
+        };
+        assert_eq!(ExclusiveManagementPlan::of_display(&unordered), None);
+        assert_eq!(
+            ExclusiveManagementPlan::of_display(&ConfirmationDisplay::EstablishClock),
+            None
+        );
+    }
+
     #[test]
     fn a_request_names_a_subject_and_round_trips() {
         for subject in [
@@ -989,6 +1312,7 @@ mod tests {
                 invitation_id: InvitationId::new(Uuid::from_bytes([1; 16])),
             },
             ConfirmationSubject::EstablishClock,
+            ConfirmationSubject::SetExclusiveManagement { exclusive: true },
             ConfirmationSubject::Described(described(SensitiveAction::TrustRepositoryRoot)),
         ] {
             let params = OwnerConfirmationRequestParams { subject };

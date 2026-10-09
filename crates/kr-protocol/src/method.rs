@@ -486,6 +486,21 @@ methods! {
     doc: "Move this environment into a fresh machine group of its own, against the group and \
           revision the owner saw.";
 
+    OrganisationEnrol = "organisation.enrol", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: Always, idempotency: ACTION,
+    doc: "Opt this host into an organisation's policy and pin the chain of keys that signs it, on \
+          an owner confirmation that names exactly that chain's root and the key signing now.";
+
+    OrganisationList = "organisation.list", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "The organisations this host is enrolled in, the key each is pinned to, the devices \
+          bound to member accounts and the lease each holds, whether exclusive management is on, \
+          and the times it was turned off at this host's terminal.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],
@@ -558,6 +573,7 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Declare this device's own four public keys once, signed by the authorisation key its \
           pairing recorded, so the host keeps every key it binds.";
+
 
     // ----- Plugin catalogues ----------------------------------------------------------------
     CatalogueList = "catalogue.list", PluginCatalogues,

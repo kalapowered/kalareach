@@ -604,6 +604,42 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 17 has a host opt into an organisation's policy and pin its signing authority, and
+    // section 23 names no method that does it. The owner's enrolment is served on the local socket
+    // alone, behind host management, and always needs a fresh owner confirmation naming the chain.
+    // The list is read at both doors by a device that manages the host.
+    let organisation = [
+        ("organisation.enrol", EffectClass::Write),
+        ("organisation.list", EffectClass::Read),
+    ];
+    for (name, effect) in organisation {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        let expected_ingress: &[ActorIngress] = if name == "organisation.list" {
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice]
+        } else {
+            &[ActorIngress::LocalIpc]
+        };
+        assert_eq!(
+            entry.ingress, expected_ingress,
+            "{name} is never reachable from a session, a plugin or an unpaired peer"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+        let expected_confirmation = if name == "organisation.enrol" {
+            ConfirmationRequirement::Always
+        } else {
+            ConfirmationRequirement::None
+        };
+        assert_eq!(
+            entry.confirmation, expected_confirmation,
+            "{name} needs an owner confirmation exactly when it enlarges what the host answers to"
+        );
+    }
+
     // No method in the group may reach a right that changes code or Git state. Section 23's rule
     // for this row is "no code mutation", and this is where that stops being a convention.
     for entry in REGISTRY
@@ -720,6 +756,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + voice.len()
             + owner.len()
             + clock.len()
+            + organisation.len()
             + inspection.len(),
         "the registry holds the required methods and the named additions"
     );
@@ -1084,6 +1121,8 @@ fn host_management_methods_require_the_host_manage_right() {
         "machine.join",
         "machine.merge",
         "machine.split",
+        "organisation.enrol",
+        "organisation.list",
     ] {
         let entry = lookup(name).expect("listed");
         assert!(
@@ -1105,6 +1144,7 @@ fn owner_confirmation_covers_the_sensitive_operations() {
         "catalogue.add",
         "plugin.grant",
         "owner.confirmation.complete",
+        "organisation.enrol",
     ] {
         assert_eq!(
             lookup(name).expect("listed").confirmation,

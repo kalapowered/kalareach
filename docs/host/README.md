@@ -2572,6 +2572,49 @@ daemon records the refusal against the action identifier, and a repeat of that i
 answered with it rather than performed. Section 9 asks for authority and expiry to be
 revalidated immediately before the effect, and that is where they are.
 
+## Organisation policy
+
+A host can opt into an organisation's policy. Section 17 of the specification gives the whole
+arrangement: the organisation signs a membership lease for each member's device, the host checks
+the lease against a key it pinned when it enrolled, and the lease lasts at most fifteen minutes. The
+host fetches nothing from the organisation's service and does not need it to be reachable; what it
+holds is the chain of policy-signing keys it verified when it enrolled, and the rotations it has
+followed since.
+
+### Enrolling
+
+`organisation.enrol` pins an organisation's chain. It is served on the local socket only, needs
+`host.manage`, and always needs a fresh owner confirmation (`kr organisation enrol <chain-file>`
+takes the chain a member exported from the organisation's service). The host verifies the whole
+chain before it shows an owner anything: the chain's structure, the first link under its own key,
+every later link under the key of the revision it follows, and the head under the key of the last
+link, current at the host's reading of UTC. A host that distrusts its clock, or whose clock floor
+is owed its record, refuses, because a head is current only against a clock the host trusts. A host
+already enrolled in the organisation refuses too: it has to withdraw first.
+
+What the owner confirms is the organisation, its first key and the key signing now, each with the
+moment it took over signing. An owner device is shown the keys themselves and builds the digest
+again from them, so the confirmation covers exactly that chain. If the organisation rotates before
+the host acts, the key signing now is another key, the digest is another digest, and the owner
+confirms again. The confirmation is spent, and written to the acceptance record, before the host
+changes its policy, so a stop between the two wastes the confirmation and enrols nothing.
+
+The host keeps the first key as the organisation's identity and the key signing now as its anchor.
+It writes the enrolment in the same transaction as the action's answer, so a repeat of the action
+is answered from the record and a host never holds an enrolment with no answer to give. The
+authority revision in force when it enrolled is the enrolment's revision: a grant that requires the
+organisation names that revision in `policy_revision`, and a grant that names another is not
+honoured. `pair.invite` refuses a proposed grant that requires an organisation the host is not
+enrolled in, names another revision, or carries a right above what the owner role may hold, so an
+invitation cannot be issued for access that nothing could use. `kr pair invite --organisation
+<id>` fills the requirement in.
+
+`organisation.list`, served at both doors to a device that manages the host, reports each
+enrolment with the first key's identifier, the anchor's revision and identifier, the highest key
+revision accepted and the enrolment revision, the devices bound to member accounts with the lease
+the host last recorded for each, whether exclusive management is on, whether the host trusts its
+clock, and every time exclusive management was turned off.
+
 ## What the host owes the transport
 
 Two contracts `docs/transport/README.md` names, and where they are kept:

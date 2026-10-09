@@ -147,6 +147,7 @@ pub mod local;
 pub mod machine;
 pub mod mailbox;
 pub mod method;
+pub mod organisation;
 pub mod pairing;
 pub mod preauth;
 pub mod privacy;

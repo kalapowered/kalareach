@@ -29,8 +29,9 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_pairing::platform::PairingClock;
 use kr_protocol::confirmation::{
     CLOCK_PURPOSE, CatalogueTrustPlan, ConfirmationDisplay, DescribedAction,
-    OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
-    OwnerConfirmationPendingResult, PendingConfirmation, PluginInstallPlan,
+    ExclusiveManagementPlan, OrganisationEnrolPlan, OwnerConfirmationCompleteParams,
+    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, PendingConfirmation,
+    PluginInstallPlan,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -212,6 +213,12 @@ pub enum Subject {
     /// Installing a release with a grant, as the host's catalogue described the installation: the
     /// plan whose digest this device recomputed from what it shows.
     PluginInstall(PluginInstallPlan),
+    /// Opting the host into an organisation's policy and pinning the keys that sign it: the plan
+    /// whose digest this device recomputed from the keys it shows.
+    EnrolOrganisation(OrganisationEnrolPlan),
+    /// Making the host exclusively organisation-managed, or ending that: the plan whose digest
+    /// this device recomputed from what it shows.
+    SetExclusiveManagement(ExclusiveManagementPlan),
     /// An action its caller described by class, rights and digest only.
     Described(DescribedAction),
 }
@@ -235,6 +242,8 @@ impl std::fmt::Debug for Subject {
             Self::EstablishClock => formatter.write_str("EstablishClock"),
             Self::CatalogueAdd(_) => formatter.write_str("CatalogueAdd(..)"),
             Self::PluginInstall(_) => formatter.write_str("PluginInstall(..)"),
+            Self::EnrolOrganisation(_) => formatter.write_str("EnrolOrganisation(..)"),
+            Self::SetExclusiveManagement(_) => formatter.write_str("SetExclusiveManagement(..)"),
             Self::Described(_) => formatter.write_str("Described(..)"),
         }
     }
@@ -394,6 +403,32 @@ pub fn check(pending: &PendingConfirmation, host: &PairedHost) -> Result<Subject
             no_destination()?;
             rights(&kr_protocol::scalars::CanonicalSet::new())?;
             Ok(Subject::PluginInstall(plan))
+        }
+        ConfirmationDisplay::EnrolOrganisation { .. } => {
+            expect(SensitiveAction::ChangeHostAuthority)?;
+            // The keys are shown whole, so the digest is built again from them: a host that shows
+            // one chain and asks for the confirmation of another is found here.
+            let plan = OrganisationEnrolPlan::of_display(&pending.display)
+                .ok_or(CannotCheck::Unreadable)?;
+            let digest = plan.action_digest().map_err(|_| CannotCheck::Unreadable)?;
+            if digest != request.action_digest {
+                return Err(CannotCheck::DigestMismatch);
+            }
+            no_destination()?;
+            rights(&kr_protocol::scalars::CanonicalSet::new())?;
+            Ok(Subject::EnrolOrganisation(plan))
+        }
+        ConfirmationDisplay::ExclusiveManagement { .. } => {
+            expect(SensitiveAction::ChangeHostAuthority)?;
+            let plan = ExclusiveManagementPlan::of_display(&pending.display)
+                .ok_or(CannotCheck::Unreadable)?;
+            let digest = plan.action_digest().map_err(|_| CannotCheck::Unreadable)?;
+            if digest != request.action_digest {
+                return Err(CannotCheck::DigestMismatch);
+            }
+            no_destination()?;
+            rights(&kr_protocol::scalars::CanonicalSet::new())?;
+            Ok(Subject::SetExclusiveManagement(plan))
         }
     }
 }
@@ -649,6 +684,29 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                     shown(&plan.catalogue_id, names)
                 )
             }
+            Subject::EnrolOrganisation(plan) => format!(
+                "trust the organisation whose first key starts {} to sign the access it grants on                  {host}, now through the key starting {} (revision {})",
+                key_start(&plan.root.public_key),
+                key_start(&plan.anchor.public_key),
+                plan.anchor.revision.get()
+            ),
+            Subject::SetExclusiveManagement(plan) => {
+                let organisations = match plan.organisation_ids.len() {
+                    1 => "its organisation".to_owned(),
+                    more => format!("its {more} organisations"),
+                };
+                if plan.exclusive {
+                    format!(
+                        "make {host} answer to {organisations} for your own access too: every \
+                         access to it then needs a current membership lease"
+                    )
+                } else {
+                    format!(
+                        "end {organisations}'s exclusive management of {host}: your own access \
+                         then needs no lease"
+                    )
+                }
+            }
             Subject::Described(described) => {
                 let action = match described.action {
                     SensitiveAction::EnlargeGrant => "widen what devices may do",
@@ -725,6 +783,20 @@ pub fn is_plain_text(text: &str) -> bool {
         && !text
             .chars()
             .any(|character| character.is_whitespace() && character != ' ')
+}
+
+/// The start of a key's identifier, grouped, which is how an administrator reads a key out to the
+/// person enrolling.
+fn key_start(key: &kr_protocol::scalars::AuthorisationKey) -> String {
+    let identifier = kr_protocol::pairing::key_id(
+        kr_protocol::pairing::KeyPurpose::Authorisation,
+        key.as_bytes(),
+    );
+    let hex: String = identifier.as_bytes()[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    group_verification_value(&hex)
 }
 
 /// True when every word an enrolment or an installation shows can be shown exactly as written:

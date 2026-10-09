@@ -8145,6 +8145,70 @@
         },
         {
           "additionalProperties": false,
+          "description": "Opting this host into this organisation's policy, pinned to these keys.",
+          "properties": {
+            "enrol_organisation": {
+              "additionalProperties": false,
+              "properties": {
+                "anchor": {
+                  "$ref": "#/$defs/PolicyKeyShown",
+                  "description": "The key signing now, which the host follows rotation from."
+                },
+                "organisation_id": {
+                  "$ref": "#/$defs/OrganisationId",
+                  "description": "The organisation."
+                },
+                "root": {
+                  "$ref": "#/$defs/PolicyKeyShown",
+                  "description": "The first key of its chain, which is its identity."
+                }
+              },
+              "required": [
+                "organisation_id",
+                "root",
+                "anchor"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "enrol_organisation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Making this host exclusively organisation-managed, or ending that.",
+          "properties": {
+            "exclusive_management": {
+              "additionalProperties": false,
+              "properties": {
+                "exclusive": {
+                  "description": "True to make the host exclusively organisation-managed, false to end that.",
+                  "type": "boolean"
+                },
+                "organisation_ids": {
+                  "description": "The organisations the host is enrolled in, in ascending order.",
+                  "items": {
+                    "$ref": "#/$defs/OrganisationId"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "exclusive",
+                "organisation_ids"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "exclusive_management"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Adopting this repository's trust root.",
           "properties": {
             "catalogue_add": {
@@ -8425,6 +8489,42 @@
           "const": "establish_clock",
           "description": "Establishing this host's clock again after it was found to have gone backwards.",
           "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Opting this host into an organisation's policy and pinning the chain of keys that signs\nit, as this exact `organisation.enrol` would.\n\nThe host verifies the whole chain first and shows the owner the root and the key signing\nnow. The request carries the chain and no proof.",
+          "properties": {
+            "enrol_organisation": {
+              "$ref": "#/$defs/OrganisationEnrolParams"
+            }
+          },
+          "required": [
+            "enrol_organisation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Making this host exclusively organisation-managed, or ending that, as this exact\n`organisation.exclusive.set` would.",
+          "properties": {
+            "set_exclusive_management": {
+              "additionalProperties": false,
+              "properties": {
+                "exclusive": {
+                  "description": "True to make the host exclusively organisation-managed, false to end that.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "exclusive"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "set_exclusive_management"
+          ],
+          "type": "object"
         },
         {
           "additionalProperties": false,
@@ -14209,6 +14309,39 @@
         }
       ]
     },
+    "ExclusiveManagementEvent": {
+      "additionalProperties": false,
+      "description": "A time exclusive management was turned off, kept by the host so its owners and the\norganisation can see it.",
+      "properties": {
+        "at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host turned it off, in UTC milliseconds."
+        },
+        "channel": {
+          "$ref": "#/$defs/ConfirmationChannel",
+          "description": "How the owner's confirmation reached the host. The interactive controlling terminal is the\nchannel of a host that had no owner device left to confirm on."
+        },
+        "organisation_ids": {
+          "description": "The organisations the host was enrolled in when it turned exclusive management off.",
+          "items": {
+            "$ref": "#/$defs/OrganisationId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The event's position in the host's outbox of such events."
+        }
+      },
+      "required": [
+        "sequence",
+        "at_ms",
+        "channel",
+        "organisation_ids"
+      ],
+      "type": "object"
+    },
     "ExecutionReceipt": {
       "additionalProperties": false,
       "description": "What one execution did.",
@@ -18693,6 +18826,78 @@
       ],
       "type": "object"
     },
+    "MembershipPresentParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `membership.present`.",
+      "properties": {
+        "authority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyAuthority"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The organisation's chain, when it has moved since the host last accepted one. A chain\nthat is not newer changes nothing, and the lease beside it is still judged against the\nkeys the host already holds."
+        },
+        "lease": {
+          "$ref": "#/$defs/MembershipLease",
+          "description": "The lease the organisation signed for this device. The device the lease names is the one\nthat presents it: a host refuses a lease that names another device's key."
+        }
+      },
+      "required": [
+        "lease",
+        "authority"
+      ],
+      "type": "object"
+    },
+    "MembershipPresentResult": {
+      "additionalProperties": false,
+      "description": "The result of `membership.present`.",
+      "properties": {
+        "account_id": {
+          "$ref": "#/$defs/AccountId",
+          "description": "The member account it names."
+        },
+        "exclusive": {
+          "description": "Whether this host is exclusively organisation-managed.",
+          "type": "boolean"
+        },
+        "exclusive_ended_at_terminal_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last time exclusive management was turned off at this host's terminal, or null when it\nnever was. A member's client carries it to the organisation with its next lease request."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it stops being usable, in UTC milliseconds."
+        },
+        "key_revision": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The key revision that signed it."
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation the lease speaks for."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "account_id",
+        "key_revision",
+        "expires_at_ms",
+        "exclusive",
+        "exclusive_ended_at_terminal_ms"
+      ],
+      "type": "object"
+    },
     "MeteringRole": {
       "description": "A forwarding boundary inside one relay instance.\n\nA payload crosses two boundaries at a relay: it is read from the sending connection and it is\nwritten to the receiving one. They are not the same event. A payload counted as it arrives may\nstill be fenced by a revocation, dropped for a full queue or lost to a closing connection before\nit is delivered, so which boundary counts decides what the payer pays for.",
       "oneOf": [
@@ -18799,6 +19004,16 @@
         {
           "const": "machine.split",
           "description": "Move this environment into a fresh machine group of its own, against the group and revision the owner saw.",
+          "type": "string"
+        },
+        {
+          "const": "organisation.enrol",
+          "description": "Opt this host into an organisation's policy and pin the chain of keys that signs it, on an owner confirmation that names exactly that chain's root and the key signing now.",
+          "type": "string"
+        },
+        {
+          "const": "organisation.list",
+          "description": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and the times it was turned off at this host's terminal.",
           "type": "string"
         },
         {
@@ -20843,11 +21058,279 @@
         }
       ]
     },
+    "OrganisationChangeMarker": {
+      "description": "What the claim of an organisation change keeps while its answer is still to be built from the\nfence the change owes.\n\nA withdrawal and making a host exclusively organisation-managed restrict work already\nadmitted, so each writes its policy row and this marker in one transaction and answers from the\nbarrier that follows. The marker is what lets a repeat of the action tell a change that\ncommitted from one that never began.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "`organisation.withdraw` committed for this organisation.",
+          "properties": {
+            "withdrawn": {
+              "additionalProperties": false,
+              "properties": {
+                "organisation_id": {
+                  "$ref": "#/$defs/OrganisationId",
+                  "description": "The organisation the host left."
+                }
+              },
+              "required": [
+                "organisation_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "withdrawn"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "exclusive_on",
+          "description": "`organisation.exclusive.set` committed with `exclusive` true.",
+          "type": "string"
+        }
+      ]
+    },
+    "OrganisationEnrolParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `organisation.enrol`.",
+      "properties": {
+        "authority": {
+          "$ref": "#/$defs/PolicyAuthority",
+          "description": "The organisation's whole published policy-signing chain, as a member exported it. The host\nverifies every link and the head before it shows the owner anything, and the owner's\nconfirmation is for exactly the root and the key signing now."
+        }
+      },
+      "required": [
+        "authority"
+      ],
+      "type": "object"
+    },
+    "OrganisationEnrolResult": {
+      "additionalProperties": false,
+      "description": "The result of `organisation.enrol`, and what a repeat of the action is answered with.",
+      "properties": {
+        "accepted_head": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The highest key revision the host has accepted."
+        },
+        "enrolment_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The authority revision in force when the host enrolled. A grant that requires this\norganisation names it, and a grant that names another is not honoured."
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation the host is now enrolled in."
+        },
+        "root_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The identifier of the organisation's first key, which is its identity: what an\nadministrator can read out to the person enrolling."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "enrolment_revision",
+        "accepted_head",
+        "root_key_id"
+      ],
+      "type": "object"
+    },
+    "OrganisationEnrolmentView": {
+      "additionalProperties": false,
+      "description": "One organisation this host is enrolled in.",
+      "properties": {
+        "accepted_head": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The highest key revision the host has accepted."
+        },
+        "anchor_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The identifier of that key."
+        },
+        "anchor_revision": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The revision of the key the host follows rotation from."
+        },
+        "enrolment_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The authority revision in force when the host enrolled."
+        },
+        "members": {
+          "description": "The devices bound to member accounts, by device identity.",
+          "items": {
+            "$ref": "#/$defs/OrganisationMemberView"
+          },
+          "type": "array"
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation."
+        },
+        "root_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The identifier of its first key, which is its identity."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "root_key_id",
+        "anchor_revision",
+        "anchor_key_id",
+        "accepted_head",
+        "enrolment_revision",
+        "members"
+      ],
+      "type": "object"
+    },
+    "OrganisationExclusiveSetParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `organisation.exclusive.set`.",
+      "properties": {
+        "exclusive": {
+          "description": "True to make this host exclusively organisation-managed, false to end that.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exclusive"
+      ],
+      "type": "object"
+    },
+    "OrganisationExclusiveSetResult": {
+      "additionalProperties": false,
+      "description": "The result of `organisation.exclusive.set`.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The authority revision in force when the change was answered."
+        },
+        "barrier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevocationBarrier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The per-worker completion of the fence that making a host exclusive owes, because it\nrestricts work already admitted. Null when the change was to end exclusive management,\nwhich restricts nothing."
+        },
+        "exclusive": {
+          "description": "Whether the host is exclusively organisation-managed now.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exclusive",
+        "authority_revision",
+        "barrier"
+      ],
+      "type": "object"
+    },
     "OrganisationId": {
       "description": "One organisation whose signed policy a host has opted into.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "OrganisationLeaseView": {
+      "additionalProperties": false,
+      "description": "The lease a host holds for one bound device, as `organisation.list` reports it.",
+      "properties": {
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it stops being usable, in UTC milliseconds."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the organisation signed it, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "issued_at_ms",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "OrganisationListParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `organisation.list`. There are none.",
+      "type": "object"
+    },
+    "OrganisationListResult": {
+      "additionalProperties": false,
+      "description": "The result of `organisation.list`.",
+      "properties": {
+        "clock_trusted": {
+          "description": "Whether this host trusts its own clock. While it does not, it installs no lease and\nfollows no chain, and the owner trusts the clock again with `host.clock.establish`.",
+          "type": "boolean"
+        },
+        "enrolments": {
+          "description": "The organisations this host is enrolled in, by organisation identity.",
+          "items": {
+            "$ref": "#/$defs/OrganisationEnrolmentView"
+          },
+          "type": "array"
+        },
+        "exclusive": {
+          "description": "Whether this host is exclusively organisation-managed.",
+          "type": "boolean"
+        },
+        "exclusive_events": {
+          "description": "Every time exclusive management was turned off, oldest first.",
+          "items": {
+            "$ref": "#/$defs/ExclusiveManagementEvent"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "enrolments",
+        "exclusive",
+        "clock_trusted",
+        "exclusive_events"
+      ],
+      "type": "object"
+    },
+    "OrganisationMemberView": {
+      "additionalProperties": false,
+      "description": "A device bound to a member account in an organisation.",
+      "properties": {
+        "account_id": {
+          "$ref": "#/$defs/AccountId",
+          "description": "The member account its first verified lease named."
+        },
+        "bound_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host bound the device, in UTC milliseconds."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device."
+        },
+        "device_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The identifier of the authorisation key that lease named and the device proved."
+        },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OrganisationLeaseView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The newest lease the host recorded for the device, or null when it has recorded none. A\nrestarted host holds no lease until the device presents a newer one, and this is the\nrecord of the last one, not a promise that it is still in force."
+        }
+      },
+      "required": [
+        "device_id",
+        "account_id",
+        "device_key_id",
+        "bound_at_ms",
+        "lease"
+      ],
+      "type": "object"
     },
     "OrganisationPolicy": {
       "additionalProperties": false,
@@ -21003,6 +21486,20 @@
       "required": [
         "organisation_id",
         "policy_revision"
+      ],
+      "type": "object"
+    },
+    "OrganisationWithdrawParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `organisation.withdraw`. The answer is a [`RevocationResult`].",
+      "properties": {
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation to leave."
+        }
+      },
+      "required": [
+        "organisation_id"
       ],
       "type": "object"
     },
@@ -23955,6 +24452,30 @@
       "description": "The revision of an organisation's policy-signing key, advanced on every rotation.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "PolicyKeyShown": {
+      "additionalProperties": false,
+      "description": "One key of an organisation's chain, as an owner is shown it and as the confirmation covers it.\n\nThe whole key is shown, not a fingerprint of it, because the owner device builds the digest\nagain from what it is shown. The moment the revision took over signing is covered too: the host\nkeeps the link it pins byte for byte and decides every later lease against it.",
+      "properties": {
+        "not_before_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this revision took over signing, in UTC milliseconds."
+        },
+        "public_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The Ed25519 public key."
+        },
+        "revision": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The revision of the key."
+        }
+      },
+      "required": [
+        "revision",
+        "public_key",
+        "not_before_ms"
+      ],
+      "type": "object"
     },
     "PossiblyExecutedAction": {
       "additionalProperties": false,
@@ -38478,6 +38999,9 @@
     "evidence_reference": {
       "$ref": "#/$defs/EvidenceReference"
     },
+    "exclusive_management_event": {
+      "$ref": "#/$defs/ExclusiveManagementEvent"
+    },
     "expiration_tombstone": {
       "$ref": "#/$defs/ExpirationTombstone"
     },
@@ -38943,6 +39467,12 @@
     "membership_lease": {
       "$ref": "#/$defs/MembershipLease"
     },
+    "membership_present_params": {
+      "$ref": "#/$defs/MembershipPresentParams"
+    },
+    "membership_present_result": {
+      "$ref": "#/$defs/MembershipPresentResult"
+    },
     "method_entry": {
       "$ref": "#/$defs/MethodEntry"
     },
@@ -38976,8 +39506,41 @@
     "operation_record": {
       "$ref": "#/$defs/OperationRecord"
     },
+    "organisation_change_marker": {
+      "$ref": "#/$defs/OrganisationChangeMarker"
+    },
+    "organisation_enrol_params": {
+      "$ref": "#/$defs/OrganisationEnrolParams"
+    },
+    "organisation_enrol_result": {
+      "$ref": "#/$defs/OrganisationEnrolResult"
+    },
+    "organisation_enrolment_view": {
+      "$ref": "#/$defs/OrganisationEnrolmentView"
+    },
+    "organisation_exclusive_set_params": {
+      "$ref": "#/$defs/OrganisationExclusiveSetParams"
+    },
+    "organisation_exclusive_set_result": {
+      "$ref": "#/$defs/OrganisationExclusiveSetResult"
+    },
+    "organisation_lease_view": {
+      "$ref": "#/$defs/OrganisationLeaseView"
+    },
+    "organisation_list_params": {
+      "$ref": "#/$defs/OrganisationListParams"
+    },
+    "organisation_list_result": {
+      "$ref": "#/$defs/OrganisationListResult"
+    },
+    "organisation_member_view": {
+      "$ref": "#/$defs/OrganisationMemberView"
+    },
     "organisation_policy": {
       "$ref": "#/$defs/OrganisationPolicy"
+    },
+    "organisation_withdraw_params": {
+      "$ref": "#/$defs/OrganisationWithdrawParams"
     },
     "output_event": {
       "$ref": "#/$defs/OutputEvent"
