@@ -116,9 +116,9 @@ fn main() -> ExitCode {
             eprintln!("kr-controller: stays in the service it was started in: {why}");
         }
     }
-    // Before anything is read or started: a daemon of an installed release holds that release for
-    // as long as it runs, which covers the workers it starts from it until each holds the release
-    // itself, and does not start at all once the release is being removed.
+    // Before the daemon serves a request or starts a worker: a daemon of an installed release holds
+    // that release for as long as it runs, which covers the workers it starts from it until each
+    // holds the release itself, and does not start at all once the release is being removed.
     let running = match kr_ipc::install::this_process() {
         Ok(running) => running,
         Err(error) => {

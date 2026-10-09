@@ -3074,11 +3074,12 @@ worker ran in and the kernel read empty, or a job that needed no help.
 other accounts: a recorded number that a process of another account now holds is described as one
 the host cannot describe, and never as ended. On Linux, when the worker cannot read its process
 tree, the processes that are on the terminal of the session are recorded instead, and the closure
-says that this leaves out a process that left the terminal's session. When the worker cannot hold a
-process by more than its process number, it sends no hang up signal or kill signal to it, neither
-when it is closed by the user nor when it is cleaned up; the closure names the process. When the
+says that this leaves out a process that left the terminal's session. When a host cannot hold a
+process by more than its process number, no hang up signal or kill signal is sent to it, neither at
+the worker's own close nor in the cleanup after a crash; the closure names the process. When the
 control group of a service is read, processes that were not recorded by the worker but are ended by
-the service manager with a kill are listed together with the other processes, as forced.
+the service manager with a kill command are described together with the other processes as forced
+ended.
 
 **A control daemon that a session's command started.** On Linux, if a command like `kr new` or `kr
 update` starts a control daemon from a shell of a session, and the session runs as a service of the
@@ -3087,7 +3088,7 @@ the user service manager has answered about that service, the daemon moves into 
 scope `kr-daemon-<id>.scope`, before it starts serving. It doesn't move on macOS, or if there is no
 service manager on a Linux host, or if `systemd-run` cannot be used, or if it was started in a group
 below the service. If the manager takes the request for the scope but refuses it, the start fails
-and `kr new` will say that the daemon didn't answer and show the log of the daemon. If the daemon is
+and `kr new` will say that the daemon didn't answer and name the log of the daemon. If the daemon is
 in the service, i.e. its own control group is the service, `kr doctor` will mention the service,
 otherwise it won't mention anything about it.
 
