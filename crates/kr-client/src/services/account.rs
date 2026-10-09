@@ -1876,8 +1876,8 @@ pub struct SignedInAccount {
     clock_ms: fn() -> u64,
     ended: AtomicBool,
     /// Tokens that wait to be ended and that the queue could not take, kept in memory until a send
-    /// can queue them: a sign-in token whose grant the store holds is the sign-in and is let go of,
-    /// and any other is ended at the service.
+    /// can queue them or the service acknowledges them: a sign-in token whose grant the store holds
+    /// is the sign-in and is let go of, and any other is ended at the service.
     unsettled: Mutex<Vec<(String, RefreshToken)>>,
     status: tokio::sync::watch::Sender<AccountStatus>,
 }
@@ -2338,18 +2338,18 @@ impl SignedInAccount {
     /// cannot be kept, so a caller has one thing to do with the issued tokens and none of it can
     /// end a token the store holds.
     ///
-    /// A token the store is known not to hold is sent to the service ([`Self::revoke_unkept`]). When
-    /// the store could not say ([`Commit::Unsettled`]) nothing is sent for the new grant until the
-    /// store can say: the account is settled at once ([`Self::recover`]), which removes whichever
-    /// grant the store holds that has its own revocation queued, sends every queued token, and ends
-    /// a token held in memory unless the store holds its grant. The outcome is [`Commit::Kept`]
-    /// only when that settlement left the store holding the new grant with no revocation queued for
-    /// it: then it is the sign-in, and the next recovery will not remove it. Every other outcome is
-    /// [`Commit::Unsettled`]: the settlement left the device signed out with every token ended or
-    /// queued, or the store still cannot be read or changed and the settlement waits for the next send, which
-    /// settles a token in memory, or the next recovery, sign-out or replacing sign-in, which
-    /// removes a held grant whose revocation is queued; until then a grant the store returns is
-    /// presented as it was found.
+    /// A token the store is known not to hold is sent to the service ([`Self::revoke_unkept`]).
+    /// When the store could not say ([`Commit::Unsettled`]) nothing is sent for the new grant until
+    /// the store can say: the account is settled at once ([`Self::recover`]), which removes
+    /// whichever grant the store holds that has its own revocation queued, sends every queued
+    /// token, and ends a token held in memory unless the store holds its grant. The outcome is
+    /// [`Commit::Kept`] only when that settlement left the store holding the new grant with no
+    /// revocation queued for it: then it is the sign-in, and the next recovery will not remove it.
+    /// Every other outcome is [`Commit::Unsettled`]: the settlement left the device signed out with
+    /// every token ended or queued, or the store still cannot be read or changed and the settlement
+    /// waits for the next send, which settles a token in memory, or the next recovery, sign-out or
+    /// replacing sign-in, which removes a held grant whose revocation is queued; until then a grant
+    /// the store returns is presented as it was found.
     ///
     /// # Errors
     ///
@@ -2500,14 +2500,17 @@ impl SignedInAccount {
     /// Sends every queued revocation and removes each one the service acknowledges, except any that
     /// name the grant this device still holds. Returns how many are still waiting.
     ///
-    /// A token kept in memory because neither the store nor the queue could take it is settled
-    /// here, under the same lock that reads the store and the queue, so no commit can add one
-    /// between the reads and the decision: one whose grant the store holds is the sign-in and is
-    /// let go of; any other moves into the queue, which is where every token that waits to be ended
-    /// is kept, and is sent with it. Only a token the queue still refuses stays in memory, and is
-    /// sent on its own, before the queue is worked through, so that a store that fails while the
-    /// queue is cleaned up cannot keep a token that nothing durable names from the service; it is
-    /// counted as waiting until the service acknowledges it.
+    /// A token kept in memory is settled here, under the same lock that reads the store and the
+    /// queue: one a commit kept because neither the store nor the queue could take it, and one
+    /// [`Self::revoke_unkept`] kept because the queue refused it and the service did not take it.
+    /// The memory list's own lock is held from the moment the list is taken until what the queue
+    /// refused is put back, so an addition waits for it and is not lost to the put-back. A token
+    /// whose grant the store holds is the sign-in and is let go of; any other moves into the
+    /// queue, which is where every token that waits to be ended is kept, and is sent with it. Only
+    /// a token the queue still refuses stays in memory, and is sent on its own, before the queue is
+    /// worked through, so that a store that fails while the queue is cleaned up cannot keep a token
+    /// that nothing durable names from the service; it is counted as waiting until the service
+    /// acknowledges it.
     ///
     /// # Errors
     ///
@@ -2517,9 +2520,9 @@ impl SignedInAccount {
             let _held = self.hold().await?;
             let kept = self.read_grant()?.map(|grant| grant.grant_id);
             // The memory list is held from the moment it is taken to the moment what the queue
-            // refused is put back, with no wait in between, so a token added meanwhile (by
-            // `revoke_unkept`, which does not hold the store's lock) is added to the list that is
-            // put back and not lost to it.
+            // refused is put back, with no wait in between, so an addition (by `revoke_unkept`,
+            // which does not hold the store's lock) waits for this lock and goes into the list as
+            // it was put back.
             let mut memory = self
                 .unsettled
                 .lock()

@@ -365,8 +365,9 @@ impl Account {
                     },
                     Ok(Commit::Unsettled) => {
                         tracing::warn!(
-                            "the store could not say whether a sign-in was kept, so it is settled \
-                             at the next start, sign-out or sign-in where it was not settled now"
+                            "the store could not say whether a sign-in was kept, so it was settled \
+                             now where the store allowed, and is settled at the next start, \
+                             sign-out or sign-in where it was not"
                         );
                         Some(Outcome::NotKept)
                     }
