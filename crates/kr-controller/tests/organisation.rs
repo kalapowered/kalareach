@@ -1669,6 +1669,97 @@ async fn one_device_racing_two_accounts_binds_exactly_one() {
     );
 }
 
+/// KR-REQ-17.53: a device presents only under a grant that answers to this host's enrolment: the
+/// revision it names is the one this host enrolled at, and its environment selector admits this
+/// host's environment. A grant that names another revision, or admits other environments only,
+/// cannot present; the control is a grant that does both, which binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_that_names_another_enrolment_or_another_environment_cannot_present() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, organisation, revision, now) = enrolled_daemon(&temp, 0x32).await;
+    let organisation_id = organisation.organisation_id;
+    let ada = member("ada");
+    let another_environment = EnvironmentSelector::These {
+        environment_ids: [EnvironmentId::new(Uuid::from_bytes([0xee; 16]))]
+            .into_iter()
+            .collect(),
+    };
+    for (byte, name, requirement, environment) in [
+        (
+            0x51,
+            "another enrolment revision",
+            (organisation_id, AuthorityRevision::new(revision.get() + 1)),
+            EnvironmentSelector::Any,
+        ),
+        (
+            0x52,
+            "another environment only",
+            (organisation_id, revision),
+            another_environment,
+        ),
+    ] {
+        let key = device();
+        let mut paired = member_device(byte, *key.public(), Some(requirement));
+        paired.grant.environment_selector = environment;
+        controller.devices().commit(&paired).expect("paired");
+        let lease = organisation.lease(2, &ada, *key.public(), now, VIEW);
+        assert_eq!(
+            controller
+                .present_membership_lease(paired.device_id, key.public(), &lease, None, None)
+                .expect("storage"),
+            Err(LeaseRefused::NoOrganisationGrant),
+            "{name}"
+        );
+        assert!(
+            binding_of(&controller, organisation_id, paired.device_id).is_none(),
+            "{name}: nothing was bound"
+        );
+    }
+    let key = device();
+    let paired = member_device(0x53, *key.public(), Some((organisation_id, revision)));
+    controller.devices().commit(&paired).expect("paired");
+    let lease = organisation.lease(2, &ada, *key.public(), now, VIEW);
+    assert!(
+        controller
+            .present_membership_lease(paired.device_id, key.public(), &lease, None, None)
+            .expect("storage")
+            .expect("the control installs")
+            .bound
+    );
+}
+
+/// KR-REQ-17.54: on a host that is exclusively organisation-managed a live personal grant stands to
+/// present, since its owner's own access answers to a lease there and could never have one
+/// otherwise; on a host that is not, it does not. The first lease binds the owner's device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_an_exclusive_host_a_personal_grant_may_present_and_elsewhere_it_may_not() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, organisation, _revision, now) = enrolled_daemon(&temp, 0x33).await;
+    let organisation_id = organisation.organisation_id;
+    let key = device();
+    let personal = member_device(0x54, *key.public(), None);
+    controller.devices().commit(&personal).expect("paired");
+    let lease = organisation.lease(2, &member("ada"), *key.public(), now, VIEW);
+    assert_eq!(
+        controller
+            .present_membership_lease(personal.device_id, key.public(), &lease, None, None)
+            .expect("storage"),
+        Err(LeaseRefused::NoOrganisationGrant),
+        "a personal grant answers to no lease on a host that is not exclusive"
+    );
+    controller
+        .update_policy(|policy| policy.set_exclusively_managed(true))
+        .expect("the flag is written down");
+    assert!(
+        controller
+            .present_membership_lease(personal.device_id, key.public(), &lease, None, None)
+            .expect("storage")
+            .expect("on an exclusive host it presents")
+            .bound
+    );
+    assert!(binding_of(&controller, organisation_id, personal.device_id).is_some());
+}
+
 /// A pairing record written with an organisation requirement before this host enrolled still
 /// reads, and its grant answers only once an enrolment records exactly its revision and the device
 /// is bound on its own lease.
