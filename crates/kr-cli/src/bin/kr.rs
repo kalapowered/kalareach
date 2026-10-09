@@ -859,10 +859,31 @@ async fn run(cli: Cli) -> Result<Completion> {
                     .state_dir()
                     .join(kr_shell_integration::host::terminal::PREFERENCE_FILE);
                 let available = kr_shell_integration::host::terminal::detect();
+                // A saved preference is a record stamped with a version: saving one holds the
+                // writers' lock and asks for the leave to write it, before anything is changed.
+                // The environment's state directory is made for it, as a first edit of the
+                // environment's configuration makes it.
+                let writers = terminal
+                    .set
+                    .is_some()
+                    .then(kr_cli::barrier::hold)
+                    .transpose()?;
+                let permit = writers
+                    .as_ref()
+                    .map(|writers| {
+                        kr_cli::barrier::permit(
+                            writers,
+                            &kr_shell_integration::host::terminal::PREFERENCE_WRITTEN,
+                        )
+                    })
+                    .transpose()?;
+                if terminal.set.is_some() {
+                    environment.paths.create()?;
+                }
                 // A change of the saved preference is made while the preference is held, as the
                 // daemon's stamping of its format is. An environment whose state directory is not
                 // there yet has no preference to clear, and none is held.
-                let _held = ((terminal.clear || terminal.set.is_some())
+                let held = ((terminal.clear || terminal.set.is_some())
                     && environment.paths.state_dir().is_dir())
                 .then(|| {
                     kr_shell_integration::host::terminal::hold_preference(
@@ -903,12 +924,33 @@ async fn run(cli: Cli) -> Result<Completion> {
                             describe_terminals(&available)
                         )));
                     }
-                    kr_ipc::paths::write_owner_only_file(
-                        &file,
-                        kr_shell_integration::host::terminal::preference_document(chosen)
-                            .as_bytes(),
+                    let (Some(held), Some(permit)) = (&held, &permit) else {
+                        return Err(CliError::Other(Shown::said(
+                            "the preference could not be held for saving",
+                        )));
+                    };
+                    kr_shell_integration::host::terminal::save_preference(
+                        environment.paths.state_dir(),
+                        chosen,
+                        held,
+                        permit,
                     )
-                    .map_err(CliError::Ipc)?;
+                    .map_err(|refused| match refused {
+                        kr_shell_integration::host::terminal::SaveRefused::Barred(refused) => {
+                            CliError::from(&refused)
+                        }
+                        kr_shell_integration::host::terminal::SaveRefused::NotOurs => {
+                            CliError::Other(shown!(
+                                "{} is not a terminal preference this build reads; kr host \
+                                 terminal --clear removes it, and kr host terminal --set saves \
+                                 the choice again",
+                                Shown::root(&file)
+                            ))
+                        }
+                        kr_shell_integration::host::terminal::SaveRefused::Store(error) => {
+                            CliError::Ipc(error)
+                        }
+                    })?;
                 }
                 let preferred = kr_shell_integration::host::terminal::saved_preference(
                     environment.paths.state_dir(),

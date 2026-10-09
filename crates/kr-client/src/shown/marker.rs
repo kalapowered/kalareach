@@ -651,7 +651,12 @@ mod cases {
         let drafts =
             crate::answers::AnswerDrafts::open(directory.path().join("answers")).expect("a store");
         let kept = answer_draft(MARKER);
-        drafts.keep(&kept).expect("kept");
+        let writers = kr_ipc::install::hold_writers(&mut || {})
+            .expect("a client outside a store holds nothing");
+        let permit = writers
+            .permit(&crate::answers::WRITTEN)
+            .expect("a client outside a store may keep an answer");
+        drafts.keep(&kept, &permit).expect("kept");
         for read in drafts.drafts().expect("the kept answers") {
             assert_unmarked("a kept answer", &debug_renderings(&read));
         }

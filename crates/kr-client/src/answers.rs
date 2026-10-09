@@ -33,6 +33,9 @@
 
 use std::path::{Path, PathBuf};
 
+use std::time::{Duration, Instant};
+
+use kr_ipc::install::{Permit, Written};
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::{QuestionId, QuestionRevision, SessionId};
@@ -59,6 +62,19 @@ const EXTENSION: &str = "answer";
 /// Remove the reading of a kept answer that states no version once no supported upgrade starts
 /// from one written before the format was recorded.
 pub const ANSWER_FORMAT: u32 = 1;
+
+/// The kept answers, as a release's manifest lists them and at the format this build writes them.
+pub const WRITTEN: Written = Written::new("kept-answers", ANSWER_FORMAT as u64);
+
+/// The file in the store's directory whose lock a write holds from its look at the answer it
+/// replaces until the answer is in place.
+const LOCK_NAME: &str = "answers.lock";
+
+/// How long a write waits for another that is under way.
+const LOCK_PATIENCE: Duration = Duration::from_secs(2);
+
+/// The most a kept answer can hold, with room for what is kept beside it.
+const KEPT_LIMIT: u64 = 4 * MAX_ANSWER_BYTES as u64;
 
 /// Whether a record states no format, which is how an earlier build wrote every one.
 const fn unstated(version: &u32) -> bool {
@@ -197,8 +213,10 @@ pub enum Answered {
     /// the question as it now stands, which the host leaves out of the answer to a device whose
     /// grant does not reach it ([`QuestionResolveResult::question`]).
     Sent(Box<QuestionResolveResult>),
-    /// The host could not be reached, so it is kept on this device.
-    Kept(AnswerDraft),
+    /// The host could not be reached, or did not say whether it took the answer. The caller keeps it
+    /// on this device ([`AnswerDrafts::keep`]), which is a write of a stored record and is made
+    /// under the leave to write it.
+    NotSent(AnswerDraft),
 }
 
 impl std::fmt::Debug for Answered {
@@ -211,14 +229,14 @@ impl std::fmt::Debug for Answered {
                 .field("revision", &resolved.revision)
                 .field("state", &resolved.state)
                 .finish_non_exhaustive(),
-            Self::Kept(draft) => formatter.debug_tuple("Kept").field(draft).finish(),
+            Self::NotSent(draft) => formatter.debug_tuple("NotSent").field(draft).finish(),
         }
     }
 }
 
 /// A kept answer's file as a failure may name it: whole when this store wrote its name.
 fn stored(path: &std::path::Path) -> Shown {
-    Shown::stored(path, &[], &[EXTENSION, "partial"])
+    Shown::stored(path, &[LOCK_NAME], &[EXTENSION, "partial"])
 }
 
 /// A failure of this module.
@@ -259,6 +277,9 @@ pub enum AnswerError {
     /// The host refused, or the connection failed in a way that is not a lost connection.
     #[error("{0}")]
     Host(#[from] ClientError),
+    /// The leave to write a kept answer was given for another record.
+    #[error("the leave to write was not for a kept answer")]
+    NotPermitted,
 }
 
 impl AnswerError {
@@ -273,6 +294,7 @@ impl AnswerError {
             Self::Retired(Retired::Gone) => ErrorCode::UnknownSession,
             Self::Unlisted => ErrorCode::ResourceUnavailable,
             Self::Store { .. } | Self::Unreadable { .. } => ErrorCode::StorageUnavailable,
+            Self::NotPermitted => ErrorCode::InvalidArgument,
             Self::Host(error) => error.code(),
         }
     }
@@ -392,13 +414,28 @@ impl AnswerDrafts {
         Ok(Self { directory })
     }
 
-    /// Keeps one answer, in place of any answer kept earlier for the same question.
+    /// Keeps one answer, in place of any answer kept earlier for the same question, in the format
+    /// this build writes whatever `draft` states.
+    ///
+    /// `permit` is the leave to write a kept answer at that format ([`WRITTEN`]), asked for under
+    /// the writers' lock. The answer kept earlier is read first, under the store's own lock: one of a
+    /// later format, or one that cannot be read, is left as it is and the new answer is not kept. A
+    /// link or a pipe at the answer's name holds no answer this build wrote, and is replaced.
     ///
     /// # Errors
     ///
-    /// Returns [`AnswerError::Store`] when it cannot be written.
-    pub fn keep(&self, draft: &AnswerDraft) -> Result<()> {
-        let bytes = kr_cbor::to_canonical_vec(draft).map_err(|error| {
+    /// Returns [`AnswerError::Store`] when it cannot be written, [`AnswerError::Unreadable`] when the
+    /// answer it would replace is of a later format or cannot be read, and
+    /// [`AnswerError::NotPermitted`] when the permit is for another record.
+    pub fn keep(&self, draft: &AnswerDraft, permit: &Permit<'_>) -> Result<()> {
+        permit
+            .require(&WRITTEN)
+            .map_err(|_| AnswerError::NotPermitted)?;
+        let kept = AnswerDraft {
+            version: ANSWER_FORMAT,
+            ..draft.clone()
+        };
+        let bytes = kr_cbor::to_canonical_vec(&kept).map_err(|error| {
             AnswerError::Form(crate::shown!(
                 "the answer cannot be kept: {}",
                 Shown::cbor(&error)
@@ -409,6 +446,8 @@ impl AnswerDrafts {
             path: stored(&path),
             fault: IoFault::from(error),
         };
+        let _lock = self.lock().map_err(store)?;
+        replaceable(&path)?;
         // A name of this write's own, so a second writer of the same question writes a file of its
         // own too, and the last rename is the answer that stays.
         let unique = crate::drafts::fresh_uuid()
@@ -477,6 +516,67 @@ impl AnswerDrafts {
     fn path(&self, question_id: QuestionId) -> PathBuf {
         self.directory.join(format!("{question_id}.{EXTENSION}"))
     }
+
+    /// Takes the store's lock for a write, waiting [`LOCK_PATIENCE`] for another that is under way.
+    /// Closing the file releases it.
+    fn lock(&self) -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.directory.join(LOCK_NAME))?;
+        let deadline = Instant::now() + LOCK_PATIENCE;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Checks that the answer at `path`, if there is one, is one this build may replace: nothing there,
+/// or a link or a pipe, which holds no answer this build wrote and is replaced by the rename; or a
+/// regular file that is an answer of this format or of none. One of a later format, or one that
+/// cannot be read, is not replaced.
+fn replaceable(path: &Path) -> Result<()> {
+    let about = match std::fs::symlink_metadata(path) {
+        Ok(about) => about,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AnswerError::Store {
+                path: stored(path),
+                fault: IoFault::from(error),
+            });
+        }
+    };
+    if !about.file_type().is_file() {
+        return Ok(());
+    }
+    let unreadable = |detail: Shown| AnswerError::Unreadable {
+        path: stored(path),
+        detail,
+    };
+    let Some(bytes) = kr_ipc::paths::read_owner_only_file(path, KEPT_LIMIT)
+        .map_err(|error| unreadable(Shown::ipc(&error)))?
+    else {
+        return Ok(());
+    };
+    let earlier: AnswerDraft = kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| unreadable(Shown::cbor(&error)))?;
+    if earlier.version > ANSWER_FORMAT {
+        return Err(unreadable(Shown::said(
+            "it is of a later format than this build reads, so the new answer was not kept",
+        )));
+    }
+    Ok(())
 }
 
 /// Reads one kept answer.
@@ -581,8 +681,7 @@ pub async fn answer<H: QuestionHost>(
         drafted_at_ms: now,
     };
     let Some(host) = host else {
-        drafts.keep(&draft)?;
-        return Ok(Answered::Kept(draft));
+        return Ok(Answered::NotSent(draft));
     };
     let params = draft
         .submission(Some(question))
@@ -593,10 +692,7 @@ pub async fn answer<H: QuestionHost>(
             drafts.discard(draft.question_id)?;
             Ok(Answered::Sent(Box::new(resolved)))
         }
-        Err(error) if keeps_the_answer(&error) => {
-            drafts.keep(&draft)?;
-            Ok(Answered::Kept(draft))
-        }
+        Err(error) if keeps_the_answer(&error) => Ok(Answered::NotSent(draft)),
         Err(error) => Err(AnswerError::Host(error)),
     }
 }

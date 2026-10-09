@@ -19,7 +19,7 @@ use kr_shell_integration::host::package::{
 };
 use kr_shell_integration::host::refusal::Refusal;
 use kr_shell_integration::host::startup::{
-    self, Change, EntryRecord, HomeLayout, RecordError, StartupTarget,
+    self, Change, ENTRY_WRITTEN, EntryRecord, HomeLayout, RecordError, StartupTarget,
 };
 
 use crate::error::{CliError, Result};
@@ -268,11 +268,14 @@ fn install_targets(
     // Held from before the first file is recorded until the last entry is written, so a removal
     // run at the same time waits for the whole install rather than reading the record part way
     // through it. A dry run writes nothing and holds nothing.
-    let held = if dry_run {
-        None
-    } else {
+    let writers = (!dry_run).then(crate::barrier::hold).transpose()?;
+    let permit = writers
+        .as_ref()
+        .map(|writers| crate::barrier::permit(writers, &ENTRY_WRITTEN))
+        .transpose()?;
+    let held = if let Some(permit) = &permit {
         let held = record
-            .hold()
+            .hold(permit)
             .map_err(|error| record_failure(record, &error))?;
         // One file can take two entries, as when PowerShell's two profiles are one file, and is
         // recorded once.
@@ -285,6 +288,8 @@ fn install_targets(
         held.add(package.kind(), &files)
             .map_err(|error| record_failure(record, &error))?;
         Some(held)
+    } else {
+        None
     };
     // The report has one entry for each target, in the order the targets are in, so each is paired
     // with its own body and placement by position and never by the file: one file can take two
@@ -364,15 +369,19 @@ pub fn remove(
     dry_run: bool,
 ) -> Result<ShellReport> {
     let targets = layout.targets(kind);
-    let held = if dry_run {
-        None
-    } else {
-        Some(
+    let writers = (!dry_run).then(crate::barrier::hold).transpose()?;
+    let permit = writers
+        .as_ref()
+        .map(|writers| crate::barrier::permit(writers, &ENTRY_WRITTEN))
+        .transpose()?;
+    let held = permit
+        .as_ref()
+        .map(|permit| {
             record
-                .hold()
-                .map_err(|error| record_failure(record, &error))?,
-        )
-    };
+                .hold(permit)
+                .map_err(|error| record_failure(record, &error))
+        })
+        .transpose()?;
     let recorded = held
         .as_ref()
         .map_or_else(|| record.files(kind), |held| held.files(kind))
@@ -452,6 +461,7 @@ fn record_failure(record: &EntryRecord, error: &RecordError) -> CliError {
              install records the entries it writes again",
             Shown::root(record.path())
         )),
+        RecordError::Barred(refused) => CliError::from(refused),
     }
 }
 
@@ -587,6 +597,18 @@ pub const fn change_name(change: Change) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Holds `record` as a program outside a store does, which holds nothing else.
+    fn hold(record: &EntryRecord) -> std::result::Result<startup::HeldRecord<'_>, RecordError> {
+        static WRITERS: std::sync::OnceLock<kr_ipc::install::Writers> = std::sync::OnceLock::new();
+        static PERMIT: std::sync::OnceLock<kr_ipc::install::Permit<'static>> =
+            std::sync::OnceLock::new();
+        let writers = WRITERS.get_or_init(|| {
+            kr_ipc::install::hold_writers(&mut || {}).expect("a test outside a store holds nothing")
+        });
+        let permit = PERMIT.get_or_init(|| writers.permit(&ENTRY_WRITTEN).expect("permitted"));
+        record.hold(permit)
+    }
     use crate::output::planted::{only_asked, only_asked_lines, planted_text};
     use crate::shown::marker::MARKER;
     use kr_shell_integration::host::startup::Placement;
@@ -856,8 +878,7 @@ mod tests {
         );
         let profile = home.path().join("profile.ps1");
         std::fs::write(&profile, &signed).expect("writes");
-        record
-            .hold()
+        hold(&record)
             .expect("holds")
             .add(ShellKind::PowerShell, std::slice::from_ref(&profile))
             .expect("records");
@@ -929,8 +950,7 @@ mod tests {
             Change::Added
         );
         // The install that wrote it recorded the file.
-        record
-            .hold()
+        hold(&record)
             .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
