@@ -4120,7 +4120,7 @@ fn a_daemon_started_inside_a_service_asks_for_one_scope_and_is_the_process_kr_st
     );
     // The manager is asked about the service the daemon is in before the scope is: the first
     // environment's worker, whose service the second `kr new` ran in.
-    let service = format!("{}.service", control_group_of_worker(&host, &inside));
+    let service = control_group_of_worker(&host, &inside);
     let asked = recorded
         .iter()
         .position(|call| {
