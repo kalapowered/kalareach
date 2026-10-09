@@ -1688,7 +1688,8 @@ turned off. A member's account name is shown as the organisation signed it.
 `kr pair invite --view --organisation <id>` fills in the requirement from the host's enrolment in
 that organisation. The host refuses a proposal that requires an organisation it is not enrolled in,
 names another enrolment revision, or carries a right above what an owner of an organisation may
-hold. The owner device that is asked to confirm the invitation is shown the organisation and the
+hold. The owner device that is asked to confirm the invitation is told that it answers to the
+organisation's membership, and, where the prompt's line has room, which organisation and which
 enrolment revision.
 
 ## `kr host import-journals`

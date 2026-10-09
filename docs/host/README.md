@@ -2616,8 +2616,9 @@ the enrolment's revision. Any grant that requires the organisation names that re
 refuses a proposed grant that requires an organisation the host is not enrolled in, names another
 revision, or carries a right above what the organisation's owner role may hold, so an invitation
 cannot be issued for access that nothing could use. The owner device that confirms such an
-invitation, or a device being added under such a grant, is told which organisation and which
-enrolment revision the grant names. `kr pair invite --organisation <id>` fills the requirement in.
+invitation, or a device being added under such a grant, is told that the grant answers to an
+organisation's membership. Where the prompt's line has room it also names the organisation and the
+enrolment revision, and the companion lists both in full. `kr pair invite --organisation <id>` fills the requirement in.
 
 `organisation.list`, served at both doors to a device that manages the host, lists the organisations
 the host is enrolled in. For each it reports the identifier of its first key, the anchor's revision
