@@ -1300,6 +1300,32 @@ async fn a_workers_endpoint_is_open_to_its_owner_alone() {
     close(&mut client, &host, created.session.session_id).await;
 }
 
+/// KR-REQ-07.58: a worker the detached start launches, which is the start of a host with no
+/// service manager to own it, leads a session of its own: it is not in the daemon's session or on
+/// the daemon's terminal, so nothing aimed at either reaches it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_the_detached_start_launches_leads_a_session_of_its_own() {
+    let host = Host::create();
+    let _daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    let worker = worker_of(&host, created.session.session_id);
+    let pid = rustix::process::Pid::from_raw(i32::try_from(worker.pid.get()).expect("a pid"))
+        .expect("a process number");
+    assert_eq!(
+        rustix::process::getsid(Some(pid)).expect("the worker's session"),
+        pid,
+        "the worker leads a session"
+    );
+    assert_ne!(
+        rustix::process::getsid(Some(pid)).expect("the worker's session"),
+        rustix::process::getsid(None).expect("the daemon's session"),
+        "and it is not the daemon's"
+    );
+    close(&mut client, &host, created.session.session_id).await;
+}
+
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell. The daemon asks its supervisor to start the worker and nothing else: no plugin runtime
 /// or other separately supervised service, lazily or otherwise. And nothing the worker itself
