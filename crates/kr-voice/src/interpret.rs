@@ -192,47 +192,91 @@ impl DelegationInterpreter for GrammarInterpreter {
     }
 }
 
+/// Marks a token may begin with: an opening quotation mark or bracket.
+const OPENING: &[char] = &['"', '(', '\''];
+
+/// Marks a token may end with: the stop of a sentence, or a closing quotation mark or bracket.
+const CLOSING: &[char] = &['.', ',', '!', '?', ';', ':', '\u{2026}', ')', '"', '\''];
+
 /// The words of `spoken`, lower-cased.
 ///
-/// Sentence punctuation after a word ("three.", "three?") and quotation marks round it are not part
-/// of it, a hyphen between two letters stands for the space it joins ("twenty-three"), and an
-/// apostrophe inside a word is dropped ("what's" is "whats"). Anything else stays in the word, so
-/// that a sign or a point beside a number leaves a token that is no number: "-3", ".3", "3.5" and
-/// "1,000" are each refused as numbers and never read as the digits they hold.
+/// The rule that decides what a word is: **a character leaves a token only at its ends, or as a
+/// mark that stands for a space or for nothing between two letters.** The ends of a token lose an
+/// opening quotation mark or bracket at the front and a stop, a closing quotation mark or a
+/// closing bracket at the back ("three.", "three?", "\"three\""). Inside a token, an apostrophe
+/// between two letters is dropped ("what's" is "whats") and a hyphen that follows a letter stands
+/// for the space it joins ("twenty-three", and "twenty-" at the end of one fragment before "three"
+/// in the next). Nothing else is ever removed, so no mark between two words or inside a number
+/// disappears and leaves a different number behind: "-3", ".3", "3.5", "1,000", "3'4" and "3,please"
+/// are each one token that is no number, and a mark standing alone between two words ("session . 3")
+/// is a token of its own that no request holds. A mark standing alone closes the utterance only
+/// when it is the last thing said ("session 3 ."), where it is dropped.
 fn words_of(spoken: &str) -> Vec<String> {
     let mut words = Vec::new();
-    for raw in spoken.split_whitespace() {
-        let trimmed = raw
-            .trim_start_matches(['"', '\u{201c}', '\u{2018}', '(', '\''])
-            .trim_end_matches([
-                '.', ',', '!', '?', ';', ':', ')', '"', '\u{201d}', '\u{2019}', '\'',
-            ]);
-        let word: String = trimmed
-            .chars()
-            .filter(|character| !matches!(character, '\'' | '\u{2019}'))
-            .flat_map(char::to_lowercase)
-            .collect();
-        if word.is_empty() {
+    for raw in plain_marks(spoken).split_whitespace() {
+        let trimmed = raw.trim_start_matches(OPENING).trim_end_matches(CLOSING);
+        if trimmed.is_empty() {
+            words.push(raw.to_owned());
             continue;
         }
-        // A hyphen joins two letters, or it belongs to the token.
+        let characters: Vec<char> = trimmed.chars().flat_map(char::to_lowercase).collect();
+        let letter_before = |index: usize| index > 0 && characters[index - 1].is_alphabetic();
+        let letter_after = |index: usize| {
+            characters
+                .get(index + 1)
+                .is_some_and(|next| next.is_alphabetic())
+        };
+        let word: String = characters
+            .iter()
+            .enumerate()
+            .filter(|&(index, each)| {
+                !(*each == '\'' && letter_before(index) && letter_after(index))
+            })
+            .map(|(_, each)| *each)
+            .collect();
+        // Only hyphens that follow a letter and join it to a letter, or to the end of the token,
+        // are spaces. A token with any other hyphen stays whole.
         let characters: Vec<char> = word.chars().collect();
-        let joins_letters = characters.contains(&'-')
+        let joins = characters.contains(&'-')
             && characters.iter().enumerate().all(|(index, each)| {
                 *each != '-'
                     || (index > 0
                         && characters[index - 1].is_alphabetic()
                         && characters
                             .get(index + 1)
-                            .is_some_and(|next| next.is_alphabetic()))
+                            .is_none_or(|next| next.is_alphabetic()))
             });
-        if joins_letters {
-            words.extend(word.split('-').map(str::to_owned));
+        if joins {
+            words.extend(
+                word.split('-')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned),
+            );
         } else {
             words.push(word);
         }
     }
+    while words
+        .last()
+        .is_some_and(|word| word.chars().all(|each| CLOSING.contains(&each)))
+    {
+        words.pop();
+    }
     words
+}
+
+/// `spoken` with the variants of a quotation mark, an apostrophe and a hyphen that a transcript
+/// writes put as the plain mark, so that one rule reads them all.
+fn plain_marks(spoken: &str) -> String {
+    spoken
+        .chars()
+        .map(|each| match each {
+            '\u{2018}' | '\u{2019}' | '\u{02bc}' | '`' => '\'',
+            '\u{201c}' | '\u{201d}' | '\u{201e}' => '"',
+            '\u{2010}' | '\u{2011}' => '-',
+            other => other,
+        })
+        .collect()
 }
 
 /// `words` without the courtesies a person puts round a request.

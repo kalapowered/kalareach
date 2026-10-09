@@ -7,10 +7,12 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-15.11 | `the_grammar_reads_the_requests_it_holds_and_nothing_else` |
+//! | KR-REQ-15.11 | `the_grammar_reads_the_requests_it_holds_and_nothing_else`, `a_mark_in_or_beside_a_number_leaves_no_number` |
 
-use kr_protocol::scalars::U64;
+use kr_protocol::ids::SessionId;
+use kr_protocol::scalars::{U64, Uuid};
 use kr_protocol::voice::{FragmentText, TranscriptFragment, VoiceAction};
+use kr_voice::interpret::SpokenDestination;
 use kr_voice::{DelegationInterpreter, GrammarInterpreter, Misread};
 
 fn fragments(texts: &[&str]) -> Vec<TranscriptFragment> {
@@ -82,9 +84,23 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["status session twenty three"], (Status, Some(23))),
         (&["status session ninety nine"], (Status, Some(99))),
         (&["status session 104"], (Status, Some(104))),
-        // Said in pieces: the fragments are one utterance.
+        (&["status session twenty\u{2011}three"], (Status, Some(23))),
+        // Said in pieces: the fragments are one utterance, and a piece may end in the hyphen.
         (&["status of", "session", "three"], (Status, Some(3))),
         (&["Go to", "session 5."], (Navigate, Some(5))),
+        (&["status of session twenty-", "three"], (Status, Some(23))),
+        // Marks round the words: quotation marks, brackets, the stops of a sentence, an apostrophe
+        // in a word written straight or curly, and a mark that closes the utterance on its own.
+        (&["\u{201c}Status of session 3.\u{201d}"], (Status, Some(3))),
+        (&["\"Open session (6)\""], (Navigate, Some(6))),
+        (
+            &["What\u{2019}s the status of session 3"],
+            (Status, Some(3)),
+        ),
+        (&["what's the status of session 3?!"], (Status, Some(3))),
+        (&["status of session 3\u{2026}"], (Status, Some(3))),
+        (&["status of session 3 ."], (Status, Some(3))),
+        (&["status of session 3", "?"], (Status, Some(3))),
     ];
     for (texts, expected) in reads {
         assert_eq!(read(texts), Ok(*expected), "{texts:?}");
@@ -123,6 +139,18 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["status session +3"], Misread::UnreadableNumber),
         (&["go to session 3/4"], Misread::UnreadableNumber),
         (&["status session - 3"], Misread::UnreadableNumber),
+        (&["open session ."], Misread::UnreadableNumber),
+        (&["open session .", "3"], Misread::UnreadableNumber),
+        (&["open session (", "3)"], Misread::UnreadableNumber),
+        (&["status session 3'4"], Misread::UnreadableNumber),
+        (&["status session 1\u{2019}000"], Misread::UnreadableNumber),
+        (&["status session #3"], Misread::UnreadableNumber),
+        // A point or a comma with no space after it is how a decimal or a thousand is written, so
+        // "3,please" is no number followed by a word.
+        (&["status session 3,please"], Misread::UnreadableNumber),
+        // A mark that is not a stop stays a word, wherever it stands.
+        (&["status session 3 -"], Misread::NotARequest),
+        (&["status \u{2014} session 3"], Misread::NotARequest),
         // A number that cannot be read.
         (&["status session"], Misread::UnreadableNumber),
         (&["status session banana"], Misread::UnreadableNumber),
@@ -136,4 +164,54 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
     for (texts, expected) in refused {
         assert_eq!(read(texts), Err(*expected), "{texts:?}");
     }
+}
+
+/// KR-REQ-15.11: no mark disappears from the middle of a number or from between the words that
+/// name it, whatever the mark and however the transcript spaces it, so that the session read is
+/// never one the person did not say. Only a quotation mark or a bracket right before a number is set
+/// aside.
+#[test]
+fn a_mark_in_or_beside_a_number_leaves_no_number() {
+    const QUOTATION: &[&str] = &[
+        "(", "\"", "'", "\u{201c}", "\u{2018}", "\u{201d}", "\u{2019}",
+    ];
+    const OTHER: &[&str] = &[
+        ".", ",", ";", ":", "!", "?", "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}",
+        "\u{2013}", "\u{2014}", "\u{2011}", ")",
+    ];
+    for mark in QUOTATION.iter().chain(OTHER) {
+        for utterance in [
+            format!("open session {mark} 3"),
+            format!("open session 3 {mark} 3"),
+            format!("open session 3{mark}3"),
+        ] {
+            assert!(
+                read(&[&utterance]).is_err(),
+                "{utterance:?} names no session"
+            );
+        }
+        // The same across the boundary of two fragments.
+        assert!(
+            read(&[&format!("open session {mark}"), "3"]).is_err(),
+            "{mark:?} then 3 names no session"
+        );
+    }
+    for mark in OTHER {
+        let utterance = format!("open session {mark}3");
+        assert!(
+            read(&[&utterance]).is_err(),
+            "{utterance:?} names no session"
+        );
+    }
+}
+
+/// What a person said is content, and a destination the host holds prints without it, so that a
+/// log line or a panic message that shows one shows the session and not the words.
+#[test]
+fn a_spoken_destination_prints_without_the_words() {
+    let destination = SpokenDestination {
+        session_id: SessionId::new(Uuid::from_bytes([7; 16])),
+        spoken_text: "the words nobody should log".to_owned(),
+    };
+    assert!(!format!("{destination:?}").contains("nobody"));
 }
