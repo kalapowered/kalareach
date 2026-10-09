@@ -726,6 +726,9 @@ async fn a_short_delay_the_service_names_is_waited_out_by_the_carrier_and_not_by
     let web = Arc::clone(rig.served.web());
     within("the first status read", web.requests_reach(STATUS, 1)).await;
     let asked = web.requests_to(STATUS);
+    // The enrolment's wake is spent before the work arrives, so the one pass that follows is the
+    // admission's, and the wait it asks for is the first the timer holds.
+    rig.enrol_the_writer_and_let_the_carrier_settle().await;
     web.fail(
         STATUS,
         1,
@@ -735,37 +738,29 @@ async fn a_short_delay_the_service_names_is_waited_out_by_the_carrier_and_not_by
             retry_after_seconds: Some(2),
         },
     );
-    let runtime = rig.controller.backup_runtime().expect("a carrier");
-    let finished = *runtime.passes().borrow();
-    rig.admit(1, &[(1, plaintext(2048))]);
-    rig.until("the pass finishes", |_| {
-        *runtime.passes().borrow() > finished
-    })
-    .await;
+    rig.admit_to_an_enrolled_archive(1, &[(1, plaintext(2048))]);
+    let (waited, _) = within("the carrier waits out the delay", timer.next_wait()).await;
 
+    assert!(
+        waited >= Duration::from_secs(2),
+        "the carrier waits out the delay the service named: {waited:?}"
+    );
     assert_eq!(
         web.requests_to(STATUS),
         asked + 1,
         "nothing was sent inside the delay the service named"
-    );
-    assert!(
-        timer
-            .asked_for()
-            .iter()
-            .any(|waited| *waited >= Duration::from_secs(2)),
-        "the carrier waits out the delay: {:?}",
-        timer.asked_for()
     );
 }
 
 /// A publication the service turned back as an outcome it cannot say is not sent again blind: the
 /// next look at the service asks whether it holds the generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_publication_the_service_cannot_settle_is_found_by_the_fetch_and_not_sent_again() {
+async fn a_publication_the_service_cannot_settle_is_asked_after_and_not_sent_again() {
     let timer = HeldTimer::held();
     let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
     let web = Arc::clone(rig.served.web());
     within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.enrol_the_writer_and_let_the_carrier_settle().await;
     web.fail(
         MANIFEST,
         1,
@@ -775,7 +770,7 @@ async fn a_publication_the_service_cannot_settle_is_found_by_the_fetch_and_not_s
             retry_after_seconds: None,
         },
     );
-    rig.admit(1, &[(1, plaintext(2048))]);
+    rig.admit_to_an_enrolled_archive(1, &[(1, plaintext(2048))]);
     let (_, first) = within("the first pass is held back", timer.next_wait()).await;
     let runtime = rig.controller.backup_runtime().expect("a carrier");
     let finished = *runtime.passes().borrow();
@@ -785,14 +780,20 @@ async fn a_publication_the_service_cannot_settle_is_found_by_the_fetch_and_not_s
     })
     .await;
 
-    let publications = web
-        .arrived()
-        .iter()
-        .filter(|request| request.body.get("publish").is_some())
-        .count();
+    let sent = |member: &str| {
+        web.arrived()
+            .iter()
+            .filter(|request| request.body.get(member).is_some())
+            .count()
+    };
     assert_eq!(
-        publications, 1,
+        sent("publish"),
+        1,
         "the publication the service could not settle was not sent again"
+    );
+    assert!(
+        sent("fetch") >= 1,
+        "the pass after it asked the service what it holds"
     );
     assert!(!rig.published(1));
 }
