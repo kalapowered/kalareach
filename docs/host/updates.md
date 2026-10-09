@@ -134,8 +134,9 @@ Only the current release's `kr` updates the host. An update, in order:
    does not stop, because its attempt is over, holds the update: the daemons not yet told resume,
    and those already told are waited for to have gone, up to thirty seconds from the last telling,
    before anything is started again. Once every daemon has stopped, it holds every environment's
-   lock and the writers' lock (see "The writers' lock"), reads every store the new release lists and refuses the switch, naming each, when one is at
-   a version the new release does not read (see "Rolling back"), brings forward any registry that
+   lock and the writers' lock (see "The writers' lock"), reads every store the new release lists and
+   refuses the switch, naming each, when one is at a version the new release does not read (see
+   "Rolling back"), brings forward any registry that
    records an earlier schema (see "Environments whose daemon did not run"), and reads every
    environment's registry as it is. A log that a daemon ended by a
    signal left beside the registry is taken into its file first, as the daemon's own stop would
@@ -143,8 +144,8 @@ Only the current release's `kr` updates the host. An update, in order:
    and the run then starts again what it stopped and exits with 1. A worker at a level the new
    release does not retain, a worker that does not answer its challenge and has not ended, and a
    session still being started each hold the update;
-6. switches `current` in one rename, records the switch, lets go of the locks, starts each daemon as it was started
-   before, now from the new release, and waits for each to answer as a daemon of it;
+6. switches `current` in one rename, records the switch, lets go of the locks, starts each daemon as
+   it was started before, now from the new release, and waits for each to answer as a daemon of it;
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
    for a later update, and not one a running program holds.
 
@@ -388,11 +389,11 @@ Note that the version number may not be present in records written to other stor
 
 Some records are written by commands, not by the daemon. These are the configuration document, the service start’s record, the startup entries, the saved terminal preference, the answers kept on a device and the plan for merging two machines. These all exist at particular versions. A switch is refused when a store is at a version the release switched to does not read, but that check runs once, and a command could write a version after it and before the switch.
 
-To prevent commands and an update from writing these records at the same time, a command that writes one of these records holds `writers.lock` in the store, shared, while it writes. It requests permission to write the record before making any changes. An update takes this lock exclusively after it has taken all the environments’ locks but before it checks the stores. It releases this lock once it has switched `current` and recorded the switch. If a command cannot immediately take the lock then it outputs a message to standard error once and then waits for up to 30 seconds to take it. If the update has not yet released the lock by this time then the command exits with a non-zero exit code of 9 and will write the record if the command is run again. If a command has not released the lock after 30 seconds then the update starts again every daemon that it has stopped and exits with a non-zero exit code of 9.
+To keep a command from writing one of these records between the check and the switch, a command that writes one holds `writers.lock` in the store, shared, while it writes. It requests permission to write the record before making any changes. An update takes this lock exclusively after it has taken all the environments’ locks but before it checks the stores. It releases this lock once it has switched `current` and recorded the switch. If a command cannot immediately take the lock then it outputs a message to standard error once and then waits for up to 30 seconds to take it. If the update has not yet released the lock by this time then the command exits with a non-zero exit code of 9 and writes nothing. Run again once the update has finished, it is judged by the release now current. If a command has not released the lock after 30 seconds then the update starts again every daemon that it has stopped and exits with a non-zero exit code of 9, or of 1 when a daemon it stopped does not start again.
 
 A command writes a record while holding this lock by first reading the manifest of the release that is the current release in the store. It can then write a record that is not mentioned in the manifest as the current release will not read it. It can write a record that is mentioned in the manifest if the manifest mentions it at the same version that this `kr` will write it at. Otherwise it will not write the record and will output the version that the manifest has the record at and the version that it would have written the record at. This prevents a `kr` that was running when a switch was performed and which is now out of date, or is newer than the current release, from writing a record that the current release cannot read. The user will need to run the command again with the `kr` of the current release. A command will read the saved terminal preference or kept answers, under their respective locks, before replacing them. If it can’t read these records, either because they are at a later version or because they cannot be read at all, it will not write a new record. The command `kr host terminal --clear` can be used to delete the saved terminal preference. The user will need to manually move aside a damaged kept answers record.
 
-A `kr` that is not from an installed release, for example a developmental `kr` or one from an archive that has been unpacked, will not take this lock. Neither will a `kr` from a release that does not have this lock. The check looks only in the roots that a daemon of the store recorded, and a command writes where its variables point. The configuration document that a daemon started later with other variables would read is not looked at. A daemon of an environment the update could not reach keeps its release, and writes the configuration document of that release after a rollback. Until these issues are closed, the update suite will keep all of these records at versions that can be read by all releases that mention the stores (currently version 1, apart from the configuration document which is at version 2).
+Four gaps remain. A `kr` that is not from an installed release, for example a developmental `kr` or one from an archive that has been unpacked, will not take this lock. The check looks only in the roots that a daemon of the store recorded, and a command writes where its variables point. The configuration document that a daemon started later with other variables would read is not looked at. A daemon of an environment the update could not reach keeps its release, and writes the configuration document of that release after a rollback. Until each is closed, the update suite will keep all of these records at versions that can be read by all releases that mention the stores (currently version 1, apart from the configuration document which is at version 2). A release that does not have this lock holds nothing off, so the oldest release this host can be updated from sets the lowest version that a release with the lock may require its programs to read.
 
 ### What a release says about its stores
 
@@ -423,5 +424,5 @@ It is worth noting what the check does not do: it does not compare the lock with
 A Windows host keeps no store: a directory link there cannot be replaced in one step by a user who
 does not administer the machine. Its installer replaces the release, and `kr host install`,
 `kr host update`, `kr host rollback` and `kr host versions` say so. With no store there is no
-writers' lock to take and no release to read it from, so a command that writes a stored record is
-never held off or refused there.
+writers' lock to take and no release to read it from, so the lock never holds a command off or
+refuses it there. A record's own format check still applies.
