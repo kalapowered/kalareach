@@ -194,6 +194,49 @@ impl Rig {
     ) -> Result<HostDoctorResult, kr_client::ClientError> {
         session.read(Method::HostDoctor, &()).await
     }
+
+    /// Stops the daemon and starts it again while the feed cannot be reached, so that what it
+    /// knows of the feed is what it wrote down. A suite closes its clients before it restarts.
+    async fn restarted_while_the_feed_is_down(self) -> (Host, Served) {
+        let Self { host, served, .. } = self;
+        for nth in 1..=4 {
+            served.web().fail(
+                AUTHORITY,
+                nth,
+                Moment::Refuse {
+                    status: 503,
+                    code: "SERVICE_UNAVAILABLE",
+                    retry_after_seconds: None,
+                },
+            );
+        }
+        let stopped = host.shut_down().await;
+        let timer = HeldTimer::held();
+        let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        (host, served)
+    }
+
+    /// How many requests of one kind (`read`, `revise`, `acknowledge`, ...) reached the feed.
+    fn arrivals(&self, operation: &str) -> usize {
+        self.served
+            .web()
+            .arrived()
+            .iter()
+            .filter(|arrived| arrived.path == AUTHORITY && arrived.body.get(operation).is_some())
+            .count()
+    }
+
+    /// What the feed holds of one request, as its publisher reads it.
+    async fn held(
+        &self,
+        request: &RevocationRequest,
+    ) -> kr_client::services::authority::AuthorityFeedRecord {
+        self.feed_as_the_owner_sees_it()
+            .await
+            .record(request.request_id)
+            .expect("the record")
+            .clone()
+    }
 }
 
 /// A failure guard for a test that waits on a condition: the tests decide on what the daemon did,
@@ -705,29 +748,7 @@ async fn a_grant_that_rests_on_the_feed_is_refused_after_it_removes_the_host_unt
     session.close();
     drop(session);
     drop(local);
-    let Rig {
-        host,
-        served,
-        owner,
-        ..
-    } = rig;
-    let origin = served.origin().to_owned();
-    // The feed cannot be reached when the host starts again, so the removal it knows is the one it
-    // wrote down.
-    for nth in 1..=4 {
-        served.web().fail(
-            AUTHORITY,
-            nth,
-            Moment::Refuse {
-                status: 503,
-                code: "SERVICE_UNAVAILABLE",
-                retry_after_seconds: None,
-            },
-        );
-    }
-    let stopped = host.shut_down().await;
-    let timer = HeldTimer::held();
-    let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+    let (host, served) = rig.restarted_while_the_feed_is_down().await;
     let again = connect(&host, &phone, &record).await;
     let refused = again
         .read::<_, HostDoctorResult>(Method::HostDoctor, &())
@@ -738,7 +759,6 @@ async fn a_grant_that_rests_on_the_feed_is_refused_after_it_removes_the_host_unt
         refused.to_string().contains("was removed"),
         "refused for the feed's removal and not for something else: {refused}"
     );
-    let _ = (owner, origin);
     drop(served);
 }
 
@@ -968,4 +988,430 @@ async fn a_host_that_stops_after_a_request_took_effect_and_before_it_was_written
         "carried out once"
     );
     drop(served);
+}
+
+/// A request the feed holds again after it dropped the original is the request the host already
+/// carried out: it is acknowledged under the revision it was first issued, which the feed has long
+/// been past, and the requests after it are carried out. Nothing the host issued since can leave a
+/// request that was numbered before it unable to be finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_feed_holds_again_is_acknowledged_under_its_first_revision_and_blocks_none() {
+    let rig = Rig::start().await;
+    let (_first_phone, first_device) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_second_phone, second_device) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_third_phone, third_device) = rig.pairs(&[ActionRight::SessionView]).await;
+    let first = rig
+        .owner_publishes(0xc1, devices(first_device.device_id))
+        .await;
+    rig.poll().await;
+    let first_revision = rig
+        .held(&first)
+        .await
+        .acknowledgement
+        .0
+        .expect("acknowledged")
+        .authority_revision;
+    rig.owner_publishes(0xc2, devices(second_device.device_id))
+        .await;
+    rig.poll().await;
+
+    // A week later the feed has dropped what the host finished with, and the same signed request
+    // is published again, with a new one behind it.
+    rig.served.web().a_week_passes_in_the_feeds();
+    rig.remote
+        .publish(rig.feed(), &first, None)
+        .await
+        .expect("the feed takes the request again");
+    let after = rig
+        .owner_publishes(0xc3, devices(third_device.device_id))
+        .await;
+    rig.poll().await;
+
+    let again = rig
+        .held(&first)
+        .await
+        .acknowledgement
+        .0
+        .expect("the host acknowledged the request again");
+    assert_eq!(again.completion, RevocationCompletion::Complete);
+    assert_eq!(
+        again.authority_revision, first_revision,
+        "under the revision it was first issued"
+    );
+    let carried = rig
+        .held(&after)
+        .await
+        .acknowledgement
+        .0
+        .expect("the request behind it was carried out");
+    assert_eq!(carried.completion, RevocationCompletion::Complete);
+    assert!(carried.authority_revision > first_revision);
+}
+
+/// A second request for what an earlier one withdrew is refused as covered, and a refusal that
+/// never reached the feed is made again by the next pass: the host issues no revision for it, and
+/// the requests after it are carried out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_request_for_what_was_withdrawn_is_refused_again_when_the_refusal_is_lost() {
+    let rig = Rig::start().await;
+    let (_first_phone, first_device) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_second_phone, second_device) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.owner_publishes(0xd1, devices(first_device.device_id))
+        .await;
+    rig.poll().await;
+    let again = rig
+        .owner_publishes(0xd2, devices(first_device.device_id))
+        .await;
+
+    // The pass reads (1) and refuses the second request (2): the refusal never arrives.
+    rig.served.web().fail(AUTHORITY, 2, Moment::Before);
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&again).await.rejected.0,
+        None,
+        "the refusal was lost"
+    );
+
+    let after = rig
+        .owner_publishes(0xd3, devices(second_device.device_id))
+        .await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&again).await.rejected.0,
+        Some(RejectionReason::Superseded)
+    );
+    let carried = rig
+        .held(&after)
+        .await
+        .acknowledgement
+        .0
+        .expect("the request behind it was carried out");
+    assert_eq!(carried.completion, RevocationCompletion::Complete);
+    assert_eq!(
+        rig.arrivals("revise"),
+        2,
+        "a revision for each request that withdrew something, and none for the one that did not"
+    );
+}
+
+/// A pass that fails waits out a backoff before it asks the feed again, as a pass that reads the
+/// feed waits out its interval, and the request the failure left is finished by the pass after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_fails_waits_out_a_backoff_and_then_finishes_the_request() {
+    let rig = Rig::start().await;
+    let (_phone, device) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.poll().await;
+    let request = rig.owner_publishes(0xf1, devices(device.device_id)).await;
+
+    // The pass reads (1), issues its revision (2) and acknowledges (3): the feed turns the
+    // acknowledgement back, naming no delay.
+    rig.served.web().fail(
+        AUTHORITY,
+        3,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
+    );
+    rig.poll().await;
+    let poll_interval = Duration::from_millis(kr_controller::grants::feed::FEED_POLL_INTERVAL_MS);
+    let (backoff, release) = within(
+        "the carrier asks for a wait shorter than its poll interval",
+        rig.timer.next_wait_under(poll_interval),
+    )
+    .await;
+    assert!(backoff > Duration::ZERO);
+
+    release.notify_one();
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&request)
+            .await
+            .acknowledgement
+            .0
+            .expect("acknowledged by the pass after the backoff")
+            .completion,
+        RevocationCompletion::Complete
+    );
+}
+
+/// The host decides the issuer of a request as it decides the same device's own revocation: a
+/// device whose grant carries the right to manage the host, and that this host's configuration
+/// leaves no right to manage with, has no owner authority by the feed either, and what it names is
+/// not withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_the_configuration_leaves_no_right_to_manage_the_host_has_no_authority_by_the_feed()
+ {
+    let rig = Rig::start().await;
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+
+    // The configuration allows a grant to carry the right to view a session and nothing else.
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = 2;
+    document.authority.origin = Nullable::some(rig.served.origin().to_owned());
+    document.ceilings.grant_rights =
+        Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]);
+    let environment = rig.host.tree().environment();
+    let path = kr_worker::config::document_path(&environment);
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("the document");
+    let effective = rig.host.controller().effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "{:?}",
+        effective.not_in_force
+    );
+
+    let request = rig.owner_publishes(0xe1, devices(record.device_id)).await;
+    rig.poll().await;
+
+    assert_eq!(
+        rig.held(&request).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority)
+    );
+    let session = connect(&rig.host, &phone, &record).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("what the request named was not withdrawn");
+}
+
+/// A feed longer than a pass reads is not read through, so it is not a synchronisation: the host
+/// goes on at the cursor in the next pass, and shows the synchronisation only when it has read to
+/// the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_read_through() {
+    let rig = Rig::start().await;
+    rig.runtime().read_at_most_pages(1);
+    let synchronised = rig.shown().await.list.feed_synchronised_at_ms.0;
+    assert!(synchronised.is_some(), "the host has read the feed once");
+
+    // One page holds 64 records, and these are 70. The feed keeps a publisher to 32 of what the
+    // host has not finished with, so three keys publish them.
+    let unknown = |id: u8| {
+        devices(DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [id; 16],
+        )))
+    };
+    let strangers = [
+        AuthorisationKeyPair::generate().expect("a key"),
+        AuthorisationKeyPair::generate().expect("a key"),
+    ];
+    for id in 1..=70_u8 {
+        let (key, client) = match id {
+            1..=32 => (&rig.owner.authorisation, &rig.remote),
+            33..=64 => (
+                &strangers[0],
+                &client_for(rig.served.origin(), strangers[0].clone()),
+            ),
+            _ => (
+                &strangers[1],
+                &client_for(rig.served.origin(), strangers[1].clone()),
+            ),
+        };
+        let request = rig.signed_by(key, id, unknown(id));
+        client
+            .publish(rig.feed(), &request, None)
+            .await
+            .expect("the feed stores the request");
+    }
+    rig.poll().await;
+    assert_eq!(
+        rig.shown().await.list.feed_synchronised_at_ms.0,
+        synchronised,
+        "a pass that left records unread is no synchronisation"
+    );
+    // A publisher reads what it published. The last six are the second page, which the pass did
+    // not reach.
+    let last_publisher = client_for(rig.served.origin(), strangers[1].clone());
+    let last = || async {
+        last_publisher
+            .read(rig.feed(), None, false)
+            .await
+            .expect("the last publisher reads its records")
+    };
+    let unread = last().await;
+    assert_eq!(unread.records.len(), 6);
+    assert!(
+        unread
+            .records
+            .iter()
+            .all(|record| record.rejected.0.is_none()),
+        "the pass left the last records for the next"
+    );
+
+    rig.timer.release_held();
+    rig.poll().await;
+    assert!(
+        last()
+            .await
+            .records
+            .iter()
+            .all(|record| record.rejected.0.is_some()),
+        "the next pass went on at the cursor and read the feed through"
+    );
+}
+
+/// A connection waits for the synchronisation section 10 asks for only as long as the bound: a feed
+/// that holds the read open does not hold the device out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_bound() {
+    let rig = Rig::start().await;
+    rig.runtime()
+        .wait_for_a_synchronisation_at_most(Duration::from_millis(100));
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.poll().await;
+
+    rig.served.web().fail(AUTHORITY, 1, Moment::Hold);
+    let session = within(
+        "the connection is served",
+        connect(&rig.host, &phone, &record),
+    )
+    .await;
+    rig.doctor_as(&session)
+        .await
+        .expect("served while the feed still holds the read");
+    // The read is still held: a connection served after the host gave the read up would find the
+    // feed unreachable instead.
+    assert!(!rig.shown().await.list.feed_stale);
+    rig.served.web().release_held();
+}
+
+/// A removal the registry cannot take is still in force: what rests on the feed is refused, the
+/// carrier asks again, and the removal is written when the registry can. A host that starts again
+/// with the feed down keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_the_registry_cannot_take_is_in_force_and_is_written_when_it_can() {
+    let rig = Rig::start().await;
+    rig.the_owner_bounds_offline_validity();
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    let session = connect(&rig.host, &phone, &record).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("inside the bound, with the feed standing");
+
+    let registry =
+        rusqlite::Connection::open(rig.host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_removal BEFORE INSERT ON host_authority
+             WHEN NEW.key IN ('feed_removal', 'policy')
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    rig.the_feed_removes_the_host().await;
+    let refused = rig
+        .doctor_as(&session)
+        .await
+        .expect_err("the grant rests on a feed that removed the host");
+    assert!(
+        refused.to_string().contains("was removed"),
+        "refused for the feed's removal: {refused}"
+    );
+
+    registry
+        .execute_batch("DROP TRIGGER refuse_removal")
+        .expect("the fault is lifted");
+    rig.timer.release_held();
+    rig.poll().await;
+    session.close();
+    drop(session);
+    drop(registry);
+    let (host, served) = rig.restarted_while_the_feed_is_down().await;
+    let again = connect(&host, &phone, &record).await;
+    let refused = again
+        .read::<_, HostDoctorResult>(Method::HostDoctor, &())
+        .await
+        .expect_err("the removal was written down once the registry could take it");
+    assert!(refused.to_string().contains("was removed"), "{refused}");
+    drop(served);
+}
+
+/// A pass this host could not finish for a reason of its own is no synchronisation either: what is
+/// shown of the feed is stale, as it is when the feed cannot be reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_this_host_could_not_finish_leaves_what_is_shown_stale() {
+    let rig = Rig::start().await;
+    let (_phone, device) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.poll().await;
+    assert!(
+        !rig.shown().await.list.feed_stale,
+        "the control: it is current"
+    );
+
+    // The registry cannot take the note this host writes before it carries a request out.
+    let registry =
+        rusqlite::Connection::open(rig.host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_note BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'feed'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    rig.owner_publishes(0xf2, devices(device.device_id)).await;
+    rig.poll().await;
+    assert!(
+        rig.shown().await.list.feed_stale,
+        "a pass that stopped for a reason of this host's is no synchronisation"
+    );
+
+    registry
+        .execute_batch("DROP TRIGGER refuse_note")
+        .expect("the fault is lifted");
+    rig.poll().await;
+    assert!(!rig.shown().await.list.feed_stale);
+}
+
+/// A request whose issuer's authority rests on a bound the synchronisation in progress renews is
+/// judged again by the next pass, and not refused for the bound: a host that was out of reach of
+/// its feed longer than the owner's bounded offline validity would otherwise refuse the one request
+/// that tells it who to revoke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_waits_for_the_synchronisation_that_renews_its_issuers_bound() {
+    let rig = Rig::start().await;
+    let (_phone, device) = rig.pairs(&[ActionRight::SessionView]).await;
+    // Every pass the pairing asked for has run, so none renews the bound before the request is
+    // judged.
+    rig.poll().await;
+    rig.poll().await;
+    // The owner chose a bound of an hour, and the host last synchronised two hours ago.
+    let now = kr_ipc::now_ms().get();
+    rig.host
+        .controller()
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
+                    now - 2 * 60 * 60 * 1000,
+                )),
+            }));
+        })
+        .expect("the owner chooses a bound");
+    let request = rig.owner_publishes(0xf3, devices(device.device_id)).await;
+
+    rig.poll().await;
+    let held = rig.held(&request).await;
+    assert!(
+        held.acknowledgement.0.is_none() && held.rejected.0.is_none(),
+        "the pass that renews the bound neither carried the request out nor refused it"
+    );
+
+    rig.poll().await;
+    let held = rig.held(&request).await;
+    assert_eq!(held.rejected.0, None, "not refused for a bound that renews");
+    assert_eq!(
+        held.acknowledgement.0.expect("carried out").completion,
+        RevocationCompletion::Complete,
+        "carried out once the synchronisation had renewed the bound"
+    );
 }
