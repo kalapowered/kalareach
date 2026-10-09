@@ -2339,19 +2339,27 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
     // shell makes it: the record the worker leaves cannot name it, and only the group can end it.
     #[cfg(target_os = "linux")]
     if drifts {
-        // The stop of the one process that ignores the request is refused, as the kernel refuses
-        // one that belongs to another account: only the service manager can end it, and the
-        // closure must say it was forced.
-        let stubborn = named
-            .iter()
-            .find(|(name, _)| *name == "stubborn")
-            .map(|(_, identity)| identity.clone())
-            .expect("the tree's stubborn member");
+        // The stop of two of the processes that ignore the request is refused, as the kernel
+        // refuses one that belongs to another account: only the service manager can end them, and
+        // the closure must say it was forced. `orphan` stays in the service's group itself.
+        let member = |wanted: &str| {
+            named
+                .iter()
+                .find(|(name, _)| *name == wanted)
+                .map(|(_, identity)| identity.clone())
+                .unwrap_or_else(|| panic!("the tree's {wanted} member"))
+        };
+        let stubborn = member("stubborn");
         kr_controller::testing::refuse_stopping(stubborn.clone());
-        // That one is also moved into a control group below the service's, as a process of a
-        // session can be by what it runs: the manager's kill reaches it there, and the cleanup
-        // has to read it as the group's member to say it was forced. The service's group is the
-        // account's own to make groups in under a user service manager.
+        kr_controller::testing::refuse_stopping(member("orphan"));
+        until("the worker to stop, every thread of it", || {
+            hold_still(&worker).then_some(())
+        })
+        .await;
+        // `stubborn` is also moved into a control group two levels below the service's, as a
+        // process of a session can be by what it runs: the manager's kill reaches it there, and
+        // the cleanup has to read it as the group's member to say it was forced. The service's
+        // group is the account's own to make groups in under a user service manager.
         let below = Path::new("/sys/fs/cgroup")
             .join(
                 recorded_by(&host, session_id)
@@ -2359,20 +2367,16 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
                     .expect("the worker recorded its group")
                     .trim_start_matches('/'),
             )
-            .join("below");
-        std::fs::create_dir(&below).expect("makes a control group below the service's");
+            .join("below/under");
+        std::fs::create_dir_all(&below).expect("makes control groups below the service's");
         std::fs::write(below.join("cgroup.procs"), stubborn.pid.get().to_string())
             .expect("moves the stubborn process into it");
         let now = std::fs::read_to_string(format!("/proc/{}/cgroup", stubborn.pid.get()))
             .expect("its group");
         assert!(
-            now.trim().ends_with("/below"),
-            "the stubborn process is in the group below the service's: {now}"
+            now.trim().ends_with("/below/under"),
+            "the stubborn process is in a group below the service's: {now}"
         );
-        until("the worker to stop, every thread of it", || {
-            hold_still(&worker).then_some(())
-        })
-        .await;
         std::fs::write(host.temp.root().join("kr-go"), b"").expect("lets the shell go on");
         let drifter = until("the drifter to write its number", || {
             member_of(&host, "drifter")
