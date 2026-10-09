@@ -193,8 +193,9 @@ pub fn table() -> Vec<Store> {
                 protocol::<attention::ReviewAcknowledgeResult>("ReviewAcknowledgeResult"),
                 protocol::<attention::VisitAcknowledgeResult>("VisitAcknowledgeResult"),
                 protocol::<action::HostTimeState>("HostTimeState"),
-                // The `source` column of the cursors, the gaps, the items and the changes holds
-                // one of these, and the store refuses a row that holds another.
+                // The `source` of the cursors, the gaps, the items and the omitted ranges, and
+                // the `record_source` of the items, the changes and the pending inputs, hold one
+                // of these, and the store refuses a row that holds another.
                 Kept::Words(
                     "attention sources",
                     attention::AttentionSource::ALL
