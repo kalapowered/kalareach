@@ -821,11 +821,11 @@ fn check_declared_attachment(
 
 /// Builds the effect to compare from the invocation, refusing a plan that disagrees with it.
 ///
-/// The worker checks what only it can see: that the plan is for the action invoked, that it is of
-/// the class the declaration implies, that it carries the arguments the component was given, and
-/// that the operation is one the invocation can carry. Whether that operation is the one the action
-/// declared, and whether the binding holds the grant it needs, is the broker's to decide when the
-/// effect is validated.
+/// The worker checks what it can before anything is claimed for the plan: that the plan is for the
+/// action invoked, that it is of the class the declaration implies, that it carries the arguments
+/// the component was given, and that its operation is the one the action declared. The broker
+/// compares the operation again, against the declaration in force when the plan comes back, and
+/// decides whether the binding holds the grant it needs, when the effect is validated.
 fn effect_of(plan: &WirePlan, request: &PreparationRequest) -> Result<PreparedEffect> {
     let action = &request.params.action;
     if plan.action_id != action.as_str() {
