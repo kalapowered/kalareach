@@ -8845,6 +8845,11 @@ async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_
                 && message.contains(&format!("version {}", writes + 1)),
             "{store}: it names the record and both versions: {said}"
         );
+        let record = match store {
+            "terminal-preference" => refused.tree.environment().state_dir().join("terminal.json"),
+            _ => refused.tree.paths().state_root().join("shell-entries.json"),
+        };
+        assert!(!record.exists(), "{store}: nothing was written");
 
         // The control: a release that does not list the record does not stop the command with that.
         let unlisted = Host::bare();
@@ -10005,12 +10010,23 @@ const WRITTEN_BY_RELEASES_WITHOUT_THE_LOCK: [(&str, u32); 6] = [
 
 /// A way a record a command writes can reach a switch without the writers' lock, and the records it
 /// leaves exposed. While one is open, a record it exposes is not raised past its floor, however the
-/// lock is taken: closing the gap, or accepting what it permits, removes the line.
+/// lock is taken: closing the gap, or accepting what it permits for a record, removes the record
+/// from the line.
 struct OpenGap {
     /// What the gap is.
     what: &'static str,
     /// The records, by name, that it exposes.
     exposes: &'static [&'static str],
+}
+
+/// A limit that is accepted for one record, in the words the documents state it in.
+struct AcceptedLimit {
+    /// What the limit is.
+    what: &'static str,
+    /// The record it is accepted for.
+    record: &'static str,
+    /// What a person is told it costs.
+    statement: &'static str,
 }
 
 /// Every record a command writes.
@@ -10023,35 +10039,79 @@ const COMMAND_WRITTEN: &[&str] = &[
     "terminal-preference",
 ];
 
-/// The gaps that are open. The lock holds off the commands of an installed release; these are the ways
-/// a record gets past it:
-/// - a `kr` outside an installed release (a development build, an unpacked archive, another store's)
-///   takes no lock, and a state root does not name the store that serves it, so a store's update
-///   cannot hold such a command off;
-/// - the check of the stores looks only in the roots a daemon of the store recorded, and a command
-///   writes where its variables point;
-/// - the configuration document that a daemon started later with other variables would read is not
-///   looked at by the check, which finds it only where an earlier daemon said it read it;
-/// - a daemon in an environment the update could not reach keeps its release and writes the
-///   configuration document after a rollback.
-const OPEN_GAPS: [OpenGap; 4] = [
-    OpenGap {
-        what: "a kr outside an installed release takes no lock, and a state root names no store",
-        exposes: COMMAND_WRITTEN,
+/// The gaps that are open. The lock holds off the commands of an installed release, and what a
+/// command writes is registered with the store before it writes, so the check finds it; this is the
+/// way a record still gets past the lock:
+/// - a `kr` outside an installed release (a development build, an unpacked archive) takes no lock,
+///   and a state root does not name the store that serves it, so a store's update cannot hold such a
+///   command off. A `kr` of another store takes its own store's lock, which does not hold this one's
+///   update off either.
+///
+/// The records it leaves exposed are the five whose floor stays. The configuration document is not
+/// among them: the limit is accepted for it ([`ACCEPTED_FOR_CONFIGURATION`]).
+const OPEN_GAPS: [OpenGap; 1] = [OpenGap {
+    what: "a kr outside an installed release takes no lock, and a state root names no store",
+    exposes: &[
+        "controller-service",
+        "kept-answers",
+        "machine-merge-plan",
+        "shell-entries",
+        "terminal-preference",
+    ],
+}];
+
+/// The limits accepted for the configuration document, in the words the documents state them in:
+///
+/// - a `kr` outside an installed release, or of another store, can write the document into a host on
+///   any release, at its own version;
+/// - a control daemon in an environment the update could not reach keeps its release, and after a
+///   rollback it can write the document at that release's version.
+///
+/// The gaps the check had (a root no daemon recorded, a document a later daemon with other
+/// variables would read) are closed: a command registers the roots and the document it writes
+/// before it writes, and the check reads every one. What stays open there is a document a person
+/// writes by hand where no program recorded a path.
+const ACCEPTED_FOR_CONFIGURATION: [AcceptedLimit; 2] = [
+    AcceptedLimit {
+        what: "a kr outside an installed release, or of another store, takes no lock of this store",
+        record: "configuration",
+        statement: "A `kr` outside an installed release (a development build, or an unpacked \
+            archive) takes no writers' lock, and a `kr` of another store takes that store's lock \
+            and registers its roots there, which does not hold this store's update off. Whatever \
+            release is current, such a `kr` can write the document at its own version. A release \
+            that holds the change to fail closed over a document it cannot read then creates no new \
+            session until the document is put right. Each release before the first that holds it \
+            reads the document with the product defaults: descriptions on, the platform's worker \
+            profile, no proxy and no network, and a restriction that only the document holds is not \
+            applied. An update to a release that reads the version restores every setting.",
     },
-    OpenGap {
-        what: "the check looks only in the roots a daemon of the store recorded",
-        exposes: COMMAND_WRITTEN,
-    },
-    OpenGap {
-        what: "the configuration a daemon started later with other variables would read is not looked at",
-        exposes: &["configuration"],
-    },
-    OpenGap {
+    AcceptedLimit {
         what: "a daemon of an environment the update could not reach writes the configuration of its own release",
-        exposes: &["configuration"],
+        record: "configuration",
+        statement: "A control daemon in an environment that the update cannot reach keeps its release, \
+            and after a rollback it can write the document at that release's version. Its registry \
+            is then at that release's schema, so no daemon of the current release starts there until \
+            the host is updated again. This rests on every raise of the document also raising the \
+            registry, which ends rollback across the release once its daemon runs; configuration \
+            levels, which raise no registry, remove that premise.",
     },
 ];
+
+/// The records a command writes that no open gap exposes and no accepted limit covers: a record
+/// whose gap was deleted instead of ruled on.
+fn unruled_command_written_records(
+    gaps: &[OpenGap],
+    accepted: &[AcceptedLimit],
+) -> Vec<&'static str> {
+    COMMAND_WRITTEN
+        .iter()
+        .copied()
+        .filter(|name| {
+            !gaps.iter().any(|gap| gap.exposes.contains(name))
+                && !accepted.iter().any(|limit| limit.record == *name)
+        })
+        .collect()
+}
 
 /// What a command-written record's version and writers break, given the gaps that are open.
 ///
@@ -10127,15 +10187,19 @@ fn broken_by_command_written_records(
 /// write a record after the check and before the switch, or a program of a newer release that a
 /// rollback left running can write one after it. The writers' lock holds the commands of an installed
 /// release off, and a record of the release `current` names listed at another version is not
-/// written. Until the gaps in `OPEN_GAPS` are closed or accepted, a record that is exposed by one
-/// stays at the version its floor gives, which is what every release that lists its stores reads.
+/// written. Each way a record gets past the lock has one ruling for each record it exposes:
+/// - a `kr` outside an installed release is open for the five records whose floor stays, and
+///   accepted for the configuration document;
+/// - a root no daemon of the store recorded, and a document a daemon started later with other
+///   variables would read, are closed for every record: a command registers the roots and the
+///   document it writes before it writes, and the check reads every one of them;
+/// - a daemon in an environment the update could not reach is accepted for the configuration
+///   document.
 ///
 /// The next raise of the configuration document, past 2, needs:
-/// - each gap that exposes it (the third and fourth above, and the first two, which expose every
-///   record) closed, or ruled to be accepted, and its line removed with the reason in the change;
-/// - the document's `VERSION` at 3, `OLDEST_VERSION` kept at 1 while a release that writes version 1
-///   is a source of an update, the version-1 reading kept, and the floor entry for the document
-///   replaced by the table of what releases without the lock write, not deleted;
+/// - the document's `VERSION` at 3, with `OLDEST_VERSION` kept at 1 while a release that writes
+///   version 1 is a source of an update and the version-1 reading kept; the table of what releases
+///   without the lock write stays, because it bounds what the reader may require;
 /// - the registry's version raised with its forward step, since the registry keeps the document it
 ///   accepted, and `stored-formats.lock` written, the document at 3 in the release's `stores` list
 ///   (with equality a list at 2 refuses the release's own commands);
@@ -10144,12 +10208,11 @@ fn broken_by_command_written_records(
 /// - a test that a rollback is refused naming a version 3 document, as
 ///   `a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read` does for 2,
 ///   and the sentence in `docs/host/updates.md` that gives the floor;
-/// - a base that holds the writers' lock. The owners of the gaps: the updater's survey of recorded
-///   environments (the second, fourth), its reading of a configuration document where a later daemon
-///   would read it (the third), and the rule that ties a state root to the store that serves it (the
-///   first).
+/// - a base that holds the writers' lock and the registration.
 ///
-/// Remove an entry of `OPEN_GAPS` when its gap is closed.
+/// A line of `OPEN_GAPS` goes when its gap is closed for the record, or the limit is accepted for it
+/// and stated in `ACCEPTED_FOR_CONFIGURATION` and in `docs/host/updates.md`, in the change that
+/// rules it.
 #[test]
 fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_while_a_gap_is_open() {
     let stores: Vec<_> = stored_formats::table::table()
@@ -10186,6 +10249,32 @@ fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_whi
         assert!(
             barred.contains(name),
             "{name} is a record a command writes and holds the writers' lock"
+        );
+    }
+    // The stores an update looks for in a root only a command registered are the ones this list
+    // names, and no others.
+    let mut looked_for: Vec<&str> = kr_cli::barrier::COMMAND_WRITTEN_STORES.to_vec();
+    looked_for.sort_unstable();
+    let mut written: Vec<&str> = COMMAND_WRITTEN.to_vec();
+    written.sort_unstable();
+    assert_eq!(
+        looked_for, written,
+        "the stores a command writes, which an update reads in a root only a command registered, \
+         are the records the gate rules on"
+    );
+    // Every record has one ruling for the way a `kr` outside the lock gets past it: open, or a limit
+    // accepted and stated. Deleting a gap's line does not let a record pass its floor unruled.
+    assert_eq!(
+        unruled_command_written_records(&OPEN_GAPS, &ACCEPTED_FOR_CONFIGURATION),
+        Vec::<&str>::new(),
+        "a record passes its floor only with a ruling for the way a kr outside the lock reaches it: \
+         state the limit in ACCEPTED_FOR_CONFIGURATION or keep the record in OPEN_GAPS"
+    );
+    for limit in &ACCEPTED_FOR_CONFIGURATION {
+        assert!(
+            COMMAND_WRITTEN.contains(&limit.record) && !limit.statement.is_empty(),
+            "{}: a limit is accepted for a record a command writes, and stated",
+            limit.what
         );
     }
     // And the other way: the gaps expose the records of this list, so a record a command writes that
@@ -10242,6 +10331,44 @@ fn the_gate_on_command_written_records_refuses_what_it_is_for() {
         exposes: &["kept-answers"],
     }];
     assert!(broken_by_command_written_records(&raised, &elsewhere).is_empty());
+
+    // One gap that exposes several records stops each of them and not the ones it does not name.
+    static ANSWERS_2: kr_ipc::install::Written = kr_ipc::install::Written::new("kept-answers", 2);
+    static ENTRIES_2: kr_ipc::install::Written = kr_ipc::install::Written::new("shell-entries", 2);
+    static TERMINAL_2: kr_ipc::install::Written =
+        kr_ipc::install::Written::new("terminal-preference", 2);
+    let several = [OpenGap {
+        what: "a gap",
+        exposes: &["kept-answers", "shell-entries"],
+    }];
+    let raised_several = [
+        (Writers::Barred(&ANSWERS_2), "kept-answers", 2, 0),
+        (Writers::Barred(&ENTRIES_2), "shell-entries", 2, 0),
+        (Writers::Barred(&TERMINAL_2), "terminal-preference", 2, 0),
+    ];
+    assert_eq!(
+        broken_by_command_written_records(&raised_several, &several).len(),
+        2,
+        "the two records the gap exposes are refused and the third is not"
+    );
+    assert!(broken_by_command_written_records(&raised_several, &[]).is_empty());
+
+    // A gap deleted instead of ruled on leaves its records unruled; a limit accepted for a record
+    // or a gap that exposes it rules on it.
+    let limit = |record| AcceptedLimit {
+        what: "a limit",
+        record,
+        statement: "stated",
+    };
+    assert_eq!(
+        unruled_command_written_records(&[], &[limit("configuration")]).len(),
+        COMMAND_WRITTEN.len() - 1
+    );
+    assert!(unruled_command_written_records(&OPEN_GAPS, &[limit("configuration")]).is_empty());
+    assert_eq!(
+        unruled_command_written_records(&several, &[]).len(),
+        COMMAND_WRITTEN.len() - 2
+    );
 
     // A record nothing holds off is held to its floor whatever gaps are open.
     let unbarred = [(Writers::Commands, "configuration", 3, 1)];
