@@ -2661,7 +2661,9 @@ The organisation's chain may travel beside the lease. The host follows a newer o
 the lease, so a lease signed by a revision the host has not heard of is accepted with the chain that
 brings the revision in. A chain that is not newer changes nothing and does not refuse the lease
 beside it. A newer chain that does not verify, or that does not carry the host's anchor, or that
-belongs to another organisation, refuses the whole presentation and installs nothing.
+belongs to another organisation, refuses the whole presentation and installs nothing. So does a
+lease that some rule refuses: the host keeps a newer chain only with the lease beside it, and the
+device presents the chain again with its next lease.
 
 A renewal that says less than the lease it replaces, and a chain that shows an installed lease was
 signed after its revision was succeeded, take access away from copies of it that may still be in

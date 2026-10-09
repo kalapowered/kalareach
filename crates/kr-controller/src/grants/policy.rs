@@ -1197,8 +1197,10 @@ impl HostPolicy {
                 // by now, and what the device's standing in the organisation is, is decided where
                 // the lease is judged.
                 if request.method == Method::MembershipPresent {
+                    // No right comes of it: the method asks for none, and a decision that has no
+                    // lease says nothing of what the device may do.
                     return Ok(PolicyIntersection {
-                        rights: grant.actions.clone(),
+                        rights: CanonicalSet::new(),
                         organisation_id: Some(requirement.organisation_id),
                         lease: None,
                         offline: None,

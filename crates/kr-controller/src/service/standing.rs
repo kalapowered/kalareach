@@ -183,11 +183,15 @@ impl Controller {
         // The debt is on disk before the restriction it covers is.
         let owed = reach
             .map(|reach| {
-                self.owe_debt(
-                    &format!("a membership lease that narrows device {device_id}'s access"),
-                    reach,
-                )
-                .map(|debt| (debt, reach))
+                let covers = match reach {
+                    super::barrier::Reach::Host => {
+                        "a policy-signing chain that dropped membership leases".to_owned()
+                    }
+                    super::barrier::Reach::Device(_) => {
+                        format!("a membership lease that narrows device {device_id}'s access")
+                    }
+                };
+                self.owe_debt(&covers, reach).map(|debt| (debt, reach))
             })
             .transpose()?;
         let snapshot = candidate.snapshot();
