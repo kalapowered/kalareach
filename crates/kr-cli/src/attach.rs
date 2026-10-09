@@ -84,6 +84,15 @@ pub const GUARD_READY: u8 = b'A';
 /// minute is not going to answer.
 pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a report about a guard whose report pipe has closed tries to collect its exit status.
+///
+/// The pipe closes with the guard's descriptors, a little before the guard can be waited for: the
+/// operating system releases the rest of the process in between. That is usually microseconds, and
+/// on a loaded machine it can be milliseconds. The bound is for a guard with no status to give, one
+/// that closed its end and went on running or that the system is slow to finish; the report then
+/// says there was none.
+const GUARD_DEPARTURE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The out-of-process restoration guard.
 ///
 /// It holds the saved terminal state and a handle on the terminal, in a process this one does not
@@ -240,11 +249,28 @@ impl RestorationGuard {
     }
 
     /// How the guard went, for a report about a guard that is no longer answering.
+    ///
+    /// The guard's end of the report pipe closes before its exit status is there to collect, so a
+    /// single look can find a guard that has gone and still has no status. This looks until the
+    /// status is there, for at most [`GUARD_DEPARTURE_WAIT`], and says so when it never is.
     fn departure(&mut self) -> Shown {
-        match self.child.try_wait() {
-            Ok(Some(status)) => shown!(" ({})", status),
-            Ok(None) => Shown::said(""),
-            Err(error) => shown!(" (its status could not be read: {})", Shown::io(&error)),
+        let deadline = std::time::Instant::now() + GUARD_DEPARTURE_WAIT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return shown!(" ({})", status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(None) => {
+                    return shown!(
+                        " (no status to collect after {} ms)",
+                        GUARD_DEPARTURE_WAIT.as_millis()
+                    );
+                }
+                Err(error) => {
+                    return shown!(" (its status could not be read: {})", Shown::io(&error));
+                }
+            }
         }
     }
 
@@ -688,7 +714,7 @@ async fn call<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMessage>(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{GUARD_ARM_TIMEOUT, RestorationGuard};
+    use super::RestorationGuard;
     use crate::terminal::SavedModes;
 
     /// A guard that leaves without answering is reported at once, with how it left.
@@ -699,7 +725,8 @@ mod tests {
     /// bound and then calls that guard "still running". [`RestorationGuard::start`] owns the
     /// `Command` and returns before anything waits, which is what closes it. This goes through the
     /// whole of [`RestorationGuard::arm_on_handle`], which is everything `arm` does but opening the
-    /// terminal, so a change that put the waiting back beside the `Command` fails here.
+    /// terminal, so a change that put the waiting back beside the `Command` fails here: the report
+    /// then says the guard was still running, where this one says it ended.
     #[test]
     fn a_guard_that_leaves_without_answering_is_reported_without_waiting_out_the_bound() {
         let terminal = std::fs::File::create(
@@ -716,7 +743,6 @@ mod tests {
 
         // `false` takes the arguments it is given, ignores them and exits, which is a guard that
         // never reports readiness.
-        let started = std::time::Instant::now();
         let refusal = RestorationGuard::arm_on_handle(
             std::path::Path::new("/usr/bin/false"),
             terminal,
@@ -726,17 +752,12 @@ mod tests {
         .to_string();
 
         assert!(
-            started.elapsed() < GUARD_ARM_TIMEOUT / 4,
-            "the report pipe ended with the process rather than waiting out the bound: {:?}",
-            started.elapsed()
-        );
-        assert!(
             refusal.contains("ended without answering"),
             "and the attach is told which of the four it was: {refusal}"
         );
         assert!(
-            refusal.contains("exit status"),
-            "with how the guard left: {refusal}"
+            refusal.contains("exit status: 1"),
+            "with how the guard left, which `false` leaves as status 1: {refusal}"
         );
     }
 }
