@@ -430,8 +430,9 @@ impl ViewerScope {
     /// A grant with no history bound is told of a condition first seen at or after its start,
     /// whether or not it includes the live screen. So a scope with no bound reaches what was
     /// produced from `from_ms`, the grant's start, on, and nothing older, and a scope with a bound
-    /// keeps its bound. A live view reaches less only for a grant with neither a bound nor the
-    /// live screen: [`Self::live_from`] leaves that scope with no bound, which admits no content.
+    /// keeps its bound. A live view differs for a scope with no bound: [`Self::live_from`] dates it
+    /// from the moment the view began, and only when it includes the live screen. Without the live
+    /// screen, the scope keeps no bound and reaches nothing it does not name.
     #[must_use]
     pub fn reaching_from(self, from_ms: u64) -> Self {
         if self.lower_bound_ms.is_none() {
