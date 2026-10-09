@@ -2952,31 +2952,35 @@ reservation, and the number of its endpoint only grows, so no later session shar
 a survivor. Coverage is complete only where the cleanup confirmed a boundary: a control group the
 worker ran in and the kernel read empty, or a job that needed no help.
 
-**Where the cleanup cannot see.** Where `/proc` is mounted to hide other accounts' processes, a
-recorded number that a process of another account now holds is described as one the host cannot
-describe, and never as ended. A Linux worker that cannot read its process tree records the processes on the
-session's terminal instead, and the closure says that this leaves out a process that left the
-terminal's session. A host that gives no hold on a process by more than its number sends it no
-hangup or kill, from the worker's own close as from the cleanup; the closure names it. When a
-service's control group is read, a process in it that the worker never recorded and that the
-manager's kill ends is listed with the others, as forced.
+**Where the cleanup cannot see.** This happens where `/proc` is mounted to hide the processes of
+other accounts: a recorded number that a process of another account now holds is described as one
+the host cannot describe, and never as ended. On Linux, when the worker cannot read its process
+tree, the processes that are on the terminal of the session are recorded instead, and the closure
+says that this leaves out a process that left the terminal's session. When the worker cannot hold a
+process by more than its process number, it sends no hang up signal or kill signal to it, neither
+when it is closed by the user nor when it is cleaned up; the closure names the process. When the
+control group of a service is read, processes that were not recorded by the worker but are ended by
+the service manager with a kill are listed together with the other processes, as forced.
 
-**A control daemon that a session's command started.** On Linux, `kr new` and `kr update` can start
-a control daemon from the shell of a session, and the daemon then starts in that session's service,
-so that the end of the service ends it. When the user service manager answers about that service,
-the daemon moves itself into a transient scope of its own, `kr-daemon-<id>.scope`, before it serves.
-It does not move on macOS; on a Linux host where no manager answers or `systemd-run` cannot be used;
-or when it started in a group below the service. If the manager takes the request for the scope and
-refuses it, the start fails, and `kr new` reports a daemon that did not answer, with its log. `kr
-doctor` names the service when the daemon's own control group is that service, and says nothing
-otherwise.
+**A control daemon that a session's command started.** On Linux, if a command like `kr new` or `kr
+update` starts a control daemon from a shell of a session, and the session runs as a service of the
+user's service manager, the daemon starts in that service, and the end of the service ends it. After
+the user service manager has answered about that service, the daemon moves into its own transient
+scope `kr-daemon-<id>.scope`, before it starts serving. It doesn't move on macOS, or if there is no
+service manager on a Linux host, or if `systemd-run` cannot be used, or if it was started in a group
+below the service. If the manager takes the request for the scope but refuses it, the start fails
+and `kr new` will say that the daemon didn't answer and show the log of the daemon. If the daemon is
+in the service, i.e. its own control group is the service, `kr doctor` will mention the service,
+otherwise it won't mention anything about it.
 
-Until it moves, and if it never does, two things can end it with the session. The end of the service
-ends everything in it, recorded or not. The cleanup by recorded identity ends it if the session's
-worker recorded it: after a crash, the cleanup of the first environment's daemon; at a close, the
-worker itself. On Linux the worker records a process for as long as it descends from the root shell,
-which is the whole run of the command that started the daemon. On macOS it records the process while
-it is on the session's terminal, until the daemon's own `setsid`. A daemon that does not move and
+Until it moves, and if it doesn't move at all, two things can end the daemon together with the
+session. When the service ends, it will end all the processes in the service, whether they are
+recorded there or not. The cleanup by recorded identity will end the daemon if the worker of the
+session has recorded it: after a crash, the cleanup of the first environment's daemon; at a close,
+the worker itself. On Linux, the worker will record the process as long as it is a descendant of the
+root shell of the session, which is during the whole run of a command that starts a daemon. On
+macOS, the worker will record the process as long as the process is on the terminal of the session,
+which is until the daemon moves into its own session with `setsid`. A daemon that doesn't move and
 takes the detached start also runs the workers and shells of the sessions it starts as its own
 children. Inside the session's service they end with the service. On Linux without a manager, the
 first worker can record them while the command runs, and the first session's close or cleanup then
@@ -2984,7 +2988,8 @@ ends another environment's session.
 
 A recorded process that is read in a daemon's scope is not stopped. The worker's own closure lists
 it as `left_for_a_daemon`, apart from the processes the session owned and outside the coverage
-decision. A crash closure lists it only while the worker's last record still holds it.
+decision, while the process is running. A crash closure lists it only while the worker's last record
+still holds it.
 
 **Who waits for it.** The closure is recorded after the cleanup, so a read, a list, the barrier
 and a daemon that starts beside a crashed session wait for it: about five seconds when a recorded
