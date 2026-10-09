@@ -27,11 +27,10 @@
 //! it.
 //!
 //! **Coverage** is complete only for a boundary this pass confirmed: a control group it proved the
-//! **Coverage** is complete only for a boundary this pass confirmed: a control group it proved the
 //! worker ran in and read empty at the end, or a job that needed no help. Everywhere else it is
 //! incomplete, always on macOS and on a Linux host with no service manager, because a process the
-//! record does not name (one that began after its last write, or that left the session out of the
-//! worker's sight) is not found there.
+//! record does not name (one that began after its last write, or that left the session and lost
+//! its parent before an observation saw it) is not found there.
 
 use std::time::{Duration, Instant};
 
@@ -57,8 +56,9 @@ pub struct Ended {
     /// The process and its start.
     pub identity: ProcessStartIdentity,
     /// Whether this pass had to end it with no chance to refuse, or the platform's job had to be
-    /// helped. False for one that was already gone, ended after it was asked, or ended with the
-    /// worker.
+    /// helped, or the service manager's delivered kill found it in the unit's group. False for one
+    /// that was already gone, ended after it was asked, or ended with the worker; and for one the
+    /// manager may have ended after this pass stopped waiting for its answer.
     pub forced: bool,
     /// Whether it is the session's root shell.
     pub root: bool,
@@ -195,11 +195,15 @@ impl ArchiveService {
                     // Whether the process is gone is the kernel's word, asked at the next look:
                     // a version-bound signal that finds nothing can be a process that ran a new
                     // program in between.
+                    //
+                    // A hold the platform could not take this time is not a refusal: the process
+                    // stays to be ended, and a hold that cannot be taken at the end either is the
+                    // reason it is named as a survivor.
                     kr_ipc::identity::Stopped::Signalled
                     | kr_ipc::identity::Stopped::Gone
+                    | kr_ipc::identity::Stopped::Unsafe(_)
                     | kr_ipc::identity::Stopped::Unsupported => {}
-                    kr_ipc::identity::Stopped::Refused(why)
-                    | kr_ipc::identity::Stopped::Unsafe(why) => {
+                    kr_ipc::identity::Stopped::Refused(why) => {
                         process.state = Standing::Refused(why);
                     }
                 }
@@ -239,13 +243,19 @@ impl ArchiveService {
         // What the manager then ends was forced, whether or not the worker had recorded it.
         let mut group_refused = None;
         if let Some(group) = group.as_mut() {
-            // Which recorded processes the manager's kill finds, asked before it is sent: one
-            // whose own stop was refused is among them, and so is one that was asked and is still
-            // there.
+            // Which recorded processes the manager's kill finds, asked before it is sent: the
+            // ones the kernel lists in the unit's group that are not seen to have ended. One whose
+            // own stop was refused is among them. A process the group does not hold is not the
+            // manager's to end, and a group that cannot be read attributes nothing.
+            let held = match group.holders().await {
+                Holders::Some(identities) => identities,
+                Holders::None | Holders::Unreadable(_) => Vec::new(),
+            };
             let standing: Vec<bool> = tracked
                 .iter()
                 .map(|process| {
-                    !matches!(process.state, Standing::Ended)
+                    held.contains(&process.identity)
+                        && !matches!(process.state, Standing::Ended)
                         && !matches!(
                             kr_ipc::identity::process_state(&process.identity),
                             kr_ipc::identity::ProcessState::Ended
@@ -362,9 +372,10 @@ impl ArchiveService {
                     "a process that moved itself to another service or scope is not found on this \
                      host"
                 } else if cfg!(target_os = "linux") {
-                    "a process that left the session after its parent had ended, a process the \
-                     worker started outside the session and a process that began after the last \
-                     record was written are not found on this host"
+                    "a process that left the session and lost its parent before an observation \
+                     saw it, what such a process starts, a process the worker started outside \
+                     the session and a process that began after the last record was written are \
+                     not found on this host"
                 } else {
                     "a process that left the terminal's session, a process the worker started \
                      outside it and a process that began after the last record was written are \
@@ -523,9 +534,9 @@ enum Holders {
     expect(dead_code, reason = "only a Linux host has a control group to kill")
 )]
 enum Forced {
-    /// The group held nothing, or had already been asked.
+    /// The group held nothing, had already been asked, or the manager no longer has the unit.
     Nothing,
-    /// The manager was asked, and did not refuse.
+    /// The manager was asked, and delivered the kill.
     Killed,
     /// The manager refused, did not answer, or could not be asked.
     Refused(String),
@@ -567,7 +578,8 @@ impl Group {
             let asked =
                 tokio::task::spawn_blocking(move || crate::supervision::kill_unit(&unit, FORCED));
             match tokio::time::timeout(FORCED, asked).await {
-                Ok(Ok(Ok(()))) => Forced::Killed,
+                Ok(Ok(Ok(true))) => Forced::Killed,
+                Ok(Ok(Ok(false))) => Forced::Nothing,
                 Ok(Ok(Err(why))) => Forced::Refused(why),
                 Ok(Err(_)) => {
                     Forced::Refused("the call to the service manager did not finish".to_owned())
