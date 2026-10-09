@@ -42,8 +42,8 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
     private let factory = RTCPeerConnectionFactory()
     private let connection: RTCPeerConnection
     private let lock = NSLock()
-    private var gatheringDone: CheckedContinuation<Void, Never>?
-    private var gathered = false
+    private var addressWaiting: CheckedContinuation<Void, Never>?
+    private var addressFound = false
     private var channel: RTCDataChannel?
 
     /// Fulfilled when the channel the offer names is open at this end.
@@ -59,8 +59,9 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
     override init() {
         let configuration = RTCConfiguration()
         configuration.sdpSemantics = .unifiedPlan
-        // Once, so that the gathering reports itself done and the answer carries every candidate.
-        configuration.continualGatheringPolicy = .gatherOnce
+        // Continually, so that a network that comes up late is still found: gathering once can
+        // report itself done with no address, on a device that has only just started.
+        configuration.continualGatheringPolicy = .gatherContinually
         connection = factory.peerConnection(
             with: configuration,
             constraints: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
@@ -72,7 +73,7 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
 
     deinit { connection.close() }
 
-    /// Applies `offer` and answers it, with the candidates this peer gathered.
+    /// Applies `offer` and answers it, with the candidates this peer has found by its first.
     func answer(_ offer: String) async throws -> String {
         try await connection.setRemoteDescription(RTCSessionDescription(type: .offer, sdp: offer))
         let answer = try await connection.answer(for: RTCMediaConstraints(
@@ -82,16 +83,16 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
         try await connection.setLocalDescription(answer)
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             lock.lock()
-            if gathered {
+            if addressFound {
                 lock.unlock()
                 done.resume()
             } else {
-                gatheringDone = done
+                addressWaiting = done
                 lock.unlock()
-                // A peer that never reports gathering done answers with what it has after this
-                // long, instead of holding the test forever.
+                // A peer that finds no address answers with what it has after this long, instead
+                // of holding the test forever, and the test then fails on its next wait.
                 DispatchQueue.global().asyncAfter(deadline: .now() + AnsweringPeer.gatherWithin) { [weak self] in
-                    self?.gatheringEnded()
+                    self?.foundAnAddress()
                 }
             }
         }
@@ -117,16 +118,17 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
         _ = open?.sendData(RTCDataBuffer(data: Data(text.utf8), isBinary: false))
     }
 
-    func peerConnection(_: RTCPeerConnection, didChange state: RTCIceGatheringState) {
-        guard state == .complete else { return }
-        gatheringEnded()
+    func peerConnection(_: RTCPeerConnection, didChange _: RTCIceGatheringState) {}
+
+    func peerConnection(_: RTCPeerConnection, didGenerate _: RTCIceCandidate) {
+        foundAnAddress()
     }
 
-    private func gatheringEnded() {
+    private func foundAnAddress() {
         lock.lock()
-        gathered = true
-        let waiting = gatheringDone
-        gatheringDone = nil
+        addressFound = true
+        let waiting = addressWaiting
+        addressWaiting = nil
         lock.unlock()
         waiting?.resume()
     }
@@ -150,7 +152,6 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
     func peerConnection(_: RTCPeerConnection, didAdd _: RTCMediaStream) {}
     func peerConnection(_: RTCPeerConnection, didRemove _: RTCMediaStream) {}
     func peerConnection(_: RTCPeerConnection, didChange _: RTCIceConnectionState) {}
-    func peerConnection(_: RTCPeerConnection, didGenerate _: RTCIceCandidate) {}
     func peerConnection(_: RTCPeerConnection, didRemove _: [RTCIceCandidate]) {}
 }
 

@@ -50,7 +50,9 @@ class VoiceNegotiationTest {
     /** A peer in this process that answers an offer and reads the channel the offer names. */
     private class AnsweringPeer {
         private val factory = PeerConnectionFactory.builder().createPeerConnectionFactory()
-        private val gathered = CountDownLatch(1)
+
+        /** Counted down when the peer has found its first address. */
+        private val addressFound = CountDownLatch(1)
 
         /** Counted down when the channel the offer names is open at this end. */
         val channelOpen = CountDownLatch(1)
@@ -64,9 +66,9 @@ class VoiceNegotiationTest {
         private val connection: PeerConnection = factory.createPeerConnection(
             PeerConnection.RTCConfiguration(emptyList()).apply {
                 sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-                // Once, so that the gathering reports itself done and the answer carries every
-                // candidate.
-                continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+                // Continually, so that a network that comes up late is still found: gathering once
+                // can report itself done with no address, on a device that has only just started.
+                continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
             },
             object : PeerConnection.Observer {
                 override fun onDataChannel(opened: DataChannel) {
@@ -82,14 +84,12 @@ class VoiceNegotiationTest {
                     if (opened.state() == DataChannel.State.OPEN) channelOpen.countDown()
                 }
 
-                override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-                    if (state == PeerConnection.IceGatheringState.COMPLETE) gathered.countDown()
-                }
+                override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {}
 
                 override fun onSignalingChange(state: PeerConnection.SignalingState) {}
                 override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {}
                 override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-                override fun onIceCandidate(candidate: IceCandidate) {}
+                override fun onIceCandidate(candidate: IceCandidate) = addressFound.countDown()
                 override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {}
                 override fun onAddStream(stream: MediaStream) {}
                 override fun onRemoveStream(stream: MediaStream) {}
@@ -98,7 +98,7 @@ class VoiceNegotiationTest {
             },
         ) ?: error("the peer could not open a connection")
 
-        /** Applies `offer` and answers it, with the candidates this peer gathered. */
+        /** Applies `offer` and answers it, with the candidates this peer has found by its first. */
         fun answer(offer: String): String {
             await { connection.setRemoteDescription(it, SessionDescription(SessionDescription.Type.OFFER, offer)) }
             val constraints = MediaConstraints().apply {
@@ -107,8 +107,11 @@ class VoiceNegotiationTest {
             var made: SessionDescription? = null
             await({ made = it }) { connection.createAnswer(it, constraints) }
             await { connection.setLocalDescription(it, made!!) }
-            assertTrue("the peer gathered its candidates", gathered.await(SECONDS, TimeUnit.SECONDS))
-            return asIceLite(connection.localDescription.description)
+            assertTrue("the peer found an address", addressFound.await(SECONDS, TimeUnit.SECONDS))
+            val answer = connection.localDescription.description
+            // An answer with no address in it leaves both ends with nothing to check.
+            assertTrue("the peer's answer names an address", answer.contains("a=candidate:"))
+            return asIceLite(answer)
         }
 
         /**
