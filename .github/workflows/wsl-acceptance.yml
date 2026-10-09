@@ -29,7 +29,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The runner has one build cache and no reason to keep incremental artefacts between steps.
+  # Each build starts from nothing, so incremental artefacts would only take disk.
   CARGO_INCREMENTAL: "0"
   # A root file system pinned by its digest, so the run asks about the commit and never about what a
   # mirror served.
