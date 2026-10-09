@@ -333,3 +333,25 @@ describe('the desktop port and the connection state', () => {
     expect(await heard(live)).toEqual([live])
   })
 })
+
+describe('the desktop port and recovery', () => {
+  it('sends the sync service and each recovery step to its own command, naming no secret', async () => {
+    const port = tauriPort()
+    await port.syncServiceView()
+    await port.syncServiceSet('https://sync.example')
+    await port.recoveryView()
+    await port.recoveryTurnOn()
+    await port.recoverySettle()
+    await port.recoverySaveKit('/tmp/kit.txt')
+    await port.accountSignInForRecovery()
+    expect(shell.invoked).toEqual([
+      { command: 'sync_service_view', args: {} },
+      { command: 'sync_service_set', args: { origin: 'https://sync.example' } },
+      { command: 'recovery_view', args: {} },
+      { command: 'recovery_turn_on', args: {} },
+      { command: 'recovery_settle', args: {} },
+      { command: 'recovery_save_kit', args: { path: '/tmp/kit.txt' } },
+      { command: 'account_sign_in_for_recovery', args: {} }
+    ])
+  })
+})
