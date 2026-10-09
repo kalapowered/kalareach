@@ -598,7 +598,9 @@ pub fn table() -> Vec<Store> {
                 ),
             ],
         },
-        // The configuration document, wherever the environment keeps it.
+        // The configuration document, wherever the environment keeps it. A document with no
+        // `version` member is read as the version its reader writes, and the lock counts it as
+        // version 1, which every release that reads this document reads.
         Store {
             writers: Writers::Commands,
             entry: entry(

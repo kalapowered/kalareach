@@ -1331,7 +1331,7 @@ impl ComposedBundle {
 ///
 /// ```json
 /// {
-///   "version": 1,
+///   "version": 2,
 ///   "revision": 3,
 ///   "preferences": { "sleep_inhibition": "mains_only" },
 ///   "profiles": { "review": { "worker_profile": "headless_user" } },
@@ -1663,10 +1663,15 @@ pub mod configuration {
     /// The oldest version this build reads and brings forward.
     ///
     /// A document at version 1 has no `storage` section, which reads as a selection of none; it is
-    /// read as a document at [`VERSION`], and the next edit writes it at that version. Raise this,
-    /// and remove the step in [`load`] that brings an earlier document forward, once no supported
-    /// upgrade starts from a document at version 1.
-    pub const OLDEST_VERSION: u64 = 1;
+    /// read as a document at [`VERSION`], and the next edit writes it at that version. The file is
+    /// not rewritten by anything else, so a document its owner never edits stays at version 1, and
+    /// so does the copy of it that the registry holds until the next acceptance.
+    ///
+    /// Raise this, and remove the step in [`load`] that brings an earlier document forward, once no
+    /// supported upgrade starts from a document at version 1. A release that does so refuses a
+    /// switch to it while a document is at version 1, naming the document, and reads a registry
+    /// record at version 1 as no accepted document, which makes its next start accept the document
+    /// on disk again.
 
     /// The longest configuration document this host reads.
     ///
@@ -9044,6 +9049,12 @@ mod tests {
     /// KR-REQ-26.13: a document declaring a version this build does not know is left alone.
     #[test]
     fn an_unknown_version_reads_as_defaults_and_says_so() {
+        let below = configuration::load(Some(br#"{"version": 0, "preferences": {}}"#));
+        assert_eq!(below.status.state, DocumentState::UnknownVersion);
+        assert!(
+            below.document.is_none(),
+            "version 0 is below the oldest this build reads"
+        );
         let loaded = configuration::load(Some(br#"{"version": 99, "preferences": {}}"#));
         assert_eq!(loaded.status.state, DocumentState::UnknownVersion);
         assert!(loaded.document.is_none(), "nothing is read out of it");

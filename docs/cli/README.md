@@ -905,7 +905,7 @@ the sleep policy, then a line for each live session saying where its `PATH`, loc
 directory came from, then this host's effective configuration, then the checks and a summary:
 
 ```text
-configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json (schema version 1, revision 3): version 1
+configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json (schema version 2, revision 3): version 2
   runtime directory /run/user/1000/kalareach/ab12cd34
   state directory /home/someone/.local/state/kalareach/environments/ab12cd34
   document belongs at $XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json, or

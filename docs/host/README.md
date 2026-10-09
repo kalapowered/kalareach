@@ -99,7 +99,7 @@ configuration file this host reads.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "revision": 3,
   "preferences": { "sleep_inhibition": "mains_only" },
   "profiles": { "review": { "worker_profile": "headless_user" } },

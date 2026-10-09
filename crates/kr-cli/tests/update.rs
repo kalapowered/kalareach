@@ -5061,31 +5061,12 @@ fn reading_transfers_from_2() -> Vec<ReleaseStore> {
         .collect()
 }
 
-/// The stores a release assembled here declares it reads, with the configuration document's versions
-/// given.
-fn reading_the_configuration_at(migrates_from: u32, version: u32) -> Vec<ReleaseStore> {
+/// The stores a release assembled here declares it reads, with the versions of the store `name` given.
+fn reading_a_store_at(name: &str, migrates_from: u32, version: u32) -> Vec<ReleaseStore> {
     release_stores()
         .into_iter()
         .map(|store| {
-            if store.store == "configuration" {
-                ReleaseStore {
-                    migrates_from,
-                    version,
-                    ..store
-                }
-            } else {
-                store
-            }
-        })
-        .collect()
-}
-
-/// The stores a release assembled here declares it reads, with the registry's versions given.
-fn reading_the_registry_at(migrates_from: u32, version: u32) -> Vec<ReleaseStore> {
-    release_stores()
-        .into_iter()
-        .map(|store| {
-            if store.store == "registry" {
+            if store.store == name {
                 ReleaseStore {
                     migrates_from,
                     version,
@@ -5324,7 +5305,7 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
     let mut host = Host::bare();
     let older = registry_version() - 1;
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
-        .reading(reading_the_registry_at(1, older));
+        .reading(reading_a_store_at("registry", 1, older));
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
@@ -5399,8 +5380,11 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read() {
     let mut host = Host::bare();
-    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
-        .reading(reading_the_configuration_at(1, 1));
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+        "configuration",
+        1,
+        1,
+    ));
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
@@ -5486,7 +5470,7 @@ async fn an_update_is_refused_naming_a_store_the_new_release_cannot_read() {
     let scratch = host.scratch("archives");
     // A release that reads only versions the registry has not reached.
     let ahead = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
-        .reading(reading_the_registry_at(beyond, beyond));
+        .reading(reading_a_store_at("registry", beyond, beyond));
     let archive = scratch.join("ahead.tar.gz");
     ahead.archive(&archive);
 
@@ -7749,7 +7733,7 @@ async fn a_daemon_started_again_has_the_variables_that_decide_its_paths_the_one_
     // current, which is the same restart.
     let beyond = registry_version() + 1;
     let ahead = Assembled::at_this_level("0.3.0+cccccccccccc", 3)
-        .reading(reading_the_registry_at(beyond, beyond));
+        .reading(reading_a_store_at("registry", beyond, beyond));
     let archive_ahead = scratch.join("ahead.tar.gz");
     ahead.archive(&archive_ahead);
     let (output, said) = host.kr_json_with(

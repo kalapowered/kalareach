@@ -4305,11 +4305,11 @@ mod tests {
         drop(registry);
         Connection::open(&path)
             .expect("opens")
-            .execute("UPDATE schema_version SET version = 8", [])
+            .execute("UPDATE schema_version SET version = 7", [])
             .expect("sets the file back to the release before");
 
         let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
-        assert_eq!(carried, Some(Carried { from: 8, to: 9 }));
+        assert_eq!(carried, Some(Carried { from: 7, to: 9 }));
         let read = Registry::open_to_read(&path, environment()).expect("reads at this version");
         let accepted = read.accepted_configuration().expect("reads the record");
         assert_eq!(accepted.revision, 4);
