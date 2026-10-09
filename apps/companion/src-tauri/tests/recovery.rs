@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use companion_tauri::AppState;
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
+use companion_tauri::device::DeviceIdentity;
 use companion_tauri::recovery::{Recovery, SEED_SCOPE};
-use companion_tauri::sync_service::SyncService;
 use kr_client::recovery::{BundleStore, parse_kit};
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AccountToken, AccountTokenSource, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE,
@@ -33,7 +33,7 @@ use kr_client::services::{
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
-use kr_crypto::store::{MemoryStore, store_recovery_seed};
+use kr_crypto::store::{MemoryStore, load_recovery_seed, store_recovery_seed};
 use kr_protocol::archive::{RecoveryBundle, RecoveryContext, RecoveryKit, TrustedWriter};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
@@ -180,13 +180,12 @@ async fn read_with_only_the_kit(served: &Served, kit: &RecoveryKit) -> RecoveryB
 /* This computer, and the application started on it                            */
 /* -------------------------------------------------------------------------- */
 
-/// What survives the application being closed: the service, the data directory, the secure store
-/// and the device's key.
+/// What survives the application being closed: the service, the data directory and the secure
+/// store, which holds the device's keys and, once recovery is on, the recovery seed.
 struct Computer {
     served: Served,
     data: tempfile::TempDir,
     secrets: Arc<MemoryStore>,
-    key: AuthorisationKeyPair,
 }
 
 impl Computer {
@@ -195,8 +194,12 @@ impl Computer {
             served: serve().await,
             data: tempfile::tempdir().expect("a directory"),
             secrets: Arc::new(MemoryStore::new()),
-            key: AuthorisationKeyPair::generate().expect("a key"),
         }
+    }
+
+    /// This computer's identity: its keys, made the first time and read from the store after.
+    fn identity(&self) -> DeviceIdentity {
+        DeviceIdentity::in_store(Arc::clone(&self.secrets) as _).expect("the device's keys")
     }
 
     /// The origin of the sync service this computer can reach.
@@ -206,21 +209,8 @@ impl Computer {
 
     /// The application, started over this computer's records, with `account` as its account.
     fn start(&self, account: Arc<Account>) -> Page {
-        let service = Arc::new(SyncService::open(self.data.path()));
-        let recovery = Arc::new(
-            Recovery::open(
-                self.data.path(),
-                Arc::clone(&self.secrets) as _,
-                self.key.clone(),
-                Arc::clone(&service),
-            )
-            .expect("recovery opens"),
-        );
-        let state = AppState::new();
-        state.sync_service_opened(service);
-        state.recovery_opened(Arc::clone(&recovery));
         let app = mock_builder()
-            .manage(state)
+            .manage(AppState::new())
             .manage(AccountSlot::ready(Arc::clone(&account)))
             .invoke_handler(tauri::generate_handler![
                 companion_tauri::commands::sync_service_view,
@@ -232,6 +222,14 @@ impl Computer {
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
+        // The functions the application's start calls, over this computer's records.
+        companion_tauri::start_sync_service(app.handle(), self.data.path());
+        companion_tauri::start_recovery(app.handle(), self.data.path(), &self.identity())
+            .expect("recovery opens");
+        let recovery = app
+            .state::<AppState>()
+            .recovery()
+            .expect("recovery was opened");
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");
@@ -461,6 +459,13 @@ async fn turning_recovery_on_puts_the_bundle_at_the_service_and_hands_over_a_kit
         json!({ "sync_service": service, "state": "on", "kept_at": host, "blocker": null })
     );
 
+    // The seed is in this computer's secure store, which is where the kit's seed comes from.
+    assert!(
+        load_recovery_seed(&*computer.secrets, SEED_SCOPE)
+            .expect("the store is read")
+            .is_some()
+    );
+
     // One write reached the service, under the account's token, naming no revision to replace.
     let web = computer.served.web();
     let arrived = web.arrived();
@@ -670,13 +675,17 @@ async fn left_by_an_earlier_run(
     sealed_under: &RecoverySeed,
 ) {
     store_recovery_seed(&*computer.secrets, SEED_SCOPE, kept).expect("the seed is kept");
-    std::fs::create_dir_all(computer.data.path().join("recovery")).expect("the directory");
-    std::fs::write(
-        computer.data.path().join("recovery").join("recovery.json"),
+    // The directory an earlier run made: recovery keeps its records in an owner-only directory.
+    kr_ipc::paths::create_private_directory(&computer.data.path().join("recovery"))
+        .expect("the directory");
+    // The record as the first version of the application wrote it, which this version still reads.
+    kr_ipc::paths::write_owner_only_file(
+        &computer.data.path().join("recovery").join("recovery.json"),
         format!(
             r#"{{"version":1,"service_origin":"{}","bundle_locator":"{LOCATOR}","kept":false}}"#,
             computer.served.origin()
-        ),
+        )
+        .as_bytes(),
     )
     .expect("the record");
     let origin = computer.origin();
@@ -689,7 +698,7 @@ async fn left_by_an_earlier_run(
     let service = ManagedSyncService::new(
         origin,
         Arc::new(http),
-        Arc::new(Installation(computer.key.clone())),
+        Arc::new(Installation(computer.identity().keys.authorisation.clone())),
     )
     .presenting(Arc::new(Bearer(TOKEN)), BACKUP_WRITE_SCOPE);
     let directory = tempfile::tempdir().expect("a directory");
@@ -756,6 +765,47 @@ async fn a_bundle_the_seed_does_not_open_is_neither_adopted_nor_written_over() {
     )
     .expect_err("no kit is offered for a bundle that was not adopted");
     assert!(!path.exists());
+}
+
+/// KR-REQ-20.18: a step holds the lock a second companion on this machine would wait on, for as
+/// long as it runs and no longer, so two companions never each draw a locator and commit a bundle
+/// of their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_holds_the_lock_another_companion_waits_on_while_it_runs() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(computer.data.path().join("recovery").join("recovery.lock"))
+        .expect("the lock file");
+    assert!(
+        lock.try_lock().is_ok(),
+        "nothing holds the lock between steps"
+    );
+    lock.unlock().expect("released");
+
+    // The service holds the first write, so the step is in flight.
+    let web = Arc::clone(computer.served.web());
+    web.fail(SYNC_PATH, 1, Moment::Hold);
+    let recovery = Arc::clone(&page.recovery);
+    let account = Arc::clone(&page.account);
+    let step = tokio::spawn(async move { recovery.turn_on(&account).await });
+    web.requests_reach(SYNC_PATH, 1).await;
+    assert!(
+        matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "a step in flight holds the lock"
+    );
+
+    web.release_held();
+    step.await
+        .expect("the step ends")
+        .expect_err("the held write was never answered");
+    assert!(
+        lock.try_lock().is_ok(),
+        "the lock is let go when the step ends"
+    );
 }
 
 /* -------------------------------------------------------------------------- */
