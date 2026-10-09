@@ -458,9 +458,17 @@ async fn duplex_watched(broker: &Arc<Broker>) -> Served {
 
 /// The same over one named connection, which a restart's own connection needs.
 async fn duplex_watched_on(broker: &Arc<Broker>, connection: GatewayConnectionId) -> Served {
+    duplex_watched_framed(broker, connection, Framing::new(NativeFraming::JsonLines)).await
+}
+
+/// The same with the framing the connection's connector declared.
+async fn duplex_watched_framed(
+    broker: &Arc<Broker>,
+    connection: GatewayConnectionId,
+    framing: Framing,
+) -> Served {
     let (upstream_here, upstream_there) = socket_pair();
     let (client_here, client_there) = socket_pair();
-    let framing = Framing::new(NativeFraming::JsonLines);
     let observations = broker.observatory().subscribe(connection);
     let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
     let (owner, writes) = Duplex::new(
@@ -3964,6 +3972,292 @@ async fn next_line_from<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> S
         .await
         .expect("the stream is readable");
     line
+}
+
+/// A request that names `method` and is exactly `bytes` bytes long, padded in its parameters.
+fn request_of(id: u32, method: &str, bytes: usize) -> String {
+    let bare = format!(r#"{{"id":{id},"method":"{method}","params":{{"pad":""}}}}"#);
+    let padding = "x".repeat(
+        bytes
+            .checked_sub(bare.len())
+            .expect("room for the envelope"),
+    );
+    let frame = format!(r#"{{"id":{id},"method":"{method}","params":{{"pad":"{padding}"}}}}"#);
+    assert_eq!(frame.len(), bytes);
+    frame
+}
+
+/// What became of one frame written to one end of a connection.
+enum Crossing {
+    /// The line the other end read.
+    Carried(String),
+    /// The connection ended, and the other end was never given a byte.
+    Ended { stopped: bool, other_end: String },
+}
+
+/// Writes `frame` and its line end to one end of a real connection framed as `framing` says, and
+/// reports what the other end got. `from_upstream` says which end writes.
+async fn cross(framing: Framing, from_upstream: bool, frame: &str) -> Crossing {
+    let broker = broker();
+    let Served {
+        owner,
+        upstream,
+        client,
+        upstream_reads,
+        drained,
+        observations: _,
+    } = duplex_watched_framed(&broker, GatewayConnectionId::new(1), framing).await;
+    let (mut writing, serving, receiving) = if from_upstream {
+        let owner = Arc::clone(&owner);
+        (
+            upstream,
+            tokio::spawn(async move { owner.serve(upstream_reads, true).await }),
+            client,
+        )
+    } else {
+        // Nothing reads the upstream's socket here but the test, so its other half is let go: the
+        // end of the connection is then the end of what the test reads.
+        drop(upstream_reads);
+        let (reads, writing) = socket_pair();
+        let owner = Arc::clone(&owner);
+        (
+            writing,
+            tokio::spawn(async move { owner.serve(reads, false).await }),
+            upstream,
+        )
+    };
+    let mut receiving = tokio::io::BufReader::new(receiving);
+    // The frame is a megabyte, so it is written while the other end is being read.
+    let line = format!("{frame}\n");
+    let writer = tokio::spawn(async move {
+        let _ = writing.write_all(line.as_bytes()).await;
+        writing
+    });
+    let carried = tokio::select! {
+        line = next_line(&mut receiving) => Some(line),
+        () = async { let _ = tokio::time::timeout(LIVENESS_DEADLINE, serving).await; } => None,
+    };
+    let _writing = writer.await.expect("the writer is joined");
+    if let Some(line) = carried
+        && !line.is_empty()
+    {
+        owner.shutdown();
+        drop(owner);
+        drained.abort();
+        return Crossing::Carried(line);
+    }
+    let stopped = owner.stopping();
+    owner.shutdown();
+    drop(owner);
+    let _ = tokio::time::timeout(LIVENESS_DEADLINE, drained).await;
+    let mut other_end = String::new();
+    let _ = tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        tokio::io::AsyncReadExt::read_to_string(&mut receiving, &mut other_end),
+    )
+    .await;
+    Crossing::Ended { stopped, other_end }
+}
+
+/// KR-REQ-11.32 and section 9: a frame whose body is exactly the frame bound crosses a connection
+/// whole in both directions, and one byte more ends the connection without a byte of it carried.
+///
+/// The queue that holds what is waiting for an end is no smaller than a frame the connection may
+/// carry, so a frame at the bound is not refused for the newline that ends it or for the
+/// identifier this host gives a request on its way out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_frame_at_the_frame_bound_is_carried_and_one_byte_above_ends_the_connection()
+{
+    let bound = kr_worker::broker::gateway::MAX_NATIVE_FRAME_BYTES;
+    let framing = Framing::new(NativeFraming::JsonLines);
+    for from_upstream in [true, false] {
+        let end = if from_upstream {
+            "upstream"
+        } else {
+            "terminal"
+        };
+
+        let at = request_of(7, "session/update", bound);
+        let Crossing::Carried(line) = cross(framing, from_upstream, &at).await else {
+            panic!("a frame of exactly the bound, from the {end}, was not carried");
+        };
+        let carried: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("the other end read a whole frame");
+        assert_eq!(
+            carried["params"]["pad"],
+            serde_json::from_str::<serde_json::Value>(&at).expect("a frame")["params"]["pad"],
+            "the parameters arrived whole from the {end}"
+        );
+
+        let above = request_of(8, "session/update", bound + 1);
+        let Crossing::Ended { stopped, other_end } = cross(framing, from_upstream, &above).await
+        else {
+            panic!("a frame one byte above the bound, from the {end}, was carried");
+        };
+        assert!(
+            stopped,
+            "a frame above the bound from the {end} ends the connection"
+        );
+        assert!(
+            other_end.is_empty(),
+            "and none of it was carried to the other end: {} bytes",
+            other_end.len()
+        );
+    }
+}
+
+/// KR-REQ-11.32 and section 9: a connector's own limit below the host's is the limit its
+/// connection keeps, and a limit above the host's is held to the host's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_connector_s_frame_limit_is_kept_below_the_host_s_and_clamped_above_it() {
+    let bound = kr_worker::broker::gateway::MAX_NATIVE_FRAME_BYTES;
+    let declared = 4096;
+    let small = Framing::within(NativeFraming::JsonLines, declared);
+    for from_upstream in [true, false] {
+        let at = request_of(7, "session/update", declared);
+        assert!(
+            matches!(cross(small, from_upstream, &at).await, Crossing::Carried(_)),
+            "a frame at the connector's own limit is carried"
+        );
+        let above = request_of(8, "session/update", declared + 1);
+        assert!(
+            matches!(
+                cross(small, from_upstream, &above).await,
+                Crossing::Ended { stopped: true, .. }
+            ),
+            "and one byte above it ends the connection although the host would carry it"
+        );
+    }
+    // A connector that declares more than the host carries is held to what the host carries.
+    let large = Framing::within(NativeFraming::JsonLines, 8 * bound);
+    let above = request_of(9, "session/update", bound + 1);
+    assert!(
+        matches!(
+            cross(large, true, &above).await,
+            Crossing::Ended { stopped: true, .. }
+        ),
+        "a declared limit never raises the host's"
+    );
+}
+
+/// KR-REQ-11.32 and section 9: a reply that grows past what the connection carries when it goes
+/// back under the terminal's own identifier ends the connection, and none of it is carried.
+///
+/// The upstream's reply is at the connector's limit under the short identifier this host gave the
+/// request. The terminal's identifier is long, so putting it back makes the reply larger than the
+/// connection carries, which is more than the allowance for the identifiers this host gives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_reply_that_grows_past_what_the_connection_carries_ends_it() {
+    let broker = broker();
+    let served = duplex_watched_framed(
+        &broker,
+        GatewayConnectionId::new(1),
+        Framing::within(NativeFraming::JsonLines, 4096),
+    )
+    .await;
+    let (owner, drained) = (Arc::clone(&served.owner), served.drained);
+    let long = "i".repeat(200);
+    owner
+        .from_client(
+            format!(r#"{{"id":"{long}","method":"session/update","params":{{}}}}"#).as_bytes(),
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the terminal's request, under a long identifier, is carried");
+
+    // A reply of exactly the connector's limit, under the identifier this host gave the request.
+    let bare = r#"{"id":"kr-1","result":{"pad":""}}"#;
+    let reply = format!(
+        r#"{{"id":"kr-1","result":{{"pad":"{}"}}}}"#,
+        "x".repeat(4096 - bare.len())
+    );
+    assert_eq!(reply.len(), 4096);
+    owner
+        .from_upstream(reply.as_bytes(), TimestampMs::new(3))
+        .await
+        .expect_err("the reply, with the terminal's identifier in it, is more than is carried");
+    assert!(owner.stopping(), "and the connection ends");
+    owner.shutdown();
+    drop(owner);
+    tokio::time::timeout(LIVENESS_DEADLINE, drained)
+        .await
+        .expect("the writers finish")
+        .expect("they are joined");
+    let mut told = String::new();
+    tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        tokio::io::AsyncReadExt::read_to_string(
+            &mut tokio::io::BufReader::new(served.client),
+            &mut told,
+        ),
+    )
+    .await
+    .expect("the terminal's end reaches its end")
+    .expect("it is readable");
+    assert!(
+        !told.contains("xxxx"),
+        "none of the reply was carried to the terminal"
+    );
+}
+
+/// KR-REQ-11.32 and section 9: a frame above the bound ends the connection and the terminal is
+/// told, under its own identifier, about the request it was still waiting on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_frame_above_the_bound_tells_the_terminal_what_it_was_waiting_on() {
+    let broker = broker();
+    let served = duplex_watched(&broker).await;
+    let (owner, drained) = (Arc::clone(&served.owner), served.drained);
+    owner
+        .from_client(
+            br#"{"id":41,"method":"session/update","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the terminal's own request is carried");
+    let (mut writing, reads) = (served.upstream, served.upstream_reads);
+    let serving = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move { owner.serve(reads, true).await })
+    };
+    let above = request_of(5, "session/request_permission", 1_048_577);
+    let writer = tokio::spawn(async move {
+        let _ = writing.write_all(format!("{above}\n").as_bytes()).await;
+        writing
+    });
+    tokio::time::timeout(LIVENESS_DEADLINE, serving)
+        .await
+        .expect("the reader ends rather than carrying on")
+        .expect("its task is joined");
+    let _writing = writer.await.expect("the writer is joined");
+    assert!(owner.stopping(), "the connection ended");
+    owner.shutdown();
+    drop(owner);
+    tokio::time::timeout(LIVENESS_DEADLINE, drained)
+        .await
+        .expect("the writers finish")
+        .expect("they are joined");
+    let mut told = String::new();
+    tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        tokio::io::AsyncReadExt::read_to_string(
+            &mut tokio::io::BufReader::new(served.client),
+            &mut told,
+        ),
+    )
+    .await
+    .expect("the terminal's end reaches its end")
+    .expect("it is readable");
+    let answers: Vec<serde_json::Value> = told
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a frame"))
+        .collect();
+    assert_eq!(answers.len(), 1, "the terminal is told once: {told}");
+    assert_eq!(answers[0]["id"], 41, "under the identifier it used");
+    assert!(
+        answers[0].get("error").is_some(),
+        "and the answer is an error"
+    );
 }
 
 /// KR-REQ-12.13 and section 9: the client's own requests are bounded, given up on a deadline, and
