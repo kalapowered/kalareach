@@ -15,6 +15,8 @@ base64.workspace = true
 # The rendezvous room socket carries its frames in one task, which polls both directions at once.
 futures-util.workspace = true
 iroh.workspace = true
+# A moment shown in UTC, in the lines an owner confirms an organisation's keys by.
+jiff.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-flush.workspace = true
