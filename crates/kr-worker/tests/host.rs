@@ -2733,8 +2733,9 @@ async fn a_process_that_outlasts_the_cleanup_is_named_and_cannot_act_as_the_sess
         "by identifier and start: {named:?}"
     );
     assert!(
-        named.detail.contains("ran in"),
-        "and by where it ran: {named:?} (the worker's group was {cgroup:?})"
+        named.detail.contains("recorded the session's processes in")
+            || named.detail.contains("ran in the control group"),
+        "and by where the worker recorded it: {named:?} (the worker's group was {cgroup:?})"
     );
     assert!(
         !closure

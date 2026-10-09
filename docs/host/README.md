@@ -2926,9 +2926,10 @@ and a missing one are not acted on, and the closure says why. A recorded process
 through the platform's hold on it: a process descriptor on Linux, the kernel's own version of the
 process on macOS (which the kernel checks again as it signals), an open handle on Windows. A
 platform that offers none of these does not signal the process by its number. On Unix the cleanup
-asks (terminate, hang up, continue), waits the five-second period section 7 gives a closing
-session for the recorded processes and for whatever the unit's control group still holds, ends
-what is left, and waits two seconds more. On Windows the worker's job object held the
+asks (terminate, hang up, continue; a server the worker started is asked with terminate and
+continue alone, because a hang-up kills it at once and leaves the commands it started), waits the
+five-second period section 7 gives a closing session for the recorded processes and for whatever
+the unit's control group still holds, ends what is left, and waits two seconds more. On Windows the worker's job object held the
 whole tree and closed with the worker; the cleanup waits for that, and ends by handle only what is
 left. A worker that ran as a systemd service also ran in that service's control group, named from
 the reservation and unable to name anything else. The cleanup reads the group from the kernel, asks
@@ -4640,7 +4641,11 @@ somebody else's service, and the listing says so rather than offering one that w
 1. The session moves to `closing` atomically. Input is rejected from that moment.
 2. The acceptance is written to the requester **before** anything is signalled, because the
    requester is often a command running inside the process group about to be stopped.
-3. The owned process group is asked to stop, and has five seconds.
+3. The owned process group is asked to stop, and has five seconds. Each recorded process is
+   signalled through the platform's hold on it (a process descriptor on Linux, which needs kernel
+   5.3 or later and a system that allows `pidfd_open`; the kernel's own version of the process on
+   macOS). A system that offers none signals none of them by its number, and the record names each
+   process it did not signal and why.
 4. Whatever remains is forced.
 5. Output drains for two more seconds.
 6. The record is written: the reason, the root shell's exit status or the signal that ended it, the

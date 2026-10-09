@@ -1270,6 +1270,47 @@ impl Session {
         }
     }
 
+    /// Adds a server the worker started for the session as a root of the record, and hands the
+    /// writer the record with it in.
+    ///
+    /// Returns what says whether the record was written, for the caller to wait for outside the
+    /// session's lock. A server whose record is not on disk is one a daemon cannot stop after this
+    /// worker dies, so a caller that starts a server waits for the answer, and takes anything but
+    /// `true` before its deadline (a failed write, a writer that has gone, no answer in time) as a
+    /// record that was not written.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no record can be written. A session that is closing or closed refuses a new
+    /// server: nothing the closure has begun to stop would find it. A session that keeps no record
+    /// of its processes refuses it too. In the third case, a session with no journal file or a
+    /// thread that could not be started, the server is already a root of the in-memory record, so
+    /// the session's own closure stops it, and the caller treats the launch as one whose record
+    /// was not written.
+    pub fn record_backend(
+        &mut self,
+        identity: kr_protocol::identity::ProcessStartIdentity,
+    ) -> std::result::Result<tokio::sync::oneshot::Receiver<bool>, String> {
+        if !self.state.accepts_input() {
+            return Err("this session is closing, so no server is started for it".to_owned());
+        }
+        let owned = self
+            .owned
+            .as_mut()
+            .ok_or_else(|| "this session records no processes".to_owned())?;
+        owned.add_backend(identity);
+        let record = owned.record();
+        self.start_owned_writer();
+        self.owned_writer
+            .as_ref()
+            .map(|writer| writer.submit_acknowledged(record))
+            .ok_or_else(|| {
+                "this session keeps no record of its processes on disk, or the thread that \
+                 writes it could not be started"
+                    .to_owned()
+            })
+    }
+
     /// Starts the thread that writes the record, if there is none and the journal is a file. A
     /// thread that cannot be started is noted as something this host could not establish, and
     /// is tried again at the next observation.

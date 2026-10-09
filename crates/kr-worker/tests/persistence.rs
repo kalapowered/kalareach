@@ -1151,6 +1151,7 @@ fn what_a_worker_records_of_its_processes_is_read_back_whole() {
         cgroup: Some("/user.slice/kr-worker-x.service".to_owned()),
         boundary: "the terminal's process group".to_owned(),
         limits: vec!["a limit".to_owned()],
+        backends: Vec::new(),
     };
     journal.record_owned(session_id, &record).expect("records");
     let newer = kr_worker::ownership::OwnedRecord {
@@ -3580,4 +3581,109 @@ fn a_widened_state_directory_is_not_owner_only() {
         not_owner_only(&owned).is_some(),
         "a directory that grants Everyone is not owner-only"
     );
+}
+
+/// A record handed to the writer with a request to be told is answered after it is on disk, a write
+/// that cannot be made is answered `false`, and two requests merged into one write are both
+/// answered. The lifecycle of a server waits for this answer before the server is used.
+#[tokio::test]
+async fn kr_req_07_60_the_writer_of_the_owned_record_says_whether_a_record_was_written() {
+    let path = journal_path("owned-acknowledged");
+    let session_id = fixture_session();
+    let identity = |pid: u64| {
+        kr_protocol::identity::ProcessStartIdentity::new(
+            pid,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            pid * 3,
+        )
+    };
+    let record = |processes: Vec<u64>| kr_worker::ownership::OwnedRecord {
+        boot: kr_ipc::identity::boot_identity().ok(),
+        root: identity(10),
+        processes: processes.into_iter().map(identity).collect(),
+        cgroup: None,
+        boundary: "the terminal's process group".to_owned(),
+        limits: Vec::new(),
+        backends: vec![identity(11)],
+    };
+    let journal = Journal::open(&path).expect("opens");
+
+    // The record is on disk when the answer comes.
+    let writer = kr_worker::owned_writer::OwnedWriter::start(path.clone(), session_id)
+        .expect("the thread starts");
+    let first = record(vec![10, 11]);
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        writer.submit_acknowledged(first.clone()),
+    )
+    .await
+    .expect("an answer comes")
+    .expect("the thread answers");
+    assert!(answer, "the write was made");
+    let first_on_disk = first;
+    assert_eq!(
+        journal.read_owned(session_id).expect("reads"),
+        Some(first_on_disk.clone()),
+        "and the record is the one that was handed over"
+    );
+
+    // Requests that merge into one write are all answered, and the latest record is the one on
+    // disk. The journal is held by a transaction of this test, so the thread cannot finish its
+    // first write until it is let go: the three requests are queued behind it, and at least the
+    // last two are one batch whatever the scheduler does.
+    let holder = rusqlite::Connection::open(&path).expect("a second connection");
+    holder
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("holds the journal's write lock");
+    let (third, fourth) = (record(vec![10, 11, 12]), record(vec![10, 11, 12, 13]));
+    let blocked = writer.submit_acknowledged(record(vec![10]));
+    let (third_answer, fourth_answer) = (
+        writer.submit_acknowledged(third),
+        writer.submit_acknowledged(fourth.clone()),
+    );
+    // Nothing is on disk or answered while the lock is held, which is what an acknowledgement
+    // sent before its write would get wrong.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        journal.read_owned(session_id).expect("reads"),
+        Some(first_on_disk.clone()),
+        "no write was made while the journal was held"
+    );
+    holder.execute_batch("COMMIT").expect("lets the journal go");
+    drop(holder);
+    for answer in [blocked, third_answer, fourth_answer] {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), answer)
+                .await
+                .expect("an answer comes")
+                .expect("the thread answers"),
+            "every request is told its write was made"
+        );
+    }
+    assert_eq!(
+        journal.read_owned(session_id).expect("reads"),
+        Some(fourth),
+        "and the latest record is the one on disk"
+    );
+    drop(writer);
+    drop(journal);
+
+    // A write that cannot be made is answered false.
+    let unwritable = kr_worker::owned_writer::OwnedWriter::start(
+        path.parent().expect("a parent").to_path_buf(),
+        session_id,
+    )
+    .expect("the thread starts");
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        unwritable.submit_acknowledged(record(vec![10, 11])),
+    )
+    .await
+    .expect("an answer comes")
+    .expect("the thread answers");
+    assert!(
+        !answer,
+        "a directory is not a journal, and the answer says so"
+    );
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }

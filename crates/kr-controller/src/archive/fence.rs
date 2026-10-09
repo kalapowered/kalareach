@@ -16,9 +16,10 @@
 //! On Windows the worker's own job object held the whole tree and closed with the worker; this
 //! waits for that, and ends by handle only what is left.
 //!
-//! **How.** Unix processes are asked to end (terminate, hang up, continue) and given the grace
-//! period section 7 gives a closing session, then ended with no chance to refuse, and given a
-//! moment more. The cleanup is bounded. A process that is still there at the end of it has been
+//! **How.** Unix processes are asked to end (terminate, hang up, continue; a server the worker
+//! started is asked with terminate and continue alone, because a hang-up kills it at once and
+//! leaves the commands it started) and given the grace period section 7 gives a closing session,
+//! then ended with no chance to refuse, and given a moment more. The cleanup is bounded. A process that is still there at the end of it has been
 //! fenced in the sense section 24 allows: the worker that served it is dead and its endpoint,
 //! descriptor and terminal are gone, so nothing it holds lets it act as the session, and the
 //! closure names it by identifier, start and where it ran, with incomplete coverage, so that
@@ -194,7 +195,17 @@ impl ArchiveService {
         #[cfg(unix)]
         for process in &mut tracked {
             if matches!(process.state, Standing::Pending) {
-                match stop(&process.identity, kr_ipc::identity::Stop::Terminate) {
+                // A server the worker started is asked with a terminate alone: a hang-up kills
+                // it at once and leaves the commands it started, which a terminate lets it end.
+                let backend = record
+                    .as_ref()
+                    .is_some_and(|record| record.backends.contains(&process.identity));
+                let request = if backend {
+                    kr_ipc::identity::Stop::Term
+                } else {
+                    kr_ipc::identity::Stop::Terminate
+                };
+                match stop(&process.identity, request) {
                     // Whether the process is gone is the kernel's word, asked at the next look:
                     // a version-bound signal that finds nothing can be a process that ran a new
                     // program in between.
@@ -426,7 +437,7 @@ fn survivor(
             if boundary.is_empty() {
                 String::new()
             } else {
-                format!("; it ran in {boundary}")
+                format!("; the worker recorded the session's processes in {boundary}")
             }
         },
         |group| format!("; it ran in the control group {}", group.path),
