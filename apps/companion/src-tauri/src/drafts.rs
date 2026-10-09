@@ -166,6 +166,9 @@ impl DraftDesk {
             application_instance_id: Nullable::from(params.application_instance_id),
             agent_binding_revision: Nullable::from(params.agent_binding_revision),
         });
+        // A person who sends a draft somewhere has chosen it, so it is no longer a copy kept beside
+        // another: it is a draft of the session it now goes to.
+        draft.conflict_of = Nullable::null();
         let updated = store.update(&draft, now).map_err(failure)?;
         Ok(StoredDraft::of(&updated))
     }

@@ -384,6 +384,44 @@ fn retargeting_is_the_way_back_to_open_and_names_the_version_it_was_shown() {
     assert_eq!(moved["text"], "for the old conversation");
 }
 
+/// A copy kept beside another window's draft becomes an ordinary draft of the session it is sent to,
+/// by the person's choice, and is not a copy any more.
+#[test]
+fn sending_a_copy_to_a_session_makes_it_a_draft_of_that_session() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let one = Window::over(data.path());
+    let two = Window::over(data.path());
+    let made = one.write("begun");
+    let id = made["draft"]["id"].as_str().expect("an id").to_owned();
+    two.call(
+        "device_draft_save",
+        save(Some(&id), Some("1"), SESSION, None, "theirs"),
+    )
+    .expect("saved");
+    let copy = one
+        .call(
+            "device_draft_save",
+            save(Some(&id), Some("1"), SESSION, None, "mine"),
+        )
+        .expect("kept");
+    assert_eq!(copy["outcome"], "copied");
+    let copy_id = copy["draft"]["id"].as_str().expect("an id").to_owned();
+
+    let sent = one
+        .call(
+            "device_draft_retarget",
+            json!({ "id": copy_id, "expectedRevision": "1", "sessionId": OTHER_SESSION,
+                    "applicationInstanceId": null, "agentBindingRevision": null }),
+        )
+        .expect("retargeted");
+    assert_eq!(sent["sessionId"], OTHER_SESSION);
+    assert_eq!(
+        sent["copyOf"],
+        Value::Null,
+        "a draft the person sent is not a copy"
+    );
+}
+
 /// A discard removes the version the person was shown and no later one.
 #[test]
 fn a_discard_removes_the_version_that_was_shown_and_no_later_one() {
