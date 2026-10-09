@@ -260,7 +260,8 @@ test.describe('the attention inbox', () => {
 
 // KR-REQ-13.15: the conversation keeps up with new entries only while the reader is at its live
 // end, leaves a reader who scrolled away where they are, and a change of view and back returns them
-// to the same place.
+// to the same place. KR-REQ-13.03: the draft written meanwhile is kept across the same two changes,
+// with the reader's place.
 test.describe('the conversation keeps its place', () => {
   const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -318,12 +319,15 @@ test.describe('the conversation keeps its place', () => {
     await expect(scroll.locator('[data-node-id$=":47"]')).toBeAttached()
     expect(await reading(scroll)).toEqual(before)
 
-    // To the terminal and back: the same node, the same distance from the top.
+    // A draft is being written where the reader is. To the terminal and back: the same node, the
+    // same distance from the top, and the same draft.
+    await page.getByTestId('composer-input').fill('half a thought, written while reading')
     await page.getByRole('tab', { name: 'Terminal' }).click()
     await page.getByTestId('raw-terminal').waitFor()
     await page.getByRole('tab', { name: 'Conversation' }).click()
     await expect(scroll).toBeVisible()
     await expect.poll(() => reading(scroll)).toEqual(before)
+    await expect(page.getByTestId('composer-input')).toHaveValue('half a thought, written while reading')
     await page.screenshot({ path: shot(`conversation-place-13.15-${test.info().project.name}`) })
   })
 })
