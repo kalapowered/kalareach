@@ -92,7 +92,14 @@ struct Arguments {
 }
 
 fn main() -> ExitCode {
-    // First: a worker of an installed release holds that release for as long as it runs, which is
+    // A worker's lifetime must not depend on whatever started it. Becoming a session leader is
+    // what detaches it: it leaves the launcher's session and its controlling terminal, so nothing
+    // aimed at that terminal or that session reaches this process or the shell it will start. It
+    // comes before everything else, the release hold included, so that the time the worker shares
+    // the launcher's session is the program's own start. A worker that a service manager started
+    // already leads a process group, which is what the launcher's own detached start does not do.
+    detach_from_the_launcher();
+    // Next: a worker of an installed release holds that release for as long as it runs, which is
     // for as long as its session does, and does not start at all once the release is being removed.
     if let Err(error) = kr_ipc::install::this_process() {
         eprintln!("kr-worker: {error}");
@@ -119,11 +126,6 @@ fn main() -> ExitCode {
 }
 
 async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
-    // A worker's lifetime must not depend on whatever started it. Becoming a session leader is
-    // what detaches it: it leaves the launcher's session and its controlling terminal, so nothing
-    // aimed at that terminal or that session reaches this process or the shell it will start.
-    // A worker a service manager already placed in its own session is one already, and says so.
-    detach_from_the_launcher();
     let session_id = SessionId::new(arguments.session);
     let environment_id = EnvironmentId::new(arguments.environment);
     let paths = HostPaths::new(&arguments.runtime_dir, &arguments.state_dir)?;
@@ -780,9 +782,10 @@ fn default_shell() -> String {
 
 /// Leaves the session and controlling terminal of whatever started this worker.
 ///
-/// `setsid` fails when the caller already leads a process group, which is exactly the case when a
-/// service manager has already put this worker in its own session. That failure means the goal is
-/// already met, so it is not one.
+/// `setsid` fails when the caller already leads a process group. The daemon's detached start does
+/// not make the worker one, so there it succeeds. A service manager's job leads a group, or a
+/// session, of its own already: there it fails, which means the goal is met as far as the manager
+/// meets it, so it is not an error.
 #[cfg(unix)]
 fn detach_from_the_launcher() {
     let _ = rustix::process::setsid();
