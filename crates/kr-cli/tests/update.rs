@@ -8314,14 +8314,13 @@ fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_whi
 /// can switch to lists its stores, and so reads the configuration document at version 2.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_is_refused_to_a_release_that_lists_no_store() {
-    let host = Host::create();
+    let host = Host::bare();
     let unlisted = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).without_stores();
     let listed = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&listed);
     // Written into the store as an earlier build left it: this build starts none of its programs,
     // because its manifest is not one this build reads.
     unlisted.write(&host.store.release_directory(unlisted.name()));
-    host.put(&listed);
-    host.switch(listed.name());
 
     let (output, said) = host.kr_json(&[
         "host",
