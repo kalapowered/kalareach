@@ -4007,12 +4007,12 @@ reaches the store when the journal is back. That event is numbered above the num
 spent while the journal was out, so the store notes a gap before it, and each other approval of the
 session that is still pending is shown as uncertain until it ends. None of the three carries text
 but the question ledger and the host events: what an approval asks is the application's to show.
-For each live session the daemon opens a connection of its own to the session's worker, verified and bound to
-the daemon's generation like every other, and declared for attention: it carries the daemon's
-requests for these records and nothing else, and a newer one replaces the one before it. The daemon
-keeps one request for records past the store's cursors waiting on it. The worker answers that
-request as soon as it commits a question transition, the transition of an approval, a host event
-or a privacy transition, and after at most thirty seconds otherwise, so a question asked in a
+For each live session the daemon opens a connection of its own to the session's worker, verified
+and bound to the daemon's generation like every other, and declared for attention: it carries the
+daemon's requests for these records and nothing else, and a newer one replaces the one before it.
+The daemon keeps one request for records past the store's cursors waiting on it. The worker answers
+that request as soon as it commits a question transition, the transition of an approval, a host
+event or a privacy transition, and after at most thirty seconds otherwise, so a question asked in a
 session is in the inbox within moments rather than at some later pass. A broker transition of any
 other request waits to go with the next page. A page that ends before the broker's newest record is
 answered at once, so the transition of an approval behind a full page is not read late.

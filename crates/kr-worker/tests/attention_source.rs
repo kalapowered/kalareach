@@ -563,16 +563,13 @@ async fn a_held_page_answers_when_a_question_is_committed() {
     let host = host().await;
     notify(&host, "the build finished");
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let held_before = host.service.held_attention_requests();
     link.writer()
         .write_message(&ControlFrame::AttentionSources(sources(0, 1, 20_000)))
         .await
         .expect("writes the request");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), next_answer(&mut link))
-            .await
-            .is_err(),
-        "nothing past the cursors, so the request is held"
-    );
+    // Nothing is past the cursors, so the worker holds the request.
+    until_held_again(&host, held_before).await;
 
     // The connection goes on serving text while the page is held.
     let served = text(&mut link, texts(&[(AttentionSource::HostEvents, 1)])).await;
@@ -597,15 +594,12 @@ async fn a_held_page_answers_when_a_question_is_committed() {
 async fn a_held_page_answers_when_a_host_event_is_committed() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let held_before = host.service.held_attention_requests();
     link.writer()
         .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
         .await
         .expect("writes the request");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), next_answer(&mut link))
-            .await
-            .is_err()
-    );
+    until_held_again(&host, held_before).await;
     notify(&host, "the build finished");
     let Answer::Page(page) = within(&mut link, Duration::from_secs(5)).await else {
         panic!("expected the held page");

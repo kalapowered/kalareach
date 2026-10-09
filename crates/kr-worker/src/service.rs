@@ -2660,12 +2660,13 @@ impl WorkerService {
     /// Reads one page, holding the request while there is nothing to answer with.
     ///
     /// It answers at once when a question or a host event is past its cursor, when an approval's
-    /// transition is, or when the page ends before the broker's newest record, so that an
-    /// approval's transition behind a full page is read at once and not at the bound (a broker
-    /// transition of any other request waits to go with the next page), when the session's privacy
-    /// generation has moved since the request arrived or is past the generation the request says
-    /// the daemon has recorded, and when the request's bound runs out. Every subscription is taken before each read, so a commit between the read and the
-    /// wait wakes the wait rather than falling between them. A request a newer one replaced
+    /// transition is, when the session's privacy generation has moved since the request arrived or
+    /// is past the generation the request says the daemon has recorded, and when the request's
+    /// bound runs out. A broker transition of any other request waits to go with the next page,
+    /// unless the page ends before the broker's newest record: then the transition of an approval
+    /// may be behind it, and the page is answered so that the daemon reads on at once. Every
+    /// subscription is taken before each read, so a commit between the read and the wait wakes the
+    /// wait rather than falling between them. A request a newer one replaced
     /// answers nothing: the replacement is checked before every read and before the answer is
     /// handed over, and it wins a wait that something else ends at the same moment.
     async fn finish_page(
