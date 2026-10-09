@@ -918,6 +918,21 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-client --lib
 
+      # The loopback listener a sign-in comes back to. Windows lets a socket that asks for address
+      # reuse take over an address another program is listening on, so the listener takes the
+      # address exclusively before it binds; these cases bind an address twice and see that the
+      # second attempt is told it is held.
+      - name: Test the loopback listener of a sign-in
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-loopback
+
+      # The host's own sign-in and sign-out through a real daemon. A sign-in comes back on one
+      # loopback address, which a second attempt binds again once the first has let it go, and an
+      # address another program holds ends the attempt as held.
+      - name: Sign the host in and out through the daemon
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-controller --test voice_broker sign
+
       # The rule a rendering follows, read from the sources as this platform names their files: a
       # file is named by its path's components, so the files the rule allows are the same files here
       # as on a platform whose separator is `/`.
