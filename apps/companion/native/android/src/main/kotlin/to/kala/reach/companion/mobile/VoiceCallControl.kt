@@ -72,8 +72,9 @@ interface VoiceCallPlatform {
  * through three steps, and capture waits for all of them:
  *
  * 1. [permit] takes the host's answer: the voice session and the moment the service closes the
- *    call. It refuses a stopped or already permitted call and an answer whose moment has passed,
- *    takes audio focus and asks for the foreground service. A refusal of either undoes both and ends
+ *    call. It refuses a stopped or already permitted call, and one whose provider answer is not
+ *    applied yet, and changes nothing; it refuses an answer whose moment has passed, takes audio
+ *    focus and asks for the foreground service. A refusal of either of those undoes both and ends
  *    the call. The call's end is scheduled for that moment, on the call's own thread.
  * 2. The service enters the foreground ([servicePromoted]). Only then is the gate permitted, with
  *    the clock read again, so time the platform took counts against the deadline instead of
