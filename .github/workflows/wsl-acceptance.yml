@@ -50,16 +50,6 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: wsl-linux-set-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-
       # The helper, the daemon and the worker, and the bridge suite and the pairing suite as the test
       # executables cargo builds for them, which the acceptance installs beside them and runs inside
       # the distribution.
@@ -125,16 +115,6 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
           cargo --version
-
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: wsl-windows-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       # What the acceptance reaches the distributions with. The script looks for them in
       # `target/debug` of the checkout.
