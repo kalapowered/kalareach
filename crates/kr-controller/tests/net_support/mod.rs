@@ -23,7 +23,7 @@ use kr_client::transport::NetworkTransport;
 use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Clocks, Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
@@ -94,6 +94,8 @@ pub struct Host {
     pub room: room::TestRoom,
     /// The network settings the host was started with, which a restart keeps.
     settings: NetworkSettings,
+    /// The clocks the host was started on, which a restart keeps.
+    clocks: Clocks,
 }
 
 impl Host {
@@ -111,6 +113,20 @@ impl Host {
 
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
+        Self::start_unowned_on_clocks(Clocks::system()).await
+    }
+
+    /// Starts a daemon with `owner` as its first owner, on the clocks a suite moves by hand, by
+    /// the path a daemon takes on the machine's own.
+    pub async fn start_on_clocks(owner: &DeviceKeys, clocks: Clocks) -> Self {
+        let mut host = Self::start_unowned_on_clocks(clocks).await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
+    async fn start_unowned_on_clocks(clocks: Clocks) -> Self {
         Self::start_on(
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
@@ -118,6 +134,7 @@ impl Host {
                 endpoint: loopback(),
                 ..NetworkSettings::default()
             },
+            clocks,
         )
         .await
     }
@@ -141,6 +158,7 @@ impl Host {
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
             settings,
+            Clocks::system(),
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -172,6 +190,7 @@ impl Host {
             owner,
             room,
             settings,
+            clocks,
             ..
         } = self;
         clients.abort();
@@ -194,6 +213,7 @@ impl Host {
             room,
             owner,
             settings,
+            clocks,
         }
     }
 
@@ -203,31 +223,35 @@ impl Host {
         temp: kr_ipc::testing::TempHost,
         room: room::TestRoom,
         settings: NetworkSettings,
+        clocks: Clocks,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
-            Controller::start(ControllerSetup {
-                paths: environment.clone(),
-                environment_id,
-                identity: Box::new(move || {
-                    let store =
-                        open_store_in(&secrets).expect("a secret store for the test environment");
-                    Ok(
-                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                            .expect("an identity"),
-                    )
-                }),
-                secret_store: StoreSelection::File,
-                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: Box::new(RefusingSupervisor),
-                worker_program: PathBuf::from("/nonexistent/kr-worker"),
-                build_id: build(),
-                release: "0".to_owned(),
-                shell_packages: None,
-                terminal: Box::new(kr_controller::supervision::NoTerminal),
-            })
+            Controller::start_on_clocks(
+                ControllerSetup {
+                    paths: environment.clone(),
+                    environment_id,
+                    identity: Box::new(move || {
+                        let store = open_store_in(&secrets)
+                            .expect("a secret store for the test environment");
+                        Ok(
+                            ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                                .expect("an identity"),
+                        )
+                    }),
+                    secret_store: StoreSelection::File,
+                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    supervisor: Box::new(RefusingSupervisor),
+                    worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                    build_id: build(),
+                    release: "0".to_owned(),
+                    shell_packages: None,
+                    terminal: Box::new(kr_controller::supervision::NoTerminal),
+                },
+                clocks.clone(),
+            )
         })
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
@@ -258,6 +282,7 @@ impl Host {
             owner_device: None,
             room,
             settings,
+            clocks,
         }
     }
 
@@ -357,6 +382,7 @@ pub struct Stopped {
     room: room::TestRoom,
     owner: Option<DeviceRecord>,
     settings: NetworkSettings,
+    clocks: Clocks,
 }
 
 impl Stopped {
@@ -376,9 +402,13 @@ impl Stopped {
     /// `settings` and the stopped one's owner.
     pub async fn start(self, settings: NetworkSettings) -> Host {
         let Self {
-            temp, room, owner, ..
+            temp,
+            room,
+            owner,
+            clocks,
+            ..
         } = self;
-        let mut host = Host::start_on(temp, room, settings).await;
+        let mut host = Host::start_on(temp, room, settings, clocks).await;
         host.owner = owner;
         host
     }
