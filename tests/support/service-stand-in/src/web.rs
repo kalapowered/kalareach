@@ -1,4 +1,5 @@
-//! Managed storage and the backup manifest, answering as the managed service answers them.
+//! Managed storage, the backup manifest and the authority feed, answering as the managed service
+//! answers them.
 //!
 //! It checks what the service checks before it acts: that the request is addressed to this
 //! service's own origin, that it was signed inside the freshness window, the signature over the
@@ -211,7 +212,7 @@ pub enum Handled {
     Slow(u64, ServiceHttpAnswer),
 }
 
-/// Managed storage and the backup manifest.
+/// Managed storage, the backup manifest and the authority feed.
 #[derive(Debug)]
 pub struct ServiceWeb {
     /// The origin this service answers as, which every request must name.

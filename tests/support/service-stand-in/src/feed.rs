@@ -161,6 +161,15 @@ fn counter(value: &Value) -> Option<u64> {
 /// The largest counter the service reads: what a number in its language holds exactly.
 const MAX_SAFE_COUNTER: u64 = (1 << 53) - 1;
 
+/// The number the service's language reads from a counter spelled as text, which is the nearest
+/// one it holds when the counter is past what it holds exactly.
+fn as_a_number(value: &Value) -> f64 {
+    value
+        .as_str()
+        .and_then(|text| text.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 /// The time as an RFC 3339 instant, in UTC, to the millisecond.
 fn instant(ms: u64) -> String {
     let days = i64::try_from(ms / 86_400_000).unwrap_or(0);
@@ -561,7 +570,7 @@ impl Feed {
             return Err(refusal(
                 402,
                 "QUOTA_EXHAUSTED",
-                "This feed holds as many records the host has not finished with as it may.",
+                "This feed holds 1000 records the host has not finished with.",
             ));
         }
         if !self.removal_keys.contains(&caller.key_id)
@@ -697,9 +706,11 @@ impl Feed {
                 "That request has already been acknowledged as complete.",
             ));
         }
+        // Compared as the service compares them, as numbers in its own language: a time past what
+        // that language holds exactly is the nearest one it does.
         if let Some(held) = record.acknowledgement.as_ref()
-            && acknowledgement.acknowledged_at_ms.get()
-                < counter(&held["acknowledged_at_ms"]).unwrap_or(0)
+            && (acknowledgement.acknowledged_at_ms.get() as f64)
+                < as_a_number(&held["acknowledged_at_ms"])
         {
             return Err(invalid(
                 "That acknowledgement is older than the one this record holds.",

@@ -1,6 +1,6 @@
 [package]
 name = "kr-service-stand-in"
-description = "A stand-in for the managed storage and backup manifest services, answering as their contract states, in process and over a loopback socket"
+description = "A stand-in for the managed storage, backup manifest and authority feed services, answering as their contract states, in process and over a loopback socket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
