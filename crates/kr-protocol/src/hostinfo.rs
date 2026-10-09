@@ -1672,6 +1672,7 @@ pub mod configuration {
     /// switch to it while a document is at version 1, naming the document, and reads a registry
     /// record at version 1 as no accepted document, which makes its next start accept the document
     /// on disk again.
+    pub const OLDEST_VERSION: u64 = 1;
 
     /// The longest configuration document this host reads.
     ///
