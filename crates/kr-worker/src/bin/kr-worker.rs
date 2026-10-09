@@ -99,10 +99,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let arguments = Arguments::parse();
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let processors = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let runtime = match session_runtime(processors) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("kr-worker: could not start: {error}");
@@ -116,6 +114,22 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The runtime this worker runs on: one scheduler thread per processor, and at most four.
+///
+/// A worker serves one session, so a thread per processor of a large host is memory held for no
+/// capacity. Each scheduler thread keeps a stack and its own allocator state resident, which on a
+/// 64-processor host is a measurable share of what twenty idle sessions hold. Four is the fewest
+/// processors a reference host has, so a host of four or fewer schedules as before and a larger one
+/// needs no more for one session. The pseudo-terminal's reader and writer are threads of their own
+/// and blocking work runs on the runtime's separate blocking pool; neither is counted here. An
+/// explicit count also takes precedence over `TOKIO_WORKER_THREADS`.
+fn session_runtime(processors: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(processors.clamp(1, 4))
+        .enable_all()
+        .build()
 }
 
 async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
@@ -906,5 +920,19 @@ mod tests {
             interactive_arguments("pwsh.exe", StartupMode::Login),
             vec!["-NoLogo".to_owned(), "-NoExit".to_owned()]
         );
+    }
+
+    /// KR-PERF-003: a session's worker holds a scheduler thread per processor up to four, and no
+    /// more on a larger host, so a worker's scheduler threads do not grow with the host.
+    #[test]
+    fn a_workers_runtime_has_a_scheduler_thread_per_processor_up_to_four() {
+        for (processors, threads) in [(1, 1), (2, 2), (4, 4), (5, 4), (64, 4)] {
+            let runtime = super::session_runtime(processors).expect("a runtime");
+            assert_eq!(
+                runtime.metrics().num_workers(),
+                threads,
+                "a host of {processors} processors"
+            );
+        }
     }
 }
