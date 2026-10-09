@@ -15,6 +15,8 @@ use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::owner::Owner;
 use crate::pairing::PastePlatform;
+use crate::recovery::Recovery;
+use crate::sync_service::SyncService;
 
 /// The backend's long-lived state.
 #[derive(Debug)]
@@ -24,6 +26,8 @@ pub struct AppState {
     device: OnceLock<Arc<Device>>,
     owner: OnceLock<Arc<Owner>>,
     paste: OnceLock<Arc<dyn PastePlatform>>,
+    sync_service: OnceLock<Arc<SyncService>>,
+    recovery: OnceLock<Arc<Recovery>>,
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
@@ -54,6 +58,8 @@ impl AppState {
             device: OnceLock::new(),
             owner: OnceLock::new(),
             paste: OnceLock::new(),
+            sync_service: OnceLock::new(),
+            recovery: OnceLock::new(),
             drafts: Mutex::new(None),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
@@ -298,6 +304,38 @@ impl AppState {
     pub fn owner(&self) -> Result<Arc<Owner>> {
         self.owner.get().cloned().ok_or_else(|| {
             CommandError::local_failure("this computer's pairing records could not be opened")
+        })
+    }
+
+    /// Records the sync service this computer is set to use.
+    pub fn sync_service_opened(&self, service: Arc<SyncService>) {
+        let _ = self.sync_service.set(service);
+    }
+
+    /// Records this computer's recovery seed and bundle, once they have been opened.
+    pub fn recovery_opened(&self, recovery: Arc<Recovery>) {
+        let _ = self.recovery.set(recovery);
+    }
+
+    /// The sync service this computer is set to use.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when this computer's data directory could not be found.
+    pub fn sync_service(&self) -> Result<Arc<SyncService>> {
+        self.sync_service.get().cloned().ok_or_else(|| {
+            CommandError::local_failure("this computer's sync service setting could not be opened")
+        })
+    }
+
+    /// This computer's recovery seed and bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when this computer's keys or records could not be opened.
+    pub fn recovery(&self) -> Result<Arc<Recovery>> {
+        self.recovery.get().cloned().ok_or_else(|| {
+            CommandError::local_failure("this computer's recovery records could not be opened")
         })
     }
 

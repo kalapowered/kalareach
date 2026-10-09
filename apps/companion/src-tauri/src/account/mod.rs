@@ -20,9 +20,10 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::services::account::{
     AccountService, AccountStatus, AccountUsage, Answer, AnswerFault, AuthorisationGrant,
-    AuthorisationRequest, Commit, Exchanged, GrantUsage, IdentityRead, PendingAuthorisation,
-    SignedInAccount, USAGE_SCOPE, UsageResource,
+    AuthorisationRequest, BACKUP_WRITE_SCOPE, Commit, Exchanged, GrantUsage, IdentityRead,
+    PendingAuthorisation, SignedInAccount, USAGE_SCOPE, UsageResource,
 };
+use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 use tokio::sync::watch;
 
@@ -153,10 +154,32 @@ enum Phase {
 /// Publishes a view to the page.
 pub type Emit = Arc<dyn Fn(&AccountView) + Send + Sync>;
 
+/// What a sign-in asks the account for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asking {
+    /// What the application itself uses.
+    Application,
+    /// That, and the right to write what the account keeps as backup, which keeping a recovery
+    /// bundle takes: a second authorisation that replaces the grant the device holds.
+    Recovery,
+}
+
+/// What the signed-in account allows this device to do with the account's backup storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Standing {
+    /// An account is signed in.
+    pub signed_in: bool,
+    /// The sign-in carries the right to write the account's backup storage.
+    pub backup_write: bool,
+}
+
 /// The account on this device.
 pub struct Account {
     signed_in: Arc<SignedInAccount>,
     service: Arc<dyn AccountService>,
+    /// The origin of the service the account is signed in to, which is the only origin its token
+    /// goes to.
+    origin: GatewayOrigin,
     carrier: Arc<dyn Carrier>,
     phase: Mutex<Phase>,
     outcome: Mutex<Option<Outcome>>,
@@ -164,17 +187,20 @@ pub struct Account {
 }
 
 impl Account {
-    /// The account kept by `signed_in`, exchanging through `service`, carried by `carrier`.
+    /// The account kept by `signed_in`, exchanging through `service` at `origin`, carried by
+    /// `carrier`.
     #[must_use]
     pub fn new(
         signed_in: Arc<SignedInAccount>,
         service: Arc<dyn AccountService>,
+        origin: GatewayOrigin,
         carrier: Arc<dyn Carrier>,
         emit: Emit,
     ) -> Self {
         Self {
             signed_in,
             service,
+            origin,
             carrier,
             phase: Mutex::new(Phase::Idle),
             outcome: Mutex::new(None),
@@ -186,6 +212,27 @@ impl Account {
     #[must_use]
     pub fn tokens(&self) -> Arc<SignedInAccount> {
         Arc::clone(&self.signed_in)
+    }
+
+    /// The origin of the service the account is signed in to.
+    #[must_use]
+    pub const fn origin(&self) -> &GatewayOrigin {
+        &self.origin
+    }
+
+    /// Whether an account is signed in, and whether it may write the account's backup storage.
+    #[must_use]
+    pub fn standing(&self) -> Standing {
+        match self.signed_in.status() {
+            Ok(AccountStatus::SignedIn { scopes, .. }) => Standing {
+                signed_in: true,
+                backup_write: scopes.iter().any(|scope| scope == BACKUP_WRITE_SCOPE),
+            },
+            _ => Standing {
+                signed_in: false,
+                backup_write: false,
+            },
+        }
     }
 
     /// Settles what an earlier run left, and publishes every change of status from here on.
@@ -284,6 +331,16 @@ impl Account {
     /// One attempt at a time: while one is open, a second press changes nothing and is told the
     /// browser is open.
     pub async fn sign_in(&self) -> AccountView {
+        self.sign_in_asking(Asking::Application).await
+    }
+
+    /// Signs this device in again, asking for the right to write the account's backup storage as
+    /// well, which keeping a recovery bundle takes.
+    pub async fn sign_in_for_recovery(&self) -> AccountView {
+        self.sign_in_asking(Asking::Recovery).await
+    }
+
+    async fn sign_in_asking(&self, asking: Asking) -> AccountView {
         let (cancel, cancelled) = watch::channel(false);
         let claimed = {
             let mut phase = self.phase.lock().expect("the phase lock is not poisoned");
@@ -302,7 +359,12 @@ impl Account {
             self.publish().await;
             return self.view().await;
         };
-        let Ok(request) = AuthorisationRequest::new(self.signed_in.client(), plan.redirect) else {
+        let client = self.signed_in.client();
+        let request = match asking {
+            Asking::Application => AuthorisationRequest::new(client, plan.redirect),
+            Asking::Recovery => AuthorisationRequest::with_recovery_backup(client, plan.redirect),
+        };
+        let Ok(request) = request else {
             self.set_phase(Phase::Idle);
             self.set_outcome(Some(Outcome::BrowserFailed));
             self.publish().await;

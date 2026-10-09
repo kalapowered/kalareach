@@ -35,9 +35,11 @@ pub mod hosts;
 pub mod links;
 pub mod owner;
 pub mod pairing;
+pub mod recovery;
 pub mod remote;
 pub mod setup;
 pub mod state;
+pub mod sync_service;
 pub mod target;
 pub mod terminal;
 pub mod transfers;
@@ -104,6 +106,7 @@ pub fn run() {
             open_pairing(app.handle());
             #[cfg(mobile)]
             hosts::resume(app.handle());
+            open_recovery(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -186,8 +189,12 @@ fn build_account(
     };
     let origin = kr_protocol::service::GatewayOrigin::new(ACCOUNT_ORIGIN)
         .map_err(|error| error.to_string())?;
-    let http = HttpService::with(origin, HttpDeadlines::default(), managed_response_limits())
-        .map_err(|error| error.to_string())?;
+    let http = HttpService::with(
+        origin.clone(),
+        HttpDeadlines::default(),
+        managed_response_limits(),
+    )
+    .map_err(|error| error.to_string())?;
     let service: Arc<dyn AccountService> = Arc::new(ManagedAccountService::new(
         Arc::new(http) as Arc<dyn AccountHttp>,
         client,
@@ -216,6 +223,7 @@ fn build_account(
     Ok(Arc::new(account::Account::new(
         Arc::new(signed_in),
         service,
+        origin,
         carrier,
         Arc::new(move |view| {
             let _ = emitter.emit(account::ACCOUNT_EVENT, view);
@@ -282,6 +290,51 @@ fn open_pairing(app: &tauri::AppHandle) {
     if let Err(error) = opened {
         tracing::warn!(%error, "this computer's pairing records could not be opened");
     }
+}
+
+/// Opens the sync service setting and, on this computer's own keys, recovery.
+///
+/// A computer whose keys cannot be opened still has the setting; recovery needs the keys, so it is
+/// the one that is missing then.
+fn open_recovery(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let Ok(data) = app.path().app_data_dir() else {
+        tracing::warn!("no application data directory, so this computer keeps no sync setting");
+        return;
+    };
+    if let Err(error) = start_recovery(app, &data) {
+        tracing::warn!(%error, "this computer's recovery records could not be opened");
+    }
+}
+
+/// Opens the sync service setting kept under `data`, and recovery on the keys and secret store of
+/// the device this computer opened as, when it did.
+///
+/// # Errors
+///
+/// Returns a local failure when recovery's directory cannot be made. The setting is open then.
+pub fn start_recovery<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    data: &std::path::Path,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use tauri::Manager as _;
+
+    let service = Arc::new(sync_service::SyncService::open(data));
+    let state = app.state::<AppState>();
+    state.sync_service_opened(Arc::clone(&service));
+    let device = state.device()?;
+    let identity = device.identity();
+    let recovery = recovery::Recovery::open(
+        data,
+        Arc::clone(&identity.secrets),
+        identity.keys.authorisation.clone(),
+        service,
+    )?;
+    state.recovery_opened(Arc::new(recovery));
+    Ok(())
 }
 
 /// Opens this computer as a device that pairs, made of `parts` with its records under `data`, and

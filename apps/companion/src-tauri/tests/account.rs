@@ -25,8 +25,8 @@ use kr_client::services::ServiceFuture;
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AUTHORIZE_PATH, AccountIdentity, AccountService, AccountToken, AccountUsage,
     AuthorisationGrant, Carrier as Delivery, Client, Exchanged, ISSUER, IssuedGrant,
-    PendingAuthorisation, RELYING_PARTY_ID, REQUESTED_SCOPES, Redirect, RefreshToken, Refreshed,
-    SignedInAccount, StoredGrant, code_challenge,
+    PendingAuthorisation, RECOVERY_BACKUP_SCOPES, RELYING_PARTY_ID, REQUESTED_SCOPES, Redirect,
+    RefreshToken, Refreshed, SignedInAccount, StoredGrant, code_challenge,
 };
 use kr_crypto::store::{MemoryStore, SecretStore};
 use kr_loopback::Listener;
@@ -179,6 +179,7 @@ fn invoke(account: Arc<Account>, command: &str) -> serde_json::Value {
         .invoke_handler(tauri::generate_handler![
             companion_tauri::commands::account_status,
             companion_tauri::commands::account_sign_in,
+            companion_tauri::commands::account_sign_in_for_recovery,
             companion_tauri::commands::account_sign_in_cancel,
             companion_tauri::commands::account_sign_out,
             companion_tauri::commands::account_usage,
@@ -234,6 +235,7 @@ fn account_in(
     Arc::new(Account::new(
         signed_in,
         service,
+        kr_protocol::service::GatewayOrigin::new(ACCOUNT_ORIGIN).expect("the account's origin"),
         carrier,
         Arc::new(move |view| published.lock().expect("the record").push(view.clone())),
     ))
@@ -241,6 +243,11 @@ fn account_in(
 
 /// What one sign-in handed the browser, what the service was asked, and what the page was told.
 fn hand_off(client: Client, redirect: Redirect) {
+    hand_off_asking(client, redirect, "account_sign_in", &REQUESTED_SCOPES);
+}
+
+/// What the sign-in `command` handed the browser, asking for `scopes`, and what followed.
+fn hand_off_asking(client: Client, redirect: Redirect, command: &str, scopes: &[&str]) {
     let opened = Arc::new(Mutex::new(Vec::new()));
     let exchanges = Arc::new(Exchanges::default());
     let views = Arc::new(Mutex::new(Vec::new()));
@@ -270,7 +277,7 @@ fn hand_off(client: Client, redirect: Redirect) {
         }),
     };
     let account = account(client, carrier, &exchanges, &views);
-    let answer = invoke(Arc::clone(&account), "account_sign_in");
+    let answer = invoke(Arc::clone(&account), command);
 
     // Exactly one address reached the browser: the authorisation endpoint on the fixed origin,
     // whose host is the relying party, with exactly this client's parameters.
@@ -286,7 +293,7 @@ fn hand_off(client: Client, redirect: Redirect) {
     assert_eq!(one("response_type"), "code");
     assert_eq!(one("client_id"), client.id());
     assert_eq!(one("redirect_uri"), redirect.uri());
-    assert_eq!(one("scope"), REQUESTED_SCOPES.join(" "));
+    assert_eq!(one("scope"), scopes.join(" "));
     assert_eq!(one("code_challenge_method"), "S256");
     assert_eq!(one("prompt"), "login");
     assert_eq!(sent.len(), 9, "{sent:?}");
@@ -320,6 +327,19 @@ fn hand_off(client: Client, redirect: Redirect) {
 #[test]
 fn the_desktop_hands_the_ceremony_to_the_browser_at_the_fixed_origin() {
     hand_off(Client::Desktop, Redirect::Loopback);
+}
+
+/// KR-REQ-20.15: signing in for recovery asks for the application's scopes and the right to write
+/// the account's backup storage, which the application's ordinary sign-in does not ask for.
+#[test]
+fn signing_in_for_recovery_asks_for_the_right_to_write_backup_storage() {
+    assert!(!REQUESTED_SCOPES.contains(&"backup.write"));
+    hand_off_asking(
+        Client::Desktop,
+        Redirect::Loopback,
+        "account_sign_in_for_recovery",
+        &RECOVERY_BACKUP_SCOPES,
+    );
 }
 
 /// KR-REQ-17.19: a phone hands it to the browser-backed session, answered on the app link.
