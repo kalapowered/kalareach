@@ -541,6 +541,22 @@ fn duration(expiry: &GrantExpiry, now_ms: u64) -> String {
     }
 }
 
+/// What a grant that requires an organisation's membership says of it in a prompt, or nothing for
+/// a personal grant: the access answers to the organisation's lease, so a person who confirms it
+/// is told so, and which organisation and which enrolment of this host it names.
+fn membership(grant: &ProposedGrant) -> String {
+    grant
+        .organisation
+        .as_ref()
+        .map_or_else(String::new, |requirement| {
+            format!(
+                ", only while the holder is a member of organisation {} (enrolment {})",
+                requirement.organisation_id,
+                requirement.policy_revision.get()
+            )
+        })
+}
+
 /// Where a repository's metadata is served from.
 enum Location {
     /// A named host.
@@ -623,20 +639,22 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                     (InviteModeKind::Direct, _) => "a QR code on this network".to_owned(),
                 };
                 format!(
-                    "issue an invitation from {host}: {offered}, for a device that may {} {}",
+                    "issue an invitation from {host}: {offered}, for a device that may {} {}{}",
                     authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
-                    duration(&proposed_grant.expiry, now_ms)
+                    duration(&proposed_grant.expiry, now_ms),
+                    membership(proposed_grant)
                 )
             }
             Subject::ConfirmDevice {
                 candidate,
                 proposed_grant,
             } => format!(
-                "confirm adding {} ({}) to {host}, which may {} {}. {}",
+                "confirm adding {} ({}) to {host}, which may {} {}{}. {}",
                 shown(candidate.device_name.as_str(), names),
                 platform(candidate.platform),
                 authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
                 duration(&proposed_grant.expiry, now_ms),
+                membership(proposed_grant),
                 shows_value(&group_verification_value(&candidate.verification_value))
             ),
             Subject::EstablishClock => format!("trust the clock of {host} again"),
@@ -685,10 +703,13 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 )
             }
             Subject::EnrolOrganisation(plan) => format!(
-                "trust the organisation whose first key starts {} to sign the access it grants on                  {host}, now through the key starting {} (revision {})",
+                "trust organisation key {} (from {}), now key {} (revision {}, from {}), to sign \
+                 the access it grants on {host}",
                 key_start(&plan.root.public_key),
+                utc_minute(plan.root.not_before_ms.get()).ok_or(CannotCheck::CannotShow)?,
                 key_start(&plan.anchor.public_key),
-                plan.anchor.revision.get()
+                plan.anchor.revision.get(),
+                utc_minute(plan.anchor.not_before_ms.get()).ok_or(CannotCheck::CannotShow)?,
             ),
             Subject::SetExclusiveManagement(plan) => {
                 let organisations = match plan.organisation_ids.len() {
@@ -785,18 +806,50 @@ pub fn is_plain_text(text: &str) -> bool {
             .any(|character| character.is_whitespace() && character != ' ')
 }
 
-/// The start of a key's identifier, grouped, which is how an administrator reads a key out to the
-/// person enrolling.
-fn key_start(key: &kr_protocol::scalars::AuthorisationKey) -> String {
-    let identifier = kr_protocol::pairing::key_id(
+/// The identifier of a policy-signing key as an administrator reads it out, in lower-case
+/// hexadecimal: a hash of the key that names it whole.
+#[must_use]
+pub fn policy_key_identifier(key: &kr_protocol::scalars::AuthorisationKey) -> String {
+    kr_protocol::pairing::key_id(
         kr_protocol::pairing::KeyPurpose::Authorisation,
         key.as_bytes(),
-    );
-    let hex: String = identifier.as_bytes()[..4]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    group_verification_value(&hex)
+    )
+    .as_bytes()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// The first 64 bits of a key's identifier, grouped, which is what a prompt with one line to say it
+/// in shows. Every surface with room for it shows the whole identifier.
+fn key_start(key: &kr_protocol::scalars::AuthorisationKey) -> String {
+    group_verification_value(&policy_key_identifier(key)[..16])
+}
+
+/// A moment, given in UTC milliseconds, as the minute it falls in, or `None` for one that cannot
+/// be written as a date.
+#[must_use]
+pub fn utc_minute(milliseconds: u64) -> Option<String> {
+    let moment = jiff::Timestamp::from_millisecond(i64::try_from(milliseconds).ok()?).ok()?;
+    Some(
+        moment
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .strftime("%Y-%m-%d %H:%M UTC")
+            .to_string(),
+    )
+}
+
+/// A moment, given in UTC milliseconds, to the second, or `None` for one that cannot be written as
+/// a date.
+#[must_use]
+pub fn utc_second(milliseconds: u64) -> Option<String> {
+    let moment = jiff::Timestamp::from_millisecond(i64::try_from(milliseconds).ok()?).ok()?;
+    Some(
+        moment
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .strftime("%Y-%m-%d %H:%M:%S UTC")
+            .to_string(),
+    )
 }
 
 /// True when every word an enrolment or an installation shows can be shown exactly as written:
@@ -1402,6 +1455,289 @@ mod tests {
             Ok(Subject::PluginInstall(install)),
             "an installation the host describes"
         );
+    }
+
+    /// One key of an organisation's chain, as a host describes it.
+    fn policy_key(
+        seed: u8,
+        revision: u64,
+        not_before_ms: u64,
+    ) -> kr_protocol::confirmation::PolicyKeyShown {
+        kr_protocol::confirmation::PolicyKeyShown {
+            revision: kr_protocol::ids::PolicyKeyRevision::new(revision),
+            public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([seed; 32]),
+            not_before_ms: TimestampMs::new(not_before_ms),
+        }
+    }
+
+    /// The enrolment a host describes: an organisation, its first key and the key signing now.
+    fn enrol_plan() -> OrganisationEnrolPlan {
+        OrganisationEnrolPlan {
+            organisation_id: kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([0x21; 16])),
+            root: policy_key(0x31, 1, NOW - 2 * 86_400_000),
+            anchor: policy_key(0x32, 2, NOW - 3_600_000),
+        }
+    }
+
+    /// KR-REQ-17.53, KR-REQ-10.05: an owner device takes an organisation's enrolment and a change
+    /// of exclusive management only when the digest it builds again from what it is shown is the
+    /// one the host issued. A display that differs in any member, activation times included, is
+    /// refused, and the control is the display the digest covers.
+    #[test]
+    fn what_a_host_describes_of_an_organisation_is_checked_against_its_digest() {
+        let host = paired_host();
+        let plan = enrol_plan();
+        let confirmed = plan.action_digest().expect("a digest");
+        let pending = pending_for(
+            &host,
+            SensitiveAction::ChangeHostAuthority,
+            confirmed,
+            plan.display(),
+        );
+        assert_eq!(
+            check(&pending, &host),
+            Ok(Subject::EnrolOrganisation(plan)),
+            "an enrolment the digest covers"
+        );
+        let edits: Edits<OrganisationEnrolPlan> = vec![
+            (
+                "the organisation",
+                Box::new(|plan| {
+                    plan.organisation_id =
+                        kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([0x22; 16]));
+                }),
+            ),
+            (
+                "the first key",
+                Box::new(|plan| plan.root = policy_key(0x41, 1, NOW - 2 * 86_400_000)),
+            ),
+            (
+                "when the first key took over",
+                Box::new(|plan| plan.root.not_before_ms = TimestampMs::new(NOW - 86_400_000)),
+            ),
+            (
+                "the key signing now",
+                Box::new(|plan| plan.anchor = policy_key(0x42, 2, NOW - 3_600_000)),
+            ),
+            (
+                "when the key signing now took over",
+                Box::new(|plan| plan.anchor.not_before_ms = TimestampMs::new(NOW - 60_000)),
+            ),
+            (
+                "the revision of the key signing now",
+                Box::new(|plan| {
+                    plan.anchor.revision = kr_protocol::ids::PolicyKeyRevision::new(3);
+                }),
+            ),
+        ];
+        for (name, edit) in edits {
+            let mut altered = plan;
+            edit(&mut altered);
+            let pending = pending_for(
+                &host,
+                SensitiveAction::ChangeHostAuthority,
+                confirmed,
+                altered.display(),
+            );
+            assert_eq!(
+                check(&pending, &host),
+                Err(CannotCheck::DigestMismatch),
+                "{name}"
+            );
+        }
+
+        let exclusive = ExclusiveManagementPlan {
+            exclusive: true,
+            organisation_ids: [kr_protocol::ids::OrganisationId::new(Uuid::from_bytes(
+                [0x21; 16],
+            ))]
+            .into_iter()
+            .collect(),
+        };
+        let confirmed = exclusive.action_digest().expect("a digest");
+        let pending = pending_for(
+            &host,
+            SensitiveAction::ChangeHostAuthority,
+            confirmed,
+            exclusive.display(),
+        );
+        assert_eq!(
+            check(&pending, &host),
+            Ok(Subject::SetExclusiveManagement(exclusive.clone())),
+            "a change of exclusive management the digest covers"
+        );
+        for (name, altered) in [
+            (
+                "the new state",
+                ExclusiveManagementPlan {
+                    exclusive: false,
+                    ..exclusive.clone()
+                },
+            ),
+            (
+                "the organisations",
+                ExclusiveManagementPlan {
+                    organisation_ids: CanonicalSet::new(),
+                    ..exclusive.clone()
+                },
+            ),
+        ] {
+            let pending = pending_for(
+                &host,
+                SensitiveAction::ChangeHostAuthority,
+                confirmed,
+                altered.display(),
+            );
+            assert_eq!(
+                check(&pending, &host),
+                Err(CannotCheck::DigestMismatch),
+                "{name}"
+            );
+        }
+        // Another action, or a destination the host names, is not a change of this kind.
+        let pending = pending_for(
+            &host,
+            SensitiveAction::EnlargeGrant,
+            plan.action_digest().expect("a digest"),
+            plan.display(),
+        );
+        assert_eq!(check(&pending, &host), Err(CannotCheck::ActionMismatch));
+    }
+
+    /// KR-REQ-17.53: the line a platform's dialog shows for an enrolment names both keys by the
+    /// start of their identifiers and when each took over, and reads as one line: two plans that
+    /// differ only in a key's activation time are two different lines.
+    #[test]
+    fn the_line_for_an_enrolment_names_both_keys_and_when_they_took_over() {
+        let plan = enrol_plan();
+        let line = reason(&Subject::EnrolOrganisation(plan), "studio", NOW).expect("a line");
+        assert!(line.chars().count() <= MAX_REASON_CHARS, "{line}");
+        assert!(!line.contains("  "), "no run of spaces: {line:?}");
+        assert!(line.ends_with(" on studio"), "{line}");
+        for key in [&plan.root, &plan.anchor] {
+            assert!(line.contains(&key_start(&key.public_key)), "{line}");
+            assert_eq!(
+                key_start(&key.public_key).replace(' ', ""),
+                policy_key_identifier(&key.public_key)[..16],
+                "64 bits of the identifier"
+            );
+        }
+        let anchor_minute = utc_minute(plan.anchor.not_before_ms.get()).expect("a date");
+        let root_minute = utc_minute(plan.root.not_before_ms.get()).expect("a date");
+        assert!(
+            line.contains(&root_minute) && line.contains(&anchor_minute),
+            "{line}"
+        );
+        assert!(line.contains("revision 2"), "{line}");
+
+        let mut later = plan;
+        later.anchor.not_before_ms = TimestampMs::new(plan.anchor.not_before_ms.get() + 120_000);
+        let other = reason(&Subject::EnrolOrganisation(later), "studio", NOW).expect("a line");
+        assert_ne!(line, other, "activation times are in the line");
+
+        // A host name is shortened before anything of the keys is left out, and the line stays one
+        // line even for a long name.
+        let long = reason(
+            &Subject::EnrolOrganisation(plan),
+            &"a very long name for a studio host ".repeat(4),
+            NOW,
+        )
+        .expect("a line");
+        assert!(long.chars().count() <= MAX_REASON_CHARS, "{long}");
+        assert!(long.contains(&key_start(&plan.anchor.public_key)), "{long}");
+    }
+
+    /// KR-REQ-17.54: the line for a change of exclusive management says whether it makes the
+    /// host answer to its organisations for the person's own access or ends that.
+    #[test]
+    fn the_line_for_exclusive_management_says_which_way_it_changes_the_host() {
+        let organisations = |count: u8| -> CanonicalSet<kr_protocol::ids::OrganisationId> {
+            (1..=count)
+                .map(|n| kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([n; 16])))
+                .collect()
+        };
+        for (exclusive, count, words) in [
+            (
+                true,
+                1,
+                "make studio answer to its organisation for your own access too",
+            ),
+            (
+                true,
+                2,
+                "make studio answer to its 2 organisations for your own access too",
+            ),
+            (
+                false,
+                1,
+                "end its organisation's exclusive management of studio",
+            ),
+            (
+                false,
+                3,
+                "end its 3 organisations' exclusive management of studio",
+            ),
+        ] {
+            let plan = ExclusiveManagementPlan {
+                exclusive,
+                organisation_ids: organisations(count),
+            };
+            let line =
+                reason(&Subject::SetExclusiveManagement(plan), "studio", NOW).expect("a line");
+            assert!(line.starts_with(words), "{line}");
+            assert!(line.chars().count() <= MAX_REASON_CHARS, "{line}");
+        }
+    }
+
+    /// KR-REQ-17.53: an invitation or a device whose grant answers to an organisation's lease says
+    /// so, with the organisation and the enrolment of the host it names; a personal grant says
+    /// nothing of it.
+    #[test]
+    fn a_prompt_for_a_grant_that_requires_an_organisation_names_it() {
+        let organisation = kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+        let mut member = grant(&[ActionRight::SessionView], an_hour());
+        member.organisation = Nullable::some(kr_protocol::grant::OrganisationRequirement {
+            organisation_id: organisation,
+            policy_revision: kr_protocol::ids::AuthorityRevision::new(7),
+        });
+        let personal = grant(&[ActionRight::SessionView], an_hour());
+        let invitation = |proposed_grant: ProposedGrant| Subject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            origin: None,
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant,
+        };
+        let device = |proposed_grant: ProposedGrant| Subject::ConfirmDevice {
+            candidate: candidate("Pixel 8"),
+            proposed_grant,
+        };
+        for (name, member_line, personal_line) in [
+            (
+                "an invitation",
+                reason(&invitation(member.clone()), "studio", NOW).expect("a line"),
+                reason(&invitation(personal.clone()), "studio", NOW).expect("a line"),
+            ),
+            (
+                "a device",
+                reason(&device(member.clone()), "studio", NOW).expect("a line"),
+                reason(&device(personal.clone()), "studio", NOW).expect("a line"),
+            ),
+        ] {
+            assert!(
+                member_line.contains(&format!(
+                    "member of organisation {organisation} (enrolment 7)"
+                )),
+                "{name}: {member_line}"
+            );
+            assert!(
+                !personal_line.contains("organisation"),
+                "{name}: {personal_line}"
+            );
+            assert!(
+                member_line.chars().count() <= MAX_REASON_CHARS,
+                "{name}: {member_line}"
+            );
+        }
     }
 
     /// A change to one member of a plan, named for what it changes.

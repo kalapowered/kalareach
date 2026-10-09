@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, FIELD_CHARS, Listed, OwnerConfirmations, ReviewOutcome,
-    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown_host, shows_value,
+    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, policy_key_identifier, reason,
+    shown_host, shows_value, utc_second,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::confirmation::{CatalogueTrustPlan, NATIVE_BRIDGE_NOTICE, PluginInstallPlan};
@@ -533,9 +534,15 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
         Subject::EnrolOrganisation(plan) => Some(Particulars {
             facts: vec![
                 exact("Organisation", plan.organisation_id.to_string()),
-                exact("First key", organisation_key(&plan.root)),
-                exact("Key signing now", organisation_key(&plan.anchor)),
+                exact("First key", organisation_key(&plan.root)?),
+                exact("Key signing now", organisation_key(&plan.anchor)?),
             ],
+            notice: None,
+            statement: None,
+        }),
+        Subject::IssueInvitation { proposed_grant, .. }
+        | Subject::ConfirmDevice { proposed_grant, .. } => Some(Particulars {
+            facts: membership_facts(proposed_grant),
             notice: None,
             statement: None,
         }),
@@ -547,16 +554,35 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
     }
 }
 
-/// A policy-signing key as an owner reads it out: its revision and its public key in hexadecimal,
-/// which are what the confirmation covers.
-fn organisation_key(key: &kr_protocol::confirmation::PolicyKeyShown) -> String {
-    let hex: String = key
-        .public_key
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("revision {}, {}", key.revision, grouped_hex(&hex))
+/// The organisation a grant answers to, for an invitation or a device that would hold one, and
+/// nothing for a personal grant.
+fn membership_facts(grant: &kr_protocol::pairing::ProposedGrant) -> Vec<Fact> {
+    grant
+        .organisation
+        .as_ref()
+        .map_or_else(Vec::new, |requirement| {
+            vec![
+                exact(
+                    "Needs membership of",
+                    requirement.organisation_id.to_string(),
+                ),
+                words(
+                    "Enrolment of this host",
+                    requirement.policy_revision.get().to_string(),
+                ),
+            ]
+        })
+}
+
+/// A policy-signing key as an owner reads it out: the identifier an administrator reads out, whole,
+/// its revision, and the moment it took over signing. The confirmation covers all three.
+fn organisation_key(key: &kr_protocol::confirmation::PolicyKeyShown) -> Option<String> {
+    Some(format!(
+        "{}, revision {}, from {}",
+        grouped_hex(&policy_key_identifier(&key.public_key)),
+        key.revision,
+        utc_second(key.not_before_ms.get())?
+    ))
 }
 
 /// Hexadecimal digits as groups of eight, which a person reads and compares by group.
@@ -924,6 +950,126 @@ mod tests {
         assert_eq!(view.notice, None);
         assert_eq!(view.statement, None);
         assert_eq!(view.value, None);
+    }
+
+    /// KR-REQ-17.53: an organisation's enrolment is listed with everything its confirmation covers,
+    /// each key by the whole identifier an administrator reads out, its revision and the moment it
+    /// took over signing, and two plans that differ only in an activation time are listed apart.
+    #[test]
+    fn an_organisations_enrolment_is_listed_with_its_keys_and_when_they_took_over() {
+        use kr_protocol::confirmation::{OrganisationEnrolPlan, PolicyKeyShown};
+        use kr_protocol::ids::{OrganisationId, PolicyKeyRevision};
+        use kr_protocol::scalars::AuthorisationKey;
+
+        let key = |seed: u8, revision: u64, not_before_ms: u64| PolicyKeyShown {
+            revision: PolicyKeyRevision::new(revision),
+            public_key: AuthorisationKey::from_bytes([seed; 32]),
+            not_before_ms: TimestampMs::new(not_before_ms),
+        };
+        let plan = OrganisationEnrolPlan {
+            organisation_id: OrganisationId::new(Uuid::from_bytes([0x21; 16])),
+            root: key(0x31, 1, NOW - 172_800_000),
+            anchor: key(0x32, 2, NOW - 3_600_000),
+        };
+        let listed = listed_subject(
+            Subject::EnrolOrganisation(plan),
+            SensitiveAction::ChangeHostAuthority,
+        );
+        let view = describe("a reference", "studio", &listed, NOW);
+        assert!(view.checkable);
+        assert_eq!(view.title, "Enrol this host in an organisation");
+        let line = view.detail.expect("a request this computer checked");
+        assert!(line.contains("revision 2"), "{line}");
+        let [organisation, first, signing] = &view.facts[..] else {
+            panic!("three facts: {:?}", view.facts);
+        };
+        assert_eq!(organisation.label, "Organisation");
+        for (fact, key) in [(first, &plan.root), (signing, &plan.anchor)] {
+            let identifier = policy_key_identifier(&key.public_key);
+            assert!(
+                fact.value.starts_with(&grouped_hex(&identifier)),
+                "the whole identifier, grouped: {}",
+                fact.value
+            );
+            assert!(
+                fact.value
+                    .ends_with(&utc_second(key.not_before_ms.get()).expect("a date")),
+                "the moment it took over signing: {}",
+                fact.value
+            );
+            assert!(fact.code, "read character by character");
+        }
+        let mut later = plan;
+        later.anchor.not_before_ms = TimestampMs::new(plan.anchor.not_before_ms.get() + 1_000);
+        let other = describe(
+            "a reference",
+            "studio",
+            &listed_subject(
+                Subject::EnrolOrganisation(later),
+                SensitiveAction::ChangeHostAuthority,
+            ),
+            NOW,
+        );
+        assert_ne!(view.facts, other.facts, "activation times are listed");
+    }
+
+    /// KR-REQ-17.53: an invitation or a device whose grant answers to an organisation lists the
+    /// organisation and the enrolment of the host it names, and a personal grant lists nothing.
+    #[test]
+    fn a_grant_that_requires_an_organisation_is_listed_with_it() {
+        let organisation = kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+        let mut member = kr_pairing::grants::personal_owner_grant();
+        member.actions = [kr_protocol::rights::ActionRight::SessionView]
+            .into_iter()
+            .collect();
+        member.organisation = Nullable::some(kr_protocol::grant::OrganisationRequirement {
+            organisation_id: organisation,
+            policy_revision: kr_protocol::ids::AuthorityRevision::new(7),
+        });
+        let personal = kr_pairing::grants::personal_owner_grant();
+        let keys = DeviceKeys::generate().expect("keys").public_keys();
+        type Make = Box<dyn Fn(kr_protocol::pairing::ProposedGrant) -> Subject>;
+        let device: Make = Box::new(move |proposed_grant| Subject::ConfirmDevice {
+            candidate: PairCandidateView {
+                device_name: DeviceName::new("Pixel 8").expect("a name"),
+                platform: DevicePlatform::Android,
+                keys,
+                verification_value: "f3c146fd".to_owned(),
+            },
+            proposed_grant,
+        });
+        let invitation: Make = Box::new(|proposed_grant| Subject::IssueInvitation {
+            mode: kr_protocol::invitation::InviteModeKind::Direct,
+            origin: None,
+            grant_kind: kr_protocol::invitation::InviteGrantKind::SessionInvitation,
+            proposed_grant,
+        });
+        for (name, subject, action) in [
+            (
+                "an invitation",
+                invitation,
+                SensitiveAction::IssueInvitation,
+            ),
+            ("a device", device, SensitiveAction::ConfirmDevice),
+        ] {
+            let listed = listed_subject(subject(member.clone()), action);
+            let view = describe("a reference", "studio", &listed, NOW);
+            assert_eq!(
+                view.facts,
+                vec![
+                    fact("Needs membership of", &organisation.to_string(), true),
+                    fact("Enrolment of this host", "7", false),
+                ],
+                "{name}"
+            );
+            let listed = listed_subject(subject(personal.clone()), action);
+            assert!(
+                describe("a reference", "studio", &listed, NOW)
+                    .facts
+                    .is_empty(),
+                "{name}: a personal grant answers to no organisation"
+            );
+        }
     }
 
     /// KR-REQ-11.42: an installation of a release with a native bridge carries the host's own

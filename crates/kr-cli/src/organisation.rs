@@ -130,7 +130,9 @@ async fn enrol(
     Ok(())
 }
 
-/// Says what an owner device is asked to confirm, as the host resolved it from the chain.
+/// Says what an owner device is asked to confirm, as the host resolved it from the chain: each
+/// key by its whole identifier, revision and the moment it took over signing, which is what an
+/// administrator reads out and what the confirmation covers.
 fn say_what_is_asked(display: &ConfirmationDisplay) {
     if let ConfirmationDisplay::EnrolOrganisation {
         organisation_id,
@@ -138,12 +140,23 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
         anchor,
     } = display
     {
+        let key = |shown: &kr_protocol::confirmation::PolicyKeyShown| {
+            key_identifier(&kr_protocol::pairing::key_id(
+                kr_protocol::pairing::KeyPurpose::Authorisation,
+                shown.public_key.as_bytes(),
+            ))
+        };
         output::line(&stdout_line!(
-            "An owner device is asked to trust organisation {} to sign the access it grants here: \
-             its first key is revision {} and the key signing now is revision {}.",
+            "An owner device is asked to trust organisation {} to sign the access it grants here. \
+             Its first key is {} (revision {}, from {}), and the key signing now is {} (revision \
+             {}, from {}).",
             *organisation_id,
+            key(root),
             root.revision,
-            anchor.revision
+            utc_moment(root.not_before_ms.get()),
+            key(anchor),
+            anchor.revision,
+            utc_moment(anchor.not_before_ms.get())
         ));
     }
 }
