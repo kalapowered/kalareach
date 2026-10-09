@@ -7,7 +7,7 @@
 
 use kr_protocol::update::{Recording, ReleaseStore, StoreScope};
 
-use super::{Claim, Kept, Named, Store, Writers, protocol};
+use super::{Claim, Kept, Known, KnownIs, Named, Store, Writers, known_protocol, protocol};
 
 fn version(number: i64) -> u32 {
     u32::try_from(number).expect("a version is a small number")
@@ -49,6 +49,258 @@ fn entry(
         version,
         migrates_from,
     }
+}
+
+/// The types a store keeps that the table does not declare yet, each with the store that keeps it and a
+/// digest of what it is today. Each store declares its own at its next raise, and deletes its lines.
+#[must_use]
+pub fn known() -> Vec<Known> {
+    use kr_protocol::{
+        account, attention, automation, delivery, describe, error, identity, pairing, privacy,
+        push, sharing, skill, update,
+    };
+
+    let source = |store, name, file, pinned| Known {
+        store,
+        name,
+        is: KnownIs::Source(file),
+        pinned,
+    };
+    vec![
+        // The update record: the release names, and the update channel's root metadata, which the
+        // `tough` crate defines and its locked version stands for.
+        source(
+            "install-record",
+            "ReleaseName",
+            "crates/kr-protocol/src/update.rs",
+            "91bbc30b10d91732394bbfe480fef5bbf3139f8cb0d927090a3f5a374904fe08",
+        ),
+        Known {
+            store: "install-record",
+            name: "Root",
+            is: KnownIs::Crate("tough"),
+            pinned: "f5b947cf662ef8fdff16acb09d75cac6c569657f033d5d3f0327621e8daa8c14",
+        },
+        Known {
+            store: "install-record",
+            name: "Signed",
+            is: KnownIs::Crate("tough"),
+            pinned: "f5b947cf662ef8fdff16acb09d75cac6c569657f033d5d3f0327621e8daa8c14",
+        },
+        // The installed agent tools record.
+        known_protocol::<skill::ChangeOperation>(
+            "agent-tools",
+            "ChangeOperation",
+            "985268b0d22fb13c1fc2ad1decd42d7fed267550734783dc22a1018fc236166a",
+        ),
+        // The workflow journal.
+        known_protocol::<automation::WorkflowRunStatus>(
+            "workflows",
+            "WorkflowRunStatus",
+            "7840b23fa2bfbd1d3167e89020a9502fda0b13ce1ffd075765332b0ba5886756",
+        ),
+        // What the registry keeps inside its tables and the answers it keeps for a retried call.
+        known_protocol::<pairing::DevicePublicKeys>(
+            "registry",
+            "DevicePublicKeys",
+            "a4a908abbd01f0e01b9e41265b30c82b901bf23271b5156c97c5bf06007da604",
+        ),
+        known_protocol::<error::ErrorCode>(
+            "registry",
+            "ErrorCode",
+            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+        ),
+        known_protocol::<pairing::ClientBundle>(
+            "registry",
+            "ClientBundle",
+            "5a5f7a11c4a723dbed6a2036b3e178a043479b1fba2bf832f8a72e8549754b68",
+        ),
+        known_protocol::<pairing::ProposedGrant>(
+            "registry",
+            "ProposedGrant",
+            "9f9b7667a7d609186639a05a23abeea6c869c9329759eca726b7e2c464a5b9cf",
+        ),
+        known_protocol::<account::PolicyAuthorityLink>(
+            "registry",
+            "PolicyAuthorityLink",
+            "d9aab1ca1f34156f2a5541e55f6bbef63516ea7073ac3ca2f44cc250a20fdc19",
+        ),
+        known_protocol::<sharing::OfflineValidityPolicy>(
+            "registry",
+            "OfflineValidityPolicy",
+            "2de9e423e33e137cf44fce90d9474ebeff021e6fcb25eb1c85f55ed13a581c04",
+        ),
+        known_protocol::<pairing::RevocationRequest>(
+            "registry",
+            "RevocationRequest",
+            "9c4f06edcd64ab8b33dc62ae19587459c4ac85394fbf981eb50284d686d0eeef",
+        ),
+        known_protocol::<describe::SessionRenameResult>(
+            "registry",
+            "SessionRenameResult",
+            "8647db2b73068c496d6d6fc3a923e0bf3b2838d05c6926b0052c937115003c2b",
+        ),
+        known_protocol::<delivery::DeliveryDestinationSecretSetResult>(
+            "registry",
+            "DeliveryDestinationSecretSetResult",
+            "7e42aec33f5a7268d9be57d2d354b4cc851e08a130d89430d98104be3c2c4c53",
+        ),
+        known_protocol::<identity::EnvironmentEnrolResult>(
+            "registry",
+            "EnvironmentEnrolResult",
+            "3eb4302c748c84b5bcab7b7574a679c467c724731e5ca050220b3e4e7c7cb8ea",
+        ),
+        known_protocol::<identity::EnvironmentForgetResult>(
+            "registry",
+            "EnvironmentForgetResult",
+            "e272573f7b9fc996da5193d518004c36cb03bf95545ce1eac3579b89c1d586ed",
+        ),
+        known_protocol::<identity::EnvironmentRefreshResult>(
+            "registry",
+            "EnvironmentRefreshResult",
+            "64d30dbbfe9ee9d78404d2a2f004b683c8d46675a209606032c8341dbad54468",
+        ),
+        known_protocol::<update::HostUpdateHandoverResult>(
+            "registry",
+            "HostUpdateHandoverResult",
+            "b216ad57793ff4fb71dd5829f786381e2498baac9c3b9193b20dae2100949e0e",
+        ),
+        known_protocol::<privacy::PrivacyReport>(
+            "registry",
+            "PrivacyReport",
+            "dadfdbb0172fc9bd6a888204d9f6902bb6c3c2b62e9f1746f27c65413b46f070",
+        ),
+        known_protocol::<describe::DescriptionSetup>(
+            "registry",
+            "DescriptionSetup",
+            "8ba498cbe7eb06a54b8574f4228f984cc1639567863034b35b7f8a4176e26f72",
+        ),
+        // The delivery journal: what a notice holds, and the words it matches stored text against.
+        source(
+            "delivery",
+            "Audience",
+            "crates/kr-delivery/src/producer.rs",
+            "5e41c0cda7e2b49990ef41184e0013514dd1742cde3f951e1cd616ea07ac53cc",
+        ),
+        source(
+            "delivery",
+            "EventKey",
+            "crates/kr-delivery/src/journal.rs",
+            "3d28f50a04cc36f772c63a50afa83056c2da969d66b3322e61b2625376b058f6",
+        ),
+        source(
+            "delivery",
+            "EventSource",
+            "crates/kr-delivery/src/journal.rs",
+            "9d7ca85f394721ecbea1c7a09f08ffb90a68306181435b9ea570c418e9e7c06e",
+        ),
+        source(
+            "delivery",
+            "ContentLine",
+            "crates/kr-delivery/src/external.rs",
+            "18bd4f8548e3dc51740d1a715185a4c5ac710f8d2277a6b381ca2db85d17fa0f",
+        ),
+        known_protocol::<push::PushAlert>(
+            "delivery",
+            "PushAlert",
+            "bbc5b37ad31b754786dddec762e2119addf7419446d390380f60ca7ab1eae9b4",
+        ),
+        known_protocol::<push::PushUrgency>(
+            "delivery",
+            "PushUrgency",
+            "e299a0789eb8e4f4c26d886628cc8d967bfdb5bee1f82f3ef89e3c95d6a36bd0",
+        ),
+        known_protocol::<push::PushSuppressionReason>(
+            "delivery",
+            "PushSuppressionReason",
+            "d8cf6277ce4f76936cb45e5b5ce8856c6f6fdf8cb314706f5db45085e1490ef3",
+        ),
+        Known {
+            store: "delivery",
+            name: "event sources",
+            is: KnownIs::Words(
+                kr_delivery::journal::EventSource::ALL
+                    .iter()
+                    .map(|source| source.as_str().to_owned())
+                    .collect(),
+            ),
+            pinned: "e59eb540e3a179fa14b6a3c0c3e55665967ad3a9d4a4be710fb096e3adf97ab2",
+        },
+        Known {
+            store: "delivery",
+            name: "delivery states",
+            is: KnownIs::Words(
+                kr_delivery::journal::DeliveryState::ALL
+                    .iter()
+                    .map(|state| state.as_str().to_owned())
+                    .collect(),
+            ),
+            pinned: "e12dd6b5cb95d82e6e30bc54b206ad3fea8f00076b827fe76a64a5e7338d21b7",
+        },
+        // The attention store: the words it matches stored text against.
+        known_protocol::<identity::ProcessStartSource>(
+            "attention",
+            "ProcessStartSource",
+            "9cc04dc86b97f91b55155fe61811bbbc9063773871311035d7fa5bf7c2fe15e3",
+        ),
+        known_protocol::<attention::ReviewSubject>(
+            "attention",
+            "ReviewSubject",
+            "c57b88a504a5530ccca58cb6eb9b7b24a940dc08d93cb14fc14de069413db053",
+        ),
+        // The environment's presence record.
+        known_protocol::<identity::EnvironmentPresence>(
+            "environments",
+            "EnvironmentPresence",
+            "a07b031cd0381ebcd6a05d6bd312db6de6af43e1bfc92cbb9f85562523a7a3fa",
+        ),
+        // The startup files an install wrote an entry to.
+        source(
+            "shell-entries",
+            "ShellKind",
+            "crates/kr-shell-integration/src/contract/qualification.rs",
+            "f26c63cc6c6c50b9cc71b44e302a694c66a91fd6159d7b18e45b518a1409b4bd",
+        ),
+        // A merge's recorded steps.
+        known_protocol::<error::ErrorCode>(
+            "machine-merge-plan",
+            "ErrorCode",
+            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+        ),
+    ]
+}
+
+/// The type of the answer the registry keeps for each method that has it kept, by the type's name:
+/// the method's answer, as `kr_controller::service::RETAINED_AUTHORITY_ANSWERS` and
+/// `RETAINED_MACHINE_ANSWERS` name the methods.
+#[must_use]
+pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
+    use kr_protocol::method::Method;
+
+    vec![
+        (Method::GrantCreate, "GrantCreateResult"),
+        (Method::GrantRevoke, "RevocationResult"),
+        (Method::DeviceRevoke, "RevocationResult"),
+        (
+            Method::DevicePreviewKeyUpdate,
+            "DevicePreviewKeyUpdateResult",
+        ),
+        (
+            Method::DeliveryDestinationSecretSet,
+            "DeliveryDestinationSecretSetResult",
+        ),
+        (Method::PrivacySet, "PrivacyReport"),
+        (Method::SessionRename, "SessionRenameResult"),
+        (Method::DescriptionConfigure, "DescriptionSetup"),
+        (Method::DescriptionDownload, "DescriptionSetup"),
+        (Method::EnvironmentEnrol, "EnvironmentEnrolResult"),
+        (Method::EnvironmentForget, "EnvironmentForgetResult"),
+        (Method::EnvironmentRefresh, "EnvironmentRefreshResult"),
+        (Method::HostUpdateHandover, "HostUpdateHandoverResult"),
+        (Method::MachineJoin, "MachineStepResult"),
+        (Method::MachineMerge, "MachineStepResult"),
+        (Method::MachineSplit, "MachineStepResult"),
+    ]
 }
 
 /// Every store, in the order of their names.

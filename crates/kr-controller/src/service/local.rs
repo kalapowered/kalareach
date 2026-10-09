@@ -63,6 +63,33 @@ impl Default for LocalPace {
     }
 }
 
+/// The methods whose answer the registry keeps under the actor's action, in its receipts, and
+/// answers again to a repeat. The stored-formats table pairs each with the type of the answer it
+/// keeps, so an answer kept here whose type the table does not name fails the lock's checks.
+pub const RETAINED_AUTHORITY_ANSWERS: [Method; 13] = [
+    Method::GrantCreate,
+    Method::GrantRevoke,
+    Method::DeviceRevoke,
+    Method::DevicePreviewKeyUpdate,
+    Method::DeliveryDestinationSecretSet,
+    Method::PrivacySet,
+    Method::SessionRename,
+    Method::DescriptionConfigure,
+    Method::DescriptionDownload,
+    Method::EnvironmentEnrol,
+    Method::EnvironmentForget,
+    Method::EnvironmentRefresh,
+    Method::HostUpdateHandover,
+];
+
+/// The methods whose answer the machine group's record keeps, in the same store, and answers again to
+/// a repeat.
+pub const RETAINED_MACHINE_ANSWERS: [Method; 3] = [
+    Method::MachineJoin,
+    Method::MachineMerge,
+    Method::MachineSplit,
+];
+
 impl Controller {
     /// Makes this daemon's local connections write unasked at the pace given, and wait for their
     /// peer for `write_bound`, from the next connection on.
@@ -193,30 +220,12 @@ impl Controller {
         // readable after the window that admitted it has expired, and a retry of a revocation that
         // cannot reach its result would otherwise be told its window is gone rather than what
         // happened.
-        if matches!(
-            method,
-            Method::GrantCreate
-                | Method::GrantRevoke
-                | Method::DeviceRevoke
-                | Method::DevicePreviewKeyUpdate
-                | Method::DeliveryDestinationSecretSet
-                | Method::PrivacySet
-                | Method::SessionRename
-                | Method::DescriptionConfigure
-                | Method::DescriptionDownload
-                | Method::EnvironmentEnrol
-                | Method::EnvironmentForget
-                | Method::EnvironmentRefresh
-                | Method::HostUpdateHandover
-        ) {
+        if RETAINED_AUTHORITY_ANSWERS.contains(&method) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }
         // A machine group step is claimed in the same store and answered from it the same way, and
         // from the machine group record where an attempt ended without recording what it did.
-        if matches!(
-            method,
-            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit
-        ) {
+        if RETAINED_MACHINE_ANSWERS.contains(&method) {
             return self.machine_retained(actor_id, mutation).await;
         }
         // A declaration of a device's keys is answered the same way, from the outcome the device

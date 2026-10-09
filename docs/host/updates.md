@@ -416,7 +416,7 @@ The update suite checks this by starting a daemon, running a session and checkin
 
 The lock also names everything else under the state root, along with the reason it has no version: locks, markers, logs, directories containing content, leftovers from crashes, and the per-session journals, which keep the archive's own rule. After a daemon has run, every entry of the state root and of each environment's directory must be a store or be named, and a database found anywhere which is neither fails the check. The names in the source and those in the lock are compared, so an exception that is not in the committed lock fails the check.
 
-It is worth noting what the check does not do: it does not compare the lock with the lock on the main branch (so a change to the lock is for a person to review), it does not check that all of the types in a store are declared, it does not check that all types nested inside a given type are declared, and it does not check for encoding differences (e.g. the difference between a JSON and CBOR encoding of a UUID or 64-bit number).
+Note that this does not check the lock against the one on the main branch, so if the lock changes it is up to the person to look at it and see if it is valid. It also does not find a type that a store keeps and that no declared type holds, words that the code matches by hand and the table does not declare, or a different encoding of a value (such as a JSON vs CBOR encoding for a UUID or 64 bit number). However, there is a second test in the test suite that finds the types a declared item holds: a type that the table names nowhere for the store fails it, unless the type is listed as known with a digest that fails it again when the type changes.
 
 ## Windows
 

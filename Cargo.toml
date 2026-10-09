@@ -207,6 +207,8 @@ tauri-build = { version = "=2.6.3", default-features = false }
 # The companion reads an invitation from the pasteboard in native code, so the text never passes
 # through the page.
 tauri-plugin-clipboard-manager = "=2.3.3"
+# The stored-format checks read the definitions of the types a store keeps.
+syn = { version = "=2.0.119", features = ["full", "visit"] }
 # The entries of a release archive, each read and checked before anything is written: no link, no
 # device and no path outside the release. Extended attributes are never read.
 tar = { version = "=0.4.46", default-features = false }

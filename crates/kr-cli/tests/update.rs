@@ -9908,6 +9908,122 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     );
 }
 
+/// KR-REQ-26.10: no type a store keeps goes undeclared. Every type that a source item the table
+/// declares holds in a field is declared for the same store or listed as known for it, however deep;
+/// every method whose answer the registry keeps is paired with the type of that answer, which the
+/// registry declares or lists as known; and a known type is the one it was when it was listed. A
+/// type added to a stored item, or a method that keeps an answer, without a line in the table fails
+/// here until it has one.
+#[test]
+fn no_type_a_store_keeps_is_undeclared() {
+    let table = stored_formats::table::table();
+    let known = stored_formats::table::known();
+    let undeclared = stored_formats::undeclared_in(&table, &known).expect("the sources are read");
+    assert!(
+        undeclared.is_empty(),
+        "a type a store keeps is neither declared nor known:\n{}",
+        undeclared.join("\n")
+    );
+    let changed =
+        stored_formats::known_that_changed(&table, &known).expect("the known types are read");
+    assert!(changed.is_empty(), "{}", changed.join("\n"));
+
+    // The answers the registry keeps.
+    let retained: Vec<_> = kr_controller::service::RETAINED_AUTHORITY_ANSWERS
+        .iter()
+        .chain(kr_controller::service::RETAINED_MACHINE_ANSWERS.iter())
+        .copied()
+        .collect();
+    let unaccounted = stored_formats::retained_unaccounted(
+        &table,
+        &known,
+        &stored_formats::table::retained_answers(),
+        &retained,
+    );
+    assert!(unaccounted.is_empty(), "{}", unaccounted.join("\n"));
+}
+
+/// KR-REQ-26.10: the detection finds what it is for. A line of the known list taken away is found as
+/// the type it named; a known type whose pinned digest is not the one it has is found; a known type
+/// the store has since declared, and one listed for a store the table does not have, are found as
+/// lines to delete; and a method whose answer the registry keeps is found when it is not paired, when
+/// its type is named nowhere, and when it is paired and keeps none.
+#[test]
+fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_stale_line() {
+    use kr_protocol::method::Method;
+
+    let table = stored_formats::table::table();
+    let known = stored_formats::table::known();
+    assert!(
+        stored_formats::undeclared_in(&table, &known)
+            .expect("read")
+            .is_empty()
+    );
+
+    let without: Vec<_> = stored_formats::table::known()
+        .into_iter()
+        .filter(|line| line.name != "Audience")
+        .collect();
+    let found = stored_formats::undeclared_in(&table, &without).expect("read");
+    assert!(
+        found.iter().any(|said| said.contains("holds Audience")),
+        "a nested type without a line is found: {found:?}"
+    );
+
+    let mut moved = stored_formats::table::known();
+    moved
+        .iter_mut()
+        .find(|line| line.name == "EventKey")
+        .expect("listed")
+        .pinned = "0000";
+    let found = stored_formats::known_that_changed(&table, &moved).expect("read");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("EventKey "), "{found:?}");
+
+    let mut stale = stored_formats::table::known();
+    stale.push(stored_formats::known_protocol::<
+        kr_protocol::push::PushDeliveryRequest,
+    >("delivery", "PushDeliveryRequest", "0000"));
+    stale.push(
+        stored_formats::known_protocol::<kr_protocol::push::PushAlert>(
+            "no-such-store",
+            "PushAlert",
+            "0000",
+        ),
+    );
+    let found = stored_formats::known_that_changed(&table, &stale).expect("read");
+    assert!(
+        found
+            .iter()
+            .any(|said| said.contains("PushDeliveryRequest") && said.contains("delete the line")),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|said| said.contains("no-such-store")),
+        "{found:?}"
+    );
+
+    let paired = stored_formats::table::retained_answers();
+    let retained = [Method::SessionRename, Method::GrantCreate];
+    let found = stored_formats::retained_unaccounted(&table, &known, &paired, &retained);
+    assert!(
+        found
+            .iter()
+            .any(|said| said.contains("is paired with an answer and keeps none")),
+        "{found:?}"
+    );
+    let found = stored_formats::retained_unaccounted(&table, &known, &[], &retained);
+    assert_eq!(found.len(), 2, "two unpaired methods: {found:?}");
+    let found = stored_formats::retained_unaccounted(
+        &table,
+        &[],
+        &[(Method::SessionRename, "SessionRenameResult")],
+        &[Method::SessionRename],
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("names that type nowhere"), "{found:?}");
+}
+
 /// KR-REQ-26.10: a state root's files are all named. After a daemon has run and a session has been
 /// made and closed, every entry of the state root and of the environment's directory is a store's or
 /// is named in the lock with the reason it has no version, and a file that nothing names is found,

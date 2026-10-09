@@ -89,6 +89,8 @@ rmcp = { workspace = true, features = ["client", "transport-async-rw", "transpor
 rusqlite.workspace = true
 # The setup tests write a home directory of their own rather than this user's.
 tempfile.workspace = true
+# The stored-format checks read the types a store keeps from their definitions in the source.
+syn.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
