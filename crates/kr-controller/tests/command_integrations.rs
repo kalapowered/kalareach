@@ -535,9 +535,9 @@ async fn kr_req_11_42_the_doctor_carries_the_check_of_the_native_bridges() {
     assert_eq!(check.status, DoctorStatus::NotApplicable, "{check:?}");
 }
 
-/// One flag as long as a package's integration can have in plain text: an owner is shown what the
-/// integration does whole, and that is at most `MAX_STATEMENT_CHARS` characters, the flag and the
-/// rest of the statement together.
+/// One long flag: an owner is shown what the integration does whole, and that is at most
+/// `MAX_STATEMENT_CHARS` characters, the flag and the rest of the statement together, so a flag this
+/// long takes most of it.
 fn largest_flags() -> Vec<String> {
     vec![format!(
         "--{}",
