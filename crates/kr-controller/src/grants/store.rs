@@ -3301,4 +3301,94 @@ mod tests {
             "a second open writes nothing"
         );
     }
+
+    /// The policy of a host at authority revision `revision`, as the store keeps it.
+    fn policy_at(revision: u64) -> StoredPolicy {
+        super::super::HostPolicy::personal(AuthorityRevision::new(revision)).snapshot()
+    }
+
+    /// A claim on an action, held by this attempt.
+    fn claimed(store: &GrantDirectory) -> ClaimHold {
+        let actor = ActorId::new("local:1").expect("an actor");
+        let digest = Digest256::from_bytes([3; 32]);
+        match store
+            .claim_action(&actor, ActionId::new(Uuid::from_bytes([9; 16])), &digest, 1)
+            .expect("the claim is written")
+        {
+            ActionClaim::Claimed { hold } => hold,
+            ActionClaim::Recorded(_) => panic!("a first claim on an action is this attempt's"),
+        }
+    }
+
+    /// A policy and the answer to the action that changed it are written together or not at all:
+    /// a check that refuses inside the transaction, after the store's lock is held and before the
+    /// first write, leaves the policy and the claim as they were, and so does a claim that holds
+    /// an outcome already.
+    #[test]
+    fn a_policy_and_the_answer_to_its_action_are_written_together_or_not_at_all() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        let before = policy_at(1);
+        store.store_policy(&before).expect("the policy is written");
+        let hold = claimed(&store);
+
+        let refused = store.store_policy_claimed(&policy_at(2), &hold, b"answer", 2, || {
+            Err(ControllerError::PermissionDenied {
+                detail: "the admission lapsed while the store's lock was awaited".to_owned(),
+            })
+        });
+        assert!(
+            matches!(refused, Err(ControllerError::PermissionDenied { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(store.stored_policy().expect("reads"), Some(before.clone()));
+        let actor = ActorId::new("local:1").expect("an actor");
+        let digest = Digest256::from_bytes([3; 32]);
+        assert!(
+            matches!(
+                store.recorded_action(&actor, ActionId::new(Uuid::from_bytes([9; 16])), &digest),
+                Ok(Some(ActionRecord::InFlight))
+            ),
+            "the claim holds no answer"
+        );
+
+        // The control: with nothing refusing, both are written, and the answer is the claim's.
+        store
+            .store_policy_claimed(&policy_at(2), &hold, b"answer", 2, || Ok(()))
+            .expect("the policy and the answer are written");
+        assert_eq!(store.stored_policy().expect("reads"), Some(policy_at(2)));
+        drop(hold);
+        assert_eq!(
+            store
+                .recorded_action(&actor, ActionId::new(Uuid::from_bytes([9; 16])), &digest)
+                .expect("reads"),
+            Some(ActionRecord::Answered {
+                result: b"answer".to_vec()
+            })
+        );
+
+        // A claim that holds an outcome already takes no second one, and the policy it would have
+        // written is not written either.
+        let again =
+            store.claim_action(&actor, ActionId::new(Uuid::from_bytes([9; 16])), &digest, 3);
+        assert!(matches!(again, Ok(ActionClaim::Recorded(_))));
+        let other = ActionId::new(Uuid::from_bytes([8; 16]));
+        let ActionClaim::Claimed { hold: second } = store
+            .claim_action(&actor, other, &digest, 4)
+            .expect("a second action's claim")
+        else {
+            panic!("a new action is this attempt's");
+        };
+        store
+            .retain_result(&second, b"first", 5)
+            .expect("the answer is kept");
+        let late = store.store_policy_claimed(&policy_at(3), &second, b"second", 6, || Ok(()));
+        assert!(late.is_err(), "{late:?}");
+        assert_eq!(
+            store.stored_policy().expect("reads"),
+            Some(policy_at(2)),
+            "the policy did not move"
+        );
+    }
 }
