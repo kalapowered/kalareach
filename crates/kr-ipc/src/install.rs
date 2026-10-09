@@ -1339,7 +1339,7 @@ const REGISTERED_RECORD: &str = "registered";
 const DOCUMENT_RECORD: &str = "document";
 
 /// What a command works in, which it registers with the store before it writes a record
-/// ([`Store::hold_writers`]).
+/// (`Store::hold_writers`, on a Unix host).
 #[derive(Clone, Debug)]
 pub struct Writing {
     /// The runtime root the command works in.
