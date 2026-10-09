@@ -102,6 +102,14 @@ pub fn run() {
                 }
             });
             watch_drops(app.handle());
+            // The place for what this application keeps on this device: the answers a host did not
+            // confirm. Nothing can be answered without it.
+            match app.path().app_data_dir() {
+                Ok(data) => app.state::<AppState>().keep_under(&data),
+                Err(error) => {
+                    tracing::warn!(%error, "no application data directory, so no answer can be kept");
+                }
+            }
             open_pairing(app.handle());
             #[cfg(mobile)]
             hosts::resume(app.handle());

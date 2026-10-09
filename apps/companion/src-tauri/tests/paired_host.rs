@@ -18,6 +18,7 @@
 //! | KR-REQ-13.08 | `a_choice_made_from_a_listing_that_has_since_forgotten_the_host_is_refused` |
 //! | KR-REQ-13.08 | `forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_other` |
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
+//! | KR-REQ-23.32 | `a_paired_devices_questions_go_through_the_host` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -275,6 +276,34 @@ async fn a_paired_host_answers_the_commands_the_page_calls() {
             .expect("choosing the same host again")["connected"],
         true
     );
+    host.stop().await;
+}
+
+/// KR-REQ-23.32: on a host this device is paired with, a session's questions go through the host's
+/// daemon, which serves them to a paired device under the rights its grant carries, and not over a
+/// link to a worker on this computer, which a phone does not have. The host's own answer is what the
+/// page is told: here a session no worker serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_devices_questions_go_through_the_host() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    connection(&phone.companion, true).await;
+
+    let refusal = phone
+        .companion
+        .call(
+            "question_read",
+            json!({ "params": {
+                "session_id": "8a7b6c50-22bb-4c3d-8e4f-000000000101",
+                "question_id": null,
+                "include_resolved": false
+            } }),
+        )
+        .expect_err("the host has no worker for that session");
+    // The host answered. A read tried over a link to a worker on this computer would have failed
+    // for want of a host here, as a failure to reach one.
+    assert_eq!(refusal["code"], "UNKNOWN_SESSION", "{refusal}");
     host.stop().await;
 }
 

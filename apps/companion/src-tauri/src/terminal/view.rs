@@ -183,6 +183,7 @@ async fn open(
     let crate::worker::Reached {
         mut client,
         descriptor,
+        ..
     } = crate::worker::reach(&paths, session_id)
         .await
         .map_err(crate::worker::Unreached::words)?;
