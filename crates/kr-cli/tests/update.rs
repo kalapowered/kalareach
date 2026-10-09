@@ -209,17 +209,23 @@ fn crate_of(program: &str) -> &str {
 /// Why `program`, built into a target directory, is not one built from the checkout at `repository`
 /// as it is now, or `None` when it is.
 ///
-/// Cargo writes beside every program a file that lists each source it was built from. A program
-/// older than any of them was built before the tree changed, as one left in a target directory by an
-/// earlier run is, and a program whose list names the crate's sources in another checkout was built
-/// there: both would be assembled into a release and started, and would write and read what this tree
-/// does not. This is Cargo's own rule for a stale build, applied before the suite relies on the
-/// program. It does not see a program copied over a fresh one with a later time, or a build with
-/// other features.
+/// A build of a program by name (`cargo build -p ...`) writes beside it a file that lists each source
+/// it was built from. A program older than any of them was built before the tree changed, as one left
+/// in a target directory by an earlier run is, and a program whose list names the crate's sources in
+/// another checkout was built there: both would be assembled into a release and started, and would
+/// write and read what this tree does not. This is Cargo's own rule for a stale build, applied before
+/// the suite relies on the program.
+///
+/// What it does not judge: a program with no such list, or with a list older than the program. A run
+/// that builds the programs only to test (`cargo test --workspace`) writes no list, or leaves the
+/// one of an earlier build beside a program it has made again, so there is nothing to tell that
+/// program by and it is used as it is. It does not see a program copied over a fresh one with a later
+/// time, or a build with other features either.
 fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Option<String> {
     let listing = program.with_file_name(format!("{name}.d"));
     let text = match std::fs::read_to_string(&listing) {
         Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             return Some(format!("{} cannot be read: {error}", listing.display()));
         }
@@ -228,6 +234,12 @@ fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Opt
         Ok(built) => built,
         Err(error) => return Some(format!("its time cannot be read: {error}")),
     };
+    // A list written before the program was is the list of an earlier build. The few seconds are the
+    // time a build takes between writing one and the other.
+    let listed = std::fs::metadata(&listing).and_then(|about| about.modified());
+    if listed.is_ok_and(|listed| listed + Duration::from_secs(5) < built) {
+        return None;
+    }
     // Makefile syntax: the program, a colon, then each source, a space escaped with a backslash.
     let Some((_, after)) = text.split_once(": ") else {
         return Some(format!("{} is not a dependency file", listing.display()));
@@ -407,10 +419,11 @@ fn module_tree() -> [(&'static str, &'static str); 2] {
 }
 
 /// A program that is older than a source it was built from, one built from another checkout's sources,
-/// and one with no list of its sources are each refused by name, and a program newer than every source
-/// it lists is not. This is the check the suite makes before it assembles a release from the daemons
-/// found in a target directory: one left there by an earlier run wrote a wrong digest into the lock on
-/// the box, and passed every other check.
+/// and one whose list names a source that is gone are each refused by name, and a program newer than
+/// every source it lists, one with no list and one with a list older than itself are not. This is the
+/// check the suite makes before it assembles a release from the daemons found in a target directory:
+/// one left there by an earlier run wrote a wrong digest into the lock on the box, and passed every
+/// other check.
 #[test]
 fn a_program_not_built_from_this_tree_is_refused() {
     let directory = tempfile::tempdir().expect("a directory");
@@ -495,9 +508,21 @@ fn a_program_not_built_from_this_tree_is_refused() {
         .expect("another checkout's build is refused");
     assert!(why.contains("another/crates/kr-controller"), "{why}");
 
-    // No list of its sources, and a list that names none of its crate's.
+    // No list of its sources: a program made again by a run that writes none is not judged.
     std::fs::remove_file(target.join("kr-controller.d")).expect("removes the list");
-    assert!(built_from_another_tree(&program, "kr-controller", &repository).is_some());
+    assert_eq!(
+        built_from_another_tree(&program, "kr-controller", &repository),
+        None
+    );
+    // A list older than the program is the list of an earlier build, whatever it names.
+    listing(&[&other_tree, &gone]);
+    set_time(&target.join("kr-controller.d"), long_ago);
+    set_time(&program, std::time::SystemTime::now());
+    assert_eq!(
+        built_from_another_tree(&program, "kr-controller", &repository),
+        None
+    );
+    // A list that names none of its crate's sources.
     listing(&[]);
     let why = built_from_another_tree(&program, "kr-controller", &repository)
         .expect("a list of nothing is refused");
