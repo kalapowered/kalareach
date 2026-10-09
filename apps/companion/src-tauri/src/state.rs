@@ -25,6 +25,7 @@ pub struct AppState {
     owner: OnceLock<Arc<Owner>>,
     paste: OnceLock<Arc<dyn PastePlatform>>,
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
+    questions: crate::questions::QuestionDesk,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
     supervision: Mutex<Supervision>,
@@ -55,6 +56,7 @@ impl AppState {
             owner: OnceLock::new(),
             paste: OnceLock::new(),
             drafts: Mutex::new(None),
+            questions: crate::questions::QuestionDesk::default(),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
             supervision: Mutex::new(Supervision::default()),
@@ -383,6 +385,12 @@ impl AppState {
                 "a file is attached by dropping it on this window",
             )),
         }
+    }
+
+    /// The questions this application has read, and the answers it keeps.
+    #[must_use]
+    pub const fn questions(&self) -> &crate::questions::QuestionDesk {
+        &self.questions
     }
 
     /// Opens, or reuses, this device's draft store.

@@ -83,9 +83,14 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("history_page", Some(Method::HistoryPage)),
     ("action_read", Some(Method::ActionRead)),
     ("action_cancel", Some(Method::ActionCancel)),
-    // Questions.
+    // Questions. Each goes to the session's own worker, and the answers kept while it cannot be
+    // reached are this device's: the page names a question and an answer, never a method or a path.
     ("question_read", Some(Method::QuestionRead)),
     ("question_answer", Some(Method::QuestionAnswer)),
+    ("question_kept", None),
+    ("question_settle", None),
+    ("question_send_kept", None),
+    ("question_dismiss_kept", None),
     // The agent. Each goes to the session's own worker, which checks the caller itself: the page
     // supplies the method's parameters, and the link, the envelope and its target are native
     // code's. A prompt that names a draft goes through the host's daemon, which holds the draft.
@@ -220,6 +225,21 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // request its broker is arbitrating, following the pages of that one snapshot, on the
     // session's own worker.
     ("session_agents", &[Method::EventsSnapshot]),
+    // A kept answer is settled, sent and dismissed on this device: settling reads the session's
+    // questions and, for a session the worker no longer serves, the daemon's record of it; sending
+    // reads them again first and then answers. The page names a question, never a method.
+    (
+        "question_settle",
+        &[Method::QuestionRead, Method::SessionRead],
+    ),
+    (
+        "question_send_kept",
+        &[
+            Method::QuestionRead,
+            Method::SessionRead,
+            Method::QuestionAnswer,
+        ],
+    ),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -259,6 +279,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         action_cancel,
         question_read,
         question_answer,
+        question_kept,
+        question_settle,
+        question_send_kept,
+        question_dismiss_kept,
         agent_capabilities,
         agent_snapshot,
         agent_commands,
@@ -626,11 +650,81 @@ mutate_command!(
     description_download, Method::DescriptionDownload,
     kr_protocol::describe::DescriptionDownloadParams
 );
-read_command!(
-    /// Reads the agent's questions.
-    question_read, Method::QuestionRead,
-    kr_protocol::question::QuestionReadParams => kr_protocol::question::QuestionReadResult
-);
+/// Reads a session's questions on its own worker.
+///
+/// The daemon on this machine does not carry `question.read` for this computer: a session's
+/// questions are its worker's, so they are read over the link held for its agent calls. What is
+/// read is remembered with the place an answer goes, because the answer is checked against the
+/// question as the person was shown it.
+#[tauri::command]
+pub async fn question_read(
+    links: State<'_, crate::agent::WorkerLinks>,
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: kr_protocol::question::QuestionReadParams = decode(params)?;
+    let link = links.link(typed.session_id).await?;
+    let answer: std::result::Result<kr_protocol::question::QuestionReadResult, _> =
+        link.session.read(Method::QuestionRead, &typed).await;
+    let result = links.settle(typed.session_id, &link, answer)?;
+    crate::questions::remember(
+        &state,
+        &result.questions,
+        &crate::questions::target_of(&link),
+    );
+    encode(&result)
+}
+
+/// Answers a question, or keeps the answer on this device when the worker cannot take it.
+///
+/// The page names the question and the revision it was shown; the question itself and the place
+/// the answer goes are the ones read. An answer kept is sent only by [`question_send_kept`].
+#[tauri::command]
+pub async fn question_answer(
+    links: State<'_, crate::agent::WorkerLinks>,
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: kr_protocol::question::QuestionAnswerParams = decode(params)?;
+    let answer = crate::questions::answer(&state, &links, typed).await?;
+    encode(&answer)
+}
+
+/// Lists the answers kept on this device, in every environment.
+#[tauri::command]
+pub async fn question_kept(state: State<'_, AppState>) -> Result<Value> {
+    encode(&crate::questions::kept(&state).await?)
+}
+
+/// Says where the questions of the answers kept for one session stand now. Sends and removes
+/// nothing.
+#[tauri::command]
+pub async fn question_settle(
+    links: State<'_, crate::agent::WorkerLinks>,
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: crate::questions::SettleParams = decode(params)?;
+    encode(&crate::questions::settle(&state, &links, &typed).await?)
+}
+
+/// Sends one kept answer, for a person who chose to.
+#[tauri::command]
+pub async fn question_send_kept(
+    links: State<'_, crate::agent::WorkerLinks>,
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: crate::questions::KeptRef = decode(params)?;
+    encode(&crate::questions::send(&state, &links, &typed).await?)
+}
+
+/// Dismisses one kept answer, if it is still the one the person was shown.
+#[tauri::command]
+pub async fn question_dismiss_kept(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: crate::questions::KeptRef = decode(params)?;
+    encode(&crate::questions::dismiss(&state, &typed).await?)
+}
 /// Reads what became of one action.
 ///
 /// The receipt of an action on a live session is that session's worker's, which performed it, so
@@ -721,10 +815,6 @@ read_command!(
     /// Reads one chunk of the source the handle named.
     attachment_image_chunk, Method::DownloadChunk,
     kr_protocol::transfer::DownloadChunkParams => kr_protocol::transfer::DownloadChunkResult
-);
-mutate_command!(
-    /// Answers a question.
-    question_answer, Method::QuestionAnswer, kr_protocol::question::QuestionAnswerParams
 );
 mutate_command!(
     /// Cancels a pending action.
@@ -2026,6 +2116,12 @@ mod tests {
                 // What an invitation would carry, from the protocol's own table. It reaches
                 // nothing.
                 "grant_notices",
+                // The answers kept for a worker out of reach, and what a person does with them:
+                // the questions themselves go to the session's worker.
+                "question_kept",
+                "question_settle",
+                "question_send_kept",
+                "question_dismiss_kept",
             ])
         );
     }
