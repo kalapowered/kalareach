@@ -134,17 +134,17 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// Returns the processes one process is the parent of now: those it started that have not been
 /// collected, and each one it adopted as the child subreaper when that one's own parent exited.
 ///
-/// What it costs follows the one process, not the host: the kernel keeps the list with each of the
-/// process's threads, and a reading is at least two passes, each of which, when it reads, lists the
-/// threads twice, reads every thread's list and reads the standing of the threads from the first to
-/// the first live one, usually one, and of that one again. A process that has gone is the parent of
-/// nothing. A kernel that is built without those
-/// lists, and a reading that failed for any other reason, is an error here rather than an empty
-/// answer, so a caller never reads "no children" into it. So is a process whose threads keep
-/// leaving while they are read: a pass in which the listing of them ended early, a listed thread
-/// had gone, the thread that takes children began to end, one ahead of it was ending, or the threads
-/// were not the same after the pass, is made again, since the children of such a thread are in a
-/// list the pass may have read already or never reached.
+/// On Linux, what it costs follows the one process, not the host: the kernel keeps the list with
+/// each of the process's threads, and a reading is at least two passes, each of which, when it
+/// reads, lists the threads twice, reads every thread's list and reads the standing of the threads
+/// from the first to the first live one, usually one, and of that one again. A process that has
+/// gone is the parent of nothing. A kernel that is built without those lists, and a reading that
+/// failed for any other reason, is an error here rather than an empty answer, so a caller never
+/// reads "no children" into it. So is a process whose threads keep leaving while they are read: a
+/// pass in which the listing of them ended early, a listed thread had gone, the thread that takes
+/// children began to end, one ahead of it was ending, or the threads were not the same after the
+/// pass, is made again, since the children of such a thread are in a list the pass may have read
+/// already or never reached.
 ///
 /// What the kernel lists is not a promise: its list of a thread's children can skip one that was
 /// there throughout when children ahead of it are collected while it is read. So a process is read
@@ -155,12 +155,17 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// two apart, and the next pass that reads any children misses the same ones, by the same again or
 /// by a skip of the kernel's list as another child is collected.
 ///
+/// On macOS the list comes from the kernel's process table, which a reading walks twice (once for
+/// the size), so what it costs follows the host's processes. A list is a hint on every platform: a
+/// caller reads each process with [`process_lineage`] and keeps it only when that reading names
+/// `pid` as its parent.
+///
 /// # Errors
 ///
 /// Returns [`IpcError::IdentityUnavailable`] when the process cannot be read, when the kernel
 /// keeps no list of children, or when its threads or children never hold still long enough to be
 /// read, which includes a thread ahead of the one that takes children that stays ending.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 pub fn children_of(pid: u32) -> Result<Vec<u32>> {
     platform::children_of(pid)
 }
@@ -352,6 +357,17 @@ pub enum Stop {
     /// Ask it to end: terminate, hang up and continue, which a stopped process needs to see the
     /// other two. A platform with no such request ([`Stopped::Unsupported`]) is waited on instead.
     Terminate,
+    /// Ask it to end with terminate and continue, and no hang-up.
+    ///
+    /// For a process that a hang-up kills before it has finished what it does on a terminate: an
+    /// application's server, which on a hang-up dies at once and leaves the commands it started
+    /// running, and on a terminate ends them first. A platform with no such request is
+    /// [`Stopped::Unsupported`].
+    Term,
+    /// Ask it to end with a hang-up and continue, and nothing else: what a terminal's closing
+    /// says to every process that holds it. A platform with no such request is
+    /// [`Stopped::Unsupported`].
+    Hangup,
     /// End it, with no chance to refuse.
     Kill,
 }
@@ -1119,6 +1135,8 @@ mod platform {
         }
         let signals: &[Signal] = match stop {
             super::Stop::Terminate => &[Signal::TERM, Signal::HUP, Signal::CONT],
+            super::Stop::Term => &[Signal::TERM, Signal::CONT],
+            super::Stop::Hangup => &[Signal::HUP, Signal::CONT],
             super::Stop::Kill => &[Signal::KILL],
         };
         for (index, signal) in signals.iter().enumerate() {
@@ -1358,18 +1376,39 @@ mod platform {
     use libproc::processes::{ProcFilter, pids_by_type};
     use sysctl::Sysctl as _;
 
+    /// The processes the kernel lists under `filter`.
+    ///
+    /// The library that lists them reads an empty answer as a failure whenever the calling
+    /// thread's error number is set, and nothing clears it, so a thread whose earlier call failed
+    /// for an unrelated reason would report that failure as the listing's. The number is cleared
+    /// first.
+    fn listed(filter: ProcFilter) -> std::io::Result<Vec<u32>> {
+        super::macos_signal::clear_error_number();
+        pids_by_type(filter)
+    }
+
     pub(super) fn processes_in_group(group: u32) -> super::Result<Vec<u32>> {
-        pids_by_type(ProcFilter::ByProgramGroup { pgrpid: group })
+        listed(ProcFilter::ByProgramGroup { pgrpid: group })
             .map_err(|error| super::unavailable("process group", format!("group {group}: {error}")))
     }
 
     pub(super) fn processes_on_terminal(terminal: u32) -> super::Result<Vec<u32>> {
-        pids_by_type(ProcFilter::ByTTY { tty: terminal }).map_err(|error| {
+        listed(ProcFilter::ByTTY { tty: terminal }).map_err(|error| {
             super::unavailable(
                 "controlling terminal",
                 format!("terminal {terminal}: {error}"),
             )
         })
+    }
+
+    /// The processes whose parent is `pid` now, from the kernel's list.
+    ///
+    /// A list is a hint: a process listed may have ended and its identifier passed to another by
+    /// the time it is read, so the caller reads each with [`super::process_lineage`] and keeps it
+    /// only when that reading names `pid` as its parent.
+    pub(super) fn children_of(pid: u32) -> super::Result<Vec<u32>> {
+        listed(ProcFilter::ByParentProcess { ppid: pid })
+            .map_err(|error| super::unavailable("children", format!("process {pid}: {error}")))
     }
 
     /// What a test runs once, right after [`stop`] has read the instance it will signal.
@@ -1418,6 +1457,8 @@ mod platform {
         }
         let signals: &[i32] = match stop {
             super::Stop::Terminate => &[libc::SIGTERM, libc::SIGHUP, libc::SIGCONT],
+            super::Stop::Term => &[libc::SIGTERM, libc::SIGCONT],
+            super::Stop::Hangup => &[libc::SIGHUP, libc::SIGCONT],
             super::Stop::Kill => &[libc::SIGKILL],
         };
         // How many times a process that keeps running new programs is followed before it is said
@@ -1666,6 +1707,14 @@ mod macos_signal {
         Refused(String),
         /// The call is not there, or failed in a way that says nothing about the process.
         Unavailable(String),
+    }
+
+    /// Clears this thread's error number, so that a call whose answer is empty is not read as
+    /// failed because of an earlier call that did fail.
+    pub(super) fn clear_error_number() {
+        // SAFETY: `__error` returns the address of the calling thread's error number, which is
+        // valid for as long as the thread runs, and nothing else reads it during this call.
+        unsafe { *libc::__error() = 0 };
     }
 
     /// Reads one process, or none if the kernel has none under the identifier.
@@ -1990,15 +2039,15 @@ mod platform {
     /// creation time that was compared to the process that is ended.
     ///
     /// There is no request to end a process on this platform that is not also the end of it, so
-    /// [`super::Stop::Terminate`] is [`super::Stopped::Unsupported`]: a caller that wants a
-    /// grace period waits for the session's job to do its work, and ends what is left.
+    /// every request but [`super::Stop::Kill`] is [`super::Stopped::Unsupported`]: a caller that
+    /// wants a grace period waits for the session's job to do its work, and ends what is left.
     pub(super) fn stop(
         identity: &kr_protocol::identity::ProcessStartIdentity,
         stop: super::Stop,
     ) -> super::Stopped {
         use super::Stopped;
 
-        if stop == super::Stop::Terminate {
+        if stop != super::Stop::Kill {
             return Stopped::Unsupported;
         }
         let Ok(pid) = u32::try_from(identity.pid.get()) else {
@@ -2735,6 +2784,26 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.pid.get(), u64::from(std::process::id()));
         assert_eq!(process_state(&first), ProcessState::Running);
+    }
+
+    /// A process that has no children lists none, whatever failed earlier on the thread asking: a
+    /// listing that returns nothing is not read as failed because of a call before it.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_process_with_no_children_lists_none_after_an_unrelated_failure() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a child");
+        // The failure that sets the error number on this thread and nothing else.
+        let _ = std::fs::metadata("/nonexistent/for/the/children/test");
+        let listed = super::children_of(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            listed.expect("an empty list, not a failure"),
+            Vec::<u32>::new()
+        );
     }
 
     /// A process's children are read from that process alone: what it costs follows the one
