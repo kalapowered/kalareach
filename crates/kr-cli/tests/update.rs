@@ -8863,6 +8863,16 @@ async fn no_file_of_a_state_root_goes_unnamed() {
     let table = stored_formats::table::table();
     let named = stored_formats::table::named();
     let root = host.tree.paths().state_root().to_path_buf();
+    // What a client leaves in the state root when it keeps an answer: the answer, and the lock the
+    // write of the next one holds.
+    let kept = root.join("kept-answers");
+    std::fs::create_dir_all(&kept).expect("the directory of kept answers");
+    std::fs::write(kept.join("answers.lock"), b"").expect("the lock a write holds");
+    std::fs::write(
+        kept.join(format!("{}.answer", kr_ipc::new_uuid())),
+        b"a kept answer",
+    )
+    .expect("a kept answer");
     let unnamed = stored_formats::unnamed(&root, &table, &named);
     assert!(unnamed.is_empty(), "named by nothing: {unnamed:?}");
 
@@ -8926,51 +8936,248 @@ async fn no_file_of_a_state_root_goes_unnamed() {
 /// switched to. Every other record a command writes is at version 1.
 const READ_BY_EVERY_LISTED_RELEASE: [(&str, u32); 1] = [("configuration", 2)];
 
+/// For a record a command writes, the version a release that has no writers' lock writes it at, which
+/// is the most a release with the lock may require of a record to be read by its programs: such a
+/// release holds nothing off a switch, so a command of it can write that version after the check.
+/// Release 0.66.1 and the releases before it stamp no version on four of these records, which a
+/// manifest reads as 0; they all write the configuration document and the service record at 1.
+///
+/// Remove an entry's release from the supported ones, and this table with it, only when no host
+/// can update from a release that lacks the lock.
+const WRITTEN_BY_RELEASES_WITHOUT_THE_LOCK: [(&str, u32); 6] = [
+    ("configuration", 1),
+    ("controller-service", 1),
+    ("kept-answers", 0),
+    ("machine-merge-plan", 0),
+    ("shell-entries", 0),
+    ("terminal-preference", 0),
+];
+
+/// A way a record a command writes can reach a switch without the writers' lock, and the records it
+/// leaves exposed. While one is open, a record it exposes is not raised past its floor, however the
+/// lock is taken: closing the gap, or accepting what it permits, removes the line.
+struct OpenGap {
+    /// What the gap is.
+    what: &'static str,
+    /// The records, by name, that it exposes.
+    exposes: &'static [&'static str],
+}
+
+/// Every record a command writes.
+const COMMAND_WRITTEN: &[&str] = &[
+    "configuration",
+    "controller-service",
+    "kept-answers",
+    "machine-merge-plan",
+    "shell-entries",
+    "terminal-preference",
+];
+
+/// The gaps that are open. The lock holds off the commands of an installed release; these are the ways
+/// a record gets past it:
+/// - a `kr` outside an installed release (a development build, an unpacked archive, another store's)
+///   takes no lock, and a state root does not name the store that serves it, so a store's update
+///   cannot hold such a command off;
+/// - the check of the stores looks only in the roots a daemon of the store recorded, and a command
+///   writes where its variables point;
+/// - the configuration document that a daemon started later with other variables would read is not
+///   looked at by the check, which finds it only where an earlier daemon said it read it;
+/// - a daemon in an environment the update could not reach keeps its release and writes the
+///   configuration document after a rollback.
+const OPEN_GAPS: [OpenGap; 4] = [
+    OpenGap {
+        what: "a kr outside an installed release takes no lock, and a state root names no store",
+        exposes: COMMAND_WRITTEN,
+    },
+    OpenGap {
+        what: "the check looks only in the roots a daemon of the store recorded",
+        exposes: COMMAND_WRITTEN,
+    },
+    OpenGap {
+        what: "the configuration a daemon started later with other variables would read is not looked at",
+        exposes: &["configuration"],
+    },
+    OpenGap {
+        what: "a daemon of an environment the update could not reach writes the configuration of its own release",
+        exposes: &["configuration"],
+    },
+];
+
+/// What a command-written record's version and writers break, given the gaps that are open.
+///
+/// A record no barrier holds off may not be raised past what every release that lists its stores
+/// reads. A record that is barred may be, once no open gap exposes it; whatever its version, its
+/// reader may not require more than a release without the lock writes, and the name and version its
+/// writer is given leave to write are the ones the lock records.
+fn broken_by_command_written_records(
+    stores: &[(stored_formats::Writers, &str, u32, u32)],
+    gaps: &[OpenGap],
+) -> Vec<String> {
+    let floor = |name: &str| {
+        READ_BY_EVERY_LISTED_RELEASE
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map_or(1, |(_, version)| *version)
+    };
+    let mut broken = Vec::new();
+    for (writers, name, version, migrates_from) in stores {
+        match writers {
+            stored_formats::Writers::Daemon | stored_formats::Writers::Update => {}
+            stored_formats::Writers::Commands => {
+                if *version > floor(name) {
+                    broken.push(format!(
+                        "{name} is at version {version}, and a command writes it with nothing to hold \
+                         it off an update's switch: every release that lists its stores reads up to {}",
+                        floor(name)
+                    ));
+                }
+            }
+            stored_formats::Writers::Barred(written) => {
+                if written.store != *name || written.version != *version {
+                    broken.push(format!(
+                        "{name} is listed at version {version}, and its writer is given leave to write \
+                         {} at version {}",
+                        written.store, written.version
+                    ));
+                }
+                let lowest = WRITTEN_BY_RELEASES_WITHOUT_THE_LOCK
+                    .iter()
+                    .find(|(known, _)| known == name)
+                    .map_or(0, |(_, version)| *version);
+                if *migrates_from > lowest {
+                    broken.push(format!(
+                        "{name} migrates from version {migrates_from}, and a release without the \
+                         lock writes version {lowest}"
+                    ));
+                }
+                let open: Vec<&str> = gaps
+                    .iter()
+                    .filter(|gap| gap.exposes.contains(name))
+                    .map(|gap| gap.what)
+                    .collect();
+                if *version > floor(name) && !open.is_empty() {
+                    broken.push(format!(
+                        "{name} is at version {version}, past {}, while {}",
+                        floor(name),
+                        open.join("; and ")
+                    ));
+                }
+            }
+        }
+    }
+    broken
+}
+
 /// KR-REQ-26.10: no record a command writes is raised past the highest version that every release that
-/// lists its stores reads, which is version 1 but for the entries above, while nothing holds a command
-/// off between an update's check of the stores and its switch.
+/// lists its stores reads, which is version 1 but for the entries above, unless every writer of it
+/// takes the writers' lock that an update holds across its check and its switch and no gap in that
+/// lock is open for it.
 ///
 /// A switch is checked against every version on disk, and a `kr` command that is not held off can
 /// write a record after the check and before the switch, or a program of a newer release that a
-/// rollback left running can write one after it. Neither can put a record out of the range of the
-/// release switched to while every record a command writes is at a version every release that lists
-/// its stores reads. The next raise of any record a command writes, past what the entries above
-/// give, needs the writer barrier first: every writer of the record takes a lock the update holds
-/// exclusively across its check and its switch, and refuses to write a version that the current
-/// release does not write.
+/// rollback left running can write one after it. The writers' lock holds the commands of an installed
+/// release off, and a record of the release `current` names listed at another version is not
+/// written. Until the gaps in `OPEN_GAPS` are closed or accepted, a record that is exposed by one
+/// stays at the version its floor gives, which is what every release that lists its stores reads.
 ///
-/// Remove this test once all of these hold: the barrier and the rule for a pinned program have
-/// landed; a state root names the store that serves it, and a `kr` outside a store takes that
-/// store's barrier or refuses to write; the configuration document of an environment with no
-/// running daemon is found where its next daemon reads it, or the switch is refused for it; and,
-/// for as long as a supported release has no barrier, the `migrates_from` of each record a command
-/// writes stays at or below the version that release writes.
+/// The next raise of the configuration document, past 2, needs the gaps that expose it ruled on, the
+/// registry's version raised with its forward step (the registry keeps the document it accepted), the
+/// lock written, and `OLDEST_VERSION` kept at 1 while a release that writes version 1 is a source of
+/// an update. Remove an entry of `OPEN_GAPS` when its gap is closed, with the reason in the change.
 #[test]
-fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_while_no_barrier_exists()
- {
-    let past: Vec<String> = stored_formats::table::table()
+fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_while_a_gap_is_open() {
+    let stores: Vec<_> = stored_formats::table::table()
         .into_iter()
-        .filter(|store| {
-            let floor = READ_BY_EVERY_LISTED_RELEASE
-                .iter()
-                .find(|(name, _)| *name == store.entry.store)
-                .map_or(1, |(_, version)| *version);
-            store.writers == stored_formats::Writers::Commands && store.entry.version > floor
-        })
         .map(|store| {
-            format!(
-                "{} is at version {}",
-                store.entry.store, store.entry.version
+            (
+                store.writers,
+                store.entry.store.clone(),
+                store.entry.version,
+                store.entry.migrates_from,
             )
         })
         .collect();
+    let borrowed: Vec<_> = stores
+        .iter()
+        .map(|(writers, name, version, migrates_from)| {
+            (*writers, name.as_str(), *version, *migrates_from)
+        })
+        .collect();
+    let broken = broken_by_command_written_records(&borrowed, &OPEN_GAPS);
     assert!(
-        past.is_empty(),
-        "a record a command writes cannot be raised past the highest version every release that \
-         lists its stores reads until every writer of it takes the lock an update holds \
-         exclusively across its check and its switch: {}",
-        past.join("; ")
+        broken.is_empty(),
+        "a record a command writes cannot be raised past what every release that lists its \
+         stores reads until every writer of it takes the lock an update holds across its check \
+         and its switch, and no gap in that lock is open for it: {}",
+        broken.join("; ")
     );
+    let barred: Vec<&str> = borrowed
+        .iter()
+        .filter(|(writers, ..)| matches!(writers, stored_formats::Writers::Barred(_)))
+        .map(|(_, name, ..)| *name)
+        .collect();
+    for name in COMMAND_WRITTEN {
+        assert!(
+            barred.contains(name),
+            "{name} is a record a command writes and holds the writers' lock"
+        );
+    }
+}
+
+/// KR-REQ-26.10: the rule above stops what it is for and lets through what it is not. A barred record
+/// at its floor passes whatever gap is open; one raised past it passes only with no gap open for it;
+/// a record nothing holds off, one whose reader requires more than a release without the lock
+/// writes, and one whose writer is given leave for another name or version are refused.
+#[test]
+fn the_gate_on_command_written_records_refuses_what_it_is_for() {
+    use stored_formats::Writers;
+
+    static CONFIGURATION_2: kr_ipc::install::Written =
+        kr_ipc::install::Written::new("configuration", 2);
+    static CONFIGURATION_3: kr_ipc::install::Written =
+        kr_ipc::install::Written::new("configuration", 3);
+    static ANSWERS_1: kr_ipc::install::Written = kr_ipc::install::Written::new("kept-answers", 1);
+    let exposed = [OpenGap {
+        what: "a gap",
+        exposes: &["configuration"],
+    }];
+
+    // The control: the records as they are, at their floors, with the gaps open.
+    let at_floor = [
+        (Writers::Barred(&CONFIGURATION_2), "configuration", 2, 1),
+        (Writers::Barred(&ANSWERS_1), "kept-answers", 1, 0),
+    ];
+    assert!(broken_by_command_written_records(&at_floor, &exposed).is_empty());
+
+    // Raised past its floor while a gap exposes it: refused. With the gap gone: allowed.
+    let raised = [(Writers::Barred(&CONFIGURATION_3), "configuration", 3, 1)];
+    assert_eq!(
+        broken_by_command_written_records(&raised, &exposed).len(),
+        1
+    );
+    assert!(broken_by_command_written_records(&raised, &[]).is_empty());
+    // A gap that exposes another record does not stop it.
+    let elsewhere = [OpenGap {
+        what: "a gap",
+        exposes: &["kept-answers"],
+    }];
+    assert!(broken_by_command_written_records(&raised, &elsewhere).is_empty());
+
+    // A record nothing holds off is held to its floor whatever gaps are open.
+    let unbarred = [(Writers::Commands, "configuration", 3, 1)];
+    assert_eq!(broken_by_command_written_records(&unbarred, &[]).len(), 1);
+    assert!(
+        broken_by_command_written_records(&[(Writers::Commands, "configuration", 2, 1)], &[])
+            .is_empty()
+    );
+
+    // A reader that requires more than a release without the lock writes.
+    let requiring = [(Writers::Barred(&ANSWERS_1), "kept-answers", 1, 1)];
+    assert_eq!(broken_by_command_written_records(&requiring, &[]).len(), 1);
+
+    // A writer given leave for another version than the one the lock records.
+    let strayed = [(Writers::Barred(&CONFIGURATION_3), "configuration", 2, 1)];
+    assert_eq!(broken_by_command_written_records(&strayed, &[]).len(), 1);
 }
 
 /// KR-REQ-26.10: a rollback to a release whose manifest lists no store is refused, naming that, and

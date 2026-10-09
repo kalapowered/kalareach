@@ -738,6 +738,16 @@
     },
     {
       "scope": "state_root",
+      "path": "kept-answers",
+      "reason": "the lock a write of a kept answer holds from reading the answer it replaces until the new one is in place; empty",
+      "children": [
+        "answers.lock"
+      ],
+      "opaque": false,
+      "databases": false
+    },
+    {
+      "scope": "state_root",
       "path": "machine-merge-plan.lock",
       "reason": "the lock on the merge plan; empty",
       "children": [],

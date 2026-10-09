@@ -158,6 +158,11 @@ pub enum Writers {
     /// A command, or another program, that takes a lock of its own and neither of those: nothing
     /// holds it off between an update's check and its switch.
     Commands,
+    /// A command that takes the writers' lock and asks for the leave to write the record, named and
+    /// versioned as the constant says, before it writes it: an update holds that lock across its
+    /// check and its switch, and a record the release `current` names lists at another version is
+    /// not written.
+    Barred(&'static kr_ipc::install::Written),
 }
 
 /// A store as the code declares it.

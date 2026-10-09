@@ -91,13 +91,13 @@ pub fn table() -> Vec<Store> {
         },
         // The startup files an install wrote an entry to, which a removal works from.
         Store {
-            writers: Writers::Commands,
+            writers: Writers::Barred(&kr_shell_integration::host::startup::ENTRY_WRITTEN),
             entry: entry(
-                "shell-entries",
+                kr_shell_integration::host::startup::ENTRY_WRITTEN.store,
                 StoreScope::StateRoot,
                 "shell-entries.json",
                 member("version", 0),
-                kr_shell_integration::host::startup::ENTRY_RECORD_VERSION,
+                kr_shell_integration::host::startup::ENTRY_WRITTEN.version,
                 0,
             ),
             owned: Vec::new(),
@@ -451,17 +451,16 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
-            writers: Writers::Commands,
+            writers: Writers::Barred(&kr_shell_integration::host::terminal::PREFERENCE_WRITTEN),
             entry: entry(
-                "terminal-preference",
+                kr_shell_integration::host::terminal::PREFERENCE_WRITTEN.store,
                 StoreScope::Environment,
                 "terminal.json",
                 member(
                     kr_shell_integration::host::terminal::PREFERENCE_VERSION_KEY,
                     0,
                 ),
-                u32::try_from(kr_shell_integration::host::terminal::PREFERENCE_VERSION)
-                    .expect("a small number"),
+                kr_shell_integration::host::terminal::PREFERENCE_WRITTEN.version,
                 0,
             ),
             owned: Vec::new(),
@@ -474,13 +473,13 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
-            writers: Writers::Commands,
+            writers: Writers::Barred(&kr_cli::service_manager::WRITTEN),
             entry: entry(
-                "controller-service",
+                kr_cli::service_manager::WRITTEN.store,
                 StoreScope::Environment,
                 "controller-service.json",
                 member("version", 0),
-                kr_cli::service_manager::RECORD_VERSION,
+                kr_cli::service_manager::WRITTEN.version,
                 kr_cli::service_manager::RECORD_VERSION,
             ),
             owned: Vec::new(),
@@ -560,13 +559,13 @@ pub fn table() -> Vec<Store> {
         },
         // The records the client keeps on this device, in the user's state root.
         Store {
-            writers: Writers::Commands,
+            writers: Writers::Barred(&kr_client::answers::WRITTEN),
             entry: entry(
-                "kept-answers",
+                kr_client::answers::WRITTEN.store,
                 StoreScope::StateRoot,
                 "kept-answers/*.answer",
                 cbor_member("version", 0),
-                kr_client::answers::ANSWER_FORMAT,
+                kr_client::answers::WRITTEN.version,
                 0,
             ),
             owned: Vec::new(),
@@ -577,13 +576,13 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
-            writers: Writers::Commands,
+            writers: Writers::Barred(&kr_cli::machine::WRITTEN),
             entry: entry(
-                "machine-merge-plan",
+                kr_cli::machine::WRITTEN.store,
                 StoreScope::StateRoot,
                 "machine-merge-plan",
                 cbor_member("version", 0),
-                kr_cli::machine::PLAN_FORMAT,
+                kr_cli::machine::WRITTEN.version,
                 0,
             ),
             owned: Vec::new(),
@@ -602,13 +601,13 @@ pub fn table() -> Vec<Store> {
         // `version` member is read as the version its reader writes, and the lock counts it as
         // version 1, which every release that reads this document reads.
         Store {
-            writers: Writers::Commands,
+            writers: Writers::Barred(&kr_cli::doctor::configuration::WRITTEN),
             entry: entry(
-                "configuration",
+                kr_cli::doctor::configuration::WRITTEN.store,
                 StoreScope::Configuration,
                 "config.json",
                 member("version", 1),
-                u32::try_from(hostinfo::configuration::VERSION).expect("a small number"),
+                kr_cli::doctor::configuration::WRITTEN.version,
                 u32::try_from(hostinfo::configuration::OLDEST_VERSION).expect("a small number"),
             ),
             owned: Vec::new(),
@@ -652,6 +651,14 @@ pub fn named() -> Vec<Named> {
             "environments",
             "the state directories of the environments, each of which is named under its own scope",
         ),
+        Named {
+            scope: StoreScope::StateRoot,
+            name: "kept-answers",
+            children: &["answers.lock"],
+            opaque: false,
+            databases: false,
+            reason: "the lock a write of a kept answer holds from reading the answer it replaces until the new one is in place; empty",
+        },
         leaf(
             StoreScope::StateRoot,
             "machine-merge-plan.lock",
