@@ -298,6 +298,10 @@ that means, and each rule is a fact about a file here rather than a convention:
   `owner.confirmation.request` and `grant.transfer` are methods only native code calls, and the
   transfer only after an owner device has answered.
 
+- **Recovery's secrets stay native.** The page asks for recovery to be turned on and for the kit to
+  be saved. The seed, the bundle's locator and the account's token stay in native code, and the kit
+  is written to a destination the save dialog returned.
+
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
 One hardening switch is deliberately off. `freezePrototype` freezes `Object.prototype` before the
@@ -442,6 +446,39 @@ It is not possible to make a second invitation to the same session and device, o
 An attempt is said not to have happened, as far as the host shows, only after the bound that the window sets has passed, and an attempt whose outcome cannot be told is shown as unknown. If the host's result carries something the person is owed (for example, the screen the host kept with a live invitation, or how far the session workers have got with a revocation), the record stays after the attempt ends, and the host can still be asked for the result until the page has shown it, so a restart before the page read it loses nothing.
 
 A hand-over asks the host to describe the plan and put it to the owner devices, and sends nothing that changes who holds the session. The page holds a reference to it, and the plan, the action and the parameters stay in native code. It asks every second whether an owner device has answered, and when one has, native code checks that the plan the host described names the session, the grant and the receiving device that were asked for, and sends the transfer once. The hand-over leaves native code's table in the same step that keeps the record of the transfer, so a cancel either came first and nothing is sent, or comes later and finds nothing to cancel. The panel tells the person how the send went whether or not it is still on screen, and leaving it before the send lets the hand-over go. What the page has been told of a result is kept for as long as the page lives, so leaving the tab does not lose it. A hand-over that has not been answered when its challenge runs out is shown as that, and Ask again starts a new one. If the host does not answer the request for the owner devices' confirmation, only its answer to the first request is final. When the repeats run out, the page says it is not known whether an owner device was asked, and that one can still be shown the request for up to two minutes, though nothing this application sends will hand anything over.
+
+## The sync service and recovery
+
+The sync service is a setting of its own. It is the managed service, `https://reach.kala.to`, until
+the person picks another, and the choice is kept in `sync-origin` in the application's data
+directory. It is not taken from the account's origin, the pairing service or a host. The Account
+sheet shows it with a Change control, as the pairing screen does for its service, and accepts an
+https origin or an http one on this computer.
+
+Recovery keeps the owner's seed on this computer and an encrypted bundle at a stable locator on the
+sync service. `src-tauri/src/recovery.rs` does it with `kr-client`'s `BundleStore`, which owns the
+bundle's rules: writes that compare the revision they replace, a record of any write whose answer
+never came back, and a checkpoint that never moves back.
+
+- Turning recovery on makes the seed and keeps it in the device's secure store. It then writes
+  `recovery/recovery.json` (the service, the locator, and whether the first write landed) and puts
+  the first bundle at the service. A kit exists only once that write has landed. A start that did
+  not finish goes on with the locator it began with, and a bundle that landed unrecorded is read
+  and kept, never written over.
+- A write whose answer never came back shows as unsettled, and nothing else is written until the
+  person settles it. Settling asks the service to fence the write's identity and reads the bundle
+  back. A restart keeps the write unsettled.
+- Saving the kit writes the seed, the locator and the service to a file at a destination the save
+  dialog returned, readable by the user alone. The page is sent none of them.
+- `Recovery::enable_writer` is how a backup writer is made recovery-enabled. It commits the bundle
+  with the writer named in it, and returns the evidence that the writer is enabled only after that
+  commit has landed.
+
+The bundle is reached with this device's signature and the account's token, and the token goes only
+to the service the account is signed in to. When the sync service setting names another service, no
+request is made and the refusal names the setting. A sign-in that does not carry the right to write
+the account's backup storage sends nothing either, and the person signs in again with that right.
+A phone shows the setting and offers no recovery.
 
 ## The design system
 
