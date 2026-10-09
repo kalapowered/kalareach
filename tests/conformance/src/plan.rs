@@ -1183,6 +1183,24 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the loopback listener a sign-in comes back to",
+            &["test", "--locked", "-p", "kr-loopback"],
+        ),
+        qualified_only(
+            "the host's sign-in and sign-out through the daemon",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "voice_broker",
+                "sign",
+            ],
+            "sign",
+        ),
+        Step::cargo(
+            Group::Rust,
             "the client and the command line held to the rendering rule",
             &[
                 "test",
