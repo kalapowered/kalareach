@@ -51,7 +51,9 @@ struct Arguments {
     /// For a command that starts this daemon on demand, as `kr new` does under the standalone
     /// start: the daemon outlives that command, and nothing the terminal the command ran in does, a
     /// hangup, an interrupt or the end of a login, reaches it. The process it is given must not
-    /// already lead a process group, which a process a program starts directly never does.
+    /// already lead a process group, which a process a program starts directly never does. Started
+    /// by a command of a session on Linux, in the service that session runs in, the daemon then
+    /// moves into a scope of its own, so that the end of that service does not end it.
     #[cfg(unix)]
     #[arg(long)]
     own_session: bool,
