@@ -176,6 +176,14 @@ async fn create(host: &Host, owned: &mut Owned) -> Result<SessionCreateResult, S
 async fn compose(
     host: &Host,
 ) -> Result<(LocalClient, kr_protocol::envelope::MutationRequest), String> {
+    compose_params(host, &create_params(host)).await
+}
+
+/// Opens a connection and composes the create of a session with the given parameters.
+async fn compose_params(
+    host: &Host,
+    params: &SessionCreateParams,
+) -> Result<(LocalClient, kr_protocol::envelope::MutationRequest), String> {
     let endpoint = host
         .temp
         .environment()
@@ -189,7 +197,7 @@ async fn compose(
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
             ActionTarget::environment(host.environment_id),
-            &create_params(host),
+            params,
         )
         .await
         .map_err(|error| format!("compose the create: {error}"))?;
@@ -1507,4 +1515,434 @@ async fn observer(
         .map_err(|error| format!("the subscribe call: {error}"))?
         .map_err(|error| format!("the subscription failed: {error}"))?;
     Ok(client)
+}
+
+/// The root program of the session the output measurement types into: raw mode, bracketed paste
+/// switched on, then a wait for one byte before a background producer starts printing, and an echo
+/// of whatever it is sent after that. The echo shows the control bytes it receives as printable
+/// text (`^[` for an escape), because the terminal engine holds a bare escape back until a byte
+/// follows it, and the producer's next line would be that byte. The producer prints lines of
+/// letters and digits that hold neither `x` nor `^`, which are the two bytes the measurement waits
+/// for.
+#[cfg(unix)]
+const ECHOES_UNDER_OUTPUT: &str = "#!/bin/sh\n\
+    stty raw -echo\n\
+    printf '\\033[?2004hkr-ready.'\n\
+    dd bs=1 count=1 > /dev/null 2>&1\n\
+    line=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\
+    ( while :; do i=0; while [ $i -lt 500 ]; do printf '%s\\n' \"$line\"; i=$((i+1)); done; sleep 0.01; done ) &\n\
+    exec cat -uv\n";
+
+/// How many keystrokes the output measurement sends.
+#[cfg(unix)]
+const OUTPUT_SAMPLES: usize = 1_000;
+
+/// Input round trips and the echo of every paste-delimiter prefix, beside KR-PERF-001 and
+/// KR-PERF-002's figures, through real worker processes: twenty sessions and thirty-two views on a
+/// daemon that starts each worker as its own process, the one typed into printing sustained output. The input benchmark builds its workers
+/// inside its own process, so it cannot show what the shipped worker executable does; this runs the
+/// executable itself. The figures are recorded, and the measurement asserts only that every
+/// exchange completed as it should: a keystroke forwarded whole, a prefix held, an echo seen.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement rather than a test; run by hand with the worker program under test"]
+async fn input_through_real_workers_while_a_session_prints() {
+    let host = host().await;
+    let mut owned = Owned::default();
+    let measured = input_under_output(&host, &mut owned).await;
+    let closed = close_all(&host, &owned).await;
+    measured.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
+    closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
+    let _ = host.controller;
+    let _ = host.worker;
+}
+
+#[cfg(unix)]
+async fn input_under_output(host: &Host, owned: &mut Owned) -> Result<(), String> {
+    use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+
+    // Nineteen idle sessions and thirty-two views, beside the session that is typed into. Section 27
+    // states twenty live shells and thirty-two views for an idle host; typing into one of them while
+    // it prints is this measurement's choice.
+    for _ in 1..IDLE_SESSIONS {
+        create(host, owned).await?;
+    }
+    let program = host.temp.root().join("echoes-under-output.sh");
+    std::fs::write(&program, ECHOES_UNDER_OUTPUT)
+        .map_err(|error| format!("write the root program: {error}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("make the root program runnable: {error}"))?;
+    }
+    let params = SessionCreateParams {
+        shell: Nullable::some(program.display().to_string()),
+        ..create_params(host)
+    };
+    let (mut creator, request) = compose_params(host, &params).await?;
+    let typed = admit(host, owned, &mut creator, request).await?;
+    let mut views = Vec::new();
+    for index in 0..ATTACHED_VIEWS {
+        let created = &owned.sessions[index % (owned.sessions.len() - 1)];
+        let endpoint = kr_ipc::paths::Endpoint::from_path(
+            created
+                .endpoint
+                .as_ref()
+                .ok_or_else(|| "a live session has an endpoint".to_owned())?,
+        )
+        .map_err(|error| format!("a session's endpoint: {error}"))?;
+        views.push(observer(&endpoint, host.environment_id, created.session.session_id).await?);
+    }
+
+    let session_id = typed.session.session_id;
+    let endpoint = kr_ipc::paths::Endpoint::from_path(
+        typed
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "a live session has an endpoint".to_owned())?,
+    )
+    .map_err(|error| format!("the session's endpoint: {error}"))?;
+    let target = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .map_err(|error| format!("connect to the worker: {error}"))?;
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .map_err(|error| format!("the attach call: {error}"))?
+        .map_err(|error| format!("the attach failed: {error}"))?
+        .to_typed()
+        .map_err(|error| format!("the attach result: {error}"))?;
+    let attachment_id = attached.attachment.attachment_id;
+    let mut streams = CanonicalSet::new();
+    streams.insert(EventStream::Output);
+    client
+        .request(
+            Method::EventsSubscribe,
+            &EventsSubscribeParams {
+                session_id,
+                attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .map_err(|error| format!("the subscribe call: {error}"))?
+        .map_err(|error| format!("the subscription failed: {error}"))?;
+    let lease: InputAcquireResult = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .map_err(|error| format!("the acquire call: {error}"))?
+        .map_err(|error| format!("the acquire failed: {error}"))?
+        .to_typed()
+        .map_err(|error| format!("the acquire result: {error}"))?;
+    let epoch = lease.lease.epoch;
+
+    // The root program is waiting for a byte once it has printed its first words, and the screen
+    // this attachment was given holds them because nothing else has been printed. Then one byte
+    // starts its producer, and the first line the producer prints says the session is printing.
+    let mut seen = Vec::new();
+    wait_for_output(&mut client, &mut seen, b"kr-ready.").await?;
+    let mut sequence = 0_u64;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request(
+            Method::InputWrite,
+            &InputWriteParams {
+                session_id,
+                attachment_id,
+                epoch,
+                sequence: kr_protocol::ids::InputSequence::new(sequence),
+                bytes: kr_protocol::scalars::Bytes::new(b"s".to_vec()),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| "the start byte was not answered within ten seconds".to_owned())?
+    .map_err(|error| format!("the start byte did not reach the worker: {error}"))?
+    .map_err(|error| format!("the start byte was refused: {}", error.message))?;
+    sequence += 1;
+    wait_for_output(&mut client, &mut seen, b"0123456789abcdef").await?;
+
+    let window = record::Window::open();
+    let measured_from = Instant::now();
+    let mut printed = 0_u64;
+    // One byte at a time, each waited for in the session's output: the byte `x` is in no line the
+    // producer prints, so the first output that holds one is this keystroke's echo.
+    let mut samples = Vec::with_capacity(OUTPUT_SAMPLES);
+    for _ in 0..OUTPUT_SAMPLES {
+        let (answer, echoed) = send_and_wait(
+            &mut client,
+            &InputWriteParams {
+                session_id,
+                attachment_id,
+                epoch,
+                sequence: kr_protocol::ids::InputSequence::new(sequence),
+                bytes: kr_protocol::scalars::Bytes::new(b"x".to_vec()),
+            },
+            sequence + 1,
+            b'x',
+            &mut printed,
+        )
+        .await?;
+        sequence += 1;
+        if answer.forwarded_bytes.get() != 1 {
+            return Err("a single ordinary byte was forwarded whole".to_owned());
+        }
+        samples.push(echoed);
+    }
+    samples.sort_unstable();
+
+    // Every proper prefix of both paste delimiters, each alone. The root program echoes an escape as
+    // `^[`, so the byte that is waited for is `^`, which the producer never prints.
+    let mut holds = Vec::new();
+    for (name, delimiter) in [("start", &b"\x1b[200~"[..]), ("end", &b"\x1b[201~"[..])] {
+        for length in 1..delimiter.len() {
+            let (answer, held) = send_and_wait(
+                &mut client,
+                &InputWriteParams {
+                    session_id,
+                    attachment_id,
+                    epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(sequence),
+                    bytes: kr_protocol::scalars::Bytes::new(delimiter[..length].to_vec()),
+                },
+                sequence + 1,
+                b'^',
+                &mut printed,
+            )
+            .await?;
+            sequence += 1;
+            if answer.held_prefix_bytes.get() != length as u64 {
+                return Err(format!(
+                    "a prefix of {length} bytes of the {name} delimiter was not held: {} held",
+                    answer.held_prefix_bytes.get()
+                ));
+            }
+            holds.push((
+                format!(
+                    "{name} delimiter, {length} byte{}",
+                    if length == 1 { "" } else { "s" }
+                ),
+                held,
+            ));
+        }
+    }
+    let printing = printed as f64 / measured_from.elapsed().as_secs_f64() / (1024.0 * 1024.0);
+    let conditions = window.close();
+    drop(client);
+    drop(views);
+
+    let milliseconds = |duration: Duration| format!("{:.3} ms", duration.as_secs_f64() * 1000.0);
+    let rank = |fraction: f64| {
+        let index = ((samples.len() as f64 * fraction).ceil() as usize).clamp(1, samples.len());
+        samples[index - 1]
+    };
+    let mut lines = conditions.lines();
+    lines.push(format!(
+        "  measurement       {OUTPUT_SAMPLES} single-byte writes and every proper prefix of both \
+         paste delimiters, typed into one session of a daemon that starts each worker as its own \
+         process, beside {} idle sessions and {ATTACHED_VIEWS} attached views; the typed session \
+         prints throughout, and each figure runs from the write to the output holding the byte its \
+         root program echoes, read by the typing client",
+        IDLE_SESSIONS - 1
+    ));
+    lines.push(format!(
+        "  output            {printing:.2} MiB a second reached the typing client over the \
+         measurement"
+    ));
+    lines.push(format!(
+        "  samples           {}: median {}, p95 {}, p99 {}, worst {}",
+        samples.len(),
+        milliseconds(rank(0.5)),
+        milliseconds(rank(0.95)),
+        milliseconds(rank(0.99)),
+        milliseconds(samples[samples.len() - 1])
+    ));
+    for (what, held) in &holds {
+        lines.push(format!(
+            "  echoed after      {}: {what}",
+            milliseconds(*held)
+        ));
+    }
+    lines.push(format!(
+        "  echoed longest    {}, after the write of a prefix whose recogniser deadline is {}",
+        milliseconds(
+            holds
+                .iter()
+                .map(|(_, held)| *held)
+                .max()
+                .unwrap_or_default()
+        ),
+        milliseconds(kr_worker::input::RECOGNISER_DEADLINE)
+    ));
+    record::report(
+        RECORD,
+        "Input round trips and prefix echoes through real workers under sustained output, beside \
+         KR-PERF-001 and KR-PERF-002",
+        &lines,
+    );
+    Ok(())
+}
+
+/// The bytes of one output event, or nothing for any other frame.
+#[cfg(unix)]
+fn output_bytes(frame: &kr_protocol::envelope::ControlFrame) -> Result<Vec<u8>, String> {
+    use kr_protocol::envelope::ControlFrame;
+    match frame {
+        ControlFrame::Notification(notification)
+            if notification.event_type.as_str() == "session.output" =>
+        {
+            let event = notification
+                .payload
+                .to_typed::<kr_protocol::recovery::OutputEvent>()
+                .map_err(|error| format!("the output did not decode: {error}"))?;
+            Ok(event.bytes.as_slice().to_vec())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Reads output until it holds `needle`, for at most a minute. `seen` carries the end of what was
+/// read, so a needle split across two events is still found.
+#[cfg(unix)]
+async fn wait_for_output(
+    client: &mut LocalClient,
+    seen: &mut Vec<u8>,
+    needle: &[u8],
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if seen.windows(needle.len()).any(|window| window == needle) {
+            return Ok(());
+        }
+        // Checked here as well as by the timeout below: a read that is ready is polled before the
+        // timer, so output that never pauses could otherwise hold the wait past its end.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the root program printed nothing like {:?} in a minute",
+                String::from_utf8_lossy(needle)
+            ));
+        }
+        if seen.len() >= needle.len() {
+            seen.drain(..seen.len() - (needle.len() - 1));
+        }
+        let frame = tokio::time::timeout_at(deadline, client.recv())
+            .await
+            .map_err(|_| {
+                format!(
+                    "the root program printed nothing like {:?} in a minute",
+                    String::from_utf8_lossy(needle)
+                )
+            })?
+            .map_err(|error| format!("the connection ended: {error}"))?;
+        seen.extend(output_bytes(&frame)?);
+    }
+}
+
+/// Writes input and returns the worker's answer and how long the first output holding `wanted`
+/// took to reach this client, adding the size of the output the client received to `printed`. The
+/// answer and the output arrive on one connection in either order, and the write, the answer and the
+/// echo together have ten seconds, however much unrelated output arrives in them.
+#[cfg(unix)]
+async fn send_and_wait(
+    client: &mut LocalClient,
+    params: &kr_protocol::input::InputWriteParams,
+    request: u64,
+    wanted: u8,
+    printed: &mut u64,
+) -> Result<(kr_protocol::input::InputWriteResult, Duration), String> {
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
+    let request_id = kr_protocol::ids::RequestId::new(request);
+    let encoded = ParamsValue::from_typed(params)
+        .map_err(|error| format!("the request did not encode: {error}"))?;
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::from_std(started + Duration::from_secs(10));
+    tokio::time::timeout_at(
+        deadline,
+        client
+            .writer()
+            .write_message(&ControlFrame::Request(Request {
+                request_id,
+                method: Method::InputWrite.into(),
+                method_version: kr_protocol::method::MethodVersion::V1,
+                params: encoded,
+            })),
+    )
+    .await
+    .map_err(|_| "the write did not reach the worker within ten seconds".to_owned())?
+    .map_err(|error| format!("the write did not reach the worker: {error}"))?;
+    let mut answer = None;
+    let mut echoed = None;
+    while answer.is_none() || echoed.is_none() {
+        // Checked here as well as by the timeout below, for the reason given in `wait_for_output`.
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the write was not answered and echoed within ten seconds".to_owned());
+        }
+        let frame = tokio::time::timeout_at(deadline, client.recv())
+            .await
+            .map_err(|_| "the write was not answered and echoed within ten seconds".to_owned())?
+            .map_err(|error| format!("the connection ended: {error}"))?;
+        let elapsed = started.elapsed();
+        match &frame {
+            ControlFrame::Response(response) if response.request_id == request_id => {
+                match &response.outcome {
+                    Outcome::Ok(value) => {
+                        answer = Some(
+                            value
+                                .to_typed::<kr_protocol::input::InputWriteResult>()
+                                .map_err(|error| format!("the answer did not decode: {error}"))?,
+                        );
+                    }
+                    Outcome::Error(error) => {
+                        return Err(format!("the write was refused: {}", error.message));
+                    }
+                }
+            }
+            ControlFrame::Response(_) => {
+                return Err("an answer to another request arrived".to_owned());
+            }
+            _ => {
+                let bytes = output_bytes(&frame)?;
+                *printed += bytes.len() as u64;
+                if echoed.is_none() && bytes.contains(&wanted) {
+                    echoed = Some(elapsed);
+                }
+            }
+        }
+    }
+    Ok((
+        answer.ok_or_else(|| "an answer".to_owned())?,
+        echoed.ok_or_else(|| "an echo".to_owned())?,
+    ))
 }
