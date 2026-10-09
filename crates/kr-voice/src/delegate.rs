@@ -4,15 +4,22 @@
 //! provider's read-only data channel; the paired device submits it to the host over its own
 //! authenticated connection; the actor is that device under its ordinary grant intersected with
 //! the voice grant and the session binding; **the coordinator proposes and the worker validates
-//! normally**. The delegation event supplies an identifier and a timeline offset, not task text,
-//! so what the coordinator proposes comes from the host's own state and from the action the device
-//! named — never from what the model said the person wants.
+//! normally**. The delegation event supplies an identifier and a timeline offset, and the paired
+//! device hands the host the fragments of what the person said. The host reads them itself, with a
+//! grammar of its own ([`crate::interpret`]): the device, the model and the provider name no
+//! action, session or destination, so what the coordinator proposes comes from the words as the
+//! host reads them and from the host's own state — never from what the model said the person
+//! wants.
 //!
 //! # The order the checks run in
 //!
+//! 0. The set of fragments is within its bounds (count, size, order, how far back), the call exists
+//!    and is this device's, the words are read, and the session they name is found among the
+//!    sessions this call reaches by the number a person says. Any of these refuses the delegation
+//!    and spends nothing.
 //! 1. The voice session exists and belongs to this device.
 //! 2. The delegation identifier belongs to this call's own timeline and has not been spent.
-//! 3. The session named is one this voice session may reach.
+//! 3. The session read is one this voice session may reach.
 //! 4. **The confirmation**, for the five classes of section 15 ¶13 that need one. It is checked
 //!    before the grant deliberately: an action in one of those classes is refused for the missing
 //!    confirmation whatever the grant says, so the refusal is the same sentence for everyone and
@@ -342,6 +349,7 @@ impl Coordinator {
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's interpreter panicked.
+    #[cfg(feature = "testing")]
     pub fn attach_interpreter(&self, interpreter: Arc<dyn DelegationInterpreter>) {
         *self
             .interpreter
@@ -1694,9 +1702,7 @@ impl Coordinator {
                     _ => {
                         return Err(VoiceError::refused(
                             VoiceRefusal::SessionOutsideVoiceSession,
-                            format!(
-                                "this voice session does not reach a session numbered {number}"
-                            ),
+                            "this voice session does not reach a session with that number",
                         ));
                     }
                 }
@@ -2156,6 +2162,8 @@ fn is_clear_affirmative(spoken: &str) -> bool {
         "nevermind",
     ];
 
+    // A transcript writes the apostrophe straight or curly; "don\u{2019}t" is "don't".
+    let spoken = spoken.replace('\u{2019}', "'");
     let mut words = spoken
         .split(|character: char| !(character.is_alphanumeric() || character == '\''))
         .filter(|word| !word.is_empty())

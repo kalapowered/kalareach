@@ -490,7 +490,7 @@ impl Scripted {
     }
 
     /// Has this worker keep its connection open and answer no read, or answer again.
-    fn mute_reads(&self, muted: bool) {
+    pub(super) fn mute_reads(&self, muted: bool) {
         self.muted.store(muted, Ordering::Release);
     }
 

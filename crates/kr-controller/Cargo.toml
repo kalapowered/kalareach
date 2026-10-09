@@ -83,7 +83,7 @@ url.workspace = true
 # store write, the hooks that place the description process, its clock and the conditions it reads,
 # and the stub that stands in for the description process. It compiles to nothing without this
 # feature, and no shipped build enables it.
-testing = ["kr-describe/testing"]
+testing = ["kr-describe/testing", "kr-voice/testing"]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }

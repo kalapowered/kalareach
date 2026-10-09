@@ -343,9 +343,9 @@ impl RemoteConnection {
                 .map_err(|error| error.to_protocol_error())?;
         }
         // A voice mutation's subject is this host. A voice session is not a shell session, so the
-        // target names none, and the session a delegation acts on travels in the parameters where
-        // the coordinator checks it against what that voice session may reach. Its own subject
-        // check is the one the local ingress makes.
+        // target names none, and the session a delegation acts on is read by the coordinator from
+        // the words in the parameters and checked against what that voice session may reach. Its
+        // own subject check is the one the local ingress makes.
         let voice = crate::voice::VoiceModule::serves(entry.method);
         if voice {
             crate::voice::VoiceModule::check_subject(entry.method, mutation)

@@ -6,12 +6,16 @@
 //!
 //! # The data-access boundary
 //!
-//! **What the coordinator may read.** One thing: content a host has already passed through the
-//! shared host-side history filter at `Surface::VoiceContext`, under a viewer scope built from the
-//! requesting device's own grant. The seam that delivers it ([`ContextSource`]) takes that grant
-//! and nothing else, so there is no shape of call that asks for the host owner's broader history.
-//! The coordinator then applies the grant's history lower bound a second time to every item it was
-//! handed: a caller that filtered incorrectly does not get its mistake past this crate.
+//! **What the coordinator may read.** Two things. The first is content a host has already passed
+//! through the shared host-side history filter at `Surface::VoiceContext`, under a viewer scope
+//! built from the requesting device's own grant. The seam that delivers it ([`ContextSource`])
+//! takes that grant and nothing else, so there is no shape of call that asks for the host owner's
+//! broader history. The coordinator then applies the grant's history lower bound a second time to
+//! every item it was handed: a caller that filtered incorrectly does not get its mistake past this
+//! crate. The second is the bounded fragments of what the person said, which the paired device
+//! hands over with each delegation and the coordinator reads once, with a grammar of its own
+//! ([`interpret`]). It keeps the digest of a delegation, and the action and session it read, and
+//! nothing that says what was said.
 //!
 //! **What the coordinator may send.** The bounded selection of section 15 ¶12 — session
 //! description, working directory, active application, pending decision summaries and the last

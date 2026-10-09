@@ -17,7 +17,14 @@ kr-crypto.workspace = true
 kr-protocol.workspace = true
 thiserror.workspace = true
 
+[features]
+# The seam a test uses to script what a person says, for the actions the host's grammar does not
+# read yet. It compiles to nothing without this feature, and no shipped build enables it.
+testing = []
+
 [dev-dependencies]
+# This crate's own tests, with the seam above compiled in.
+kr-voice = { path = ".", features = ["testing"] }
 kr-cbor.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

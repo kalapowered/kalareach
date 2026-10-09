@@ -37,9 +37,19 @@ fn delegation_of(
     voice_session_id: VoiceSessionId,
     words: &str,
 ) -> MutationRequest {
+    delegation_named("item_one", environment_id, voice_session_id, words)
+}
+
+/// The same, under the provider's identifier `name`.
+fn delegation_named(
+    name: &str,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    voice_session_id: VoiceSessionId,
+    words: &str,
+) -> MutationRequest {
     let params = VoiceDelegateParams {
         voice_session_id,
-        delegation_id: VoiceDelegationId::new("item_one").expect("a delegation"),
+        delegation_id: VoiceDelegationId::new(name).expect("a delegation"),
         offset_ms: U64::new(0),
         fragments: vec![TranscriptFragment {
             start_ms: U64::new(0),
@@ -418,6 +428,153 @@ async fn a_read_asked_again_gives_only_what_the_history_bound_admits_now() {
         "nothing the first answer carried is in it: {narrower}"
     );
     world.serving.abort();
+}
+
+/// KR-REQ-15.11: a session said by its number is found in this daemon's records and not by asking
+/// its worker. A worker that answers nothing does not hold the lookup, and its silence does not make
+/// its session a session with no number, which would refuse a request for it as naming nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sessions_number_is_found_without_asking_its_worker() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    script.mute_reads(true);
+
+    let number = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        world.controller.voice_session_number(world.session_id),
+    )
+    .await
+    .expect("the lookup does not wait on a worker that answers nothing");
+    assert!(number.is_some(), "the number is the daemon's own record");
+    world.serving.abort();
+}
+
+/// KR-REQ-15.11 and 19: what a person said is content, and the host keeps no copy of it. After a
+/// read the words asked for and a request for a session the call does not reach have been through
+/// the daemon, a phrase of the first and the number of the second are in none of the files the
+/// daemon keeps under its state root, and the answers quote neither. A control file that holds the
+/// phrase shows the search finds what it looks for. Not covered here: the daemon's output and the
+/// phone's log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_keeps_nothing_that_says_what_was_said() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let controller = Arc::clone(&world.controller);
+    let device = paired(&controller, 51, None);
+    let actor_id = device.principal();
+    reach_history_from(&world._temp, &device, 1);
+    let voice_session_id = call_over(
+        &controller,
+        device.device_id,
+        world.session_id,
+        &[VoiceAction::Status],
+    )
+    .await;
+    let number = controller
+        .voice_session_number(world.session_id)
+        .await
+        .expect("the session has a number");
+    let phrase = "give me the status of session";
+    let marker = "918273645";
+
+    let read = delegation_named(
+        "item_read",
+        world.environment_id,
+        voice_session_id,
+        &format!("Please {phrase} {number}."),
+    );
+    let performed: VoiceDelegateResult = ask(&controller, &actor_id, device.device_id, &read)
+        .await
+        .expect("the read is answered")
+        .to_typed()
+        .expect("a delegation result");
+    assert!(
+        matches!(performed.outcome, VoiceDelegationOutcome::Performed { .. }),
+        "{:?}",
+        performed.outcome
+    );
+    let elsewhere = delegation_named(
+        "item_elsewhere",
+        world.environment_id,
+        voice_session_id,
+        &format!("status of session {marker}"),
+    );
+    let refused: VoiceDelegateResult = ask(&controller, &actor_id, device.device_id, &elsewhere)
+        .await
+        .expect("the request is answered")
+        .to_typed()
+        .expect("a delegation result");
+    assert!(
+        matches!(refused.outcome, VoiceDelegationOutcome::Refused { .. }),
+        "{:?}",
+        refused.outcome
+    );
+    let answers = format!("{performed:?} {refused:?}");
+    assert!(
+        !answers.contains(marker) && !answers.contains(phrase),
+        "{answers}"
+    );
+
+    fn files(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files(&path, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let holds = |path: &std::path::Path, text: &str| {
+        std::fs::read(path)
+            .unwrap_or_default()
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    };
+    let control = world._temp.paths().state_root().join("control");
+    std::fs::write(&control, format!("{phrase} {marker}")).expect("a control file");
+    let mut found = Vec::new();
+    files(world._temp.paths().state_root(), &mut found);
+    assert!(
+        found.iter().any(|path| path.ends_with("registry.sqlite")),
+        "{found:?}"
+    );
+    for text in [phrase, marker] {
+        let holding: Vec<_> = found.iter().filter(|path| holds(path, text)).collect();
+        assert_eq!(holding, vec![&control], "only the control holds {text}");
+    }
+    world.serving.abort();
+}
+
+/// KR-REQ-09.16: a read an earlier build performed, whose answer recorded no action, is neither
+/// given back as it was kept (it may carry content) nor read again (nothing says what it read).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_that_recorded_no_action_is_neither_given_back_nor_read_again() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired(&controller, 52, None);
+    let actor_id = device.principal();
+    let mutation = delegation_of(
+        temp.environment_id(),
+        VoiceSessionId::new(kr_ipc::new_uuid()),
+        "status",
+    );
+    let kept = VoiceDelegateResult {
+        delegation_id: VoiceDelegationId::new("item_one").expect("a delegation"),
+        action: Nullable::null(),
+        session_id: Nullable::null(),
+        outcome: VoiceDelegationOutcome::Performed {
+            action_id: mutation.action_id,
+            summary: "session 3 is live in /work".to_owned(),
+        },
+    };
+    keep(&controller, &actor_id, &mutation, &kept);
+    let refused = ask(&controller, &actor_id, device.device_id, &mutation)
+        .await
+        .expect_err("the content is not given back");
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
+    assert!(!refused.to_string().contains("/work"), "{refused}");
 }
 
 /// KR-REQ-09.16: a receipt for an action that is not a read goes back as it was kept, whatever it

@@ -4957,6 +4957,7 @@ dependencies = [
  "kr-client",
  "kr-crypto",
  "kr-protocol",
+ "kr-voice",
  "thiserror 2.0.20",
  "tokio",
 ]

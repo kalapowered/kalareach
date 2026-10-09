@@ -15077,7 +15077,7 @@
       "type": "object"
     },
     "FragmentText": {
-      "description": "What a person said, as the provider's transcript wrote it. Data, never authority.",
+      "description": "What a person said, as the provider's transcript wrote it: at most 512 bytes of UTF-8 and no control character, which the host counts in bytes where a schema counts characters. Data, never authority.",
       "maxLength": 512,
       "minLength": 1,
       "type": "string"

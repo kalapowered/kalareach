@@ -32,9 +32,14 @@ not pass through the managed service.
 
 ## What the coordinator may read
 
-The coordinator may read one thing: content the host has already passed through its shared host-side
-history filter at the voice-context surface, under a viewer scope built from the **requesting
-device's** grant.
+The coordinator may read two things. The first is content the host has already passed through its
+shared host-side history filter at the voice-context surface, under a viewer scope built from the
+**requesting device's** grant. The second is the bounded fragments of what the person said, which
+the paired device hands over with each delegation; the coordinator reads them once, with the grammar
+below, and keeps the digest of the delegation and the action and session it read, and nothing that
+says what was said.
+
+The first:
 
 - The filter is the one section 10 requires, and voice context is one of its named callers. It is
   applied once, on the host side, before anything reaches the coordinator.
@@ -116,9 +121,11 @@ become authority by arriving over a channel the host trusts for something else.
   authorise another. Submitting one of those actions the first time answers with the challenge to
   sign rather than with a refusal, and the delegation is not spent by asking: the same delegation
   comes back carrying the signature and becomes one action.
-- A delegation identifier is spent when it is submitted, for that device, through every call it holds
-  and across a restart, for as long as the host keeps a de-duplication record. One delegation is one
-  action.
+- A delegation identifier is spent when the words have been read and found to name something this
+  call may reach, for that device, through every call it holds and across a restart, for as long as
+  the host keeps a de-duplication record. One delegation is one action. A set of fragments that
+  breaks a rule, words the grammar does not hold and a number the call does not reach are refused
+  before that and spend nothing.
 - Submitting a prompt needs a spoken confirmation that names the destination session. The host
   checks the session against the one it is about to submit to, and checks the words themselves for
   a clear agreement, so silence and "do not send that" both stop it. The words reach the host from
@@ -148,7 +155,7 @@ words were read to ask for, and a repeat of it is answered from what was read th
 
 The fragments are bounded: at most 16, of at most 512 bytes each and 2,048 in all, each starting no
 later than the delegation's offset and no more than thirty seconds before it, in the order they were
-said. A set over a limit is refused whole and never cut, and a refusal spends nothing. A fragment's
+said. A set over a limit is refused whole and never cut. A fragment's
 text prints as nothing in a log or a panic message, and a confirmation binds to the words as well as
 to the action, so a signature given for one utterance does not confirm another.
 

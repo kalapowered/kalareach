@@ -30,12 +30,22 @@ use kr_protocol::voice::{TranscriptFragment, VoiceAction};
 ///
 /// Section 15 ¶13 requires the confirmation to name the destination, so the host checks the name
 /// against the session it is about to submit to rather than accepting that one was given.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SpokenDestination {
     /// The session the speaker named.
     pub session_id: SessionId,
     /// The words the speaker used, as the transcript recorded them. Data, never authority.
     pub spoken_text: String,
+}
+
+impl fmt::Debug for SpokenDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The words are what a person said, and print as nothing.
+        formatter
+            .debug_struct("SpokenDestination")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An approval answer, with the details of the request it answers.
@@ -182,22 +192,45 @@ impl DelegationInterpreter for GrammarInterpreter {
     }
 }
 
-/// The words of `spoken`, lower-cased, with punctuation and apostrophes gone and hyphens read as
-/// the space they stand for.
+/// The words of `spoken`, lower-cased.
+///
+/// Sentence punctuation after a word ("three.", "three?") and quotation marks round it are not part
+/// of it, a hyphen between two letters stands for the space it joins ("twenty-three"), and an
+/// apostrophe inside a word is dropped ("what's" is "whats"). Anything else stays in the word, so
+/// that a sign or a point beside a number leaves a token that is no number: "-3", ".3", "3.5" and
+/// "1,000" are each refused as numbers and never read as the digits they hold.
 fn words_of(spoken: &str) -> Vec<String> {
     let mut words = Vec::new();
-    let mut current = String::new();
-    for character in spoken.chars() {
-        if character.is_alphanumeric() {
-            current.extend(character.to_lowercase());
-        } else if matches!(character, '\'' | '\u{2019}') {
-            // "what's" is "whats", not "what" and "s".
-        } else if !current.is_empty() {
-            words.push(std::mem::take(&mut current));
+    for raw in spoken.split_whitespace() {
+        let trimmed = raw
+            .trim_start_matches(['"', '\u{201c}', '\u{2018}', '(', '\''])
+            .trim_end_matches([
+                '.', ',', '!', '?', ';', ':', ')', '"', '\u{201d}', '\u{2019}', '\'',
+            ]);
+        let word: String = trimmed
+            .chars()
+            .filter(|character| !matches!(character, '\'' | '\u{2019}'))
+            .flat_map(char::to_lowercase)
+            .collect();
+        if word.is_empty() {
+            continue;
         }
-    }
-    if !current.is_empty() {
-        words.push(current);
+        // A hyphen joins two letters, or it belongs to the token.
+        let characters: Vec<char> = word.chars().collect();
+        let joins_letters = characters.contains(&'-')
+            && characters.iter().enumerate().all(|(index, each)| {
+                *each != '-'
+                    || (index > 0
+                        && characters[index - 1].is_alphabetic()
+                        && characters
+                            .get(index + 1)
+                            .is_some_and(|next| next.is_alphabetic()))
+            });
+        if joins_letters {
+            words.extend(word.split('-').map(str::to_owned));
+        } else {
+            words.push(word);
+        }
     }
     words
 }

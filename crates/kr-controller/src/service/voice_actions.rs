@@ -189,15 +189,24 @@ impl Controller {
         ))
     }
 
-    /// The display number of one session as a person says it, or nothing when the session cannot
-    /// be read: a session that cannot be read has no number to be named by.
+    /// The display number of one session as a person says it, or nothing when this daemon holds
+    /// none for it.
+    ///
+    /// Read from this daemon's own records and from no worker: the directory's entry for a live
+    /// session, and the registry's reservation for any session it ever made, which keeps the
+    /// number a closed session was listed under. A lookup that asked each session's worker would
+    /// wait on a worker that does not answer, for a session the person did not name, and would
+    /// read a worker's silence as a session that has no number.
     pub(crate) async fn voice_session_number(
         self: &Arc<Self>,
         session_id: SessionId,
     ) -> Option<u64> {
-        let params = ParamsValue::from_typed(&SessionReadParams { session_id }).ok()?;
-        let read: SessionReadResult = parse(&self.session_read(&params).await.ok()?).ok()?;
-        Some(read.session.display_number.get())
+        if let Some(worker) = self.directory.lock().await.get(session_id) {
+            return Some(worker.descriptor.display_number.get());
+        }
+        let registry = self.registry.lock().await;
+        let reservation = registry.reservation_for_session(session_id).ok()??;
+        Some(reservation.display_number.get())
     }
 
     /// What the description host holds of a session: the name a person pinned, what a model wrote
@@ -511,9 +520,21 @@ impl Controller {
         let answered = decoded(kept)?;
         let receipt: VoiceDelegateResult = parse(&answered)?;
         // What the first answer recorded the words to ask for, and nothing read from them again.
-        if !matches!(receipt.outcome, VoiceDelegationOutcome::Performed { .. })
-            || receipt.action.0.and_then(crate::voice::method_for) != Some(Method::SessionRead)
-        {
+        if !matches!(receipt.outcome, VoiceDelegationOutcome::Performed { .. }) {
+            return Ok(answered);
+        }
+        // A read that recorded no action is one this host cannot say what it read: it is not given
+        // back as kept, because it may carry content, and not read again, because nothing says
+        // what to read.
+        let Some(action) = receipt.action.0 else {
+            return Err(ControllerError::Uncertain {
+                detail:
+                    "that delegation was performed, and this host did not record what it read, \
+                         so it is neither given again nor read again"
+                        .to_owned(),
+            });
+        };
+        if crate::voice::method_for(action) != Some(Method::SessionRead) {
             return Ok(answered);
         }
         self.voice()
