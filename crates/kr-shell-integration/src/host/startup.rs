@@ -1960,7 +1960,11 @@ mod tests {
         static WRITERS: std::sync::OnceLock<kr_ipc::install::Writers> = std::sync::OnceLock::new();
         static PERMIT: std::sync::OnceLock<Permit<'static>> = std::sync::OnceLock::new();
         let writers = WRITERS.get_or_init(|| {
-            kr_ipc::install::hold_writers(&mut || {}).expect("a test outside a store holds nothing")
+            kr_ipc::install::hold_writers(
+                &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+                &mut || {},
+            )
+            .expect("a test outside a store holds nothing")
         });
         let permit = PERMIT.get_or_init(|| writers.permit(&ENTRY_WRITTEN).expect("permitted"));
         record.hold(permit)

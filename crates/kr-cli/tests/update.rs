@@ -47,8 +47,6 @@ mod teardown;
 #[cfg(target_os = "linux")]
 #[path = "support/user_manager.rs"]
 mod user_manager;
-#[path = "support/withholding_worker.rs"]
-mod withholding_worker;
 
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -675,7 +673,7 @@ fn places() -> &'static (Mutex<usize>, std::sync::Condvar) {
 struct StandingIn<'a> {
     host: &'a Host,
     update: kr_ipc::install::StoreLock,
-    install: kr_ipc::install::StoreLock,
+    install: kr_ipc::install::ExclusiveInstall,
     writers: kr_ipc::install::ExclusiveWriters,
 }
 
@@ -4396,54 +4394,6 @@ impl Idle {
         self
     }
 
-    /// A live session whose worker is a peer of the test that answers its hello and holds its
-    /// challenge until the test lets it prove itself. No descriptor is published for it, so only the
-    /// classification of the registry's workers ever meets it.
-    fn with_a_worker_that_withholds_its_proof(self) -> (Self, withholding_worker::Withholding) {
-        use kr_controller::registry::{Registry, WorkerRecord};
-        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-        use kr_protocol::ids::{ActorId, AuthorityRevision};
-        use kr_protocol::session::SessionState;
-
-        let mut registry = Registry::open(self.registry(), self.temp.environment_id())
-            .expect("the registry opens");
-        let running =
-            kr_ipc::identity::current_process_start_identity().expect("this process's identity");
-        let reservation = reserve_with(
-            &mut registry,
-            &ActorId::new("local:501").expect("a principal"),
-            &running,
-            4,
-            b"intent",
-        );
-        let peer = withholding_worker::Withholding::start(
-            &self.temp.environment(),
-            reservation.display_number,
-            reservation.session_id,
-        );
-        registry
-            .claim_rendezvous(reservation.reservation_id, peer.key())
-            .expect("claims");
-        registry
-            .record_worker(
-                reservation.reservation_id,
-                &WorkerRecord {
-                    session_id: reservation.session_id,
-                    display_number: reservation.display_number,
-                    public_key: peer.key(),
-                    process_identity: running,
-                    endpoint: peer.endpoint().to_owned(),
-                    profile: WorkerProfile::HeadlessUser,
-                    state: SessionState::Live,
-                    acknowledged_revision: AuthorityRevision::new(0),
-                },
-                &DesktopBinding::none(),
-            )
-            .expect("records the worker");
-        drop(registry);
-        (self, peer)
-    }
-
     /// The registry as an earlier release left it at `version`, between 4 and 6: what each later
     /// schema added is taken away, and the version says so.
     fn shaped_as(self, version: i64) -> Self {
@@ -5488,7 +5438,8 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
 
     // The owner's choice, written by this build as it writes one.
     let environment = host.tree.environment();
-    let writers = kr_cli::barrier::hold().expect("a test outside a store holds nothing");
+    let writers = kr_cli::barrier::hold_for_configuration(&environment)
+        .expect("a test outside a store holds nothing");
     let permit = kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)
         .expect("permitted");
     kr_cli::doctor::configuration::apply(
@@ -8253,8 +8204,17 @@ impl Host {
 
     /// Starts `kr` of the current release with `arguments` and does not wait for it.
     fn spawn_kr(&self, arguments: &[&str]) -> Writing {
-        let mut child = self
-            .command(&self.store.stable(Program::Kr), arguments)
+        self.spawn_kr_with(&[], arguments)
+    }
+
+    /// Starts `kr` of the current release with `arguments` and the variables `set`, and does not
+    /// wait for it.
+    fn spawn_kr_with(&self, set: &[(&str, &std::ffi::OsStr)], arguments: &[&str]) -> Writing {
+        let mut command = self.command(&self.store.stable(Program::Kr), arguments);
+        for (name, value) in set {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -8521,6 +8481,7 @@ async fn a_command_that_cannot_use_the_lock_or_read_current_writes_nothing() {
     let directory = host.store.release_directory(two.name());
     writable(&directory);
     let manifest = host.store.manifest(two.name());
+    let sealed = std::fs::read_to_string(&manifest).expect("the manifest");
     std::fs::remove_file(&manifest).expect("the manifest a release is sealed with");
     std::fs::write(&manifest, b"not a manifest").expect("damaged");
     let output = host.run(
@@ -8537,6 +8498,40 @@ async fn a_command_that_cannot_use_the_lock_or_read_current_writes_nothing() {
         "it says which kr to run: {said}"
     );
     assert!(!document.exists(), "and writes nothing");
+
+    // A current release whose manifest lists no stores, which is what an earlier release's was: with
+    // no `stores` member, and with an empty list. The reader refuses either before a permit is asked
+    // for, so a command of another release is not permitted every record on it.
+    let as_written: Value = serde_json::from_str(&sealed).expect("a manifest");
+    for emptied in [false, true] {
+        let mut changed = as_written.clone();
+        let members = changed["signed"]
+            .as_object_mut()
+            .expect("the signed members");
+        if emptied {
+            members.insert("stores".to_owned(), serde_json::json!([]));
+        } else {
+            members.remove("stores");
+        }
+        std::fs::remove_file(&manifest).expect("the manifest a release is sealed with");
+        std::fs::write(&manifest, changed.to_string()).expect("a manifest that lists no stores");
+        let output = host.run(
+            &host.program(one.name(), Program::Kr),
+            &["host", "startup", "--set", "standalone", "--json"],
+        );
+        let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a manifest with {} is refused: {said}",
+            if emptied {
+                "an empty list of stores"
+            } else {
+                "no list of stores"
+            }
+        );
+        assert!(!document.exists(), "and nothing is written");
+    }
 }
 
 /// KR-REQ-26.08, KR-REQ-26.10: an update whose writers' lock cannot be used stops nothing for good.
@@ -8671,21 +8666,20 @@ async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_
     }
 }
 
-/// KR-REQ-26.10: a command that tries after an update has checked the stores and before it has
-/// switched waits, and is judged by the release switched to. A real rollback to a release that reads
-/// the configuration document at version 1 is held inside its classification of the registry's workers
-/// by a worker that withholds its proof: the stores have been checked and `current` has not changed.
-/// A command started then says it waits; the worker then proves itself, the rollback switches, and
-/// the command is refused: the document was never at version 2 while the rollback was under way.
+/// KR-REQ-26.10: a command that tries while a real rollback holds the locks, after it has checked the
+/// stores and before it has switched, waits, and is judged by the release switched to. The rollback to
+/// a release that reads the configuration document at version 1 is held by the test at the step before
+/// the switch, which is a condition of the test and not a time. A command started then says it waits;
+/// the rollback is let go on, switches, and the command is refused: the document was never at version
+/// 2 while the rollback was under way. The pause points exist in a debug build only.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_command_that_tries_between_the_check_and_the_switch_of_a_real_rollback_waits_and_is_refused()
- {
+async fn a_command_that_tries_while_a_real_rollback_holds_the_locks_waits_and_is_refused() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build has no pause points in its updater");
+        return;
+    }
     let mut host = Host::bare();
-    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
-        "configuration",
-        1,
-        1,
-    ));
+    let one = reading_the_document_at_1("0.1.0+aaaaaaaaaaaa");
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
@@ -8707,21 +8701,22 @@ async fn a_command_that_tries_between_the_check_and_the_switch_of_a_real_rollbac
     let document = host.configuration_document();
     assert!(!document.exists(), "no document is written yet");
 
-    // An environment of the store with a live worker that is slow to prove itself.
-    let (_idle, mut worker) = Idle::new(&host.store).with_a_worker_that_withholds_its_proof();
-    let rollback = host.spawn_kr(&["host", "rollback", "--json"]);
-    tokio::time::timeout(LIVENESS_DEADLINE, worker.challenged())
-        .await
-        .expect("the rollback challenges the worker");
+    let pause = host.scratch("pause");
+    std::fs::write(pause.join("before-install-lock.release"), b"").expect("lets that step go");
+    let rollback = host.spawn_kr_with(
+        &[("KR_UPDATE_PAUSE_DIR", pause.as_os_str())],
+        &["host", "rollback", "--json"],
+    );
+    wait_for(&pause.join("before-switch.reached"));
 
-    // The rollback is inside its classification: it has checked the stores and holds the lock.
+    // The rollback has checked the stores and holds the locks; `current` has not changed.
     let writing = host.write_the_configuration();
     assert!(
         writing.waits_for_an_update(),
         "the command says it waits for the rollback"
     );
     assert!(!document.exists(), "and writes nothing while it waits");
-    worker.prove();
+    std::fs::write(pause.join("before-switch.release"), b"").expect("lets the switch go");
 
     let (code, said) = rollback.finish();
     assert_eq!(code, Some(0), "the rollback goes through: {said}");
@@ -8736,11 +8731,6 @@ async fn a_command_that_tries_between_the_check_and_the_switch_of_a_real_rollbac
         "the release rolled back to reads the document at version 1, not 2: {said}"
     );
     assert!(!document.exists(), "the document was never written");
-    assert_eq!(
-        worker.connections(),
-        1,
-        "the one challenge the worker met was the classification's"
-    );
 }
 
 /// KR-REQ-26.08, KR-REQ-26.10: an update that cannot take the writers' lock stops nothing for good.
@@ -9159,6 +9149,489 @@ async fn kr_new_with_no_daemon_over_an_unusable_document_names_the_way_out() {
             "{what}: {said}"
         );
     }
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* What a command registers                                                                      */
+/* -------------------------------------------------------------------------------------------- */
+
+/// A release that reads the configuration document at version 1 only: a rollback to it is refused
+/// for a document at version 2.
+fn reading_the_document_at_1(name: &str) -> Assembled {
+    Assembled::at_this_level(name, 1).reading(reading_a_store_at("configuration", 1, 1))
+}
+
+/// Waits until `path` is there, which a condition of the test decides, and fails after the bound a
+/// test that went wrong is given.
+fn wait_for(path: &Path) {
+    let started = Instant::now();
+    while !path.exists() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+impl Host {
+    /// Runs `kr` of the current release as a command that works in the roots of `tree`, which
+    /// no control daemon of this store has served, and not in this host's own.
+    fn kr_in(&self, tree: &teardown::Tree, arguments: &[&str]) -> (Output, Value) {
+        let runtime = tree.paths().runtime_root().as_os_str().to_owned();
+        let state = tree.paths().state_root().as_os_str().to_owned();
+        self.kr_json_with(
+            &[("KR_RUNTIME_DIR", &runtime), ("KR_STATE_DIR", &state)],
+            arguments,
+        )
+    }
+
+    /// Rolls back to `release`, as a person types it.
+    fn roll_back_to(&self, release: &Assembled) -> (Output, Value) {
+        self.kr_json(&[
+            "host",
+            "rollback",
+            "--to",
+            release.name().as_str(),
+            "--json",
+        ])
+    }
+}
+
+/// KR-REQ-26.10: a command that writes the configuration document in a state root no control daemon of
+/// the store recorded is found by the check, and the switch is refused while the document is out of
+/// range. The command registered the root and the document before it wrote; the control is the same
+/// rollback once the document is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_writes_in_a_root_no_daemon_recorded_is_found_by_the_check() {
+    let host = Host::bare();
+    let one = reading_the_document_at_1("0.1.0+aaaaaaaaaaaa");
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&two);
+    host.put(&one);
+    let other = teardown::Tree::create();
+    let (output, said) = host.kr_in(
+        &other,
+        &["host", "startup", "--set", "standalone", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "kr host startup: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = kr_cli::doctor::configuration::document_path(&other.environment());
+    assert!(document.exists(), "the command wrote the document");
+
+    let (output, said) = host.roll_back_to(&one);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let message = said["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&document.display().to_string()) && message.contains("records version 2"),
+        "the refusal names the document: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+
+    std::fs::remove_file(&document).expect("the document goes");
+    let (output, said) = host.roll_back_to(&one);
+    assert!(
+        output.status.success(),
+        "the control: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+}
+
+/// KR-REQ-26.10: a command that writes a state-root record, here the startup entries `kr shell
+/// install` records, in a root no control daemon of the store served has it found by the check: the
+/// command registered the root before it wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_writes_a_state_root_record_in_a_root_no_daemon_recorded_is_found() {
+    let host = Host::create();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+        "shell-entries",
+        0,
+        0,
+    ));
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let directory = host.put(&two);
+    host.switch(two.name());
+    // The commands run against the store read its record as an owner-only file.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(host.store.record(), std::fs::Permissions::from_mode(0o600))
+            .expect("the record is owner-only");
+    }
+    write_zsh_package(&directory.join("shells"));
+    host.put(&one);
+    let other = teardown::Tree::create();
+    let home = host.scratch("home");
+    let runtime = other.paths().runtime_root().as_os_str().to_owned();
+    let state = other.paths().state_root().as_os_str().to_owned();
+    let (output, _) = host.kr_json_with(
+        &[
+            ("HOME", home.as_os_str()),
+            ("KR_RUNTIME_DIR", &runtime),
+            ("KR_STATE_DIR", &state),
+        ],
+        &["shell", "install", "--shell", "zsh"],
+    );
+    assert!(
+        output.status.success(),
+        "kr shell install: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = other.paths().state_root().join("shell-entries.json");
+    assert!(record.exists(), "the command recorded its entries");
+
+    let (output, said) = host.roll_back_to(&one);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("shell-entries.json"),
+        "the refusal names the record: {said}"
+    );
+    std::fs::remove_file(&record).expect("the record goes");
+    let (output, said) = host.roll_back_to(&one);
+    assert!(output.status.success(), "the control: {said}");
+}
+
+/// KR-REQ-26.10: a command that registers before an update takes the install lock is found by the
+/// update's survey under it. The rollback is held by the test at the step before the lock; the
+/// command runs to its end meanwhile; the rollback then finds the root and refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_registers_before_the_update_takes_the_install_lock_is_checked() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build has no pause points in its updater");
+        return;
+    }
+    let host = Host::bare();
+    let one = reading_the_document_at_1("0.1.0+aaaaaaaaaaaa");
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&two);
+    host.put(&one);
+    let other = teardown::Tree::create();
+    let pause = host.scratch("pause");
+    std::fs::write(pause.join("before-switch.release"), b"").expect("lets that step go");
+    let rollback = host.spawn_kr_with(
+        &[("KR_UPDATE_PAUSE_DIR", pause.as_os_str())],
+        &["host", "rollback", "--to", one.name().as_str(), "--json"],
+    );
+    wait_for(&pause.join("before-install-lock.reached"));
+
+    let (output, said) = host.kr_in(
+        &other,
+        &["host", "startup", "--set", "standalone", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "the install lock is free, so the command runs to its end: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(pause.join("before-install-lock.release"), b"").expect("lets the lock be taken");
+
+    let (code, said) = rollback.finish();
+    assert_eq!(code, Some(1), "{said}");
+    let document = kr_cli::doctor::configuration::document_path(&other.environment());
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&document.display().to_string()),
+        "the rollback found the root the command registered: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+}
+
+/// KR-REQ-26.10: a command waits for an update from the moment the update holds the install lock,
+/// and registers and writes once it lets go. Only the install lock is held here, so a command that
+/// did not take it would write at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_waits_for_an_update_that_holds_the_install_lock() {
+    let host = Host::bare();
+    host.install(&Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1));
+    let document = host.configuration_document();
+    let held = host
+        .store
+        .try_lock_install()
+        .expect("asks")
+        .expect("nothing holds it");
+    let writing = host.write_the_configuration();
+    assert!(
+        writing.waits_for_an_update(),
+        "the command says it waits for the update"
+    );
+    assert!(!document.exists(), "and writes nothing while it waits");
+    drop(held);
+    let (code, said) = writing.finish();
+    assert_eq!(code, Some(0), "{said}");
+    assert!(document.exists(), "it writes once the update lets go");
+}
+
+/// KR-REQ-26.10: commands that registered a root and were refused, or that work in a root with no
+/// state of its own, leave a host an update can switch. The roots are only checked: a path too long
+/// for a socket, a state root nobody can read, and a terminal the host lacks stop nothing, and the
+/// root nobody could read is named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_registered_and_was_refused_leaves_a_host_that_can_be_updated() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (host, _one, two, archive) = host_to_update().await;
+    let refused = teardown::Tree::create();
+    let state_directory = refused.environment().state_dir().to_path_buf();
+    std::fs::remove_dir_all(&state_directory).expect("the environment has no state directory");
+    let (output, said) = host.kr_in(
+        &refused,
+        &["host", "terminal", "--set", "no-such-terminal", "--json"],
+    );
+    assert!(
+        !output.status.success(),
+        "a terminal the host lacks is refused: {said}"
+    );
+    assert!(
+        !state_directory.exists(),
+        "and it made none of the environment's directories"
+    );
+    let long = host.scratch(&"r".repeat(110));
+    std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o700)).expect("owner-only");
+    let elsewhere = teardown::Tree::create();
+    let state = elsewhere.paths().state_root().as_os_str().to_owned();
+    let (output, said) = host.kr_json_with(
+        &[
+            ("KR_RUNTIME_DIR", long.as_os_str()),
+            ("KR_STATE_DIR", &state),
+        ],
+        &["host", "terminal", "--set", "no-such-terminal", "--json"],
+    );
+    assert!(!output.status.success(), "{said}");
+    let unreadable = refused.paths().state_root().to_path_buf();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+        .expect("nobody can read the root");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700))
+        .expect("the root can be read again");
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert!(
+        said["not_reached"]
+            .to_string()
+            .contains(&unreadable.display().to_string()),
+        "the root nobody could read is named: {said}"
+    );
+}
+
+/// KR-REQ-26.10: a store does not hand over, and does not read the daemon records of, a root another
+/// store serves. A `kr` of one store run against another store's roots registers them; the first
+/// store's update checks what a command writes there and leaves the second store's daemon serving,
+/// and a record only that daemon writes, at a version the first store's target does not read, does
+/// not refuse the switch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_does_not_hand_over_or_read_the_daemon_records_of_another_store() {
+    let mut served = Host::bare();
+    let served_release = Assembled::at_this_level("0.1.0+cccccccccccc", 1);
+    served.install(&served_release);
+    let controller = served.store.stable(Program::Controller);
+    served.start_daemon(&controller).await;
+
+    let host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(reading_a_store_at(
+        "machine-group",
+        5,
+        5,
+    ));
+    host.install(&one);
+    let runtime = served.tree.paths().runtime_root().as_os_str().to_owned();
+    let state = served.tree.paths().state_root().as_os_str().to_owned();
+    let (output, said) = host.kr_json_with(
+        &[("KR_RUNTIME_DIR", &runtime), ("KR_STATE_DIR", &state)],
+        &["host", "startup", "--set", "standalone", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "a kr of the first store works in the second's roots: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert_eq!(
+        served.daemon_build().await,
+        format!("kr-controller/{}", served_release.name()),
+        "the other store's daemon was not handed over"
+    );
+}
+
+/// KR-REQ-26.10: a command that works in the state root of a running daemon but with other runtime
+/// variables registers its roots without replacing the daemon's, so the update still reaches the
+/// daemon at the runtime root it was started with.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_run_with_other_runtime_variables_does_not_replace_the_daemons_runtime_root() {
+    let (host, _one, two, archive) = host_to_update().await;
+    let runtime = host.scratch("another-runtime");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only");
+    }
+    let (output, said) = host.kr_json_with(
+        &[("KR_RUNTIME_DIR", runtime.as_os_str())],
+        &["host", "startup", "--set", "standalone", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "kr host startup: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the update handed the daemon over"
+    );
+}
+
+/// KR-REQ-26.10: a root a command registered that is gone later, or is a file, stops no switch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registered_root_that_is_gone_does_not_stop_a_switch() {
+    let (host, _one, two, archive) = host_to_update().await;
+    let gone = teardown::Tree::create();
+    let (output, said) = host.kr_in(&gone, &["host", "startup", "--set", "standalone", "--json"]);
+    assert!(output.status.success(), "{said}");
+    let state = gone.paths().state_root().to_path_buf();
+    std::fs::remove_dir_all(&state).expect("the root goes");
+    std::fs::write(&state, b"a file where the root was").expect("a file");
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    std::fs::remove_file(&state).expect("the file goes");
+    std::fs::create_dir(&state).expect("a root for the teardown");
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+}
+
+/// KR-REQ-26.10: a document a command writes under a configuration home of its own, which no daemon
+/// read, is found by the check: the command recorded where it wrote.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_a_command_writes_under_another_configuration_home_is_checked() {
+    let host = Host::bare_as_a_default_install();
+    let one = reading_the_document_at_1("0.1.0+aaaaaaaaaaaa");
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&two);
+    host.put(&one);
+    let home = host.scratch("command-home");
+    let config = host.scratch("command-config");
+    let state_home = host.tree.root().to_path_buf();
+    let output = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["host", "startup", "--set", "standalone", "--json"],
+        )
+        .env_remove("KR_STATE_DIR")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("kr runs");
+    assert!(
+        output.status.success(),
+        "kr host startup: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = config
+        .join("kalareach")
+        .join("environments")
+        .join(kr_ipc::paths::short_prefix(host.tree.environment_id()))
+        .join("config.json");
+    assert!(document.exists(), "the command wrote under its own home");
+
+    let (output, said) = host.roll_back_to(&one);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&document.display().to_string()),
+        "the refusal names the document: {said}"
+    );
+    std::fs::remove_file(&document).expect("the document goes");
+    let (output, said) = host.roll_back_to(&one);
+    assert!(output.status.success(), "the control: {said}");
+}
+
+/// KR-REQ-26.10: a command that cannot register what it works in writes nothing and says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_whose_registration_cannot_be_written_writes_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = Host::bare();
+    host.install(&Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1));
+    let roots = host.store.roots();
+    std::fs::create_dir_all(&roots).expect("the records");
+    std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o500))
+        .expect("read-only records");
+    let (code, said) = host.write_the_configuration().finish();
+    std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o700))
+        .expect("writable again");
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("roots"),
+        "the command names the records it could not write: {said}"
+    );
+    assert!(
+        !host.configuration_document().exists(),
+        "and writes nothing"
+    );
 }
 
 /* -------------------------------------------------------------------------------------------- */

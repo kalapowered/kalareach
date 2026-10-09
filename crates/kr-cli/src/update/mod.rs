@@ -1520,6 +1520,32 @@ fn deferred(
     ))
 }
 
+/// A point at which a debug build waits for a test to let it go on, so that a test decides what
+/// happens between two steps of an update by a condition and not by how long a step takes.
+///
+/// When `KR_UPDATE_PAUSE_DIR` names a directory the update creates `<point>.reached` there and
+/// waits for `<point>.release` to appear; it goes on anyway after ten minutes, which exists so that
+/// a test that failed cannot hold a host. A release build has no such point.
+#[cfg(all(unix, debug_assertions))]
+async fn pause(point: &str) {
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(600);
+
+    let Some(directory) = std::env::var_os("KR_UPDATE_PAUSE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let _ = std::fs::write(directory.join(format!("{point}.reached")), b"");
+    let release = directory.join(format!("{point}.release"));
+    let deadline = tokio::time::Instant::now() + BOUND;
+    while !release.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// A release build has no pause points.
+#[cfg(all(unix, not(debug_assertions)))]
+#[allow(clippy::unused_async)]
+async fn pause(_point: &str) {}
+
 /// What an update holds from its check of the stores until it has switched `current`: every
 /// environment's lock, the install lock and the writers' lock. They are let go together, and before
 /// anything is undone, so that the undo, which may start a service, takes none of the locks a
@@ -1527,7 +1553,7 @@ fn deferred(
 #[cfg(unix)]
 struct Holds {
     _environments: Vec<kr_controller::singleton::SingletonLock>,
-    install: kr_ipc::install::StoreLock,
+    install: kr_ipc::install::ExclusiveInstall,
     writers: kr_ipc::install::ExclusiveWriters,
 }
 
@@ -1593,6 +1619,7 @@ async fn hand_over(
     } else {
         "kr host update"
     };
+    pause("before-install-lock").await;
     let install = match handover::install_lock(store, handover::INSTALL_LOCK_WAIT, command).await {
         Ok(install) => install,
         Err(error) => {
@@ -1759,7 +1786,7 @@ async fn hand_over(
             .as_ref()
             .map(Transaction::published_directories)
             .unwrap_or_default();
-        let refusals = formats::check(
+        let checked = formats::check(
             target,
             store,
             &every,
@@ -1767,9 +1794,12 @@ async fn hand_over(
             !report.rolled_back,
             &holds.writers,
         );
-        if !refusals.is_empty() {
+        // A root a command registered that could not be looked at is named, and does not stop the
+        // switch: nothing of this store serves it.
+        report.unreached.extend(checked.unreached);
+        if !checked.refusals.is_empty() {
             drop(holds);
-            return Err(undo(store, record, formats::refusal(target, &refusals)).await);
+            return Err(undo(store, record, formats::refusal(target, &checked.refusals)).await);
         }
     }
     let mut holding: Option<Shown> = None;
@@ -1818,6 +1848,7 @@ async fn hand_over(
         drop(holds);
         return Err(undo(store, record, deferred(target, held_by, report.rolled_back)).await);
     }
+    pause("before-switch").await;
     if let Err(error) = store.switch(&target.release, update_lock, &holds.install, &holds.writers) {
         drop(holds);
         return Err(undo(store, record, CliError::Other(said(&error))).await);

@@ -1093,7 +1093,7 @@ fn apply_as_a_command(
     environment: &kr_ipc::paths::EnvironmentPaths,
     change: &kr_protocol::hostinfo::configuration::Change,
 ) -> crate::error::Result<u64> {
-    let writers = crate::barrier::hold()?;
+    let writers = crate::barrier::hold_for_configuration(environment)?;
     let permit = crate::barrier::permit(&writers, &configuration::WRITTEN)?;
     configuration::apply(environment, change, &permit)
 }

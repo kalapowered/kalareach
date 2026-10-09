@@ -13,6 +13,7 @@
 
 use kr_client::shown;
 use kr_client::shown::Shown;
+use kr_ipc::paths::HostPaths;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
@@ -230,6 +231,7 @@ pub fn install(
     package: &ShellPackage,
     layout: &HomeLayout,
     record: &EntryRecord,
+    paths: &HostPaths,
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
@@ -237,6 +239,7 @@ pub fn install(
         package,
         &layout.targets(package.kind()),
         record,
+        paths,
         nsh_bypass,
         dry_run,
     )
@@ -248,6 +251,7 @@ fn install_targets(
     package: &ShellPackage,
     targets: &[StartupTarget],
     record: &EntryRecord,
+    paths: &HostPaths,
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
@@ -268,7 +272,9 @@ fn install_targets(
     // Held from before the first file is recorded until the last entry is written, so a removal
     // run at the same time waits for the whole install rather than reading the record part way
     // through it. A dry run writes nothing and holds nothing.
-    let writers = (!dry_run).then(crate::barrier::hold).transpose()?;
+    let writers = (!dry_run)
+        .then(|| crate::barrier::hold(paths))
+        .transpose()?;
     let permit = writers
         .as_ref()
         .map(|writers| crate::barrier::permit(writers, &ENTRY_WRITTEN))
@@ -366,10 +372,13 @@ pub fn remove(
     kind: ShellKind,
     layout: &HomeLayout,
     record: &EntryRecord,
+    paths: &HostPaths,
     dry_run: bool,
 ) -> Result<ShellReport> {
     let targets = layout.targets(kind);
-    let writers = (!dry_run).then(crate::barrier::hold).transpose()?;
+    let writers = (!dry_run)
+        .then(|| crate::barrier::hold(paths))
+        .transpose()?;
     let permit = writers
         .as_ref()
         .map(|writers| crate::barrier::permit(writers, &ENTRY_WRITTEN))
@@ -602,6 +611,11 @@ mod tests {
     use kr_shell_integration::host::startup::Placement;
 
     /// Holds `record` as a program outside a store does, which holds nothing else.
+    /// The roots a test works in: none is a store's, so nothing is registered.
+    fn host_paths() -> HostPaths {
+        HostPaths::new(std::env::temp_dir(), std::env::temp_dir()).expect("roots")
+    }
+
     fn hold_the_record(
         record: &EntryRecord,
     ) -> std::result::Result<startup::HeldRecord<'_>, RecordError> {
@@ -609,7 +623,11 @@ mod tests {
         static PERMIT: std::sync::OnceLock<kr_ipc::install::Permit<'static>> =
             std::sync::OnceLock::new();
         let writers = WRITERS.get_or_init(|| {
-            kr_ipc::install::hold_writers(&mut || {}).expect("a test outside a store holds nothing")
+            kr_ipc::install::hold_writers(
+                &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+                &mut || {},
+            )
+            .expect("a test outside a store holds nothing")
         });
         let permit = PERMIT.get_or_init(|| writers.permit(&ENTRY_WRITTEN).expect("permitted"));
         record.hold(permit)
@@ -748,8 +766,9 @@ mod tests {
             let targets =
                 startup::powershell_targets(&package.executable(), all_hosts.clone(), current_host);
             for dry_run in [true, false] {
-                let refused = install_targets(&package, &targets, &record, false, dry_run)
-                    .expect_err(&format!("{name}: refused"));
+                let refused =
+                    install_targets(&package, &targets, &record, &host_paths(), false, dry_run)
+                        .expect_err(&format!("{name}: refused"));
                 let said = refused.to_string();
                 assert!(
                     said.contains(&format!("this profile cannot take the entry: {says}")),
@@ -886,8 +905,14 @@ mod tests {
             .expect("records");
 
         for dry_run in [true, false] {
-            let refused = remove(ShellKind::PowerShell, &layout, &record, dry_run)
-                .expect_err("a signed profile is refused");
+            let refused = remove(
+                ShellKind::PowerShell,
+                &layout,
+                &record,
+                &host_paths(),
+                dry_run,
+            )
+            .expect_err("a signed profile is refused");
             let said = refused.to_string();
             assert!(
                 said.contains("it is signed") && said.contains("sign the profile again"),
@@ -904,7 +929,14 @@ mod tests {
         // The control: the same profile without the signature is cleaned and leaves the record.
         let unsigned = format!("{entries}$x = 1\r\n");
         std::fs::write(&profile, &unsigned).expect("writes");
-        let report = remove(ShellKind::PowerShell, &layout, &record, false).expect("removes");
+        let report = remove(
+            ShellKind::PowerShell,
+            &layout,
+            &record,
+            &host_paths(),
+            false,
+        )
+        .expect("removes");
         assert!(
             report
                 .entries
@@ -963,7 +995,8 @@ mod tests {
             shells(None).expect("every shell").len(),
             ShellKind::ALL.len()
         );
-        let report = remove(ShellKind::Zsh, &layout, &record, false).expect("removes");
+        let report =
+            remove(ShellKind::Zsh, &layout, &record, &host_paths(), false).expect("removes");
         assert_eq!(report.kind, ShellKind::Zsh);
         assert!(
             report
@@ -1037,8 +1070,8 @@ mod tests {
             },
             directory,
         };
-        let reported =
-            install_targets(&package, &targets, &record, false, false).expect("installs");
+        let reported = install_targets(&package, &targets, &record, &host_paths(), false, false)
+            .expect("installs");
         assert_eq!(reported.entries.len(), 2);
         assert_eq!(
             reported.entries[1].file, profile,
@@ -1107,7 +1140,7 @@ mod tests {
             directory,
         };
         for dry_run in [false, true] {
-            let outcome = install(&package, &layout, &record, false, dry_run);
+            let outcome = install(&package, &layout, &record, &host_paths(), false, dry_run);
             assert_eq!(
                 std::fs::read_to_string(&zshrc).expect("reads"),
                 theirs,

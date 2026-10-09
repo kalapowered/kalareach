@@ -211,7 +211,7 @@ async fn run(
     // on hands the environment over first.
     let controller = {
         #[cfg(unix)]
-        let _starting = hold_the_start(running, &paths)?;
+        let _starting = hold_the_start(running, &paths, &environment)?;
         kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
             paths: environment.clone(),
             environment_id,
@@ -311,7 +311,7 @@ fn starter(_arguments: &Arguments) -> ExitCode {
 }
 
 /// Holds the store's start, where this is a daemon of an installed release, until the daemon has
-/// taken its environment, and records the roots it serves.
+/// taken its environment, and records the roots it serves and the document it reads.
 ///
 /// Held shared, as every starting daemon of the store holds it, and an update takes it exclusively
 /// while it switches `current`. So `current` cannot change between this daemon's look at it and its
@@ -321,6 +321,7 @@ fn starter(_arguments: &Arguments) -> ExitCode {
 fn hold_the_start(
     running: &Running,
     paths: &HostPaths,
+    environment: &kr_ipc::paths::EnvironmentPaths,
 ) -> Result<Option<kr_ipc::install::StoreLock>, Box<dyn std::error::Error>> {
     let (Some(store), Some(release)) = (running.store(), running.release()) else {
         return Ok(None);
@@ -345,6 +346,12 @@ fn hold_the_start(
         }
     }
     store.record_roots(paths.runtime_root(), paths.state_root())?;
+    // And where this daemon reads its configuration document, which its variables decide: an
+    // update looks there for a document its target cannot read, also when the daemon has stopped.
+    store.record_document(
+        environment.environment_id(),
+        &kr_worker::config::document_path(environment),
+    )?;
     Ok(Some(held))
 }
 

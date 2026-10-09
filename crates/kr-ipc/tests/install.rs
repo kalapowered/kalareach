@@ -86,6 +86,11 @@ impl TestStore {
         program
     }
 
+    /// What a command of this store works in: roots of its own beside the store.
+    fn writing(&self) -> kr_ipc::install::Writing {
+        kr_ipc::install::Writing::in_roots(self.root.join("run"), self.root.join("state"))
+    }
+
     /// Makes a release current, under the locks every switch is made under.
     fn switch(&self, release: &ReleaseName) {
         let update = self
@@ -256,11 +261,15 @@ fn the_writers_lock_is_shared_by_commands_and_exclusive_to_an_update() {
     let mut waits = 0;
     let first = test
         .store
-        .hold_writers(None, Duration::from_secs(1), &mut || waits += 1)
+        .hold_writers(None, &test.writing(), Duration::from_secs(1), &mut || {
+            waits += 1
+        })
         .expect("a command holds the lock");
     let second = test
         .store
-        .hold_writers(None, Duration::from_secs(1), &mut || waits += 1)
+        .hold_writers(None, &test.writing(), Duration::from_secs(1), &mut || {
+            waits += 1
+        })
         .expect("another command holds it at once");
     assert_eq!(waits, 0, "neither waited");
     assert!(
@@ -274,9 +283,12 @@ fn the_writers_lock_is_shared_by_commands_and_exclusive_to_an_update() {
         .try_lock_writers()
         .expect("asks")
         .expect("an update takes it once no command holds it");
-    let refused = test
-        .store
-        .hold_writers(None, Duration::from_millis(100), &mut || waits += 1);
+    let refused = test.store.hold_writers(
+        None,
+        &test.writing(),
+        Duration::from_millis(100),
+        &mut || waits += 1,
+    );
     assert!(
         matches!(refused, Err(WriteRefused::Switching)),
         "a command that waits the whole wait is refused: {refused:?}"
@@ -284,7 +296,12 @@ fn the_writers_lock_is_shared_by_commands_and_exclusive_to_an_update() {
     assert_eq!(waits, 1, "and said once that it waited");
     drop(update);
     test.store
-        .hold_writers(None, Duration::from_millis(100), &mut || waits += 1)
+        .hold_writers(
+            None,
+            &test.writing(),
+            Duration::from_millis(100),
+            &mut || waits += 1,
+        )
         .expect("a command holds the lock once the update lets go");
     assert_eq!(waits, 1);
 }
@@ -298,9 +315,12 @@ fn a_record_is_permitted_only_at_the_version_the_current_release_lists() {
     let one = release("0.1.0+aaaaaaaaaaaa");
     test.install(&one);
 
-    let nothing = test
-        .store
-        .hold_writers(None, Duration::from_millis(100), &mut || {});
+    let nothing = test.store.hold_writers(
+        None,
+        &test.writing(),
+        Duration::from_millis(100),
+        &mut || {},
+    );
     assert!(
         matches!(nothing, Err(WriteRefused::Store(_))),
         "a store with no current release holds nothing: {nothing:?}"
@@ -309,7 +329,12 @@ fn a_record_is_permitted_only_at_the_version_the_current_release_lists() {
     test.switch(&one);
     let writers = test
         .store
-        .hold_writers(Some(&one), Duration::from_secs(1), &mut || {})
+        .hold_writers(
+            Some(&one),
+            &test.writing(),
+            Duration::from_secs(1),
+            &mut || {},
+        )
         .expect("holds");
     let listed = Written::new("registry", 7);
     let permit = writers.permit(&listed).expect("the version it lists");
@@ -342,6 +367,84 @@ fn a_record_is_permitted_only_at_the_version_the_current_release_lists() {
     drop(writers);
 
     // A program outside a store, as this test binary is, holds nothing and is permitted every record.
-    let outside = kr_ipc::install::hold_writers(&mut || {}).expect("holds nothing");
+    let outside =
+        kr_ipc::install::hold_writers(&test.writing(), &mut || {}).expect("holds nothing");
     assert!(outside.permit(&Written::new("registry", 8)).is_ok());
+}
+
+/// KR-REQ-26.10: a command registers what it works in before it holds the writers' lock, under the
+/// install lock, and a registration never replaces the record of a control daemon's roots. The
+/// install lock is not held once the command holds the writers' lock, and a refused command has
+/// registered nothing it did not mean to: a registration that cannot be written refuses the command.
+#[test]
+fn a_command_registers_what_it_works_in_before_it_writes() {
+    use kr_protocol::ids::EnvironmentId;
+    use kr_protocol::scalars::Uuid;
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    test.switch(&one);
+    let environment = EnvironmentId::new(Uuid::from_bytes([7; 16]));
+    let first_home = test.root.join("config-one").join("config.json");
+    let second_home = test.root.join("config-two").join("config.json");
+
+    // The daemon's record of the same state root is kept apart from the command's.
+    test.store
+        .record_roots(&test.root.join("daemon-run"), &test.root.join("state"))
+        .expect("a daemon records its roots");
+    for home in [&first_home, &second_home] {
+        let writing = test.writing().with_document(environment, home);
+        let writers = test
+            .store
+            .hold_writers(Some(&one), &writing, Duration::from_secs(1), &mut || {})
+            .expect("a command holds the lock");
+        assert!(
+            test.store.try_lock_install().expect("asks").is_some(),
+            "the install lock is let go of once the writers' lock is held"
+        );
+        drop(writers);
+    }
+    let daemon = test.store.recorded_roots().expect("reads");
+    assert_eq!(daemon.len(), 1, "a command writes no record of a daemon's");
+    assert_eq!(daemon[0].runtime_root, test.root.join("daemon-run"));
+    let registered = test.store.registered_roots().expect("reads");
+    assert_eq!(registered.len(), 1, "one state root, one record");
+    assert_eq!(registered[0].runtime_root, test.root.join("run"));
+    assert_eq!(registered[0].state_root, test.root.join("state"));
+    let documents = test.store.recorded_documents().expect("reads");
+    let mut paths: Vec<_> = documents
+        .iter()
+        .map(|document| document.path.clone())
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![first_home, second_home],
+        "two paths for one environment are both kept, as absolute paths"
+    );
+    assert!(
+        documents
+            .iter()
+            .all(|document| document.environment == environment)
+    );
+
+    // A registration that cannot be written refuses the command.
+    let roots = test.store.roots();
+    std::fs::remove_dir_all(&roots).expect("the records are removed");
+    std::fs::write(&roots, b"a file where the directory of records belongs").expect("a file");
+    let refused = test.store.hold_writers(
+        Some(&one),
+        &test.writing(),
+        Duration::from_secs(1),
+        &mut || {},
+    );
+    assert!(
+        matches!(refused, Err(WriteRefused::Store(_))),
+        "a command that cannot register does not hold the lock: {refused:?}"
+    );
+    assert!(
+        test.store.try_lock_writers().expect("asks").is_some(),
+        "and holds nothing"
+    );
 }

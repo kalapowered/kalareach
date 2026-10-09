@@ -1230,7 +1230,8 @@ async fn a_repository_added_from_a_terminal_asks_for_the_budgets_this_host_allow
     for (what, allows) in [("the defaults", allowed()), ("less than them", narrowed)] {
         let temp = kr_ipc::testing::TempHost::create();
         // A document that names other budgets than the host enforces, which the command ignores.
-        let writers = kr_cli::barrier::hold().expect("a program outside a store holds nothing");
+        let writers = kr_cli::barrier::hold_for_configuration(&temp.environment())
+            .expect("a program outside a store holds nothing");
         let permit = kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)
             .expect("permitted");
         kr_cli::doctor::configuration::apply(

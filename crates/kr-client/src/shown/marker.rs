@@ -651,8 +651,11 @@ mod cases {
         let drafts =
             crate::answers::AnswerDrafts::open(directory.path().join("answers")).expect("a store");
         let kept = answer_draft(MARKER);
-        let writers = kr_ipc::install::hold_writers(&mut || {})
-            .expect("a client outside a store holds nothing");
+        let writers = kr_ipc::install::hold_writers(
+            &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+            &mut || {},
+        )
+        .expect("a client outside a store holds nothing");
         let permit = writers
             .permit(&crate::answers::WRITTEN)
             .expect("a client outside a store may keep an answer");

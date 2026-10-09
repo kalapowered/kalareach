@@ -93,7 +93,7 @@ async fn integration(
     let environment = crate::resolve::select(paths, arguments.selector.environment.as_deref())?;
     // Held for the write alone: the daemon is asked below, with nothing held.
     let revision = {
-        let writers = crate::barrier::hold()?;
+        let writers = crate::barrier::hold_for_configuration(&environment.paths)?;
         let permit = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)?;
         crate::doctor::configuration::apply(
             &environment.paths,

@@ -816,7 +816,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         ))
                     })?;
                     // Held for the write alone: the daemon is asked below, with nothing held.
-                    let writers = kr_cli::barrier::hold()?;
+                    let writers = kr_cli::barrier::hold_for_configuration(&environment.paths)?;
                     let permit =
                         kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)?;
                     kr_cli::doctor::configuration::apply(
@@ -867,7 +867,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 let writers = terminal
                     .set
                     .is_some()
-                    .then(kr_cli::barrier::hold)
+                    .then(|| kr_cli::barrier::hold_in(&environment.paths))
                     .transpose()?;
                 let permit = writers
                     .as_ref()
@@ -1151,7 +1151,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                 // is trying to get rid of.
                 ShellCommand::Remove(remove) => kr_cli::shell::shells(selector)?
                     .into_iter()
-                    .map(|kind| kr_cli::shell::remove(kind, &layout, &record, remove.dry_run))
+                    .map(|kind| {
+                        kr_cli::shell::remove(kind, &layout, &record, &paths, remove.dry_run)
+                    })
                     .collect::<Result<Vec<_>>>()?,
                 command => {
                     let packages = kr_cli::shell::packages()?;
@@ -1168,6 +1170,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                                     package,
                                     &layout,
                                     &record,
+                                    &paths,
                                     install.nsh_bypass,
                                     install.dry_run,
                                 )

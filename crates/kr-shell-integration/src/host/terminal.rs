@@ -824,8 +824,11 @@ mod tests {
     fn saving_a_preference_does_not_replace_one_it_cannot_read() {
         let directory = tempfile::tempdir().expect("a directory");
         let file = directory.path().join(PREFERENCE_FILE);
-        let writers = kr_ipc::install::hold_writers(&mut || {})
-            .expect("a test outside a store holds nothing");
+        let writers = kr_ipc::install::hold_writers(
+            &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+            &mut || {},
+        )
+        .expect("a test outside a store holds nothing");
         let permit = writers.permit(&PREFERENCE_WRITTEN).expect("permitted");
         let held = hold_preference(directory.path()).expect("held");
         let save = || save_preference(directory.path(), "kitty", &held, &permit);
