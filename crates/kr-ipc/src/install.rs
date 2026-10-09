@@ -15,6 +15,7 @@
 //! | `roots/` | The runtime and state roots the control daemons of this store have served |
 //! | `install.json` | The store's own record, which makes the directory a store |
 //! | `update.lock`, `install.lock` | The locks an update and a starting control daemon take |
+//! | `writers.lock` | The lock a command that writes a stored record takes, shared, and an update takes, exclusively, from before it checks the stores to after it switches |
 //!
 //! An update puts the new release beside the old ones and renames a new `current` link over the
 //! old one, and nothing else changes: whatever must follow an update names its path through
@@ -46,6 +47,21 @@
 //! has a hold of its own: the control daemon's hold covers the workers it launches, and an update
 //! waits for the daemon's launches to settle before the daemon stops.
 //!
+//! # The writers' lock
+//!
+//! A command of the `kr` family writes some records outside an update's hold, each stamped with a
+//! version ([`Written`]). Between the update's check that the release it switches to can read every
+//! store and its switch, such a command could write a version that release cannot read. So every
+//! writer of such a record holds `writers.lock` shared ([`hold_writers`]) while it writes, and an
+//! update holds it exclusively ([`Store::try_lock_writers`]) from before its check until its switch
+//! has been made. Under the lock a writer reads the manifest of the release `current` names and
+//! asks [`Writers::permit`] for the one record it is about to write: a record the manifest lists is
+//! written only at the version the manifest says its release writes, and a record it does not list is
+//! one that release does not read. A program of a release older or newer than `current`, which a
+//! switch leaves running, therefore cannot leave a record that `current` cannot read.
+//!
+//! A program that runs outside a store holds nothing and is permitted every record.
+//!
 //! Windows keeps no store here: a directory link there cannot be replaced in one step by a user
 //! who does not administer the machine, so every Windows process runs as a build outside a store.
 
@@ -72,6 +88,13 @@ pub const STAGING: &str = "staging";
 
 /// The directory releases are moved into to be removed.
 pub const TRASH: &str = "trash";
+
+/// The lock a command that writes a stored record takes shared, and an update takes exclusively.
+const WRITERS_LOCK: &str = "writers.lock";
+
+/// How many seconds a command that writes a stored record waits for an update that is switching
+/// releases, and an update for a command that is writing one.
+pub const WRITERS_WAIT_SECONDS: u64 = 30;
 
 /// A host executable, by the name it has in every release's `bin/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -545,7 +568,6 @@ fn hold_opened_within(
     release: &ReleaseName,
     within: Duration,
 ) -> Result<(File, ReleaseManifest)> {
-    use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
 
     if !lock_within(
@@ -571,15 +593,23 @@ fn hold_opened_within(
                      replaced while it started",
         });
     }
+    let manifest = read_manifest(&file, &path, release)?;
+    Ok((file, manifest))
+}
+
+/// Reads the manifest from an open file at `path`, and checks that it names `release`.
+#[cfg(unix)]
+fn read_manifest(file: &File, path: &Path, release: &ReleaseName) -> Result<ReleaseManifest> {
+    use std::io::Read as _;
+
     let mut bytes = Vec::new();
     let limit = kr_protocol::update::MAX_MANIFEST_LEN;
-    (&file)
-        .take(limit + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| InstallError::io("read", &path, error))?;
+        .map_err(|error| InstallError::io("read", path, error))?;
     if bytes.len() as u64 > limit {
         return Err(InstallError::Manifest {
-            path,
+            path: path.to_path_buf(),
             source: kr_protocol::update::ManifestError::Malformed(
                 "it is larger than any release's manifest".to_owned(),
             ),
@@ -587,16 +617,16 @@ fn hold_opened_within(
     }
     let manifest =
         ReleaseManifest::read_document(&bytes).map_err(|source| InstallError::Manifest {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         })?;
     if manifest.release != *release {
         return Err(InstallError::Replaced {
-            path,
+            path: path.to_path_buf(),
             reason: "names another release than the directory it is in",
         });
     }
-    Ok((file, manifest))
+    Ok(manifest)
 }
 
 #[cfg(not(unix))]
@@ -890,6 +920,64 @@ impl Store {
         )
     }
 
+    /// Takes the writers' lock exclusively when no command holds it, without waiting. An update
+    /// holds it from before it checks the stores until it has switched `current`; the caller
+    /// retries for as long as it can afford to wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked for any reason
+    /// but a holder.
+    pub fn try_lock_writers(&self) -> Result<Option<ExclusiveWriters>> {
+        StoreLock::try_take(
+            &self.root.join(WRITERS_LOCK),
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .map(|taken| taken.map(ExclusiveWriters))
+    }
+
+    /// Holds the writers' lock shared, for a command that writes a stored record in this store, and
+    /// reads the manifest of the release `current` names under it.
+    ///
+    /// `own` is the release of the program that writes, where it is one of this store. The lock is
+    /// polled for up to `wait`; `on_wait` runs once, if the first try finds it held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteRefused::Switching`] when an update held the lock for the whole wait, and
+    /// [`WriteRefused::Store`] when the lock cannot be opened or locked, or `current` names no
+    /// release whose manifest this build reads.
+    pub fn hold_writers(
+        &self,
+        own: Option<&ReleaseName>,
+        wait: Duration,
+        on_wait: &mut dyn FnMut(),
+    ) -> std::result::Result<Writers, WriteRefused> {
+        let lock = StoreLock::take_shared_within(&self.root.join(WRITERS_LOCK), wait, on_wait)
+            .map_err(WriteRefused::Store)?
+            .ok_or(WriteRefused::Switching)?;
+        let link = self.current_link();
+        let current = self
+            .current()
+            .map_err(WriteRefused::Store)?
+            .ok_or(WriteRefused::Store(InstallError::Replaced {
+                path: link,
+                reason: "does not exist: this store has no current release",
+            }))?;
+        let path = self.manifest(&current);
+        let file = open_regular_file(&path)
+            .map_err(|error| WriteRefused::Store(InstallError::io("open", &path, error)))?;
+        let manifest = read_manifest(&file, &path, &current).map_err(WriteRefused::Store)?;
+        Ok(Writers {
+            shared: Some(Shared {
+                _lock: lock,
+                current,
+                own: own.cloned(),
+                manifest,
+            }),
+        })
+    }
+
     /// Takes the install lock shared, waiting for it: a control daemon holds it while it starts,
     /// so `current` cannot change between its look at it and its taking the environment.
     ///
@@ -909,6 +997,8 @@ impl Store {
     /// `update` is the update lock, so what `current` names stays what an install or an update
     /// found it to be for as long as that holds it. `install` is the install lock, taken
     /// exclusively: nothing starts a control daemon of this store while `current` changes.
+    /// `writers` is the writers' lock, taken exclusively: no command writes a stored record
+    /// meanwhile, and the next one to do so is judged by the release this makes current.
     ///
     /// # Errors
     ///
@@ -919,9 +1009,11 @@ impl Store {
         release: &ReleaseName,
         update: &StoreLock,
         install: &StoreLock,
+        writers: &ExclusiveWriters,
     ) -> Result<()> {
         debug_assert_eq!(update.path, self.root.join("update.lock"));
         debug_assert_eq!(install.path, self.root.join("install.lock"));
+        debug_assert_eq!(writers.0.path, self.root.join(WRITERS_LOCK));
         if !self.manifest(release).is_file() {
             return Err(InstallError::Replaced {
                 path: self.release_directory(release),
@@ -1132,6 +1224,27 @@ impl StoreLock {
         })
     }
 
+    /// Takes the lock shared, trying for up to `within`, and says `on_wait` once when the first try
+    /// finds it held. `None` when it was held for the whole wait.
+    fn take_shared_within(
+        path: &Path,
+        within: Duration,
+        on_wait: &mut dyn FnMut(),
+    ) -> Result<Option<Self>> {
+        let file = Self::open(path)?;
+        let shared = rustix::fs::FlockOperation::NonBlockingLockShared;
+        if !lock_within(&file, path, shared, Duration::ZERO)? {
+            on_wait();
+            if !lock_within(&file, path, shared, within)? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Self {
+            file,
+            path: path.to_path_buf(),
+        }))
+    }
+
     fn try_take(path: &Path, operation: rustix::fs::FlockOperation) -> Result<Option<Self>> {
         let file = Self::open(path)?;
         match rustix::fs::flock(&file, operation) {
@@ -1162,6 +1275,207 @@ impl Drop for StoreLock {
         // here rather than left to the close.
         let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
     }
+}
+
+/// The writers' lock held exclusively: no command writes a stored record of this store while it is
+/// held. An update takes it before it checks the stores and holds it until it has switched.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ExclusiveWriters(StoreLock);
+
+#[cfg(unix)]
+impl ExclusiveWriters {
+    /// The lock file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+/// A record a command writes, by the name a release's manifest lists it under and the version this
+/// build writes it at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Written {
+    /// The store's name in a manifest's list of stores.
+    pub store: &'static str,
+    /// The version this build writes.
+    pub version: u32,
+}
+
+impl Written {
+    /// The record `store`, written at the `version` its crate states.
+    ///
+    /// # Panics
+    ///
+    /// Panics, at compile time where it is used for a constant, when `version` is not a small number.
+    #[must_use]
+    pub const fn new(store: &'static str, version: u64) -> Self {
+        assert!(version <= u32::MAX as u64, "a version is a small number");
+        Self {
+            store,
+            version: version as u32,
+        }
+    }
+}
+
+/// Why a command may not write a stored record now.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteRefused {
+    /// An update of this host held the writers' lock for the whole wait.
+    #[error("an update of this host is switching releases")]
+    Switching,
+    /// The lock could not be used, or the release `current` names could not be read.
+    #[error("{0}")]
+    Store(#[source] InstallError),
+    /// This process could not establish the release it runs.
+    #[error("{0}")]
+    Process(&'static InstallError),
+    /// The release `current` names lists the record at a version this program does not write.
+    #[error(
+        "{store} is listed at version {reads} by the current release {current}, and this program \
+         writes version {writes}"
+    )]
+    NotWhatCurrentReads {
+        /// The store.
+        store: &'static str,
+        /// The version this program writes.
+        writes: u32,
+        /// The version the current release lists.
+        reads: u32,
+        /// The release `current` names.
+        current: ReleaseName,
+        /// The release this program is of, where it is one of the store.
+        own: Option<ReleaseName>,
+    },
+    /// A permit given for one record was used for another.
+    #[error("a permit for {permitted} was used to write {record}")]
+    WrongRecord {
+        /// The record the permit is for.
+        permitted: &'static str,
+        /// The record being written.
+        record: &'static str,
+    },
+}
+
+/// What a command that writes a stored record holds while it writes: the writers' lock, shared, and
+/// the manifest of the release `current` names, which cannot change while the lock is held.
+#[derive(Debug)]
+pub struct Writers {
+    #[cfg(unix)]
+    shared: Option<Shared>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct Shared {
+    _lock: StoreLock,
+    current: ReleaseName,
+    own: Option<ReleaseName>,
+    manifest: ReleaseManifest,
+}
+
+impl Writers {
+    /// What a program that runs outside any store holds: nothing, and every record is permitted.
+    ///
+    /// A `kr` outside a store takes no store's lock, whichever state root it writes to. Remove this
+    /// once a state root names the store that serves it and a program outside a store takes that
+    /// store's lock or refuses to write.
+    #[must_use]
+    pub const fn outside_a_store() -> Self {
+        Self {
+            #[cfg(unix)]
+            shared: None,
+        }
+    }
+
+    /// Permits the write of `record`, when the release `current` names does not list it at another
+    /// version than this program writes it at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteRefused::NotWhatCurrentReads`] when it does.
+    pub fn permit(&self, record: &Written) -> std::result::Result<Permit<'_>, WriteRefused> {
+        #[cfg(unix)]
+        if let Some(shared) = &self.shared
+            && let Some(listed) = shared
+                .manifest
+                .stores
+                .iter()
+                .find(|listed| listed.store == record.store)
+            && listed.version != record.version
+        {
+            return Err(WriteRefused::NotWhatCurrentReads {
+                store: record.store,
+                writes: record.version,
+                reads: listed.version,
+                current: shared.current.clone(),
+                own: shared.own.clone(),
+            });
+        }
+        Ok(Permit {
+            writers: std::marker::PhantomData,
+            record: *record,
+        })
+    }
+}
+
+/// Proof that one record may be written, valid for as long as the [`Writers`] it came from.
+#[derive(Debug)]
+pub struct Permit<'a> {
+    writers: std::marker::PhantomData<&'a Writers>,
+    record: Written,
+}
+
+impl Permit<'_> {
+    /// Checks that this permit is for `record`, which a writer does before it writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteRefused::WrongRecord`] when it is for another.
+    pub fn require(&self, record: &Written) -> std::result::Result<(), WriteRefused> {
+        if self.record == *record {
+            Ok(())
+        } else {
+            Err(WriteRefused::WrongRecord {
+                permitted: self.record.store,
+                record: record.store,
+            })
+        }
+    }
+}
+
+/// Holds the writers' lock of this process's store, for a command that writes a stored record, and
+/// reads the manifest of the release `current` names under it. A process outside a store holds
+/// nothing ([`Writers::outside_a_store`]).
+///
+/// `on_wait` runs once when an update holds the lock and the wait begins; it waits for up to
+/// [`WRITERS_WAIT_SECONDS`].
+///
+/// # Errors
+///
+/// Returns what [`Store::hold_writers`] returns, and [`WriteRefused::Process`] when this process
+/// could not establish the release it runs.
+#[cfg(unix)]
+pub fn hold_writers(on_wait: &mut dyn FnMut()) -> std::result::Result<Writers, WriteRefused> {
+    match this_process() {
+        Err(error) => Err(WriteRefused::Process(error)),
+        Ok(Running::Loose { .. }) => Ok(Writers::outside_a_store()),
+        Ok(Running::Installed(installed)) => installed.store.hold_writers(
+            Some(&installed.release),
+            Duration::from_secs(WRITERS_WAIT_SECONDS),
+            on_wait,
+        ),
+    }
+}
+
+/// Holds nothing: a Windows host keeps no store, and its programs run outside one.
+///
+/// # Errors
+///
+/// Never.
+#[cfg(not(unix))]
+pub fn hold_writers(_on_wait: &mut dyn FnMut()) -> std::result::Result<Writers, WriteRefused> {
+    Ok(Writers::outside_a_store())
 }
 
 /// Flushes a directory, so a name just added to it or taken out of it survives a crash.
@@ -1282,7 +1596,14 @@ mod tests {
             .try_lock_install()
             .expect("locks")
             .expect("nothing starts a daemon");
-        test.store.switch(&one, &update, &held).expect("switches");
+        let writers = test
+            .store
+            .try_lock_writers()
+            .expect("locks")
+            .expect("no command is writing");
+        test.store
+            .switch(&one, &update, &held, &writers)
+            .expect("switches");
         let through_current = test
             .store
             .root()
@@ -1858,9 +2179,18 @@ mod tests {
             .try_lock_install()
             .expect("locks")
             .expect("nothing starts a daemon");
-        test.store.switch(&one, &update, &held).expect("switches");
+        let writers = test
+            .store
+            .try_lock_writers()
+            .expect("locks")
+            .expect("no command is writing");
+        test.store
+            .switch(&one, &update, &held, &writers)
+            .expect("switches");
         assert_eq!(test.store.current().expect("reads"), Some(one.clone()));
-        test.store.switch(&two, &update, &held).expect("switches");
+        test.store
+            .switch(&two, &update, &held, &writers)
+            .expect("switches");
         assert_eq!(test.store.current().expect("reads"), Some(two.clone()));
         assert_eq!(
             std::fs::read_link(test.store.current_link()).expect("a link"),
@@ -1873,7 +2203,11 @@ mod tests {
         );
         // The control: a release that is not in the store is never made current.
         let absent = release("0.3.0+cccccccccccc");
-        assert!(test.store.switch(&absent, &update, &held).is_err());
+        assert!(
+            test.store
+                .switch(&absent, &update, &held, &writers)
+                .is_err()
+        );
         assert_eq!(test.store.current().expect("reads"), Some(two));
         let leftovers: Vec<_> = std::fs::read_dir(test.store.root())
             .expect("the store")

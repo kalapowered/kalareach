@@ -868,7 +868,7 @@ fn a_document_the_release_before_wrote_is_read_and_the_next_edit_writes_it_forwa
         kr_protocol::desktop::SleepInhibitionSetting::MainsOnly
     );
 
-    let revision = configuration::apply(
+    let revision = apply_as_a_command(
         &environment,
         &kr_protocol::hostinfo::configuration::Change::SleepInhibition(
             kr_protocol::desktop::SleepInhibitionSetting::Off,
@@ -899,7 +899,7 @@ fn the_commands_edit_validates_before_it_writes_and_refuses_a_document_it_must_n
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
 
-    let revision = configuration::apply(
+    let revision = apply_as_a_command(
         &environment,
         &kr_protocol::hostinfo::configuration::Change::SleepInhibition(
             kr_protocol::desktop::SleepInhibitionSetting::MainsOnly,
@@ -917,7 +917,7 @@ fn the_commands_edit_validates_before_it_writes_and_refuses_a_document_it_must_n
         kr_protocol::desktop::SleepInhibitionSetting::MainsOnly
     );
 
-    let refused = configuration::apply(
+    let refused = apply_as_a_command(
         &environment,
         &kr_protocol::hostinfo::configuration::Change::SessionLimit(Some(0)),
     )
@@ -941,7 +941,7 @@ fn the_commands_edit_validates_before_it_writes_and_refuses_a_document_it_must_n
         kr_protocol::hostinfo::configuration::contents(&unknown).as_bytes(),
     )
     .expect("writes a document from a later build");
-    let refused = configuration::apply(
+    let refused = apply_as_a_command(
         &environment,
         &kr_protocol::hostinfo::configuration::Change::SleepInhibition(
             kr_protocol::desktop::SleepInhibitionSetting::Off,
@@ -1085,4 +1085,15 @@ fn the_standalone_starts_check_says_whose_valid_and_available_apart() {
     );
     assert_eq!(unused.status, DoctorStatus::Warning);
     assert!(unused.detail().contains("nothing uses it"));
+}
+
+/// Applies one change to the environment's configuration document as a command does, holding the
+/// writers' lock for the write; these tests run outside a store, so nothing is held.
+fn apply_as_a_command(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    change: &kr_protocol::hostinfo::configuration::Change,
+) -> crate::error::Result<u64> {
+    let writers = crate::barrier::hold()?;
+    let permit = crate::barrier::permit(&writers, &configuration::WRITTEN)?;
+    configuration::apply(environment, change, &permit)
 }

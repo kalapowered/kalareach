@@ -36,6 +36,7 @@
 //! | [`platform`] | The one place this crate calls the operating system directly |
 //! | [`shell`] | `kr shell`: the guarded startup entries and what the integration resolved to |
 //! | [`update`] | `kr host install`, `kr host update` and `kr host versions`: the releases this host keeps side by side |
+//! | [`barrier`] | The lock a command takes before it writes a stored record, which an update holds across its check of the stores and its switch |
 //! | [`output`] | Everything written on standard output, and the only writer there |
 //! | [`report`] | Text for people and the `--json` shapes |
 //! | [`error`] | The failures above, each with its own exit code |
@@ -43,6 +44,7 @@
 pub mod account;
 pub mod answer;
 pub mod attach;
+pub mod barrier;
 pub mod bind;
 pub mod bridge;
 pub mod changeset;

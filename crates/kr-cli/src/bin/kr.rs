@@ -815,10 +815,16 @@ async fn run(cli: Cli) -> Result<Completion> {
                             "the power setting is off, mains_only or battery_too",
                         ))
                     })?;
+                    // Held for the write alone: the daemon is asked below, with nothing held.
+                    let writers = kr_cli::barrier::hold()?;
+                    let permit =
+                        kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)?;
                     kr_cli::doctor::configuration::apply(
                         &environment.paths,
                         &kr_protocol::hostinfo::configuration::Change::SleepInhibition(chosen),
+                        &permit,
                     )?;
+                    drop(writers);
                 }
                 // The daemon is asked what the setting is now doing, because the setting alone is
                 // a choice rather than a state: what is held depends on the work and the power

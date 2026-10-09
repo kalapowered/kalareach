@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_ipc::install::{Program, Running, Store};
+use kr_ipc::install::{Program, Running, Store, WriteRefused, Written};
 use kr_protocol::update::ReleaseName;
 
 /// The variable that makes the helper test act, naming the directory it talks through.
@@ -98,8 +98,13 @@ impl TestStore {
             .try_lock_install()
             .expect("the install lock")
             .expect("nothing starts a daemon");
+        let writers = self
+            .store
+            .try_lock_writers()
+            .expect("the writers' lock")
+            .expect("no command is writing");
         self.store
-            .switch(release, &update, &install)
+            .switch(release, &update, &install, &writers)
             .expect("the release is current");
     }
 }
@@ -237,4 +242,106 @@ fn a_program_outside_a_store_finds_its_programs_beside_it() {
     assert_eq!(running.own(Program::Worker), beside);
     assert_eq!(running.stable(Program::Worker), beside);
     assert_eq!(running.shells(), None);
+}
+
+/// KR-REQ-26.10: the writers' lock is shared by commands that write and exclusive to an update. Any
+/// number of commands hold it at once and an update cannot take it meanwhile; an update that holds it
+/// keeps a command waiting until the command's wait ends, and the command says once that it waits.
+#[test]
+fn the_writers_lock_is_shared_by_commands_and_exclusive_to_an_update() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    test.switch(&one);
+    let mut waits = 0;
+    let first = test
+        .store
+        .hold_writers(None, Duration::from_secs(1), &mut || waits += 1)
+        .expect("a command holds the lock");
+    let second = test
+        .store
+        .hold_writers(None, Duration::from_secs(1), &mut || waits += 1)
+        .expect("another command holds it at once");
+    assert_eq!(waits, 0, "neither waited");
+    assert!(
+        test.store.try_lock_writers().expect("asks").is_none(),
+        "an update cannot take the lock while a command holds it"
+    );
+    drop((first, second));
+
+    let update = test
+        .store
+        .try_lock_writers()
+        .expect("asks")
+        .expect("an update takes it once no command holds it");
+    let refused = test
+        .store
+        .hold_writers(None, Duration::from_millis(100), &mut || waits += 1);
+    assert!(
+        matches!(refused, Err(WriteRefused::Switching)),
+        "a command that waits the whole wait is refused: {refused:?}"
+    );
+    assert_eq!(waits, 1, "and said once that it waited");
+    drop(update);
+    test.store
+        .hold_writers(None, Duration::from_millis(100), &mut || waits += 1)
+        .expect("a command holds the lock once the update lets go");
+    assert_eq!(waits, 1);
+}
+
+/// KR-REQ-26.10: a record is permitted at the version the release `current` names lists for it and at
+/// no other; a record the release does not list is one it does not read, and any version goes. A
+/// permit is for one record, and a store with no current release permits nothing.
+#[test]
+fn a_record_is_permitted_only_at_the_version_the_current_release_lists() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+
+    let nothing = test
+        .store
+        .hold_writers(None, Duration::from_millis(100), &mut || {});
+    assert!(
+        matches!(nothing, Err(WriteRefused::Store(_))),
+        "a store with no current release holds nothing: {nothing:?}"
+    );
+
+    test.switch(&one);
+    let writers = test
+        .store
+        .hold_writers(Some(&one), Duration::from_secs(1), &mut || {})
+        .expect("holds");
+    let listed = Written::new("registry", 7);
+    let permit = writers.permit(&listed).expect("the version it lists");
+    assert!(permit.require(&listed).is_ok());
+    assert!(
+        matches!(
+            permit.require(&Written::new("unlisted", 7)),
+            Err(WriteRefused::WrongRecord { .. })
+        ),
+        "a permit is for the record it was asked for"
+    );
+    match writers.permit(&Written::new("registry", 8)) {
+        Err(WriteRefused::NotWhatCurrentReads {
+            store,
+            writes,
+            reads,
+            current,
+            own,
+        }) => {
+            assert_eq!((store, writes, reads), ("registry", 8, 7));
+            assert_eq!(current, one);
+            assert_eq!(own, Some(one.clone()));
+        }
+        other => panic!("another version than the release lists is refused: {other:?}"),
+    }
+    assert!(
+        writers.permit(&Written::new("unlisted", 3)).is_ok(),
+        "a record the release does not list is not one it reads"
+    );
+    drop(writers);
+
+    // A program outside a store holds nothing and is permitted every record.
+    let outside = kr_ipc::install::Writers::outside_a_store();
+    assert!(outside.permit(&Written::new("registry", 8)).is_ok());
 }
