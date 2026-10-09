@@ -180,4 +180,20 @@ final class VoiceNegotiationTests: XCTestCase {
         let offer = try await call.offer()
         XCTAssertTrue(offer.contains("a=candidate:"), "the offer names at least one address to reach")
     }
+
+    /// KR-REQ-15.34: the call knows whether the provider's answer has been applied, and what it
+    /// says of discontinuous transmission, only once it has been. A host's answer is taken only
+    /// after that, which ``VoiceCallControl`` decides.
+    func testTheCallKnowsTheAnswerOnlyOnceItIsApplied() async throws {
+        let call = try VoiceCall(observer: Told())
+        defer { call.stop() }
+        let offer = try await call.offer()
+        XCTAssertFalse(call.answerIsApplied)
+        XCTAssertNil(call.answerUsesDtx)
+
+        let answer = try await AnsweringPeer().answer(offer)
+        try await call.accept(answerSdp: answer)
+        XCTAssertTrue(call.answerIsApplied)
+        XCTAssertEqual(call.answerUsesDtx, false)
+    }
 }

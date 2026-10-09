@@ -467,6 +467,9 @@ public final class VoiceCallControl: @unchecked Sendable {
     public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
         entered {
             guard !stopped, gate.current == nil else { return false }
+            // Before the provider's answer is applied there is no call to open the microphone for.
+            // Nothing changes, so the same answer is taken once the provider's is.
+            guard platform.answerApplied() else { return false }
             let wall = platform.epochMs()
             guard closesAtEpochMs > wall else {
                 stopLocked()
