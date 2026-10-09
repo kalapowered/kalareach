@@ -1037,6 +1037,8 @@ impl SystemdSupervisor {
 /// not answer is ended and given [`COLLECT_BOUND`] to be collected, which is on top of it. A
 /// caller with a deadline of its own runs this on a thread it does not wait for past it.
 ///
+/// Returns whether the kill was delivered: false when the manager has no such unit any more.
+///
 /// # Errors
 ///
 /// Returns why the manager could not be asked or refused.
@@ -1044,15 +1046,15 @@ impl SystemdSupervisor {
 pub(crate) fn kill_unit(
     label: &str,
     bound: std::time::Duration,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let unit = format!("{label}.service");
     match command_within(
         "systemctl",
         &["--user", "kill", "--signal=SIGKILL", &unit],
         bound.min(SERVICE_MANAGER_BOUND),
     ) {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("not loaded") => Ok(()),
+        Ok(output) if output.status.success() => Ok(true),
+        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("not loaded") => Ok(false),
         Ok(output) => Err(format!(
             "systemctl --user kill {unit}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
