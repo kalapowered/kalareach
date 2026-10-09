@@ -1271,9 +1271,33 @@ mod tests {
             organisation_ids: [second, first].into_iter().collect(),
         };
         let confirmed = plan.action_digest().expect("encodes");
+        assert_eq!(
+            confirmed,
+            Digest256::from_bytes([
+                0x9d, 0x1d, 0xcb, 0xd8, 0x7f, 0xdd, 0xab, 0x76, 0x85, 0x34, 0xb6, 0x2f, 0x59, 0xb7,
+                0x88, 0xef, 0x29, 0xcc, 0xab, 0xb3, 0xa1, 0x63, 0x2f, 0x23, 0x3a, 0xbe, 0x4f, 0xd8,
+                0x2c, 0xbd, 0x7f, 0x7f,
+            ]),
+            "the digest of the fixed plan, computed apart from this code as the SHA-256 of the \
+             KR-CBOR-1 array of the domain, the new value and the organisations in ascending order"
+        );
         let shown = ExclusiveManagementPlan::of_display(&plan.display()).expect("the same plan");
         assert_eq!(shown, plan);
         assert_eq!(shown.action_digest().expect("encodes"), confirmed);
+        assert_eq!(
+            ExclusiveManagementPlan {
+                exclusive: false,
+                ..plan.clone()
+            }
+            .action_digest()
+            .expect("encodes"),
+            Digest256::from_bytes([
+                0x4d, 0x84, 0x29, 0x81, 0xdb, 0x53, 0xe6, 0x64, 0xb8, 0xb3, 0x0c, 0x87, 0xc0, 0x80,
+                0xa6, 0xb6, 0xd3, 0xfa, 0xbf, 0xd0, 0xf1, 0xad, 0x2f, 0xcc, 0xac, 0xb0, 0x2e, 0x45,
+                0x9e, 0xbd, 0xd3, 0xa0,
+            ]),
+            "turning it off is another confirmation"
+        );
         assert_ne!(
             ExclusiveManagementPlan {
                 exclusive: false,
