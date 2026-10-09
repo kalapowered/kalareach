@@ -2249,9 +2249,10 @@ impl Catalogue {
     ///
     /// Returns [`CatalogueError::NotFound`] when the repository has no activated generation or its
     /// index does not carry the release, [`CatalogueError::Integrity`] when the hash is not the
-    /// one the index declares, the manifest is not the document it names, or the statement of its
-    /// integration is longer than an owner is shown whole, and the refusal a fetch decided when
-    /// the manifest has to be fetched and cannot be.
+    /// one the index declares or the manifest is not the document it names,
+    /// [`CatalogueError::UnsafePackage`] when the bridge's words hold the label the host writes
+    /// before its reading of an integration or that reading is longer than an owner is shown
+    /// whole, and the refusal a fetch decided when the manifest has to be fetched and cannot be.
     pub async fn grant_statement(
         &mut self,
         id: &RepositoryId,

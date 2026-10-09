@@ -72,8 +72,8 @@ pub struct RequestView {
     /// What the request names beyond the sentence, one fact to a line, exactly as the host
     /// described it and as the confirmation covers it.
     pub facts: Vec<Fact>,
-    /// What this host says in its own words about what the request would place, where it would
-    /// place code that runs outside the plugin sandbox.
+    /// What this host says in its own words about what the request would grant: the notice for each
+    /// capability it describes (code outside the plugin sandbox, a command that starts differently).
     pub notice: Option<String>,
     /// What the publisher says in its own words about what the release does. The page quotes it
     /// apart from the host's own words, so it is never read as the host's.
@@ -509,8 +509,8 @@ struct Particulars {
 }
 
 /// The facts, the host's notice, the publisher's statement and the host's reading for an
-/// enrolment or an installation, and nothing for any other request. `None` when a word the host or the publisher wrote could
-/// not be shown exactly as it was written.
+/// enrolment or an installation, and nothing for any other request. `None` when a word the host or
+/// the publisher wrote could not be shown exactly as it was written.
 fn particulars(subject: &Subject) -> Option<Particulars> {
     match subject {
         Subject::CatalogueAdd(plan) => Some(Particulars {
@@ -530,7 +530,9 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
                 Some(words) => Some(plain(words, STATEMENT_CHARS)?),
                 None => None,
             };
-            let split = parts.as_deref().map(split_install_statement);
+            let split = parts
+                .as_deref()
+                .map(|statement| split_install_statement(&grant, statement));
             Some(Particulars {
                 facts: installation_facts(plan)?,
                 notice: (!notices.is_empty()).then(|| notices.join(" ")),
