@@ -89,8 +89,9 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["status of", "session", "three"], (Status, Some(3))),
         (&["Go to", "session 5."], (Navigate, Some(5))),
         (&["status of session twenty-", "three"], (Status, Some(23))),
-        // Marks round the words: quotation marks, brackets, the stops of a sentence, an apostrophe
-        // in a word written straight or curly, and a mark that closes the utterance on its own.
+        // Marks that end what was said cost nothing: a quotation round all of it, the stop of a
+        // sentence, a stop standing alone at the end, an apostrophe in a word written straight or
+        // curly, and courtesies with a stop beside them.
         (&["\u{201c}Status of session 3.\u{201d}"], (Status, Some(3))),
         (&["\"open session 6.\""], (Navigate, Some(6))),
         (
@@ -98,8 +99,14 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
             (Status, Some(3)),
         ),
         (&["status of session twenty-three."], (Status, Some(23))),
+        (&["whats the status of session 3"], (Status, Some(3))),
         (&["status of session 3 ."], (Status, Some(3))),
         (&["status of session 3", "?"], (Status, Some(3))),
+        (
+            &["Please, show me the status of session 4"],
+            (Status, Some(4)),
+        ),
+        (&["Please. Open session 6."], (Navigate, Some(6))),
     ];
     for (texts, expected) in reads {
         assert_eq!(read(texts), Ok(*expected), "{texts:?}");
@@ -147,7 +154,8 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         // A point or a comma with no space after it is how a decimal or a thousand is written, so
         // "3,please" is no number followed by a word.
         (&["status session 3,please"], Misread::UnreadableNumber),
-        // A mark that is not a stop stays a word, wherever it stands.
+        // A mark that is neither a stop nor a quotation mark nor a bracket stays a word, wherever it
+        // stands.
         (&["status session 3 -"], Misread::NotARequest),
         (&["status \u{2014} session 3"], Misread::NotARequest),
         // A number that cannot be read.
@@ -165,10 +173,29 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["open session twenty (three)"], Misread::NotARequest),
         (&["open session twenty - three"], Misread::NotARequest),
         // A number said in words and left unfinished is no number: a hyphen that runs on to
-        // nothing, or a trailing off.
+        // nothing, to a word that is not a unit, or a trailing off. A hyphen that a fragment ends
+        // in runs on into the next, and what it runs on to decides.
         (&["open session twenty-"], Misread::UnreadableNumber),
         (&["go to session twenty- please"], Misread::UnreadableNumber),
+        (
+            &["go to session twenty-", "please"],
+            Misread::UnreadableNumber,
+        ),
+        (
+            &["status of session forty-", "Please."],
+            Misread::UnreadableNumber,
+        ),
+        (
+            &["brief me on session ninety-", "please?"],
+            Misread::UnreadableNumber,
+        ),
+        (&["go to session twenty-please"], Misread::UnreadableNumber),
+        (&["go to session twenty-ten"], Misread::UnreadableNumber),
         (&["open session twenty\u{2026}"], Misread::UnreadableNumber),
+        // A hyphen is no space: only a ten and a unit are written with one.
+        (&["go-to session 3"], Misread::NotARequest),
+        // Nothing inside a token is removed: an apostrophe in a number word leaves no number.
+        (&["status session thr'ee"], Misread::UnreadableNumber),
         // Several marks together are no stop, and a mark after a number that is not one stays in it.
         (&["status session 3.."], Misread::UnreadableNumber),
         (

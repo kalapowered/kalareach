@@ -14,7 +14,8 @@
 //! | "go to session 3", "open session twenty one" | go to the session |
 //!
 //! A session is named by its display number, written as the provider's transcript writes it: in
-//! digits or in words, from zero to ninety-nine. A request that names no session means the call's
+//! digits (any number), or in words from zero to ninety-nine ("twenty three" and "twenty-three"
+//! alike). A request that names no session means the call's
 //! one session, when the call reaches only one. A question is the same request. Negation, a
 //! second request, a word the grammar does not hold, and a number that cannot be read are each
 //! refused, because a host that acted on a guess about what a person meant would be acting on
@@ -145,6 +146,7 @@ pub struct GrammarInterpreter;
 const LEADS: &[(VoiceAction, &[&str])] = &[
     (VoiceAction::Status, &["status"]),
     (VoiceAction::Status, &["what", "is", "the", "status"]),
+    (VoiceAction::Status, &["what's", "the", "status"]),
     (VoiceAction::Status, &["whats", "the", "status"]),
     (VoiceAction::Status, &["give", "me", "the", "status"]),
     (VoiceAction::Status, &["show", "me", "the", "status"]),
@@ -188,8 +190,9 @@ impl DelegationInterpreter for GrammarInterpreter {
 }
 
 /// The fragments as one text, in the order they were said. A fragment that ends in the hyphen of
-/// a word ("twenty-") runs on into the next with no space, since the provider cut the word where it
-/// was joined.
+/// a word ("twenty-") runs on into the next with no space, so that a number the provider cut at its
+/// hyphen is one word again. What follows the hyphen is not checked here: "twenty-" and "please"
+/// make "twenty-please", which is no number word and is refused where numbers are read.
 fn utterance(fragments: &[TranscriptFragment]) -> String {
     let mut spoken = String::new();
     for fragment in fragments {
@@ -230,10 +233,11 @@ const STOPS: &[char] = &['.', ',', '!', '?', ';', ':'];
 /// it is not read as one thing ("twenty, three" is two words and a boundary, never twenty-three).
 /// A boundary at the start or the end of the whole utterance is dropped before the words are read
 /// ([`bare`]), so a stop that ends what was said, or a quotation round all of it, costs nothing.
-/// Inside a token a mark is never removed, except an apostrophe between two letters ("what's" is
-/// "whats") and a hyphen between two letters, which stands for the space it joins
-/// ("twenty-three"): "-3", ".3", "3.5", "1,000", "3'4" and "3,please" are each one token that is
-/// no number.
+/// **Nothing inside a token is ever removed or changed, but its case**: "-3", ".3", "3.5", "1,000",
+/// "3'4" and "3,please" are each one token that is no number, and "what's" is a word of its own,
+/// which the leads hold as it is written and as it is written without its apostrophe. A hyphen
+/// never stands for a space; the one hyphenated word the grammar holds is a ten and a unit
+/// ("twenty-three"), which [`number_of`] reads as the word it is.
 fn words_of(spoken: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let set_aside = |words: &mut Vec<String>| {
@@ -250,46 +254,13 @@ fn words_of(spoken: &str) -> Vec<String> {
         let stopped = closed.strip_suffix(STOPS).unwrap_or(closed);
         let core = stopped.trim_end_matches(CLOSING);
         if !core.is_empty() {
-            words.extend(word_parts(core));
+            words.push(core.to_lowercase());
         }
         if core.len() != opened.len() {
             set_aside(&mut words);
         }
     }
     words
-}
-
-/// The words one token holds: the token lower-cased with the apostrophes between letters dropped,
-/// and split at the hyphens when each stands between two letters. A token with any other hyphen
-/// stays whole, so "twenty-" at the end of what was said is no number.
-fn word_parts(token: &str) -> Vec<String> {
-    let characters: Vec<char> = token.chars().flat_map(char::to_lowercase).collect();
-    let letter_at = |index: Option<usize>| {
-        index
-            .and_then(|index| characters.get(index))
-            .is_some_and(|each| each.is_alphabetic())
-    };
-    let word: Vec<char> = characters
-        .iter()
-        .enumerate()
-        .filter(|&(index, each)| {
-            !(*each == '\'' && letter_at(index.checked_sub(1)) && letter_at(Some(index + 1)))
-        })
-        .map(|(_, each)| *each)
-        .collect();
-    let joins_letters = word.contains(&'-')
-        && word.iter().enumerate().all(|(index, each)| {
-            *each != '-'
-                || (index > 0
-                    && word[index - 1].is_alphabetic()
-                    && word.get(index + 1).is_some_and(|next| next.is_alphabetic()))
-        });
-    let word: String = word.into_iter().collect();
-    if joins_letters {
-        word.split('-').map(str::to_owned).collect()
-    } else {
-        vec![word]
-    }
 }
 
 /// `spoken` with the variants of a quotation mark, an apostrophe and a hyphen that a transcript
@@ -386,6 +357,12 @@ fn number_of(words: &[&str]) -> Option<(u64, usize)> {
     }
     if let Some(value) = small(first) {
         return Some((value, 1));
+    }
+    // "twenty-three": a ten and a unit, written as one word. A hyphen that joins anything else, or
+    // joins nothing, makes no number.
+    if let Some((ten, unit)) = first.split_once('-') {
+        let unit = small(unit).filter(|unit| (1..10).contains(unit))?;
+        return Some((tens(ten)? + unit, 1));
     }
     let tens = tens(first)?;
     // "twenty three": a ten and then a unit.
