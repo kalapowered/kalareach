@@ -638,8 +638,7 @@ impl Fate {
 /// The lines an external message carries for one announcement, in the host's own words.
 ///
 /// What a message names is what the host itself knows of the condition: which rule raised it, the
-/// session it belongs to and when it was first seen, and, for an automation paused by a limit, the
-/// host's own summary of it. A session's own words never enter: the attention store keeps none of
+/// session it belongs to and, for an automation paused by a limit, the host's own summary of it. A session's own words never enter: the attention store keeps none of
 /// them, and a message built here could not carry them if it tried. The lines are committed with
 /// the notice, so a recovery that produces from the event again composes from the same lines.
 ///
@@ -675,8 +674,9 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
     };
     let mut lines = vec![line(sentence)];
     // Only an automation paused by a limit carries its summary out: it is the host's own record
-    // of the limit. Any other rule's summary can be made of a command line, a turn or a notice's
-    // body, which a person or a program wrote, and stays with the host.
+    // of the limit. Any other rule's summary is made of words its event carried, such as a command
+    // line, a turn, an adapter's report or a notice's body, which a person or a program wrote, and
+    // stays with the host.
     if rule == AttentionRule::AutomationPaused && !notice.summary.is_empty() {
         lines.push(line(notice.summary.clone()));
     }
@@ -3034,10 +3034,6 @@ mod tests {
                 session_id: Some(session(1)),
                 produced_at_ms: Some(at_ms),
                 text: text.to_owned(),
-            };
-            let audience = |at_ms| Audience::Sessions {
-                sessions: vec![session(1)],
-                at_ms,
             };
             assert!(
                 audience(began).admits(&scope),
