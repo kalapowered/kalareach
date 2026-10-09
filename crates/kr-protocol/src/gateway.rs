@@ -130,6 +130,17 @@ impl NativeClassification {
     pub const fn suspends_rich_mutations(&self) -> bool {
         !self.declared
     }
+
+    /// Returns true when a frame of this classification can carry a credential: a key a login
+    /// hands the application, the tokens it asks its terminal to refresh.
+    ///
+    /// Such a frame is forwarded as it is and retained nowhere. A method the table does not list is
+    /// presumed a mutation and not a credential, so an unlisted method that carries one is kept as
+    /// any frame is; the qualified table is what names the methods that do.
+    #[must_use]
+    pub const fn carries_credentials(&self) -> bool {
+        matches!(self.class, NativeMethodClass::CredentialOrConfiguration)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

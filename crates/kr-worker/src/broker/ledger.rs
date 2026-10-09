@@ -163,7 +163,8 @@ pub struct ClientIntent {
     pub method: UpstreamMethod,
     /// How the connection's own pinned table classified it.
     pub classification: NativeClassification,
-    /// The retained source frame the bytes were kept as.
+    /// The source frame the bytes were retained as, or, for a method that carries a credential,
+    /// a handle nothing was retained under: the bytes of such a frame are kept nowhere.
     pub source: SourceEventHandle,
     /// What became of it.
     pub outcome: ClientRequestOutcome,
