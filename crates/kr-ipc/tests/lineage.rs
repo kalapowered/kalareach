@@ -10,7 +10,9 @@
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 
-use kr_ipc::identity::{process_lineage, process_start_identity};
+use kr_ipc::identity::{
+    process_lineage, process_start_identity, processes_in_group, processes_on_terminal,
+};
 
 #[test]
 fn a_reading_names_the_parent_and_the_group_of_the_process_that_holds_the_number() {
@@ -56,4 +58,41 @@ fn a_process_that_has_gone_has_no_reading() {
     let pid = child.id();
     child.wait().expect("collects the child");
     assert!(process_lineage(pid).is_err(), "nothing holds {pid}");
+}
+
+/// A call that failed earlier on the same thread has left its error number behind, and a listing
+/// that finds nothing must not read that number as its own failure.
+fn fail_a_call() {
+    assert!(std::fs::File::open("/nowhere/at/all").is_err());
+}
+
+#[test]
+fn a_group_that_nothing_is_in_is_an_empty_list_whatever_failed_before_it() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starts a child");
+    let group = child.id();
+    child.wait().expect("collects the child");
+    fail_a_call();
+    let members = processes_in_group(group).expect("a group nobody is in lists as empty");
+    assert!(
+        members.is_empty(),
+        "nothing is in group {group}: {members:?}"
+    );
+}
+
+#[test]
+fn a_terminal_that_nothing_holds_is_an_empty_list_whatever_failed_before_it() {
+    fail_a_call();
+    let holders =
+        processes_on_terminal(0x7fff_fffe).expect("a terminal nobody holds lists as empty");
+    assert!(
+        holders.is_empty(),
+        "no process holds that terminal: {holders:?}"
+    );
 }
