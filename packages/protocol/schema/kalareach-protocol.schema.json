@@ -7842,7 +7842,7 @@
           "description": "The managed storage service this host uploads its backups to.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches it."
         },
         "version": {
-          "default": 1,
+          "default": 2,
           "description": "The schema version this document is written against.",
           "format": "uint64",
           "minimum": 0,
