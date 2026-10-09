@@ -213,10 +213,9 @@ async fn delivery_goes_through_the_proxy_the_daemon_started_with() {
 /// around it: the delivery the daemon attaches makes no transport, so a webhook address, which a
 /// direct route would reach, hears nothing, and neither does the proxy named before. A document put
 /// right afterwards changes nothing until the daemon starts again.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
-    let documents: [(&str, Vec<u8>, u32); 4] = [
+    let documents: Vec<(&str, Vec<u8>, u32)> = vec![
         (
             "a version it does not know",
             br#"{"version": 99}"#.to_vec(),
@@ -227,21 +226,25 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
             br#"{"version": 2, "not_a_member": 1}"#.to_vec(),
             0o600,
         ),
-        (
-            "permissions wider than owner-only",
-            br#"{"version": 2}"#.to_vec(),
-            0o644,
-        ),
         ("a document too large", vec![b' '; 70_000], 0o600),
     ];
-    for (what, bytes, mode) in documents {
+    for (what, bytes, mode) in documents.into_iter().chain(wider_than_owner_only()) {
         let proxy = ConnectProxy::refusing(502).await;
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let mut accepted = ConfigurationDocument::empty();
         accepted.revision = 1;
         accepted.network.proxy_url = Nullable::some(proxy.url.clone());
+        // A daemon accepts the document that names the proxy, and stops.
         write_document(&environment, &accepted);
+        let accepting = start_controller(&environment, host.environment_id()).await;
+        assert_eq!(
+            accepting.started_outbound().expect("a route"),
+            Outbound::Through(proxy.url.parse().expect("a proxy address")),
+            "{what}: the control: the document names the proxy"
+        );
+        drop(accepting);
+        // The next daemon starts over a document it cannot use.
         write_bytes(&environment, &bytes, mode);
         let controller = start_controller(&environment, host.environment_id()).await;
         let Outbound::Closed(refusal) = controller.started_outbound().expect("a route") else {
@@ -257,10 +260,30 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
                 .expect("the shipped daemon attaches its delivery by this route"),
             "{what}: one transport is attached"
         );
+
+        // The transport the catalogue fetches repositories through, asked for an address a direct
+        // route would reach: it fetches nothing, and says why.
+        let (repository, repository_authority, repository_listener) = unreached();
+        let catalogue_transport = controller.catalogue().transport().clone();
+        let fetched = tokio::time::timeout(
+            WATCHDOG,
+            tough::Transport::fetch(
+                &*catalogue_transport,
+                format!("{repository}/1.root.json")
+                    .parse()
+                    .expect("an address"),
+            ),
+        )
+        .await
+        .expect("the fetch ends");
+        let Err(refused) = fetched else {
+            panic!("{what}: the catalogue fetches a repository");
+        };
         assert!(
-            matches!(controller.catalogue().outbound(), Outbound::Closed(_)),
-            "{what}: the catalogue was opened on the closed route"
+            refused.to_string().contains("config.json"),
+            "{what}: {refused}"
         );
+        heard_nothing(&repository_listener);
 
         // The transport the daemon attached, and not one the test builds: asked for an address a
         // direct route would reach, it makes none.
@@ -313,7 +336,38 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
             .expect("the message ends");
         assert_eq!(proxy.asked(), vec![format!("POST {address} HTTP/1.1")]);
         heard_nothing(&hook);
+        // And the catalogue's repositories, through the restarted daemon's own transport.
+        let _ = tokio::time::timeout(
+            WATCHDOG,
+            tough::Transport::fetch(
+                &**restarted.catalogue().transport(),
+                format!("{repository}/1.root.json")
+                    .parse()
+                    .expect("an address"),
+            ),
+        )
+        .await
+        .expect("the fetch ends");
+        assert_eq!(
+            proxy.asked(),
+            vec![
+                format!("POST {address} HTTP/1.1"),
+                format!("CONNECT {repository_authority} HTTP/1.1")
+            ]
+        );
+        heard_nothing(&repository_listener);
     }
+}
+
+/// A document that others can read, where there are modes to read it by.
+fn wider_than_owner_only() -> Option<(&'static str, Vec<u8>, u32)> {
+    cfg!(unix).then(|| {
+        (
+            "permissions wider than owner-only",
+            br#"{"version": 2}"#.to_vec(),
+            0o644,
+        )
+    })
 }
 
 /// A loopback address that is listened on and never answered: its origin, its authority, and the
@@ -359,15 +413,20 @@ fn write_document(environment: &kr_ipc::paths::EnvironmentPaths, document: &Conf
     .expect("the document");
 }
 
-/// Replaces the configuration document with `bytes` of `mode`, whatever they are.
-#[cfg(unix)]
+/// Replaces the configuration document with `bytes` of `mode` where there are modes, whatever they
+/// are.
 fn write_bytes(environment: &kr_ipc::paths::EnvironmentPaths, bytes: &[u8], mode: u32) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let path = kr_worker::config::document_path(environment);
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, bytes).expect("the document");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("its mode");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("its mode");
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
 }
 
 /// Starts a daemon in-process on `environment`, launching no worker.
