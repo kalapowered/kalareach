@@ -596,9 +596,25 @@ impl Group {
         Forced::Nothing
     }
 
-    /// Whether the kernel says the group holds nothing.
+    /// Whether the kernel says the group holds nothing: its own word on whether it is populated,
+    /// which covers the groups below it, without listing who is in them.
     async fn empty(&self) -> bool {
-        matches!(self.holders().await, Holders::None)
+        #[cfg(target_os = "linux")]
+        {
+            let path = self.path.clone();
+            matches!(
+                tokio::task::spawn_blocking(move || read_group(&path, false))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Holders::Unreadable("reading the control group did not finish".to_owned())
+                    }),
+                Holders::None
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
     }
 
     /// What the group holds, as the kernel says.
@@ -606,7 +622,7 @@ impl Group {
         #[cfg(target_os = "linux")]
         {
             let path = self.path.clone();
-            tokio::task::spawn_blocking(move || read_group(&path))
+            tokio::task::spawn_blocking(move || read_group(&path, true))
                 .await
                 .unwrap_or_else(|_| {
                     Holders::Unreadable("reading the control group did not finish".to_owned())
@@ -619,42 +635,79 @@ impl Group {
     }
 }
 
-/// How many levels of groups below a unit's are read for who is in them.
+/// How many control groups the walk below a unit reads before it says it could not read them all.
 #[cfg(target_os = "linux")]
-const GROUP_DEPTH: usize = 8;
+const GROUP_BUDGET: usize = 4096;
 
-/// Adds the identity of every process in the group at `directory` and in the groups below it, to
-/// `depth` levels.
+/// Adds the identity of every process in the group at `directory` and in every group below it,
+/// which is what the manager's kill reaches.
+///
+/// # Errors
+///
+/// Returns why the walk could not read all of them: a list or a directory the kernel would not
+/// give, a process it would not describe, or more groups than [`GROUP_BUDGET`]. What was read is
+/// in `held` all the same, but the set is not whole.
 #[cfg(target_os = "linux")]
-fn members_below(directory: &std::path::Path, held: &mut Vec<ProcessStartIdentity>, depth: usize) {
-    if let Ok(procs) = std::fs::read_to_string(directory.join("cgroup.procs")) {
-        for pid in procs
-            .lines()
-            .filter_map(|line| line.trim().parse::<u32>().ok())
-        {
-            if let Ok(identity) = kr_ipc::identity::process_start_identity(pid)
-                && !held.contains(&identity)
-            {
-                held.push(identity);
+fn members_below(
+    directory: &std::path::Path,
+    held: &mut Vec<ProcessStartIdentity>,
+) -> std::result::Result<(), String> {
+    use std::io::ErrorKind::NotFound;
+
+    let mut pending = vec![directory.to_path_buf()];
+    let mut read = 0_usize;
+    while let Some(group) = pending.pop() {
+        read += 1;
+        if read > GROUP_BUDGET {
+            return Err(format!(
+                "more than {GROUP_BUDGET} control groups lie below the service's"
+            ));
+        }
+        // A group that went while the walk was under way holds nothing.
+        match std::fs::read_to_string(group.join("cgroup.procs")) {
+            Ok(procs) => {
+                for pid in procs
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok())
+                {
+                    match kr_ipc::identity::query_process(pid) {
+                        kr_ipc::identity::ProcessQuery::Present(identity) => {
+                            if !held.contains(&identity) {
+                                held.push(identity);
+                            }
+                        }
+                        kr_ipc::identity::ProcessQuery::Gone => {}
+                        kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+                            return Err(format!("process {pid} could not be described: {error}"));
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", group.display())),
+        }
+        let entries = match std::fs::read_dir(&group) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", group.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("{}: {error}", group.display()))?;
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(entry.path()),
+                Ok(_) => {}
+                Err(error) if error.kind() == NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", entry.path().display())),
             }
         }
     }
-    if depth == 0 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            members_below(&entry.path(), held, depth - 1);
-        }
-    }
+    Ok(())
 }
 
-/// Reads a control group from the unified hierarchy's files.
+/// Reads a control group from the unified hierarchy's files; `members` says whether to list who is
+/// in it and below it when it is populated.
 #[cfg(target_os = "linux")]
-fn read_group(path: &str) -> Holders {
+fn read_group(path: &str, members: bool) -> Holders {
     let root = std::path::Path::new("/sys/fs/cgroup");
     // The files below are the unified hierarchy's only if it is what is mounted here. Elsewhere a
     // directory that is not there says nothing about the group.
@@ -669,13 +722,15 @@ fn read_group(path: &str) -> Holders {
             return Holders::Unreadable(format!("/sys/fs/cgroup could not be read: {error}"));
         }
     }
-    read_group_under(root, path)
+    read_group_under(root, path, members)
 }
 
 /// Reads a control group from the unified hierarchy's files under `root`: whether it is populated,
-/// and who is in it and in every group below it, which is what the manager's kill reaches.
+/// and, if `members` says so, who is in it and in every group below it, which is what the
+/// manager's kill reaches. A group whose members could not all be read is unreadable, never a
+/// shorter list.
 #[cfg(target_os = "linux")]
-fn read_group_under(root: &std::path::Path, path: &str) -> Holders {
+fn read_group_under(root: &std::path::Path, path: &str, members: bool) -> Holders {
     let directory = root.join(path.trim_start_matches('/'));
     match std::fs::read_to_string(directory.join("cgroup.events")) {
         Ok(events) => {
@@ -685,15 +740,17 @@ fn read_group_under(root: &std::path::Path, path: &str) -> Holders {
                 .map(str::trim);
             match populated {
                 Some("0") => Holders::None,
+                Some("1") if !members => Holders::Some(Vec::new()),
                 Some("1") => {
                     let mut held = Vec::new();
-                    members_below(&directory, &mut held, GROUP_DEPTH);
-                    if held.is_empty() {
-                        Holders::Unreadable(format!(
+                    match members_below(&directory, &mut held) {
+                        Err(why) => Holders::Unreadable(format!(
+                            "the control group {path} could not be read to the end: {why}"
+                        )),
+                        Ok(()) if held.is_empty() => Holders::Unreadable(format!(
                             "the control group {path} holds processes this host could not describe"
-                        ))
-                    } else {
-                        Holders::Some(held)
+                        )),
+                        Ok(()) => Holders::Some(held),
                     }
                 }
                 _ => Holders::Unreadable(format!("the control group {path} has no populated line")),
@@ -719,28 +776,30 @@ fn read_group_under(root: &std::path::Path, path: &str) -> Holders {
 mod tests {
     use super::{Holders, read_group_under};
 
-    /// A unit's control group holds what is directly in it and what is in the groups below it, and
-    /// the manager's kill reaches both: a populated group whose own list is empty but whose child
-    /// group holds a process is not unreadable, and names that process.
+    /// A unit's control group holds what is directly in it and what is in every group below it, at
+    /// any depth, and the manager's kill reaches all of them: a populated group whose own list is
+    /// empty but whose descendant holds a process is not unreadable, and names that process. A
+    /// group the walk could not read to the end is unreadable, never a shorter list.
     ///
-    /// The files are the kernel's own format, written to a directory: a test cannot create a group
-    /// below a unit it does not own.
+    /// The files are the kernel's own format, written to a directory: a test cannot create a
+    /// group below a unit it does not own.
     #[test]
-    fn a_group_names_the_processes_in_the_groups_below_it() {
+    fn a_group_names_the_processes_in_every_group_below_it() {
         let root = tempfile::tempdir().expect("a directory");
         let unit = root.path().join("kr-worker-example.service");
-        std::fs::create_dir_all(unit.join("child/grandchild")).expect("the groups");
+        let mut deep = unit.clone();
+        for level in 0..12 {
+            deep.push(format!("level{level}"));
+            std::fs::create_dir_all(&deep).expect("the group");
+            std::fs::write(deep.join("cgroup.procs"), "").expect("an empty list");
+        }
         std::fs::write(unit.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
         std::fs::write(unit.join("cgroup.procs"), "").expect("the unit's own list");
         let here = std::process::id();
-        std::fs::write(unit.join("child/cgroup.procs"), "").expect("the child's list");
-        std::fs::write(
-            unit.join("child/grandchild/cgroup.procs"),
-            format!("{here}\n"),
-        )
-        .expect("the grandchild's list");
+        std::fs::write(deep.join("cgroup.procs"), format!("{here}\n")).expect("the deep list");
+        let unit_path = "/kr-worker-example.service";
 
-        match read_group_under(root.path(), "/kr-worker-example.service") {
+        match read_group_under(root.path(), unit_path, true) {
             Holders::Some(held) => {
                 assert_eq!(held.len(), 1, "{held:?}");
                 assert_eq!(held[0].pid.get(), u64::from(here));
@@ -748,10 +807,29 @@ mod tests {
             Holders::None => panic!("a populated group read as empty"),
             Holders::Unreadable(why) => panic!("a group with a process below it: {why}"),
         }
+        assert!(
+            matches!(
+                read_group_under(root.path(), unit_path, false),
+                Holders::Some(held) if held.is_empty()
+            ),
+            "asked only whether it holds anything, a populated group says so without a list"
+        );
+
+        // A list the walk cannot read makes the whole read unreadable.
+        let broken = unit.join("level0/broken");
+        std::fs::create_dir_all(broken.join("cgroup.procs")).expect("a list that is a directory");
+        assert!(
+            matches!(
+                read_group_under(root.path(), unit_path, true),
+                Holders::Unreadable(why) if why.contains("to the end")
+            ),
+            "a group below that could not be read is not a shorter list"
+        );
+        std::fs::remove_dir_all(&broken).expect("removes it");
 
         std::fs::write(unit.join("cgroup.events"), "populated 0\n").expect("events");
         assert!(matches!(
-            read_group_under(root.path(), "/kr-worker-example.service"),
+            read_group_under(root.path(), unit_path, true),
             Holders::None
         ));
     }
