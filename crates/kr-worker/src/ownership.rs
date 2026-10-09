@@ -459,6 +459,15 @@ impl OwnedProcesses {
             self.take(tree);
             return;
         }
+        // The terminal reads fewer processes than the worker's tree: a process that left the
+        // terminal's session is not among them. On Linux, where the tree is what the worker reads
+        // when it can, falling back to the terminal is a gap the closure has to name.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.note_unestablished(
+            "the worker's process tree could not be read, so the processes on the session's \
+             terminal were recorded instead, which leaves out a process that left the terminal's \
+             session",
+        );
         // Otherwise the terminal, where the kernel names it: an interactive shell puts each job in
         // its own process group, so the group finds the shell and nothing it started, while every
         // one of those jobs keeps the terminal.
