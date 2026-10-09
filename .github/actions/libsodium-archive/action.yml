@@ -8,6 +8,15 @@ description: >-
   branch saves them, with its own cache-save step and only after a build that ran the crate's
   build script, which checks their signatures. The script this runs says what is placed and why.
 
+inputs:
+  restore:
+    description: >-
+      'false' leaves the Actions cache out: nothing is restored, and the archives are fetched
+      from libsodium's host on every run. A job that signs a release sets it, so that nothing a
+      cache holds is linked into what it signs.
+    required: false
+    default: 'true'
+
 outputs:
   cache-hit:
     description: "'true' when the archives were restored from the cache."
@@ -16,7 +25,7 @@ outputs:
     description: The key the archives are cached under.
     value: ${{ steps.name.outputs.key }}
   path:
-    description: The directory the archives are in.
+    description: The path the archives are cached under, in the form the cache actions take.
     value: ${{ steps.name.outputs.path }}
 
 runs:
@@ -28,10 +37,19 @@ runs:
       run: |
         key="$(bash scripts/place-libsodium-archive.sh --key)"
         echo "key=$key" >> "$GITHUB_OUTPUT"
-        echo "path=$RUNNER_TEMP/libsodium-archive" >> "$GITHUB_OUTPUT"
+        # A cache is found by its key and by the text of its path. The path is written from the
+        # home directory so that every runner, whatever drive its temporary directory is on,
+        # names the same cache; the build script is given the directory as the platform spells it.
+        echo "path=~/libsodium-archive" >> "$GITHUB_OUTPUT"
+        if command -v cygpath > /dev/null 2>&1; then
+            echo "dir=$(cygpath -m "$HOME")/libsodium-archive" >> "$GITHUB_OUTPUT"
+        else
+            echo "dir=$HOME/libsodium-archive" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Restore
       id: restore
+      if: inputs.restore == 'true'
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ steps.name.outputs.path }}
@@ -40,7 +58,7 @@ runs:
     - name: Place what the cache lacks
       shell: bash
       env:
-        ARCHIVE_DIR: ${{ steps.name.outputs.path }}
+        ARCHIVE_DIR: ${{ steps.name.outputs.dir }}
       run: |
         bash scripts/place-libsodium-archive.sh "$ARCHIVE_DIR"
         echo "SODIUM_DIST_DIR=$ARCHIVE_DIR" >> "$GITHUB_ENV"
