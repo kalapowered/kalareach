@@ -1,7 +1,7 @@
 //! The host's own sign-in to the managed account service.
 //!
-//! Managed voice spends an account's balance, so the host presents an account token of its own.
-//! The daemon alone holds the sign-in: the grant lives in the host's secret store under
+//! Managed voice spends an account's balance and managed storage keeps an account's backups, so the
+//! host presents an account token of its own to both. The daemon alone holds the sign-in: the grant lives in the host's secret store under
 //! [`SignedInAccount`], whose refresh token rotates on every use, so a second holder would end it.
 //! A person starts the sign-in at this machine (`kr account sign-in`); the daemon listens on the
 //! loopback address the desktop client is registered with, the person's browser comes back to it,
@@ -11,20 +11,23 @@
 //!
 //! The browser signs in at the account service, and the code it brings back is redeemable there and
 //! nowhere else, so the exchange, every refresh and every revocation go to that one service. The
-//! host's configuration names a voice broker; the host signs in, and presents a token to the broker,
-//! only when the broker is that service. A host whose broker is another service, or none, signs in
-//! nowhere and presents nothing.
+//! host's configuration names a voice broker and may select a storage service; the host presents a
+//! token to each only when it is that service, and signs in when it presents to one. A host that
+//! selects no storage service and whose broker is another service, or none, signs in nowhere and
+//! presents nothing.
 //!
 //! What the store holds is kept in a scope named by the service. A grant, and a revocation that
 //! waits to be sent, can therefore be read only through the service that issued them, and a host
 //! never sends a token to a service that did not issue it. A host that is moved off the managed
 //! broker still reaches the account service for what it holds: it can see the grant, send the
 //! revocations that wait and sign out, because those requests go to the service that issued the
-//! grant whatever the broker is. No check stands between a stored credential and the wrong
-//! service, because there is no path from one to the other.
+//! grant whatever the broker is. Two checks keep a token from the wrong service: a token source is
+//! made for the origin of the service it serves ([`HostAccount::tokens_for`]) and hands out nothing
+//! for any other, and the daemon does not start when the storage service it selects is not the
+//! account service.
 //!
-//! The grant is refreshed when a call needs a token and the one held is about to end, never before,
-//! so a host that makes no call spends no refresh token.
+//! The grant is refreshed when a call, the storage carrier or `kr doctor` needs a token and the one
+//! held is about to end, never before, so a host that does none of them spends no refresh token.
 //!
 //! # The account never changes under a call
 //!
@@ -84,6 +87,9 @@ const IMPORTED_TOKEN_FILE: &str = "account-token.json";
 pub struct Service {
     /// The account service's origin. Everything stored for the sign-in is kept under its name.
     pub origin: String,
+    /// The resource scopes a sign-in asks for: one for each service the host presents its account
+    /// to, and none for a service the host does not select.
+    pub scopes: Vec<&'static str>,
     /// The account service at that origin.
     pub account: Arc<dyn AccountService>,
 }
@@ -147,6 +153,7 @@ pub trait Calls: Send + Sync {
 
 struct Held {
     origin: String,
+    scopes: Vec<&'static str>,
     account: Arc<dyn AccountService>,
     signed_in: SignedInAccount,
 }
@@ -189,7 +196,8 @@ impl std::fmt::Debug for HostAccount {
 impl HostAccount {
     /// The sign-in of one environment, kept in `store`, at `service` where this host can reach the
     /// account service, or why it cannot. `refused` is why this host neither signs in nor presents
-    /// its account, when it does not: its voice broker is not the account service.
+    /// its account, when it does not: it selects no storage service and its voice broker is not the
+    /// account service.
     ///
     /// Removes the account token file an earlier version of this host imported, under
     /// `runtime_root`, once, and starts settling what an earlier run left.
@@ -224,6 +232,7 @@ impl HostAccount {
                 (
                     Some(Held {
                         origin: service.origin,
+                        scopes: service.scopes,
                         account: service.account,
                         signed_in,
                     }),
@@ -297,11 +306,14 @@ impl HostAccount {
         assert_eq!(committed, Commit::Kept);
     }
 
-    /// The token source a managed call presents: this host's sign-in at the account service.
+    /// The token source a managed call to the service at `origin` presents: this host's sign-in at
+    /// the account service, handed out only when `origin` is that service. A token is a bearer
+    /// credential for the service that issued it, so a service at any other origin is refused one.
     #[must_use]
-    pub fn tokens(&self) -> Arc<dyn AccountTokenSource> {
+    pub fn tokens_for(&self, origin: &str) -> Arc<dyn AccountTokenSource> {
         Arc::new(HostTokens {
             inner: Arc::clone(&self.inner),
+            origin: origin.to_owned(),
         })
     }
 
@@ -339,11 +351,10 @@ impl HostAccount {
     ///
     /// # Errors
     ///
-    /// Returns why no sign-in can start: this host's voice broker is not the account service, a
-    /// sign-in is finishing, a managed call is open, or another program holds the loopback
-    /// address.
+    /// Returns why no sign-in can start: this host presents its account to no service, a sign-in is
+    /// finishing, a managed call is open, or another program holds the loopback address.
     pub async fn sign_in(&self) -> Result<AccountSignInStarted> {
-        self.inner.presenting()?;
+        let held = self.inner.presenting()?;
         if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
         }
@@ -377,12 +388,9 @@ impl HostAccount {
                 });
             }
         };
-        let request = AuthorisationRequest::asking(
-            Client::Desktop,
-            Redirect::Loopback,
-            &[kr_client::services::voice::VOICE_SCOPE],
-        )
-        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let request =
+            AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, &held.scopes)
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let url = request.url();
         let pending = PendingAuthorisation::new(request);
         let expires_at_ms = kr_ipc::now_ms()
@@ -541,8 +549,8 @@ impl Inner {
         })
     }
 
-    /// The account service, when this host also signs in and presents its account there: its voice
-    /// broker is that service.
+    /// The account service, when this host also signs in and presents its account there: it selects
+    /// a storage service, which is that service, or its voice broker is that service.
     fn presenting(&self) -> Result<&Held> {
         let held = self.service()?;
         match self.unavailable {
@@ -563,8 +571,8 @@ impl Inner {
                      configuration says: see the daemon's log"
                 }
                 SignInUnavailable::NoBroker => {
-                    "this host names no managed voice service: set voice.broker_origin in its \
-                     configuration document to the managed account service's origin"
+                    "this host names no managed service: set voice.broker_origin or storage.origin \
+                     in its configuration document to the managed account service's origin"
                 }
             }
             .to_owned(),
@@ -803,6 +811,8 @@ async fn until_down(
 /// The token source a managed call presents.
 struct HostTokens {
     inner: Arc<Inner>,
+    /// The service the call is to.
+    origin: String,
 }
 
 impl std::fmt::Debug for HostTokens {
@@ -814,14 +824,17 @@ impl std::fmt::Debug for HostTokens {
 impl AccountTokenSource for HostTokens {
     fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
         Box::pin(async move {
-            let Ok(held) = self.inner.presenting() else {
-                return Err(kr_client::ClientError::refusal(
-                    ErrorCode::HostNotConfigured,
-                    kr_client::shown::Shown::said(
-                        "this host's voice broker is not a service it signs in to, so it presents \
-                         no account token",
-                    ),
-                ));
+            let held = match self.inner.presenting() {
+                Ok(held) if held.origin == self.origin => held,
+                _ => {
+                    return Err(kr_client::ClientError::refusal(
+                        ErrorCode::HostNotConfigured,
+                        kr_client::shown::Shown::said(
+                            "the service this call is to is not the account service this host \
+                             signs in at, so it presents no account token",
+                        ),
+                    ));
+                }
             };
             // While the account is being changed a request waits for the change to end, so that a
             // call that starts then is made under the account the change leaves and not under one

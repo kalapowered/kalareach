@@ -121,9 +121,13 @@ impl Controller {
             proxy,
             crate::managed_transport::VOICE_DEADLINES,
         ));
-        crate::voice::VoiceModule::managed_provider(origin, transport, self.account.tokens())
-            .inspect_err(|error| origin_unusable(error))
-            .ok()
+        crate::voice::VoiceModule::managed_provider(
+            origin,
+            transport,
+            self.account.tokens_for(origin),
+        )
+        .inspect_err(|error| origin_unusable(error))
+        .ok()
     }
 
     /// The environment's voice service.

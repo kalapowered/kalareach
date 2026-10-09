@@ -202,7 +202,7 @@ variables an older build read joins nothing because of them.
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
 | `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and account service, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
-| `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -244,35 +244,40 @@ than leaving a host that appears to run and cannot be reached.
 
 ### Account sign-in
 
-Brokering a managed call spends an account's balance, so the host signs an account in on its own,
-at this machine. `kr account sign-in` asks the control daemon over its local socket
-(`account.sign_in`, served there alone and asking for host management). The daemon listens on the
-loopback address the desktop client is registered with, `127.0.0.1:8765`; the command reads the
-address a person opens in a browser from the daemon (`account.status`), opens it and always prints
-it, with a note for a host without a display: forward the port from the machine that has the
-browser, `ssh -L 8765:127.0.0.1:8765 <host>`, and open the printed address there. The daemon
-exchanges the answer with the service and keeps the grant in the host's secret store.
-`kr account show` says whether the host is signed out, waiting for the browser, signed in, or
-ended, and how the last attempt that ended ended. Nothing it prints or answers is a token.
+Brokering a managed call spends an account's balance and a backup upload keeps an account's storage,
+so the host signs an account in on its own, at this machine. `kr account sign-in` asks the control
+daemon over its local socket (`account.sign_in`, served there alone and asking for host management).
+The daemon listens on the loopback address the desktop client is registered with, `127.0.0.1:8765`;
+the command reads the address a person opens in a browser from the daemon (`account.status`), opens
+it and always prints it, with a note for a host without a display: forward the port from the machine
+that has the browser, `ssh -L 8765:127.0.0.1:8765 <host>`, and open the printed address there. The
+daemon exchanges the answer with the service and keeps the grant in the host's secret store. `kr
+account show` says whether the host is signed out, waiting for the browser, signed in, or ended, and
+how the last attempt that ended ended. Nothing it prints or answers is a token.
 
-The browser signs in at the managed account service, and the code it brings back is redeemable
-there and nowhere else, so the exchange, every refresh and every revocation go to that one service.
-The host presents a token to the voice broker its configuration names only when that broker is the
-account service (`voice.broker_origin` is `https://reach.kala.to`). A host whose broker is another
-service, or none, signs in nowhere and presents nothing: `kr account sign-in` says so. It still
-reaches the account service for what it holds, so a grant it was signed in with while its broker was
-the managed one is shown by `kr account show`, revoked when a revocation waits, and ended by
-`kr account sign-out`. What the store holds is kept under the service's name, so a grant, and a
-revocation that waits to be sent, are reached only through the service that issued them.
+The browser signs in at the managed account service, and the code it brings back is redeemable there
+and nowhere else, so the exchange, every refresh and every revocation go to that one service. The
+host presents a token to the voice broker or the storage service its configuration names only when
+that service is the account service (the value of `voice.broker_origin` or `storage.origin` is
+`https://reach.kala.to`). The sign-in asks for the scope of each service it presents to (`voice` for
+the voice broker and `backup.write` for the storage service). If the host has no storage service
+selected and is either talking to another voice broker or no voice broker at all, then it won't sign
+in anywhere and won't present an account to any service, and `kr account sign-in` will tell the
+person so. A sign-in made before the host selected a service holds no scope for it, whichever
+service that is, and a person signs in again. It still reaches the account service for what it
+holds, so a grant it was signed in with while its broker was the managed one is shown by `kr account
+show`, revoked when a revocation waits, and ended by `kr account sign-out`. What the store holds is
+kept under the service's name, so a grant, and a revocation that waits to be sent, are reached only
+through the service that issued them.
 
 The grant is of the same kind as the one the companion keeps on a desktop: an access token that
 lasts ten minutes, and a refresh token that rotates on every use, so a second holder would end the
-sign-in. That is why only the daemon holds it. A call that needs a token asks for one when it needs
-it, and the daemon refreshes the grant then, never before. At start the daemon settles what an
-earlier run left: a grant whose revocation was queued is removed, and every revocation the service
-has not acknowledged is sent again, before any token is handed out. Signing in again replaces the
-grant and queues the old one for revocation. A host whose service ended the sign-in (a refresh token
-it no longer accepts) shows `ended` until then.
+sign-in. That is why only the daemon holds it. A call, the storage carrier or `kr doctor` that needs
+a token asks for one when it needs it, and the daemon refreshes the grant then, never before. At
+start the daemon settles what an earlier run left: a grant whose revocation was queued is removed,
+and every revocation the service has not acknowledged is sent again, before any token is handed out.
+Signing in again replaces the grant and queues the old one for revocation. A host whose service
+ended the sign-in (a refresh token it no longer accepts) shows `ended` until then.
 
 The sign-in is single use and local: one attempt waits at a time, a newer one ends the older one,
 and nothing is waiting after fifteen minutes. A program that already holds the loopback address
@@ -3278,15 +3283,18 @@ store and starts carrying the outbox. A service that does not answer in time doe
 start: reconciliation records the generation as unknown, as it does for a publication nothing could
 ask about. That question carries no account token, so it is asked whatever token the host holds.
 
-Requests that spend an account's storage carry the account token of the sign-in held by the daemon
-(`kr account sign-in`), beside the writer's signature. The daemon will renew this token as needed,
-allowing uploads to last longer than the life of any one token. Nothing leaves the host with a token
-if no account is signed in, if the account was signed in to a service other than the one
-`storage.origin` names, if the service has ended the sign-in, or if the grant lacks `backup.write`.
-In each of these cases, `kr doctor` says which holds and names signing in again as the remedy. As
-long as there is work to be done and the host has no usable token, the daemon looks again every 30
-seconds. This is needed because a person signs in at a command line, which tells the carrier
-nothing.
+Requests that spend an account's storage carry the account token from the sign-in that the daemon
+holds (`kr account sign-in`), along with the signature from the writer. The host only sends this
+token to the managed account service, which is why `storage.origin` must name that service. In fact
+the daemon will not start if `storage.origin` names another service, and its refusal names
+`storage.origin`. When signing in, the `backup.write` scope is requested when the document selects a
+storage service. The daemon renews the token as needed, so an upload can outlast any one token.
+Nothing leaves the host with a token if no account is signed in, if the sign-in has been ended by
+the service, or if the grant does not include the `backup.write` scope (which would happen if a
+sign-in was done before a storage service was selected). In these cases, `kr doctor` will indicate
+which holds, and suggest signing in again to resolve it. While there is work and no usable token,
+the daemon looks again every 30 seconds, because a person signs in at a command line that tells the
+carrier nothing.
 
 The carrier waits between passes as the service and the cause allow:
 
@@ -3329,15 +3337,16 @@ admits generations to the outbox this carries. It serves no method of its own: `
 `backup.manifest` are *service* methods, which this host calls rather than answers.
 
 `kr doctor` reports the service as the `managed-storage` check. The detail says whether the account
-token is usable and when it stops being accepted, whether backup storage is on for the account and
-what allowance the service reports, what the last pass did, and what the service turned back,
-whether a status read or a pass met it. The check reads well only when the token is usable, backup
-storage is on, and neither the last status read nor the last pass that carried work was turned back.
-When the service
-refused the writer, the detail gives the start of the writer key's identifier for the owner to
-enrol. With no origin configured the check is not applicable. The status read happens once, for five
-seconds at most, and not at all while the service has asked to be left alone or the host has no
-usable token; then the check shows the last answer.
+token is usable and, when it is not, why and what mends it, whether backup storage is on for the
+account and what allowance the service reports, what the last pass did, and what the service turned
+back, whether a status read or a pass met it. The check reads well only when the token is usable,
+backup storage is on, and neither the last status read nor the last pass that carried work was
+turned back. When the service refused the writer, the detail gives the start of the writer key's
+identifier for the owner to enrol. With no origin configured the check is not applicable. The status
+read happens once, for five seconds at most, and not at all while the service has asked to be left
+alone or the host has no usable token; then the check shows the last answer. Asking whether the
+token is usable can renew it at the account service, which is not cut off at five seconds and takes
+at most the account service's own deadlines.
 
 ## Privacy mode
 

@@ -63,14 +63,15 @@ pub struct AccountStatusParams {}
 #[serde(deny_unknown_fields)]
 pub struct AccountReport {
     /// The account service this host keeps its account for, which is also where its token is
-    /// presented when its voice broker is that service. Null when the host could not set up how to
-    /// reach it, and `unavailable` says why.
+    /// presented when its voice broker is that service or it selects that service for storage.
+    /// Null when the host could not set up how to reach it, and `unavailable` says why.
     pub service: Nullable<String>,
-    /// Why this host does not sign in or present its account: its configuration names no voice
-    /// broker, names another service than the account service, or the host could not set up how to
-    /// reach the account service. For the first two, a grant the host already keeps still shows in
-    /// `state`, and `account.sign_out` ends it, whatever the broker is; for the third the host
-    /// reaches no account service, shows `signed_out` and refuses to sign out.
+    /// Why this host does not sign in or present its account: its configuration selects no storage
+    /// service and names no voice broker, selects none and names a broker that is another service
+    /// than the account service, or the host could not set up how to reach the account service. For
+    /// the first two, a grant the host already keeps still shows in `state`, and `account.sign_out`
+    /// ends it, whatever the broker is; for the third the host reaches no account service, shows
+    /// `signed_out` and refuses to sign out.
     pub unavailable: Nullable<SignInUnavailable>,
     /// The account this host is signed in as, or what stands in its way.
     pub state: AccountState,
@@ -97,9 +98,10 @@ impl fmt::Debug for AccountReport {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SignInUnavailable {
-    /// The host's configuration names no voice broker.
+    /// The host's configuration names neither a voice broker nor a storage service.
     NoBroker,
-    /// The voice broker it names is another service than the account service the host signs in at.
+    /// The host selects no storage service, and the voice broker it names is another service than
+    /// the account service the host signs in at.
     BrokerIsAnotherService,
     /// The host could not set up how to reach the account service the way its configuration says.
     NotUsable,

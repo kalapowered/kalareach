@@ -198,7 +198,7 @@ fn lines(report: &AccountReport) -> Vec<Line> {
              the daemon's log says why."
         )),
         (_, Some(SignInUnavailable::NoBroker)) | (None, None) => lines.push(stdout_line!(
-            "This host names no managed voice service: set voice.broker_origin in its \
+            "This host names no managed service: set voice.broker_origin or storage.origin in its \
              configuration document to the managed account service's origin."
         )),
     }

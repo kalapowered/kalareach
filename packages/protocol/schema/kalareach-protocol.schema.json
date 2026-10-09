@@ -133,7 +133,7 @@
               "type": "null"
             }
           ],
-          "description": "The account service this host keeps its account for, which is also where its token is\npresented when its voice broker is that service. Null when the host could not set up how to\nreach it, and `unavailable` says why."
+          "description": "The account service this host keeps its account for, which is also where its token is\npresented when its voice broker is that service or it selects that service for storage.\nNull when the host could not set up how to reach it, and `unavailable` says why."
         },
         "state": {
           "$ref": "#/$defs/AccountState",
@@ -148,7 +148,7 @@
               "type": "null"
             }
           ],
-          "description": "Why this host does not sign in or present its account: its configuration names no voice\nbroker, names another service than the account service, or the host could not set up how to\nreach the account service. For the first two, a grant the host already keeps still shows in\n`state`, and `account.sign_out` ends it, whatever the broker is; for the third the host\nreaches no account service, shows `signed_out` and refuses to sign out."
+          "description": "Why this host does not sign in or present its account: its configuration selects no storage\nservice and names no voice broker, selects none and names a broker that is another service\nthan the account service, or the host could not set up how to reach the account service. For\nthe first two, a grant the host already keeps still shows in `state`, and `account.sign_out`\nends it, whatever the broker is; for the third the host reaches no account service, shows\n`signed_out` and refuses to sign out."
         }
       },
       "required": [
@@ -33163,12 +33163,12 @@
       "oneOf": [
         {
           "const": "no_broker",
-          "description": "The host's configuration names no voice broker.",
+          "description": "The host's configuration names neither a voice broker nor a storage service.",
           "type": "string"
         },
         {
           "const": "broker_is_another_service",
-          "description": "The voice broker it names is another service than the account service the host signs in at.",
+          "description": "The host selects no storage service, and the voice broker it names is another service than\nthe account service the host signs in at.",
           "type": "string"
         },
         {

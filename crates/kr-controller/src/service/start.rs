@@ -604,7 +604,7 @@ impl Controller {
             Arc::clone(&secret_store),
             setup.environment_id,
             setup.paths.runtime_root(),
-        ));
+        )?);
         // The managed storage service this host uploads its backups to, when its configuration
         // document selects one. Its clients are built here, from that document and from nothing a
         // process inherited, and they sign as a writer key only this host holds, made the first
@@ -629,7 +629,7 @@ impl Controller {
                     &origin,
                     Self::proxy_of(&started)?.as_ref(),
                     &writer,
-                    &account.tokens(),
+                    &account.tokens_for(origin.as_str()),
                 )?;
                 Some(crate::backup::runtime::BackupRuntime::new(
                     Arc::clone(&backup),

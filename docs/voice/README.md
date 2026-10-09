@@ -228,16 +228,17 @@ token rotates on every use and a second holder would end the sign-in. The setup 
 
 The value is never printed: not by either command, not in a refusal, not in a log. It lives in a
 type with no display, and the one place it is read is the authorisation header of the request it
-authorises. The access token lasts ten minutes. The daemon refreshes it when a call needs one and
-the one it holds is about to end, never before, so a host that starts no call spends no refresh
-token. The browser signs in at the managed account service, and its code is redeemable there alone,
-so a token is presented only to a voice broker that is that service; a host whose configuration
-names another broker presents none. A token issued without the `voice` scope is refused before any
-request carries it. A call closes under the account it started under, so a sign-in is refused while
-a call is open. A call whose phone is lost never stops it: when a sign-in or a sign-out next asks,
-the host ends the record of a call that is past its deadline or that the service says it no longer
-holds, as a stop would. When the service ends the sign-in, the host shows it as ended, and a call
-that needs a token is refused with a message that says to sign in again.
+authorises. The access token lasts ten minutes. The daemon refreshes it when a call, the storage
+carrier or `kr doctor` needs one and the one it holds is about to end, never before, so a host that
+does none of them spends no refresh token. The browser signs in at the managed account service, and
+its code is redeemable there alone, so a token is presented only to a voice broker that is that
+service; a host whose configuration names another broker presents none. A token issued without the
+`voice` scope is refused before any request carries it. A call closes under the account it started
+under, so a sign-in is refused while a call is open. A call whose phone is lost never stops it: when
+a sign-in or a sign-out next asks, the host ends the record of a call that is past its deadline or
+that the service says it no longer holds, as a stop would. When the service ends the sign-in, the
+host shows it as ended, and a call that needs a token is refused with a message that says to sign in
+again.
 
 A host with no account signed in and a host with no provider attached are both complete hosts.
 They start no managed call, and nothing else on them depends on one: sessions, agents and their questions work as

@@ -25,9 +25,16 @@ pub async fn with_account_origin<F: Future>(origin: Option<String>, start: F) ->
     }
 }
 
+/// The environment variable that stands the account service at an origin for a daemon a suite
+/// runs as a program of its own, which no task of the suite starts.
+pub const ACCOUNT_ORIGIN_VARIABLE: &str = "KR_TEST_ACCOUNT_ORIGIN";
+
 /// The origin a suite stood the account service at for the start in progress, when it did.
 pub(crate) fn account_origin() -> Option<String> {
-    ACCOUNT_ORIGIN.try_with(Clone::clone).ok()
+    ACCOUNT_ORIGIN
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| std::env::var(ACCOUNT_ORIGIN_VARIABLE).ok())
 }
 
 /// How long a start is given to take over an environment that is still held.

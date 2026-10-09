@@ -2644,8 +2644,8 @@ export interface AccountReport {
   last_attempt: AccountAttempt | null
   /**
    * The account service this host keeps its account for, which is also where its token is
-   * presented when its voice broker is that service. Null when the host could not set up how to
-   * reach it, and `unavailable` says why.
+   * presented when its voice broker is that service or it selects that service for storage.
+   * Null when the host could not set up how to reach it, and `unavailable` says why.
    */
   service: string | null
   /**
@@ -2694,11 +2694,12 @@ export interface AccountReport {
         state: 'ended'
       }
   /**
-   * Why this host does not sign in or present its account: its configuration names no voice
-   * broker, names another service than the account service, or the host could not set up how to
-   * reach the account service. For the first two, a grant the host already keeps still shows in
-   * `state`, and `account.sign_out` ends it, whatever the broker is; for the third the host
-   * reaches no account service, shows `signed_out` and refuses to sign out.
+   * Why this host does not sign in or present its account: its configuration selects no storage
+   * service and names no voice broker, selects none and names a broker that is another service
+   * than the account service, or the host could not set up how to reach the account service. For
+   * the first two, a grant the host already keeps still shows in `state`, and `account.sign_out`
+   * ends it, whatever the broker is; for the third the host reaches no account service, shows
+   * `signed_out` and refuses to sign out.
    */
   unavailable: SignInUnavailable | null
 }

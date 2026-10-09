@@ -1666,10 +1666,15 @@ kr account show       # signed out, waiting for the browser, signed in, or ended
 client is registered with, and prints the address to open with the port to forward for a host with
 no display (`ssh -L 8765:127.0.0.1:8765 <host>`). It opens the address in the default browser where
 there is one and always prints it. The command ends when the daemon is listening; the browser's page
-says how the sign-in ended, and `kr account show` says it again, with how the last attempt that ended
-ended. Nothing any of the commands prints is a token. The host signs in at the managed account
-service, which must be the voice broker its configuration names; `docs/host/README.md` has the rest,
-and `docs/voice/README.md` what a call does with the account.
+says how the sign-in ended, and `kr account show` says it again, with how the last attempt that
+ended ended. Nothing any of the commands prints is a token. When signing in, the system asks for the
+scope of each service that the host presents its account to. That is, it asks for scope `voice`, if
+`voice.broker_origin` is the managed account service, and it asks for scope `backup.write`, if
+`storage.origin` has been set. If a host selects storage after having signed in already, it holds a
+grant without that scope. In that case, a person needs to sign in again. The command `kr doctor`
+will tell when that is needed. The same holds for `voice` when the broker is selected after a
+sign-in made for storage alone. `docs/host/README.md` has the rest, and `docs/voice/README.md` what
+a call does with the account.
 
 `kr account sign-out` has the daemon end a sign-in that is waiting, remove the account and ask the
 service to end it. When the service cannot be told, the account is gone from this host all the
@@ -1678,14 +1683,15 @@ refused while a voice call is open.
 
 `--json` prints `{ "ok", "opened", "authorise_url", "redirect_address", "expires_at_ms" }` for
 `sign-in`; when the attempt had already ended by the time the command looked, it prints the `show`
-document instead. `sign-out` prints `{ "ok", "was_signed_in", "service_told" }`. `show` prints `{ "ok", "state", "service", "unavailable", "email", "scopes",
-"last_attempt" }`, where `state` is `signed_out`, `waiting_for_browser`, `finishing`, `signed_in`
-or `ended`, and the other fields are present only when they apply: `service` is the account service
-the host keeps its account for, and `unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it does not
-sign in or present an account. A host whose broker is not the account service refuses `sign-in` with
-`HOST_NOT_CONFIGURED`, shows a grant it still keeps, and signs it out; a host that cannot reach the
-account service at all refuses both. One with a voice call open refuses both with
-`RESOURCE_UNAVAILABLE`.
+document instead. `sign-out` prints `{ "ok", "was_signed_in", "service_told" }`. `show` prints `{
+"ok", "state", "service", "unavailable", "email", "scopes", "last_attempt" }`, where `state` is
+`signed_out`, `waiting_for_browser`, `finishing`, `signed_in` or `ended`, and the other fields are
+present only when they apply: `service` is the account service the host keeps its account for, and
+`unavailable` (`no_broker`, `broker_is_another_service` or `not_usable`) says why it does not sign
+in or present an account. A host that selects no storage service and whose broker is not the account
+service refuses `sign-in` with `HOST_NOT_CONFIGURED`, shows a grant it still keeps, and signs it
+out; a host that cannot reach the account service at all refuses both. One with a voice call open
+refuses both with `RESOURCE_UNAVAILABLE`.
 
 ## `kr host paths`
 

@@ -22,8 +22,9 @@
 //!   nobody enrolled, no usable account token): after five minutes, or when work or a writer
 //!   arrives. The host's own account token is checked first and every 30 seconds, because a person
 //!   signs in at a command line that tells the carrier nothing, and no request that carries the
-//!   token leaves the host without a usable one. Requests that carry no token are not held back by that check: the host
-//!   settles what an earlier run sent, and ends work in flight under a fence, whatever the token.
+//!   token leaves the host without a usable one. Requests that carry no token are not held back by
+//!   that check: the host settles what an earlier run sent, and ends work in flight under a fence,
+//!   whatever the token.
 //! * **Nothing is owed**: when something changes.
 //!
 //! # Where it runs
@@ -133,8 +134,6 @@ enum TokenState {
     Absent,
     /// A sign-in is waiting for the person's browser, and nothing is signed in yet.
     SigningIn,
-    /// The account was signed in at another service than the one storage is selected at.
-    OtherService,
     /// The service ended the sign-in.
     Ended,
     /// The account is signed in and its grant lacks the scope backup storage needs, as one made
@@ -152,7 +151,6 @@ impl TokenState {
         match self {
             Self::Absent => "no account is signed in on this host",
             Self::SigningIn => "a sign-in on this host is waiting to finish",
-            Self::OtherService => "the account signed in on this host belongs to another service",
             Self::Ended => "the service ended the sign-in on this host",
             Self::WithoutScope => "the account signed in on this host lacks the backup.write scope",
             Self::NotRenewed => {
@@ -167,10 +165,6 @@ impl TokenState {
         match self {
             Self::Absent => "Sign this host in with `kr account sign-in`.",
             Self::SigningIn => "Finish the sign-in at the address `kr account sign-in` printed.",
-            Self::OtherService => {
-                "Sign this host in again with `kr account sign-in`, at the service storage.origin \
-                 names."
-            }
             Self::Ended => "Sign this host in again with `kr account sign-in`.",
             Self::WithoutScope => {
                 "Sign this host in again with `kr account sign-in`, which asks for backup \
@@ -190,19 +184,13 @@ impl TokenState {
 ///
 /// Whether a request may carry the token is decided by asking the [`AccountTokenSource`], which is
 /// what the clients ask. This only says why, and it is read for no other purpose.
-fn describe_token(account: &HostAccount, origin: &str) -> TokenState {
+fn describe_token(account: &HostAccount) -> TokenState {
     match account.report().state {
-        AccountState::SignedIn {
-            origin: signed_in_at,
-            scopes,
-            ..
-        } => {
-            if signed_in_at != origin {
-                TokenState::OtherService
-            } else if !scopes.iter().any(|scope| scope == BACKUP_WRITE_SCOPE) {
-                TokenState::WithoutScope
-            } else {
+        AccountState::SignedIn { scopes, .. } => {
+            if scopes.iter().any(|scope| scope == BACKUP_WRITE_SCOPE) {
                 TokenState::NotRenewed
+            } else {
+                TokenState::WithoutScope
             }
         }
         AccountState::Ended => TokenState::Ended,
@@ -306,7 +294,6 @@ struct Shared {
     account: Arc<dyn AccountTokenSource>,
     /// The host's sign-in, read only to say what is wrong with it.
     sign_in: Arc<HostAccount>,
-    origin: String,
     writer_key_id: KeyId,
     signals: Arc<BackupSignals>,
     observed: Mutex<Observed>,
@@ -615,9 +602,8 @@ impl BackupRuntime {
         let quiet = Arc::new(Quiet::new(Arc::clone(&timer)));
         let shared = Arc::new(Shared {
             storage: Arc::clone(storage),
-            account: account.tokens(),
+            account: account.tokens_for(origin.as_str()),
             sign_in: account,
-            origin: origin.as_str().to_owned(),
             writer_key_id: writer.key_id(),
             signals: backup.signals(),
             observed: Mutex::default(),
@@ -716,7 +702,9 @@ impl BackupRuntime {
     ///
     /// It asks the service about backup storage, once and for a few seconds, unless the service
     /// asked to be left alone or the host has no usable token, in which case nothing is sent and
-    /// the last answer stands.
+    /// the last answer stands. Asking whether there is a usable token can renew it at the account
+    /// service, under that service's own deadlines and not the status read's: a renewal is never
+    /// cut off part way, because the service may already have spent the refresh token it was sent.
     pub async fn doctor_check(&self) -> DoctorCheck {
         let usable = self.shared.token_usable().await;
         if usable && self.shared.quiet.left().is_none() {
@@ -735,7 +723,7 @@ impl BackupRuntime {
         let state = if usable {
             TokenState::Usable
         } else {
-            describe_token(&self.shared.sign_in, &self.shared.origin)
+            describe_token(&self.shared.sign_in)
         };
         let observed = self.shared.observed();
         let writer = self.shared.writer_key_id;
