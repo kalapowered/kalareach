@@ -192,11 +192,42 @@ impl Controller {
             || {
                 self.check_admission(&registry, &carried)?;
                 self.owner
-                    .covers(&confirmed, digest, "organisation enrolment")
+                    .covers(&confirmed, digest, "organisation enrolment")?;
+                self.head_holds_still(&params.authority, reading.as_ref())
             },
         )?;
         drop(registry);
         encode(&answer)
+    }
+
+    /// Whether the chain's head is still current, and this host still trusts the clock that said
+    /// so, once the enrolment has waited for the locks it writes under.
+    ///
+    /// The head was judged at a reading taken before those waits, and the head's lifetime is a
+    /// bound that can pass while they last. This asks again at the clock now, under the floor, and
+    /// reads nothing that writes: the caller is inside the store's transaction, which a second
+    /// connection to the same file cannot write under.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the chain or the clock earns: a distrusted clock, a head that has run
+    /// out, or a bound this host cannot answer while the floor is owed its record.
+    fn head_holds_still(
+        &self,
+        authority: &kr_protocol::account::PolicyAuthority,
+        read: Option<&crate::service::net::devices::ObservedUtc>,
+    ) -> Result<()> {
+        if !self.lifetimes.clock_trust().is_trusted_now() {
+            return Err(chain_refusal(ChainRefused::ClockUntrusted));
+        }
+        let head_ends = kr_protocol::grant::GrantExpiry::At {
+            expires_at_ms: authority.head.payload.expires_at_ms,
+        };
+        let read_at = read.map_or(0, |reading| reading.now.get());
+        if self.sharing.grants().bound_passed(head_ends, read_at)? {
+            return Err(chain_refusal(ChainRefused::HeadNotCurrent));
+        }
+        Ok(())
     }
 
     /// Refuses a proposed grant that requires an organisation this host cannot answer for.
