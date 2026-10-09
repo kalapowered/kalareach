@@ -491,10 +491,17 @@ jobs:
         run: |
           Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "0.0.0.0 download.libsodium.org"
           ipconfig /flushdns | Out-Null
-          $answer = @([System.Net.Dns]::GetHostAddresses('download.libsodium.org') | ForEach-Object { $_.ToString() })
-          Write-Host "download.libsodium.org now resolves to: $($answer -join ', ')"
-          if ($answer.Count -ne 1 -or $answer[0] -ne '0.0.0.0') {
-            throw 'The route to libsodium''s download host is still open.'
+          # The resolver answers a name that the hosts file sends to 0.0.0.0 with "no data", and
+          # an answer of 0.0.0.0 would close the route as well. Any other address leaves it open.
+          $open = @()
+          try {
+            $open = @([System.Net.Dns]::GetHostAddresses('download.libsodium.org') |
+              Where-Object { $_.ToString() -notin @('0.0.0.0', '::') })
+          } catch [System.Net.Sockets.SocketException] {
+            Write-Host "download.libsodium.org no longer resolves: $($_.Exception.Message)"
+          }
+          if ($open.Count -gt 0) {
+            throw "The route to libsodium's download host is still open: $($open -join ', ')"
           }
 
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
