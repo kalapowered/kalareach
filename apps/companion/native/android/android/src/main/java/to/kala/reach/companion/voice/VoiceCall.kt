@@ -352,6 +352,8 @@ class VoiceCall private constructor(
 
         override fun epochMs(): Long = System.currentTimeMillis()
 
+        override fun answerApplied(): Boolean = true
+
         override fun acquireFocus(): Boolean = audioSession.activate()
 
         override fun releaseFocus() = audioSession.deactivate()

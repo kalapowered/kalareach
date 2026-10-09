@@ -27,6 +27,9 @@ interface VoiceCallPlatform {
     /** The wall clock, in milliseconds since the epoch. */
     fun epochMs(): Long
 
+    /** Whether the provider's answer to the offer has been applied to the connection. */
+    fun answerApplied(): Boolean
+
     /** Takes audio focus for the call. False when the platform refuses it. */
     fun acquireFocus(): Boolean
 
@@ -137,9 +140,10 @@ class VoiceCallControl(
      * the call, in milliseconds since the epoch.
      *
      * @return true when focus is held and the service was asked for; capture then waits for the
-     * service to enter the foreground and for the recorder to start. False when the call is stopped
-     * or already permitted, and false with the call ended when the moment has passed or the
-     * platform refused focus or the service.
+     * service to enter the foreground and for the recorder to start. False and nothing changed when
+     * the call is stopped or already permitted, or the provider's answer to the offer is not applied
+     * yet; false with the call ended when the moment has passed or the platform refused focus or
+     * the service.
      */
     fun permit(voiceSessionId: String, closesAtEpochMs: Long): Boolean =
         entered {
