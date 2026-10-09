@@ -505,6 +505,30 @@ async fn only_the_owner_enrols_and_a_device_does_not_reach_enrolment() {
         .await,
     );
     assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    // What this host can answer for is the owner's to learn. A device that does not manage the
+    // host is told nothing of which organisations it is enrolled in, at which revision: it is
+    // refused as it is for any other invitation it may not ask to have confirmed.
+    let refused = net_support::refusal(
+        raw.mutate(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &OwnerConfirmationRequestParams {
+                subject: ConfirmationSubject::IssueInvitation {
+                    mode: kr_protocol::invitation::InviteModeKind::Direct,
+                    rendezvous_origin: Nullable::null(),
+                    grant_kind: InviteGrantKind::SessionInvitation,
+                    proposed_grant: member_grant(
+                        &organisation,
+                        AuthorityRevision::new(1),
+                        &[ActionRight::SessionView],
+                    ),
+                },
+            },
+        )
+        .await,
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     raw.close();
     assert!(list(&mut client).await.enrolments.is_empty());
     host.stop().await;
