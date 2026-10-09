@@ -105,6 +105,10 @@ pub struct TransferModule {
     /// is what refuses it. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
+    /// The point a worker's read of a draft stops at once the transfer service has answered it,
+    /// before the answer is written. Compiled only with the `testing` feature.
+    #[cfg(feature = "testing")]
+    after_a_read: Arc<crate::attention::Pause>,
     /// The point a worker's claim of an attachment stops at, before it enters the transfer service.
     /// Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
@@ -372,6 +376,8 @@ impl TransferModule {
             #[cfg(feature = "testing")]
             after_the_outer_check: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
+            after_a_read: Arc::new(crate::attention::Pause::default()),
+            #[cfg(feature = "testing")]
             before_a_claim: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
             after_a_claim: Arc::new(crate::attention::Pause::default()),
@@ -389,6 +395,19 @@ impl TransferModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.after_the_outer_check.arm()
+    }
+
+    /// Arms the pause a worker's read of a draft stops at once the transfer service has answered
+    /// it, before the answer is written. Returns the end that says it has arrived, and the end that
+    /// lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_a_read(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.after_a_read.arm()
     }
 
     /// Arms the pause a worker's claim of an attachment stops at once it has been asked of this
@@ -711,13 +730,18 @@ impl TransferModule {
         use kr_protocol::insertion::{DraftAnswer, DraftStep};
         let service = Arc::clone(&self.service);
         #[cfg(feature = "testing")]
+        let after_a_read = Arc::clone(&self.after_a_read);
+        #[cfg(feature = "testing")]
         let before_a_claim = Arc::clone(&self.before_a_claim);
         #[cfg(feature = "testing")]
         let after_a_claim = Arc::clone(&self.after_a_claim);
         blocking(move || {
             Ok(match step {
                 DraftStep::Facts { draft_id } => {
-                    DraftAnswer::Facts(service.insertion_facts(&actor_id, session_id, draft_id)?)
+                    let read = service.insertion_facts(&actor_id, session_id, draft_id);
+                    #[cfg(feature = "testing")]
+                    after_a_read.wait();
+                    DraftAnswer::Facts(read?)
                 }
                 DraftStep::Begin(begin) => {
                     #[cfg(feature = "testing")]
@@ -726,7 +750,7 @@ impl TransferModule {
                         &actor_id,
                         session_id,
                         &begin,
-                        &kr_ipc::clock::boot_elapsed_ms,
+                        &kr_ipc::clock::SystemSharedClock,
                     );
                     #[cfg(feature = "testing")]
                     after_a_claim.wait();

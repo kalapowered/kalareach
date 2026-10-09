@@ -90,7 +90,13 @@ async fn kr_req_23_30_a_plan_that_is_not_the_invocations_own_is_rejected_and_not
     assert!(matches!(send(&mut client, first).await, Outcome::Ok(_)));
     let written = acting.frames().len();
 
-    for (request_id, (action, _)) in (10..).zip(ACTIONS.iter().skip(5)) {
+    // Every action after the ones that prepare the right plan, and not the attachment ones, which
+    // need a draft and are shown in `plugin_insertion.rs`.
+    let wrong = ACTIONS
+        .iter()
+        .skip(5)
+        .filter(|(action, _)| !action.starts_with("attach."));
+    for (request_id, (action, _)) in (10..).zip(wrong) {
         let mut mutation = acting.invocation(&client, action, b"{}");
         mutation.request_id = RequestId::new(request_id);
         let action_id = mutation.action_id;
