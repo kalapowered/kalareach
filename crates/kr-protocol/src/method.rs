@@ -499,7 +499,7 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "The organisations this host is enrolled in, the key each is pinned to, the devices \
           bound to member accounts and the lease each holds, whether exclusive management is on, \
-          and the times it was turned off at this host's terminal.";
+          and every time it was turned off, with how the owner confirmed it.";
 
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,

@@ -134,11 +134,9 @@ use crate::machine::{
 use crate::mailbox::{EnvelopePlaintext, ForwardedAuthority, SealedEnvelope};
 use crate::method::REGISTRY;
 use crate::organisation::{
-    ExclusiveManagementEvent, MembershipPresentParams, MembershipPresentResult,
-    OrganisationChangeMarker, OrganisationEnrolParams, OrganisationEnrolResult,
-    OrganisationEnrolmentView, OrganisationExclusiveSetParams, OrganisationExclusiveSetResult,
-    OrganisationLeaseView, OrganisationListParams, OrganisationListResult, OrganisationMemberView,
-    OrganisationWithdrawParams,
+    ExclusiveManagementEvent, OrganisationEnrolParams, OrganisationEnrolResult,
+    OrganisationEnrolmentView, OrganisationLeaseView, OrganisationListParams,
+    OrganisationListResult, OrganisationMemberView,
 };
 use crate::pairing::{
     AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
@@ -822,22 +820,16 @@ pub fn protocol_schema() -> Value {
         // same reason.
         "host_clock_establish_params" => HostClockEstablishParams,
         "host_clock_establish_result" => HostClockEstablishResult,
-        // Organisation policy on a host: opting in, presenting a membership lease, exclusive
-        // management, withdrawal and the list that reports them. Appended for the same reason.
+        // Organisation policy on a host: opting in, and the list that reports what it holds.
+        // Appended for the same reason.
         "exclusive_management_event" => ExclusiveManagementEvent,
-        "membership_present_params" => MembershipPresentParams,
-        "membership_present_result" => MembershipPresentResult,
-        "organisation_change_marker" => OrganisationChangeMarker,
         "organisation_enrol_params" => OrganisationEnrolParams,
         "organisation_enrol_result" => OrganisationEnrolResult,
         "organisation_enrolment_view" => OrganisationEnrolmentView,
-        "organisation_exclusive_set_params" => OrganisationExclusiveSetParams,
-        "organisation_exclusive_set_result" => OrganisationExclusiveSetResult,
         "organisation_lease_view" => OrganisationLeaseView,
         "organisation_list_params" => OrganisationListParams,
         "organisation_list_result" => OrganisationListResult,
         "organisation_member_view" => OrganisationMemberView,
-        "organisation_withdraw_params" => OrganisationWithdrawParams,
     }
     properties.insert(
         "identifiers".to_owned(),
