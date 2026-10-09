@@ -2929,13 +2929,14 @@ left. A worker that ran as a systemd service also ran in that service's control 
 the reservation and unable to name anything else. The cleanup reads the group from the kernel, asks
 the manager to kill what it still holds, and reaches a process the worker never saw. A recorded
 process that the group held and the manager's delivered kill found is listed as forced; a kill the
-cleanup stopped waiting for is not counted, so the flag is the host's best reading, and a process
-the manager ended that the worker never recorded is not listed.
+cleanup stopped waiting for is not counted, and a group the host could not read beforehand
+attributes nothing, so the flag is the host's best reading, and a process the manager ended that
+the worker never recorded is not listed.
 
 **What it cannot reach, and what a survivor means.** On macOS, a process that left the terminal's
 session, a process the worker started outside it and a process that began after the worker's last
 record are not found; on a Linux host with no service manager, a process that left the session
-and lost its parent before an observation saw it (and what such a process starts), a process the
+and lost its parent before an observation recorded it (and what such a process starts), a process the
 worker started outside the session and a process that began after the last record are not. There
 the record and the worker's own tree or terminal are all there is, and a recorded process that
 left the session is still stopped. Where a service's
@@ -2951,8 +2952,9 @@ worker ran in and the kernel read empty, or a job that needed no help.
 
 **Who waits for it.** The closure is recorded after the cleanup, so a read, a list, the barrier
 and a daemon that starts beside a crashed session wait for it: about five seconds when a recorded
-process ignores the request or the unit's control group still holds something (a group the host
-cannot read counts as holding something, so the period then runs out), and up to four more after
+process ignores the request, the unit's control group still holds something (a group the host
+cannot read counts as holding something, so the period then runs out), or a recorded process that
+this host could not take a hold on is still running, and up to four more after
 force: two for the service manager's answer, which is not waited for past that, and two for the end
 that follows. A start runs the cleanup of every crashed session it finds, claimed or published,
 before waiting for any of them, so it waits for the longest and not for each in turn. A list or a
