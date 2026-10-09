@@ -17,17 +17,20 @@ use crate::error::{ControllerError, Result};
 /// the environment over, not how soon the holder lets go.
 pub const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 
-/// What a test runs once, right after the kernel's refusal of a stop it supplied.
+/// What a test runs once, right after the first stop it supplied an answer to.
 type AfterRefusal = Box<dyn FnOnce() + Send>;
 
-/// The processes whose stop a test has had the kernel refuse, each with what runs after the first
-/// refusal.
-static REFUSED_STOPS: std::sync::Mutex<
-    Vec<(
-        kr_protocol::identity::ProcessStartIdentity,
-        Option<AfterRefusal>,
-    )>,
-> = std::sync::Mutex::new(Vec::new());
+/// An answer a test supplies for the stop of one process.
+struct Supplied {
+    identity: kr_protocol::identity::ProcessStartIdentity,
+    /// Whether the answer is "this host could not take a hold on it" the first time only, and
+    /// the platform's own after, instead of the kernel's refusal every time.
+    unsafe_once: bool,
+    then: Option<AfterRefusal>,
+}
+
+/// The stops a test has supplied an answer for.
+static SUPPLIED_STOPS: std::sync::Mutex<Vec<Supplied>> = std::sync::Mutex::new(Vec::new());
 
 /// Makes the stop of one recorded process answer "operation not permitted", as the kernel does for
 /// a process that belongs to another account. Every other stop is the platform's own.
@@ -46,27 +49,58 @@ pub fn refuse_stopping_then(
     identity: kr_protocol::identity::ProcessStartIdentity,
     then: impl FnOnce() + Send + 'static,
 ) {
-    REFUSED_STOPS
+    SUPPLIED_STOPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((identity, Some(Box::new(then))));
+        .push(Supplied {
+            identity,
+            unsafe_once: false,
+            then: Some(Box::new(then)),
+        });
 }
 
-/// Whether a test has had the stop of this process refused.
-pub(crate) fn stop_is_refused(identity: &kr_protocol::identity::ProcessStartIdentity) -> bool {
-    let (refused, then) = {
-        let mut stops = REFUSED_STOPS
+/// Makes the first stop of one recorded process answer that this host could not take a hold on
+/// it, as a platform does that cannot describe the process at that moment. Every later stop of it
+/// is the platform's own.
+pub fn fail_taking_a_hold_once(identity: kr_protocol::identity::ProcessStartIdentity) {
+    SUPPLIED_STOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Supplied {
+            identity,
+            unsafe_once: true,
+            then: None,
+        });
+}
+
+/// The answer a test has supplied for the stop of this process, if it has.
+pub(crate) fn supplied_stop(
+    identity: &kr_protocol::identity::ProcessStartIdentity,
+) -> Option<kr_ipc::identity::Stopped> {
+    let (answer, then) = {
+        let mut stops = SUPPLIED_STOPS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match stops.iter_mut().find(|(refused, _)| refused == identity) {
-            Some((_, then)) => (true, then.take()),
-            None => (false, None),
+        let position = stops
+            .iter()
+            .position(|supplied| supplied.identity == *identity)?;
+        if stops[position].unsafe_once {
+            stops.remove(position);
+            (
+                kr_ipc::identity::Stopped::Unsafe("no hold could be taken".to_owned()),
+                None,
+            )
+        } else {
+            (
+                kr_ipc::identity::Stopped::Refused("Operation not permitted".to_owned()),
+                stops[position].then.take(),
+            )
         }
     };
     if let Some(then) = then {
         then();
     }
-    refused
+    Some(answer)
 }
 
 /// How long a start waits before it tries again.

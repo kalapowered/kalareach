@@ -1002,6 +1002,44 @@ async fn a_process_the_platform_will_not_stop_is_named_and_the_coverage_stays_in
     assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete);
 }
 
+/// A hold the platform could not take when the process was asked to end is not a refusal: the
+/// process stays to be ended, and the end that follows takes the hold and ends it, forced.
+///
+/// What is supplied is the platform's answer that it could not take a hold the first time (a
+/// process it could not describe at that moment); the process is real, and the second stop is the
+/// platform's own. Windows asks nothing first, so there the case does not arise.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_that_could_not_be_taken_at_the_request_is_tried_again_at_the_end() {
+    let (_temp, archive) = host();
+    let session_id = session();
+    let process = leftover();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_owned(session_id, &owned_record(vec![process.identity.clone()]))
+            .expect("records what the session owned");
+    }
+    kr_controller::testing::fail_taking_a_hold_once(process.identity.clone());
+    let ownership = take(&archive, session_id);
+
+    let fenced = archive.fence_owned(&ownership, None).await;
+
+    assert!(
+        !process.running(),
+        "the process was ended at the second try"
+    );
+    let ended = fenced
+        .ended
+        .iter()
+        .find(|ended| ended.identity == process.identity)
+        .unwrap_or_else(|| panic!("it is listed as ended: {fenced:?}"));
+    assert!(
+        ended.forced,
+        "and as forced, because it did not end when asked: {fenced:?}"
+    );
+}
+
 /// A claim of completeness is read off the report it sits in: a process the report names as still
 /// running is never inside a complete claim, whatever else ended or was confirmed.
 ///
