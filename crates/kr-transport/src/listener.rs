@@ -950,13 +950,6 @@ pub fn device_principal(device_id: &DeviceId) -> ActorId {
     .expect("a base64url device identity is a valid opaque identifier")
 }
 
-/// Whether `actor_id` is the principal of a paired device ([`device_principal`]) and not of a
-/// caller at this machine, whose principals never begin so.
-#[must_use]
-pub fn is_device_principal(actor_id: &ActorId) -> bool {
-    actor_id.as_str().starts_with("device:")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

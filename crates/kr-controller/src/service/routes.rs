@@ -868,7 +868,7 @@ pub fn local_actor(
 /// device is named after its device identity by the transport. Anything this host cannot recognise
 /// as the local peer is treated as somebody else, because that is the answer that withholds rather
 /// than the one that publishes.
-fn is_owners_own_socket(actor_id: &ActorId) -> bool {
+pub(super) fn is_owners_own_socket(actor_id: &ActorId) -> bool {
     actor_id.as_str().starts_with(LOCAL_PRINCIPAL_PREFIX)
 }
 

@@ -4930,7 +4930,7 @@ caller whose window has closed, or whose daemon has restarted since, is still to
 * for an attempt that ended without recording what it did (the daemon stopped, or the attempt's
   task ended, in between), what this host's own records prove it did, and otherwise
   `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take
-  identities derived from the action. A revocation writes what it withdrew beside its action's
+  identities derived from the actor and the action. A revocation writes what it withdrew beside its action's
   claim, in the transaction that withdraws, and is answered from that once nothing is left for it
   to do: for a grant revocation, the grant it names stands revoked; for a device revocation, the
   device's own record stands revoked, its last write, and so does every grant the device holds.
