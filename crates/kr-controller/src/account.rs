@@ -193,6 +193,16 @@ impl std::fmt::Debug for HostAccount {
     }
 }
 
+/// What [`HostAccount::grant_mark`] says of the grant the host holds.
+#[derive(Clone, Debug)]
+pub struct GrantMark(Option<AccountStatus>);
+
+impl PartialEq for GrantMark {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((&self.0, &other.0), (Some(held), Some(then)) if held == then)
+    }
+}
+
 impl HostAccount {
     /// The sign-in of one environment, kept in `store`, at `service` where this host can reach the
     /// account service, or why it cannot. `refused` is why this host neither signs in nor presents
@@ -304,6 +314,22 @@ impl HostAccount {
             .await
             .expect("the grant is kept");
         assert_eq!(committed, Commit::Kept);
+    }
+
+    /// A mark of the grant this host holds now, for whatever must know that the grant it saw has
+    /// not been replaced since.
+    ///
+    /// Two marks are equal while it is the same grant with the same scopes: a refresh keeps both.
+    /// They differ after a sign-in, a sign-out, a sign-in again of the same account, a grant the
+    /// service ended, or a refresh that narrowed the scopes. They read the grant that is kept, and
+    /// not the state of a sign-in attempt under way. A store that cannot be read gives a mark that
+    /// is equal to none, itself included.
+    #[must_use]
+    pub fn grant_mark(&self) -> GrantMark {
+        GrantMark(match &self.inner.held {
+            None => Some(AccountStatus::SignedOut),
+            Some(held) => held.signed_in.status().ok(),
+        })
     }
 
     /// The token source a managed call to the service at `origin` presents: this host's sign-in at

@@ -344,7 +344,19 @@ impl Shared {
     }
 
     /// Notes what a pass found, and says what to wait on.
-    fn absorb(&self, report: &PassReport, backoff: &mut Backoff) -> Wait {
+    ///
+    /// `account_moved` says the account changed while the pass ran: the pass's answers from the
+    /// service are noted, and what held its work back is not, because it may have been the token
+    /// of the account before the change or of the one after, and the pass is looked at again
+    /// soon. `token_refused` says that what held the work back was the host's own token and not a
+    /// thing at the service, so the doctor says the token and not a refusal.
+    fn absorb(
+        &self,
+        report: &PassReport,
+        account_moved: bool,
+        token_refused: bool,
+        backoff: &mut Backoff,
+    ) -> Wait {
         let progressed = report
             .steps
             .iter()
@@ -360,7 +372,7 @@ impl Shared {
                 observed.status_refusal = None;
                 observed.status_unanswered = false;
             }
-            if matches!(report.idle, Some(Idle::Unavailable { .. })) {
+            if matches!(report.idle, Some(Idle::Unavailable { .. })) && !account_moved {
                 observed.status_refusal = report.hold;
                 observed.status_unanswered = false;
             }
@@ -369,7 +381,24 @@ impl Shared {
             // stopped at a delay did not, and says nothing of what held the work before. A pass
             // that was turned back at its first question carried no work, and what it met is the
             // status refusal above.
-            if report.idle.is_none() && (report.hold.is_some() || report.quiet.is_none()) {
+            if account_moved {
+                // Only the service names a delay, so a delay the pass was given stands whichever
+                // account it was asked for; a pass that stopped at a delay says nothing of what
+                // held the work before. What else the pass met may have been the token of the
+                // account before the change or of the one after.
+                observed.pass_hold =
+                    match (report.hold.and_then(|hold| hold.retry_after), report.quiet) {
+                        (Some(retry_after), _) => Some(Hold {
+                            code: ErrorCode::ServiceCapacity,
+                            retry_after: Some(retry_after),
+                        }),
+                        (None, Some(_)) => observed.pass_hold,
+                        (None, None) => None,
+                    };
+            } else if token_refused {
+                observed.pass_hold = None;
+                observed.token_blocked = true;
+            } else if report.idle.is_none() && (report.hold.is_some() || report.quiet.is_none()) {
                 observed.pass_hold = report.hold;
             }
             observed.last_pass = Some(LastPass {
@@ -386,6 +415,12 @@ impl Shared {
         }
         if progressed && report.hold.is_none() {
             backoff.reset();
+        }
+        if account_moved {
+            return Wait::Timed {
+                duration: TOKEN_CHECK,
+                wakeable: true,
+            };
         }
         if let Some(hold) = report.hold {
             return self.after(hold, backoff);
@@ -493,27 +528,27 @@ impl Shared {
             }
         }
         self.observed().token_blocked = false;
+        let grant = self.sign_in.grant_mark();
         match uploader.pass(kr_ipc::now_ms()).await {
             Ok(report) => {
-                let wait = self.absorb(&report, backoff);
                 // A refusal only a person can mend, met by a host whose token has stopped being
-                // usable since the check, is the token to wait for and not a five-minute wait.
-                if report.hold.is_some_and(|hold| hold.needs_a_person())
-                    && !self.token_usable().await
-                {
-                    // What was refused was the host's own token and not a thing at the service, so
-                    // the doctor says the token and not a refusal. Under a fence that is so as well,
-                    // and the fence keeps the wait it asked for.
-                    let mut observed = self.observed();
-                    observed.token_blocked = true;
-                    observed.pass_hold = None;
-                    drop(observed);
-                    if !fenced {
-                        return Wait::Timed {
-                            duration: TOKEN_CHECK,
-                            wakeable: true,
-                        };
-                    }
+                // usable, is the token to wait for and not a five-minute wait. Whether the token
+                // is usable is asked once the pass is over and before the account is looked at
+                // again, so that "the account is as it was when the pass began" vouches for the
+                // answer: a person who signs in, out or again while a pass runs changes the token
+                // the pass's requests present from one request to the next, and then nothing the
+                // pass met says anything sure of the service or of the token.
+                let by_a_person = report.hold.is_some_and(|hold| hold.needs_a_person());
+                let usable = !by_a_person || self.token_usable().await;
+                let account_moved = self.sign_in.grant_mark() != grant;
+                let token_refused = by_a_person && !usable && !account_moved;
+                let wait = self.absorb(&report, account_moved, token_refused, backoff);
+                // Under a fence the wait the fence asked for stands.
+                if token_refused && !fenced {
+                    return Wait::Timed {
+                        duration: TOKEN_CHECK,
+                        wakeable: true,
+                    };
                 }
                 wait
             }
