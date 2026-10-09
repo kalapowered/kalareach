@@ -12,6 +12,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-07.60 | the observation records the root shell, a job, a job that called `setsid`, and a process the worker adopted when its parent exited, and not a process of the worker's own; a process adopted while the observation runs, and one left in the session after the root shell has gone, are found too |
+//! | KR-REQ-07.66 | the worker's own close hangs up on what it recorded and, after the grace period, ends what ignored the hangup, each through the hold the platform gives on the recorded process |
 //! | KR-PERF-003 | an idle session's observation reads no process outside the worker's own tree, so what it costs does not grow with the processes on the host |
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
@@ -416,6 +417,60 @@ fn kr_req_07_60_a_process_left_after_the_root_shell_has_gone_is_found() {
         seen.contains(&left),
         "the process left in the session, {left}, is found: {seen:?}"
     );
+
+    tree.end();
+}
+
+/// Whether a process is still running: there is a `/proc` entry for it that is not a process
+/// waiting to be collected.
+fn running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
+        })
+        .is_some_and(|state| state != "Z")
+}
+
+/// Waits until a process is no longer running, for at most [`LIVENESS`].
+fn ends(pid: u32, what: &str) {
+    let deadline = Instant::now() + LIVENESS;
+    while running(pid) {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// KR-REQ-07.66: the worker's own close asks what it recorded to stop with a hangup, and ends what
+/// is left with the kill that cannot be refused. A job that takes the hangup ends at the request; a
+/// job that ignores it is still running afterwards and ends at the force.
+#[test]
+fn kr_req_07_66_the_workers_close_hangs_up_and_then_ends_what_ignored_it() {
+    let _turn = turn();
+    let mut tree = Tree::start(
+        "sleep 60 & echo \"a job that takes a hangup $!\" >> \"$KR_TREE\"; \
+         (trap '' HUP; exec sleep 60) & echo \"a job that ignores a hangup $!\" >> \"$KR_TREE\"",
+        2,
+    );
+    let hearing = tree.pid("a job that takes a hangup");
+    let deaf = tree.pid("a job that ignores a hangup");
+    let seen = tree.seen();
+    assert!(
+        seen.contains(&hearing) && seen.contains(&deaf),
+        "both jobs are recorded: {seen:?}"
+    );
+    let owned = tree
+        .session
+        .owned()
+        .expect("a launched session owns its processes");
+
+    kr_worker::ownership::request_stop(owned);
+    ends(hearing, "the job that takes a hangup ends at the request");
+    assert!(running(deaf), "the job that ignores a hangup has not ended");
+
+    kr_worker::ownership::force_stop(owned);
+    ends(deaf, "the job that ignores a hangup ends at the force");
 
     tree.end();
 }

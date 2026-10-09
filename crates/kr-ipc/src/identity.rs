@@ -431,6 +431,9 @@ pub enum Stop {
     /// Ask it to end: terminate, hang up and continue, which a stopped process needs to see the
     /// other two. A platform with no such request ([`Stopped::Unsupported`]) is waited on instead.
     Terminate,
+    /// Hang up on it, the request a terminal makes of the jobs of a session that ends and nothing
+    /// more. A platform with no such request ([`Stopped::Unsupported`]) is waited on instead.
+    Hangup,
     /// End it, with no chance to refuse.
     Kill,
 }
@@ -1198,6 +1201,7 @@ mod platform {
         }
         let signals: &[Signal] = match stop {
             super::Stop::Terminate => &[Signal::TERM, Signal::HUP, Signal::CONT],
+            super::Stop::Hangup => &[Signal::HUP],
             super::Stop::Kill => &[Signal::KILL],
         };
         for (index, signal) in signals.iter().enumerate() {
@@ -1506,6 +1510,7 @@ mod platform {
         }
         let signals: &[i32] = match stop {
             super::Stop::Terminate => &[libc::SIGTERM, libc::SIGHUP, libc::SIGCONT],
+            super::Stop::Hangup => &[libc::SIGHUP],
             super::Stop::Kill => &[libc::SIGKILL],
         };
         // How many times a process that keeps running new programs is followed before it is said
@@ -2146,15 +2151,16 @@ mod platform {
     /// creation time that was compared to the process that is ended.
     ///
     /// There is no request to end a process on this platform that is not also the end of it, so
-    /// [`super::Stop::Terminate`] is [`super::Stopped::Unsupported`]: a caller that wants a
-    /// grace period waits for the session's job to do its work, and ends what is left.
+    /// [`super::Stop::Terminate`] and [`super::Stop::Hangup`] are [`super::Stopped::Unsupported`]:
+    /// a caller that wants a grace period waits for the session's job to do its work, and ends
+    /// what is left.
     pub(super) fn stop(
         identity: &kr_protocol::identity::ProcessStartIdentity,
         stop: super::Stop,
     ) -> super::Stopped {
         use super::Stopped;
 
-        if stop == super::Stop::Terminate {
+        if stop != super::Stop::Kill {
             return Stopped::Unsupported;
         }
         let Ok(pid) = u32::try_from(identity.pid.get()) else {
