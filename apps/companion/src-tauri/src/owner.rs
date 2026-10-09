@@ -25,7 +25,7 @@ use kr_client::pairing::owner::{
     STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown_host, shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
-use kr_protocol::confirmation::{CatalogueTrustPlan, NATIVE_BRIDGE_NOTICE, PluginInstallPlan};
+use kr_protocol::confirmation::{CatalogueTrustPlan, PluginInstallPlan, install_notices};
 use kr_protocol::ids::{ConfirmationId, DeviceId};
 use kr_protocol::pairing::{OwnerConfirmationRequest, SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
@@ -511,11 +511,13 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
             statement: None,
         }),
         Subject::PluginInstall(plan) => {
-            let bridge = plan.grant_statement.is_some()
-                || plan.grant.contains(&"native_bridge.install".to_owned());
+            // The host's own notice for each capability in the grant that it describes, apart from
+            // the statement the release makes.
+            let grant: Vec<String> = plan.grant.iter().cloned().collect();
+            let notices = install_notices(&grant);
             Some(Particulars {
                 facts: installation_facts(plan)?,
-                notice: bridge.then(|| NATIVE_BRIDGE_NOTICE.to_owned()),
+                notice: (!notices.is_empty()).then(|| notices.join(" ")),
                 statement: match &plan.grant_statement {
                     Some(words) => Some(plain(words, STATEMENT_CHARS)?),
                     None => None,
@@ -958,6 +960,74 @@ mod tests {
             )),
             "{:?}",
             view.facts
+        );
+    }
+
+    /// KR-REQ-12.07: an installation whose grant holds a command integration carries the host's own
+    /// notice of it, and its statement holds the host's reading of the declaration after the label
+    /// that says so, so a bridge's words that come before it are not taken for it. A grant that
+    /// holds a native bridge too carries both notices, and a grant with only the integration
+    /// claims no bridge.
+    #[test]
+    fn an_installation_with_a_command_integration_shows_the_hosts_notice_for_it_alone() {
+        use kr_protocol::confirmation::{
+            COMMAND_INTEGRATION_NOTICE, INTEGRATION_STATEMENT_LABEL, NATIVE_BRIDGE_NOTICE,
+            install_statement,
+        };
+        let reading = "Runs \"codex\" in KalaReach sessions with no arguments added. It sets no \
+                       environment variables.";
+        let view_of = |grant: &[&str], statement: Option<String>| {
+            let plan = PluginInstallPlan {
+                grant: grant.iter().map(|name| (*name).to_owned()).collect(),
+                grant_statement: statement,
+                ..installation()
+            };
+            describe(
+                "a reference",
+                "studio",
+                &listed_subject(
+                    Subject::PluginInstall(plan),
+                    SensitiveAction::GrantExecutableCapability,
+                ),
+                NOW,
+            )
+        };
+
+        let only = view_of(
+            &["command_integration.launch"],
+            install_statement(None, Some(reading)),
+        );
+        assert!(only.checkable);
+        assert_eq!(only.notice.as_deref(), Some(COMMAND_INTEGRATION_NOTICE));
+        assert_eq!(
+            only.statement,
+            Some(format!("{INTEGRATION_STATEMENT_LABEL} {reading}"))
+        );
+        assert!(
+            only.detail.as_deref().is_some_and(|line| {
+                line.contains("a command integration that changes how a command starts")
+                    && !line.contains("native bridge")
+            }),
+            "{:?}",
+            only.detail
+        );
+
+        let both = view_of(
+            &["command_integration.launch", "native_bridge.install"],
+            install_statement(Some(PUBLISHER), Some(reading)),
+        );
+        assert!(both.checkable);
+        assert_eq!(
+            both.notice,
+            Some(format!(
+                "{NATIVE_BRIDGE_NOTICE} {COMMAND_INTEGRATION_NOTICE}"
+            ))
+        );
+        assert_eq!(
+            both.statement,
+            Some(format!(
+                "{PUBLISHER} {INTEGRATION_STATEMENT_LABEL} {reading}"
+            ))
         );
     }
 

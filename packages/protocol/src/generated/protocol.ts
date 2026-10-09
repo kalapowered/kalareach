@@ -16676,10 +16676,12 @@ export interface PendingConfirmation {
            */
           grant: string[]
           /**
-           * What the release's own manifest says a native bridge it installs does, where it
-           * installs one. These are the publisher's words, taken by the host from the verified
-           * manifest of the exact package hash and covered by the confirmation; a device shows
-           * them apart from [`NATIVE_BRIDGE_NOTICE`], which is the host's.
+           * What the release's own manifest says of what the grant would let it do: for a native
+           * bridge, the publisher's words; for a command integration, the host's own exact reading
+           * of the declaration, after [`INTEGRATION_STATEMENT_LABEL`]. The host takes both from the
+           * verified manifest of the exact package hash (see [`install_statement`]) and the
+           * confirmation covers them; a device shows them apart from the host's notices
+           * ([`NATIVE_BRIDGE_NOTICE`], [`COMMAND_INTEGRATION_NOTICE`]).
            */
           grant_statement: string | null
           /**

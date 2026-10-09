@@ -155,23 +155,47 @@ impl Installation {
     }
 
     /// Returns the first capability a grant of `proposed` would add to this installation, where
-    /// this release asks for a native bridge.
+    /// the capability is one whose statement an owner is shown only when the release is installed
+    /// with a grant.
     ///
-    /// A bridge runs under the application's own permissions, outside the plugin sandbox, and the
-    /// owner is shown the publisher's statement of what it does and the host's notice of that when
-    /// the release is installed with a grant. A grant that only changes an installation later
-    /// shows neither, so for such a release it only narrows: adding to what it holds is the
-    /// install's.
+    /// A native bridge runs under the application's own permissions, outside the plugin sandbox,
+    /// and a command integration changes how the application starts. The owner is shown the
+    /// publisher's statement of the bridge, or the host's reading of the integration, and the
+    /// host's notice of it when the release is installed with a grant. A grant that only changes
+    /// an installation later shows neither. So for a release that asks for a bridge it only
+    /// narrows, and for a release that asks for a command integration it never adds that
+    /// capability: adding is the install's.
     #[must_use]
-    pub fn widening_for_a_bridge(&self, proposed: &InstallationGrant) -> Option<PluginCapability> {
-        if !self
-            .requested
-            .iter()
-            .any(|request| request.capability == PluginCapability::NativeBridgeInstall)
-        {
-            return None;
+    pub fn widening_for_a_statement(
+        &self,
+        proposed: &InstallationGrant,
+    ) -> Option<PluginCapability> {
+        let asks = |capability| {
+            self.requested
+                .iter()
+                .any(|request| request.capability == capability)
+        };
+        let added = self.grant.increase_over(proposed);
+        if asks(PluginCapability::NativeBridgeInstall) {
+            return added.first().copied();
         }
-        self.grant.increase_over(proposed).first().copied()
+        if asks(PluginCapability::CommandIntegrationLaunch) {
+            return added
+                .into_iter()
+                .find(|capability| *capability == PluginCapability::CommandIntegrationLaunch);
+        }
+        None
+    }
+
+    /// What a refused later grant says to do instead, for the capability `added`.
+    #[must_use]
+    pub fn install_requirement(&self, added: PluginCapability) -> String {
+        format!(
+            "plugin.install of the installed release: {} asks for {added}, so a grant that adds to \
+             what it holds is made when the owner confirms the release, which shows the statement \
+             of what it does and the host's notice of it",
+            self.plugin_id
+        )
     }
 
     /// Returns whether the installation is pinned once a pin naming `package_digest` is applied.

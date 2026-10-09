@@ -25,6 +25,8 @@ kr-client = { workspace = true, features = ["terminal"] }
 kr-controller.workspace = true
 # Process identities, the host's directories and placing a binary on the internal disk.
 kr-ipc = { workspace = true, features = ["testing"] }
+# The host's reading of a command integration, which the owner's device is shown.
+kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 # Where the host's configuration document lives, as the host itself works it out.
 kr-worker.workspace = true
