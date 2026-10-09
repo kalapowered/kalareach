@@ -1,33 +1,31 @@
-//! The recovery bundle's read and write, answering as the Worker's settings-sync route does.
+//! An account's recovery bundle at the sync route, answering as the Worker's sync collection does.
 //!
-//! One route, `sync.compare_exchange`, carries eight members. This answers two: a read of the
-//! recovery bundle at its locator (`compare`), which a device restoring from a kit makes, and the
-//! owner's write of it (`exchange`). The bundle belongs to an account, so each carries two proofs.
-//! The signature is an installation's (a host's key is refused by the route), and the account token
-//! beside it carries `backup.write` for a write and `backup.write` or `backup.restore` for a read.
-//! A request without a usable token, a token another account holds, and a locator no write has
-//! reached by an account that cannot own it are answered alike, as a collection that does not
-//! exist.
+//! The bundle is one sealed object at a locator the recovery kit prints. The route is the one
+//! settings sync uses, and a request that names a `locator` is about the bundle: it carries an
+//! account token beside the signature, and a token that proves no account, or proves one without
+//! the scope the request needs, is answered as for a collection that does not exist. A write
+//! compares the revision it replaces against the one held; a write the comparison refuses keeps no
+//! copy. Every write names its request identity, and the collection keeps a receipt for it, so a
+//! write asked about or fenced after its answer was lost is settled by what the receipt holds.
 //!
-//! A write compares the revision it names against the one the bundle holds, and names none for a
-//! bundle nobody has written. It applies when they agree and is otherwise answered `conflict`,
-//! carrying where the bundle stands. A write whose request identity the service has answered is
-//! answered what it was answered the first time, and one that reuses the identity for other content
-//! is `ID_CONFLICT`. A write spends the account's backup storage, so an account the test has left
-//! with no allowance is answered `QUOTA_EXHAUSTED`.
-//!
-//! The other members of the route are not modelled: they answer `INVALID_REQUEST` and say so. A
-//! test may also put a bundle in place with [`crate::ServiceWeb::put_bundle`], which is what a
-//! write by the owner leaves behind.
+//! The account whose write first applies is the collection's owner, and every other account is
+//! answered as for a collection that does not exist. A collection put back from an archive names the
+//! history it is in, with or without a bundle. The service knows one account, so a test sets either
+//! up with [`crate::ServiceWeb::put_bundle`] and [`crate::ServiceWeb::put_bundle_back`], which leave
+//! what a write by the owner and a restore of the archive leave. It is not modelled what a sweep past
+//! the receipts' retention does to a request signed before it.
 //!
 //! The source is the web repository's `workers/api/src/sync/{index,collection}.ts` and
-//! `packages/service-contracts/src/sync.ts`.
+//! `packages/service-contracts/src/sync.ts`. Settings-sync collections, drafts and key records use
+//! the same route and are not modelled: a request for one is answered `400 INVALID_REQUEST` and
+//! says so.
 
 use std::collections::BTreeMap;
 
 use kr_client::services::ServiceHttpAnswer;
-use kr_protocol::scalars::Bytes;
-use kr_protocol::sync::SealedRecoveryBundle;
+use kr_protocol::sync::{
+    MAX_SEALED_RECOVERY_BUNDLE_BYTES, MIN_SEALED_RECOVERY_BUNDLE_BYTES, SYNC_RECORD_BYTES,
+};
 use serde_json::{Value, json};
 
 use crate::web::{BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Token, answered, refusal};
@@ -35,10 +33,7 @@ use crate::web::{BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Token, answered, refu
 /// Where the route is addressed.
 pub(crate) const PATH: &str = "/api/sync/exchange";
 
-/// The kind of the one object a recovery bundle's collection holds.
-const RECOVERY_BUNDLE_KIND: &str = "recovery_bundle";
-
-/// The members of a settings-sync request, of which one is named.
+/// The members a settings-sync request is exactly one of.
 const MEMBERS: [&str; 8] = [
     "exchange",
     "compare",
@@ -50,332 +45,221 @@ const MEMBERS: [&str; 8] = [
     "memberships",
 ];
 
-/// The bundle a service holds at one locator, and who it belongs to.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Bundle {
-    /// What the service answered each request identity of a write, with the content it was asked
-    /// for, so that a repeat is answered from it.
-    pub(crate) receipts: BTreeMap<String, (String, Value)>,
-    /// The account whose first write applied there, or nobody before one has.
-    pub(crate) owner: Option<String>,
-    /// The history the collection is in: the identity it was put back under, or none.
-    pub(crate) recovery: Option<String>,
-    /// The stream and where it stands, once a write has applied.
-    pub(crate) held: Option<Held>,
-    /// How many writes the collection has taken.
-    pub(crate) writes: u64,
-}
-
-/// One written bundle.
+/// The bundle as the collection holds it.
 #[derive(Clone, Debug)]
-pub(crate) struct Held {
-    /// The name the service gave the write.
-    pub(crate) revision: String,
-    /// The write's place in the order.
-    pub(crate) write_sequence: u64,
-    /// The sealed stream.
-    pub(crate) ciphertext: Vec<u8>,
+struct Kept {
+    revision: String,
+    write_sequence: u64,
+    updated_at: String,
+    /// The sealed stream as it arrived, in the form it travels in.
+    ciphertext: Value,
+    /// What the record around it and the stream count for.
+    bytes: u64,
 }
 
-impl Bundle {
-    /// A write by `account` of `ciphertext` has applied.
-    pub(crate) fn write(&mut self, account: &str, ciphertext: Vec<u8>) {
-        self.writes += 1;
-        self.owner.get_or_insert_with(|| account.to_owned());
-        self.held = Some(Held {
-            revision: format!("{:08x}-0000-4000-8000-{:012x}", self.writes, self.writes),
-            write_sequence: self.writes,
-            ciphertext,
+impl Kept {
+    /// The record the service names the bundle by.
+    fn record(&self, locator: &str) -> Value {
+        json!({
+            "kind": "recovery_bundle",
+            "object_id": locator,
+            "revision": self.revision,
+            "write_sequence": self.write_sequence.to_string(),
+            "updated_at": self.updated_at,
+            "bytes": self.bytes.to_string(),
+        })
+    }
+}
+
+/// What one receipt recorded about one request identity.
+#[derive(Clone, Debug)]
+struct Receipt {
+    /// What the write asked, less its identity: an exact retry asks the same.
+    digest: Value,
+    /// `written`, `conflict` or `fenced`.
+    outcome: &'static str,
+    /// What an exact retry of the write is answered again.
+    answer: Option<Value>,
+    /// The record the bundle had when the receipt was written.
+    record: Option<Value>,
+    current_revision: Option<String>,
+    current_write_sequence: Option<String>,
+    never_ran: bool,
+    recorded_at: String,
+}
+
+/// The collection one locator names.
+#[derive(Debug, Default)]
+struct Collection {
+    /// The account whose first write applied, or nobody before one has.
+    owner: Option<String>,
+    /// The history the collection is in: the identity it was put back under, or none.
+    recovery: Option<String>,
+    kept: Option<Kept>,
+    receipts: BTreeMap<String, Receipt>,
+    /// Revisions given so far, so each is new.
+    revisions: u64,
+}
+
+/// Every recovery bundle the service keeps, by locator.
+#[derive(Debug, Default)]
+pub(crate) struct Bundles {
+    collections: BTreeMap<String, Collection>,
+}
+
+/// Why a request about the bundle is not one the contract reads.
+struct Unread(ServiceHttpAnswer);
+
+impl Bundles {
+    /// The write sequence and the sealed stream the bundle at `locator` stands at.
+    pub(crate) fn held(&self, locator: &str) -> Option<(u64, Vec<u8>)> {
+        let kept = self.collections.get(locator)?.kept.as_ref()?;
+        let text = kept.ciphertext.as_str()?;
+        Some((kept.write_sequence, decode(text)?))
+    }
+
+    /// A write by `account` of `ciphertext` has applied, as the owner's write leaves the bundle: the
+    /// account owns the locator if nobody did, and the stream is held under the next place in the
+    /// collection's order. Writing again replaces the stream, as a later write of the owner does.
+    pub(crate) fn put(&mut self, locator: &str, account: &str, ciphertext: &[u8], now_ms: u64) {
+        let collection = self.collections.entry(locator.to_owned()).or_default();
+        collection.owner.get_or_insert_with(|| account.to_owned());
+        collection.revisions += 1;
+        collection.kept = Some(Kept {
+            revision: format!("00000000-0000-4000-8000-{:012x}", collection.revisions),
+            write_sequence: collection
+                .kept
+                .as_ref()
+                .map_or(1, |kept| kept.write_sequence + 1),
+            updated_at: instant(now_ms),
+            ciphertext: Value::String(kr_protocol::scalars::to_base64url(ciphertext)),
+            bytes: ciphertext.len() as u64 + SYNC_RECORD_BYTES,
         });
     }
-}
 
-/// What the route answers one request that reached it, from the second proof's account.
-///
-/// `tokens` is what the service knows of each token, `token` the bearer beside the request, and
-/// `funded` whether the account's backup storage admits a write.
-pub(crate) fn exchange(
-    bundles: &mut BTreeMap<String, Bundle>,
-    tokens: &BTreeMap<String, Token>,
-    body: &Value,
-    token: Option<&str>,
-    funded: bool,
-) -> ServiceHttpAnswer {
-    let Some(members) = body.as_object() else {
-        return refuse("A settings-sync request is an object.");
-    };
-    let named: Vec<&str> = MEMBERS
-        .into_iter()
-        .filter(|member| members.contains_key(*member))
-        .collect();
-    let [member] = named.as_slice() else {
-        return refuse(
-            "A settings-sync request exchanges, compares, resolves, queries status, fences a request identity, reads or offers key records, or lists memberships, and asks for one of those.",
-        );
-    };
-    let Some(fields) = members[*member].as_object() else {
-        return refuse("A settings-sync request carries the fields of what it asks for.");
-    };
-    if !["compare", "exchange"].contains(member) || !fields.contains_key("locator") {
-        return refuse(
-            "This service answers a read and a write of the recovery bundle at its locator and no other settings-sync request.",
-        );
-    }
-    let writing = *member == "exchange";
-    // The request against its closed shape: a locator and the one kind a locator holds, and for a
-    // write the identity, the revision it replaces and the object.
-    let allowed: &[&str] = if writing {
-        &[
-            "request_id",
-            "locator",
-            "kind",
-            "expected_revision",
-            "object",
-        ]
-    } else {
-        &["locator", "kind"]
-    };
-    if let Some(extra) = fields
-        .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
-    {
-        return refuse(&format!(
-            "A read of the recovery bundle carries {extra}, which a request naming a locator does not."
-        ));
-    }
-    let Some(locator) = fields["locator"].as_str().filter(|text| is_uuid(text)) else {
-        return refuse(
-            "A read of the recovery bundle names the bundle's locator as a canonical lowercase UUID.",
-        );
-    };
-    if fields.get("kind").and_then(Value::as_str) != Some(RECOVERY_BUNDLE_KIND) {
-        return refuse(
-            "A read of the recovery bundle is of the kind recovery_bundle, the one kind a locator holds.",
-        );
+    /// The collection at `locator` is in the history `recovery` names, as one put back from an
+    /// export is.
+    pub(crate) fn put_back(&mut self, locator: &str, recovery: &str) {
+        self.collections
+            .entry(locator.to_owned())
+            .or_default()
+            .recovery = Some(recovery.to_owned());
     }
 
-    // The second proof: an account token carrying a scope a read is answered for. Missing, unknown,
-    // expired and under-scoped are one answer, before the collection is reached.
-    let scopes: &[&str] = if writing {
-        &[BACKUP_WRITE_SCOPE]
-    } else {
-        &[BACKUP_WRITE_SCOPE, BACKUP_RESTORE_SCOPE]
-    };
-    let Some(account) = token.and_then(|token| {
-        tokens
-            .get(token)
-            .filter(|held| held.live)
-            .filter(|held| scopes.iter().any(|scope| held.scopes.contains(*scope)))
-            .map(|held| held.account.as_str())
-    }) else {
-        return absent();
-    };
-    if writing {
-        return write(bundles, locator, fields, account, funded);
-    }
-    let bundle = bundles.get(locator);
-    // The owner, or before a write has applied anybody the route admitted, and nobody else.
-    if bundle
-        .and_then(|bundle| bundle.owner.as_deref())
-        .is_some_and(|owner| owner != account)
-    {
-        return absent();
-    }
-    let recovery = bundle.and_then(|bundle| bundle.recovery.clone());
-    let held = bundle.and_then(|bundle| bundle.held.as_ref());
-    let changed: Vec<Value> = held
-        .map(|held| {
-            json!({
-                "kind": RECOVERY_BUNDLE_KIND,
-                "object_id": locator,
-                "revision": held.revision,
-                "write_sequence": held.write_sequence.to_string(),
-                "object": serde_json::to_value(SealedRecoveryBundle {
-                    ciphertext: Bytes::new(held.ciphertext.clone()),
-                })
-                .expect("a sealed bundle"),
-                "updated_at": "2026-09-25T17:00:00.000Z",
-            })
-        })
-        .into_iter()
-        .collect();
-    let revisions: Vec<Value> = held
-        .map(|held| {
-            json!({
-                "object_id": locator,
-                "revision": held.revision,
-                "write_sequence": held.write_sequence.to_string(),
-            })
-        })
-        .into_iter()
-        .collect();
-    answered(json!({
-        "changed": changed,
-        "removed": [],
-        "revisions": revisions,
-        "conflicts": [],
-        "next_conflicts_after_sequence": "0",
-        "more_conflicts": false,
-        "recovery_id": recovery,
-        "stored": {
-            "objects": u64::from(held.is_some()).to_string(),
-            "conflicts": "0",
-            "bytes": held
-                .map_or(0, |held| {
-                    SealedRecoveryBundle {
-                        ciphertext: Bytes::new(held.ciphertext.clone()),
-                    }
-                    .stored_bytes()
-                })
-                .to_string(),
-            "object_limit": "1",
-            "allowance_bytes": null,
-        },
-    }))
-}
-
-/// What the route answers a write of the bundle by `account`.
-fn write(
-    bundles: &mut BTreeMap<String, Bundle>,
-    locator: &str,
-    fields: &serde_json::Map<String, Value>,
-    account: &str,
-    funded: bool,
-) -> ServiceHttpAnswer {
-    let Some(request_id) = fields
-        .get("request_id")
-        .and_then(Value::as_str)
-        .filter(|text| is_uuid(text))
-    else {
-        return refuse("A write of the recovery bundle names its request by a canonical UUID.");
-    };
-    if fields.get("kind").and_then(Value::as_str) != Some(RECOVERY_BUNDLE_KIND) {
-        return refuse(
-            "A write of the recovery bundle is of the kind recovery_bundle, the one kind a locator holds.",
-        );
-    }
-    let expected = match fields.get("expected_revision") {
-        Some(Value::Null) => None,
-        Some(Value::String(text)) => Some(text.as_str()),
-        _ => {
-            return refuse(
-                "A write of the recovery bundle names the revision it replaces, or null for none.",
+    /// What the service answers one request that carries a locator.
+    ///
+    /// `now_ms` is the service's own clock. The kind of key that signed the request is read before
+    /// the route is reached.
+    pub(crate) fn handle(
+        &mut self,
+        tokens: &BTreeMap<String, Token>,
+        body: &Value,
+        token: Option<&str>,
+        now_ms: u64,
+    ) -> ServiceHttpAnswer {
+        let named: Vec<&str> = MEMBERS
+            .into_iter()
+            .filter(|member| body.get(*member).is_some())
+            .collect();
+        let [member] = named.as_slice() else {
+            return refusal(
+                400,
+                "INVALID_REQUEST",
+                "A settings-sync request exchanges, compares, resolves, queries status, fences a request identity, reads or offers key records, or lists memberships, and asks for one of those.",
+            );
+        };
+        let Some(fields) = body[*member].as_object() else {
+            return refusal(
+                400,
+                "INVALID_REQUEST",
+                "A settings-sync request carries the fields of what it asks for.",
+            );
+        };
+        if !fields.contains_key("locator") {
+            return refusal(
+                400,
+                "INVALID_REQUEST",
+                "This service answers the recovery bundle at its locator and no other settings-sync \
+                 request.",
             );
         }
-    };
-    let Some(ciphertext) = fields
-        .get("object")
-        .and_then(|object| object.get("ciphertext"))
-        .and_then(Value::as_str)
-        .and_then(|text| kr_protocol::scalars::from_base64url(text).ok())
-    else {
-        return refuse("A write of the recovery bundle carries the sealed bundle.");
-    };
-    // The owner, or before a write has applied anybody the route admitted, and nobody else.
-    if bundles
-        .get(locator)
-        .and_then(|bundle| bundle.owner.as_deref())
-        .is_some_and(|owner| owner != account)
-    {
-        return absent();
-    }
-    // What the request asks, as the receipt compares it: everything but the identity.
-    let content = format!(
-        "{expected:?}/{}",
-        kr_protocol::scalars::to_base64url(&ciphertext)
-    );
-    if let Some((held, answer)) = bundles
-        .get(locator)
-        .and_then(|bundle| bundle.receipts.get(request_id))
-    {
-        return if *held == content {
-            answered(answer.clone())
-        } else {
-            refusal(
-                409,
-                "ID_CONFLICT",
-                "That request identity was used for other content.",
-            )
+        let asked = match read(member, &body[*member]) {
+            Ok(asked) => asked,
+            Err(Unread(answer)) => return answer,
         };
-    }
-    if !funded {
-        return refusal(
-            402,
-            "QUOTA_EXHAUSTED",
-            "This account has no backup storage to write the recovery bundle to.",
-        );
-    }
-    let bundle = bundles.entry(locator.to_owned()).or_default();
-    let held_revision = bundle.held.as_ref().map(|held| held.revision.clone());
-    let answer = if held_revision.as_deref() == expected {
-        bundle.write(account, ciphertext);
-        let held = bundle.held.as_ref().expect("the write left a bundle");
-        json!({
-            "state": "written",
-            "record": summary(locator, held),
-            "current_revision": held.revision,
-            "current_write_sequence": held.write_sequence.to_string(),
-            "conflict": null,
-            "recovery_id": bundle.recovery,
-            "stored": usage(Some(held)),
-        })
-    } else {
-        // The comparison failed: the answer is the object as it stands, which is the record.
-        json!({
-            "state": "conflict",
-            "record": bundle.held.as_ref().map(|held| summary(locator, held)),
-            "current_revision": held_revision,
-            "current_write_sequence": bundle
-                .held
-                .as_ref()
-                .map_or(0, |held| held.write_sequence)
-                .to_string(),
-            "conflict": null,
-            "recovery_id": bundle.recovery,
-            "stored": usage(bundle.held.as_ref()),
-        })
-    };
-    bundle
-        .receipts
-        .insert(request_id.to_owned(), (content, answer.clone()));
-    answered(answer)
-}
 
-/// The summary of the object a collection holds, without its content.
-fn summary(locator: &str, held: &Held) -> Value {
-    json!({
-        "kind": RECOVERY_BUNDLE_KIND,
-        "object_id": locator,
-        "revision": held.revision,
-        "write_sequence": held.write_sequence.to_string(),
-        "bytes": SealedRecoveryBundle {
-            ciphertext: Bytes::new(held.ciphertext.clone()),
+        // The second proof: a live token that carries a scope this member is answered for. A
+        // missing one, an unknown one, an expired one and one without the scope are one answer.
+        let needs: &[&str] = if *member == "compare" {
+            &[BACKUP_WRITE_SCOPE, BACKUP_RESTORE_SCOPE]
+        } else {
+            &[BACKUP_WRITE_SCOPE]
+        };
+        let Some(account) = token
+            .and_then(|token| tokens.get(token))
+            .filter(|held| held.live && needs.iter().any(|scope| held.scopes.contains(*scope)))
+            .map(|held| held.account.as_str())
+        else {
+            return absent();
+        };
+        let locator = asked.locator().to_owned();
+        // The owner, or before a write has applied anybody the route admitted, and nobody else.
+        if self
+            .collections
+            .get(&locator)
+            .and_then(|collection| collection.owner.as_deref())
+            .is_some_and(|owner| owner != account)
+        {
+            return absent();
         }
-        .stored_bytes()
-        .to_string(),
-        "updated_at": "2026-09-25T17:00:00.000Z",
-    })
+        let held = self.collections.entry(locator.clone()).or_default();
+        match asked {
+            Asked::Exchange {
+                request_id,
+                expected,
+                object,
+                ..
+            } => held.exchange(&locator, account, now_ms, &request_id, expected, object),
+            Asked::Compare { .. } => held.compare(&locator),
+            Asked::Status { request_id, .. } => held.status(&request_id),
+            Asked::Fence { request_id, .. } => held.fence(&request_id, now_ms),
+        }
+    }
 }
 
-/// What a collection reports it holds.
-fn usage(held: Option<&Held>) -> Value {
-    json!({
-        "objects": u64::from(held.is_some()).to_string(),
-        "conflicts": "0",
-        "bytes": held
-            .map_or(0, |held| {
-                SealedRecoveryBundle {
-                    ciphertext: Bytes::new(held.ciphertext.clone()),
-                }
-                .stored_bytes()
-            })
-            .to_string(),
-        "object_limit": "1",
-        "allowance_bytes": null,
-    })
+/// A request about the bundle, once the contract has read it.
+enum Asked {
+    Exchange {
+        request_id: String,
+        locator: String,
+        expected: Option<String>,
+        object: Value,
+    },
+    Compare {
+        locator: String,
+    },
+    Status {
+        request_id: String,
+        locator: String,
+    },
+    Fence {
+        request_id: String,
+        locator: String,
+    },
 }
 
-/// What a caller is told about a collection that does not exist or is not its to read.
+impl Asked {
+    fn locator(&self) -> &str {
+        match self {
+            Self::Exchange { locator, .. }
+            | Self::Compare { locator }
+            | Self::Status { locator, .. }
+            | Self::Fence { locator, .. } => locator,
+        }
+    }
+}
+
+/// What the service answers a caller the collection does not admit, and a collection nobody made.
 fn absent() -> ServiceHttpAnswer {
     refusal(
         404,
@@ -384,16 +268,437 @@ fn absent() -> ServiceHttpAnswer {
     )
 }
 
-/// A request this route does not read.
-fn refuse(message: &str) -> ServiceHttpAnswer {
-    refusal(400, "INVALID_REQUEST", message)
+fn invalid_request(message: &str) -> Unread {
+    Unread(refusal(400, "INVALID_REQUEST", message))
 }
 
-/// Whether `text` is a canonical lowercase UUID.
-fn is_uuid(text: &str) -> bool {
-    text.len() == 36
-        && text.char_indices().all(|(at, character)| match at {
-            8 | 13 | 18 | 23 => character == '-',
-            _ => character.is_ascii_digit() || ('a'..='f').contains(&character),
+fn invalid_argument(message: &str) -> Unread {
+    Unread(refusal(400, "INVALID_ARGUMENT", message))
+}
+
+/// A canonical lowercase hyphenated UUID, as the contract reads one.
+fn is_uuid(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        text.len() == 36
+            && text.char_indices().all(|(at, character)| match at {
+                8 | 13 | 18 | 23 => character == '-',
+                _ => character.is_ascii_digit() || ('a'..='f').contains(&character),
+            })
+    })
+}
+
+/// The largest counter the service compares exactly: the largest whole number its own language
+/// holds without rounding.
+const MAX_SYNC_COUNTER: u64 = (1 << 53) - 1;
+
+/// A counter the contract reads: decimal text with no leading zero, no larger than
+/// [`MAX_SYNC_COUNTER`].
+fn counter(value: &Value) -> Option<u64> {
+    let text = value.as_str()?;
+    if text.is_empty()
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+        || (text.len() > 1 && text.starts_with('0'))
+    {
+        return None;
+    }
+    text.parse()
+        .ok()
+        .filter(|counter| *counter <= MAX_SYNC_COUNTER)
+}
+
+/// Reads one request against the closed shape its member has.
+fn read(member: &str, value: &Value) -> Result<Asked, Unread> {
+    let (allowed, asked): (&[&str], &str) = match member {
+        "exchange" => (
+            &[
+                "request_id",
+                "locator",
+                "kind",
+                "expected_revision",
+                "object",
+            ],
+            "A write of the recovery bundle",
+        ),
+        "compare" => (&["locator", "kind"], "A read of the recovery bundle"),
+        "status" => (
+            &["locator", "request_id"],
+            "A status query about the recovery bundle",
+        ),
+        "fence" => (
+            &[
+                "locator",
+                "request_id",
+                "first_signed_at_ms",
+                "last_signed_at_ms",
+            ],
+            "A fence at the recovery bundle",
+        ),
+        _ => {
+            return Err(invalid_request(
+                "A recovery bundle is written, read, asked about and fenced, and nothing else \
+                 names a locator.",
+            ));
+        }
+    };
+    let fields = value
+        .as_object()
+        .ok_or_else(|| invalid_request(&format!("{asked} is an object.")))?;
+    let mut extra: Vec<&str> = fields
+        .keys()
+        .map(String::as_str)
+        .filter(|field| !allowed.contains(field))
+        .collect();
+    extra.sort_unstable();
+    if !extra.is_empty() {
+        return Err(invalid_request(&format!(
+            "{asked} carries {}, which a request naming a locator does not.",
+            extra.join(", ")
+        )));
+    }
+    if !is_uuid(&value["locator"]) {
+        return Err(invalid_request(&format!(
+            "{asked} names the bundle's locator as a canonical lowercase UUID."
+        )));
+    }
+    let locator = value["locator"].as_str().unwrap_or_default().to_owned();
+    let request_id = || -> Result<String, Unread> {
+        match &value["request_id"] {
+            Value::Null => Err(invalid_argument("A request identity is required.")),
+            id if is_uuid(id) => Ok(id.as_str().unwrap_or_default().to_owned()),
+            _ => Err(invalid_argument(
+                "A request identity is a canonical lowercase UUID.",
+            )),
+        }
+    };
+    let kind = || -> Result<(), Unread> {
+        if value["kind"] == "recovery_bundle" {
+            Ok(())
+        } else {
+            Err(invalid_request(&format!(
+                "{asked} is of the kind recovery_bundle, the one kind a locator holds."
+            )))
+        }
+    };
+    match member {
+        "exchange" => {
+            let request_id = request_id()?;
+            kind()?;
+            // Absent is not null: a write names the revision it replaces, or says it replaces none.
+            let expected = match value.get("expected_revision") {
+                Some(Value::Null) => None,
+                Some(revision) if is_uuid(revision) => revision.as_str().map(str::to_owned),
+                _ => {
+                    return Err(invalid_request(&format!(
+                        "{asked} names the revision it replaces, one this service issued, or null \
+                         for a locator that holds none."
+                    )));
+                }
+            };
+            let object = value["object"].clone();
+            let length = object["ciphertext"]
+                .as_str()
+                .and_then(decode)
+                .map(|bytes| bytes.len() as u64)
+                .ok_or_else(|| {
+                    invalid_request(
+                        "A recovery bundle is never removed, so a write of it carries the bundle.",
+                    )
+                })?;
+            if !(MIN_SEALED_RECOVERY_BUNDLE_BYTES..=MAX_SEALED_RECOVERY_BUNDLE_BYTES)
+                .contains(&length)
+            {
+                return Err(invalid_request(&format!(
+                    "A recovery bundle is {MIN_SEALED_RECOVERY_BUNDLE_BYTES} to {MAX_SEALED_RECOVERY_BUNDLE_BYTES} bytes of sealed stream."
+                )));
+            }
+            Ok(Asked::Exchange {
+                request_id,
+                locator,
+                expected,
+                object,
+            })
+        }
+        "compare" => {
+            kind()?;
+            Ok(Asked::Compare { locator })
+        }
+        "status" => Ok(Asked::Status {
+            request_id: request_id()?,
+            locator,
+        }),
+        _ => {
+            let request_id = request_id()?;
+            let first = counter(&value["first_signed_at_ms"]);
+            let last = counter(&value["last_signed_at_ms"]);
+            let (Some(first), Some(last)) = (first, last) else {
+                return Err(invalid_argument(
+                    "A signing time is a counter this service compares exactly.",
+                ));
+            };
+            if first > last {
+                return Err(invalid_argument(
+                    "A fence names the earliest attempt no later than the latest.",
+                ));
+            }
+            Ok(Asked::Fence {
+                request_id,
+                locator,
+            })
+        }
+    }
+}
+
+/// The bytes a sealed stream is, from the form it travels in.
+fn decode(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()
+        .or_else(|| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(text)
+                .ok()
         })
+}
+
+/// A moment as the service writes one: ISO 8601 in UTC, to the millisecond.
+fn instant(ms: u64) -> String {
+    let days = i64::try_from(ms / 86_400_000).unwrap_or(i64::MAX);
+    let in_day = ms % 86_400_000;
+    // Civil date from a day count: Howard Hinnant's algorithm, for the proleptic Gregorian calendar.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        in_day / 3_600_000,
+        in_day / 60_000 % 60,
+        in_day / 1_000 % 60,
+        in_day % 1_000
+    )
+}
+
+/// The accounting every answer about the bundle ends with.
+fn stored(kept: Option<&Kept>) -> Value {
+    json!({
+        "allowance_bytes": null,
+        "bytes": kept.map_or(0, |kept| kept.bytes).to_string(),
+        "conflicts": "0",
+        "object_limit": "1",
+        "objects": u8::from(kept.is_some()).to_string(),
+    })
+}
+
+impl Collection {
+    /// One write, in the service's order: a receipt for the identity, and then the comparison.
+    fn exchange(
+        &mut self,
+        locator: &str,
+        account: &str,
+        now_ms: u64,
+        request_id: &str,
+        expected: Option<String>,
+        object: Value,
+    ) -> ServiceHttpAnswer {
+        let digest = json!({
+            "locator": locator,
+            "kind": "recovery_bundle",
+            "expected_revision": expected,
+            "object": object,
+        });
+        if let Some(receipt) = self.receipts.get(request_id) {
+            if receipt.outcome == "fenced" {
+                return refusal(
+                    409,
+                    "REQUEST_FENCED",
+                    "That settings-sync request identity has been fenced and will not be run.",
+                );
+            }
+            if receipt.digest != digest {
+                return refusal(
+                    409,
+                    "ID_CONFLICT",
+                    "That request identity was used for a different settings-sync request.",
+                );
+            }
+            return answered(receipt.answer.clone().unwrap_or(Value::Null));
+        }
+        let recorded_at = instant(now_ms);
+        let current = self.kept.clone();
+        if current.as_ref().map(|kept| kept.revision.clone()) != expected {
+            // Where the bundle stands is its write sequence, and nought where it was never written.
+            let standing = current
+                .as_ref()
+                .map_or(0, |kept| kept.write_sequence)
+                .to_string();
+            let answer = json!({
+                "state": "conflict",
+                "record": current.as_ref().map(|kept| kept.record(locator)),
+                "current_revision": current.as_ref().map(|kept| kept.revision.clone()),
+                "current_write_sequence": standing,
+                "conflict": null,
+                "recovery_id": self.recovery,
+                "stored": stored(current.as_ref()),
+            });
+            self.receipts.insert(
+                request_id.to_owned(),
+                Receipt {
+                    digest,
+                    outcome: "conflict",
+                    answer: Some(answer.clone()),
+                    record: current.as_ref().map(|kept| kept.record(locator)),
+                    current_revision: current.as_ref().map(|kept| kept.revision.clone()),
+                    current_write_sequence: Some(standing),
+                    never_ran: false,
+                    recorded_at,
+                },
+            );
+            return answered(answer);
+        }
+        self.revisions += 1;
+        self.owner.get_or_insert_with(|| account.to_owned());
+        let ciphertext = object["ciphertext"].clone();
+        let sealed = ciphertext
+            .as_str()
+            .and_then(decode)
+            .map_or(0, |bytes| bytes.len() as u64);
+        let kept = Kept {
+            revision: format!("00000000-0000-4000-8000-{:012x}", self.revisions),
+            write_sequence: current.map_or(1, |kept| kept.write_sequence + 1),
+            updated_at: instant(now_ms),
+            ciphertext,
+            bytes: sealed + SYNC_RECORD_BYTES,
+        };
+        let answer = json!({
+            "state": "written",
+            "record": kept.record(locator),
+            "current_revision": kept.revision,
+            "current_write_sequence": kept.write_sequence.to_string(),
+            "conflict": null,
+            "recovery_id": self.recovery,
+            "stored": stored(Some(&kept)),
+        });
+        self.receipts.insert(
+            request_id.to_owned(),
+            Receipt {
+                digest,
+                outcome: "written",
+                answer: Some(answer.clone()),
+                record: Some(kept.record(locator)),
+                current_revision: Some(kept.revision.clone()),
+                current_write_sequence: Some(kept.write_sequence.to_string()),
+                never_ran: false,
+                recorded_at,
+            },
+        );
+        self.kept = Some(kept);
+        answered(answer)
+    }
+
+    /// A read: the bundle and where it stands, or nothing.
+    fn compare(&self, locator: &str) -> ServiceHttpAnswer {
+        let (changed, revisions) = self.kept.as_ref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |kept| {
+                (
+                    vec![json!({
+                        "kind": "recovery_bundle",
+                        "object_id": locator,
+                        "revision": kept.revision,
+                        "write_sequence": kept.write_sequence.to_string(),
+                        "object": { "ciphertext": kept.ciphertext },
+                        "updated_at": kept.updated_at,
+                    })],
+                    vec![json!({
+                        "object_id": locator,
+                        "revision": kept.revision,
+                        "write_sequence": kept.write_sequence.to_string(),
+                    })],
+                )
+            },
+        );
+        answered(json!({
+            "changed": changed,
+            "removed": [],
+            "revisions": revisions,
+            "conflicts": [],
+            "next_conflicts_after_sequence": "0",
+            "more_conflicts": false,
+            "recovery_id": self.recovery,
+            "stored": stored(self.kept.as_ref()),
+        }))
+    }
+
+    /// What a status query and a fence are answered about one receipt.
+    fn receipt(recovery: &Option<String>, request_id: &str, receipt: &Receipt) -> Value {
+        let state = match receipt.outcome {
+            "written" => "applied",
+            "conflict" => "refused",
+            _ => "fenced",
+        };
+        json!({
+            "request_id": request_id,
+            "state": state,
+            "never_ran": receipt.never_ran,
+            "outcome": receipt.outcome,
+            "record": receipt.record,
+            "current_revision": receipt.current_revision,
+            "current_write_sequence": receipt.current_write_sequence,
+            "conflict_id": null,
+            "recovery_id": recovery,
+            "recorded_at": receipt.recorded_at,
+        })
+    }
+
+    fn status(&self, request_id: &str) -> ServiceHttpAnswer {
+        answered(self.receipts.get(request_id).map_or_else(
+            || {
+                json!({
+                    "request_id": request_id,
+                    "state": "unknown",
+                    "never_ran": false,
+                    "outcome": null,
+                    "record": null,
+                    "current_revision": null,
+                    "current_write_sequence": null,
+                    "conflict_id": null,
+                    "recovery_id": self.recovery,
+                    "recorded_at": null,
+                })
+            },
+            |receipt| Self::receipt(&self.recovery, request_id, receipt),
+        ))
+    }
+
+    /// Ends a request identity: what the collection recorded stands, and an identity it recorded
+    /// nothing for is refused from now on.
+    fn fence(&mut self, request_id: &str, now_ms: u64) -> ServiceHttpAnswer {
+        let receipt = self
+            .receipts
+            .entry(request_id.to_owned())
+            .or_insert_with(|| Receipt {
+                digest: Value::Null,
+                outcome: "fenced",
+                answer: None,
+                record: None,
+                current_revision: None,
+                current_write_sequence: None,
+                // A local deployment sweeps no receipt, so a fence that finds none can say that
+                // nothing ever ran under the identity.
+                never_ran: true,
+                recorded_at: instant(now_ms),
+            });
+        answered(Self::receipt(&self.recovery, request_id, receipt))
+    }
 }
