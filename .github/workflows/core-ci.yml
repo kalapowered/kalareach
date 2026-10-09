@@ -476,6 +476,27 @@ jobs:
           name: windows-arm64
           paths: target/aarch64-pc-windows-msvc
 
+      # On Windows, libsodium-sys-stable's build script downloads libsodium's prebuilt libraries
+      # from a host of libsodium's own, in the middle of the compile, unless it is handed them. A
+      # lookup of that host that failed has stopped this job before any test ran. The archives are
+      # placed here instead, from the cache or once from that host, and the build reads them from
+      # disk. The route to the host is then closed for the rest of the job: a step that goes back
+      # to downloading fails at once and by name, on every run, rather than on a runner whose
+      # resolver is having a bad minute.
+      - name: Place libsodium's archives
+        id: libsodium
+        uses: ./.github/actions/libsodium-archive
+
+      - name: Close the route to libsodium's download host
+        run: |
+          Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "0.0.0.0 download.libsodium.org"
+          ipconfig /flushdns | Out-Null
+          $answer = @([System.Net.Dns]::GetHostAddresses('download.libsodium.org') | ForEach-Object { $_.ToString() })
+          Write-Host "download.libsodium.org now resolves to: $($answer -join ', ')"
+          if ($answer.Count -ne 1 -or $answer[0] -ne '0.0.0.0') {
+            throw 'The route to libsodium''s download host is still open.'
+          }
+
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
       # names the Windows build, the console host, the shells it happened on and the privileges its
       # account holds, which decide whether an access-control list binds that account at all.
@@ -493,6 +514,16 @@ jobs:
       - name: Compile the workspace and its tests
         if: ${{ matrix.part == 'first' }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # The build above checked both archives against libsodium's public key, so what a later run
+      # restores is what was signed. Only a green run on the default branch saves it, as with the
+      # cargo caches.
+      - name: Save libsodium's archives
+        if: ${{ success() && matrix.part == 'first' && github.ref == 'refs/heads/main' && steps.libsodium.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.libsodium.outputs.path }}
+          key: ${{ steps.libsodium.outputs.key }}
 
       # What has been qualified on this platform, and only that: the terminal engine, the
       # repository boundary, the attach client, the contact tools against a session's job, the

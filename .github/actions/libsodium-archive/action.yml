@@ -1,0 +1,43 @@
+name: Place libsodium's archives
+description: >-
+  Restores or fetches the signed archives that libsodium-sys-stable's build script reads on
+  Windows, and points the build at them with SODIUM_DIST_DIR, so that compiling the workspace
+  downloads nothing. The archives are cached under a key that names the crate's version, and the
+  job saves them with its own cache-save step once the build has checked their signatures. The
+  script this runs says what is placed and why.
+
+outputs:
+  cache-hit:
+    description: "'true' when the archives were restored from the cache."
+    value: ${{ steps.restore.outputs.cache-hit }}
+  key:
+    description: The key the archives are cached under.
+    value: ${{ steps.name.outputs.key }}
+  path:
+    description: The directory the archives are in.
+    value: ${{ steps.name.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Name the cache
+      id: name
+      shell: bash
+      run: |
+        echo "key=$(bash scripts/place-libsodium-archive.sh --key)" >> "$GITHUB_OUTPUT"
+        echo "path=$RUNNER_TEMP/libsodium-archive" >> "$GITHUB_OUTPUT"
+
+    - name: Restore
+      id: restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.name.outputs.path }}
+        key: ${{ steps.name.outputs.key }}
+
+    - name: Place what the cache lacks
+      shell: bash
+      env:
+        ARCHIVE_DIR: ${{ steps.name.outputs.path }}
+      run: |
+        bash scripts/place-libsodium-archive.sh "$ARCHIVE_DIR"
+        echo "SODIUM_DIST_DIR=$ARCHIVE_DIR" >> "$GITHUB_ENV"
