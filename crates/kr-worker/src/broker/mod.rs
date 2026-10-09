@@ -3109,6 +3109,38 @@ impl Broker {
         Ok(())
     }
 
+    /// Compiles one installed connector's table for the executable that runs and pins it for one
+    /// instance.
+    ///
+    /// The tables are the ones [`InstalledConnector::native_tables`] makes, so they are pinned to
+    /// the version a signed record names for the executable's digest, and nothing is pinned for an
+    /// executable no record names or a version the table is not qualified for. What comes back is
+    /// what the connection over them is opened and framed with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnsupportedCapability`] naming why the connector's table is not
+    /// compiled for this executable, and whatever [`Broker::pin_table`] refuses.
+    pub fn pin_compiled(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        connector: &crate::broker::connectors::InstalledConnector,
+        executable: &Digest256,
+    ) -> Result<crate::broker::connectors::NativeTables> {
+        let compiled = connector.native_tables(executable).map_err(|refusal| {
+            BrokerError::UnsupportedCapability {
+                detail: refusal.detail,
+            }
+        })?;
+        self.pin_table(
+            application_instance_id,
+            connector.package().clone(),
+            compiled.table.clone(),
+            compiled.rich.clone(),
+        )?;
+        Ok(compiled)
+    }
+
     /// Returns what this host pinned for one installation's package.
     #[must_use]
     pub fn pinned_table(
