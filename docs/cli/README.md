@@ -1662,8 +1662,9 @@ kr organisation list                 # what this host holds for each organisatio
 ```
 
 `kr organisation enrol` reads the organisation's policy-signing chain from a JSON file that a member
-exported from the organisation's service. The host does not contact the service. The file must be a
-regular file, not a link or a pipe, and no bigger than a control frame. The host verifies the whole
+exported from the organisation's service. The host does not contact the service. The file must be no
+bigger than a control frame, and on Unix a regular file: a link or a pipe is refused. The host
+verifies the whole
 chain before asking anyone. It refuses a chain that does not verify, and a host that distrusts its
 clock, with nothing asked or changed. An owner device has to confirm the enrolment: `kr` says so,
 says what that device is asked to trust, and asks the host again every second until the confirmation

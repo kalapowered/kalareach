@@ -2576,10 +2576,10 @@ revalidated immediately before the effect, and that is where they are.
 
 Hosts can opt in to an organisation's policy. Section 17 of the specification gives the whole
 arrangement: the organisation signs a membership lease for each member's device. The host checks
-that the lease is signed by the organisation, using a pinned key from when it enrolled. Membership
-leases are only valid for up to 15 minutes and a host never needs to fetch anything from an
-organisation's service. Instead it holds the chain of policy-signing keys it verified when it
-enrolled, and the rotations it has followed since.
+that the lease is signed by the organisation, using the keys it pinned when it enrolled and the
+rotations it has followed since. Membership leases are only valid for up to 15 minutes and a host
+never needs to fetch anything from an organisation's service. Instead it holds the chain of
+policy-signing keys it verified when it enrolled, and the rotations it has followed since.
 
 ### Enrolling
 

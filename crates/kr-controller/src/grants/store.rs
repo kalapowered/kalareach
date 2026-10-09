@@ -1890,6 +1890,10 @@ impl GrantDirectory {
     ) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(policy)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // The pause is before the store's locks, so a test moves a clock or a confirmation's
+        // deadline while the change waits. It does not show where in the transaction
+        // `still_admitted` runs: that it runs after the locks and before the first write is this
+        // function's own order, and the store test of a refused callback shows nothing is written.
         #[cfg(feature = "testing")]
         self.before_effect.wait();
         self.in_transaction(|connection| {
