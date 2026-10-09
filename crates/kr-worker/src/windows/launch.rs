@@ -199,8 +199,12 @@ mod platform {
     /// How much a pipe holds before a write waits.
     const PIPE_BYTES: u32 = 64 * 1024;
 
-    /// How long a process that was created and never resumed is given to end.
+    /// How long a process that was asked to end is given to end, or to show that it is ending.
     const END_WAIT_MS: u32 = 10_000;
+
+    /// How long the handle of a process is waited on before its exit status is read again. A
+    /// status sets no signal, so a process that is ending is seen by one or the other.
+    const STATUS_SLICE_MS: u32 = 10;
 
     /// How long a blocked write is cancelled for before the writer is given up on.
     const CLOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -309,25 +313,59 @@ mod platform {
     ///
     /// A process that has ended already refuses to be ended again, and so does one that is ending,
     /// whether it was ended or ended itself: it is not signalled until its last thread has gone,
-    /// but it has its exit status from the moment it begins to end. Either is the outcome that was
-    /// wanted. A process that is running has no status, and its refusal is a failure. A process
-    /// that [`start`] created, one that was created and never resumed, and the shell in the console
-    /// are ended here, so the rule is one rule for them.
+    /// but it has its exit status from the moment it begins to end. Between the two, while another
+    /// thread is taking the process's end in hand and has not yet recorded its status, the process
+    /// refuses and shows neither: that refusal is waited out until one of the two appears. Either
+    /// is the outcome that was wanted. A process that is running has no status and is not
+    /// signalled, and its refusal is a failure once the wait has run out. A process that [`start`]
+    /// created, one that was created and never resumed, and the shell in the console are ended
+    /// here, so the rule is one rule for them.
     ///
     /// # Errors
     ///
     /// Returns the operating system's failure when a running process cannot be ended.
     pub(crate) fn end_process(process: &OwnedHandle) -> std::io::Result<()> {
+        end_process_within(
+            process,
+            std::time::Duration::from_millis(u64::from(END_WAIT_MS)),
+        )
+    }
+
+    /// Ends the process as [`end_process`] does, waiting no longer than `patience` for a process
+    /// that refuses and shows no sign of ending.
+    fn end_process_within(
+        process: &OwnedHandle,
+        patience: std::time::Duration,
+    ) -> std::io::Result<()> {
         // SAFETY: the handle is the caller's own and open for the call.
         let ended = unsafe { TerminateProcess(process.as_raw_handle().cast(), 1) };
         if ended != 0 {
             return Ok(());
         }
         let failure = std::io::Error::last_os_error();
-        if has_exit_status(process) {
+        if ends_within(process, patience) {
             Ok(())
         } else {
             Err(failure)
+        }
+    }
+
+    /// Says whether the process has ended or is ending, or does within `patience`.
+    ///
+    /// The wait is on the process's handle, so an end is seen the moment the process is signalled,
+    /// and the exit status is read again after each slice, because a status is no object to wait
+    /// on.
+    fn ends_within(process: &OwnedHandle, patience: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            if has_exit_status(process) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            // SAFETY: the handle is the caller's own and open for the call.
+            unsafe { WaitForSingleObject(process.as_raw_handle().cast(), STATUS_SLICE_MS) };
         }
     }
 
@@ -798,6 +836,8 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use std::time::Duration;
+
         use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
         use windows_sys::Win32::System::Diagnostics::Debug::{
             CloseThreadWaitChainSession, GetThreadWaitChain, OpenThreadWaitChainSession,
@@ -808,7 +848,7 @@ mod platform {
             GetThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         };
 
-        use super::{TerminateProcess, end_process, has_exit_status};
+        use super::{TerminateProcess, end_process, end_process_within, has_exit_status};
 
         /// A process that waits far longer than any test takes, and a handle on it that can be
         /// waited on and asked its status but cannot end it.
@@ -896,6 +936,22 @@ mod platform {
             let outcome = ending.join().expect("the call returns");
             child.wait().expect("the process is collected");
             outcome.expect("a refused end of a process that then ends is not a failure");
+        }
+
+        /// A refusal of a process that is running and shows no sign is a failure, once the wait
+        /// for a sign has run out.
+        #[test]
+        fn a_refused_end_of_a_process_that_goes_on_running_is_a_failure() {
+            let (mut child, watcher) = waiting_process_and_a_handle_that_cannot_end_it();
+            let outcome = end_process_within(&watcher, Duration::ZERO);
+            let _ = child.kill();
+            let _ = child.wait();
+            let failure = outcome.expect_err("a process that is running is not ended");
+            assert_eq!(
+                failure.raw_os_error(),
+                i32::try_from(ERROR_ACCESS_DENIED).ok(),
+                "and the failure is the system's refusal"
+            );
         }
     }
 }
