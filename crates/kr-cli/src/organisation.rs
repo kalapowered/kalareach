@@ -41,8 +41,8 @@ pub async fn run(paths: &HostPaths, command: OrganisationCommand, json: bool) ->
 /// Reads the chain a member exported.
 ///
 /// The file is bounded by what one control frame carries, which is what the host would refuse a
-/// larger chain for, and it is the organisation's published object as JSON. A link and a pipe are
-/// refused where the platform can tell: this reads a file, and does not wait for a writer.
+/// larger chain for, and it is the organisation's published object as JSON. On Unix a link and a
+/// pipe are refused: this reads a file, and does not wait for a writer.
 fn read_chain(path: &std::path::Path) -> Result<PolicyAuthority> {
     let bytes = read_bounded(path).map_err(|error| {
         CliError::Usage(if error.kind() == std::io::ErrorKind::InvalidData {
@@ -67,20 +67,30 @@ fn read_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     kr_ipc::install::read_regular_file(path, MAX_CONTROL_FRAME_LEN as u64)
 }
 
-/// The file's bytes, when it is a regular file of at most one control frame.
+/// The file's bytes, when it is a regular file of at most one control frame. The limit is put on
+/// the read of the file that was opened, so a file that grows after it was looked at is still cut.
+/// A link is followed here: the platform gives no way to refuse one that this program uses.
 #[cfg(not(unix))]
 fn read_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    let too_much = || {
+    use std::io::Read as _;
+
+    let refused = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "not a regular file within the bound",
         )
     };
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() > MAX_CONTROL_FRAME_LEN as u64 {
-        return Err(too_much());
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(refused());
     }
-    std::fs::read(path)
+    let limit = MAX_CONTROL_FRAME_LEN as u64;
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(refused());
+    }
+    Ok(bytes)
 }
 
 /// `kr organisation enrol`.
@@ -134,31 +144,39 @@ async fn enrol(
 /// key by its whole identifier, revision and the moment it took over signing, which is what an
 /// administrator reads out and what the confirmation covers.
 fn say_what_is_asked(display: &ConfirmationDisplay) {
-    if let ConfirmationDisplay::EnrolOrganisation {
+    if let Some(line) = what_is_asked(display) {
+        output::line(&line);
+    }
+}
+
+/// The line `say_what_is_asked` writes, for the display of an enrolment.
+fn what_is_asked(display: &ConfirmationDisplay) -> Option<output::Line> {
+    let ConfirmationDisplay::EnrolOrganisation {
         organisation_id,
         root,
         anchor,
     } = display
-    {
-        let key = |shown: &kr_protocol::confirmation::PolicyKeyShown| {
-            key_identifier(&kr_protocol::pairing::key_id(
-                kr_protocol::pairing::KeyPurpose::Authorisation,
-                shown.public_key.as_bytes(),
-            ))
-        };
-        output::line(&stdout_line!(
-            "An owner device is asked to trust organisation {} to sign the access it grants here. \
-             Its first key is {} (revision {}, from {}), and the key signing now is {} (revision \
-             {}, from {}).",
-            *organisation_id,
-            key(root),
-            root.revision,
-            utc_moment(root.not_before_ms.get()),
-            key(anchor),
-            anchor.revision,
-            utc_moment(anchor.not_before_ms.get())
-        ));
-    }
+    else {
+        return None;
+    };
+    let key = |shown: &kr_protocol::confirmation::PolicyKeyShown| {
+        key_identifier(&kr_protocol::pairing::key_id(
+            kr_protocol::pairing::KeyPurpose::Authorisation,
+            shown.public_key.as_bytes(),
+        ))
+    };
+    Some(stdout_line!(
+        "An owner device is asked to trust organisation {} to sign the access it grants here. \
+         Its first key is {} (revision {}, from {}), and the key signing now is {} (revision {}, \
+         from {}).",
+        *organisation_id,
+        key(root),
+        root.revision,
+        utc_moment(root.not_before_ms.get()),
+        key(anchor),
+        anchor.revision,
+        utc_moment(anchor.not_before_ms.get())
+    ))
 }
 
 /// `kr organisation list`.
@@ -284,4 +302,46 @@ fn document(listed: &OrganisationListResult) -> Document {
         .with("clock_trusted", listed.clock_trusted)
         .with("enrolments", enrolments)
         .with("exclusive_events", events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use kr_protocol::confirmation::{OrganisationEnrolPlan, PolicyKeyShown};
+    use kr_protocol::ids::{OrganisationId, PolicyKeyRevision};
+    use kr_protocol::scalars::{AuthorisationKey, TimestampMs, Uuid};
+
+    /// KR-REQ-17.53: what `kr organisation enrol` prints before an owner device confirms is the
+    /// whole identifier of each key, its revision and the moment it took over signing: what an
+    /// administrator reads out, and what the confirmation covers. Two plans that differ only in an
+    /// activation time print two lines, and another display prints none.
+    #[test]
+    fn the_command_prints_each_key_whole_with_when_it_took_over() {
+        let key = |seed: u8, revision: u64, at: u64| PolicyKeyShown {
+            revision: PolicyKeyRevision::new(revision),
+            public_key: AuthorisationKey::from_bytes([seed; 32]),
+            not_before_ms: TimestampMs::new(at),
+        };
+        let plan = OrganisationEnrolPlan {
+            organisation_id: OrganisationId::new(Uuid::from_bytes([0x21; 16])),
+            root: key(0x31, 1, 1_767_225_600_000),
+            anchor: key(0x32, 2, 1_767_312_000_000),
+        };
+        let line = what_is_asked(&plan.display()).expect("a line for an enrolment");
+        let text = line.text();
+        for shown in [&plan.root, &plan.anchor] {
+            let identifier = kr_client::pairing::owner::policy_key_identifier(&shown.public_key);
+            assert!(text.contains(&identifier), "the whole identifier: {text}");
+        }
+        assert!(text.contains("2026-01-01 00:00:00 UTC"), "{text}");
+        assert!(text.contains("2026-01-02 00:00:00 UTC"), "{text}");
+        assert!(text.contains("revision 2"), "{text}");
+
+        let mut later = plan;
+        later.anchor.not_before_ms = TimestampMs::new(plan.anchor.not_before_ms.get() + 1_000);
+        let other = what_is_asked(&later.display()).expect("a line");
+        assert_ne!(text, other.text(), "activation times are printed");
+        assert!(what_is_asked(&ConfirmationDisplay::EstablishClock).is_none());
+    }
 }
