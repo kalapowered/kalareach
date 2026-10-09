@@ -75,6 +75,9 @@ pub struct Chosen {
     pub document: PathBuf,
     /// What the document turned out to be.
     pub state: DocumentState,
+    /// What was found, what the host does while it cannot use the document, and how to put it
+    /// right, as the document's status says it.
+    pub detail: kr_protocol::hostinfo::export::Sentence,
     /// The revision the document is at, or zero when there is none.
     pub revision: u64,
 }
@@ -100,6 +103,7 @@ impl Chosen {
                 .and_then(|document| document.startup.controller()),
             document: document.to_path_buf(),
             state: loaded.status.state,
+            detail: loaded.status.detail.clone(),
             revision: loaded.revision(),
         }
     }
@@ -108,11 +112,12 @@ impl Chosen {
     fn setup_action(&self) -> Shown {
         if self.state.is_a_problem() {
             shown!(
-                "this environment's configuration document, {}, is {}, so it chooses no way of \
-                 starting one; start the control daemon, kr-controller, for it, or correct the \
-                 document",
+                "this environment's configuration document, {}, cannot be used ({}), so it \
+                 chooses no way of starting a control daemon, and one started by hand creates no \
+                 new session: {}",
                 Shown::root(&self.document),
-                self.state.as_str()
+                self.state.as_str(),
+                Shown::sentence(&self.detail)
             )
         } else {
             Shown::said(SETUP_ACTION)
@@ -2062,8 +2067,12 @@ mod tests {
         let unusable = Chosen::read(&host.environment());
         assert_eq!(unusable.controller, None);
         assert_eq!(unusable.state, DocumentState::Invalid);
+        // Starting a daemon does not help: the way out is the document.
         assert!(
-            unusable.setup_action().as_str().contains("is invalid"),
+            unusable
+                .setup_action()
+                .as_str()
+                .contains("rewrite the document so that it is valid against its schema"),
             "{}",
             unusable.setup_action()
         );

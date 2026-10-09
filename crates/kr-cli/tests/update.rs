@@ -8786,6 +8786,299 @@ async fn an_update_that_cannot_take_the_writers_lock_stops_nothing_for_good() {
 }
 
 /* -------------------------------------------------------------------------------------------- */
+/* A configuration document the daemon cannot use                                                */
+/* -------------------------------------------------------------------------------------------- */
+
+/// The ways a configuration document is unusable, each with the bytes that make it so and a word
+/// its remedy must carry.
+fn unusable_documents() -> Vec<(&'static str, &'static [u8], u32, &'static str)> {
+    vec![
+        (
+            "the next version",
+            br#"{"version": 3}"#,
+            0o600,
+            "use a release that reads",
+        ),
+        (
+            "the highest version",
+            br#"{"version": 4294967295}"#,
+            0o600,
+            "use a release that reads",
+        ),
+        (
+            "a version below the oldest",
+            br#"{"version": 0}"#,
+            0o600,
+            "rewrite the document",
+        ),
+        (
+            "a member the schema lacks",
+            br#"{"version": 2, "not_a_member": 1}"#,
+            0o600,
+            "valid against its schema",
+        ),
+        (
+            "permissions wider than owner-only",
+            br#"{"version": 2}"#,
+            0o644,
+            "only you can read and write",
+        ),
+    ]
+}
+
+impl Host {
+    /// Runs `kr new` of the current release with an execution context given, as a person does, and
+    /// returns what it printed.
+    fn kr_new(&self) -> (Output, Value) {
+        let cwd = self.tree.root().display().to_string();
+        let output = self.run(
+            &self.store.stable(Program::Kr),
+            &[
+                "new",
+                "--invisible",
+                "--headless",
+                "--cwd",
+                &cwd,
+                "--shell",
+                "/bin/sh",
+                "--startup",
+                "interactive",
+                "--json",
+            ],
+        );
+        let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        (output, said)
+    }
+
+    /// Writes the configuration document with `contents` and `mode`, replacing what is there.
+    fn write_the_configuration_as(&self, contents: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let document = self.configuration_document();
+        std::fs::create_dir_all(document.parent().expect("a directory")).expect("a directory");
+        let _ = std::fs::remove_file(&document);
+        std::fs::write(&document, contents).expect("writes the document");
+        std::fs::set_permissions(&document, std::fs::Permissions::from_mode(mode))
+            .expect("sets its mode");
+    }
+
+    /// A create request for a headless session in this host's own environment, as `kr new` makes
+    /// one.
+    fn headless_create_params(&self) -> kr_protocol::session::SessionCreateParams {
+        kr_protocol::session::SessionCreateParams {
+            environment_id: self.tree.environment_id(),
+            presentation: kr_protocol::session::Presentation::Invisible,
+            shell: Nullable::some("/bin/sh".to_owned()),
+            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+            cwd: Nullable::some(self.tree.root().display().to_string()),
+            dimensions: Nullable::null(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
+        }
+    }
+
+    /// Asks the daemon to accept its document, as every `kr doctor` does, and returns the
+    /// diagnostics.
+    fn doctor(&self) -> Value {
+        self.kr_json(&["--json", "doctor"]).1
+    }
+
+    /// Whether session descriptions are on, as the daemon says it.
+    fn descriptions_are_on(&self) -> bool {
+        let (output, said) = self.kr_json(&["host", "descriptions", "--json"]);
+        assert!(
+            output.status.success(),
+            "kr host descriptions: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        said["enabled"].as_bool().expect("a setting")
+    }
+}
+
+/// KR-REQ-26.13: a daemon whose configuration document it cannot use (a version it does not know,
+/// a damaged document, a file it may not read) fails closed. It turns descriptions off and creates
+/// no new session, whatever execution context the request names, and says the document and how to
+/// put it right; a session it already serves is untouched, and a document put right lifts all of it
+/// at the next create. The control is a document it reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_again_when_it_is_rewritten()
+ {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let kr = host.store.stable(Program::Kr);
+
+    // The control: a document it reads, a session made, descriptions on.
+    host.write_the_configuration_as(br#"{"version": 2}"#, 0o600);
+    host.doctor();
+    assert!(host.descriptions_are_on());
+    let (kept, _) = host.new_session(&kr);
+
+    for (what, contents, mode, remedy) in unusable_documents() {
+        host.write_the_configuration_as(contents, mode);
+        let report = host.doctor();
+        let found = report["configuration"]["status"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            found.contains(remedy) && found.contains("no new session is created"),
+            "{what}: kr doctor says what happens and how to put it right: {report}"
+        );
+        assert!(!host.descriptions_are_on(), "{what}: descriptions are off");
+        let (output, said) = host.kr_new();
+        assert!(
+            !output.status.success(),
+            "{what}: no session is created, though the request names its execution context: {said}"
+        );
+        let message = said["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("config.json") && message.contains(remedy),
+            "{what}: the refusal names the document and the remedy: {said}"
+        );
+        assert!(
+            !message.contains(&host.tree.root().display().to_string()),
+            "{what}: and not the path of the host's own directories: {said}"
+        );
+        // A command that edits the document is refused with the same words and leaves the file.
+        let before = std::fs::read(host.configuration_document()).expect("the document");
+        let (edit, refused) = host.kr_json(&["host", "startup", "--set", "standalone", "--json"]);
+        assert!(!edit.status.success(), "{what}: {refused}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(remedy),
+            "{what}: {refused}"
+        );
+        assert_eq!(
+            std::fs::read(host.configuration_document()).expect("the document"),
+            before,
+            "{what}: the file is left as it was"
+        );
+
+        // Rewritten, the next create is made and descriptions are on again.
+        host.write_the_configuration_as(br#"{"version": 2}"#, 0o600);
+        let (output, said) = host.kr_new();
+        assert!(
+            output.status.success(),
+            "{what}: a document put right lifts the refusal at the next create: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let again = said["display_number"].to_string();
+        assert!(
+            host.descriptions_are_on(),
+            "{what}: descriptions are on again"
+        );
+        host.close(&kr, &again);
+    }
+
+    // The session made before any of it is still served: closed here, with the document unusable.
+    host.write_the_configuration_as(br#"{"version": 3}"#, 0o600);
+    host.doctor();
+    host.close(&kr, &kept);
+}
+
+/// KR-REQ-26.13: a create the daemon already answered is answered again when the document breaks
+/// afterwards, and a new one is refused: a repeated token is a retry of an action that has an
+/// outcome, whatever the host's conditions are now.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_repeated_after_the_document_breaks_is_answered_and_a_new_one_is_refused() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    host.write_the_configuration_as(br#"{"version": 2}"#, 0o600);
+    host.doctor();
+
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let params = host.headless_create_params();
+    let created = client
+        .compose(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.tree.environment_id()),
+            &params,
+        )
+        .await
+        .expect("composes the create");
+    let first = client
+        .repeat(&created)
+        .await
+        .expect("the host answers")
+        .expect("the first create is made");
+
+    host.write_the_configuration_as(br#"{"version": 3}"#, 0o600);
+    host.doctor();
+    let again = client
+        .repeat(&created)
+        .await
+        .expect("the host answers")
+        .expect("the repeated create is answered from what it produced");
+    let first: kr_protocol::session::SessionCreateResult = first.to_typed().expect("decodes");
+    let again: kr_protocol::session::SessionCreateResult = again.to_typed().expect("decodes");
+    assert!(
+        !first.deduplicated && again.deduplicated,
+        "the repeat is a replay"
+    );
+    assert_eq!(
+        again.session.session_id, first.session.session_id,
+        "the same session answers the repeat"
+    );
+    let fresh = client
+        .compose(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.tree.environment_id()),
+            &params,
+        )
+        .await
+        .expect("composes the create");
+    let refused = client
+        .repeat(&fresh)
+        .await
+        .expect("the host answers")
+        .expect_err("a new create is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::HostNotConfigured,
+        "{refused:?}"
+    );
+}
+
+/// KR-REQ-26.13: with no daemon running, `kr new` over a document that cannot be used names the
+/// document's way out, not "start the control daemon".
+#[tokio::test(flavor = "multi_thread")]
+async fn kr_new_with_no_daemon_over_an_unusable_document_names_the_way_out() {
+    let host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    for (what, contents, mode, remedy) in unusable_documents() {
+        host.write_the_configuration_as(contents, mode);
+        let (output, said) = host.kr_new();
+        assert!(!output.status.success(), "{what}: {said}");
+        let message = said["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("config.json") && message.contains(remedy),
+            "{what}: {said}"
+        );
+    }
+}
+
+/* -------------------------------------------------------------------------------------------- */
 /* The stored formats                                                                            */
 /* -------------------------------------------------------------------------------------------- */
 

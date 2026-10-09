@@ -140,8 +140,8 @@ kr host power --set off              # the default
 
 The setting is one section of the versioned per-user host configuration document, `config.json` in
 the environment's own state directory, which `kr doctor` prints the path of. A document whose
-version this build does not know is left alone and every value reads as the product default rather
-than being guessed at, so an unknown document means the setting is off. Writing it installs no
+version this build does not know is left alone and the host fails closed rather than guessing at
+it, so an unknown document means the setting is off. Writing it installs no
 service, obtains no privilege and changes nothing else about the machine.
 
 ```json

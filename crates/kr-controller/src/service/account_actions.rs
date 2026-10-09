@@ -87,7 +87,9 @@ impl Controller {
         let service = GatewayOrigin::new(&origin)
             .map_err(|error| unusable(&format_args!("the account service: {error}")))
             .and_then(|gateway| {
-                let proxy = Self::proxy_of(started).map_err(|error| unusable(&error))?;
+                let proxy = Self::outbound_of(started)
+                    .and_then(|route| route.proxy().map(|proxy| proxy.cloned()))
+                    .map_err(|error| unusable(&error))?;
                 let transport = Arc::new(crate::managed_transport::ManagedTransport::new(
                     gateway,
                     proxy,

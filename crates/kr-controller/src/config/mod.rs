@@ -304,6 +304,8 @@ pub struct InForce {
     /// The variables a session started now with this host's environment is given beside it. The
     /// values are the owner's own and are printed by nothing.
     pub environment_additions: configuration::EnvironmentAdditions,
+    /// Why this host fails closed, when it cannot use its configuration document.
+    pub unusable: Option<Unusable>,
 }
 
 impl InForce {
@@ -315,6 +317,86 @@ impl InForce {
             worker_profile: resolver.chosen_worker_profile(),
             command_integrations: resolver.command_integrations().value,
             environment_additions: resolver.environment_additions().value,
+            unusable: Unusable::of(resolver.loaded()),
+        }
+    }
+}
+
+/// A configuration document this host cannot use, and what it says about it.
+///
+/// While one is in force the host takes the narrowest value of each preference and selection: its
+/// descriptions are off, it creates no new session (the owner's choice between the two worker
+/// profiles is in the document, and neither is inside the other), and its proxy-bound transports
+/// are closed from the next start. What the host accepted from the document before stays in force.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unusable {
+    /// How the document turned out.
+    pub state: configuration::DocumentState,
+    /// What was found, what happens meanwhile and how to put it right, as the document's status
+    /// says it.
+    pub detail: String,
+}
+
+impl Unusable {
+    /// What a document this host cannot use is, or `None` for one it can use or that is absent.
+    #[must_use]
+    pub fn of(loaded: &configuration::Loaded) -> Option<Self> {
+        loaded.fails_closed().then(|| Self {
+            state: loaded.status.state,
+            detail: loaded.status.detail.as_str().to_owned(),
+        })
+    }
+
+    /// The refusal of a new session. It names the document by its file name, as the daemon's other
+    /// refusals do, because a paired device reads it too.
+    #[must_use]
+    pub fn refusal(&self) -> String {
+        format!(
+            "this host's configuration document ({}) cannot be used ({}), so it creates no new \
+             session, whatever execution context the request names: {}",
+            configuration::FILE_NAME,
+            self.state.as_str(),
+            self.detail
+        )
+    }
+
+    /// The refusal of a request that would leave this host through a proxy the document may have
+    /// named.
+    #[must_use]
+    pub fn outbound_refusal(&self) -> String {
+        format!(
+            "this host's configuration document ({}) cannot be used ({}), so nothing is sent \
+             through the proxy it may name, and nothing is sent around it: {}",
+            configuration::FILE_NAME,
+            self.state.as_str(),
+            self.detail
+        )
+    }
+}
+
+/// How this daemon's outbound HTTPS leaves the host, as it read the document when it started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outbound {
+    /// Directly: the document named no proxy.
+    Direct,
+    /// Through the proxy the document named.
+    Through(kr_transport::config::ProxyUrl),
+    /// Not at all: the document could not be used, so a proxy it may have named is not known, and
+    /// "nothing goes around it" means nothing goes. Carries the refusal a request is given.
+    Closed(String),
+}
+
+impl Outbound {
+    /// The proxy a client is built with, or the refusal when nothing may leave.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] when the route is closed.
+    pub fn proxy(&self) -> Result<Option<&kr_transport::config::ProxyUrl>> {
+        match self {
+            Self::Direct => Ok(None),
+            Self::Through(proxy) => Ok(Some(proxy)),
+            Self::Closed(refusal) => Err(ControllerError::NotConfigured(refusal.clone())),
         }
     }
 }
@@ -332,18 +414,28 @@ pub struct Started {
     pub voice: configuration::VoiceSelection,
     /// The managed storage service this daemon uploads its backups to.
     pub storage: configuration::StorageSelection,
+    /// Why every outbound route the proxy governs is closed, when the document could not be used.
+    pub unusable: Option<Unusable>,
 }
 
 impl Started {
-    /// Reads the selections from one document, or the defaults of selecting nothing when this
-    /// host cannot use the document it found.
+    /// Reads the selections from one reading of the document: its own when it is usable, and the
+    /// narrowest, selecting nothing and sending nothing, when this host cannot use it. A document
+    /// that is absent selects nothing and leaves the outbound route direct.
     #[must_use]
-    pub fn of(document: Option<&configuration::ConfigurationDocument>) -> Self {
-        document.map_or_else(Self::default, |document| Self {
-            network: document.network.clone(),
-            voice: document.voice.clone(),
-            storage: document.storage.clone(),
-        })
+    pub fn of(loaded: &configuration::Loaded) -> Self {
+        loaded.document.as_ref().map_or_else(
+            || Self {
+                unusable: Unusable::of(loaded),
+                ..Self::default()
+            },
+            |document| Self {
+                network: document.network.clone(),
+                voice: document.voice.clone(),
+                storage: document.storage.clone(),
+                unusable: None,
+            },
+        )
     }
 }
 
@@ -898,9 +990,11 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         },
         detail,
         wrong.then_some(if status.state.is_a_problem() {
-            "Every ordinary preference is the product default while this document cannot be used, \
-             and every restriction this host already enforces stays in force. The file is left \
-             exactly as it is: nothing here rewrites it."
+            "While this document cannot be used, descriptions are off, this host creates no new \
+             session, and its network, voice, storage and proxy selections are closed from the \
+             next start of the control daemon; every restriction this host already enforces stays \
+             in force. The file is left exactly as it is: nothing here rewrites it. The line above \
+             says how to put it right."
         } else {
             "That document has no effect. Remove it once you have moved anything you still want \
              into the configuration above."
@@ -1145,11 +1239,13 @@ impl RunningNetwork {
 /// other than what this daemon started with, the check warns that the edit applies at the next
 /// start, rather than leaving an owner to wonder why nothing changed.
 ///
-/// `document` is the document the rest of the report was read from.
+/// `loaded` is the reading of the document the rest of the report was made from. A document this
+/// host cannot use selects nothing and closes the outbound route, which is also what the daemon
+/// started with if it could not use it then.
 #[must_use]
 pub fn network_check(
     started: &Started,
-    document: Option<&configuration::ConfigurationDocument>,
+    loaded: &configuration::Loaded,
     running: Running,
 ) -> DoctorCheck {
     let mut detail = match running.network {
@@ -1169,9 +1265,8 @@ pub fn network_check(
     } else {
         "; its voice service names no managed broker"
     });
-    // Compared with what the document says now. A document this host cannot use selects nothing,
-    // which is also what an owner who wrote no network section is told.
-    let moved = Started::of(document) != *started;
+    // Compared with what the document says now.
+    let moved = Started::of(loaded) != *started;
     if moved {
         detail = detail.stated(
             "; the configuration document now selects a different network, voice broker or storage \

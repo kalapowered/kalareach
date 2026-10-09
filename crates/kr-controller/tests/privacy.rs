@@ -1873,7 +1873,9 @@ async fn kr_req_18_08_an_external_destination_is_told_only_under_its_rule_and_it
     .await
     .expect("the owner unpairs the device");
     assert!(controller.attach_delivery_transport(Arc::new(
-        kr_controller::push::transport::ManagedTransports::new(None)
+        kr_controller::push::transport::ManagedTransports::new(
+            kr_controller::config::Outbound::Direct
+        )
     )));
 
     let _asked = environment.worker.ask("deploy-1", WORDS);
