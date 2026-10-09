@@ -110,6 +110,16 @@ pub const MAX_CONNECTIONS: usize = kr_protocol::limits::MAX_CONCURRENT_ATTACHMEN
 /// that rather than filling it exactly.
 pub const MAX_REPLAY_PAGE_BYTES: u64 = 512 * 1024;
 
+/// Whose input lease the worker's fence of granted input takes.
+#[derive(Clone, Copy, Debug)]
+enum Fenced<'a> {
+    /// The one attachment whose authority ended, a grant that ran out.
+    Attachment(AttachmentId),
+    /// The callers a revision's reach names, or every caller under a grant for the reach that
+    /// names the whole host.
+    Within(&'a kr_protocol::worker::RevisionReach),
+}
+
 /// What the worker currently accepts as controller authority.
 ///
 /// The generation and the connection that speaks for it are one value under one lock, so a token
@@ -795,6 +805,17 @@ impl WorkerService {
         self.dispatch
             .lock()
             .expect("the dispatch barrier is not poisoned")
+    }
+
+    /// Runs the fence this worker owes for a revision whose announcement it refused, as its own
+    /// maintenance does on its next tick, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn fence_what_is_owed_for_tests(&self) {
+        let _barrier = self
+            .dispatch
+            .lock()
+            .expect("the dispatch barrier is not poisoned");
+        self.fence_what_is_owed();
     }
 
     /// How many announcements of an authority revision have been refused so far because the
@@ -2264,7 +2285,9 @@ impl WorkerService {
     /// forwarded mutation carries, without which a daemon shows a paired device none of a retained
     /// answer it gives, and that it reads which grant a forwarded `session.attach` was decided
     /// under and draws a share's attachment only the screen its issuer was shown, without which a
-    /// daemon attaches no share to it.
+    /// daemon attaches no share to it, and that it reads which grants and devices an authority
+    /// revision withdrew and fences the input of those callers alone, without which a daemon
+    /// announces a revision with no reach and every caller under a grant is fenced.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         self.time
             .floor_identity()
@@ -2276,6 +2299,7 @@ impl WorkerService {
                     kr_protocol::local::FORWARDED_QUESTION_SCOPE,
                     kr_protocol::local::FORWARDED_RESULT_SCOPE,
                     kr_protocol::local::FORWARDED_SCREEN_BASIS,
+                    kr_protocol::local::AUTHORITY_REVISION_REACH,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
@@ -2967,7 +2991,17 @@ impl WorkerService {
             // newer revision's list would skip that list's beginning.
             return self.evidence_reply(state, notice.revision, page_from);
         }
-        if let Err(error) = self.fence(notice.revision) {
+        // A named reach is the reach of this revision alone, so it is trusted only when this
+        // worker has fenced every revision before it: the one after the last it acknowledged.
+        // Otherwise a revision it missed, or one it was refused for its boundary, withdrew
+        // authority this notice says nothing about.
+        let reach =
+            if held.is_some_and(|held| held.get().checked_add(1) == Some(notice.revision.get())) {
+                &notice.reach
+            } else {
+                &kr_protocol::worker::RevisionReach::Host
+            };
+        if let Err(error) = self.fence(notice.revision, reach) {
             // The acknowledgement is what the daemon waits on before it calls a revocation
             // complete. Reporting success while the fence did not finish would answer it wrongly;
             // what the pass did name is in the journal under this revision, so the next
@@ -2981,7 +3015,8 @@ impl WorkerService {
     ///
     /// The caller holds the dispatch boundary. Both callers do: the announcement, which answers
     /// with a page of what this produced, and the host's own maintenance, which runs a fence the
-    /// announcement could not.
+    /// announcement could not. `reach` says whose input the pass takes: the callers a revision
+    /// named, or every caller under a grant.
     ///
     /// The session is held from the pass until the revision is installed, because the two fences
     /// and the installation are one step: input that got past the fence and into the queue while
@@ -2993,7 +3028,11 @@ impl WorkerService {
     /// Returns [`WorkerError::JournalUnavailable`] when the pass could not finish. What it did
     /// name is in the journal, and the boundary it started from is not moved, so the next pass
     /// looks at everything this one was looking at.
-    fn fence(&self, revision: kr_protocol::ids::AuthorityRevision) -> Result<()> {
+    fn fence(
+        &self,
+        revision: kr_protocol::ids::AuthorityRevision,
+        reach: &kr_protocol::worker::RevisionReach,
+    ) -> Result<()> {
         let ran_at = kr_ipc::now_ms();
         // Which controller this host answers to, because what a *previous* one collected is not
         // something the current one holds: a revocation's names are finished with when the daemon
@@ -3035,7 +3074,7 @@ impl WorkerService {
             None => Ok(0),
         };
         outcome?;
-        self.fence_granted_input(&mut session, None);
+        self.fence_granted_input(&mut session, Fenced::Within(reach));
         let mut authority = self
             .authority
             .lock()
@@ -3069,7 +3108,9 @@ impl WorkerService {
                 .filter(|owed| held.is_none_or(|held| held.get() < owed.get()))
         };
         if let Some(revision) = owed {
-            let _ = self.fence(revision);
+            // The revision it was announced with is not kept, so every caller under a grant is
+            // fenced.
+            let _ = self.fence(revision, &kr_protocol::worker::RevisionReach::Host);
         }
     }
 
@@ -3210,25 +3251,28 @@ impl WorkerService {
     /// reach the application afterwards. Releasing the lease discards them on the same boundary
     /// the writer takes, which is the step a takeover already uses.
     ///
-    /// `only` names the attachment whose authority ended, when one is known. A revision
-    /// acknowledgement knows no attachment: which grant the revision was about is not something
-    /// this worker is told, so every lease held under a grant is fenced. A grant that ran out knows
-    /// exactly which attachment it belonged to, and fences nothing else: another caller may hold
-    /// the lease by then, and its authority is its own.
+    /// `only` says whose authority ended ([`Fenced`]). A revision acknowledgement names the grants
+    /// and devices the revision withdrew, when the daemon can say and this worker has missed no
+    /// revision before it: the lease of a caller acting under none of them is left alone, because
+    /// its authority is its own. Otherwise every lease held under a grant is fenced. A grant that
+    /// ran out knows exactly which attachment it belonged to, and fences nothing else: another
+    /// caller may hold the lease by then.
     ///
     /// Either way the caller acquires the lease again on its next request, under the authority
     /// now in force; the local owner's lease is untouched, because no revision and no grant
     /// replaces the operating-system identity behind it.
-    fn fence_granted_input(&self, session: &mut Session, only: Option<AttachmentId>) {
+    fn fence_granted_input(&self, session: &mut Session, only: Fenced<'_>) {
         let lease = session.lease();
         let Some(holder) = lease.holder.0 else {
             return;
         };
-        if only.is_some_and(|named| named != holder) {
-            return;
-        }
-        let granted = session.holds_granted_attachment(holder);
-        if !granted {
+        let to_fence = match only {
+            Fenced::Attachment(named) => {
+                named == holder && session.holds_granted_attachment(holder)
+            }
+            Fenced::Within(reach) => session.granted_attachment_within(holder, reach),
+        };
+        if !to_fence {
             return;
         }
         let _ = session.release_input(holder, lease.epoch.get());
@@ -4594,7 +4638,7 @@ impl WorkerService {
         }
         // Only this request's own attachment. Another caller may hold the lease by now, and its
         // authority has nothing to do with this one's having ended.
-        self.fence_granted_input(session, Some(attachment_id));
+        self.fence_granted_input(session, Fenced::Attachment(attachment_id));
         Err(WorkerError::PermissionDenied {
             detail: "the authority this request was admitted under has run out".to_owned(),
         })
@@ -6393,7 +6437,13 @@ impl WorkerService {
                     }
                     // And what the attachment was admitted to do ends with the authority behind
                     // it: a revision or the grant's own expiry takes its input lease away.
-                    session.note_granted_attachment(attachment_id);
+                    session.note_granted_attachment(
+                        attachment_id,
+                        crate::session::GrantedBy {
+                            grant_id: caller.grant_id.0,
+                            device_id: caller.device_id.0,
+                        },
+                    );
                 }
                 // An invoker that attached through a process bridge says whether the terminal it
                 // attaches from takes the clipboard writes this session asks for. One that says it

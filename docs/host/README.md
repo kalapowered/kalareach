@@ -4701,10 +4701,15 @@ device opens another connection to be served again, under its own grant. The rev
 reaches the connections that decided a request under it, or under a grant withdrawn with it, and
 those connections only: a read the daemon answers itself counts, and a connection that opened no
 link to the worker counts. The device's other connections, other devices and the owner's own
-connections keep their registration and their links. The revocation still advances the host's
-authority revision, which takes every paired device's input lease and refuses the actions each
-worker admitted and did not dispatch, so a device that was typing takes the lease again. Revoking a
-device still reaches every connection.
+connections keep their registration and their links. The revocation will advance the host's
+authority revision, causing it to refuse any actions that any workers have admitted, but not yet
+dispatched, and to take the input lease of any callers that were acting under a grant the revocation
+withdrew or from a device that the revocation names. Any other callers will retain their input
+lease, and a device that was typing under a grant the revocation did not touch goes on typing at the
+epoch it holds. The host tells each worker which grants and devices the revision withdrew. A worker
+that missed the revision before this one, or was told no reach, takes the input lease of every
+caller acting under a grant, and so does the revocation of a device. Revoking a device still reaches
+every connection.
 
 `grants::decide` takes the intersection in this order:
 

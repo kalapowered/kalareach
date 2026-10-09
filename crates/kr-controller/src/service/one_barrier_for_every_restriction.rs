@@ -308,3 +308,53 @@ async fn an_acceptance_whose_ceiling_could_not_move_fences_under_no_debt_of_its_
     controller.check_fence().expect("and nothing is left owed");
     drop(controller);
 }
+
+/// KR-REQ-10.45: a revision is announced with the grants its withdrawal reached to a worker that
+/// says it reads them, and as the whole host's to a worker that does not, and for a page of the
+/// evidence that follows its first announcement.
+///
+/// A worker of an earlier build ends the link a frame with a member it does not know arrived on,
+/// so the member is never sent to one, and no worker built here can be made to stand in for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_that_does_not_read_a_revisions_reach_is_announced_the_whole_host() {
+    use kr_protocol::ids::{AuthorityRevision, CapabilityId, GrantId};
+    use kr_protocol::scalars::{CanonicalSet, Uuid};
+    use kr_protocol::worker::RevisionReach;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+    let grant = GrantId::new(Uuid::from_bytes([0x61; 16]));
+    let reaching = Reach::Grants([grant].into_iter().collect());
+    let debt = controller
+        .owe_debt("a share", reaching.clone())
+        .expect("written");
+    let own = controller.publish_debts(&[(debt, reaching)]);
+    controller.barrier(own).await.expect("a barrier");
+    let revision = AuthorityRevision::new(revision(&controller).await);
+
+    let stating =
+        CanonicalSet::from_iter([
+            CapabilityId::new(kr_protocol::local::AUTHORITY_REVISION_REACH).expect("a capability"),
+        ]);
+    let names_the_grant = RevisionReach::Within {
+        grants: [grant].into_iter().collect(),
+        devices: CanonicalSet::new(),
+    };
+    assert_eq!(
+        controller.revision_notice(revision, 0, &stating).reach,
+        names_the_grant
+    );
+    assert_eq!(
+        controller
+            .revision_notice(revision, 0, &CanonicalSet::new())
+            .reach,
+        RevisionReach::Host,
+        "a worker that states nothing is told nothing of the reach"
+    );
+    assert_eq!(
+        controller.revision_notice(revision, 3, &stating).reach,
+        RevisionReach::Host,
+        "a page of the evidence of a revision the worker has fenced names no reach"
+    );
+    drop(controller);
+}

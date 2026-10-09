@@ -5183,9 +5183,7 @@ async fn kr_req_25_10_a_recipient_whose_share_is_withdrawn_is_sent_nothing_more(
     )
     .await;
 
-    // The screen changes after that, and the recipient is not sent the change. A revocation moves
-    // the host's authority revision on, which takes every device's input lease with it, so the
-    // typist takes the lease again.
+    // The screen changes after that, and the recipient is not sent the change.
     let printed = type_and_wait_for(
         &typing,
         host.environment_id,
@@ -5210,6 +5208,147 @@ async fn kr_req_25_10_a_recipient_whose_share_is_withdrawn_is_sent_nothing_more(
 
     typing.close();
     watching.session.close();
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// KR-REQ-10.45: one device changing its own grants does not take the input lease another device
+/// holds. A typist holds the lease under its pairing grant. A second device, holding an owner's
+/// share, delegates a viewer's share to a third, which redeems it, and then withdraws it: the
+/// withdrawal advances the host's authority revision. The typist's next line, at the epoch and the
+/// sequence it was on, is accepted and runs; it takes no lease again.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_45_a_devices_own_grant_changes_leave_another_devices_input_lease() {
+    use kr_protocol::sharing::{
+        GrantCreateParams, GrantCreateResult, GrantRedeemParams, GrantRevokeParams, RoleSelection,
+        SessionRole,
+    };
+
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let environment_id = host.environment_id;
+
+    let typist = Device::create(&loopback()).await;
+    let typist_record = pair(&daemon, &typist, &owner).await;
+    let typing = connect(&daemon, &typist, &typist_record).await;
+    let attached = attach(&typing, environment_id, session_id).await;
+    let lease = acquire(&typing, environment_id, session_id, attached.typing).await;
+    let mut events = typing.events();
+    typing
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: lease.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(0),
+            bytes: kr_protocol::scalars::Bytes::new(MARKER_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the first command is accepted");
+    assert!(observe(&typing, &mut events, MARKER).await.contains(MARKER));
+
+    // The second device holds an owner's share, which it delegates a viewer's share from.
+    let sharer = a_redeemed_share(
+        &daemon,
+        &host,
+        &owner,
+        &mut local,
+        session_id,
+        SessionRole::Owner,
+        None,
+    )
+    .await;
+    let third = Device::create(&loopback()).await;
+    let third_record = pair_with(
+        &daemon,
+        &third,
+        &owner,
+        proposing(&[ActionRight::SessionView], SessionSelector::None),
+    )
+    .await;
+    let selection = RoleSelection::plain(SessionRole::Viewer);
+    let delegated: GrantCreateResult = sharer
+        .session
+        .mutate(
+            Method::GrantCreate,
+            on_session(environment_id, session_id),
+            None,
+            &ParamsValue::empty(),
+            &GrantCreateParams {
+                session_id,
+                recipient_device_id: third_record.device_id,
+                parent_grant_id: Nullable::some(sharer.grant_id),
+                accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(
+                    &selection.actions(),
+                ),
+                selection,
+                lifetime_ms: Nullable::some(DurationMs::new(600_000)),
+                owner_confirmation: Nullable::null(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the device delegates from the share it holds")
+        .to_typed()
+        .expect("decodes");
+    let redeeming = connect(&daemon, &third, &third_record).await;
+    let _: kr_protocol::sharing::GrantRedeemResult = redeeming
+        .mutate(
+            Method::GrantRedeem,
+            ActionTarget::environment(environment_id),
+            None,
+            &ParamsValue::empty(),
+            &GrantRedeemParams {
+                invitation_id: delegated.preview.invitation_id,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the third device redeems it")
+        .to_typed()
+        .expect("decodes");
+    let withdrawn: kr_protocol::sharing::RevocationResult = sharer
+        .session
+        .mutate(
+            Method::GrantRevoke,
+            ActionTarget::environment(environment_id),
+            None,
+            &ParamsValue::empty(),
+            &GrantRevokeParams {
+                grant_id: delegated.grant.grant_id,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the device withdraws what it delegated")
+        .to_typed()
+        .expect("decodes");
+    assert!(withdrawn.revoked_grants.contains(&delegated.grant.grant_id));
+
+    // The typist writes again at the epoch and the sequence it was on.
+    typing
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: lease.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the typist still holds its lease");
+    assert!(
+        observe(&typing, &mut events, SECOND_MARKER)
+            .await
+            .contains(SECOND_MARKER)
+    );
+
+    typing.close();
+    redeeming.close();
+    sharer.session.close();
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }

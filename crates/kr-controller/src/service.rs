@@ -278,12 +278,14 @@ impl Controller {
 /// One announcement of an authority revision that this daemon sent to a worker, as it recorded it
 /// for this host's own tests.
 #[cfg(feature = "testing")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SentAnnouncement {
     /// The session whose worker the announcement was sent to.
     pub session_id: SessionId,
     /// The revision the announcement carried.
     pub revision: u64,
+    /// Whose authority the announcement said the revision withdrew.
+    pub reach: kr_protocol::worker::RevisionReach,
     /// How many of that revision's names the daemon already held: nought for the announcement a
     /// worker acknowledges, more for a request for a page of the evidence that follows one.
     pub evidence_from: u64,
@@ -838,6 +840,7 @@ impl Controller {
             .push(SentAnnouncement {
                 session_id,
                 revision: notice.revision.get(),
+                reach: notice.reach.clone(),
                 evidence_from: notice.evidence_from,
             });
     }

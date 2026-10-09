@@ -26,8 +26,8 @@ use kr_protocol::attachment::{
 };
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
-    AttachmentId, ConnectionId, EnvironmentId, PendingResourceId, SessionEpoch, SessionId,
-    StreamCursor,
+    AttachmentId, ConnectionId, DeviceId, EnvironmentId, GrantId, PendingResourceId, SessionEpoch,
+    SessionId, StreamCursor,
 };
 use kr_protocol::input::{InputAcquireResult, InputLeaseState};
 use kr_protocol::projection::ProjectionResetReason;
@@ -195,6 +195,16 @@ pub struct Joined {
     /// Empty for a projected attachment: its screen is state rather than bytes, and it is queued
     /// through its own subscription by [`Session::install_projection`].
     pub bytes: Vec<u8>,
+}
+
+/// Whose authority an attachment made under a grant was admitted on: the grant its caller acted
+/// under and the paired device it came from, each when the caller carried one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GrantedBy {
+    /// The grant the daemon decided the attach under.
+    pub grant_id: Option<GrantId>,
+    /// The paired device the attach came from.
+    pub device_id: Option<DeviceId>,
 }
 
 /// What a view whose subscription came with a grant's history scope keeps about the broker's
@@ -420,7 +430,10 @@ pub struct Session {
     /// attachments are not in here, because its authority is the operating-system identity the
     /// socket authenticated and no revision replaces that. An attachment leaves it wherever it
     /// leaves the session ([`Session::detach`]), the empty-prompt gesture included.
-    granted_attachments: std::collections::BTreeSet<AttachmentId>,
+    ///
+    /// Each is kept with the grant and the device its caller carried, which is what a revision's
+    /// reach is read against ([`kr_protocol::worker::RevisionReach`]).
+    granted_attachments: BTreeMap<AttachmentId, GrantedBy>,
     /// The attachments the host would serve directly and is holding in projected mode.
     ///
     /// Section 8: a transition into live byte forwarding must use a parser-ground boundary with no
@@ -699,7 +712,7 @@ impl Session {
             content_scopes: std::collections::BTreeMap::new(),
             resource_views: BTreeMap::new(),
             live_views: BTreeMap::new(),
-            granted_attachments: std::collections::BTreeSet::new(),
+            granted_attachments: BTreeMap::new(),
             // Bound before the shell starts, from the desktop the create request recorded, or
             // from the login session this worker is in where the request recorded none. A desktop
             // that has already gone by now is a session that never had one, and the watch says so
@@ -1633,14 +1646,27 @@ impl Session {
 
     /// Records that an attachment was made under a grant, so an authority revision or the grant's
     /// own expiry fences what it was admitted to do.
-    pub fn note_granted_attachment(&mut self, attachment_id: AttachmentId) {
-        self.granted_attachments.insert(attachment_id);
+    pub fn note_granted_attachment(&mut self, attachment_id: AttachmentId, by: GrantedBy) {
+        self.granted_attachments.insert(attachment_id, by);
     }
 
     /// Returns true while an attachment made under a grant is still this session's.
     #[must_use]
     pub fn holds_granted_attachment(&self, attachment_id: AttachmentId) -> bool {
-        self.granted_attachments.contains(&attachment_id)
+        self.granted_attachments.contains_key(&attachment_id)
+    }
+
+    /// Returns true while an attachment made under a grant is this session's and the reach of an
+    /// authority revision names the grant or the device it was made under.
+    #[must_use]
+    pub fn granted_attachment_within(
+        &self,
+        attachment_id: AttachmentId,
+        reach: &kr_protocol::worker::RevisionReach,
+    ) -> bool {
+        self.granted_attachments
+            .get(&attachment_id)
+            .is_some_and(|by| reach.names(by.grant_id, by.device_id))
     }
 
     /// Forgets that an attachment was made under a grant, because it has left the session.

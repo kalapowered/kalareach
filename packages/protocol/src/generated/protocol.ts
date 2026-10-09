@@ -6011,6 +6011,26 @@ export interface AuthorityRevisionNotice {
    */
   evidence_from?: number
   /**
+   * Whose authority the revision withdrew, when the host can name it.
+   *
+   * It is absent from the wire when it is the whole host, which is what a worker that does not
+   * state [`crate::local::AUTHORITY_REVISION_REACH`] is always sent.
+   */
+  reach?:
+    | 'host'
+    | {
+        within: {
+          /**
+           * The devices the revision withdrew.
+           */
+          devices: DeviceId[]
+          /**
+           * The grants the revision withdrew, with everything delegated from them.
+           */
+          grants: GrantId[]
+        }
+      }
+  /**
    * The host's ordered authority revision. Only the host issues its own revisions.
    */
   revision: string

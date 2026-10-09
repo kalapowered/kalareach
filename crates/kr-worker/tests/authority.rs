@@ -578,6 +578,7 @@ async fn a_read_admitted_under_a_revision_the_worker_has_passed_keeps_its_link()
         .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
             environment_id: host.environment_id,
             revision: AuthorityRevision::new(2),
+            reach: kr_protocol::worker::RevisionReach::Host,
             evidence_from: 0,
         })
         .await
@@ -636,11 +637,12 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
     let notice = kr_protocol::worker::AuthorityRevisionNotice {
         environment_id: host.environment_id,
         revision: kr_protocol::ids::AuthorityRevision::new(4),
+        reach: kr_protocol::worker::RevisionReach::Host,
         evidence_from: 0,
     };
     cli.writer()
         .write_message(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
-            notice,
+            notice.clone(),
         ))
         .await
         .expect("writes the notice");

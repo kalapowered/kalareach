@@ -26,7 +26,7 @@
 //! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket`, `a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope`, `the_local_owner_reads_the_last_command_on_either_socket` |
 //! | KR-REQ-10.51 | `a_local_caller_under_a_grant_reads_only_the_questions_its_scope_admits`, `the_local_owner_reads_every_question_on_either_socket`, `a_worker_states_that_it_holds_a_question_read_to_its_scope` |
 //! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not`, `a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected`, `a_detach_whose_succession_fails_after_its_marker_stays_unknown` |
-//! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners`, `an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted`, `the_empty_prompt_gesture_leaves_nothing_of_a_granted_attachment_behind`, `a_granted_attachment_detached_through_the_service_at_the_prompt_is_let_go_at_once` |
+//! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners`, `a_revision_takes_the_lease_of_the_grants_and_devices_it_names_and_no_other`, `a_revision_that_follows_one_the_worker_missed_takes_every_lease_under_a_grant`, `a_revision_refused_for_the_boundary_takes_every_lease_under_a_grant_when_the_worker_fences_it`, `an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted`, `the_empty_prompt_gesture_leaves_nothing_of_a_granted_attachment_behind`, `a_granted_attachment_detached_through_the_service_at_the_prompt_is_let_go_at_once` |
 //! | KR-REQ-23.46 | `a_local_caller_under_a_grant_cancels_its_own_intent_and_no_other`, `the_local_owner_cancels_another_actors_intent_and_a_device_does_not` |
 
 mod common;
@@ -77,7 +77,7 @@ use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, 
 use kr_protocol::session::{
     ClosureReason, Dimensions, DisplayNumber, SessionReadParams, SessionReadResult, ShellMode,
 };
-use kr_protocol::worker::AuthorityRevisionNotice;
+use kr_protocol::worker::{AuthorityRevisionNotice, RevisionReach};
 use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::qualification::ShellKind;
@@ -922,16 +922,28 @@ impl Wired {
     /// A worker inside a dispatch transition answers that the revision is still pending for it, and
     /// the daemon announces it again. So does this.
     async fn revise(&self, authority: &mut LocalClient, revision: u64) {
+        self.revise_within(authority, revision, RevisionReach::Host)
+            .await;
+    }
+
+    /// As [`Self::revise`], for a revision that withdrew only the authority `reach` names.
+    async fn revise_within(
+        &self,
+        authority: &mut LocalClient,
+        revision: u64,
+        reach: RevisionReach,
+    ) {
         let notice = AuthorityRevisionNotice {
             environment_id: self.environment_id,
             revision: AuthorityRevision::new(revision),
+            reach,
             evidence_from: 0,
         };
         let started = tokio::time::Instant::now();
         loop {
             match within(
                 "the worker's acknowledgement",
-                authority.announce_revision(notice),
+                authority.announce_revision(notice.clone()),
             )
             .await
             {
@@ -2221,6 +2233,213 @@ async fn a_revision_takes_a_devices_lease_and_leaves_the_local_owners() {
     );
 
     drop((authority, phone, window, proxy));
+    wired.close();
+}
+
+/// The grant and the device [`device`] acts under.
+fn devices_grant() -> GrantId {
+    GrantId::new(Uuid::from_bytes([5; 16]))
+}
+
+fn devices_own_id() -> DeviceId {
+    DeviceId::new(Uuid::from_bytes([4; 16]))
+}
+
+/// A reach that names one grant and no device.
+fn grant_reach(grant_id: GrantId) -> RevisionReach {
+    RevisionReach::Within {
+        grants: [grant_id].into_iter().collect(),
+        devices: CanonicalSet::new(),
+    }
+}
+
+/// A reach that names one device and no grant.
+fn device_reach(device_id: DeviceId) -> RevisionReach {
+    RevisionReach::Within {
+        grants: CanonicalSet::new(),
+        devices: [device_id].into_iter().collect(),
+    }
+}
+
+/// KR-REQ-10.45: a revision takes the input lease of the callers its reach names, and no other
+/// caller's.
+///
+/// A device that withdraws what it delegated changes its own subtree of grants. Another device
+/// that holds the input lease under a grant outside it keeps the lease and goes on typing at its
+/// epoch; the device whose grant, or whose pairing, the revision named loses it, with whatever it
+/// had not delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_takes_the_lease_of_the_grants_and_devices_it_names_and_no_other() {
+    let wired = wired("sleep 120").await;
+    let mut authority = wired.daemon(ControllerConnectionRole::Authority).await;
+    let observe_and_type = [
+        AttachmentCapability::ObserveTerminal,
+        AttachmentCapability::Input,
+    ];
+    let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
+    // The first revision this worker is told has no revision before it that it acknowledged, so it
+    // is taken as the whole host's.
+    wired.revise(&mut authority, 2).await;
+    let phones = wired
+        .attach_for(&mut phone, &device(2), WATCH_AND_TYPE, &observe_and_type)
+        .await
+        .attachment
+        .attachment_id;
+    wired
+        .acquire_for(&mut phone, &device(2), WATCH_AND_TYPE, phones)
+        .await;
+
+    // A grant and a device that are not the phone's: its lease stays.
+    let other_grant = GrantId::new(Uuid::from_bytes([9; 16]));
+    let other_device = DeviceId::new(Uuid::from_bytes([8; 16]));
+    wired
+        .revise_within(&mut authority, 3, grant_reach(other_grant))
+        .await;
+    wired
+        .revise_within(&mut authority, 4, device_reach(other_device))
+        .await;
+    assert_eq!(
+        wired.lease_holder(),
+        Some(phones),
+        "a revision that names neither the phone's grant nor the phone leaves its lease"
+    );
+
+    // Its grant: the lease goes.
+    wired
+        .revise_within(&mut authority, 5, grant_reach(devices_grant()))
+        .await;
+    assert_eq!(wired.lease_holder(), None, "the phone's grant was named");
+
+    // Its pairing: the lease goes.
+    wired
+        .acquire_for(&mut phone, &device(5), WATCH_AND_TYPE, phones)
+        .await;
+    wired
+        .revise_within(&mut authority, 6, device_reach(devices_own_id()))
+        .await;
+    assert_eq!(wired.lease_holder(), None, "the phone was named");
+
+    drop((authority, phone));
+    wired.close();
+}
+
+/// KR-REQ-10.45: a reach is trusted for the revision that follows the last one the worker
+/// acknowledged and for no other. A worker that was not told a revision before this one cannot say
+/// what that one withdrew, so it takes the lease of every caller under a grant, whatever this one
+/// names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_that_follows_one_the_worker_missed_takes_every_lease_under_a_grant() {
+    let wired = wired("sleep 120").await;
+    let mut authority = wired.daemon(ControllerConnectionRole::Authority).await;
+    let observe_and_type = [
+        AttachmentCapability::ObserveTerminal,
+        AttachmentCapability::Input,
+    ];
+    let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
+    wired.revise(&mut authority, 2).await;
+    let phones = wired
+        .attach_for(&mut phone, &device(2), WATCH_AND_TYPE, &observe_and_type)
+        .await
+        .attachment
+        .attachment_id;
+    wired
+        .acquire_for(&mut phone, &device(2), WATCH_AND_TYPE, phones)
+        .await;
+    let other_grant = GrantId::new(Uuid::from_bytes([9; 16]));
+
+    // Revision 3 never reached this worker. Revision 4 names a grant that is not the phone's, and
+    // is not the one after the last acknowledged.
+    wired
+        .revise_within(&mut authority, 4, grant_reach(other_grant))
+        .await;
+    assert_eq!(
+        wired.lease_holder(),
+        None,
+        "revision 3 may have withdrawn the phone's grant"
+    );
+
+    // Once it has caught up, a revision that follows names its reach again.
+    wired
+        .acquire_for(&mut phone, &device(4), WATCH_AND_TYPE, phones)
+        .await;
+    wired
+        .revise_within(&mut authority, 5, grant_reach(other_grant))
+        .await;
+    assert_eq!(wired.lease_holder(), Some(phones));
+
+    drop((authority, phone));
+    wired.close();
+}
+
+/// KR-REQ-10.45: an announcement refused because the worker was inside a dispatch transition is
+/// fenced by the worker itself afterwards, and it fences every caller under a grant whatever the
+/// refused notice named. The notice is not kept, so nothing says whose authority it withdrew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_refused_for_the_boundary_takes_every_lease_under_a_grant_when_the_worker_fences_it()
+ {
+    let wired = wired("sleep 120").await;
+    let mut authority = wired.daemon(ControllerConnectionRole::Authority).await;
+    let observe_and_type = [
+        AttachmentCapability::ObserveTerminal,
+        AttachmentCapability::Input,
+    ];
+    let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
+    wired.revise(&mut authority, 2).await;
+    let phones = wired
+        .attach_for(&mut phone, &device(2), WATCH_AND_TYPE, &observe_and_type)
+        .await
+        .attachment
+        .attachment_id;
+    wired
+        .acquire_for(&mut phone, &device(2), WATCH_AND_TYPE, phones)
+        .await;
+
+    // The worker is inside a dispatch transition when revision 3, which names a grant that is not
+    // the phone's, is announced, so the announcement is refused and nothing is fenced yet.
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
+    let service = Arc::clone(&wired.service);
+    let holder = std::thread::spawn(move || {
+        let _boundary = service.hold_the_dispatch_boundary();
+        let _ = held.send(());
+        let _ = wait.recv();
+    });
+    within("the boundary to be held", confirmed)
+        .await
+        .expect("the holder ended without holding the boundary");
+    let refused = within(
+        "the refusal",
+        authority.announce_revision(AuthorityRevisionNotice {
+            environment_id: wired.environment_id,
+            revision: AuthorityRevision::new(3),
+            reach: grant_reach(GrantId::new(Uuid::from_bytes([9; 16]))),
+            evidence_from: 0,
+        }),
+    )
+    .await
+    .expect_err("an announcement is refused while the worker is inside a dispatch transition");
+    assert!(
+        matches!(
+            &refused,
+            kr_ipc::IpcError::IdentityUnavailable { detail, .. }
+                if detail.starts_with(ErrorCode::ResourceUnavailable.as_str())
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(wired.lease_holder(), Some(phones));
+
+    // Released, the worker fences the revision it owes by itself, as its maintenance does on its
+    // next tick.
+    drop(release);
+    holder.join().expect("the holding thread finishes");
+    wired.service.fence_what_is_owed_for_tests();
+    assert_eq!(
+        wired.lease_holder(),
+        None,
+        "the refused revision is fenced for every caller under a grant"
+    );
+
+    drop((authority, phone));
     wired.close();
 }
 

@@ -4222,6 +4222,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reach": {
+          "$ref": "#/$defs/RevisionReach",
+          "description": "Whose authority the revision withdrew, when the host can name it.\n\nIt is absent from the wire when it is the whole host, which is what a worker that does not\nstate [`crate::local::AUTHORITY_REVISION_REACH`] is always sent."
+        },
         "revision": {
           "$ref": "#/$defs/AuthorityRevision",
           "description": "The revision now in force."
@@ -30535,6 +30539,52 @@
           "const": "installation_key_revision",
           "description": "The installation key revision at a push gateway.",
           "type": "string"
+        }
+      ]
+    },
+    "RevisionReach": {
+      "description": "Whose authority one revision withdrew.\n\nA revision invalidates the host's dispatch leases wholesale, but what it takes away from a\nsession's workers is the authority held under the grants and by the devices it withdrew. A\nworker fences the input of the callers it names and leaves every other caller's, so one\ndevice's own grant changes do not take the input lease another device holds.\n\nA worker applies a named reach only to the revision that follows the one it last acknowledged:\na worker that missed a revision, that was refused for its dispatch boundary, or that has\nacknowledged none fences every caller acting under a grant, as it does for [`Self::Host`].",
+      "oneOf": [
+        {
+          "const": "host",
+          "description": "Any authority the host holds, or authority the host cannot name.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Only the authority held under these grants and by these devices.",
+          "properties": {
+            "within": {
+              "additionalProperties": false,
+              "properties": {
+                "devices": {
+                  "description": "The devices the revision withdrew.",
+                  "items": {
+                    "$ref": "#/$defs/DeviceId"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "grants": {
+                  "description": "The grants the revision withdrew, with everything delegated from them.",
+                  "items": {
+                    "$ref": "#/$defs/GrantId"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                }
+              },
+              "required": [
+                "grants",
+                "devices"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "within"
+          ],
+          "type": "object"
         }
       ]
     },
