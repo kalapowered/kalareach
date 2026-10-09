@@ -19,7 +19,7 @@ use kr_protocol::transfer::{
 };
 use kr_transfer::service::{Action, Admission, AdmissionHook};
 use kr_transfer::{RetainEverything, TransferError};
-use support::{BOOT_NOW_MS, FixedBootClock, Harness, pattern};
+use support::{BOOT_NOW_MS, Harness, boot_clock_at, pattern};
 
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([9; 16]))
@@ -270,7 +270,7 @@ fn a_claim_marks_the_binding_inserting_for_its_owner_and_a_repeat_by_the_owner_i
             action_id: action(32),
             ..harness.begin_of(session(), created.draft_id, handle.transfer_id, owner)
         },
-        &FixedBootClock(BOOT_NOW_MS),
+        &boot_clock_at(BOOT_NOW_MS),
     );
     assert_eq!(
         rival.expect_err("another owner").code(),
@@ -308,7 +308,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
             attempt: U64::new(7),
             ..good.clone()
         },
-        &FixedBootClock(BOOT_NOW_MS),
+        &boot_clock_at(BOOT_NOW_MS),
         "an attempt the binding is not at",
     );
     refused(
@@ -316,12 +316,12 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
             max_count: U64::new(0),
             ..good.clone()
         },
-        &FixedBootClock(BOOT_NOW_MS),
+        &boot_clock_at(BOOT_NOW_MS),
         "more attachments than the operation accepts",
     );
     refused(
         &good,
-        &FixedBootClock(good.deadline_boot_ms.get()),
+        &boot_clock_at(good.deadline_boot_ms.get()),
         "a deadline that has passed",
     );
 
@@ -345,7 +345,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
         .expect("records the failure");
     refused(
         &harness.begin_of(session(), created.draft_id, second.transfer_id, action(43)),
-        &FixedBootClock(BOOT_NOW_MS),
+        &boot_clock_at(BOOT_NOW_MS),
         "a binding that failed and has not been bound again",
     );
 
@@ -381,7 +381,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
                 by_composer.1.transfer_id,
                 action(44),
             ),
-            &FixedBootClock(BOOT_NOW_MS),
+            &boot_clock_at(BOOT_NOW_MS),
         )
         .expect_err("a binding a worker does not offer");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -396,7 +396,7 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
             &harness.actor,
             session(),
             &begin,
-            &FixedBootClock(BOOT_NOW_MS),
+            &boot_clock_at(BOOT_NOW_MS),
         )
         .expect_err("a draft whose session has ended");
     assert_eq!(
@@ -585,7 +585,7 @@ fn an_unknown_offer_is_offered_again_as_a_new_attempt() {
                 action_id: action(62),
                 ..first_begin.clone()
             },
-            &FixedBootClock(BOOT_NOW_MS),
+            &boot_clock_at(BOOT_NOW_MS),
         )
         .expect_err("an unknown offer is not claimed again as it stands");
     assert_eq!(refused.code(), ErrorCode::DraftConflict);
@@ -751,7 +751,7 @@ fn the_room_for_the_report_of_every_offer_in_flight_is_kept() {
             &harness.actor,
             session(),
             &second_begin,
-            &FixedBootClock(BOOT_NOW_MS),
+            &boot_clock_at(BOOT_NOW_MS),
         )
         .expect_err("a claim that leaves no room for its report");
     assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
@@ -986,7 +986,7 @@ fn a_claim_is_refused_for_a_draft_that_is_not_the_workers_and_for_a_file_that_is
             &harness.actor,
             worker,
             &first_claim(draft, handle, number),
-            &FixedBootClock(BOOT_NOW_MS),
+            &boot_clock_at(BOOT_NOW_MS),
         )
     };
 
@@ -1133,6 +1133,19 @@ fn a_report_is_taken_only_from_the_sessions_worker_and_a_repeat_is_no_exception(
     let error = harness
         .report(other, &taken_begin, accepted("the agent's own part"))
         .expect_err("another session's worker repeating it");
+    assert!(
+        matches!(error, TransferError::UnknownDraft { .. }),
+        "{error:?}"
+    );
+    // The session is judged before the binding is looked for: another session's worker is told
+    // nothing of the draft either for a transfer the draft does not hold.
+    let unheld = InsertionBegin {
+        transfer_id: TransferId::new(Uuid::from_bytes([99; 16])),
+        ..taken_begin.clone()
+    };
+    let error = harness
+        .report(other, &unheld, failed("not mine to say"))
+        .expect_err("another session's worker, for a transfer the draft does not hold");
     assert!(
         matches!(error, TransferError::UnknownDraft { .. }),
         "{error:?}"

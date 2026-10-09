@@ -116,16 +116,6 @@ const HALF_READY: &str = "KR_KILLS_READY";
 /// The client half's name, as the test harness selects it.
 const CLIENT_HALF: &str = "serve_a_client_half_for_the_kill_stage";
 
-/// A boot clock that reads one moment.
-#[derive(Debug)]
-struct FixedClock(u64);
-
-impl kr_ipc::clock::SharedClock for FixedClock {
-    fn boot_elapsed_ms(&self) -> u64 {
-        self.0
-    }
-}
-
 /// An offer of one attachment to a session's agent that a worker claimed.
 struct Offer {
     action_id: ActionId,
@@ -438,7 +428,7 @@ impl Host {
                     max_count: U64::new(2),
                     deadline_boot_ms: U64::new(now + 60_000),
                 },
-                &FixedClock(now),
+                &kr_ipc::clock::SystemSharedClock,
             )
             .expect("the attachment is claimed for the offer");
         offer
