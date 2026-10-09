@@ -599,8 +599,9 @@ impl Controller {
         // The managed storage service this host uploads its backups to, when its configuration
         // document selects one. Its clients are built here, from that document and from nothing a
         // process inherited, and they sign as a writer key only this host holds, made the first
-        // time one is needed and loaded after that. Nothing runs yet: settling comes before the
-        // store is reconciled, and the carrier starts after it.
+        // time one is needed and loaded after that. They go through the proxy this daemon started
+        // with, the endpoint's own. Nothing runs yet: settling comes before the store is
+        // reconciled, and the carrier starts after it.
         let backup_runtime = match started.storage.origin() {
             None => None,
             Some(origin) => {
@@ -1056,8 +1057,8 @@ impl Controller {
     /// `network.proxy_url` as this daemon read it when it started, or `None` when it named none.
     ///
     /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
-    /// delivery and the plugin catalogue never go through two different proxies, and an edit
-    /// applies to all of them at the next start.
+    /// delivery, the plugin catalogue and the managed storage service never go through two
+    /// different proxies, and an edit applies to all of them at the next start.
     ///
     /// # Errors
     ///
