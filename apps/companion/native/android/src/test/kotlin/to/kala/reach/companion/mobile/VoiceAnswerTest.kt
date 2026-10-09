@@ -74,6 +74,14 @@ class VoiceAnswerTest {
      */
     @Test
     fun dtx_on_another_payload_is_not_the_calls() {
-        assertFalse(VoiceAnswer.usesDtx(recorded() + "a=fmtp:96 usedtx=1\r\n"))
+        // Inside the accepted audio section, beside the Opus payload.
+        val sdp = recorded()
+        val plain = "a=fmtp:111 minptime=10;useinbandfec=1"
+        assertTrue(sdp.contains(plain))
+        assertFalse(
+            VoiceAnswer.usesDtx(
+                sdp.replace(plain, plain + "\r\na=rtpmap:96 telephone-event/48000\r\na=fmtp:96 usedtx=1"),
+            ),
+        )
     }
 }

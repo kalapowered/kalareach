@@ -51,9 +51,11 @@ import java.util.concurrent.atomic.AtomicLong
  * negotiated, so applying an answer starts nothing on its own. The control turns it on only for a
  * call the host permitted whose foreground service holds the foreground, and every frame the
  * recorder produces is asked about separately and silenced unless the control says it may be
- * carried. Timers and the platform's reports run on this call's own thread, never the main one, and
- * so does everything the [Observer] is told: no observer code runs on WebRTC's own thread, where a
- * call that ended itself from a callback would dispose the connection that is calling it.
+ * carried. Timers and the platform's reports run on this call's own thread, never the main one.
+ * What the [Observer] is told never runs on a WebRTC thread, where a call that ended itself from a
+ * callback would dispose the connection that is calling it: provider events and the first audio
+ * come on the call's own thread, and a capture state comes at once on the thread that changed the
+ * call.
  */
 class VoiceCall private constructor(
     private val context: Context,
@@ -63,15 +65,24 @@ class VoiceCall private constructor(
     /** How the offer waits for the first round of candidate gathering. */
     private val gathering: GatheringWait,
 ) {
-    /** What a running call tells the application about, on the call's own thread. */
+    /** What a running call tells the application about. */
     interface Observer {
-        /** The microphone's state changed, for the screen and for the authority gate. */
+        /**
+         * The microphone's state changed, for the screen and for the authority gate.
+         *
+         * Reported at once, under the control's lock, on the thread that changed the call: the
+         * owner's, the notification's, or the one waiting on an offer. Keep it short, and never
+         * wait in it for a thread that enters the call.
+         */
         fun onCaptureState(state: VoiceCaptureState)
 
-        /** The provider sent something on its read-only channel. */
+        /** The provider sent something on its read-only channel. On the call's own thread. */
         fun onProviderEvent(bytes: ByteArray)
 
-        /** The first remote audio track arrived. It reports a track, not audible playback. */
+        /**
+         * The first remote audio track arrived. It reports a track, not audible playback. On the
+         * call's own thread.
+         */
         fun onFirstAudio()
     }
 
@@ -310,10 +321,11 @@ class VoiceCall private constructor(
      * Makes this call's SDP offer.
      *
      * Section 15 paragraph 3: the client creates the offer. The host forwards it and never
-     * generates one. The offer is returned after the first round of candidate gathering, or after
-     * [GATHERING_BOUND_SECONDS], so that it names the addresses this device can be reached at: the
-     * provider is answered once, and a candidate found later is not sent. A call that ends before
-     * the offer is complete makes none: this throws [IllegalStateException].
+     * generates one. The offer is returned after [GATHERING_BOUND_SECONDS], or earlier if gathering
+     * reports itself done, which continual gathering does not do, so that it names the addresses
+     * this device can be reached at: the provider is answered once, and a candidate found later is
+     * not sent. A call that ends before the offer is complete makes none: this throws
+     * [IllegalStateException].
      */
     fun offer(): String {
         val constraints = MediaConstraints().apply {
@@ -345,8 +357,9 @@ class VoiceCall private constructor(
      * Runs `use` on the connection while the call cannot end under it, or throws when it has ended.
      *
      * The connection is disposed when the call ends, after the lock that this holds, so a call made
-     * through it here reaches live memory. Nothing that runs on WebRTC's thread waits for the lock,
-     * which keeps a call into the connection that waits for that thread from waiting for it.
+     * through it here reaches live memory. Nothing that runs on a WebRTC thread waits for this lock
+     * or for the control's, which keeps a call into the connection that waits for that thread from
+     * waiting for one that waits for it.
      */
     private fun <T> onOpenConnection(use: (PeerConnection) -> T): T =
         synchronized(lock) {

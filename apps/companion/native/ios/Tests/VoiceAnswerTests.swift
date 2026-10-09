@@ -62,7 +62,13 @@ final class VoiceAnswerTests: XCTestCase {
     /// payload that is not Opus says nothing about it.
     func testDtxOnAnotherPayloadIsNotTheCalls() throws {
         let sdp = try recorded()
-        let other = sdp + "a=fmtp:96 usedtx=1\r\n"
+        // Inside the accepted audio section, beside the Opus payload.
+        let plain = "a=fmtp:111 minptime=10;useinbandfec=1"
+        XCTAssertTrue(sdp.contains(plain))
+        let other = sdp.replacingOccurrences(
+            of: plain,
+            with: plain + "\r\na=rtpmap:96 telephone-event/48000\r\na=fmtp:96 usedtx=1"
+        )
         XCTAssertFalse(VoiceAnswer.usesDtx(other))
     }
 }
