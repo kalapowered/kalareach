@@ -14,6 +14,11 @@ path = "src/bin/kr-worker.rs"
 
 [dependencies]
 clap.workspace = true
+# A native terminal reaches the gateway over a WebSocket, which the worker reads and writes as a
+# stream of messages.
+futures-util.workspace = true
+# The terminal's upgrade request is parsed and vetted here before the WebSocket library sees it.
+httparse.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 # The journal is opened the way every store is, waiting out a previous holder that is letting go.
@@ -49,6 +54,8 @@ sha2.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# The server half: a terminal started with `--remote` upgrades its connection to a WebSocket.
+tokio-websockets = { workspace = true, features = ["server"] }
 
 [target.'cfg(windows)'.dependencies]
 # The terminal is this host's own pseudo-console, because the pipe modes its boundaries need cannot
