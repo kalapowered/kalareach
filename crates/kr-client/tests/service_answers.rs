@@ -74,6 +74,7 @@ use recording::{
 
 const FIXTURE: &str = include_str!("../../../fixtures/service/storage-answers.json");
 
+/// An account token, as a source hands it over.
 #[derive(Debug)]
 struct Bearer(String);
 
