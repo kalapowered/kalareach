@@ -53,7 +53,7 @@
 //! version ([`Written`]). Between the update's check that the release it switches to can read every
 //! store and its switch, such a command could write a version that release cannot read. So every
 //! writer of such a record holds `writers.lock` shared ([`hold_writers`]) while it writes, and an
-//! update holds it exclusively ([`Store::try_lock_writers`]) from before its check until its switch
+//! update holds it exclusively (`Store::try_lock_writers`) from before its check until its switch
 //! has been made. Under the lock a writer reads the manifest of the release `current` names and
 //! asks [`Writers::permit`] for the one record it is about to write: a record the manifest lists is
 //! written only at the version the manifest says its release writes, and a record it does not list is
