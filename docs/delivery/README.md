@@ -445,7 +445,8 @@ credential over again repairs either case. Configuring under an identifier that 
 that destination. A webhook, which sends with none, takes away any credential kept for what it
 replaced, once the new destination is written. If the secret store refuses that removal, the host
 logs it and the configuration stands; the old credential stays in the store, and a later
-configuration of a credentialed kind under that identifier that gives no credential sends with it.
+configuration under that identifier, of the kind that credential is for and with no credential of
+its own, sends with it.
 
 The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
 told, and every pass asks the grant again, so a destination under a grant that stops standing is
