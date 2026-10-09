@@ -11,9 +11,10 @@ description: >-
 inputs:
   restore:
     description: >-
-      'false' leaves the Actions cache out: nothing is restored, and the archives are fetched
-      from libsodium's host on every run. A job that signs a release sets it, so that nothing a
-      cache holds is linked into what it signs.
+      'false' leaves the Actions cache out: nothing is restored, and the prebuilt archive and its
+      signature are fetched from libsodium's host on every run (the source archive comes from the
+      crate's own files). A job that signs a release sets it, so that nothing a cache holds is
+      linked into what it signs.
     required: false
     default: 'true'
 
