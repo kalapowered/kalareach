@@ -129,7 +129,9 @@ pub async fn show(
 /// Returns [`CliError::AnswerKept`] when the answer was kept rather than sent, [`CliError::Usage`]
 /// for an answer that does not fit the question's form, [`CliError::Refused`] when the question
 /// has already been resolved, has expired, or has moved to a revision this command did not read,
-/// and [`CliError::Unfinished`] when the worker took the answer and its reply cannot be read.
+/// [`CliError::Unfinished`] when the worker took the answer and its reply cannot be read, and
+/// [`CliError::UpdateDeferred`] when it could neither be sent nor kept because an update of this
+/// host held the writers' lock for the whole wait.
 pub async fn answer(
     paths: &HostPaths,
     question_id: QuestionId,
@@ -173,7 +175,7 @@ pub async fn answer(
             (_, AnswerError::Retired(reason)) => {
                 ended_first(question_id, reason, &kept_copy(&drafts, question_id))
             }
-            // Keeping it was the fallback, and it failed too.
+            // An answer kept earlier for the question could not be read or removed.
             (_, error @ (AnswerError::Store { .. } | AnswerError::Unreadable { .. })) => {
                 lost(&workers, question_id, &shown!("{}", error))
             }
@@ -1549,8 +1551,8 @@ mod tests {
 
     /// KR-REQ-26.10: an answer that was not sent is kept only where the release `current` names reads
     /// kept answers at the format this build writes them in, or does not read them. Where it lists
-    /// another format, nothing is kept and the earlier answer is as it was; whatever it lists, an
-    /// earlier answer of a later format is not replaced. A refusal because an update holds the writers'
+    /// another format, nothing is kept; whatever it lists, an earlier answer of a later format is not
+    /// replaced. A refusal because an update holds the writers'
     /// lock keeps its exit status 9, and says the answer was neither sent nor kept.
     #[cfg(unix)]
     #[test]
@@ -1592,8 +1594,13 @@ mod tests {
             assert_eq!(drafts.drafts().expect("reads"), vec![draft.clone()]);
         }
 
-        // An earlier answer of a later format stays, whatever the release lists.
-        let later = b"an answer of a later format".to_vec();
+        // An earlier answer of a later format, a valid record that only the format member says is
+        // later, stays whatever the release lists.
+        let later = kr_cbor::to_canonical_vec(&AnswerDraft {
+            version: answers::ANSWER_FORMAT + 1,
+            ..draft.clone()
+        })
+        .expect("a record of a later format");
         std::fs::write(&kept, &later).expect("planted");
         for listing in [
             Listing::of(&[(answers::WRITTEN.store, answers::WRITTEN.version)]),

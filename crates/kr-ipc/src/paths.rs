@@ -2567,6 +2567,50 @@ fn read_environment_id(path: &Path) -> Result<Option<EnvironmentId>> {
 /// The largest recorded environment identity this host will read.
 const MAX_ENVIRONMENT_ID_LEN: u64 = 128;
 
+/// Opens the lock file at `path`, creating it owner-only when it is not there, without following a
+/// link and without waiting for a writer, and checks that the handle it opened is a regular file.
+///
+/// A path inspected and then opened is two files whenever something replaces it between the calls: a
+/// link planted at the name would have the open create its target, and a pipe would hold the open
+/// for ever. The checks here are on the handle.
+///
+/// # Errors
+///
+/// Returns the failure to open it, or [`std::io::ErrorKind::InvalidInput`] when it is not a regular
+/// file.
+#[cfg(unix)]
+pub fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let file = std::fs::File::from(
+        rustix::fs::open(
+            path,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    Ok(file)
+}
+
+/// Opens the lock file at `path`, creating it when it is not there.
+///
+/// # Errors
+///
+/// Returns the failure to open it.
+#[cfg(not(unix))]
+pub fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
 /// Reads a small file this user owns, without following a link or waiting for a writer.
 ///
 /// A path check followed by a read checks one file and reads whatever the name points at by then.

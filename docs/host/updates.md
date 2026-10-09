@@ -424,4 +424,5 @@ A Windows host keeps no store: a directory link there cannot be replaced in one 
 does not administer the machine. Its installer replaces the release, and `kr host install`,
 `kr host update`, `kr host rollback` and `kr host versions` say so. With no store there is no
 writers' lock to take and no release to read it from, so the lock never holds a command off or
-refuses it there. A record's own format check still applies.
+refuses it there. A record's own format check still applies, and an older release installed again
+reads a record a newer one wrote as it does today.
