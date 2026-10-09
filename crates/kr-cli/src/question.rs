@@ -153,7 +153,7 @@ pub async fn answer(
         // The answer is a stored record: keeping it holds the writers' lock and asks for the leave to
         // write it, which no send does.
         Ok(Answered::Unconfirmed(draft)) => {
-            match keep_answer(&drafts, &draft, crate::barrier::hold()) {
+            match keep_answer(&drafts, &draft, crate::barrier::hold(paths)) {
                 Ok(()) => Err(kept(&workers, draft.question_id, "was kept")),
                 Err(refused) => Err(lost_when_not_kept(&workers, draft.question_id, refused)),
             }

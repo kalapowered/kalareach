@@ -840,7 +840,7 @@ fn encoded(plan: &Plan) -> Result<Vec<u8>> {
 /// Keeps the plan, replacing what was kept, under the writers' lock for the write alone: a plan is
 /// saved before each step is sent, and a command may run for minutes between saves.
 fn save(paths: &HostPaths, plan: &Plan) -> Result<()> {
-    save_under(paths, plan, &crate::barrier::hold()?)
+    save_under(paths, plan, &crate::barrier::hold(paths)?)
 }
 
 /// Keeps the plan, replacing what was kept, if the release `current` names does not list a plan at
@@ -854,7 +854,7 @@ fn save_under(paths: &HostPaths, plan: &Plan, writers: &Writers) -> Result<()> {
 /// Keeps a plan that is the first, which fails when one is kept already, under the writers' lock for
 /// the write alone.
 fn create(paths: &HostPaths, plan: &Plan) -> Result<()> {
-    create_under(paths, plan, &crate::barrier::hold()?)
+    create_under(paths, plan, &crate::barrier::hold(paths)?)
 }
 
 /// Keeps the first plan, if the release `current` names does not list a plan at another format than

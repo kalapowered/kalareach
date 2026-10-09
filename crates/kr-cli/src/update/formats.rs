@@ -17,7 +17,9 @@ use kr_client::shown::Shown;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::update::{Recording, ReleaseManifest, ReleaseStore, StoreScope};
 
+use super::Unreached;
 use super::inventory::Environment;
+use crate::barrier::COMMAND_WRITTEN_STORES;
 use crate::error::CliError;
 
 /// A store the target cannot read as it is, and where.
@@ -136,6 +138,23 @@ pub fn unlookable(target: &ReleaseManifest) -> Vec<Refusal> {
         .collect()
 }
 
+/// What looking at the stores found.
+pub struct Checked {
+    /// Each store the target cannot read as it is.
+    pub refusals: Vec<Refusal>,
+    /// The roots a command of this store registered that could not be looked at, which the update
+    /// names and goes on without.
+    pub unreached: Vec<Unreached>,
+}
+
+/// A root that only a command of this store registered: no control daemon of the store served it,
+/// so the update looks at what a command writes there and does nothing else with it.
+struct Registered {
+    host: kr_ipc::paths::HostPaths,
+    /// The environment the root's identity names, when it has one.
+    environment: Option<Environment>,
+}
+
 /// Looks at every store `target` lists, where the manifest says it is, and returns each that is at
 /// a version the target does not read, with those [`unlookable`] too.
 ///
@@ -145,6 +164,13 @@ pub fn unlookable(target: &ReleaseManifest) -> Vec<Refusal> {
 /// `carries` is whether the switch brings a registry that is behind forward before the target meets
 /// it, which an update does and a rollback does not. `_writers` is the writers' lock, held
 /// exclusively: no command writes a stored record between this look and the switch that follows it.
+///
+/// The roots commands registered ([`Store::registered_roots`]) and the configuration documents
+/// recorded ([`Store::recorded_documents`]) are read here, under that lock, which every command
+/// holds from before it registers to after it has written: a root that did not exist when the
+/// survey was made can exist now, and is looked at. In a root only a command registered the stores
+/// a command writes are looked at, by name, and nothing else: a daemon's store there, of this
+/// store's or another's, is not this update's to refuse a switch for.
 #[must_use]
 pub fn check(
     target: &ReleaseManifest,
@@ -153,14 +179,31 @@ pub fn check(
     published: &[(EnvironmentId, PathBuf)],
     carries: bool,
     _writers: &kr_ipc::install::ExclusiveWriters,
-) -> Vec<Refusal> {
+) -> Checked {
     let mut refusals = unlookable(target);
+    let mut unreached = Vec::new();
+    let registered = registered(install, environments, &mut unreached);
+    let documents = install.recorded_documents().unwrap_or_else(|error| {
+        refusals.push(Refusal {
+            store: "the configuration documents the store recorded".to_owned(),
+            environment: None,
+            place: install.roots(),
+            why: Why::Unreadable(super::said(&error)),
+        });
+        Vec::new()
+    });
     for listed in &target.stores {
         if listed.scope == StoreScope::Unknown || listed.recording == Recording::Unknown {
             continue;
         }
-        for (environment, directory) in directories(listed.scope, install, environments, published)
-        {
+        let places = Places {
+            install,
+            environments,
+            published,
+            registered: &registered,
+            documents: &documents,
+        };
+        for (environment, directory) in places.of(listed) {
             let mut refuse = |place: PathBuf, why: Why| {
                 refusals.push(Refusal {
                     store: listed.store.clone(),
@@ -181,50 +224,169 @@ pub fn check(
             }
         }
     }
-    refusals
+    Checked {
+        refusals,
+        unreached,
+    }
 }
 
-/// Where a scope's paths start, for each thing of that scope there is, with the environment it is
-/// an environment's.
-fn directories(
-    scope: StoreScope,
+/// The roots only a command registered, each looked at now: one that is not there holds nothing, and
+/// one that cannot be looked at is named and left.
+fn registered(
     install: &kr_ipc::install::Store,
     environments: &[&Environment],
-    published: &[(EnvironmentId, PathBuf)],
-) -> Vec<(Option<EnvironmentId>, PathBuf)> {
-    let mut found: Vec<(Option<EnvironmentId>, PathBuf)> = Vec::new();
-    match scope {
-        StoreScope::Install => found.push((None, install.root().to_path_buf())),
-        StoreScope::StateRoot => {
-            for environment in environments {
-                found.push((None, environment.host.state_root().to_path_buf()));
+    unreached: &mut Vec<Unreached>,
+) -> Vec<Registered> {
+    let recorded = match install.registered_roots() {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            unreached.push(Unreached {
+                runtime_root: PathBuf::new(),
+                state_root: install.roots(),
+                reason: super::said(&error),
+            });
+            return Vec::new();
+        }
+    };
+    let mut found = Vec::new();
+    for roots in recorded {
+        if environments
+            .iter()
+            .any(|known| known.host.state_root() == roots.state_root)
+        {
+            continue;
+        }
+        let not_reached = |reason: Shown| Unreached {
+            runtime_root: roots.runtime_root.clone(),
+            state_root: roots.state_root.clone(),
+            reason,
+        };
+        match std::fs::metadata(&roots.state_root) {
+            Ok(about) if about.is_dir() => {}
+            Ok(_) => {
+                unreached.push(not_reached(Shown::said("it is not a directory")));
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                unreached.push(not_reached(shown!(
+                    "it could not be looked at: {}",
+                    Shown::io(&error)
+                )));
+                continue;
             }
         }
-        StoreScope::Environment => {
-            for environment in environments {
-                found.push((
-                    Some(environment.environment_id),
-                    environment.paths.state_dir().to_path_buf(),
-                ));
+        let Ok(host) = kr_ipc::paths::HostPaths::new(&roots.runtime_root, &roots.state_root) else {
+            unreached.push(not_reached(Shown::said("its roots cannot be resolved")));
+            continue;
+        };
+        let environment = match host.recorded_environment_id() {
+            Ok(Some(environment_id)) => {
+                kr_ipc::paths::HostPaths::new(&roots.runtime_root, &roots.state_root)
+                    .ok()
+                    .map(|again| Environment {
+                        environment_id,
+                        paths: host.environment(environment_id),
+                        host: again,
+                    })
             }
-        }
-        StoreScope::Configuration => {
-            for environment in environments {
-                for directory in configuration_directories(environment) {
-                    found.push((Some(environment.environment_id), directory));
+            Ok(None) => None,
+            Err(error) => {
+                unreached.push(not_reached(shown!(
+                    "its environment identity could not be looked at: {}",
+                    Shown::ipc(&error)
+                )));
+                continue;
+            }
+        };
+        found.push(Registered { host, environment });
+    }
+    found
+}
+
+/// What a store's places are looked for in.
+struct Places<'a> {
+    install: &'a kr_ipc::install::Store,
+    environments: &'a [&'a Environment],
+    published: &'a [(EnvironmentId, PathBuf)],
+    registered: &'a [Registered],
+    documents: &'a [kr_ipc::install::RecordedDocument],
+}
+
+impl Places<'_> {
+    /// Where a store's paths start, for each thing of its scope there is, with the environment it is
+    /// an environment's.
+    fn of(&self, listed: &ReleaseStore) -> Vec<(Option<EnvironmentId>, PathBuf)> {
+        let command_written = COMMAND_WRITTEN_STORES.contains(&listed.store.as_str());
+        let mut found: Vec<(Option<EnvironmentId>, PathBuf)> = Vec::new();
+        match listed.scope {
+            StoreScope::Install => found.push((None, self.install.root().to_path_buf())),
+            StoreScope::StateRoot => {
+                for environment in self.environments {
+                    found.push((None, environment.host.state_root().to_path_buf()));
                 }
-                for (published_for, directory) in published {
-                    if *published_for == environment.environment_id {
-                        found.push((Some(environment.environment_id), directory.clone()));
+                if command_written {
+                    for registered in self.registered {
+                        found.push((None, registered.host.state_root().to_path_buf()));
                     }
                 }
             }
+            StoreScope::Environment => {
+                for environment in self.environments {
+                    found.push((
+                        Some(environment.environment_id),
+                        environment.paths.state_dir().to_path_buf(),
+                    ));
+                }
+                if command_written {
+                    for environment in self
+                        .registered
+                        .iter()
+                        .filter_map(|r| r.environment.as_ref())
+                    {
+                        found.push((
+                            Some(environment.environment_id),
+                            environment.paths.state_dir().to_path_buf(),
+                        ));
+                    }
+                }
+            }
+            StoreScope::Configuration => {
+                for environment in self.environments {
+                    for directory in configuration_directories(environment) {
+                        found.push((Some(environment.environment_id), directory));
+                    }
+                    for (published_for, directory) in self.published {
+                        if *published_for == environment.environment_id {
+                            found.push((Some(environment.environment_id), directory.clone()));
+                        }
+                    }
+                }
+                if command_written {
+                    for environment in self
+                        .registered
+                        .iter()
+                        .filter_map(|r| r.environment.as_ref())
+                    {
+                        for directory in configuration_directories(environment) {
+                            found.push((Some(environment.environment_id), directory));
+                        }
+                    }
+                }
+                // Every document a daemon or a command recorded, wherever its variables put it
+                // and whether or not the environment it belongs to was surveyed.
+                for document in self.documents {
+                    if let Some(directory) = document.path.parent() {
+                        found.push((Some(document.environment), directory.to_path_buf()));
+                    }
+                }
+            }
+            StoreScope::Unknown => {}
         }
-        StoreScope::Unknown => {}
+        found.sort_by(|left, right| left.1.cmp(&right.1));
+        found.dedup();
+        found
     }
-    found.sort_by(|left, right| left.1.cmp(&right.1));
-    found.dedup();
-    found
 }
 
 /// Where an environment's configuration document can be, apart from where its daemon said: with the
@@ -486,6 +648,100 @@ mod tests {
         let path = directory.join(name);
         std::fs::write(&path, text).expect("a record");
         path
+    }
+
+    /// A release that lists `shell-entries` and `machine-group`, at versions 1 to 1.
+    fn target() -> ReleaseManifest {
+        let listed = |name: &str, scope: &str, path: &str| {
+            serde_json::json!({
+                "store": name,
+                "scope": scope,
+                "path": path,
+                "recording": { "kind": "json_member", "member": "version", "absent": 0 },
+                "version": 1,
+                "migrates_from": 1,
+            })
+        };
+        let document = serde_json::json!({
+            "signed": {
+                "_type": "kalareach-release",
+                "release": "0.2.0+bbbbbbbbbbbb",
+                "sequence": "2",
+                "commit": "4254aa6e62e585478ff8dcff5518f23c7263f4ce",
+                "target": "aarch64-apple-darwin",
+                "os_floor": { "system": "macos", "version": "14.0" },
+                "protocol_version": { "major": 0, "minor": 48, "patch": 0 },
+                "public_majors": [1],
+                "retained_levels": ["0.48"],
+                "shells": [],
+                "stores": [
+                    listed("shell-entries", "state_root", "shell-entries.json"),
+                    listed("machine-group", "environment", "machine-group"),
+                ],
+                "files": [],
+            },
+            "signatures": [],
+        });
+        ReleaseManifest::read_document(document.to_string().as_bytes()).expect("a manifest")
+    }
+
+    /// KR-REQ-26.10: a root only a command registered is looked at when the check runs, under the
+    /// writers' lock, and not when it was listed: a root that did not exist then can exist now. In it
+    /// the stores a command writes are read by name, and a daemon's store of the same recording kind
+    /// is not; a root that cannot be looked at is named and does not refuse the switch.
+    #[test]
+    fn a_registered_root_is_looked_at_when_the_check_runs_and_only_for_the_stores_a_command_writes()
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = kr_ipc::install::Store::at(directory.path().join("host"));
+        store.create_directories().expect("the store");
+        let state = directory.path().join("state");
+        let mut registration = directory.path().join("run").as_os_str().as_bytes().to_vec();
+        registration.push(0);
+        registration.extend_from_slice(state.as_os_str().as_bytes());
+        kr_ipc::paths::create_private_directory(&store.roots()).expect("the records");
+        kr_ipc::paths::write_owner_only_file(
+            &store.roots().join("0123456789abcdef.registered"),
+            &registration,
+        )
+        .expect("a registration");
+        let target = target();
+        let writers = store
+            .try_lock_writers()
+            .expect("asks")
+            .expect("no command is writing");
+
+        // Registered when the root was not there: nothing to look at, and nothing to name.
+        let checked = check(&target, &store, &[], &[], true, &writers);
+        assert!(checked.refusals.is_empty() && checked.unreached.is_empty());
+
+        // The command made the root and wrote its record after that: the check, which runs later,
+        // finds it. A daemon's store in the same root, at a version the target does not read, is not
+        // this store's to refuse a switch for.
+        std::fs::create_dir_all(&state).expect("the root");
+        std::fs::write(state.join("shell-entries.json"), r#"{"version": 5}"#).expect("a record");
+        std::fs::write(state.join("machine-group"), r#"{"version": 9}"#).expect("a daemon's");
+        kr_ipc::paths::write_owner_only_file(
+            &state.join("shell-entries.json"),
+            br#"{"version": 5}"#,
+        )
+        .expect("owner-only");
+        let checked = check(&target, &store, &[], &[], true, &writers);
+        assert_eq!(checked.refusals.len(), 1, "one record is out of range");
+        assert!(
+            checked.refusals[0].place.ends_with("shell-entries.json"),
+            "and it is the command's"
+        );
+
+        // A root that is a file cannot be looked at: named, not refused.
+        std::fs::remove_dir_all(&state).expect("the root goes");
+        std::fs::write(&state, b"not a directory").expect("a file");
+        let checked = check(&target, &store, &[], &[], true, &writers);
+        assert!(checked.refusals.is_empty());
+        assert_eq!(checked.unreached.len(), 1);
+        assert_eq!(checked.unreached[0].state_root, state);
     }
 
     /// A JSON record states its version in its member; one that states none is at the version the
