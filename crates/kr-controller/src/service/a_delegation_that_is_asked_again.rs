@@ -379,6 +379,7 @@ async fn a_read_asked_again_gives_only_what_the_history_bound_admits_now() {
     let number = controller
         .voice_session_number(world.session_id)
         .await
+        .expect("the registry reads")
         .expect("the session has a number");
     let mutation = delegation_of(
         world.environment_id,
@@ -444,8 +445,64 @@ async fn a_sessions_number_is_found_without_asking_its_worker() {
         world.controller.voice_session_number(world.session_id),
     )
     .await
-    .expect("the lookup does not wait on a worker that answers nothing");
-    assert!(number.is_some(), "the number is the daemon's own record");
+    .expect("the lookup does not wait on a worker that answers nothing")
+    .expect("the registry reads");
+    assert_eq!(
+        number,
+        Some(world.worker.descriptor.display_number.get()),
+        "the number is the one the session is listed under"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-15.11: a session the directory does not hold (one that has closed, or has no worker)
+/// keeps the number it was listed under, which the registry's reservation holds, and a session this
+/// daemon never made has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sessions_number_is_found_in_the_registry_when_it_has_no_worker() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let mut registry = world.controller.registry.lock().await;
+    let mut reservations = Vec::new();
+    for byte in 1..=2 {
+        reservations.push(
+            registry
+                .reserve(
+                    &actor,
+                    kr_ipc::new_uuid(),
+                    kr_protocol::scalars::Digest256::from_bytes([byte; 32]),
+                    &[0xa0],
+                    TimestampMs::new(1),
+                )
+                .expect("reserves")
+                .reservation,
+        );
+    }
+    drop(registry);
+    let reservation = &reservations[1];
+    assert_ne!(
+        Some(reservation.display_number.get()),
+        Some(world.worker.descriptor.display_number.get()),
+        "the numbers tell the two sessions apart"
+    );
+    assert_eq!(
+        world
+            .controller
+            .voice_session_number(reservation.session_id)
+            .await
+            .expect("the registry reads"),
+        Some(reservation.display_number.get()),
+    );
+    assert_eq!(
+        world
+            .controller
+            .voice_session_number(SessionId::new(kr_ipc::new_uuid()))
+            .await
+            .expect("the registry reads"),
+        None,
+        "a session nobody made has no number"
+    );
     world.serving.abort();
 }
 
@@ -473,6 +530,7 @@ async fn the_daemon_keeps_nothing_that_says_what_was_said() {
     let number = controller
         .voice_session_number(world.session_id)
         .await
+        .expect("the registry reads")
         .expect("the session has a number");
     let phrase = "give me the status of session";
     let marker = "918273645";

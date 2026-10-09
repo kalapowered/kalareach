@@ -139,12 +139,13 @@ pub trait ContextSource: Send + Sync + fmt::Debug {
     ///
     /// A person names a session by its number ("session 3"), and a call reaches a set of sessions
     /// by identity. This is how the coordinator finds which of the call's own sessions the number
-    /// named; it asks about no session the call does not reach. A session that cannot be read has
-    /// no entry.
+    /// named; it asks about no session the call does not reach. A session the host holds no
+    /// number for has no entry.
     ///
     /// # Errors
     ///
-    /// Returns an error when the sessions cannot be read at all.
+    /// Returns an error when the host's records cannot be read: a lookup that fails is not the
+    /// answer for a session without a number.
     fn display_numbers<'a>(
         &'a self,
         sessions: &'a [SessionId],
