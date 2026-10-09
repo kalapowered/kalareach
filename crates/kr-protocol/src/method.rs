@@ -1562,8 +1562,9 @@ methods! {
     selectors: [Session, VoiceSession],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
-    doc: "Submit a delegation from the paired device. A provider delegation identifier is \
-          correlation data, never authority.";
+    doc: "Submit a delegation from the paired device: its identifier and offset, and the fragments \
+          of what the person said, which the host reads itself. A provider delegation identifier \
+          is correlation data, never authority.";
 
     VoiceContext = "voice.context", Voice,
     effect: Read, ingress: [PairedDevice],

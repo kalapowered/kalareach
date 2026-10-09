@@ -15076,6 +15076,12 @@
       ],
       "type": "object"
     },
+    "FragmentText": {
+      "description": "What a person said, as the provider's transcript wrote it. Data, never authority.",
+      "maxLength": 512,
+      "minLength": 1,
+      "type": "string"
+    },
     "FrameId": {
       "additionalProperties": false,
       "description": "Which admissions frame this is: the daemon generation that sent it, the admission revision it\ncarries, and the round.\n\nFrames are ordered by generation, then revision, then round, and a worker applies only a frame\nabove the one it holds. The daemon raises the round on every frame it sends a worker, from one\nin each generation, so a frame sent again at an unchanged revision is still newer than the last.",
@@ -19776,7 +19782,7 @@
         },
         {
           "const": "voice.delegate",
-          "description": "Submit a delegation from the paired device. A provider delegation identifier is correlation data, never authority.",
+          "description": "Submit a delegation from the paired device: its identifier and offset, and the fragments of what the person said, which the host reads itself. A provider delegation identifier is correlation data, never authority.",
           "type": "string"
         },
         {
@@ -33508,25 +33514,6 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
-    "SpokenDestination": {
-      "additionalProperties": false,
-      "description": "A spoken confirmation that names the destination session.\n\nSection 15 ¶13 requires the confirmation to name the destination, so the host checks the name\nagainst the session it is about to submit to rather than accepting that one was given.",
-      "properties": {
-        "session_id": {
-          "$ref": "#/$defs/SessionId",
-          "description": "The session the speaker named."
-        },
-        "spoken_text": {
-          "description": "The words the speaker used, as the transcript recorded them. Data, never authority.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "session_id",
-        "spoken_text"
-      ],
-      "type": "object"
-    },
     "StartupSelection": {
       "additionalProperties": false,
       "description": "How this environment's control daemon is started when a command finds none running.\n\nSection 7 lets `kr new` start the per-user controller only on a host that was set up for\nit, and makes every other host answer `HOST_NOT_CONFIGURED` with the setup action. This is\nwhere that setup is recorded: absent unless an owner, or an installer, chose it. No request,\nprofile or environment variable reaches it, so a variable exported in one terminal cannot\nmake a command start a daemon on a host that was never set up to have one started.",
@@ -34236,6 +34223,30 @@
       ],
       "type": "object"
     },
+    "TranscriptFragment": {
+      "additionalProperties": false,
+      "description": "One fragment of what the person said, with the moments on the provider's timeline it covers.",
+      "properties": {
+        "end_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "Where it ends, in milliseconds."
+        },
+        "start_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "Where on the call's timeline it starts, in milliseconds."
+        },
+        "text": {
+          "$ref": "#/$defs/FragmentText",
+          "description": "What was said."
+        }
+      },
+      "required": [
+        "start_ms",
+        "end_ms",
+        "text"
+      ],
+      "type": "object"
+    },
     "TransferId": {
       "description": "One upload or download transfer.",
       "format": "uuid",
@@ -34766,30 +34777,6 @@
           "type": "string"
         }
       ]
-    },
-    "VerifiedApprovalAnswer": {
-      "additionalProperties": false,
-      "description": "An approval answer, with the details of the request it answers.\n\nSection 15 ¶13: an approval decision requires the verified request's details and an explicit\nanswer. The host compares the details against the approval it holds, so a model that invented\nthem is refused rather than believed.",
-      "properties": {
-        "approval_request_id": {
-          "$ref": "#/$defs/ApprovalRequestId",
-          "description": "The approval being answered."
-        },
-        "approved": {
-          "description": "The explicit answer. Nothing is inferred from a transcript.",
-          "type": "boolean"
-        },
-        "details_digest": {
-          "$ref": "#/$defs/Digest256",
-          "description": "The digest of the request's details as the host read them out."
-        }
-      },
-      "required": [
-        "approval_request_id",
-        "details_digest",
-        "approved"
-      ],
-      "type": "object"
     },
     "VersionRef": {
       "additionalProperties": false,
@@ -35404,23 +35391,8 @@
     },
     "VoiceDelegateParams": {
       "additionalProperties": false,
-      "description": "Parameters of `voice.delegate`.\n\nSection 15 ¶7: the delegation event supplies an identifier and a timeline offset, not task\ntext. There is deliberately no field for what the model said the user wants; the coordinator\nuses the accumulated transcripts and current host state.",
+      "description": "Parameters of `voice.delegate`.\n\nSection 15 ¶7 and ¶22: the delegation event supplies an identifier and a timeline offset, and\nthe coordinator uses the accumulated transcripts and the host's state. The paired device is the\nonly thing that sees the provider's data channel, so it is the one that hands the host the\ntranscript: the fragments of what the person said, which the device vouches for from its own\nrecord of when the microphone was open. **The host reads them.** There is no field in which the\ndevice or the model names the action, the session or anything else the host acts on; the host's\ngrammar derives those once, from the words, and says what it derived in the answer.",
       "properties": {
-        "action": {
-          "$ref": "#/$defs/VoiceAction",
-          "description": "The action the device asks the coordinator to propose."
-        },
-        "approval": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VerifiedApprovalAnswer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The approval the answer belongs to, when the action answers one."
-        },
         "confirmation": {
           "anyOf": [
             {
@@ -35436,42 +35408,16 @@
           "$ref": "#/$defs/VoiceDelegationId",
           "description": "The provider's delegation identifier, as the device received it on the data channel."
         },
+        "fragments": {
+          "description": "What the person said that this delegation answers, in the order it was said.\n\nAt most [`VOICE_FRAGMENTS_MAX`] fragments of at most [`VOICE_FRAGMENT_BYTES_MAX`] bytes, and\n[`VOICE_FRAGMENTS_BYTES_MAX`] bytes in all. A set over a limit is refused and never cut.\nSee [`Self::check_fragments`] for the rest.",
+          "items": {
+            "$ref": "#/$defs/TranscriptFragment"
+          },
+          "type": "array"
+        },
         "offset_ms": {
           "$ref": "#/$defs/U64",
           "description": "Where in the call it happened, in milliseconds from the start."
-        },
-        "session_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SessionId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The session it acts on, when it acts on one."
-        },
-        "spoken_destination": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SpokenDestination"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The spoken confirmation naming the destination session, when the action needs one."
-        },
-        "turn_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AgentTurnId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The turn being cancelled, when the action cancels one."
         },
         "voice_session_id": {
           "$ref": "#/$defs/VoiceSessionId",
@@ -35482,11 +35428,7 @@
         "voice_session_id",
         "delegation_id",
         "offset_ms",
-        "action",
-        "session_id",
-        "spoken_destination",
-        "approval",
-        "turn_id",
+        "fragments",
         "confirmation"
       ],
       "type": "object"
@@ -35495,6 +35437,17 @@
       "additionalProperties": false,
       "description": "The result of `voice.delegate`.",
       "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the host read the fragments to ask for, when it read them to ask for anything.\n\nKept with the answer, so that a repeat is answered from what was derived then and not from\na grammar that may have changed since."
+        },
         "delegation_id": {
           "$ref": "#/$defs/VoiceDelegationId",
           "description": "The delegation this answers."
@@ -35502,10 +35455,23 @@
         "outcome": {
           "$ref": "#/$defs/VoiceDelegationOutcome",
           "description": "What the coordinator proposed and what the host did about it."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session the host read the fragments to name, when they named one."
         }
       },
       "required": [
         "delegation_id",
+        "action",
+        "session_id",
         "outcome"
       ],
       "type": "object"
@@ -36041,6 +36007,16 @@
         {
           "const": "session_outside_voice_session",
           "description": "The session named is not one this voice session may reach.",
+          "type": "string"
+        },
+        {
+          "const": "not_understood",
+          "description": "The host does not read the fragments as a request it carries out.",
+          "type": "string"
+        },
+        {
+          "const": "fragments_refused",
+          "description": "The set of fragments breaks a rule of the delegation: how many, how large, in what order or\nhow far back.",
           "type": "string"
         }
       ]

@@ -130,6 +130,28 @@ become authority by arriving over a channel the host trusts for something else.
   Interrupting speech stops playback; there is no path from one to the other, because interruption
   is not in the coordinator's vocabulary at all.
 
+## What a delegation carries, and who reads it
+
+A delegation carries the call it belongs to, the provider's identifier, where in the call it
+happened, and the fragments of what the person said. The paired device is the only thing that sees
+the provider's data channel, so it hands the host the transcript it vouches for. The device names no
+action, no session and no destination: **the host reads the words itself**, with a grammar of its
+own, and no model is called.
+
+At present the host reads three requests, said on their own: the status of a session, a briefing on
+one, and going to one. A session is named by its number, in digits or in words, and a request that
+names none means the call's one session when the call reaches only one. A question is the same
+request. The whole utterance has to be one of those; negation, a second request, a word the grammar
+does not hold and a number that cannot be read are each refused, and the refusal says what the host
+does read and never quotes what was said. A delegation answers with the action and the session the
+words were read to ask for, and a repeat of it is answered from what was read then.
+
+The fragments are bounded: at most 16, of at most 512 bytes each and 2,048 in all, each starting no
+later than the delegation's offset and no more than thirty seconds before it, in the order they were
+said. A set over a limit is refused whole and never cut, and a refusal spends nothing. A fragment's
+text prints as nothing in a log or a panic message, and a confirmation binds to the words as well as
+to the action, so a signature given for one utterance does not confirm another.
+
 ## The voice grant
 
 A voice grant is an ordinary grant in the host's one authority store. There is no second store.
@@ -166,11 +188,11 @@ two requests can never each decide about the authority the other is writing.
 ## What this daemon performs and supplies
 
 The daemon performs one kind of voice action itself, the reading of a session, which covers
-navigating, status queries, briefing and composing a prompt. For every other action that has a
-method it admits the proposal and reports it as admitted and not done, because the daemon does not
-dispatch to a session's worker, and a receipt stands for what was done. Delivering something
-externally has no method, so a proposal for it is refused. A decision on an approval is refused: the
-daemon holds no approval's details to check a spoken decision against.
+navigating, status queries and briefing: the three requests it reads from what is said. For every
+other action that has a method it admits the proposal and reports it as admitted and not done,
+because the daemon does not dispatch to a session's worker, and a receipt stands for what was done.
+Delivering something externally has no method, so a proposal for it is refused. A decision on an
+approval is refused: the daemon holds no approval's details to check a spoken decision against.
 
 The context the daemon supplies is read from the daemon. The session number, pinned name (if any)
 and shell are read, as is the time at which the session was created. The working directory and time

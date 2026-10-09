@@ -176,6 +176,9 @@ pub trait SessionFacts: Send + Sync + std::fmt::Debug {
         approval_request_id: &'a ApprovalRequestId,
     ) -> VoiceFuture<'a, Option<Digest256>>;
 
+    /// The display number of one session, as a person says it, when this host can read the session.
+    fn display_number<'a>(&'a self, session_id: SessionId) -> VoiceFuture<'a, Option<u64>>;
+
     /// The state of privacy mode as it stands now, which a reading is noted under before it is
     /// made.
     ///
@@ -321,6 +324,21 @@ impl ContextSource for FilteredContext {
     ) -> VoiceFuture<'a, Option<Digest256>> {
         self.facts.approval_digest(session_id, approval_request_id)
     }
+
+    fn display_numbers<'a>(
+        &'a self,
+        sessions: &'a [SessionId],
+    ) -> VoiceFuture<'a, Vec<(SessionId, u64)>> {
+        Box::pin(async move {
+            let mut numbered = Vec::with_capacity(sessions.len());
+            for session_id in sessions {
+                if let Some(number) = self.facts.display_number(*session_id).await? {
+                    numbered.push((*session_id, number));
+                }
+            }
+            Ok(numbered)
+        })
+    }
 }
 
 /// The viewer scope for one grant.
@@ -412,6 +430,10 @@ mod tests {
             _session_id: SessionId,
             _approval_request_id: &'a ApprovalRequestId,
         ) -> VoiceFuture<'a, Option<Digest256>> {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn display_number<'a>(&'a self, _session_id: SessionId) -> VoiceFuture<'a, Option<u64>> {
             Box::pin(async move { Ok(None) })
         }
 

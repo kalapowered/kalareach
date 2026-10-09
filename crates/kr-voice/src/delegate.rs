@@ -57,6 +57,9 @@ use crate::error::{Result, VoiceError};
 use crate::grant::{
     GrantBinding, PlannedVoiceGrant, call_expiry, permits, permitted_actions, plan_voice_grant,
 };
+use crate::interpret::{
+    DelegationInterpreter, GrammarInterpreter, SpokenDestination, VerifiedApprovalAnswer,
+};
 
 /// What a person is told when this host has no voice service to broker a call through.
 ///
@@ -155,11 +158,26 @@ pub struct Proposal {
     /// The plan the confirmation was bound to, so the host performs what was confirmed.
     pub plan: VoiceActionPlan,
     /// The approval being answered, when the action answers one.
-    pub approval: Option<kr_protocol::voice::VerifiedApprovalAnswer>,
+    pub approval: Option<VerifiedApprovalAnswer>,
     /// The agent turn being cancelled, when the action cancels one.
     pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
     /// The destination the speaker named, when the action submits a prompt.
-    pub destination: Option<kr_protocol::voice::SpokenDestination>,
+    pub destination: Option<SpokenDestination>,
+}
+
+/// What the words of a delegation asked for, resolved against the call that heard them.
+#[derive(Clone, Debug)]
+struct Intent {
+    /// What to do.
+    action: VoiceAction,
+    /// The session it acts on, when it acts on one.
+    session_id: Option<SessionId>,
+    /// The spoken confirmation naming the destination, for an action that needs one.
+    destination: Option<SpokenDestination>,
+    /// The approval answer, for an action that answers one.
+    approval: Option<VerifiedApprovalAnswer>,
+    /// The turn to cancel, for an action that cancels one.
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
 }
 
 /// One call a change withdrew, with the provider that created it.
@@ -198,6 +216,8 @@ pub struct Coordinator {
     context: Arc<dyn ContextSource>,
     authority: Arc<dyn VoiceAuthority>,
     submitter: Arc<dyn ActionSubmitter>,
+    /// Reads what a person said into what they asked for.
+    interpreter: Mutex<Arc<dyn DelegationInterpreter>>,
     /// The provider this coordinator brokers a managed call through, when one is configured.
     ///
     /// Replaceable while the coordinator runs, so that a provider the host's configuration cannot
@@ -302,6 +322,7 @@ impl Coordinator {
             context,
             authority,
             submitter,
+            interpreter: Mutex::new(Arc::new(GrammarInterpreter)),
             provider: Mutex::new(provider),
             host_device_id,
             environment_id,
@@ -309,6 +330,23 @@ impl Coordinator {
             patterns: SecretPatterns::default(),
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Replaces the interpreter that reads what a person said.
+    ///
+    /// The host never calls this: a coordinator reads with the product grammar from the moment it
+    /// is built. A test of the daemon, or of this coordinator's own rules, uses it to script a
+    /// request the grammar does not hold, because the rules for the actions beyond what the
+    /// grammar reads have to be proved before speech can reach them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's interpreter panicked.
+    pub fn attach_interpreter(&self, interpreter: Arc<dyn DelegationInterpreter>) {
+        *self
+            .interpreter
+            .lock()
+            .expect("the coordinator's interpreter") = interpreter;
     }
 
     /// Replaces the provider this coordinator brokers through.
@@ -1481,7 +1519,10 @@ impl Coordinator {
         Ok(request)
     }
 
-    /// Interprets one delegation and proposes what it means.
+    /// Reads what one delegation says and proposes what it means.
+    ///
+    /// The fragments are read here, by the host, into the one action they ask for; the answer says
+    /// what was read, so the person and a later repeat see the same thing.
     ///
     /// # Errors
     ///
@@ -1499,30 +1540,54 @@ impl Coordinator {
         params: &VoiceDelegateParams,
         now_ms: u64,
     ) -> Result<VoiceDelegateResult> {
+        let intent = match self.read(device_id, params).await {
+            Ok(intent) => intent,
+            Err(VoiceError::Refused { reason, detail }) => {
+                return Ok(answer(
+                    params,
+                    None,
+                    VoiceDelegationOutcome::Refused {
+                        reason,
+                        message: detail,
+                    },
+                ));
+            }
+            Err(other) => return Err(other),
+        };
+        let read = Some((intent.action, intent.session_id));
         match self
-            .propose(device_id, action_id, params, now_ms, Spend::Identifier)
+            .propose(
+                device_id,
+                action_id,
+                params,
+                &intent,
+                now_ms,
+                Spend::Identifier,
+            )
             .await
         {
-            Ok(Proposed::NeedsConfirmation(request)) => Ok(VoiceDelegateResult {
-                delegation_id: params.delegation_id.clone(),
-                outcome: VoiceDelegationOutcome::ConfirmationRequired {
+            Ok(Proposed::NeedsConfirmation(request)) => Ok(answer(
+                params,
+                read,
+                VoiceDelegationOutcome::ConfirmationRequired {
                     request,
                     message: format!(
                         "{} needs a confirmation on the unlocked screen of the paired device, \
                          signed by that device. A statement in the conversation that you agreed \
                          is not one. Sign this challenge and submit the same delegation again.",
-                        params.action.as_str()
+                        intent.action.as_str()
                     ),
                 },
-            }),
+            )),
             Ok(Proposed::Ready(proposal)) => self.submit(*proposal, params).await,
-            Err(VoiceError::Refused { reason, detail }) => Ok(VoiceDelegateResult {
-                delegation_id: params.delegation_id.clone(),
-                outcome: VoiceDelegationOutcome::Refused {
+            Err(VoiceError::Refused { reason, detail }) => Ok(answer(
+                params,
+                read,
+                VoiceDelegationOutcome::Refused {
                     reason,
                     message: detail,
                 },
-            }),
+            )),
             Err(other) => Err(other),
         }
     }
@@ -1532,9 +1597,11 @@ impl Coordinator {
     /// The host keeps what a delegation came to and gives it back to a caller whose reply was
     /// lost (section 23). An answer that carries content read from a session is not given back
     /// from what it said then: the read is made again, under every check a first submission
-    /// passes, against the grants as they stand now. The identifier is not spent again, because
-    /// this is the same action. The host asks this only for an action whose effect is a read of
-    /// its own state: repeating anything else would be a second effect.
+    /// passes, against the grants as they stand now. What is read again is what the first answer
+    /// recorded (`kept`): the action and the session the fragments were read to ask for, and not a
+    /// second reading of the fragments. The identifier is not spent again, because this is the
+    /// same action. The host asks this only for an action whose effect is a read of its own
+    /// state: repeating anything else would be a second effect.
     ///
     /// # Errors
     ///
@@ -1549,10 +1616,30 @@ impl Coordinator {
         device_id: DeviceId,
         action_id: ActionId,
         params: &VoiceDelegateParams,
+        kept: &VoiceDelegateResult,
         now_ms: u64,
     ) -> Result<VoiceDelegateResult> {
+        let Some(action) = kept.action.0 else {
+            return Err(VoiceError::InvalidArgument(
+                "only a read is answered again".to_owned(),
+            ));
+        };
+        let intent = Intent {
+            action,
+            session_id: kept.session_id.0,
+            destination: None,
+            approval: None,
+            turn_id: None,
+        };
         match self
-            .propose(device_id, action_id, params, now_ms, Spend::Nothing)
+            .propose(
+                device_id,
+                action_id,
+                params,
+                &intent,
+                now_ms,
+                Spend::Nothing,
+            )
             .await?
         {
             Proposed::Ready(proposal) => self.submit(*proposal, params).await,
@@ -1562,6 +1649,79 @@ impl Coordinator {
         }
     }
 
+    /// Reads the fragments of a delegation into what they ask for, against the call that heard them.
+    ///
+    /// The set is checked first, then the call is found, then the words are read, and the session
+    /// they name is found among the sessions the call reaches: a number that names none of them
+    /// names no session, and a request that names none means the call's one session.
+    async fn read(&self, device_id: DeviceId, params: &VoiceDelegateParams) -> Result<Intent> {
+        params.check_fragments().map_err(|rule| {
+            VoiceError::refused(
+                VoiceRefusal::FragmentsRefused,
+                format!("{rule}. Say it again."),
+            )
+        })?;
+        let reached: Vec<SessionId> = {
+            let state = self.state.lock().expect("the coordinator's state");
+            state
+                .sessions
+                .of_device(params.voice_session_id, device_id)?
+                .session_ids
+                .iter()
+                .copied()
+                .collect()
+        };
+        let interpreter = Arc::clone(
+            &self
+                .interpreter
+                .lock()
+                .expect("the coordinator's interpreter"),
+        );
+        let interpreted = interpreter
+            .interpret(&params.fragments)
+            .map_err(|misread| {
+                VoiceError::refused(VoiceRefusal::NotUnderstood, misread.detail())
+            })?;
+        let session_id = match interpreted.session_number {
+            Some(number) => {
+                let numbers = self.context.display_numbers(&reached).await?;
+                let mut named = numbers
+                    .iter()
+                    .filter(|(_, each)| *each == number)
+                    .map(|(session_id, _)| *session_id);
+                match (named.next(), named.next()) {
+                    (Some(session_id), None) => Some(session_id),
+                    _ => {
+                        return Err(VoiceError::refused(
+                            VoiceRefusal::SessionOutsideVoiceSession,
+                            format!(
+                                "this voice session does not reach a session numbered {number}"
+                            ),
+                        ));
+                    }
+                }
+            }
+            None => match reached.as_slice() {
+                [only] => Some(*only),
+                _ if interpreted.action.in_default_scope() => {
+                    return Err(VoiceError::refused(
+                        VoiceRefusal::NotUnderstood,
+                        "this voice session reaches more than one session. Say which, for \
+                         example session 3.",
+                    ));
+                }
+                _ => None,
+            },
+        };
+        Ok(Intent {
+            action: interpreted.action,
+            session_id,
+            destination: interpreted.spoken_destination,
+            approval: interpreted.approval,
+            turn_id: interpreted.turn_id,
+        })
+    }
+
     /// Submits what the checks admitted to the host, and reports what it did about it.
     async fn submit(
         &self,
@@ -1569,9 +1729,11 @@ impl Coordinator {
         params: &VoiceDelegateParams,
     ) -> Result<VoiceDelegateResult> {
         let receipt = self.submitter.submit(&proposal).await?;
-        Ok(VoiceDelegateResult {
-            delegation_id: params.delegation_id.clone(),
-            outcome: if receipt.performed {
+        let read = Some((proposal.action, proposal.session_id));
+        Ok(answer(
+            params,
+            read,
+            if receipt.performed {
                 VoiceDelegationOutcome::Performed {
                     action_id: receipt.action_id,
                     summary: bounded(&receipt.summary),
@@ -1584,7 +1746,7 @@ impl Coordinator {
                     note: VOICE_ADMISSION_NOTE.to_owned(),
                 }
             },
-        })
+        ))
     }
 
     /// Runs every check and builds the proposal, or names the rule that refused.
@@ -1593,6 +1755,7 @@ impl Coordinator {
         device_id: DeviceId,
         action_id: ActionId,
         params: &VoiceDelegateParams,
+        intent: &Intent,
         now_ms: u64,
         spend: Spend,
     ) -> Result<Proposed> {
@@ -1606,9 +1769,8 @@ impl Coordinator {
                 .of_device(params.voice_session_id, device_id)?;
             (
                 record.grant_id,
-                params
+                intent
                     .session_id
-                    .0
                     .is_none_or(|session_id| record.reaches(session_id)),
                 record.started_at_ms,
             )
@@ -1627,16 +1789,16 @@ impl Coordinator {
 
         let plan = VoiceActionPlan {
             voice_session_id: params.voice_session_id,
-            action: params.action,
-            session_id: params.session_id,
+            action: intent.action,
+            session_id: Nullable(intent.session_id),
             delegation_id: Nullable::some(params.delegation_id.clone()),
-            payload_digest: payload_digest(params)?,
+            payload_digest: params.payload_digest()?,
         };
 
         // 4: the confirmation, before the grant. An action in one of the five classes is refused
         // for the missing confirmation whatever this host's grants contain, so the refusal says
         // the same thing to everybody.
-        if params.action.needs_unlocked_screen() {
+        if intent.action.needs_unlocked_screen() {
             let Some(proof) = params.confirmation.0.as_ref() else {
                 // The device has no other way to obtain the challenge this action needs, so the
                 // answer to a first submission is the challenge itself. The identifier is given
@@ -1674,15 +1836,15 @@ impl Coordinator {
         }
 
         // 5: what the three remaining actions of section 15 ¶13 each need.
-        if params.action.needs_spoken_destination() {
-            let Some(destination) = params.spoken_destination.0.as_ref() else {
+        if intent.action.needs_spoken_destination() {
+            let Some(destination) = intent.destination.as_ref() else {
                 return Err(VoiceError::refused(
                     VoiceRefusal::DestinationNotNamed,
                     "submitting a prompt needs a clear spoken confirmation that names the \
                      destination session",
                 ));
             };
-            if params.session_id.0 != Some(destination.session_id) {
+            if intent.session_id != Some(destination.session_id) {
                 return Err(VoiceError::refused(
                     VoiceRefusal::DestinationNotNamed,
                     "the spoken confirmation named a different session from the one this \
@@ -1700,15 +1862,15 @@ impl Coordinator {
                 ));
             }
         }
-        if params.action.needs_verified_request() {
-            let Some(answer) = params.approval.0.as_ref() else {
+        if intent.action.needs_verified_request() {
+            let Some(answer) = intent.approval.as_ref() else {
                 return Err(VoiceError::refused(
                     VoiceRefusal::ApprovalNotVerified,
                     "an approval decision needs the verified request's details and an explicit \
                      answer",
                 ));
             };
-            let Some(session_id) = params.session_id.0 else {
+            let Some(session_id) = intent.session_id else {
                 return Err(VoiceError::refused(
                     VoiceRefusal::ApprovalNotVerified,
                     "an approval decision names the session the approval belongs to",
@@ -1726,7 +1888,7 @@ impl Coordinator {
                 ));
             }
         }
-        if params.action == VoiceAction::CancelTurn && params.turn_id.0.is_none() {
+        if intent.action == VoiceAction::CancelTurn && intent.turn_id.is_none() {
             return Err(VoiceError::refused(
                 VoiceRefusal::TurnNotNamed,
                 "cancelling an agent's work needs its typed request and the current turn \
@@ -1735,7 +1897,7 @@ impl Coordinator {
         }
 
         // 6: the authority, intersected now rather than when the grant was written.
-        if params.action.required_right().is_none() {
+        if intent.action.required_right().is_none() {
             return Err(VoiceError::refused(
                 VoiceRefusal::NoSuchEffect,
                 "this host has no effect that does that, so no grant can carry it",
@@ -1744,7 +1906,7 @@ impl Coordinator {
         let voice_grant = self.live_voice_grant(voice_grant_id)?;
         let device_grant = self
             .authority
-            .device_grant(device_id, params.session_id.0)?
+            .device_grant(device_id, intent.session_id)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -1752,24 +1914,24 @@ impl Coordinator {
                 )
             })?;
         if !voice_grant.permits(kr_protocol::rights::ActionRight::VoiceUse)
-            || !permitted_actions(&voice_grant).contains(&params.action)
+            || !permitted_actions(&voice_grant).contains(&intent.action)
         {
             return Err(VoiceError::refused(
                 VoiceRefusal::OutsideVoiceGrant,
                 format!(
                     "this voice grant does not permit {}. Broaden it in settings, where the \
                      change states which actions it permits.",
-                    params.action.as_str()
+                    intent.action.as_str()
                 ),
             ));
         }
-        if !permits(&voice_grant, &device_grant, params.action) {
+        if !permits(&voice_grant, &device_grant, intent.action) {
             return Err(VoiceError::refused(
                 VoiceRefusal::OutsideDeviceGrant,
                 format!(
                     "this device's own grant does not carry what {} needs, and a voice grant \
                      narrows it rather than adding to it",
-                    params.action.as_str()
+                    intent.action.as_str()
                 ),
             ));
         }
@@ -1779,14 +1941,14 @@ impl Coordinator {
             device_id,
             voice_grant_id: voice_grant.grant_id,
             environment_id: self.environment_id,
-            action: params.action,
+            action: intent.action,
             action_id,
-            session_id: params.session_id.0,
+            session_id: intent.session_id,
             delegation_id: params.delegation_id.clone(),
             plan,
-            approval: params.approval.0.clone(),
-            turn_id: params.turn_id.0.clone(),
-            destination: params.spoken_destination.0.clone(),
+            approval: intent.approval.clone(),
+            turn_id: intent.turn_id.clone(),
+            destination: intent.destination.clone(),
         })))
     }
 
@@ -2021,17 +2183,18 @@ fn is_clear_affirmative(spoken: &str) -> bool {
 /// identifier from a call that ended.
 const TIMELINE_TOLERANCE_MS: u64 = 20_000;
 
-/// The digest of the exact parameters a proposal will carry.
-fn payload_digest(params: &VoiceDelegateParams) -> Result<Digest256> {
-    // Everything the host will act on, and nothing the caller can vary afterwards. The
-    // confirmation is not in it: a confirmation cannot be part of what it confirms.
-    let material = VoiceDelegateParams {
-        confirmation: Nullable::null(),
-        ..params.clone()
-    };
-    Ok(Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
-        &kr_cbor::to_canonical_value(&material)?,
-    ))))
+/// A delegation's answer: what was read from it, when it was read, and what became of it.
+fn answer(
+    params: &VoiceDelegateParams,
+    read: Option<(VoiceAction, Option<SessionId>)>,
+    outcome: VoiceDelegationOutcome,
+) -> VoiceDelegateResult {
+    VoiceDelegateResult {
+        delegation_id: params.delegation_id.clone(),
+        action: Nullable(read.map(|(action, _)| action)),
+        session_id: Nullable(read.and_then(|(_, session_id)| session_id)),
+        outcome,
+    }
 }
 
 /// Cuts a host result to what one bounded context request may carry.

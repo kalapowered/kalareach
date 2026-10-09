@@ -27490,31 +27490,15 @@ export interface VoiceContextSelection1 {
 /**
  * Parameters of `voice.delegate`.
  *
- * Section 15 ¶7: the delegation event supplies an identifier and a timeline offset, not task
- * text. There is deliberately no field for what the model said the user wants; the coordinator
- * uses the accumulated transcripts and current host state.
+ * Section 15 ¶7 and ¶22: the delegation event supplies an identifier and a timeline offset, and
+ * the coordinator uses the accumulated transcripts and the host's state. The paired device is the
+ * only thing that sees the provider's data channel, so it is the one that hands the host the
+ * transcript: the fragments of what the person said, which the device vouches for from its own
+ * record of when the microphone was open. **The host reads them.** There is no field in which the
+ * device or the model names the action, the session or anything else the host acts on; the host's
+ * grammar derives those once, from the words, and says what it derived in the answer.
  */
 export interface VoiceDelegateParams {
-  /**
-   * The action the device asks the coordinator to propose.
-   */
-  action:
-    | 'navigate'
-    | 'status'
-    | 'brief'
-    | 'compose_prompt'
-    | 'submit_prompt'
-    | 'answer_approval'
-    | 'cancel_turn'
-    | 'close_session'
-    | 'change_grant'
-    | 'shell_input'
-    | 'apply_diff'
-    | 'deliver_externally'
-  /**
-   * The approval the answer belongs to, when the action answers one.
-   */
-  approval: VerifiedApprovalAnswer | null
   /**
    * The confirmation from the device's unlocked screen, when the action needs one.
    */
@@ -27524,67 +27508,50 @@ export interface VoiceDelegateParams {
    */
   delegation_id: string
   /**
+   * What the person said that this delegation answers, in the order it was said.
+   *
+   * At most [`VOICE_FRAGMENTS_MAX`] fragments of at most [`VOICE_FRAGMENT_BYTES_MAX`] bytes, and
+   * [`VOICE_FRAGMENTS_BYTES_MAX`] bytes in all. A set over a limit is refused and never cut.
+   * See [`Self::check_fragments`] for the rest.
+   */
+  fragments: TranscriptFragment[]
+  /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   offset_ms: string
-  /**
-   * The session it acts on, when it acts on one.
-   */
-  session_id: SessionId | null
-  /**
-   * The spoken confirmation naming the destination session, when the action needs one.
-   */
-  spoken_destination: SpokenDestination | null
-  /**
-   * The turn being cancelled, when the action cancels one.
-   */
-  turn_id: AgentTurnId | null
   /**
    * The voice session the delegation belongs to.
    */
   voice_session_id: string
 }
 /**
- * An approval answer, with the details of the request it answers.
- *
- * Section 15 ¶13: an approval decision requires the verified request's details and an explicit
- * answer. The host compares the details against the approval it holds, so a model that invented
- * them is refused rather than believed.
+ * One fragment of what the person said, with the moments on the provider's timeline it covers.
  */
-export interface VerifiedApprovalAnswer {
+export interface TranscriptFragment {
   /**
-   * The approval being answered.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  approval_request_id: string
+  end_ms: string
   /**
-   * The explicit answer. Nothing is inferred from a transcript.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  approved: boolean
+  start_ms: string
   /**
-   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   * What was said.
    */
-  details_digest: string
-}
-/**
- * A spoken confirmation that names the destination session.
- *
- * Section 15 ¶13 requires the confirmation to name the destination, so the host checks the name
- * against the session it is about to submit to rather than accepting that one was given.
- */
-export interface SpokenDestination {
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * The words the speaker used, as the transcript recorded them. Data, never authority.
-   */
-  spoken_text: string
+  text: string
 }
 /**
  * The result of `voice.delegate`.
  */
 export interface VoiceDelegateResult {
+  /**
+   * What the host read the fragments to ask for, when it read them to ask for anything.
+   *
+   * Kept with the answer, so that a repeat is answered from what was derived then and not from
+   * a grammar that may have changed since.
+   */
+  action: VoiceAction | null
   /**
    * An opaque provider delegation identifier. Correlation data, never authority.
    */
@@ -27648,8 +27615,14 @@ export interface VoiceDelegateResult {
             | 'approval_not_verified'
             | 'turn_not_named'
             | 'session_outside_voice_session'
+            | 'not_understood'
+            | 'fragments_refused'
         }
       }
+  /**
+   * The session the host read the fragments to name, when they named one.
+   */
+  session_id: SessionId | null
 }
 /**
  * The challenge the device's ceremony signs.

@@ -304,7 +304,7 @@ links to its document.
 | `voice.start` | write | `paired_device` | Start a voice session. Budget and account checks happen at the managed broker. | [Voice: The rate a call runs under](../voice/README.md) |
 | `voice.stop` | write | `paired_device` | Stop a voice session. Ending it revokes its voice grant immediately. | [Voice: A voice session is not a terminal session](../voice/README.md) |
 | `voice.grant` | write | `local_ipc`, `paired_device` | Create or change a voice grant, stating exactly which actions it permits. A device may broaden its own; changing another device's needs host-management authority. | [Voice: The voice grant](../voice/README.md) |
-| `voice.delegate` | write | `paired_device` | Submit a delegation from the paired device. A provider delegation identifier is correlation data, never authority. | [Voice: What is never authority](../voice/README.md) |
+| `voice.delegate` | write | `paired_device` | Submit a delegation from the paired device: its identifier and offset, and the fragments of what the person said, which the host reads itself. A provider delegation identifier is correlation data, never authority. | [Voice: What is never authority](../voice/README.md) |
 | `voice.context` | read | `paired_device` | Read the selected voice context. Selection intersects this device's scope and never uses the host owner's broader history. | [Voice: What the coordinator may send back](../voice/README.md) |
 
 ## Automation

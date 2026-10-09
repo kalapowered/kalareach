@@ -8,7 +8,7 @@ use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::service::GatewayOrigin;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
-use kr_protocol::voice::{VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationOutcome};
+use kr_protocol::voice::{VoiceDelegateResult, VoiceDelegationOutcome};
 use kr_voice::broker::ManagedVoiceService;
 
 use crate::error::{ControllerError, Result};
@@ -187,6 +187,17 @@ impl Controller {
             session_id,
             &described,
         ))
+    }
+
+    /// The display number of one session as a person says it, or nothing when the session cannot
+    /// be read: a session that cannot be read has no number to be named by.
+    pub(crate) async fn voice_session_number(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> Option<u64> {
+        let params = ParamsValue::from_typed(&SessionReadParams { session_id }).ok()?;
+        let read: SessionReadResult = parse(&self.session_read(&params).await.ok()?).ok()?;
+        Some(read.session.display_number.get())
     }
 
     /// What the description host holds of a session: the name a person pinned, what a model wrote
@@ -499,14 +510,14 @@ impl Controller {
         };
         let answered = decoded(kept)?;
         let receipt: VoiceDelegateResult = parse(&answered)?;
-        let params: VoiceDelegateParams = parse(&mutation.params)?;
+        // What the first answer recorded the words to ask for, and nothing read from them again.
         if !matches!(receipt.outcome, VoiceDelegationOutcome::Performed { .. })
-            || crate::voice::method_for(params.action) != Some(Method::SessionRead)
+            || receipt.action.0.and_then(crate::voice::method_for) != Some(Method::SessionRead)
         {
             return Ok(answered);
         }
         self.voice()
-            .answer_again(device_id, mutation, self.settled_now_ms())
+            .answer_again(device_id, mutation, &receipt, self.settled_now_ms())
             .await
     }
 

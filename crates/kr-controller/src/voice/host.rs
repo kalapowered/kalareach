@@ -67,6 +67,14 @@ impl SessionFacts for ControllerFacts {
         Box::pin(async move { Ok(None) })
     }
 
+    fn display_number<'a>(&'a self, session_id: SessionId) -> VoiceFuture<'a, Option<u64>> {
+        let daemon = self.daemon.clone();
+        Box::pin(async move {
+            let daemon = daemon.upgrade().ok_or_else(gone)?;
+            Ok(daemon.voice_session_number(session_id).await)
+        })
+    }
+
     fn privacy(&self) -> Published {
         // Read without waiting, since this runs on the executor. A change of privacy mode that is
         // being made, and a daemon that has gone, are read as privacy mode on in generation 0. No

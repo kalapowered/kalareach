@@ -373,6 +373,7 @@ impl GrantDirectory {
             .map_err(ControllerError::registry)?;
         migrate_receipts(&connection)?;
         migrate_revocation_answers(&connection)?;
+        migrate_delegation_answers(&connection)?;
         migrate_grants(&connection)?;
         migrate_policy(&connection)?;
         migrate_fence_debt(&connection)?;
@@ -2462,6 +2463,111 @@ fn migrate_revocation_answers(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(ControllerError::registry)
 }
 
+/// Brings the answers stored for earlier delegations to the shape this build reads, once.
+///
+/// An earlier build kept a delegation's answer as the delegation id and what became of it. This
+/// build also keeps what the host read the spoken words to ask for: the action and the session. A
+/// stored answer in the earlier shape is written in this build's shape with neither, and a repeat
+/// of it is answered as it was kept.
+///
+/// One kind of answer cannot keep its shape. A delegation performed under an earlier build was a
+/// read of a session, whose content the answer carries, and a repeat of a read is answered by
+/// reading the session again under the authority that stands then. The earlier answer does not
+/// name the session, so there is nothing to read again, and giving the content back as it was kept
+/// would give it back under an authority that may have ended. Such an answer is forgotten instead:
+/// its claim stays and its result goes, which is what a claim whose attempt ended without recording
+/// its answer reads as, so a repeat is told the outcome is not known and nothing is performed or
+/// given again.
+///
+/// One immediate transaction, so two processes opening one store change a row once, and a row
+/// already in this build's shape does not decode as the earlier one and is not touched, so a second
+/// open writes nothing.
+///
+/// Remove this upgrade, with [`EarlierDelegationResult`], once no supported upgrade starts from a
+/// build that stored a delegation's answer without the action it was read to ask for.
+fn migrate_delegation_answers(connection: &Connection) -> Result<()> {
+    use kr_protocol::voice::{VoiceDelegateResult, VoiceDelegationOutcome};
+
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    // A delegation's answer names its identifier under `delegation_id`, so a result that holds no
+    // such text is not one. What holds it is decided by the decode below, which accepts only the
+    // earlier shape.
+    let candidates: Vec<(String, Vec<u8>)> = transaction
+        .prepare(
+            "SELECT actor_id, action_id FROM authority_receipts
+              WHERE result IS NOT NULL
+                AND instr(result, CAST('delegation_id' AS BLOB)) > 0",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(ControllerError::registry)?;
+    let (mut kept, mut forgotten) = (0_usize, 0_usize);
+    for (actor_id, action_id) in candidates {
+        let stored: Vec<u8> = transaction
+            .query_row(
+                "SELECT result FROM authority_receipts WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let Ok(earlier) = kr_cbor::from_canonical_slice::<EarlierDelegationResult>(
+            &stored,
+            &kr_cbor::Limits::DEFAULT,
+        ) else {
+            continue;
+        };
+        if matches!(earlier.outcome, VoiceDelegationOutcome::Performed { .. }) {
+            transaction
+                .execute(
+                    "UPDATE authority_receipts SET result = NULL, recorded_at_ms = NULL
+                      WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id, action_id],
+                )
+                .map_err(ControllerError::registry)?;
+            forgotten += 1;
+            continue;
+        }
+        let current = VoiceDelegateResult {
+            delegation_id: earlier.delegation_id,
+            action: Nullable::null(),
+            session_id: Nullable::null(),
+            outcome: earlier.outcome,
+        };
+        let encoded = kr_cbor::to_canonical_vec(&current)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        transaction
+            .execute(
+                "UPDATE authority_receipts SET result = ?3 WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id, encoded],
+            )
+            .map_err(ControllerError::registry)?;
+        kept += 1;
+    }
+    if kept + forgotten > 0 {
+        eprintln!(
+            "kr-controller: {kept} stored delegation answer{} brought to the shape this build \
+             reads, and {forgotten} read{} forgotten because the session it read is not recorded",
+            if kept == 1 { "" } else { "s" },
+            if forgotten == 1 { " was" } else { "s were" }
+        );
+    }
+    transaction.commit().map_err(ControllerError::registry)
+}
+
+/// A delegation's answer as earlier builds stored it: no action and no session. It lives inside
+/// the upgrade and nowhere else.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierDelegationResult {
+    delegation_id: kr_protocol::voice::VoiceDelegationId,
+    outcome: kr_protocol::voice::VoiceDelegationOutcome,
+}
+
 /// A revocation's answer as earlier builds stored it: every list whole and no totals. It lives
 /// inside the upgrade and nowhere else.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3026,6 +3132,135 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("the row reads")
+    }
+
+    /// KR-REQ-09.16: a delegation's answer stored by an earlier build comes forward once when the
+    /// store opens. One that carried a session's content cannot be read again, because it names no
+    /// session, and is forgotten rather than given back under authority that may have ended; every
+    /// other answer gains the two fields as nothing; a row that is not such an answer, and one
+    /// already in this build's shape, are as they were; a second open writes nothing.
+    #[test]
+    fn a_delegation_answer_an_earlier_build_stored_comes_forward_once_when_the_store_opens() {
+        use kr_protocol::voice::{
+            VoiceDelegateResult, VoiceDelegationId, VoiceDelegationOutcome, VoiceRefusal,
+        };
+
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        drop(GrantDirectory::open(&path).expect("the store is created"));
+
+        let id = VoiceDelegationId::new("item_one").expect("a delegation");
+        let earlier = |outcome: VoiceDelegationOutcome| {
+            kr_cbor::to_canonical_vec(&EarlierDelegationResult {
+                delegation_id: id.clone(),
+                outcome,
+            })
+            .expect("the earlier shape encodes")
+        };
+        let read = earlier(VoiceDelegationOutcome::Performed {
+            action_id: ActionId::new(Uuid::from_bytes([0x61; 16])),
+            summary: "session 3 is live in /work".to_owned(),
+        });
+        let admitted = earlier(VoiceDelegationOutcome::Admitted {
+            action_id: ActionId::new(Uuid::from_bytes([0x62; 16])),
+            note: "admitted".to_owned(),
+        });
+        let refused = earlier(VoiceDelegationOutcome::Refused {
+            reason: VoiceRefusal::OutsideVoiceGrant,
+            message: "this voice grant does not permit that".to_owned(),
+        });
+        assert!(
+            kr_cbor::from_canonical_slice::<VoiceDelegateResult>(
+                &admitted,
+                &kr_cbor::Limits::DEFAULT
+            )
+            .is_err(),
+            "this build's reader refuses what the earlier build stored"
+        );
+        write_raw_receipt(&path, 1, &read);
+        write_raw_receipt(&path, 2, &admitted);
+        write_raw_receipt(&path, 3, &refused);
+        // Not a delegation's answer, though it holds the name of its field; and an answer already
+        // in this build's shape.
+        let other = kr_cbor::to_canonical_vec(&std::collections::BTreeMap::from([(
+            "delegation_id_note",
+            "not an answer",
+        )]))
+        .expect("a map encodes");
+        write_raw_receipt(&path, 4, &other);
+        let current = kr_cbor::to_canonical_vec(&VoiceDelegateResult {
+            delegation_id: id.clone(),
+            action: Nullable::some(kr_protocol::voice::VoiceAction::Status),
+            session_id: Nullable::null(),
+            outcome: VoiceDelegationOutcome::Admitted {
+                action_id: ActionId::new(Uuid::from_bytes([0x63; 16])),
+                note: "admitted".to_owned(),
+            },
+        })
+        .expect("encodes");
+        write_raw_receipt(&path, 5, &current);
+
+        drop(GrantDirectory::open(&path).expect("the store opens and brings the rows forward"));
+
+        let answered = |action: u8| {
+            kr_cbor::from_canonical_slice::<VoiceDelegateResult>(
+                &raw_receipt(&path, action).0,
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("an answer this build reads")
+        };
+        for (action, outcome) in [
+            (
+                2,
+                VoiceDelegationOutcome::Admitted {
+                    action_id: ActionId::new(Uuid::from_bytes([0x62; 16])),
+                    note: "admitted".to_owned(),
+                },
+            ),
+            (
+                3,
+                VoiceDelegationOutcome::Refused {
+                    reason: VoiceRefusal::OutsideVoiceGrant,
+                    message: "this voice grant does not permit that".to_owned(),
+                },
+            ),
+        ] {
+            let now = answered(action);
+            assert_eq!(now.delegation_id, id);
+            assert_eq!(now.action, Nullable::null());
+            assert_eq!(now.session_id, Nullable::null());
+            assert_eq!(now.outcome, outcome);
+        }
+        let (kept, recorded_at, _) = {
+            let connection = Connection::open(&path).expect("the store opens");
+            let row: (Option<Vec<u8>>, Option<i64>) = connection
+                .query_row(
+                    "SELECT result, recorded_at_ms FROM authority_receipts WHERE action_id = ?1",
+                    params![[1_u8; 16].as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("the row reads");
+            (row.0, row.1, ())
+        };
+        assert_eq!(
+            kept, None,
+            "the read's content is not kept: nothing names its session"
+        );
+        assert_eq!(recorded_at, None);
+        assert_eq!(
+            raw_receipt(&path, 4).0,
+            other,
+            "a row that is no answer is as it was"
+        );
+        assert_eq!(
+            raw_receipt(&path, 5).0,
+            current,
+            "an answer in this shape is as it was"
+        );
+
+        let written = raw_receipt(&path, 2);
+        drop(GrantDirectory::open(&path).expect("the store opens again"));
+        assert_eq!(raw_receipt(&path, 2), written, "nothing is upgraded twice");
     }
 
     /// A revocation's answer in the shape an earlier build stored: every list whole.

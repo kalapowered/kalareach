@@ -18,9 +18,9 @@ use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
 use kr_protocol::voice::{
-    VoiceAction, VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationId,
-    VoiceDelegationOutcome, VoiceGrantParams, VoicePrepareParams, VoiceStartOutcome,
-    VoiceStartParams,
+    FragmentText, TranscriptFragment, VoiceAction, VoiceDelegateParams, VoiceDelegateResult,
+    VoiceDelegationId, VoiceDelegationOutcome, VoiceGrantParams, VoicePrepareParams,
+    VoiceStartOutcome, VoiceStartParams,
 };
 use kr_transport::window::{AcceptedDeadline, DeadlineBound};
 
@@ -31,29 +31,21 @@ use crate::grants::{ActionClaim, ActionRecord};
 use crate::service::Controller;
 use crate::service::net::tests::{daemon_on, manual_clocks};
 
-/// A delegation of `action` to the call `voice_session_id`, as it reaches the host from a device.
+/// A delegation of `words` to the call `voice_session_id`, as it reaches the host from a device.
 fn delegation_of(
     environment_id: kr_protocol::ids::EnvironmentId,
     voice_session_id: VoiceSessionId,
-    session_id: SessionId,
-    action: VoiceAction,
+    words: &str,
 ) -> MutationRequest {
     let params = VoiceDelegateParams {
         voice_session_id,
         delegation_id: VoiceDelegationId::new("item_one").expect("a delegation"),
         offset_ms: U64::new(0),
-        action,
-        session_id: Nullable::some(session_id),
-        spoken_destination: if action == VoiceAction::SubmitPrompt {
-            Nullable::some(kr_protocol::voice::SpokenDestination {
-                session_id,
-                spoken_text: "send it to this session".to_owned(),
-            })
-        } else {
-            Nullable::null()
-        },
-        approval: Nullable::null(),
-        turn_id: Nullable::null(),
+        fragments: vec![TranscriptFragment {
+            start_ms: U64::new(0),
+            end_ms: U64::new(0),
+            text: FragmentText::new(words).expect("a fragment"),
+        }],
         confirmation: Nullable::null(),
     };
     MutationRequest {
@@ -73,6 +65,20 @@ fn delegation_of(
         action_window_id: ActionWindowId::new("device:test").expect("a window"),
         requested_ttl_ms: DurationMs::new(30_000),
         params: ParamsValue::from_typed(&params).expect("encodes"),
+    }
+}
+
+/// Reads whatever is said as one scripted request on the call's only session, for the effects the
+/// product grammar does not read.
+#[derive(Debug)]
+struct Always(kr_voice::Interpretation);
+
+impl kr_voice::DelegationInterpreter for Always {
+    fn interpret(
+        &self,
+        _fragments: &[TranscriptFragment],
+    ) -> Result<kr_voice::Interpretation, kr_voice::Misread> {
+        Ok(self.0.clone())
     }
 }
 
@@ -222,14 +228,15 @@ async fn a_delegations_receipt_goes_back_only_to_a_device_that_is_still_paired()
     let mutation = delegation_of(
         temp.environment_id(),
         VoiceSessionId::new(kr_ipc::new_uuid()),
-        SessionId::new(kr_ipc::new_uuid()),
-        VoiceAction::SubmitPrompt,
+        "send it to this session",
     );
     let params: VoiceDelegateParams = mutation.params.to_typed().expect("decodes");
 
     // What the host answered the first time, and kept under the device's claim.
     let receipt = VoiceDelegateResult {
         delegation_id: params.delegation_id,
+        action: Nullable::some(VoiceAction::SubmitPrompt),
+        session_id: Nullable::null(),
         outcome: VoiceDelegationOutcome::Admitted {
             action_id: mutation.action_id,
             note: "admitted".to_owned(),
@@ -358,11 +365,15 @@ async fn a_read_asked_again_gives_only_what_the_history_bound_admits_now() {
         &[VoiceAction::Status],
     )
     .await;
+    // Said as a person says it: by the session's number, which the daemon reads from its registry.
+    let number = controller
+        .voice_session_number(world.session_id)
+        .await
+        .expect("the session has a number");
     let mutation = delegation_of(
         world.environment_id,
         voice_session_id,
-        world.session_id,
-        VoiceAction::Status,
+        &format!("What's the status of session {number}?"),
     );
     let summary_of = |answer: ParamsValue| match answer
         .to_typed::<VoiceDelegateResult>()
@@ -418,15 +429,15 @@ async fn a_receipt_for_an_effect_is_given_back_as_it_was_kept() {
     let controller = daemon_on(&temp, clocks).await;
     let device = paired(&controller, 48, None);
     let actor_id = device.principal();
-    let session_id = SessionId::new(kr_ipc::new_uuid());
     let effect = delegation_of(
         temp.environment_id(),
         VoiceSessionId::new(kr_ipc::new_uuid()),
-        session_id,
-        VoiceAction::SubmitPrompt,
+        "send it to this session",
     );
     let kept = VoiceDelegateResult {
         delegation_id: VoiceDelegationId::new("item_one").expect("a delegation"),
+        action: Nullable::some(VoiceAction::SubmitPrompt),
+        session_id: Nullable::null(),
         outcome: VoiceDelegationOutcome::Performed {
             action_id: effect.action_id,
             summary: "sent".to_owned(),
@@ -496,11 +507,18 @@ async fn a_challenges_route_goes_back_while_its_claim_is_still_held() {
         &[VoiceAction::ShellInput],
     )
     .await;
+    // The grammar reads no shell input, so the daemon is made to read these words as some.
+    controller
+        .voice()
+        .coordinator()
+        .attach_interpreter(Arc::new(Always(kr_voice::Interpretation::of(
+            VoiceAction::ShellInput,
+            None,
+        ))));
     let mutation = delegation_of(
         temp.environment_id(),
         voice_session_id,
-        session_id,
-        VoiceAction::ShellInput,
+        "type ls and press enter",
     );
     let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("a digest");
     // What the network ingress does before the voice service: claim the route.

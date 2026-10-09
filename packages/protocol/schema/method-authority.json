@@ -5065,7 +5065,7 @@
         "session",
         "voice_session"
       ],
-      "summary": "Submit a delegation from the paired device. A provider delegation identifier is correlation data, never authority.",
+      "summary": "Submit a delegation from the paired device: its identifier and offset, and the fragments of what the person said, which the host reads itself. A provider delegation identifier is correlation data, never authority.",
       "version": 1
     },
     {
