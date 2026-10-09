@@ -113,9 +113,11 @@ class VoiceNegotiationTest {
 
         /**
          * The answer as the provider's reads: it says it is an ICE-lite agent, which only answers
-         * the checks it is sent. Given an offer with no candidate this peer has none to check
-         * either, so the call's own checks to the candidates in the answer are all that can
-         * connect the two.
+         * the checks it is sent. The peer is a full ICE agent, which WebRTC offers no way to make
+         * lite: given no candidate in the offer it has none to check, and it answers the checks it
+         * receives. Once one of them shows it the call's address it may also send a check of its
+         * own, which an ICE-lite agent never does, so the test shows that the call connects with
+         * no candidate in its offer and does not show that its own checks alone would be enough.
          */
         private fun asIceLite(sdp: String): String {
             val media = sdp.indexOf("m=")

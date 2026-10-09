@@ -237,7 +237,10 @@ public final class VoiceCall: NSObject {
     /// The offer is returned as soon as it is this end's local description, with no candidate in
     /// it: the provider answers with the addresses it can be reached at and never starts a check,
     /// so it learns where the call is from the call's own checks, which are made to the candidates
-    /// in its answer. Gathering stays continual, for the networks that change during the call.
+    /// in its answer. Gathering stays continual, for the networks that change during the call. A call
+    /// that ends before the offer is complete makes none: this throws ``VoiceAudioError/callEnded``
+    /// when the call ended after the offer became the local description, and WebRTC's own error
+    /// when it ended before.
     public func offer() async throws -> String {
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
@@ -249,6 +252,9 @@ public final class VoiceCall: NSObject {
         do {
             let description = try await connection.offer(for: constraints)
             try await connection.setLocalDescription(description)
+            // WebRTC cannot withdraw that success, and an offer for a call that ended would be
+            // sent on, so the call is asked again once it is back.
+            guard !control.isStopped else { throw VoiceAudioError.callEnded }
             return description.sdp
         } catch {
             // A call that cannot make its offer has nothing to wait for, and gives the audio back.

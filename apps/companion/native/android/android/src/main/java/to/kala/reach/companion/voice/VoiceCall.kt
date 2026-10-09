@@ -322,7 +322,9 @@ class VoiceCall private constructor(
             onOpenConnection { it.createOffer(observer, constraints) }
         }
         awaitSet { observer -> onOpenConnection { it.setLocalDescription(observer, made) } }
-        return made.description
+        // WebRTC cannot withdraw that success, and an offer for a call that ended would be sent on,
+        // so the call is asked again once it is back.
+        return onOpenConnection { made.description }
     }
 
     /**
