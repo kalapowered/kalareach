@@ -506,8 +506,13 @@ impl Controller {
             },
         };
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
-        // neither an answer nor an attempt behind it.
-        self.settle_claim(&hold, &outcome)?;
+        // neither an answer nor an attempt behind it. An enrolment that succeeded wrote its answer
+        // in the transaction that enrolled this host, and a second write of it could only report
+        // a storage failure for an action that is done.
+        let kept = method == Method::OrganisationEnrol && outcome.is_ok();
+        if !kept {
+            self.settle_claim(&hold, &outcome)?;
+        }
         drop(hold);
         outcome
     }
