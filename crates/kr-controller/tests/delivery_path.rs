@@ -1163,12 +1163,13 @@ impl Environment {
         }
     }
 
-    /// Pairs a device whose grant carries no history bound, as `kr pair --view` gives one, and
-    /// connects it.
-    async fn phone_with_no_history_bound(&self) -> Phone {
+    /// Pairs a device whose grant carries no history bound, with or without the live screen, as
+    /// the sharing screen and `kr pair --view` give them, and connects it.
+    async fn phone_with_no_history_bound(&self, include_live_screen: bool) -> Phone {
         let device = Device::with_keys(DeviceKeys::generate().expect("device keys")).await;
-        let grant = proposal(&[ActionRight::SessionView]);
+        let mut grant = proposal(&[ActionRight::SessionView]);
         assert!(grant.history.lower_bound_ms.0.is_none());
+        grant.history.include_live_screen = include_live_screen;
         let record = pair_with(&self.host, &device, &self.owner, grant).await;
         let connection = RawDevice::connect(&self.host, &device, &record).await;
         Phone {
@@ -2397,6 +2398,12 @@ impl Moved {
 
     /// Takes both clocks two days on, past the day the grant `proposal` gives a session invitation
     /// lasts.
+    ///
+    /// The wall clock goes first. A daemon that reads between the two steps sees a wall clock two
+    /// days on against a continuous clock that has not moved, so a case that moves the clocks with
+    /// a grant still unanchored in this boot would find the host distrusting its wall clock; the
+    /// four cases that use this have anchored their grant at the connection, and the grant ends on
+    /// its continuous deadline whatever the host trusts.
     fn past_the_grant(&self) {
         let days = Duration::from_secs(2 * 24 * 60 * 60);
         self.past_the_grant_by_utc();
@@ -3942,18 +3949,27 @@ async fn a_grant_that_runs_out_while_a_configuration_waits_to_be_written_configu
             .controller()
             .delivery()
             .pause_before_destination_write();
-        let hold = async {
-            tokio::task::spawn_blocking(move || arrived.recv_timeout(PATIENCE))
-                .await
-                .expect("the pause reports its arrival")
-                .expect("the write arrives");
-            if runs_out {
-                moved.past_the_grant_by_utc();
-            }
-            go.send(()).expect("the write is waiting");
-        };
         let params = webhook("ops", "https://hooks.example.test/in/ops", None, grant);
-        let (configured, ()) = tokio::join!(environment.configure(&params), hold);
+        let configuring = environment.configure(&params);
+        tokio::pin!(configuring);
+        let arrival = tokio::task::spawn_blocking(move || arrived.recv_timeout(PATIENCE));
+        // The write has to reach the pause before the configuration answers: one that is refused
+        // first fails here with its answer, and a write that never arrives fails at the deadline.
+        tokio::select! {
+            answer = &mut configuring => {
+                panic!("the configuration answered before its write reached the pause: {answer:?}")
+            }
+            arrived = arrival => {
+                arrived
+                    .expect("the pause reports its arrival")
+                    .expect("the write arrives");
+            }
+        }
+        if runs_out {
+            moved.past_the_grant_by_utc();
+        }
+        go.send(()).expect("the write is waiting");
+        let configured = configuring.await;
         if runs_out {
             configured.expect_err("the grant ran out before the row was written");
             assert!(environment.destination_named("ops").is_none());
@@ -4126,37 +4142,43 @@ async fn an_external_message_names_only_the_sessions_its_grant_reaches() {
 }
 
 /// KR-REQ-25.23: a grant with no history bound reaches what was first seen at or after its own
-/// start, as the audience decides, and the message composed for it says the same: it names the
-/// session and does not say that anything was left out. The grant is the one `kr pair --view`
-/// gives.
+/// start, as the audience decides, whether or not it includes the live screen, and the message
+/// composed for it says the same: it names the session and does not say that anything was left
+/// out. The two grants are the ones `kr pair --view` and the sharing screen give.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_external_message_under_a_grant_with_no_history_bound_leaves_nothing_out() {
     let environment = Environment::start().await;
-    let phone = environment.phone_with_no_history_bound().await;
-    environment
-        .configure(&webhook(
-            "ops",
-            "https://hooks.example.test/in/ops",
-            None,
-            phone.record.grant.grant_id,
-        ))
-        .await
-        .expect("the owner creates a webhook");
+    for (name, live_screen) in [("with-screen", true), ("without-screen", false)] {
+        let phone = environment.phone_with_no_history_bound(live_screen).await;
+        environment
+            .configure(&webhook(
+                name,
+                &format!("https://hooks.example.test/in/{name}"),
+                None,
+                phone.record.grant.grant_id,
+            ))
+            .await
+            .expect("the owner creates a webhook");
+    }
 
     environment._worker.ask("deploy-1", "Deploy the release?");
-    until("the webhook being posted to", || {
-        !environment.gateway.posted().is_empty()
+    until("both webhooks being posted to", || {
+        environment.gateway.posted().len() >= 2
     })
     .await;
-    let text = environment.gateway.posted().remove(0).text();
-    assert!(
-        text.contains(&environment.worker_session.to_string()),
-        "the message names the session the grant reaches: {text}"
-    );
-    assert!(
-        !text.contains("left out"),
-        "and nothing the grant reaches is said to be left out: {text}"
-    );
+    for posted in environment.gateway.posted() {
+        let text = posted.text();
+        assert!(
+            text.contains(&environment.worker_session.to_string()),
+            "{}: the message names the session the grant reaches: {text}",
+            posted.url
+        );
+        assert!(
+            !text.contains("left out"),
+            "{}: and nothing the grant reaches is said to be left out: {text}",
+            posted.url
+        );
+    }
 }
 
 /// KR-REQ-25.23: the credentialed kinds are configured through the same method, with their

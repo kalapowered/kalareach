@@ -425,6 +425,25 @@ impl ViewerScope {
         }
     }
 
+    /// The scope of a grant that reaches what was first seen from `from_ms` on.
+    ///
+    /// A grant with no history bound reaches what happens after it began, whether or not it
+    /// includes the live screen: earlier history is opt-in, and the future is not. So a scope with
+    /// no bound reaches what was produced from `from_ms` on, and nothing older, and a scope with a
+    /// bound keeps its bound. It is the reach of a notice about a condition first seen then, and
+    /// differs from [`Self::live_from`] only for a scope without the live screen.
+    #[must_use]
+    pub fn reaching_from(self, from_ms: u64) -> Self {
+        if self.lower_bound_ms.is_none() {
+            Self {
+                lower_bound_ms: Some(from_ms),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
     /// Returns true when this is the host owner's own unrestricted authority.
     #[must_use]
     pub const fn is_unrestricted(&self) -> bool {
