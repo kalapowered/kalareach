@@ -200,14 +200,15 @@ pub fn own_cgroup() -> Option<String> {
 /// session for a control daemon's own scope.
 pub const LEFT_FOR_A_DAEMON: &str = "left_for_a_daemon";
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Recorded {
     identity: ProcessStartIdentity,
     forced: bool,
     /// Whether the process was read in a control daemon's own scope, outside this session's
-    /// service, at an observation. Kept once read, because the process can end before the closure
-    /// and then cannot be read again; it says the process was never the session's to stop.
-    left: bool,
+    /// service, at any reading. Kept once read, because the process can end before the closure and
+    /// then cannot be read again; it says the process was never the session's to stop. Set by
+    /// readings that only have a shared reference, so it is atomic.
+    left: std::sync::atomic::AtomicBool,
 }
 
 /// The key one process is recorded under: what the operating system called it, and when it started.
@@ -235,7 +236,7 @@ impl OwnedProcesses {
             Recorded {
                 identity: root,
                 forced: false,
-                left: false,
+                left: std::sync::atomic::AtomicBool::new(false),
             },
         );
         owned
@@ -257,27 +258,34 @@ impl OwnedProcesses {
     }
 
     /// Notes processes found in the boundary, each already tied to the boundary by the reading
-    /// that gave its start, and forgets those the kernel now says have ended.
+    /// that gave its start, with whether that reading found it in a control daemon's own scope, and
+    /// forgets those the kernel now says have ended.
     ///
     /// A process that has left the session for a control daemon's own scope is noted as having
     /// left, whether it is new or was recorded before it moved, and is not among the processes the
     /// session stops: a control daemon a command of the session started is the daemon of another
     /// environment, which the session did not start for itself. That it left is kept once read,
     /// because the process can end before the closure and then cannot be read again.
-    fn take(&mut self, found: impl IntoIterator<Item = ProcessStartIdentity>) {
+    fn take(&mut self, found: impl IntoIterator<Item = (ProcessStartIdentity, bool)>) {
+        use std::sync::atomic::Ordering::Relaxed;
+
         let mut read = std::collections::BTreeSet::new();
-        for identity in found {
-            let left = self.in_a_daemons_scope(&identity);
-            read.insert(key(&identity));
-            if !left {
-                self.live.insert(key(&identity), identity.clone());
-            }
-            let recorded = self.seen.entry(key(&identity)).or_insert(Recorded {
-                identity,
+        for (identity, left) in found {
+            let this = key(&identity);
+            read.insert(this);
+            let recorded = self.seen.entry(this).or_insert(Recorded {
+                identity: identity.clone(),
                 forced: false,
-                left,
+                left: std::sync::atomic::AtomicBool::new(false),
             });
-            recorded.left |= left;
+            if left {
+                recorded.left.store(true, Relaxed);
+            }
+            if recorded.left.load(Relaxed) {
+                self.live.remove(&this);
+            } else {
+                self.live.insert(this, identity);
+            }
         }
         // One recorded earlier and not found this time is read again: it may have moved.
         let moved: Vec<(u64, u64)> = self
@@ -288,8 +296,8 @@ impl OwnedProcesses {
             .collect();
         for key in moved {
             self.live.remove(&key);
-            if let Some(recorded) = self.seen.get_mut(&key) {
-                recorded.left = true;
+            if let Some(recorded) = self.seen.get(&key) {
+                recorded.left.store(true, Relaxed);
             }
         }
         self.live.retain(|_, identity| {
@@ -312,7 +320,17 @@ impl OwnedProcesses {
     /// Whether a recorded process is no longer one of the session's: it was read in a control
     /// daemon's scope when it was last observed, or is in one now.
     fn has_left(&self, recorded: &Recorded) -> bool {
-        recorded.left || self.in_a_daemons_scope(&recorded.identity)
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if recorded.left.load(Relaxed) {
+            return true;
+        }
+        let in_one = self.in_a_daemons_scope(&recorded.identity);
+        if in_one {
+            // Kept: the process can end before anything reads it again.
+            recorded.left.store(true, Relaxed);
+        }
+        in_one
     }
 
     /// Returns the boundary this session's ownership rests on.
@@ -454,7 +472,7 @@ impl OwnedProcesses {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let tree = self.tree();
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let tree: Option<Vec<ProcessStartIdentity>> = None;
+        let tree: Option<Vec<(ProcessStartIdentity, bool)>> = None;
         if let Some(tree) = tree {
             self.take(tree);
             return;
@@ -493,7 +511,12 @@ impl OwnedProcesses {
             };
             agrees.then_some(lineage.identity)
         });
-        let agreeing: Vec<ProcessStartIdentity> = agreeing.collect();
+        let agreeing: Vec<(ProcessStartIdentity, bool)> = agreeing
+            .map(|identity| {
+                let left = self.in_a_daemons_scope(&identity);
+                (identity, left)
+            })
+            .collect();
         self.take(agreeing);
     }
 
@@ -517,7 +540,7 @@ impl OwnedProcesses {
     /// they hold nothing new: a process whose parent exits while the tree is being read is the
     /// worker's child by then, so it is in one reading or the other.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn tree(&self) -> Option<Vec<ProcessStartIdentity>> {
+    fn tree(&self) -> Option<Vec<(ProcessStartIdentity, bool)>> {
         if !matches!(rustix::process::child_subreaper(), Ok(Some(_))) {
             return None;
         }
@@ -533,7 +556,7 @@ impl OwnedProcesses {
                 .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
                 == Some(session)
         };
-        let mut members: Vec<ProcessStartIdentity> = Vec::new();
+        let mut members: Vec<(ProcessStartIdentity, bool)> = Vec::new();
         let mut walked = std::collections::BTreeSet::new();
         let mut pending: Vec<(u32, ProcessStartIdentity)> = Vec::new();
         // The root shell, if it is still the process that was recorded. A shell that has gone
@@ -546,10 +569,12 @@ impl OwnedProcesses {
                 if !walked.insert(pid) {
                     continue;
                 }
-                members.push(identity.clone());
-                // A process that left for a control daemon's own scope is read about no further:
-                // what it started is its own, not the session's.
-                if self.in_a_daemons_scope(&identity) {
+                // Read once, here, and carried to `take`: a process that left for a control daemon's
+                // own scope is read about no further (what it started is its own, not the
+                // session's), and a second reading could find it gone.
+                let left = self.in_a_daemons_scope(&identity);
+                members.push((identity.clone(), left));
+                if left {
                     continue;
                 }
                 let children = kr_ipc::identity::children_of(pid).ok()?;
@@ -649,7 +674,7 @@ impl OwnedProcesses {
                  describe, so they are not in the record"
             ));
         }
-        self.take(found);
+        self.take(found.into_iter().map(|identity| (identity, false)));
     }
 
     /// Records that an agent of this session ran under the reduced-ownership profile, which keeps
@@ -712,7 +737,7 @@ impl OwnedProcesses {
             .values()
             .filter(|recorded| {
                 // One read in a control daemon's scope ended without the session ending it.
-                !recorded.left
+                !recorded.left.load(std::sync::atomic::Ordering::Relaxed)
                     && matches!(
                         kr_ipc::identity::process_state(&recorded.identity),
                         kr_ipc::identity::ProcessState::Ended
@@ -1284,7 +1309,7 @@ mod tests {
             Recorded {
                 identity: recorded.clone(),
                 forced: false,
-                left: false,
+                left: std::sync::atomic::AtomicBool::new(false),
             },
         );
         request_stop(&owned);
@@ -1316,7 +1341,7 @@ mod tests {
             Recorded {
                 identity: second.clone(),
                 forced: false,
-                left: false,
+                left: std::sync::atomic::AtomicBool::new(false),
             },
         );
         assert_eq!(owned.seen.len(), 2, "the record holds both");
