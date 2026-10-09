@@ -24,7 +24,7 @@ pub struct AppState {
     device: OnceLock<Arc<Device>>,
     owner: OnceLock<Arc<Owner>>,
     paste: OnceLock<Arc<dyn PastePlatform>>,
-    drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
+    drafts: Arc<crate::drafts::DraftDesk>,
     questions: crate::questions::QuestionDesk,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
@@ -55,7 +55,7 @@ impl AppState {
             device: OnceLock::new(),
             owner: OnceLock::new(),
             paste: OnceLock::new(),
-            drafts: Mutex::new(None),
+            drafts: Arc::new(crate::drafts::DraftDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
@@ -393,34 +393,18 @@ impl AppState {
         &self.questions
     }
 
-    /// Gives what this application keeps on this device its place under the data directory. The
+    /// Gives what this application keeps on this device its place under the data directory: the
+    /// answers a host did not confirm and the drafts a person has not sent. The
     /// application does this once, at start, before any command can run.
     pub fn keep_under(&self, data: &std::path::Path) {
         self.questions.keep_at(crate::questions::kept_in(data));
+        self.drafts.keep_at(data.to_path_buf());
     }
 
-    /// Opens, or reuses, this device's draft store.
-    ///
-    /// A draft belongs to the device, so the store lives under this application's own per-user
-    /// directory and never under a session's working directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns the store's own failure when the directory cannot be made durable.
-    pub fn drafts(
-        &self,
-        directory: &std::path::Path,
-        device_id: kr_protocol::ids::DeviceId,
-    ) -> Result<Arc<kr_client::drafts::DraftStore>> {
-        let mut held = self.drafts.lock().expect("the draft lock is not poisoned");
-        if let Some(store) = held.as_ref() {
-            return Ok(Arc::clone(store));
-        }
-        let store = kr_client::drafts::DraftStore::open(directory, device_id)
-            .map_err(CommandError::from)?;
-        let store = Arc::new(store);
-        *held = Some(Arc::clone(&store));
-        Ok(store)
+    /// The drafts this device keeps.
+    #[must_use]
+    pub fn drafts(&self) -> Arc<crate::drafts::DraftDesk> {
+        Arc::clone(&self.drafts)
     }
 }
 

@@ -66,6 +66,12 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("terminal_view_close", None),
     // The launch surface.
     ("shell_launch", Some(Method::ShellLaunch)),
+    // The drafts this device keeps. They are the device's own, in a store of its own: the page
+    // names a draft, the version it was shown and what to keep, never a path or a method.
+    ("device_drafts", None),
+    ("device_draft_save", None),
+    ("device_draft_retarget", None),
+    ("device_draft_discard", None),
     // Drafts and attachments.
     ("draft_create", Some(Method::DraftCreate)),
     ("draft_update", Some(Method::DraftUpdate)),
@@ -266,6 +272,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         terminal_view_input,
         terminal_view_close,
         shell_launch,
+        device_drafts,
+        device_draft_save,
+        device_draft_retarget,
+        device_draft_discard,
         draft_create,
         draft_update,
         draft_add_attachment,
@@ -650,6 +660,48 @@ mutate_command!(
     description_download, Method::DescriptionDownload,
     kr_protocol::describe::DescriptionDownloadParams
 );
+/// Runs a step of the draft store, which blocks on the file system, off the runtime's threads.
+async fn blocking<T: Send + 'static>(
+    step: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tauri::async_runtime::spawn_blocking(step)
+        .await
+        .map_err(|error| {
+            CommandError::local_failure(format!("keeping the draft stopped: {error}"))
+        })?
+}
+
+/// Reads the drafts this device keeps.
+#[tauri::command]
+pub async fn device_drafts(state: State<'_, AppState>) -> Result<Value> {
+    let drafts = state.drafts();
+    encode(&blocking(move || drafts.read()).await?)
+}
+
+/// Keeps a draft: makes it, or replaces the version the page names.
+#[tauri::command]
+pub async fn device_draft_save(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: crate::drafts::SaveParams = decode(params)?;
+    let drafts = state.drafts();
+    encode(&blocking(move || drafts.save(typed, kr_ipc::now_ms())).await?)
+}
+
+/// Points a draft at a session and conversation a person chose.
+#[tauri::command]
+pub async fn device_draft_retarget(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: crate::drafts::RetargetParams = decode(params)?;
+    let drafts = state.drafts();
+    encode(&blocking(move || drafts.retarget(typed, kr_ipc::now_ms())).await?)
+}
+
+/// Throws away a draft, if it is still the version the person was shown.
+#[tauri::command]
+pub async fn device_draft_discard(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: crate::drafts::DiscardParams = decode(params)?;
+    let drafts = state.drafts();
+    encode(&blocking(move || drafts.discard(&typed)).await?)
+}
+
 /// Reads a session's questions.
 ///
 /// On this machine's own host the questions are the session's worker's, and are read over the link
@@ -2114,6 +2166,11 @@ mod tests {
                 "question_settle",
                 "question_send_kept",
                 "question_dismiss_kept",
+                // The drafts this device keeps, in a store of its own.
+                "device_drafts",
+                "device_draft_save",
+                "device_draft_retarget",
+                "device_draft_discard",
             ])
         );
     }
