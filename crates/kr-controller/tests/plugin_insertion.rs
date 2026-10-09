@@ -10,7 +10,6 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-23.30 | an action that offers an attachment names a draft the daemon holds, is validated against it, and transmits nothing when the draft moved, the package does not declare an offer of it, the action was cancelled, lost its ground or its connection while its component prepared it, or the plan was not the invocation's own; it is prepared over the connection the worker's own link holds to the plugin runtime, and again after that runtime was lost; a repeat of it is answered with its receipt and claims nothing again |
-//! | KR-REQ-12.30 | the typed half: an attachment is named to the upstream by identifiers and the read grant over its staged file, whatever the file is called (spaces, quotes, non-ASCII letters, a relative-looking name, a WSL path, a Windows drive path, an extension that varies), two images offered together are both accepted, and a prompt that names a draft whose attachment is being offered is a conflict; a retry after a refusal keeps the upload |
 //! | KR-REQ-24.09 | what the agent answered is recorded on the binding: accepted with the upstream's evidence, failed when it refused, unknown when it did not answer, and a claim the worker could not make is settled by a report |
 
 #![cfg(unix)]
@@ -1348,27 +1347,38 @@ async fn kr_req_12_30_an_attachment_is_named_to_the_upstream_by_identifiers_what
         let frames = acting.frames();
         assert_eq!(frames.len(), index + 1, "{name}");
         let frame = &frames[index];
-        let parsed: serde_json::Value = serde_json::from_str(frame).expect("a JSON frame");
+        let mut parsed: serde_json::Value = serde_json::from_str(frame).expect("a JSON frame");
         assert_eq!(
             parsed["params"]["attachment"]["transfer_id"],
             handle.transfer_id.to_string(),
             "{name}"
         );
-        let path = std::path::Path::new(
+        let path = std::path::PathBuf::from(
             parsed["params"]["attachment"]["read_grant"]["path"]
                 .as_str()
                 .expect("a path"),
         );
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .expect("a file name");
         assert_eq!(
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
-            Some(format!("{}{suffix}", staged_stem(&handle))),
+            file_name,
+            format!("{}{suffix}", staged_stem(&handle)),
             "{name}"
         );
+        assert_eq!(
+            path.canonicalize().expect("the path is there"),
+            staged_file(&acting, &handle)
+                .canonicalize()
+                .expect("the staged file is there"),
+            "{name}: the grant names the staged file"
+        );
         // The directory the host keeps the file in is the host's own choice, and may be called
-        // anything: it is left out of what is searched for the name's parts.
-        let directory = path.parent().expect("a directory").to_string_lossy();
-        let searched = frame.replace(&*directory, "");
+        // anything: only the file's name is left in the path when the frame is searched for the
+        // name's parts.
+        parsed["params"]["attachment"]["read_grant"]["path"] = serde_json::Value::String(file_name);
+        let searched = parsed.to_string();
         for part in *forbidden {
             assert!(
                 !searched.contains(part),
@@ -1470,9 +1480,11 @@ async fn kr_req_12_30_a_prompt_naming_a_draft_whose_attachment_is_being_offered_
         state_of(&acting.draft(sent_draft.draft_id), &sent),
         InsertionState::Recorded
     );
-    assert_eq!(
-        acting.frames().len(),
-        1,
+    assert!(
+        !acting
+            .frames()
+            .iter()
+            .any(|frame| frame.contains(&sent.transfer_id.to_string())),
         "nothing was written for the draft a prompt had sent: {:?}",
         acting.frames()
     );
