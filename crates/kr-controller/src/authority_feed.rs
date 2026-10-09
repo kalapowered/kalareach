@@ -18,8 +18,9 @@
 //!   ([`FeedRuntime::synchronised_before_serving`]). Polling alone would leave a revoked device its
 //!   first requests until the next poll; section 10 asks for the synchronisation before affected
 //!   remote access, so a connection waits for one that began after it was admitted, and waits at
-//!   most [`GATE_WAIT`] for it. A feed that does not answer in that time leaves the status stale and
-//!   the connection served, as an unreachable feed does.
+//!   most [`GATE_WAIT`] for it. A feed that does not answer in that time leaves the connection
+//!   served; the status goes stale when the pass that was held ends without an answer, as it does
+//!   for an unreachable feed.
 //! * **Every [`FEED_POLL_INTERVAL_MS`] after that**, while the daemon runs.
 //! * **When an owner is revoked**, so the key it held stops being named as one that may remove the
 //!   feed.
@@ -195,8 +196,12 @@ struct Shared {
     completed: tokio::sync::watch::Sender<u64>,
     wake: tokio::sync::Notify,
     removed: AtomicBool,
-    /// The highest sequence of the feed up to which everything is settled.
+    /// The highest sequence of the feed up to which everything is settled, where a scan starts.
     settled_through: AtomicU64,
+    /// Where a scan that stopped at the page limit goes on, or 0 when none is under way.
+    scan_cursor: AtomicU64,
+    /// Whether a record the scan met so far is not settled yet.
+    scan_unfinished: AtomicBool,
     observed: Mutex<Observed>,
     controller: OnceLock<Weak<Controller>>,
     /// How many passes have finished, for whatever waits on one.
@@ -254,6 +259,8 @@ impl FeedRuntime {
                 wake: tokio::sync::Notify::new(),
                 removed: AtomicBool::new(false),
                 settled_through: AtomicU64::new(0),
+                scan_cursor: AtomicU64::new(0),
+                scan_unfinished: AtomicBool::new(false),
                 observed: Mutex::default(),
                 controller: OnceLock::new(),
                 passes: tokio::sync::watch::channel(0).0,
@@ -493,6 +500,7 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
         let Some(controller) = shared.controller.get().and_then(Weak::upgrade) else {
             return;
         };
+        let mut chained = false;
         let wait = if shared.removed.load(Ordering::SeqCst) {
             None
         } else if let Some(owed) = shared.quiet.owed() {
@@ -505,6 +513,10 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
                     Some(Duration::from_millis(FEED_POLL_INTERVAL_MS))
                 }
                 Ok(Pass::Unfinished) => Some(backoff.next_delay()),
+                Ok(Pass::More) => {
+                    chained = true;
+                    None
+                }
                 Ok(Pass::Removed) => None,
                 Err(stopped) => {
                     controller.authority_feed_unreachable();
@@ -518,6 +530,12 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
             }
         };
         drop(controller);
+        if chained {
+            // The feed holds more than a pass reads. Nothing waits for this pass, because it
+            // is not the synchronisation a connection waits for, and the next goes on at once.
+            shared.passes.send_modify(|passes| *passes += 1);
+            continue;
+        }
         shared.completed.send_replace(target);
         shared.passes.send_modify(|passes| *passes += 1);
         // Interest in a wake is registered before the count of questions is read again, so a
@@ -547,6 +565,8 @@ enum Pass {
     Read,
     /// The feed was read, and something it holds is not settled yet: a barrier still running.
     Unfinished,
+    /// The feed was read as far as a pass reads, and the scan goes on at once where this stopped.
+    More,
     /// The feed answered that this host was removed from it.
     Removed,
 }
@@ -578,10 +598,19 @@ async fn pass(
     shared: &Arc<Shared>,
     controller: &Arc<Controller>,
 ) -> std::result::Result<Pass, Stopped> {
-    let mut unfinished = false;
-    let mut cursor = shared.settled_through.load(Ordering::SeqCst);
+    // A scan starts after what is settled and goes on, pass after pass, until it has read the feed
+    // through. A pass that goes on from where an earlier one stopped does not know what lies
+    // before its cursor, so only the pass that starts a scan moves the settled mark.
+    let resumed = shared.scan_cursor.load(Ordering::SeqCst);
+    let starting = resumed == 0;
+    let mut unfinished = shared.scan_unfinished.load(Ordering::SeqCst);
+    let mut cursor = if starting {
+        shared.settled_through.load(Ordering::SeqCst)
+    } else {
+        resumed
+    };
     let mut through = cursor;
-    let mut contiguous = true;
+    let mut contiguous = starting;
     let mut latest = None;
     let mut read_through = false;
     for _ in 0..shared.most_pages.load(Ordering::SeqCst) {
@@ -616,13 +645,19 @@ async fn pass(
             break;
         }
     }
-    shared.settled_through.store(through, Ordering::SeqCst);
+    if starting {
+        shared.settled_through.store(through, Ordering::SeqCst);
+    }
+    shared.scan_unfinished.store(unfinished, Ordering::SeqCst);
     if !read_through {
         // The feed holds more than a pass reads, so this is no synchronisation: nothing is shown
-        // as read, the bounded offline validity is not extended from it, and the next pass goes
-        // on at the cursor.
-        return Ok(Pass::Unfinished);
+        // as read, the bounded offline validity is not extended from it, and nothing waits for
+        // this pass. The scan goes on at the cursor at once.
+        shared.scan_cursor.store(cursor, Ordering::SeqCst);
+        return Ok(Pass::More);
     }
+    shared.scan_cursor.store(0, Ordering::SeqCst);
+    shared.scan_unfinished.store(false, Ordering::SeqCst);
     if let Some(latest) = latest {
         name_owners(shared, controller, &latest).await?;
     }
@@ -671,9 +706,10 @@ async fn settle(
     let request = &record.request;
     let id = request.request_id;
     if record.rejected.0.is_some() {
-        // Only this host refuses a request, so a note it kept of this one has nothing more to
-        // wait for.
-        controller.authority_feed_settled(id, shared.host_device_id);
+        // Only this host refuses a request, so a note it kept of this one is a refusal.
+        controller
+            .authority_feed_refusal_noted(id, shared.host_device_id)
+            .map_err(Stopped::local)?;
         return Ok(true);
     }
     if let Some(held) = record.acknowledgement.0.as_ref()
@@ -683,8 +719,11 @@ async fn settle(
         return Ok(true);
     }
     let now = kr_ipc::now_ms().get();
-    let plan = match controller.authority_feed_record(id) {
-        Some(held) if held.request != *request => {
+    let noted = controller.authority_feed_record(id);
+    let plan = match &noted {
+        // A different request under an identity this host took, or one this host refused after
+        // it began to take it and is published again: refused, and never carried out.
+        Some(held) if held.request != *request || held.is_refused_by(shared.host_device_id) => {
             return refuse(shared, controller, id, RejectionReason::Superseded, latest).await;
         }
         Some(_) => controller.plan_of(request).map_err(Stopped::local)?,
@@ -693,9 +732,6 @@ async fn settle(
             .map_err(Stopped::local)?
         {
             Judged::Refuse(reason) => return refuse(shared, controller, id, reason, latest).await,
-            // What its issuer's authority stands on is renewed by the synchronisation this pass
-            // makes, so the next pass judges it again.
-            Judged::Later => return Ok(false),
             Judged::Apply(plan) => plan,
         },
     };
@@ -717,10 +753,19 @@ async fn settle(
         // issue for a request that changed nothing, and the registry is the one allocator.
         return refuse(shared, controller, id, RejectionReason::Superseded, latest).await;
     }
-    // The feed must not hold a higher revision than the registry has reached: this host numbers
-    // what it issues from the registry, and a number at or below one the feed holds is not one it
-    // can issue.
-    if latest.revision > applied.revision.get() {
+    // This host numbers what it issues from the registry, and the feed takes only a number above
+    // the one it holds. A request not numbered yet therefore needs the registry past the feed; a
+    // request already numbered is issued again under its own number, and needs only that the
+    // registry has not fallen behind the feed.
+    let numbered = noted
+        .as_ref()
+        .is_some_and(|held| held.authority_revision.is_some());
+    let behind = if numbered {
+        latest.revision > applied.revision.get()
+    } else {
+        latest.revision >= applied.revision.get()
+    };
+    if behind {
         shared.observed().unissued = true;
         return Err(Stopped::Local);
     }
@@ -768,13 +813,17 @@ async fn refuse(
     reason: RejectionReason,
     latest: &mut Latest,
 ) -> std::result::Result<bool, Stopped> {
+    // Written down before it is sent: a refusal that never arrives is made again, and the same
+    // request published again after the feed dropped it is refused again and not carried out.
+    controller
+        .authority_feed_refusal_noted(id, shared.host_device_id)
+        .map_err(Stopped::local)?;
     let state = shared
         .client
         .reject(id, reason)
         .await
         .map_err(|error| Stopped::of(&error, &shared.quiet))?;
     *latest = Latest::of(&state);
-    controller.authority_feed_settled(id, shared.host_device_id);
     Ok(true)
 }
 
