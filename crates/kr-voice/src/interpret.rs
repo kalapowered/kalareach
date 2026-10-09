@@ -14,7 +14,7 @@
 //! | "go to session 3", "open session twenty one" | go to the session |
 //!
 //! A session is named by its display number, written as the provider's transcript writes it: in
-//! digits (any number), or in words from zero to ninety-nine ("twenty three" and "twenty-three"
+//! digits (any number a 64-bit number holds), or in words from zero to ninety-nine ("twenty three" and "twenty-three"
 //! alike). A request that names no session means the call's
 //! one session, when the call reaches only one. A question is the same request. Negation, a
 //! second request, a word the grammar does not hold, and a number that cannot be read are each
@@ -233,7 +233,8 @@ const STOPS: &[char] = &['.', ',', '!', '?', ';', ':'];
 /// it is not read as one thing ("twenty, three" is two words and a boundary, never twenty-three).
 /// A boundary at the start or the end of the whole utterance is dropped before the words are read
 /// ([`bare`]), so a stop that ends what was said, or a quotation round all of it, costs nothing.
-/// **Nothing inside a token is ever removed or changed, but its case**: "-3", ".3", "3.5", "1,000",
+/// **Nothing inside a token is ever removed, and nothing is changed but its case and the variant
+/// forms of a mark ([`plain_marks`])**: "-3", ".3", "3.5", "1,000",
 /// "3'4" and "3,please" are each one token that is no number, and "what's" is a word of its own,
 /// which the leads hold as it is written and as it is written without its apostrophe. A hyphen
 /// never stands for a space; the one hyphenated word the grammar holds is a ten and a unit
@@ -263,13 +264,33 @@ fn words_of(spoken: &str) -> Vec<String> {
     words
 }
 
+/// Whether `character` is a mark a transcript writes for an apostrophe: the plain one, the single
+/// quotation marks, the modifier letters, the grave and acute accents, the prime and the fullwidth
+/// form. Some of them are letters to Unicode, so a rule about marks asks this first.
+pub(crate) const fn is_apostrophe(character: char) -> bool {
+    matches!(
+        character,
+        '\'' | '\u{2018}'
+            | '\u{2019}'
+            | '\u{201b}'
+            | '\u{02bb}'
+            | '\u{02bc}'
+            | '`'
+            | '\u{00b4}'
+            | '\u{2032}'
+            | '\u{ff07}'
+            | '\u{a78c}'
+    )
+}
+
 /// `spoken` with the variants of a quotation mark, an apostrophe and a hyphen that a transcript
-/// writes put as the plain mark, so that one rule reads them all.
+/// writes put as the plain mark, so that one rule reads them all. A mark becomes a mark, never a
+/// letter, a digit or a space.
 fn plain_marks(spoken: &str) -> String {
     spoken
         .chars()
         .map(|each| match each {
-            '\u{2018}' | '\u{2019}' | '\u{02bc}' | '`' => '\'',
+            _ if is_apostrophe(each) => '\'',
             '\u{201c}' | '\u{201d}' | '\u{201e}' => '"',
             '\u{2010}' | '\u{2011}' => '-',
             other => other,
