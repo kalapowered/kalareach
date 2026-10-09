@@ -37,6 +37,7 @@
 //! read, then this state, then the device directory, then a registration table held through a
 //! commit. No policy or grant callback runs under this state.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kr_protocol::identity::BootIdentity;
@@ -173,6 +174,10 @@ pub struct Watched {
 /// Whether this host may decide an expiry from its own wall clock, and the transitions of that.
 pub struct ClockTrust {
     state: Mutex<State>,
+    /// Whether the state read its record and does not hold the clock distrusted, published by
+    /// whoever changes either under the state's lock, so a caller that must not wait for that lock
+    /// can ask ([`Self::is_trusted_now`]).
+    trusting: AtomicBool,
     /// The wall clock this decision is about: the daemon's own.
     wall: crate::service::WallClock,
     /// The host's clock floor, which every reading taken here is published in before anything is
@@ -221,6 +226,7 @@ impl ClockTrust {
     ) -> Self {
         Self {
             state: Mutex::new(State::default()),
+            trusting: AtomicBool::new(false),
             wall,
             floor,
             clock,
@@ -233,6 +239,13 @@ impl ClockTrust {
 
     fn held(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Publishes what `state` says of trust, for [`Self::is_trusted_now`]. Every change of
+    /// `loaded` or `distrusted` is followed by this under the same lock.
+    fn publish(&self, state: &State) {
+        self.trusting
+            .store(state.loaded && !state.distrusted, Ordering::SeqCst);
     }
 
     /// Reads the durable record into `state`, the first time anything asks.
@@ -273,6 +286,7 @@ impl ClockTrust {
             }
         }
         state.loaded = true;
+        self.publish(state);
         Ok(())
     }
 
@@ -331,6 +345,7 @@ impl ClockTrust {
             state.distrusted = true;
             state.confirmed = false;
             state.owed.distrust = true;
+            self.publish(state);
         }
         if !state.distrusted {
             // The anchor moves forward only: a reading at or beyond what this host could prove is
@@ -572,16 +587,16 @@ impl ClockTrust {
 
     /// Whether this host still trusts its clock, from what it holds in memory and nothing else.
     ///
-    /// It reads no clock and writes nothing, so a caller that is inside a store's transaction may
-    /// ask it: [`Self::sample`] writes the record of the reading it takes, which a second
-    /// connection to the same file cannot do while the transaction holds the file. A host that has
-    /// not read its record yet does not trust its clock, and neither does one whose boot lost the
-    /// continuity of its readings. A caller that sampled before it waited asks again after, to
-    /// find a distrust a reader of the clock decided meanwhile.
+    /// It reads no clock, writes nothing and takes no lock, so a caller that is inside a store's
+    /// transaction may ask it. A reading holds the state's lock while it writes its record through
+    /// the same file the transaction holds, and a caller that waited for that lock there would
+    /// wait until the write gave up. A host that has not read its record yet does not trust its
+    /// clock, and neither does one whose boot lost the continuity of its readings. A caller that
+    /// sampled before it waited asks again after, to find a distrust a reader of the clock decided
+    /// meanwhile.
     #[must_use]
     pub fn is_trusted_now(&self) -> bool {
-        let state = self.held();
-        state.loaded && !state.distrusted && !self.floor.continuity_lost()
+        self.trusting.load(Ordering::SeqCst) && !self.floor.continuity_lost()
     }
 
     /// Whether something decided is not written down yet.
@@ -658,6 +673,7 @@ impl ClockTrust {
             evidence_hold: false,
             owed: Owed::default(),
         };
+        self.publish(&state);
         self.floor.establish_continuity();
         // And in the floor the workers map, so a worker that distrusts its own clock can follow the
         // owner.
@@ -906,6 +922,75 @@ mod tests {
             assert!(proven(&run, &devices), "{reader:?}: one retrust clears it");
             assert!(run.trust.watch(&devices, true).expect("watches").proven);
         }
+    }
+
+    /// KR-REQ-17.53: what a caller inside a store's transaction asks of the clock without a lock
+    /// follows the state of trust. A host that has read nothing does not trust its clock, one that
+    /// has read it plausible does, a rollback found by a reading ends it for the next asker before
+    /// anything is written, an establishment restores it, and a lost continuity ends it whatever
+    /// else holds.
+    #[test]
+    fn what_is_asked_without_the_lock_follows_the_state_of_trust() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        assert!(!run.trust.is_trusted_now(), "nothing read yet");
+        assert!(proven(&run, &devices));
+        assert!(run.trust.is_trusted_now());
+
+        run.continuous.advance(MINUTE);
+        machine.boot_clock.advance(MINUTE);
+        machine.set_wall(machine.wall() + 50_000);
+        run.trust.sample(&devices).expect("reads");
+        machine.set_wall(machine.wall() + 10_000);
+        assert!(!proven(&run, &devices), "the step back is found");
+        assert!(
+            !run.trust.is_trusted_now(),
+            "and no asker is told otherwise"
+        );
+
+        run.trust
+            .establish(&devices)
+            .expect("the owner establishes");
+        assert!(run.trust.is_trusted_now());
+
+        run.trust.floor.lose_continuity();
+        assert!(
+            !run.trust.is_trusted_now(),
+            "a lost continuity proves nothing"
+        );
+        run.trust.floor.establish_continuity();
+        assert!(run.trust.is_trusted_now());
+    }
+
+    /// KR-REQ-17.53: the question is answered while a reader holds the state's lock. A reader holds
+    /// it across its write to the file an enrolment's transaction holds, so a caller inside that
+    /// transaction that waited for the lock would wait until the write gave up.
+    #[test]
+    fn what_is_asked_without_the_lock_does_not_wait_for_a_reader() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        assert!(proven(&run, &devices));
+
+        let reader = run.trust.held();
+        let (answered, answer) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                answered
+                    .send(run.trust.is_trusted_now())
+                    .expect("the test waits");
+            });
+            let got = answer.recv_timeout(Duration::from_secs(30));
+            // Let go before judging, so an asker that waited for the lock ends and the test fails
+            // rather than hangs.
+            drop(reader);
+            assert_eq!(
+                got,
+                Ok(true),
+                "the asker is answered while the lock is held"
+            );
+        });
     }
 
     /// KR-REQ-09.18: a rollback met by one reading and gone before any other reader looks is still
