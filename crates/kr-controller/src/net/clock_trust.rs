@@ -570,6 +570,20 @@ impl ClockTrust {
         self.write_owed(&mut state, devices, at_ms)
     }
 
+    /// Whether this host still trusts its clock, from what it holds in memory and nothing else.
+    ///
+    /// It reads no clock and writes nothing, so a caller that is inside a store's transaction may
+    /// ask it: [`Self::sample`] writes the record of the reading it takes, which a second
+    /// connection to the same file cannot do while the transaction holds the file. A host that has
+    /// not read its record yet does not trust its clock, and neither does one whose boot lost the
+    /// continuity of its readings. A caller that sampled before it waited asks again after, to
+    /// find a distrust a reader of the clock decided meanwhile.
+    #[must_use]
+    pub fn is_trusted_now(&self) -> bool {
+        let state = self.held();
+        state.loaded && !state.distrusted && !self.floor.continuity_lost()
+    }
+
     /// Whether something decided is not written down yet.
     #[must_use]
     pub fn owes_a_write(&self) -> bool {
