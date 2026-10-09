@@ -541,20 +541,37 @@ fn duration(expiry: &GrantExpiry, now_ms: u64) -> String {
     }
 }
 
+/// How much a prompt says of the organisation a grant answers to.
+#[derive(Clone, Copy)]
+enum Membership {
+    /// The start of its identifier and the enrolment of this host that the grant names.
+    Full,
+    /// The start of its identifier.
+    Organisation,
+    /// That the grant answers to an organisation's membership, and no more.
+    Members,
+    /// Nothing: the page beside the line lists the organisation and the enrolment.
+    Unsaid,
+}
+
 /// What a grant that requires an organisation's membership says of it in a prompt, or nothing for
 /// a personal grant: the access answers to the organisation's lease, so a person who confirms it
-/// is told so, with the start of the organisation's identifier and the enrolment of this host the
-/// grant names. A page with room for more shows the whole identifier beside it.
-fn membership(grant: &ProposedGrant) -> String {
+/// is told so.
+fn membership(grant: &ProposedGrant, form: Membership) -> String {
     grant
         .organisation
         .as_ref()
         .map_or_else(String::new, |requirement| {
-            format!(
-                ", only for members of organisation {} (enrolment {})",
-                organisation_start(&requirement.organisation_id),
-                requirement.policy_revision.get()
-            )
+            let start = organisation_start(&requirement.organisation_id);
+            match form {
+                Membership::Full => format!(
+                    ", only for members of organisation {start} (enrolment {})",
+                    requirement.policy_revision.get()
+                ),
+                Membership::Organisation => format!(", only for members of organisation {start}"),
+                Membership::Members => ", only for organisation members".to_owned(),
+                Membership::Unsaid => String::new(),
+            }
         })
 }
 
@@ -628,7 +645,19 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
     if !is_showable(subject) {
         return Err(CannotCheck::CannotShow);
     }
-    for names in [40, 24, 16] {
+    // Each pass says less than the one before. A host's name is shortened first; then what a grant
+    // says of the organisation it answers to. The last pass leaves that to the page beside the
+    // line: the clause only narrows the access the line states, so a line that has no room for it
+    // is still the whole of what the confirmation authorises, and a grant that could be shown
+    // without the clause is never made unshowable by it.
+    for (names, membership_form) in [
+        (40, Membership::Full),
+        (24, Membership::Full),
+        (16, Membership::Full),
+        (16, Membership::Organisation),
+        (16, Membership::Members),
+        (16, Membership::Unsaid),
+    ] {
         let host = shown_host(host_name, names);
         let text = match subject {
             Subject::IssueInvitation {
@@ -648,7 +677,7 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                     "issue an invitation from {host}: {offered}, for a device that may {} {}{}",
                     authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
                     duration(&proposed_grant.expiry, now_ms),
-                    membership(proposed_grant)
+                    membership(proposed_grant, membership_form)
                 )
             }
             Subject::ConfirmDevice {
@@ -660,7 +689,7 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 platform(candidate.platform),
                 authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
                 duration(&proposed_grant.expiry, now_ms),
-                membership(proposed_grant),
+                membership(proposed_grant, membership_form),
                 shows_value(&group_verification_value(&candidate.verification_value))
             ),
             Subject::EstablishClock => format!("trust the clock of {host} again"),
@@ -1606,7 +1635,7 @@ mod tests {
                 "{name}"
             );
         }
-        // Another action, or a destination the host names, is not a change of this kind.
+        // Another action is not a change of this kind.
         let pending = pending_for(
             &host,
             SensitiveAction::EnlargeGrant,
@@ -1702,17 +1731,20 @@ mod tests {
     }
 
     /// KR-REQ-17.53: an invitation or a device whose grant answers to an organisation's lease says
-    /// so, with the organisation and the enrolment of the host it names; a personal grant says
-    /// nothing of it.
+    /// so, with the organisation and the enrolment of the host it names, where the line has room
+    /// for it; a personal grant says nothing of it. The clause only narrows the access the line
+    /// states, so it never makes a grant that could be shown without it unshowable: at every role's
+    /// ceiling and for a long host name, a grant whose line fits as a personal grant has a line
+    /// that fits as a member's, and a line that fits is within the budget.
     #[test]
-    fn a_prompt_for_a_grant_that_requires_an_organisation_names_it() {
+    fn a_prompt_for_a_grant_that_requires_an_organisation_names_it_where_it_fits() {
+        use kr_protocol::account::TeamRole;
+
         let organisation = kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([0x21; 16]));
-        let mut member = grant(&[ActionRight::SessionView], an_hour());
-        member.organisation = Nullable::some(kr_protocol::grant::OrganisationRequirement {
+        let requirement = kr_protocol::grant::OrganisationRequirement {
             organisation_id: organisation,
             policy_revision: kr_protocol::ids::AuthorityRevision::new(7),
-        });
-        let personal = grant(&[ActionRight::SessionView], an_hour());
+        };
         let invitation = |proposed_grant: ProposedGrant| Subject::IssueInvitation {
             mode: InviteModeKind::Direct,
             origin: None,
@@ -1723,29 +1755,63 @@ mod tests {
             candidate: candidate("Pixel 8"),
             proposed_grant,
         };
-        for (name, member_line, personal_line) in [
-            (
-                "an invitation",
-                reason(&invitation(member.clone()), "studio", NOW).expect("a line"),
-                reason(&invitation(personal.clone()), "studio", NOW).expect("a line"),
-            ),
-            (
-                "a device",
-                reason(&device(member.clone()), "studio", NOW).expect("a line"),
-                reason(&device(personal.clone()), "studio", NOW).expect("a line"),
-            ),
+        let mut said = 0;
+        for role in [
+            TeamRole::Viewer,
+            TeamRole::Reviewer,
+            TeamRole::Controller,
+            TeamRole::Owner,
+        ] {
+            let mut personal = grant(&[], an_hour());
+            personal.actions = role.maximum_grants();
+            let mut member = personal.clone();
+            member.organisation = Nullable::some(requirement);
+            for host in ["studio", "a-host-with-a-sixteen-character-name"] {
+                for (name, make) in [
+                    (
+                        "an invitation",
+                        &invitation as &dyn Fn(ProposedGrant) -> Subject,
+                    ),
+                    ("a device", &device as &dyn Fn(ProposedGrant) -> Subject),
+                ] {
+                    let which = format!("{role} {name} on {host}");
+                    let personal_line = reason(&make(personal.clone()), host, NOW);
+                    let member_line = reason(&make(member.clone()), host, NOW);
+                    match (personal_line, member_line) {
+                        (Ok(personal_line), Ok(member_line)) => {
+                            assert!(
+                                member_line.chars().count() <= MAX_REASON_CHARS,
+                                "{which}: {member_line}"
+                            );
+                            assert!(
+                                !personal_line.contains("organisation"),
+                                "{which}: {personal_line}"
+                            );
+                            if member_line.contains("organisation") {
+                                said += 1;
+                            }
+                        }
+                        (Err(_), Err(_)) => {}
+                        (personal_line, member_line) => panic!(
+                            "{which}: the clause changed whether the line can be shown: \
+                             {personal_line:?} against {member_line:?}"
+                        ),
+                    }
+                }
+            }
+        }
+        assert!(said > 0, "some member's line carries the clause");
+
+        // The control: with room, the line says which organisation and which enrolment of this host.
+        let mut viewer = grant(&[ActionRight::SessionView], an_hour());
+        viewer.organisation = Nullable::some(requirement);
+        for line in [
+            reason(&invitation(viewer.clone()), "studio", NOW).expect("a line"),
+            reason(&device(viewer), "studio", NOW).expect("a line"),
         ] {
             assert!(
-                member_line.contains(", only for members of organisation 2121 2121 (enrolment 7)"),
-                "{name}: {member_line}"
-            );
-            assert!(
-                !personal_line.contains("organisation"),
-                "{name}: {personal_line}"
-            );
-            assert!(
-                member_line.chars().count() <= MAX_REASON_CHARS,
-                "{name}: {member_line}"
+                line.contains(", only for members of organisation 2121 2121 (enrolment 7)"),
+                "{line}"
             );
         }
     }
