@@ -10949,7 +10949,7 @@
           "type": "array"
         },
         "feed_removed": {
-          "description": "True when the feed answered that this host was removed from it.\n\nThe host then learns no revocation from the feed again. The default non-expiring owner\ngrants stay usable; organisation leases and grants under a bounded offline-validity policy\nare refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last\ntime the feed answered before that.",
+          "description": "True when the feed answered that this host was removed from it.\n\nThe host then learns no revocation from the feed again. The default non-expiring owner\ngrants stay usable; the grants that rest on the feed are refused until the owner acts at the\nhost: organisation leases, and personal remote access under a bounded offline-validity\npolicy or on a host that is exclusively organisation-managed.\n[`Self::feed_synchronised_at_ms`] is the last time the feed answered before that.",
           "type": "boolean"
         },
         "feed_stale": {
@@ -20154,7 +20154,7 @@
             }
           ],
           "default": null,
-          "description": "The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays\nand Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.\nNothing goes around it, so an address it cannot reach fails. Name lookups and mail\nsubmission do not use it. It is this machine's own choice: no invitation or host bundle\ncarries it. It names no user and no password, because a proxy that needs credentials is\nnot supported."
+          "description": "The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays\nand Pkarr servers, the rendezvous, delivery and webhooks, plugin repositories, the\nmanaged storage service and the authority feed.\nNothing goes around it, so an address it cannot reach fails. Name lookups and mail\nsubmission do not use it. It is this machine's own choice: no invitation or host bundle\ncarries it. It names no user and no password, because a proxy that needs credentials is\nnot supported."
         },
         "relay_only": {
           "anyOf": [

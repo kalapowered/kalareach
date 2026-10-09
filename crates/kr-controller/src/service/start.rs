@@ -602,8 +602,9 @@ impl Controller {
         // The managed storage service this host uploads its backups to, when its configuration
         // document selects one. Its clients are built here, from that document and from nothing a
         // process inherited, and they sign as a writer key only this host holds, made the first
-        // time one is needed and loaded after that. Nothing runs yet: settling comes before the
-        // store is reconciled, and the carrier starts after it.
+        // time one is needed and loaded after that. They go through the proxy this daemon started
+        // with, the endpoint's own. Nothing runs yet: settling comes before the store is
+        // reconciled, and the carrier starts after it.
         let backup_runtime = match started.storage.origin() {
             None => None,
             Some(origin) => {
@@ -641,7 +642,8 @@ impl Controller {
         };
         // The authority feed this host reads its remote revocations from, when its configuration
         // document selects one. It signs as the host, with the authorisation key its pairings
-        // recorded, which is what the feed is addressed by. Nothing runs yet.
+        // recorded, which is what the feed is addressed by. It goes through the proxy this daemon
+        // started with, the endpoint's own. Nothing runs yet.
         let feed_runtime = match started.authority.origin() {
             None => None,
             Some(origin) => {
@@ -1000,8 +1002,6 @@ impl Controller {
         controller.start_attention().await?;
         // And every session's facts for the descriptions, over the workers the directory holds.
         controller.start_descriptions().await?;
-        // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
-        // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // What the authority feed answered an earlier run, put right for the feed this host reads
         // now: a removal stands for the feed that answered it and for no other, so an owner who
         // pointed the host at another feed, or at none, has the grants that rest on the feed back
@@ -1010,6 +1010,8 @@ impl Controller {
         let removed = controller
             .authority_feed_at_start(controller.started.authority.origin())
             .await?;
+        // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
+        // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // that left this host and was never answered is recorded as unknown rather than guessed at.
         {
             // What an earlier run sent to the storage service and never saw answered is asked
@@ -1107,8 +1109,8 @@ impl Controller {
     /// `network.proxy_url` as this daemon read it when it started, or `None` when it named none.
     ///
     /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
-    /// delivery and the plugin catalogue never go through two different proxies, and an edit
-    /// applies to all of them at the next start.
+    /// delivery, the plugin catalogue, the managed storage service and the authority feed never go
+    /// through two different proxies, and an edit applies to all of them at the next start.
     ///
     /// # Errors
     ///

@@ -867,9 +867,10 @@ pub struct DeviceListResult {
     /// True when the feed answered that this host was removed from it.
     ///
     /// The host then learns no revocation from the feed again. The default non-expiring owner
-    /// grants stay usable; organisation leases and grants under a bounded offline-validity policy
-    /// are refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last
-    /// time the feed answered before that.
+    /// grants stay usable; the grants that rest on the feed are refused until the owner acts at the
+    /// host: organisation leases, and personal remote access under a bounded offline-validity
+    /// policy or on a host that is exclusively organisation-managed.
+    /// [`Self::feed_synchronised_at_ms`] is the last time the feed answered before that.
     pub feed_removed: bool,
 }
 

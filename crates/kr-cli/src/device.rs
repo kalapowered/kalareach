@@ -64,8 +64,7 @@ async fn list(paths: &HostPaths, arguments: &DeviceListArguments, json: bool) ->
         listed.authority_revision,
         if listed.feed_removed {
             "; the revocation feed was removed, so this host learns no revocation from it, and \
-             organisation leases and grants under a bounded offline policy are refused until the \
-             owner acts at the host"
+             the grants that rest on the feed are refused until the owner acts at the host"
         } else if listed.feed_stale {
             "; the revocation feed is unreachable, so what is shown may be stale"
         } else {

@@ -1301,8 +1301,8 @@ impl Engine {
                     // The host's own sentence about its own feed: nothing any session produced.
                     Text::Host(clip_summary(
                         "the authority feed this host reads removed it, so it learns no \
-                         revocation from it; organisation leases and grants under a bounded \
-                         offline policy are refused until the owner acts at the host",
+                         revocation from it; the grants that rest on the feed are refused until \
+                         the owner acts at the host",
                     )),
                     AttentionRouting::OwnerPolicy,
                 ),

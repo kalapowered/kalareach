@@ -10735,7 +10735,8 @@ export interface NetworkSelection {
   /**
    * The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
-   * and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.
+   * and Pkarr servers, the rendezvous, delivery and webhooks, plugin repositories, the
+   * managed storage service and the authority feed.
    * Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
    * submission do not use it. It is this machine's own choice: no invitation or host bundle
    * carries it. It names no user and no password, because a proxy that needs credentials is
@@ -11600,9 +11601,10 @@ export interface DeviceListResult {
    * True when the feed answered that this host was removed from it.
    *
    * The host then learns no revocation from the feed again. The default non-expiring owner
-   * grants stay usable; organisation leases and grants under a bounded offline-validity policy
-   * are refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last
-   * time the feed answered before that.
+   * grants stay usable; the grants that rest on the feed are refused until the owner acts at the
+   * host: organisation leases, and personal remote access under a bounded offline-validity
+   * policy or on a host that is exclusively organisation-managed.
+   * [`Self::feed_synchronised_at_ms`] is the last time the feed answered before that.
    */
   feed_removed: boolean
   /**

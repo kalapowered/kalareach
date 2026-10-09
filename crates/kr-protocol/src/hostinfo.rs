@@ -2373,7 +2373,8 @@ pub mod configuration {
         pub mainline_dht: Nullable<bool>,
         /// The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
-        /// and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.
+        /// and Pkarr servers, the rendezvous, delivery and webhooks, plugin repositories, the
+        /// managed storage service and the authority feed.
         /// Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
         /// submission do not use it. It is this machine's own choice: no invitation or host bundle
         /// carries it. It names no user and no password, because a proxy that needs credentials is
@@ -4125,7 +4126,8 @@ pub mod configuration {
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
         about: "the HTTP proxy this host's outbound HTTPS goes through: the network endpoint's \
-                relays and Pkarr servers, the rendezvous, delivery and plugin repositories",
+                relays and Pkarr servers, the rendezvous, delivery, plugin repositories, the managed \
+                storage service and the authority feed",
     };
 
     /// The managed voice broker this host names to its devices.

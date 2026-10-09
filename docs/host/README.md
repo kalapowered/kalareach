@@ -200,7 +200,7 @@ an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, plugin repositories, the managed storage service and the authority feed; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `authority.origin` | the authority feed this host reads its remote revocations from | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
@@ -223,8 +223,9 @@ carries it.
 
 One rule covers the proxy. Every outbound HTTPS connection this host makes goes through it when the
 document names one: the endpoint's relays and Pkarr servers, the rendezvous it reserves a code's
-locator at and opens the room at, delivery to the push gateway and to webhook addresses, and plugin
-repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook
+locator at and opens the room at, delivery to the push gateway and to webhook addresses, plugin
+repositories, the managed storage service the backup carrier uploads to (`storage.origin`) and the
+authority feed the feed carrier reads (`authority.origin`). Nothing goes around it, so an address the proxy cannot reach fails, a webhook
 included. Mail submission is SMTP and connects directly, and name lookups go directly too. Without
 a proxy every one of those connections goes directly, apart from iroh's relay latency probe and
 captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
@@ -3224,10 +3225,10 @@ person can come in the same pass, for example when a publication is refused beca
 not enrolled and the question that follows is turned back with a delay. The pass ends at the delay
 and the daemon keeps the person's refusal for `kr doctor`. A refusal that names no delay may be about
 one attempt alone, an object the service already holds for example, and the pass goes on to the next.
-
 A publication whose outcome the service says it cannot settle (`OUTCOME_UNKNOWN`) is not such a
 refusal: it stays listed as unanswered, and the next pass asks the service for the manifest to find
 out whether it took effect, and does not send it again.
+
 A part is 8 MiB and its answer begins only after the whole part has been sent, so storage exchanges
 get 60 seconds to start answering and 90 in all. That is the time the slowest supported uplink needs
 to send one: about 1.1 Mbit/s. The carrier is a task of its own, so a service that never answers
