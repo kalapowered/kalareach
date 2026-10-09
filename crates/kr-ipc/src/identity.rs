@@ -134,12 +134,12 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// Returns the processes one process is the parent of now: those it started that have not been
 /// collected, and each one it adopted as the child subreaper when that one's own parent exited.
 ///
-/// What it costs follows the one process, not the host: the kernel keeps the list with each of the
-/// process's threads, and a reading is at least two passes, each of which, when it reads, lists the
-/// threads twice, reads every thread's list and reads the standing of the threads from the first to
-/// the first live one, usually one, and of that one again. A process that has gone is the parent of
-/// nothing. A kernel that is built without those
-/// lists, and a reading that failed for any other reason, is an error here rather than an empty
+/// On Linux, what it costs follows the one process, not the host: the kernel keeps the list with
+/// each of the process's threads, and a reading is at least two passes, each of which, when it
+/// reads, lists the threads twice, reads every thread's list and reads the standing of the threads
+/// from the first to the first live one, usually one, and of that one again. A process that has
+/// gone is the parent of nothing. A kernel that is built without those lists, and a reading that
+/// failed for any other reason, is an error here rather than an empty
 /// answer, so a caller never reads "no children" into it. So is a process whose threads keep
 /// leaving while they are read: a pass in which the listing of them ended early, a listed thread
 /// had gone, the thread that takes children began to end, one ahead of it was ending, or the threads
@@ -155,12 +155,17 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// two apart, and the next pass that reads any children misses the same ones, by the same again or
 /// by a skip of the kernel's list as another child is collected.
 ///
+/// On macOS the list comes from the kernel's process table, which a reading walks twice (once for
+/// the size), so what it costs follows the host's processes. A list is a hint on every platform: a
+/// caller reads each process with [`process_lineage`] and keeps it only when that reading names
+/// `pid` as its parent.
+///
 /// # Errors
 ///
 /// Returns [`IpcError::IdentityUnavailable`] when the process cannot be read, when the kernel
 /// keeps no list of children, or when its threads or children never hold still long enough to be
 /// read, which includes a thread ahead of the one that takes children that stays ending.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 pub fn children_of(pid: u32) -> Result<Vec<u32>> {
     platform::children_of(pid)
 }
@@ -352,6 +357,17 @@ pub enum Stop {
     /// Ask it to end: terminate, hang up and continue, which a stopped process needs to see the
     /// other two. A platform with no such request ([`Stopped::Unsupported`]) is waited on instead.
     Terminate,
+    /// Ask it to end with terminate and continue, and no hang-up.
+    ///
+    /// For a process that a hang-up kills before it has finished what it does on a terminate: an
+    /// application's server, which on a hang-up dies at once and leaves the commands it started
+    /// running, and on a terminate ends them first. A platform with no such request is
+    /// [`Stopped::Unsupported`].
+    Term,
+    /// Ask it to end with a hang-up and continue, and nothing else: what a terminal's closing
+    /// says to every process that holds it. A platform with no such request is
+    /// [`Stopped::Unsupported`].
+    Hangup,
     /// End it, with no chance to refuse.
     Kill,
 }
@@ -1119,6 +1135,8 @@ mod platform {
         }
         let signals: &[Signal] = match stop {
             super::Stop::Terminate => &[Signal::TERM, Signal::HUP, Signal::CONT],
+            super::Stop::Term => &[Signal::TERM, Signal::CONT],
+            super::Stop::Hangup => &[Signal::HUP, Signal::CONT],
             super::Stop::Kill => &[Signal::KILL],
         };
         for (index, signal) in signals.iter().enumerate() {
@@ -1372,6 +1390,16 @@ mod platform {
         })
     }
 
+    /// The processes whose parent is `pid` now, from the kernel's list.
+    ///
+    /// A list is a hint: a process listed may have ended and its identifier passed to another by
+    /// the time it is read, so the caller reads each with [`super::process_lineage`] and keeps it
+    /// only when that reading names `pid` as its parent.
+    pub(super) fn children_of(pid: u32) -> super::Result<Vec<u32>> {
+        pids_by_type(ProcFilter::ByParentProcess { ppid: pid })
+            .map_err(|error| super::unavailable("children", format!("process {pid}: {error}")))
+    }
+
     /// What a test runs once, right after [`stop`] has read the instance it will signal.
     #[cfg(feature = "testing")]
     type AfterInstanceRead = Box<dyn FnOnce()>;
@@ -1418,6 +1446,8 @@ mod platform {
         }
         let signals: &[i32] = match stop {
             super::Stop::Terminate => &[libc::SIGTERM, libc::SIGHUP, libc::SIGCONT],
+            super::Stop::Term => &[libc::SIGTERM, libc::SIGCONT],
+            super::Stop::Hangup => &[libc::SIGHUP, libc::SIGCONT],
             super::Stop::Kill => &[libc::SIGKILL],
         };
         // How many times a process that keeps running new programs is followed before it is said
@@ -1990,15 +2020,15 @@ mod platform {
     /// creation time that was compared to the process that is ended.
     ///
     /// There is no request to end a process on this platform that is not also the end of it, so
-    /// [`super::Stop::Terminate`] is [`super::Stopped::Unsupported`]: a caller that wants a
-    /// grace period waits for the session's job to do its work, and ends what is left.
+    /// every request but [`super::Stop::Kill`] is [`super::Stopped::Unsupported`]: a caller that
+    /// wants a grace period waits for the session's job to do its work, and ends what is left.
     pub(super) fn stop(
         identity: &kr_protocol::identity::ProcessStartIdentity,
         stop: super::Stop,
     ) -> super::Stopped {
         use super::Stopped;
 
-        if stop == super::Stop::Terminate {
+        if stop != super::Stop::Kill {
             return Stopped::Unsupported;
         }
         let Ok(pid) = u32::try_from(identity.pid.get()) else {
