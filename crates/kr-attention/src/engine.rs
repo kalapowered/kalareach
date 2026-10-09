@@ -616,6 +616,32 @@ impl Engine {
             .is_some_and(|session_id| self.finalised.contains(&session_id))
     }
 
+    /// When the condition an item stands for was first seen, for deciding whether a grant's history
+    /// reaches it.
+    ///
+    /// A reminder is dated by the question it is about and never by the moment it fired: a question
+    /// asked before a grant's history began is not a future event for that grant because a reminder
+    /// about it is. A reminder whose question is no longer held has no date.
+    #[must_use]
+    pub fn dated(&self, item: &Item) -> Option<TimestampMs> {
+        if item.rule != AttentionRule::InputIdleReminder {
+            return Some(item.first_seen_ms);
+        }
+        let record = item.text.record()?;
+        self.items()
+            .find(|other| {
+                other.rule == AttentionRule::PendingInput && other.text.record() == Some(record)
+            })
+            .map(|asked| asked.first_seen_ms)
+    }
+
+    /// Whether `viewer` is shown one item: it may see what the item is about, and its history
+    /// reaches back to the moment the condition was first seen ([`Self::dated`]).
+    #[must_use]
+    pub fn shown_to(&self, viewer: &Viewer<'_>, item: &Item) -> bool {
+        viewer.sees(item) && viewer.reaches(self.dated(item))
+    }
+
     /// Returns the items one caller sees, oldest first, each with the record its text is read
     /// from when that text is the session's.
     ///
@@ -631,7 +657,7 @@ impl Engine {
         let mut items: Vec<_> = self
             .items
             .values()
-            .filter(|item| viewer.sees(item))
+            .filter(|item| self.shown_to(viewer, item))
             .filter(|item| session.is_none_or(|session_id| item.session() == Some(session_id)))
             .filter_map(|item| {
                 let acknowledged = self.is_acknowledged(actor, item);
@@ -675,7 +701,7 @@ impl Engine {
     ) -> crate::Result<(Vec<AttentionKey>, Vec<AttentionKey>)> {
         for (key, revision) in requested {
             if let Some(item) = self.items.get(key)
-                && viewer.sees(item)
+                && self.shown_to(viewer, item)
                 && *revision > item.revision
             {
                 return Err(crate::Error::RevisionAhead {
@@ -691,7 +717,7 @@ impl Engine {
             let current = self
                 .items
                 .get(key)
-                .filter(|item| viewer.sees(item) && item.revision == *revision)
+                .filter(|item| self.shown_to(viewer, item) && item.revision == *revision)
                 .map(|item| item.revision);
             match current {
                 Some(revision) => {

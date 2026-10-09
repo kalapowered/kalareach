@@ -1541,6 +1541,13 @@ fn decode_record(row: &rusqlite::Row<'_>, device_id: &[u8]) -> Result<DeviceReco
     let invitation: Option<Vec<u8>> = row.get(10).map_err(ControllerError::registry)?;
     let notification_preview: Option<Vec<u8>> = row.get(11).map_err(ControllerError::registry)?;
     let stored_envelope: Option<Vec<u8>> = row.get(12).map_err(ControllerError::registry)?;
+    let paired_at_ms = TimestampMs::new(u64::try_from(paired_at_ms).unwrap_or_default());
+    let mut grant: Grant = kr_cbor::from_canonical_slice(&grant, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| ControllerError::registry(error.to_string()))?;
+    // The grant is kept as the pairing gave it, and a pairing grant with no history cursor reaches
+    // from the moment the host committed the pairing: the one place a device's stored grant becomes
+    // a record, so every reader of its history decides from one moment.
+    grant.history = grant.history.from_start(paired_at_ms.get());
     Ok(DeviceRecord {
         device_id: DeviceId::new(uuid(device_id)?),
         endpoint_id: EndpointKey::from_bytes(key(&endpoint_id)?),
@@ -1559,9 +1566,8 @@ fn decode_record(row: &rusqlite::Row<'_>, device_id: &[u8]) -> Result<DeviceReco
         device_name: DeviceName::new(device_name)
             .map_err(|error| ControllerError::registry(error.to_string()))?,
         platform: platform_from(&platform)?,
-        grant: kr_cbor::from_canonical_slice(&grant, &kr_cbor::Limits::DEFAULT)
-            .map_err(|error| ControllerError::registry(error.to_string()))?,
-        paired_at_ms: TimestampMs::new(u64::try_from(paired_at_ms).unwrap_or_default()),
+        grant,
+        paired_at_ms,
         revoked_at_ms: revoked_at_ms
             .map(|at| TimestampMs::new(u64::try_from(at).unwrap_or_default())),
         expired_at_ms: expired_at_ms

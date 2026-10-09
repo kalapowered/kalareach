@@ -709,7 +709,7 @@ impl Attention {
         self.live()?;
         for requested in items {
             if let Some(item) = self.state.engine.item(&requested.key)
-                && viewer.sees(item)
+                && self.state.engine.shown_to(viewer, item)
                 && requested.revision.get() > item.revision
             {
                 return Err(crate::Error::RevisionAhead {

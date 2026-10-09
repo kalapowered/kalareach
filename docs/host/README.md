@@ -2333,8 +2333,8 @@ scope, and the worker holds the resources the broker arbitrates to it by the rul
 record follows: a snapshot, every page of it, carries an approval the grant names while it can still
 be decided, and any other resource only when it was recorded at or after the moment the grant
 reaches back to; a subscription is told a later transition only of a resource it was shown or of one
-that rule admits. A grant that keeps no retained history reaches, beside what it names, what is
-recorded after the device's first subscription of that attachment began. The local owner, and a read
+that rule admits. A grant with no history cursor reaches, beside what it names, what was recorded
+at or after its own start. The local owner, and a read
 that comes with no scope, are shown every resource and every transition. `grant.list` answers with
 the grants the device issued and everything delegated from them, and it needs `session.share`.
 
@@ -3601,8 +3601,9 @@ one, otherwise generated text, otherwise the title built from the session's disp
 directory it started in. Generated text, with its activity line and its provenance, is served only
 while privacy mode is off, only when it was produced under the generation in force, and only to a
 caller whose history reaches the whole session: the owner at this machine, or a device whose grant's
-history bound is at or before the session's start. A grant with no history bound retains no history,
-so its device is shown the pin or the metadata title. The answer also carries the state of inference
+history bound is at or before the session's start. A grant with no history cursor reaches from its
+own start, so its device is shown generated text only for a session that began at or after that
+start, and otherwise the pin or the metadata title. The answer also carries the state of inference
 on the host, the reason it is paused when it is, the cadence the host runs at and the age of the
 session's queued job. These come from the description host the daemon starts when it starts; a
 daemon whose description host did not start says that inference is paused because this environment
@@ -4418,6 +4419,13 @@ gap in the workflow journal's records is shown to a grant that carries `automati
 `attention.read` and `attention.acknowledge` are reads of the caller's current view rather than
 rights of their own, so a device holding only `host.manage` reads the environment's own items and
 none of any session or workflow. A read may name one session to narrow the inbox to it.
+
+Showing earlier history is opt-in. An item will be shown on a device only if it was first seen no
+earlier than the history cursor on the grant with which the device was given access to it, or (if
+the grant has no history cursor) no earlier than when the grant itself began, which for a pairing
+grant is when the host committed the pairing. A reminder's date is that of the question it reminds
+about, not when it fires. A gap or a review does not have a date; it is displayed by session
+only.
 
 An item's text and a change's text come from retained content: a question's wording, a command
 line, what an application printed. The store keeps none of it. When the owner reads the inbox, the

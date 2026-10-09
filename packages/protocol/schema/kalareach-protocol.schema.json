@@ -15654,7 +15654,7 @@
               "type": "null"
             }
           ],
-          "description": "The earliest content this grant may see. Null means no retained history at all."
+          "description": "The earliest content this grant may see: the moment its history cursor names.\n\nNull means the grant's own start, and nothing earlier: what a pairing grant reaches is what\nwas first recorded or seen at or after the moment the host committed the pairing. A host\nreads that start where it reads the grant ([`Self::from_start`]), so a reader that decides\nanything from this sees one moment. A reader that has no start to read it against reaches\nno earlier history. A session share never holds a null: it takes the moment it was issued."
         },
         "named_approvals": {
           "description": "Current approvals named explicitly, on the same terms, each by the identity of the one\nresource the broker arbitrates for it.\n\nAn upstream's own request identifier does not pick out one request: two connections both\ncall their first request `1`. A resource identity names exactly one.",

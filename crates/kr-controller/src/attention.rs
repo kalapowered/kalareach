@@ -233,7 +233,7 @@ impl Caller {
                 automation_manage,
                 host_manage,
                 sessions,
-                history_lower_bound_ms: _,
+                history_lower_bound_ms,
             } => {
                 let admits = |session_id: SessionId| sessions.admits(session_id);
                 with(&Viewer::Device(DeviceScope {
@@ -242,6 +242,8 @@ impl Caller {
                     automation_manage: *automation_manage,
                     host_manage: *host_manage,
                     admits_session: &admits,
+                    // A grant whose history reaches back to no moment reaches no dated item.
+                    history_from_ms: history_lower_bound_ms.map_or(u64::MAX, TimestampMs::get),
                 }))
             }
         }

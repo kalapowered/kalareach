@@ -162,23 +162,11 @@ impl Audience {
     /// The audience of one item of the attention store, or none when the item cannot be placed in
     /// time: a reminder whose question is no longer held.
     ///
-    /// A reminder is dated by the question it is about, never by the moment it fired: a question
-    /// asked before a grant's history began is not a future event for that grant because a
-    /// reminder about it is.
+    /// The item is dated as the inbox dates it ([`Engine::dated`]): a reminder by the question it
+    /// is about, never by the moment it fired.
     #[must_use]
     pub fn of_item(engine: &Engine, item: &Item) -> Option<Self> {
-        let at_ms = if item.rule == AttentionRule::InputIdleReminder {
-            let record = item.text.record()?;
-            engine
-                .items()
-                .find(|other| {
-                    other.rule == AttentionRule::PendingInput && other.text.record() == Some(record)
-                })?
-                .first_seen_ms
-                .get()
-        } else {
-            item.first_seen_ms.get()
-        };
+        let at_ms = engine.dated(item)?.get();
         let mut sessions: Vec<SessionId> = [item.origin.session(), item.session_id]
             .into_iter()
             .flatten()

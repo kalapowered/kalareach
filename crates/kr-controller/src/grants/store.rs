@@ -2898,11 +2898,18 @@ fn read_row(row: &rusqlite::Row<'_>) -> Row {
     let revoked: Option<i64> = row.get(3).map_err(ControllerError::registry)?;
     let by_parent: Option<Vec<u8>> = row.get(4).map_err(ControllerError::registry)?;
     let activated: Option<i64> = row.get(5).map_err(ControllerError::registry)?;
+    let activated_at_ms = activated.map(|moment| u64::try_from(moment).unwrap_or_default());
+    // A grant with no history cursor reaches from its own start, the moment its invitation was
+    // redeemed; a proposal nobody redeemed has no start and reaches nothing.
+    let mut grant = grant;
+    if let Some(started_at_ms) = activated_at_ms {
+        grant.history = grant.history.from_start(started_at_ms);
+    }
     Ok(GrantRecord {
         grant,
         session_id: session.as_deref().and_then(uuid_of).map(SessionId::new),
         issued_at_ms: u64::try_from(issued).unwrap_or_default(),
-        activated_at_ms: activated.map(|moment| u64::try_from(moment).unwrap_or_default()),
+        activated_at_ms,
         revoked_at_ms: revoked.map(|moment| u64::try_from(moment).unwrap_or_default()),
         revoked_by_parent: by_parent.as_deref().and_then(uuid_of).map(GrantId::new),
     })

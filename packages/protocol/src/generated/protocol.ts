@@ -8136,7 +8136,13 @@ export interface HistoryScope {
    */
   include_live_screen: boolean
   /**
-   * The earliest content this grant may see. Null means no retained history at all.
+   * The earliest content this grant may see: the moment its history cursor names.
+   *
+   * Null means the grant's own start, and nothing earlier: what a pairing grant reaches is what
+   * was first recorded or seen at or after the moment the host committed the pairing. A host
+   * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
+   * anything from this sees one moment. A reader that has no start to read it against reaches
+   * no earlier history. A session share never holds a null: it takes the moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -14151,7 +14157,13 @@ export interface HistoryScope1 {
    */
   include_live_screen: boolean
   /**
-   * The earliest content this grant may see. Null means no retained history at all.
+   * The earliest content this grant may see: the moment its history cursor names.
+   *
+   * Null means the grant's own start, and nothing earlier: what a pairing grant reaches is what
+   * was first recorded or seen at or after the moment the host committed the pairing. A host
+   * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
+   * anything from this sees one moment. A reader that has no start to read it against reaches
+   * no earlier history. A session share never holds a null: it takes the moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -14406,7 +14418,13 @@ export interface HistoryScope2 {
    */
   include_live_screen: boolean
   /**
-   * The earliest content this grant may see. Null means no retained history at all.
+   * The earliest content this grant may see: the moment its history cursor names.
+   *
+   * Null means the grant's own start, and nothing earlier: what a pairing grant reaches is what
+   * was first recorded or seen at or after the moment the host committed the pairing. A host
+   * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
+   * anything from this sees one moment. A reader that has no start to read it against reaches
+   * no earlier history. A session share never holds a null: it takes the moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -17124,7 +17142,13 @@ export interface HistoryScope3 {
    */
   include_live_screen: boolean
   /**
-   * The earliest content this grant may see. Null means no retained history at all.
+   * The earliest content this grant may see: the moment its history cursor names.
+   *
+   * Null means the grant's own start, and nothing earlier: what a pairing grant reaches is what
+   * was first recorded or seen at or after the moment the host committed the pairing. A host
+   * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
+   * anything from this sees one moment. A reader that has no start to read it against reaches
+   * no earlier history. A session share never holds a null: it takes the moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -17350,7 +17374,13 @@ export interface HistoryScope4 {
    */
   include_live_screen: boolean
   /**
-   * The earliest content this grant may see. Null means no retained history at all.
+   * The earliest content this grant may see: the moment its history cursor names.
+   *
+   * Null means the grant's own start, and nothing earlier: what a pairing grant reaches is what
+   * was first recorded or seen at or after the moment the host committed the pairing. A host
+   * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
+   * anything from this sees one moment. A reader that has no start to read it against reaches
+   * no earlier history. A session share never holds a null: it takes the moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -25992,7 +26022,13 @@ export interface HistoryScope5 {
    */
   include_live_screen: boolean
   /**
-   * The earliest content this grant may see. Null means no retained history at all.
+   * The earliest content this grant may see: the moment its history cursor names.
+   *
+   * Null means the grant's own start, and nothing earlier: what a pairing grant reaches is what
+   * was first recorded or seen at or after the moment the host committed the pairing. A host
+   * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
+   * anything from this sees one moment. A reader that has no start to read it against reaches
+   * no earlier history. A session share never holds a null: it takes the moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**

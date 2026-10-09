@@ -15,9 +15,14 @@
 //! The automation rule is the workflow journal's own rule for `workflow.read`: a device is shown the
 //! workflows that act under its own grant and the chains whose root run does, and nothing of
 //! another grant's.
+//!
+//! Earlier history is opt-in. Beside what its grant admits, a device is shown an item only when the
+//! condition it stands for was first seen at or after the moment its grant's history reaches back
+//! to ([`Viewer::reaches`]): its history cursor, or its own start when it has none.
 
 use kr_protocol::attention::{AttentionGap, AttentionSource};
 use kr_protocol::ids::{GrantId, SessionId};
+use kr_protocol::scalars::TimestampMs;
 
 use crate::engine::Item;
 
@@ -33,6 +38,10 @@ pub struct DeviceScope<'a> {
     pub host_manage: bool,
     /// Whether the grant's environment and session selectors admit one session.
     pub admits_session: &'a dyn Fn(SessionId) -> bool,
+    /// The earliest moment, in UTC milliseconds, of what the grant's history reaches: a condition
+    /// first seen before it is not the device's to be told of. A grant whose history reaches back
+    /// to no moment at all sets the latest one there is.
+    pub history_from_ms: u64,
 }
 
 impl core::fmt::Debug for DeviceScope<'_> {
@@ -43,6 +52,7 @@ impl core::fmt::Debug for DeviceScope<'_> {
             .field("session_view", &self.session_view)
             .field("automation_manage", &self.automation_manage)
             .field("host_manage", &self.host_manage)
+            .field("history_from_ms", &self.history_from_ms)
             .finish_non_exhaustive()
     }
 }
@@ -87,6 +97,21 @@ impl Viewer<'_> {
                     return scope.automation_manage && item.grant == Some(scope.grant_id);
                 }
                 scope.host_manage
+            }
+        }
+    }
+
+    /// Whether this caller's history reaches back to the moment a condition was first seen.
+    ///
+    /// The owner's reaches back to every moment. A device's reaches back to the moment its grant's
+    /// cursor, or its own start, names, and an item that has no date to check is not one it can be
+    /// shown.
+    #[must_use]
+    pub fn reaches(&self, first_seen: Option<TimestampMs>) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Device(scope) => {
+                first_seen.is_some_and(|first_seen| first_seen.get() >= scope.history_from_ms)
             }
         }
     }

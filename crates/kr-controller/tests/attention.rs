@@ -1493,6 +1493,68 @@ async fn a_device_s_batch_acknowledges_only_what_its_grant_shows_it() {
     host.stop().await;
 }
 
+/// KR-REQ-10.49, KR-REQ-25.01 and KR-REQ-23.45: earlier history is opt-in. A device paired under a
+/// grant with no history cursor is shown what was first seen after its pairing and nothing from
+/// before it, and an acknowledgement of an item from before is stale. The controls: a device whose
+/// grant names a cursor at the start of time is shown both, and so is the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_under_a_grant_with_no_cursor_is_shown_what_is_first_seen_after_its_pairing() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    host.controller()
+        .attention()
+        .observe(&[approval(session_id, "before")])
+        .expect("the store records the approval");
+
+    let (_phone, no_cursor) =
+        net_support::paired_device(&host, &owner_keys, &[ActionRight::SessionView]).await;
+    let mut reaching = net_support::proposal(&[ActionRight::SessionView]);
+    reaching.history.lower_bound_ms = Nullable::some(TimestampMs::new(1));
+    let tablet = net_support::Device::create().await;
+    let record = net_support::pair_with(&host, &tablet, &owner_keys, reaching).await;
+    let cursor = net_support::connect(&host, &tablet, &record).await;
+
+    host.controller()
+        .attention()
+        .observe(&[approval_at(session_id, 2, "after")])
+        .expect("the store records the approval");
+    let mut control = host.client().await;
+    let owners = owner_inbox(&mut control).await;
+    assert_eq!(owners.len(), 2, "the owner sees both");
+    let (before, after) = (owners[0].clone(), owners[1].clone());
+
+    let keys = |read: &AttentionReadResult| -> Vec<_> {
+        read.items.iter().map(|item| item.key.clone()).collect()
+    };
+    assert_eq!(
+        keys(&device_inbox(&no_cursor).await),
+        vec![after.key.clone()],
+        "the device paired after the first approval is shown only the second"
+    );
+    assert_eq!(
+        keys(&device_inbox(&cursor).await),
+        vec![before.key.clone(), after.key.clone()],
+        "a grant whose cursor reaches back to the start of time is shown both"
+    );
+    let stale: AttentionAcknowledgeResult = device_mutation(
+        &no_cursor,
+        ActionTarget::environment(host.environment_id),
+        Method::AttentionAcknowledge,
+        &AttentionAcknowledgeParams {
+            items: vec![AttentionItemRevision {
+                key: before.key.clone(),
+                revision: before.revision,
+            }],
+        },
+    )
+    .await
+    .expect("the acknowledgement is answered");
+    assert!(stale.acknowledged.is_empty());
+    assert_eq!(stale.stale, vec![before.key]);
+    host.stop().await;
+}
+
 /// KR-REQ-23.45: a device whose grant carries `host.manage` and no `session.view` sees none of a
 /// session's items, an acknowledgement naming one is stale, and it may set the quiet hours.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
