@@ -10,6 +10,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-23.30 | an action that offers an attachment names a draft the daemon holds, is validated against it, and transmits nothing when the draft moved, the package does not declare an offer of it, the action was cancelled, lost its ground or its connection while its component prepared it, or the plan was not the invocation's own; it is prepared over the connection the worker's own link holds to the plugin runtime, and again after that runtime was lost; a repeat of it is answered with its receipt and claims nothing again |
+//! | KR-REQ-12.30 | the typed half: an attachment is named to the upstream by identifiers and the read grant over its staged file, whatever the file is called (spaces, quotes, non-ASCII letters, a relative-looking name, a WSL path, a Windows drive path, an extension that varies), two images offered together are both accepted, and a prompt that names a draft whose attachment is being offered is a conflict; a retry after a refusal keeps the upload |
 //! | KR-REQ-24.09 | what the agent answered is recorded on the binding: accepted with the upstream's evidence, failed when it refused, unknown when it did not answer, and a claim the worker could not make is settled by a report |
 
 #![cfg(unix)]
@@ -1273,6 +1274,8 @@ async fn kr_req_24_09_a_staged_file_that_is_not_what_the_frame_says_is_refused_b
     assert_eq!(acting.frames().len(), 1, "the frame was written");
     let failed = until_binding(&acting, draft.draft_id, &handle, InsertionState::Failed).await;
     assert_eq!(failed.attachments[0].handle, handle, "the upload is kept");
+    assert_eq!(failed.state, draft.state, "the draft is still open");
+    assert_eq!(failed.text, draft.text, "the draft's text is kept");
 
     // The file is as it was, the attachment is bound again, and the offer is accepted.
     std::fs::write(&staged, &original).expect("restores the file");
@@ -1291,10 +1294,12 @@ async fn kr_req_24_09_a_staged_file_that_is_not_what_the_frame_says_is_refused_b
 }
 
 /// KR-REQ-12.30: whatever a file is called, the frame to the upstream names it by identifiers and
-/// by the grant's path, which is derived from the transfer's identifier, and never by the name. The
-/// names are a name with spaces, quotes and non-ASCII letters, one that looks like a relative path
-/// out of a directory, a WSL path, a WSL network path and a Windows drive path; each is offered,
-/// read by the receiver and accepted.
+/// by the grant's path, which is the transfer's identifier and at most one extension from a closed
+/// list, and never by the name. The names are a name with spaces, quotes and non-ASCII letters, one
+/// that looks like a relative path out of a directory, a WSL path, a WSL network path and a Windows
+/// drive path, and five in which the extension is what varies: `shot.PNG` and `page.html`, whose
+/// extensions are kept in lower case, and `tool.exe`, `shot.png.exe` and a name with no extension,
+/// which keep none. Each is offered, read by the receiver and accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_12_30_an_attachment_is_named_to_the_upstream_by_identifiers_whatever_its_file_is_called()
  {
@@ -1303,26 +1308,36 @@ async fn kr_req_12_30_an_attachment_is_named_to_the_upstream_by_identifiers_what
     };
     *acting.upstream.lock().expect("not poisoned") = Upstream::Reads;
     let mut client = acting.client().await;
-    let names: [(&str, &[&str]); 5] = [
+    // The name offered, what the frame must not carry of it, and the suffix the staged file keeps.
+    let names: [(&str, &[&str], &str); 10] = [
         (
             "a name with spaces and \"quotes\" and ünïcode.png",
             &["spaces", "quotes", "ünïcode"],
+            ".png",
         ),
-        ("../../outside/escape.png", &["outside", "escape"]),
+        ("../../outside/escape.png", &["outside", "escape"], ".png"),
         (
             "/mnt/c/Users/me/Pictures/holiday.png",
             &["holiday", "Pictures", "/mnt"],
+            ".png",
         ),
         (
             "\\\\wsl.localhost\\Ubuntu\\home\\me\\wslshot.png",
             &["wslshot", "Ubuntu", "wsl.localhost"],
+            ".png",
         ),
         (
             "C:\\Users\\me\\Desktop\\desktopshot.png",
             &["desktopshot", "Desktop", "C:"],
+            ".png",
         ),
+        ("shot.PNG", &["shot"], ".png"),
+        ("page.html", &["page"], ".html"),
+        ("tool.exe", &["tool", "exe"], ""),
+        ("shot.png.exe", &["shot", "exe"], ""),
+        ("no-extension", &["no-extension"], ""),
     ];
-    for (index, (name, forbidden)) in names.iter().enumerate() {
+    for (index, (name, forbidden, suffix)) in names.iter().enumerate() {
         let handle = acting.publish(&[40 + index as u8; 64], name);
         let draft = acting.bind(&acting.new_draft(), &handle);
         let mut mutation =
@@ -1333,28 +1348,33 @@ async fn kr_req_12_30_an_attachment_is_named_to_the_upstream_by_identifiers_what
         let frames = acting.frames();
         assert_eq!(frames.len(), index + 1, "{name}");
         let frame = &frames[index];
-        for part in *forbidden {
-            assert!(
-                !frame.contains(part),
-                "{name}: the frame carries {part}: {frame}"
-            );
-        }
         let parsed: serde_json::Value = serde_json::from_str(frame).expect("a JSON frame");
         assert_eq!(
             parsed["params"]["attachment"]["transfer_id"],
             handle.transfer_id.to_string(),
             "{name}"
         );
-        let path = parsed["params"]["attachment"]["read_grant"]["path"]
-            .as_str()
-            .expect("a path");
+        let path = std::path::Path::new(
+            parsed["params"]["attachment"]["read_grant"]["path"]
+                .as_str()
+                .expect("a path"),
+        );
         assert_eq!(
-            std::path::Path::new(path)
-                .file_name()
+            path.file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
-            Some(format!("{}.png", staged_stem(&handle))),
+            Some(format!("{}{suffix}", staged_stem(&handle))),
             "{name}"
         );
+        // The directory the host keeps the file in is the host's own choice, and may be called
+        // anything: it is left out of what is searched for the name's parts.
+        let directory = path.parent().expect("a directory").to_string_lossy();
+        let searched = frame.replace(&*directory, "");
+        for part in *forbidden {
+            assert!(
+                !searched.contains(part),
+                "{name}: the frame carries {part}: {frame}"
+            );
+        }
         until_binding(
             &acting,
             draft.draft_id,
@@ -1423,6 +1443,7 @@ async fn kr_req_12_30_a_prompt_naming_a_draft_whose_attachment_is_being_offered_
     assert!(matches!(offered, Outcome::Ok(_)), "{offered:?}");
 
     // The other order: a draft a prompt has already sent to the session is not offered from.
+    *acting.upstream.lock().expect("not poisoned") = Upstream::Answers;
     let sent = acting.publish(&[21; 64], "sent.png");
     let sent_draft = acting.bind(&acting.new_draft(), &sent);
     let mut prompt = acting.prompting(&caller, sent_draft.draft_id);
@@ -1448,5 +1469,11 @@ async fn kr_req_12_30_a_prompt_naming_a_draft_whose_attachment_is_being_offered_
     assert_eq!(
         state_of(&acting.draft(sent_draft.draft_id), &sent),
         InsertionState::Recorded
+    );
+    assert_eq!(
+        acting.frames().len(),
+        1,
+        "nothing was written for the draft a prompt had sent: {:?}",
+        acting.frames()
     );
 }
