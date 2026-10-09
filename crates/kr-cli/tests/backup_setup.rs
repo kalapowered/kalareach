@@ -672,7 +672,7 @@ async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_
         text(&doctor.stdout)
     );
     // The bundle is where the kit says.
-    let sealed = rig
+    let (_, sealed) = rig
         .served
         .web()
         .bundle(kit.locator())
