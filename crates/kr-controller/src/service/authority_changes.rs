@@ -20,6 +20,7 @@ use kr_protocol::sharing::{
 
 use crate::error::{ControllerError, Result};
 
+use super::revocation::Audience;
 use super::{Controller, encode, net, parse, respond};
 
 /// Who an authority change is made for.
@@ -29,6 +30,16 @@ pub(crate) enum AuthorityCaller {
     Owner,
     /// A paired device, acting as itself.
     Device(kr_protocol::ids::DeviceId),
+}
+
+impl AuthorityCaller {
+    /// Who a revocation's answer is for when this caller made it.
+    const fn audience(self) -> Audience {
+        match self {
+            Self::Owner => Audience::Host,
+            Self::Device(_) => Audience::Device,
+        }
+    }
 }
 
 impl Controller {
@@ -52,7 +63,7 @@ impl Controller {
         {
             Ok(Some(record)) => Some(respond(
                 mutation.request_id,
-                self.recorded_authority_change(actor_id, mutation, record)
+                self.recorded_authority_change(actor_id, Audience::Host, mutation, record)
                     .await,
             )),
             Ok(None) => None,
@@ -76,7 +87,7 @@ impl Controller {
             .recorded_action(actor_id, mutation.action_id, &digest)
         {
             Ok(Some(record)) => self
-                .answer_without_fence(mutation, &record)
+                .answer_without_fence(actor_id, mutation, &record)
                 .map(|answer| respond(mutation.request_id, answer)),
             Ok(None) => None,
             Err(error) => Some(respond(mutation.request_id, Err(error))),
@@ -115,12 +126,16 @@ impl Controller {
     pub(super) async fn recorded_authority_change(
         &self,
         actor_id: &ActorId,
+        audience: Audience,
         mutation: &MutationRequest,
         record: crate::grants::ActionRecord,
     ) -> Result<ParamsValue> {
-        match self.answer_without_fence(mutation, &record) {
+        match self.answer_without_fence(actor_id, mutation, &record) {
             Some(answer) => answer,
-            None => self.revocation_on_record(actor_id, mutation).await,
+            None => {
+                self.revocation_on_record(actor_id, audience, mutation)
+                    .await
+            }
         }
     }
 
@@ -135,6 +150,7 @@ impl Controller {
     /// about which request set it, and a voice change is not an authority change.
     fn answer_without_fence(
         &self,
+        actor_id: &ActorId,
         mutation: &MutationRequest,
         record: &crate::grants::ActionRecord,
     ) -> Option<Result<ParamsValue>> {
@@ -154,7 +170,7 @@ impl Controller {
                 Some(Method::GrantRevoke | Method::DeviceRevoke | Method::GrantTransfer) => None,
                 Some(Method::GrantCreate) => {
                     let (grant_id, invitation_id) =
-                        Self::share_identities(mutation.action_id.get());
+                        Self::share_identities(actor_id, mutation.action_id.get());
                     Some(self.sharing.shared(grant_id, invitation_id).and_then(
                         |shared| match shared {
                             Some(shared) => encode(&shared),
@@ -187,6 +203,7 @@ impl Controller {
     async fn revocation_on_record(
         &self,
         actor_id: &ActorId,
+        audience: Audience,
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
         let nothing_left = match mutation.method.method() {
@@ -252,7 +269,11 @@ impl Controller {
         }
         encode(
             &self
-                .complete_revocation(withdrawn.into_iter().collect(), self.publish_debts(&[]))
+                .complete_revocation(
+                    audience,
+                    withdrawn.into_iter().collect(),
+                    self.publish_debts(&[]),
+                )
                 .await?,
         )
     }
@@ -504,7 +525,7 @@ impl Controller {
                 // withdrawn, and without the deadline a receipt outlives. The answer is waited for
                 // first: it is the check made with the answer in hand that decides.
                 let answered = self
-                    .recorded_authority_change(actor_id, mutation, record)
+                    .recorded_authority_change(actor_id, caller.audience(), mutation, record)
                     .await;
                 #[cfg(feature = "testing")]
                 self.after_the_retained_lookup.wait().await;
@@ -517,7 +538,7 @@ impl Controller {
         };
         let outcome = match method {
             Method::GrantCreate => {
-                self.grant_create(caller, mutation, carried, claimed_at_ms)
+                self.grant_create(actor_id, caller, mutation, carried, claimed_at_ms)
                     .await
             }
             Method::GrantRedeem => self.grant_redeem(mutation, caller, carried, &hold).await,
@@ -595,6 +616,7 @@ impl Controller {
     /// anything, so what the device is shown never exceeds what the grant it delegates from reaches.
     async fn grant_create(
         &self,
+        actor_id: &ActorId,
         caller: AuthorityCaller,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
@@ -608,7 +630,7 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let (grant_id, invitation_id) = Self::share_identities(mutation.action_id.get());
+        let (grant_id, invitation_id) = Self::share_identities(actor_id, mutation.action_id.get());
         let mut request = crate::sharing::ShareRequest {
             invitation_id,
             grant_id,
@@ -801,7 +823,9 @@ impl Controller {
         device_id: kr_protocol::ids::DeviceId,
         grant_id: kr_protocol::ids::GrantId,
     ) -> Result<kr_protocol::ids::GrantId> {
-        // A parent link never leads back, so a chain this long is not one a host wrote.
+        // The longest chain walked. A parent link never leads back, and a delegation narrows
+        // what it is made from, so a chain this long is not one a person made; a grant further
+        // below a share than this is revoked with the grant above it, which is within reach.
         const GENERATIONS: usize = 256;
         let denied = || ControllerError::PermissionDenied {
             detail: "this device holds no grant that this one was delegated from".to_owned(),
@@ -834,14 +858,21 @@ impl Controller {
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
         // A paired device revokes what it delegated, and what was delegated on from that: a grant
-        // below one it holds. Decided again here, where the revocation is made, because the grant
-        // it held when the request was admitted can have been revoked since.
+        // below one it holds. The door decided it from the grants as they stood then. Decided
+        // again here, so a request that waited for the claim is held to the grants as they stand;
+        // a share revoked after this point is caught where the revocation is written, which asks
+        // the admission again and finds the share's revocation advanced the revision.
         if let AuthorityCaller::Device(device_id) = caller {
             self.delegating_ancestor(device_id, params.grant_id)?;
         }
         encode(
             &self
-                .revoke_grant(params.grant_id, Some(&carried), Some(hold))
+                .revoke_grant(
+                    params.grant_id,
+                    caller.audience(),
+                    Some(&carried),
+                    Some(hold),
+                )
                 .await?,
         )
     }
@@ -941,6 +972,19 @@ impl Controller {
             .ok_or_else(|| denied("the transferring device is not paired with this host"))?;
         let to = paired(params.to_device_id)?
             .ok_or_else(|| denied("the receiving device is not paired with this host"))?;
+        // A device that holds a grant this one was delegated from keeps control of the session
+        // through it, and could revoke the replacement through it, so handing the session over
+        // would hand over nothing. Who holds an ancestor does not change, so it is settled here,
+        // before an owner is asked to confirm.
+        if self
+            .delegating_ancestor(from.device_id, source.grant.grant_id)
+            .is_ok()
+        {
+            return Err(denied(
+                "the transferring device holds a grant that this one was delegated from, so it \
+                 would keep control of the session",
+            ));
+        }
         let to_keys = to.public_keys().ok_or_else(|| {
             denied("this host does not hold all four keys of the receiving device")
         })?;
@@ -1015,7 +1059,7 @@ impl Controller {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 return self
-                    .recorded_authority_change(actor_id, mutation, record)
+                    .recorded_authority_change(actor_id, Audience::Device, mutation, record)
                     .await;
             }
         };
@@ -1227,18 +1271,27 @@ impl Controller {
         })
     }
 
-    /// The identities of the grant and of the invitation that carries it, for a share written as
-    /// `action`.
+    /// The identities of the grant and of the invitation that carries it, for a share written by
+    /// `actor_id` as `action`.
     ///
-    /// They are derived from the action the caller named, not minted fresh. An attempt that ended
-    /// before it recorded its answer therefore left a grant and an invitation this host can find by
-    /// the action alone, and a retry is answered from them.
+    /// They are derived from the actor and the action the caller named, not minted fresh. An
+    /// attempt that ended before it recorded its answer therefore left a grant and an invitation
+    /// this host can find by that actor's action, and a retry is answered from them. An action is
+    /// claimed per actor, so two actors that send one action identifier write two shares, and
+    /// neither finds the other's.
     pub(super) fn share_identities(
+        actor_id: &ActorId,
         action: kr_protocol::scalars::Uuid,
     ) -> (kr_protocol::ids::GrantId, kr_protocol::ids::InvitationId) {
         (
-            kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
-            kr_protocol::ids::InvitationId::new(Self::derived_identity(action, b"invitation")),
+            kr_protocol::ids::GrantId::new(Self::derived_identity(
+                action,
+                format!("grant/{}", actor_id.as_str()).as_bytes(),
+            )),
+            kr_protocol::ids::InvitationId::new(Self::derived_identity(
+                action,
+                format!("invitation/{}", actor_id.as_str()).as_bytes(),
+            )),
         )
     }
 

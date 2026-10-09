@@ -227,7 +227,12 @@ impl Controller {
             }
             Ok(crate::grants::ActionClaim::Recorded(record)) => {
                 let answered = self
-                    .recorded_authority_change(actor_id, mutation, record)
+                    .recorded_authority_change(
+                        actor_id,
+                        super::revocation::Audience::Host,
+                        mutation,
+                        record,
+                    )
                     .await;
                 #[cfg(feature = "testing")]
                 self.after_the_retained_lookup.wait().await;

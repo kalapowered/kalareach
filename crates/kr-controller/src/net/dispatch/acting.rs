@@ -13,7 +13,10 @@
 //!    admit the session, and otherwise under the one live share that admits it. Several shares and
 //!    no pairing grant that admits the session leave nothing to choose by, and the request is
 //!    refused with the way out: name the grant.
-//! 3. A request that names no session is decided under the pairing grant.
+//! 3. A request that names no session is decided under the pairing grant, but for two mutations
+//!    that act under a share: `grant.create` is decided under the grant it delegates from, which
+//!    its parameters name, and `grant.revoke` under the share this device delegated the revoked
+//!    grant from, which the grants say ([`RemoteConnection::acting_as_share`]).
 //!
 //! Once a connection has a link to a session's worker, the grant it opened that link under is the
 //! grant it acts under for that session until the connection ends. The worker keeps state that

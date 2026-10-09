@@ -142,6 +142,17 @@ pub(super) fn owner_share(
     session_id: SessionId,
     holder: DeviceId,
 ) -> Grant {
+    numbered_owner_share(controller, session_id, holder, 1)
+}
+
+/// As [`owner_share`], under the identities `number` names, so that one session can be shared more
+/// than once.
+pub(super) fn numbered_owner_share(
+    controller: &Controller,
+    session_id: SessionId,
+    holder: DeviceId,
+    number: u8,
+) -> Grant {
     let environment_id = controller.paths().environment_id();
     let host_device_id = DeviceId::new(environment_id.get());
     let now_ms = kr_ipc::now_ms().get();
@@ -150,8 +161,8 @@ pub(super) fn owner_share(
         .sharing()
         .share(
             &ShareRequest {
-                invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes([1; 16])),
-                grant_id: GrantId::new(Uuid::from_bytes([2; 16])),
+                invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes([number; 16])),
+                grant_id: GrantId::new(Uuid::from_bytes([number + 1; 16])),
                 environment_id,
                 session_id,
                 issuer_device_id: host_device_id,
