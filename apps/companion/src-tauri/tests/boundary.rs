@@ -233,7 +233,7 @@ fn the_page_opens_nothing_itself_and_a_link_goes_through_the_scheme_policy() {
 /// KR-REQ-17.19: the account's commands are the application's own, and none of them is a host
 /// method or takes an address from the page.
 #[test]
-fn the_account_is_reached_through_five_named_commands() {
+fn the_account_is_reached_through_six_named_commands() {
     let account: Vec<&str> = NAMED_COMMANDS
         .iter()
         .filter(|(command, _)| command.starts_with("account_"))
@@ -247,6 +247,7 @@ fn the_account_is_reached_through_five_named_commands() {
         [
             "account_status",
             "account_sign_in",
+            "account_sign_in_for_recovery",
             "account_sign_in_cancel",
             "account_sign_out",
             "account_usage"
