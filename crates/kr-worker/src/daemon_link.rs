@@ -707,9 +707,14 @@ mod tests {
         }
     }
 
-    /// Asks `daemon` for a claim whose deadline is `after_ms` from now, and says when the report
-    /// that follows arrives, if one does, together with the deadline.
-    async fn claim_and_wait_for_the_report(claim: Claim, after_ms: u64) -> (u64, Option<u64>) {
+    /// Asks the scripted daemon for a claim whose deadline is `after_ms` from now. Returns the
+    /// deadline and the boot-clock reading at which a report reached the daemon: waited for where
+    /// `a_report_follows`, and otherwise looked for once, after checking that none is queued.
+    async fn claim_and_wait_for_the_report(
+        claim: Claim,
+        after_ms: u64,
+        a_report_follows: bool,
+    ) -> (u64, Option<u64>) {
         let host = kr_ipc::testing::TempHost::create();
         let path = host
             .environment()
@@ -736,13 +741,18 @@ mod tests {
             .await
             .expect_err("the claim was not answered with a claim");
         drop(error);
-        let report = if drafts.reports_waiting() == 0 {
-            None
-        } else {
+        let report = if a_report_follows {
             tokio::time::timeout(Duration::from_secs(60), arrived.recv())
                 .await
                 .ok()
                 .flatten()
+        } else {
+            assert_eq!(
+                drafts.reports_waiting(),
+                0,
+                "a report is queued for a claim that was not made"
+            );
+            arrived.try_recv().ok()
         };
         (deadline, report)
     }
@@ -754,7 +764,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_report_of_a_claim_nobody_answered_is_made_only_after_the_claims_deadline() {
         for claim in [Claim::Closes, Claim::CannotSay] {
-            let (deadline, report) = claim_and_wait_for_the_report(claim, 1500).await;
+            let (deadline, report) = claim_and_wait_for_the_report(claim, 1500, true).await;
             let at = report.expect("the report is made");
             assert!(
                 at > deadline,
@@ -766,9 +776,14 @@ mod tests {
     /// A claim the daemon refused for good was not made, and nothing is reported for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_claim_the_daemon_refused_for_good_leaves_no_report_to_make() {
-        let (_, report) = claim_and_wait_for_the_report(Claim::Refuses, 1500).await;
+        let (_, report) = claim_and_wait_for_the_report(Claim::Refuses, 1500, false).await;
         assert_eq!(report, None);
     }
+}
+
+#[cfg(test)]
+mod asked {
+    use super::*;
 
     #[test]
     fn a_refusal_that_cannot_say_what_became_of_the_question_is_no_answer() {
