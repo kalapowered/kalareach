@@ -6268,16 +6268,18 @@ connection rather than silently losing every frame after it.
 The native terminal's own traffic has a route. A frame it writes that names a method is its own
 request or notification, not an answer, and it goes through the same native admission an upstream
 request does: the method is classified with the table this host pinned, the bytes are retained as a
-source event of the instance, and the intent is recorded before anything is written. A method the
-table does not classify suspends that instance's rich mutations first, so an unclassified request
-cannot act while rich mutations are still enabled. A request is then rewritten under an identifier
-of this host's, the terminal's own identifier is kept, and the upstream's reply goes back under the
-identifier the terminal used. What this host holds for those is bounded and each entry has a
-deadline: an upstream that reads requests and never answers them cannot grow that map. A request
-this connection cannot take, one whose deadline passes and one still waiting when the connection
-ends are each answered to the terminal under its own identifier, rather than left waiting for a
-reply that is not coming. A reply that cannot be handed to the terminal ends the connection: a
-person who would never learn what their request did is not something to carry on through.
+source event of the instance (unless the table classes the method as carrying a credential, whose
+bytes are forwarded whole and kept nowhere), and the intent is recorded before anything is written.
+A method the table does not classify suspends that instance's rich mutations first, so an
+unclassified request cannot act while rich mutations are still enabled. A request is then rewritten
+under an identifier of this host's, the terminal's own identifier is kept, and the upstream's reply
+goes back under the identifier the terminal used. What this host holds for those is bounded and
+each entry has a deadline: an upstream that reads requests and never answers them cannot grow that
+map. A request this connection cannot take, one whose deadline passes and one still waiting when
+the connection ends are each answered to the terminal under its own identifier, rather than left
+waiting for a reply that is not coming. A reply that cannot be handed to the terminal ends the
+connection: a person who would never learn what their request did is not something to carry on
+through.
 
 Every durable change a resource undergoes is committed with the record that announces it, in one
 transaction, because a crash between the two would lose an event about a change that did happen.
