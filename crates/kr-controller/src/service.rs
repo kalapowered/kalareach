@@ -1082,6 +1082,10 @@ mod a_voice_grant_on_the_floor;
 #[cfg(test)]
 mod a_delegation_that_is_asked_again;
 
+/// A transfer of control whose attempt ended before its answer was recorded.
+#[cfg(test)]
+mod a_transfer_left_unanswered;
+
 /// An action an earlier build claimed in the grant store alone, as the route check finds it.
 #[cfg(test)]
 mod a_voice_receipt_from_an_earlier_build;
