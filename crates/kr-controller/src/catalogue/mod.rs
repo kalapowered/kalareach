@@ -213,8 +213,10 @@ pub struct CatalogueModule {
     environment_id: EnvironmentId,
     /// The native bridges installed packages put in their applications' own directories.
     bridges: Arc<native_bridge::NativeBridges>,
-    /// How its repositories are fetched: what the daemon started with, for as long as it runs.
-    outbound: crate::config::Outbound,
+    /// The transport its repositories are fetched through: what the daemon started with, for as
+    /// long as it runs. For this host's own tests, which fetch through it.
+    #[cfg(feature = "testing")]
+    transport: Arc<RepositoryTransport>,
     /// The last snapshot of admissions computed, with the revision and the live releases it was
     /// computed for: rounds at an unchanged revision reuse it. Nothing a snapshot carries moves
     /// without the revision moving, the bridges included (see [`Self::write`]).
@@ -340,9 +342,9 @@ impl CatalogueModule {
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
             detail: error.to_string(),
         };
-        let mut catalogue =
-            Catalogue::with_broker(&root, broker, Arc::new(repository_transport(outbound)))
-                .map_err(unavailable)?;
+        let transport = Arc::new(repository_transport(outbound));
+        let mut catalogue = Catalogue::with_broker(&root, broker, transport.clone() as Arc<_>)
+            .map_err(unavailable)?;
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
             .map_err(unavailable)?;
@@ -365,7 +367,8 @@ impl CatalogueModule {
             catalogue: Arc::new(Mutex::new(catalogue)),
             environment_id,
             bridges,
-            outbound: outbound.clone(),
+            #[cfg(feature = "testing")]
+            transport,
             snapshots: Arc::new(std::sync::Mutex::new(None)),
             budgets: std::sync::Mutex::new(budgets),
             limits,
@@ -378,11 +381,13 @@ impl CatalogueModule {
         })
     }
 
-    /// How this catalogue's repositories are fetched: through the proxy the daemon started with,
-    /// directly, or not at all when it started over a configuration document it could not use.
+    /// The transport this catalogue fetches its repositories through: over the proxy the daemon
+    /// started with, directly, or not at all when it started over a configuration document it
+    /// could not use. For this host's own tests.
+    #[cfg(feature = "testing")]
     #[must_use]
-    pub const fn outbound(&self) -> &crate::config::Outbound {
-        &self.outbound
+    pub fn transport(&self) -> &Arc<RepositoryTransport> {
+        &self.transport
     }
 
     /// Returns the native bridges installed packages put in place, which say what each applied
