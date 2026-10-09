@@ -3074,12 +3074,13 @@ worker ran in and the kernel read empty, or a job that needed no help.
 other accounts: a recorded number that a process of another account now holds is described as one
 the host cannot describe, and never as ended. On Linux, when the worker cannot read its process
 tree, the processes that are on the terminal of the session are recorded instead, and the closure
-says that this leaves out a process that left the terminal's session. When a host cannot hold a
-process by more than its process number, no hang up signal or kill signal is sent to it, neither at
-the worker's own close nor in the cleanup after a crash; the closure names the process. When the
-control group of a service is read, processes that were not recorded by the worker but are ended by
-the service manager with a kill command are described together with the other processes as forced
-ended.
+says that this leaves out a process that left the terminal's session. When the worker is started in
+an environment where processes cannot be controlled by any other means than by the process number,
+no hang up signal or kill signal is sent to a process by that number, neither at the worker's own
+close nor in the cleanup after a crash. Such processes are only described at the end of the session.
+When reading the cgroup of a service, processes that were not recorded by the worker but are ended
+by the service manager with a kill command are described together with the other processes as
+forced ended.
 
 **A control daemon that a session's command started.** On Linux, if a command like `kr new` or `kr
 update` starts a control daemon from a shell of a session, and the session runs as a service of the
