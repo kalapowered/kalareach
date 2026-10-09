@@ -1036,7 +1036,7 @@ async fn a_hold_that_could_not_be_taken_at_the_request_is_tried_again_at_the_end
         .unwrap_or_else(|| panic!("it is listed as ended: {fenced:?}"));
     assert!(
         ended.forced,
-        "and as forced, because it did not end when asked: {fenced:?}"
+        "and as forced, because it was not asked to end: {fenced:?}"
     );
 }
 
