@@ -19,13 +19,14 @@ use std::time::Duration;
 use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::sharing::{
-    ConfirmedTransfer, ShareRequest, SharingService, TransferHost, TransferPlan,
-    requires_owner_confirmation, roles, transfer,
+    ConfirmedAction, ShareRequest, SharingService, TransferWrite, requires_owner_confirmation,
+    roles, transfer,
 };
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::actor::ActorIngress;
+use kr_protocol::confirmation::TransferControlPlan;
 use kr_protocol::grant::{Grant, GrantExpiry, SessionSelector};
 use kr_protocol::ids::{
     AuthorityRevision, BuildId, DeviceId, EnvironmentId, GrantId, InvitationId, SessionId,
@@ -123,11 +124,7 @@ impl kr_pairing::platform::PairingClock for Clock {
     }
 }
 
-/// Runs the owner-confirmation ceremony for one transfer plan, for real.
-///
-/// The challenge is issued for this exact plan's digest, the owner's key signs it, and
-/// `ConfirmedTransfer::verify` is the thing that accepts it: the test never constructs the
-/// evidence, because nothing outside this crate can.
+/// The keys of the device the plans below hand control to.
 fn recipient_keys() -> kr_protocol::pairing::DevicePublicKeys {
     kr_protocol::pairing::DevicePublicKeys {
         authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([11; 32]),
@@ -137,46 +134,103 @@ fn recipient_keys() -> kr_protocol::pairing::DevicePublicKeys {
     }
 }
 
-fn transfer_host(keys: &kr_protocol::pairing::DevicePublicKeys) -> TransferHost<'_> {
-    transfer_host_for(device_id(0xf0), keys)
+/// The endpoint the ceremony's challenges name as the host's.
+fn host_endpoint() -> kr_protocol::scalars::EndpointKey {
+    kr_protocol::scalars::EndpointKey::from_bytes([3; 32])
 }
 
-fn transfer_host_for(
-    host_device_id: DeviceId,
-    keys: &kr_protocol::pairing::DevicePublicKeys,
-) -> TransferHost<'_> {
-    TransferHost {
-        device_id: host_device_id,
-        endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([3; 32]),
-        recipient_keys: keys,
+/// The plan that hands `source`, the grant its device holds over the session, to `to`: every
+/// right an owner holds and the source carries, and the source's issuer, parent, history and
+/// lifetime, under the grant identity `issuing`.
+fn plan_of(source: &Grant, to: DeviceId, issuing: GrantId) -> TransferControlPlan {
+    TransferControlPlan {
+        environment_id: environment_id(0xe0),
+        session_id: session_id(0xa0),
+        source_grant_id: source.grant_id,
+        parent_grant_id: source.parent_grant_id,
+        issuer_device_id: source.issuer_device_id,
+        from_device_id: source.recipient_device_id,
+        from_device_name: kr_protocol::pairing::DeviceName::new("a laptop").expect("a name"),
+        to_device_id: to,
+        to_device_name: kr_protocol::pairing::DeviceName::new("a phone").expect("a name"),
+        to_keys: recipient_keys(),
+        to_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+        new_grant_id: issuing,
+        environment_selector: source.environment_selector.clone(),
+        actions: transfer::transferable_actions(source),
+        history: source.history.clone(),
+        expiry: source.expiry,
+        organisation: source.organisation,
     }
 }
 
+/// Accepts `proof` as the host does: against the expectation it builds from the plan itself, never
+/// from the challenge, so a challenge for another host, another device or other rights is not an
+/// answer to it.
+fn accept_plan(
+    plan: &TransferControlPlan,
+    host_device_id: DeviceId,
+    ledger: &mut kr_pairing::confirm::ConfirmationLedger,
+    clock: &dyn kr_pairing::platform::PairingClock,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+    proof: &kr_protocol::pairing::OwnerConfirmationProof,
+    signer: &kr_protocol::scalars::AuthorisationKey,
+) -> kr_controller::error::Result<ConfirmedAction> {
+    let keys = plan.to_keys;
+    ConfirmedAction::verify(
+        &kr_pairing::confirm::ConfirmationExpectation {
+            action: TransferControlPlan::sensitive_action(),
+            action_digest: plan.action_digest().expect("a digest"),
+            host_device_id,
+            host_endpoint_id: host_endpoint(),
+            destination_keys: Some(&keys),
+            destination_rights: &plan.actions,
+        },
+        ledger,
+        clock,
+        request,
+        proof,
+        signer,
+        kr_pairing::confirm::HostEnrolment::Enrolled,
+    )
+}
+
+/// The challenge a host issues for `plan`, as `host_device_id` states itself.
+fn challenge_for(
+    plan: &TransferControlPlan,
+    host_device_id: DeviceId,
+    clock: &dyn kr_pairing::platform::PairingClock,
+) -> kr_protocol::pairing::OwnerConfirmationRequest {
+    kr_pairing::confirm::request_confirmation(
+        clock,
+        TransferControlPlan::sensitive_action(),
+        plan.action_digest().expect("a digest"),
+        Some(plan.to_keys),
+        plan.actions.iter().copied().collect(),
+        host_device_id,
+        host_endpoint(),
+    )
+    .expect("a challenge")
+}
+
+/// Runs the owner-confirmation ceremony for one transfer plan, for real.
+///
+/// `ConfirmedAction::verify` is the thing that accepts it: the test never constructs the
+/// evidence, because nothing outside this crate can.
 fn confirm_transfer(
-    plan: &TransferPlan,
+    plan: &TransferControlPlan,
     owner_key: &kr_crypto::keys::AuthorisationKeyPair,
-) -> ConfirmedTransfer {
+) -> ConfirmedAction {
     confirm_transfer_for(plan, device_id(0xf0), owner_key)
 }
 
 fn confirm_transfer_for(
-    plan: &TransferPlan,
+    plan: &TransferControlPlan,
     host_device_id: DeviceId,
     owner_key: &kr_crypto::keys::AuthorisationKeyPair,
-) -> ConfirmedTransfer {
+) -> ConfirmedAction {
     let clock = Clock;
-    let keys = recipient_keys();
-    let host = transfer_host_for(host_device_id, &keys);
-    let request = kr_pairing::confirm::request_confirmation(
-        &clock,
-        TransferPlan::sensitive_action(),
-        plan.action_digest().expect("a digest"),
-        Some(keys),
-        plan.actions.iter().copied().collect(),
-        host.device_id,
-        host.endpoint_id,
-    )
-    .expect("a challenge");
+    let request = challenge_for(plan, host_device_id, &clock);
     let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
     ledger.issue(&request, &clock);
     let proof = kr_pairing::confirm::sign_confirmation(
@@ -185,17 +239,34 @@ fn confirm_transfer_for(
         kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
     )
     .expect("a proof");
-    ConfirmedTransfer::verify(
+    accept_plan(
         plan,
-        &host,
+        host_device_id,
         &mut ledger,
         &clock,
         &request,
         &proof,
         owner_key.public(),
-        kr_pairing::confirm::HostEnrolment::Enrolled,
     )
     .expect("the owner confirmed this transfer")
+}
+
+/// The grant an owner-role share writes, for a plan that needs a source and no store.
+fn an_owner_grant() -> Grant {
+    SharingService::in_memory(device_id(0xf0))
+        .expect("a sharing service")
+        .share(&share(SessionRole::Owner, 1), || Ok(()))
+        .expect("an owner")
+        .grant
+}
+
+/// What a library-level transfer is written under: the revision, the moment, and no action.
+const fn written(authority_revision: AuthorityRevision, now_ms: u64) -> TransferWrite<'static> {
+    TransferWrite {
+        authority_revision,
+        now_ms,
+        claim: None,
+    }
 }
 
 /// A grant whose admission lapses while the store is waited for is not written.
@@ -311,30 +382,12 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
         )
         .expect("the owner redeems it");
 
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: device_id(0xf1),
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: owner.grant.grant_id,
-        issuing_grant_id: grant_id(9),
-        actions: transfer::transferable_actions(&owner.grant),
-    };
+    let plan = plan_of(&owner.grant, device_id(0xf2), grant_id(9));
     // The ceremony runs on the fixed clock, so the deadline the evidence carries is
     // `CEREMONY_MONOTONIC_MS + CONFIRMATION_LIFETIME_MS` and nothing about this test depends on
     // how long the machine takes to reach the next line.
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
-    let keys = recipient_keys();
-    let host = transfer_host(&keys);
-    let request = kr_pairing::confirm::request_confirmation(
-        &Ceremony,
-        TransferPlan::sensitive_action(),
-        plan.action_digest().expect("a digest"),
-        Some(keys),
-        plan.actions.iter().copied().collect(),
-        host.device_id,
-        host.endpoint_id,
-    )
-    .expect("a challenge");
+    let request = challenge_for(&plan, device_id(0xf0), &Ceremony);
     let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
     ledger.issue(&request, &Ceremony);
     let proof = kr_pairing::confirm::sign_confirmation(
@@ -343,15 +396,14 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
         kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
     )
     .expect("a proof");
-    let confirmed = ConfirmedTransfer::verify(
+    let confirmed = accept_plan(
         &plan,
-        &host,
+        device_id(0xf0),
         &mut ledger,
         &Ceremony,
         &request,
         &proof,
         owner_key.public(),
-        kr_pairing::confirm::HostEnrolment::Enrolled,
     )
     .expect("the owner confirmed this transfer");
 
@@ -361,8 +413,8 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
             &plan,
             &confirmed,
             &clock,
-            AuthorityRevision::new(1),
-            NOW + 2,
+            written(AuthorityRevision::new(1), NOW + 2),
+            || Ok(()),
         )
         .expect_err("the confirmation ran out while this waited for the store");
     assert!(
@@ -372,14 +424,14 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
     assert!(
         service
             .grants()
-            .record(plan.issuing_grant_id)
+            .record(plan.new_grant_id)
             .expect("readable")
             .is_none(),
         "the recipient received nothing"
     );
     let source = service
         .grants()
-        .record(plan.revoking_grant_id)
+        .record(plan.source_grant_id)
         .expect("readable")
         .expect("present");
     assert!(
@@ -421,18 +473,13 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
     }
 
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
-    let keys = recipient_keys();
-    let host = transfer_host(&keys);
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: device_id(0xf1),
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: grant_id(1),
-        issuing_grant_id: grant_id(9),
+    let plan = TransferControlPlan {
         actions: [ActionRight::SessionView, ActionRight::SessionShare]
             .into_iter()
             .collect(),
+        ..plan_of(&an_owner_grant(), device_id(0xf2), grant_id(9))
     };
+    let host_device_id = device_id(0xf0);
 
     // The challenge is issued at wall clock 1,000 and lives two minutes. It is accepted one second
     // before it expires.
@@ -442,16 +489,7 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
         wall_clock_ms: 1_000,
         boot: std::sync::Mutex::new([3; 32]),
     };
-    let request = kr_pairing::confirm::request_confirmation(
-        &issuing,
-        TransferPlan::sensitive_action(),
-        plan.action_digest().expect("a digest"),
-        Some(keys),
-        plan.actions.iter().copied().collect(),
-        host.device_id,
-        host.endpoint_id,
-    )
-    .expect("a challenge");
+    let request = challenge_for(&plan, host_device_id, &issuing);
 
     let accepting = Staged {
         monotonic_ms: std::sync::atomic::AtomicU64::new(5_000 + lifetime - 1_000),
@@ -466,27 +504,27 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
         kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
     )
     .expect("a proof");
-    let confirmed = ConfirmedTransfer::verify(
+    let confirmed = accept_plan(
         &plan,
-        &host,
+        host_device_id,
         &mut ledger,
         &accepting,
         &request,
         &proof,
         owner_key.public(),
-        kr_pairing::confirm::HostEnrolment::Enrolled,
     )
     .expect("accepted one second before the challenge expired");
+    let digest = plan.action_digest().expect("a digest");
 
     // One second of the challenge's own life is left, not a fresh two minutes.
     confirmed
-        .covers(&plan, host.device_id, &accepting)
+        .covers(digest, host_device_id, &accepting, "transfer")
         .expect("still inside the challenge's own deadline");
     accepting
         .monotonic_ms
         .store(5_000 + lifetime + 1, std::sync::atomic::Ordering::SeqCst);
     let error = confirmed
-        .covers(&plan, host.device_id, &accepting)
+        .covers(digest, host_device_id, &accepting, "transfer")
         .expect_err("the challenge's own deadline has passed");
     assert!(
         error.to_string().contains("expired"),
@@ -498,11 +536,11 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
         .monotonic_ms
         .store(5_000, std::sync::atomic::Ordering::SeqCst);
     confirmed
-        .covers(&plan, host.device_id, &accepting)
+        .covers(digest, host_device_id, &accepting, "transfer")
         .expect("inside its deadline again");
     *accepting.boot.lock().expect("the boot value") = [4; 32];
     let error = confirmed
-        .covers(&plan, host.device_id, &accepting)
+        .covers(digest, host_device_id, &accepting, "transfer")
         .expect_err("a confirmation does not survive a reboot");
     assert!(
         error.to_string().contains("earlier boot"),
@@ -517,16 +555,7 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
         wall_clock_ms: 1_000,
         boot: std::sync::Mutex::new([3; 32]),
     };
-    let request = kr_pairing::confirm::request_confirmation(
-        &issuing,
-        TransferPlan::sensitive_action(),
-        plan.action_digest().expect("a digest"),
-        Some(keys),
-        plan.actions.iter().copied().collect(),
-        host.device_id,
-        host.endpoint_id,
-    )
-    .expect("a challenge");
+    let request = challenge_for(&plan, host_device_id, &issuing);
     let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
     ledger.issue(&request, &issuing);
     let proof = kr_pairing::confirm::sign_confirmation(
@@ -535,22 +564,21 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
         kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
     )
     .expect("a proof");
-    let confirmed = ConfirmedTransfer::verify(
+    let confirmed = accept_plan(
         &plan,
-        &host,
+        host_device_id,
         &mut ledger,
         &rolled_back,
         &request,
         &proof,
         owner_key.public(),
-        kr_pairing::confirm::HostEnrolment::Enrolled,
     )
     .expect("accepted while the wall clock said the challenge had just been issued");
     rolled_back
         .monotonic_ms
         .store(5_000 + lifetime + 1, std::sync::atomic::Ordering::SeqCst);
     confirmed
-        .covers(&plan, host.device_id, &rolled_back)
+        .covers(digest, host_device_id, &rolled_back, "transfer")
         .expect_err("a wall clock that went back does not lengthen the deadline");
 }
 
@@ -561,28 +589,14 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
 fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
     let clock = Clock;
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
-    let keys = recipient_keys();
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: device_id(0xf1),
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: grant_id(1),
-        issuing_grant_id: grant_id(9),
+    let plan = TransferControlPlan {
         actions: [ActionRight::SessionView, ActionRight::SessionShare]
             .into_iter()
             .collect(),
+        ..plan_of(&an_owner_grant(), device_id(0xf2), grant_id(9))
     };
     // The challenge names another host entirely.
-    let request = kr_pairing::confirm::request_confirmation(
-        &clock,
-        TransferPlan::sensitive_action(),
-        plan.action_digest().expect("a digest"),
-        Some(keys),
-        plan.actions.iter().copied().collect(),
-        device_id(0xee),
-        kr_protocol::scalars::EndpointKey::from_bytes([9; 32]),
-    )
-    .expect("a challenge");
+    let request = challenge_for(&plan, device_id(0xee), &clock);
     let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
     ledger.issue(&request, &clock);
     let proof = kr_pairing::confirm::sign_confirmation(
@@ -591,16 +605,14 @@ fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
         kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
     )
     .expect("a proof");
-    let host = transfer_host(&keys);
-    ConfirmedTransfer::verify(
+    accept_plan(
         &plan,
-        &host,
+        device_id(0xf0),
         &mut ledger,
         &clock,
         &request,
         &proof,
         owner_key.public(),
-        kr_pairing::confirm::HostEnrolment::Enrolled,
     )
     .expect_err("this host builds the expectation, so another host's challenge does not answer it");
 
@@ -611,12 +623,12 @@ fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
     };
     let request = kr_pairing::confirm::request_confirmation(
         &clock,
-        TransferPlan::sensitive_action(),
+        TransferControlPlan::sensitive_action(),
         plan.action_digest().expect("a digest"),
         Some(elsewhere),
         plan.actions.iter().copied().collect(),
-        host.device_id,
-        host.endpoint_id,
+        device_id(0xf0),
+        host_endpoint(),
     )
     .expect("a challenge");
     let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
@@ -627,15 +639,14 @@ fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
         kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
     )
     .expect("a proof");
-    ConfirmedTransfer::verify(
+    accept_plan(
         &plan,
-        &host,
+        device_id(0xf0),
         &mut ledger,
         &clock,
         &request,
         &proof,
         owner_key.public(),
-        kr_pairing::confirm::HostEnrolment::Enrolled,
     )
     .expect_err("the owner was shown a different device than the one this transfer hands over to");
 }
@@ -1077,19 +1088,12 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
         )
         .expect("the owner redeems it");
 
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: device_id(0xf1),
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: owner.grant.grant_id,
-        issuing_grant_id: grant_id(9),
-        actions: transfer::transferable_actions(&owner.grant),
-    };
+    let plan = plan_of(&owner.grant, device_id(0xf2), grant_id(9));
 
     // A confirmation the owner gave for a *different* transfer authorises nothing. The digest
     // covers the whole plan, so changing the recipient changes it.
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
-    let elsewhere_plan = TransferPlan {
+    let elsewhere_plan = TransferControlPlan {
         to_device_id: device_id(0xbb),
         ..plan.clone()
     };
@@ -1099,8 +1103,8 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
             &plan,
             &elsewhere,
             &Clock,
-            AuthorityRevision::new(1),
-            NOW + 2,
+            written(AuthorityRevision::new(1), NOW + 2),
+            || Ok(()),
         )
         .expect_err("a confirmation is about one exact transfer");
     assert!(
@@ -1122,8 +1126,8 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
             &plan,
             &confirmed,
             &Clock,
-            AuthorityRevision::new(1),
-            NOW + 2,
+            written(AuthorityRevision::new(1), NOW + 2),
+            || Ok(()),
         )
         .expect("the owner confirmed this transfer");
 
@@ -1523,18 +1527,11 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
     let owner = service
         .share(&share(SessionRole::Owner, 1), || Ok(()))
         .expect("an owner");
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: device_id(0xf1),
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: owner.grant.grant_id,
-        issuing_grant_id: grant_id(2),
-        actions: transfer::transferable_actions(&owner.grant),
-    };
+    let plan = plan_of(&owner.grant, device_id(0xf2), grant_id(2));
     transfer::check_transfer(&plan, &owner.grant).expect("an owner may transfer control");
     assert!(plan.actions.contains(&ActionRight::SessionShare));
     assert_eq!(
-        TransferPlan::sensitive_action(),
+        TransferControlPlan::sensitive_action(),
         kr_protocol::pairing::SensitiveAction::ChangeHostAuthority,
         "transferring control changes who holds host authority, and is confirmed as that"
     );
@@ -1551,12 +1548,7 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
             || Ok(()),
         )
         .expect("a controller");
-    let refused = TransferPlan {
-        from_device_id: device_id(0xf4),
-        revoking_grant_id: controller.grant.grant_id,
-        actions: transfer::transferable_actions(&controller.grant),
-        ..plan.clone()
-    };
+    let refused = plan_of(&controller.grant, device_id(0xf2), grant_id(2));
     let error = transfer::check_transfer(&refused, &controller.grant)
         .expect_err("a controller cannot transfer control");
     assert!(
@@ -1572,16 +1564,29 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
             .collect(),
         ..owner.grant.clone()
     };
-    let overreaching = TransferPlan {
+    let overreaching = TransferControlPlan {
         actions: [ActionRight::SessionView, ActionRight::TerminalInput]
             .into_iter()
             .collect(),
-        ..plan
+        ..plan.clone()
     };
     let error = transfer::check_transfer(&overreaching, &narrowed)
         .expect_err("a transfer cannot hand over what was never held");
     assert!(
         error.to_string().contains("terminal.input"),
+        "unexpected refusal: {error}"
+    );
+
+    // Nor reach further than the grant it takes from in time: a grant that ends is not replaced
+    // by one that never does.
+    let outliving = TransferControlPlan {
+        expiry: GrantExpiry::Never,
+        ..plan
+    };
+    let error = transfer::check_transfer(&outliving, &owner.grant)
+        .expect_err("a transfer cannot outlast the grant it replaces");
+    assert!(
+        error.to_string().contains("more than"),
         "unexpected refusal: {error}"
     );
 }
@@ -1782,21 +1787,14 @@ async fn transferring_control_through_the_daemon_completes_through_the_barrier()
         )
         .expect("the owner redeems it");
 
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: device_id(0xf1),
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: owner.grant.grant_id,
-        issuing_grant_id: grant_id(9),
-        actions: transfer::transferable_actions(&owner.grant),
-    };
+    let plan = plan_of(&owner.grant, device_id(0xf2), grant_id(9));
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
     // Evidence the owner gave for **another** host does not authorise a transfer on this one, even
     // though the plan and the signature are otherwise the same.
     let elsewhere = confirm_transfer_for(&plan, device_id(0xee), &owner_key);
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.transfer_control(&plan, &elsewhere),
+        controller.transfer_control(&plan, &elsewhere, &Clock, None, None),
     )
     .await
     .expect("the refusal is prompt")
@@ -1806,7 +1804,7 @@ async fn transferring_control_through_the_daemon_completes_through_the_barrier()
     let before = controller.policy().authority_revision();
     let (transfer, completed) = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.transfer_control(&plan, &confirmed),
+        controller.transfer_control(&plan, &confirmed, &Clock, None, None),
     )
     .await
     .expect("the transfer completes")
@@ -1961,14 +1959,7 @@ async fn transfer_to_another(
     source: &Grant,
     issuing: GrantId,
 ) -> kr_controller::error::Result<()> {
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: source.recipient_device_id,
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: source.grant_id,
-        issuing_grant_id: issuing,
-        actions: transfer::transferable_actions(source),
-    };
+    let plan = plan_of(source, device_id(0xf2), issuing);
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
     let confirmed = confirm_transfer_for(
         &plan,
@@ -1977,7 +1968,7 @@ async fn transfer_to_another(
     );
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.transfer_control(&plan, &confirmed),
+        controller.transfer_control(&plan, &confirmed, &Clock, None, None),
     )
     .await
     .expect("the transfer is answered promptly")
@@ -2298,14 +2289,7 @@ async fn a_transfer_whose_source_expired_before_it_was_written_is_refused() {
     let (_temp, controller) = daemon().await;
     let (source, checked_at_ms) = expired_an_hour_ago(&controller, 1, device_id(0xf1));
     floor_written_now(&controller);
-    let plan = TransferPlan {
-        session_id: session_id(0xa0),
-        from_device_id: device_id(0xf1),
-        to_device_id: device_id(0xf2),
-        revoking_grant_id: source.grant_id,
-        issuing_grant_id: grant_id(9),
-        actions: transfer::transferable_actions(&source),
-    };
+    let plan = plan_of(&source, device_id(0xf2), grant_id(9));
     let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
     let confirmed = confirm_transfer_for(
         &plan,
@@ -2319,8 +2303,8 @@ async fn a_transfer_whose_source_expired_before_it_was_written_is_refused() {
             &plan,
             &confirmed,
             &Clock,
-            controller.policy().authority_revision(),
-            checked_at_ms + 1,
+            written(controller.policy().authority_revision(), checked_at_ms + 1),
+            || Ok(()),
         )
         .expect_err("the source had expired by the time the transfer was written");
     assert_eq!(

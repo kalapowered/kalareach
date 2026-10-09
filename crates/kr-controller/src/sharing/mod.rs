@@ -26,6 +26,7 @@ pub mod invitation;
 pub mod roles;
 pub mod transfer;
 
+use kr_protocol::confirmation::TransferControlPlan;
 use kr_protocol::grant::{Grant, GrantExpiry};
 use kr_protocol::ids::{
     AuthorityRevision, DeviceId, EnvironmentId, GrantId, InvitationId, SessionId,
@@ -40,9 +41,9 @@ use kr_protocol::sharing::{
 use crate::error::{ControllerError, Result};
 use crate::grants::{GrantDirectory, GrantRecord, GrantRevocation};
 
-pub use confirmation::{ConfirmedAction, OwnerConfirmations};
+pub use confirmation::{ConfirmedAction, ExactAction, OwnerConfirmations};
 pub use invitation::InvitationRecord;
-pub use transfer::{ConfirmedTransfer, ControlTransfer, TransferHost, TransferPlan};
+pub use transfer::{ControlTransfer, TransferWrite};
 
 /// What the issuer supplies when it shares a session.
 #[derive(Clone, Debug)]
@@ -471,15 +472,20 @@ impl SharingService {
     ///
     /// Two effects that have to happen together: the recipient receives the transferring device's
     /// authority over the session, and the transferring device's grant is revoked. It is not a
-    /// delegation — the issuer does not keep what it hands over — so it is its own operation, and
-    /// section 23 requires an owner's confirmation for it because it changes who holds authority.
+    /// delegation, since the issuer does not keep what it hands over, so it is its own operation,
+    /// and section 23 requires an owner's confirmation for it because it changes who holds
+    /// authority.
     ///
-    /// The grant it issues is active immediately. There is no invitation to redeem: the owner
+    /// The grant it issues is the one `plan` builds, so what is written is what the owner
+    /// confirmed, and it is active immediately. There is no invitation to redeem: the owner
     /// confirming the transfer *is* the ceremony, and a transfer that left the recipient holding a
-    /// proposal would leave the session with nobody in control.
+    /// proposal would leave the session with nobody in control. It keeps the issuer and the parent
+    /// of the grant it replaces, and ends no later than that grant does on the continuous clock.
     ///
     /// The source is re-read and re-checked inside the transaction, so two transfers of one grant
-    /// produce one replacement and one refusal.
+    /// produce one replacement and one refusal. `still_admitted` is run there too, with the
+    /// store's lock held and before anything is written: the wait for that lock can outlast the
+    /// admission the transfer was accepted under.
     ///
     /// `confirmation` is the owner's, already verified against the ceremony's challenge by the
     /// caller. This takes evidence rather than a flag, because a Boolean is something any caller
@@ -488,72 +494,54 @@ impl SharingService {
     /// # Errors
     ///
     /// Returns [`ControllerError::PermissionDenied`] when the transferring device does not hold
-    /// the grant it names at the moment the transaction reads it, or when the plan hands over more
-    /// than that grant carries.
+    /// the grant the plan names at the moment the transaction reads it, when the plan hands over
+    /// more than that grant carries, or when the confirmation is about another transfer, was
+    /// accepted for another host or boot, or has run out.
     pub fn transfer_control(
         &self,
-        plan: &TransferPlan,
-        confirmation: &transfer::ConfirmedTransfer,
+        plan: &TransferControlPlan,
+        confirmation: &ConfirmedAction,
         clock: &dyn kr_pairing::platform::PairingClock,
-        authority_revision: AuthorityRevision,
-        now_ms: u64,
+        write: TransferWrite<'_>,
+        still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<ControlTransfer> {
+        let digest = plan
+            .action_digest()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // Against **this** host. Evidence accepted for another host, in another boot, or past the
         // ceremony's own lifetime authorises nothing here. It is checked twice: once now, so an
         // obviously stale confirmation is refused before anything is read, and again inside the
         // transaction, because the deadline can pass while this waits for the store's lock and a
         // check before a wait proves only what was true before the wait.
-        confirmation.covers(plan, self.host_device_id, clock)?;
-        // Built from the source rather than from the caller, so a transfer cannot widen the
-        // environment or the history the source reached. The source is read again inside the
-        // transaction; this copy is only to build the record, and the transaction's own check is
-        // what decides.
-        let source = self.grants.record(plan.revoking_grant_id)?.ok_or_else(|| {
-            ControllerError::PermissionDenied {
-                detail: "this host holds no such grant".to_owned(),
-            }
-        })?;
-        let issued = Grant {
-            grant_id: plan.issuing_grant_id,
-            parent_grant_id: source.grant.parent_grant_id,
-            issuer_device_id: plan.from_device_id,
-            recipient_device_id: plan.to_device_id,
-            authority_revision,
-            environment_selector: source.grant.environment_selector.clone(),
-            // The plan names one session, so the replacement covers one session. Copying a source
-            // selector that said `Any` would hand over every session in the environment under a
-            // plan that named one, and the owner confirmed the plan.
-            session_selector: kr_protocol::grant::SessionSelector::These {
-                session_ids: [plan.session_id].into_iter().collect(),
-            },
-            actions: plan.actions.clone(),
-            history: source.grant.history.clone(),
-            expiry: source.grant.expiry,
-            organisation: source.grant.organisation,
-        };
+        confirmation.covers(digest, self.host_device_id, clock, "transfer")?;
+        let issued = plan.replacement(write.authority_revision);
         let replacement = GrantRecord {
             grant: issued.clone(),
             // The session the plan names, so a listing that filters by session finds it. Copying a
             // broad source's `None` would leave the replacement out of the very list its recipient
             // would look in.
             session_id: Some(plan.session_id),
-            issued_at_ms: now_ms,
+            issued_at_ms: write.now_ms,
             // Active on issue. The confirmation is the ceremony; there is nothing left to redeem.
-            activated_at_ms: Some(now_ms),
+            activated_at_ms: Some(write.now_ms),
             revoked_at_ms: None,
             revoked_by_parent: None,
         };
         let host_device_id = self.host_device_id;
-        let revoked =
-            self.grants
-                .transfer(plan.revoking_grant_id, &replacement, now_ms, |source| {
-                    // Again, inside the transaction. The check above happened before the store's
-                    // lock was taken, and a confirmation's deadline is short enough that a wait
-                    // for that lock can outlast it; a check before a wait proves only what was
-                    // true before the wait.
-                    confirmation.covers(plan, host_device_id, clock)?;
-                    transfer::check_transfer(plan, &source.grant)
-                })?;
+        let revoked = self.grants.transfer(
+            plan.source_grant_id,
+            &replacement,
+            write.now_ms,
+            |source| {
+                still_admitted()?;
+                // Again, inside the transaction. The check above happened before the store's lock
+                // was taken, and a confirmation's deadline is short enough that a wait for that
+                // lock can outlast it.
+                confirmation.covers(digest, host_device_id, clock, "transfer")?;
+                transfer::check_transfer(plan, &source.grant)
+            },
+            write.claim,
+        )?;
         Ok(ControlTransfer {
             plan: plan.clone(),
             issued,

@@ -151,7 +151,7 @@ impl Controller {
                 detail: "another attempt under this action identifier has not finished".to_owned(),
             })),
             crate::grants::ActionRecord::Unfinished => match mutation.method.method() {
-                Some(Method::GrantRevoke | Method::DeviceRevoke) => None,
+                Some(Method::GrantRevoke | Method::DeviceRevoke | Method::GrantTransfer) => None,
                 Some(Method::GrantCreate) => {
                     let (grant_id, invitation_id) =
                         Self::share_identities(mutation.action_id.get());
@@ -172,6 +172,8 @@ impl Controller {
     ///
     /// Nothing is left for a grant revocation once the grant it names stands revoked, because its
     /// descendants went with it and none can be delegated from it since. Nothing is left for a
+    /// transfer once the grant it gives up stands revoked and the one it writes is on record, which
+    /// are one commit. Nothing is left for a
     /// device revocation once the device's own record stands revoked, its last write, and so does
     /// every grant the device holds: grants withdrawn beside a live record are not a finished
     /// withdrawal, and a record revoked some other way says nothing of the grants. Answering then
@@ -207,6 +209,18 @@ impl Controller {
                         .iter()
                         .all(|held| held.revoked_at_ms.is_some())
             }
+            Some(Method::GrantTransfer) => {
+                let params: kr_protocol::sharing::GrantTransferParams = parse(&mutation.params)?;
+                self.sharing
+                    .grants()
+                    .record(params.from_grant_id)?
+                    .is_some_and(|record| record.revoked_at_ms.is_some())
+                    && self
+                        .sharing
+                        .grants()
+                        .record(Self::transfer_identity(actor_id, mutation.action_id))?
+                        .is_some()
+            }
             _ => false,
         };
         if !nothing_left {
@@ -219,11 +233,22 @@ impl Controller {
         else {
             return Err(unfinished_and_unknown());
         };
-        encode(
-            &self
-                .complete_revocation(withdrawn.into_iter().collect(), self.publish_debts(&[]))
-                .await?,
-        )
+        let revoked = self
+            .complete_revocation(withdrawn.into_iter().collect(), self.publish_debts(&[]))
+            .await?;
+        if mutation.method.method() == Some(Method::GrantTransfer) {
+            let replacement = self
+                .sharing
+                .grants()
+                .record(Self::transfer_identity(actor_id, mutation.action_id))?
+                .ok_or_else(unfinished_and_unknown)?
+                .grant;
+            return encode(&kr_protocol::sharing::GrantTransferResult {
+                replacement,
+                revoked,
+            });
+        }
+        encode(&revoked)
     }
 
     /// Keeps what a claimed action came to, under the hold that claimed it.
@@ -488,6 +513,10 @@ impl Controller {
             Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
             Method::GrantRedeem => self.grant_redeem(mutation, caller, carried, &hold).await,
             Method::GrantRevoke => self.grant_revoke(mutation, carried, &hold).await,
+            Method::GrantTransfer => {
+                self.grant_transfer(actor_id, mutation, carried, &hold)
+                    .await
+            }
             Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
             Method::DevicePreviewKeyUpdate => {
                 self.device_preview_key_update(actor_id, mutation, carried)
@@ -738,6 +767,131 @@ impl Controller {
                 .revoke_grant(params.grant_id, Some(&carried), Some(hold))
                 .await?,
         )
+    }
+
+    /// Hands a session's control to another paired device, on the owner's confirmation.
+    ///
+    /// The plan is built from this host's own records, so it is what an owner device was shown
+    /// when the host described the transfer for the same action, and the answer an owner device
+    /// recorded for exactly that plan is spent here, once, before anything is written. A transfer
+    /// that cannot be written is refused before the confirmation is spent. The grant written is the
+    /// one the plan builds, and the grant it gives up is revoked in the same commit.
+    async fn grant_transfer(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+        hold: &crate::grants::ClaimHold,
+    ) -> Result<ParamsValue> {
+        use crate::sharing::OwnerConfirmations as _;
+
+        let params: kr_protocol::sharing::GrantTransferParams = parse(&mutation.params)?;
+        let plan = self.transfer_plan(actor_id, &params, mutation.action_id)?;
+        let pairing = self
+            .network
+            .get()
+            .map(|guard| std::sync::Arc::clone(guard.pairing()))
+            .ok_or_else(|| {
+                ControllerError::NotConfigured(
+                    "this transfer needs an owner device's confirmation, and this host is not on \
+                     the network, so it has none to ask; select a network and restart it"
+                        .to_owned(),
+                )
+            })?;
+        let digest = plan
+            .action_digest()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let confirmed = pairing.accept_recorded(&crate::sharing::ExactAction {
+            action: kr_protocol::confirmation::TransferControlPlan::sensitive_action(),
+            digest,
+            destination: Some(&plan.to_keys),
+            rights: &plan.actions,
+        })?;
+        let (transfer, revoked) = self
+            .transfer_control(
+                &plan,
+                &confirmed,
+                pairing.clock(),
+                Some(&carried),
+                Some(hold),
+            )
+            .await?;
+        encode(&kr_protocol::sharing::GrantTransferResult {
+            replacement: transfer.issued,
+            revoked,
+        })
+    }
+
+    /// What a transfer of control would do, as this host's records state it.
+    ///
+    /// It is the plan an owner device is shown when it is asked to confirm the transfer, and the
+    /// plan the transfer then writes, so it is built here once from the grant given up and the two
+    /// devices. Nothing in it is a caller's word but the three things it names: the session, the
+    /// grant and the receiving device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] for a grant this host does not hold or that
+    /// carries no control to transfer, for a device that is not paired with all four of its keys
+    /// held, and for a plan that hands over more than the grant carries.
+    pub(crate) fn transfer_plan(
+        &self,
+        actor_id: &ActorId,
+        params: &kr_protocol::sharing::GrantTransferParams,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> Result<kr_protocol::confirmation::TransferControlPlan> {
+        let denied = |detail: &str| ControllerError::PermissionDenied {
+            detail: detail.to_owned(),
+        };
+        let source = self
+            .sharing
+            .grants()
+            .record(params.from_grant_id)?
+            .ok_or_else(|| denied("this host holds no such grant"))?;
+        if !source.is_active() || source.revoked_at_ms.is_some() {
+            return Err(denied(
+                "a grant that nobody redeemed, or that was revoked, carries no control to transfer",
+            ));
+        }
+        let paired = |device_id| {
+            self.devices
+                .record_for_device(device_id)
+                .map(|record| record.filter(net::devices::DeviceRecord::is_paired))
+        };
+        let from = paired(source.grant.recipient_device_id)?
+            .ok_or_else(|| denied("the transferring device is not paired with this host"))?;
+        let to = paired(params.to_device_id)?
+            .ok_or_else(|| denied("the receiving device is not paired with this host"))?;
+        let to_keys = to.public_keys().ok_or_else(|| {
+            denied("this host does not hold all four keys of the receiving device")
+        })?;
+        let actions = crate::sharing::transfer::transferable_actions(&source.grant);
+        if actions.is_empty() {
+            return Err(denied(
+                "the transferring grant carries nothing to hand over",
+            ));
+        }
+        let plan = kr_protocol::confirmation::TransferControlPlan {
+            environment_id: self.paths.environment_id(),
+            session_id: params.session_id,
+            source_grant_id: source.grant.grant_id,
+            parent_grant_id: source.grant.parent_grant_id,
+            issuer_device_id: source.grant.issuer_device_id,
+            from_device_id: from.device_id,
+            from_device_name: from.device_name.clone(),
+            to_device_id: to.device_id,
+            to_device_name: to.device_name.clone(),
+            to_keys,
+            to_key_revision: to.device_key_revision,
+            new_grant_id: Self::transfer_identity(actor_id, action_id),
+            environment_selector: source.grant.environment_selector.clone(),
+            actions,
+            history: source.grant.history.clone(),
+            expiry: source.grant.expiry,
+            organisation: source.grant.organisation,
+        };
+        crate::sharing::transfer::check_transfer(&plan, &source.grant)?;
+        Ok(plan)
     }
 
     /// Revokes a device, every grant it holds, and everything they were being used for.
@@ -1007,6 +1161,19 @@ impl Controller {
             kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
             kr_protocol::ids::InvitationId::new(Self::derived_identity(action, b"invitation")),
         )
+    }
+
+    /// The identity of the grant a transfer writes, derived from the actor that performs it and
+    /// its action, so the plan an owner confirms names it before the action exists, and a retry
+    /// finds it.
+    pub(super) fn transfer_identity(
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> kr_protocol::ids::GrantId {
+        kr_protocol::ids::GrantId::new(Self::derived_identity(
+            action_id.get(),
+            format!("transfer/{}", actor_id.as_str()).as_bytes(),
+        ))
     }
 
     /// One identity derived from an action identifier and a purpose.

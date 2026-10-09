@@ -1332,12 +1332,18 @@ impl GrantDirectory {
     ///
     /// Returns [`ControllerError::PermissionDenied`] when the source is not this host's to
     /// transfer at the moment the transaction reads it.
+    ///
+    /// The replacement takes the continuous-clock deadline recorded for the source in this boot,
+    /// so it never outlasts the grant it replaces however the wall clock has moved. When an action
+    /// performs the transfer, `claim` is its hold: what the transfer withdrew is written beside the
+    /// claim in the same commit ([`Self::recorded_withdrawal`]).
     pub fn transfer(
         &self,
         source_grant_id: GrantId,
         replacement: &GrantRecord,
         now_ms: u64,
         check: impl FnOnce(&GrantRecord) -> Result<()>,
+        claim: Option<&ClaimHold>,
     ) -> Result<GrantRevocation> {
         let encoded = kr_cbor::to_canonical_vec(&replacement.grant)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -1381,12 +1387,27 @@ impl GrantDirectory {
             }
             check(&source)?;
             write_grant(connection, replacement, &encoded)?;
-            Self::revoke_within(
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO grant_deadlines (grant_id, boot_value, deadline_boot_ms)
+                     SELECT ?2, boot_value, deadline_boot_ms FROM grant_deadlines
+                      WHERE grant_id = ?1",
+                    params![
+                        source_grant_id.get().as_bytes().as_slice(),
+                        replacement.grant.grant_id.get().as_bytes().as_slice(),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            let revocation = Self::revoke_within(
                 connection,
                 source_grant_id,
                 now_ms,
                 &format!("the transfer of control away from grant {source_grant_id}"),
-            )
+            )?;
+            if let Some(hold) = claim {
+                record_withdrawal(connection, hold, &revocation.revoked)?;
+            }
+            Ok(revocation)
         });
         self.after_effect(transferred, ran_out.get())
     }

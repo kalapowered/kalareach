@@ -639,6 +639,27 @@ impl Controller {
                     ));
                 }
             }
+            // So does a transfer of its control.
+            Method::GrantTransfer => {
+                let named = mutation
+                    .target
+                    .session_id
+                    .as_ref()
+                    .copied()
+                    .ok_or_else(|| {
+                        ControllerError::InvalidArgument(format!(
+                            "{} names the session whose control it hands over",
+                            entry.name
+                        ))
+                    })?;
+                let params: kr_protocol::sharing::GrantTransferParams = parse(&mutation.params)?;
+                if params.session_id != named {
+                    return Err(ControllerError::InvalidArgument(
+                        "the request's target and its parameters name different sessions"
+                            .to_owned(),
+                    ));
+                }
+            }
             // A revocation acts on a grant or a device, both of which belong to this host rather
             // than to one session: a grant can cover several sessions, and a device holds several
             // grants. A request that named a session here would be asking for a revocation scoped
