@@ -7,18 +7,20 @@
 //! host adds is the bytes the package hash names: the host reads it only from the verified
 //! manifest, never from anything that describes the installation. Asking for it is the
 //! `command_integration.launch` capability, which the owner confirms on every release. The plan an
-//! installation or a grant is confirmed against holds the capability names and the exact package
-//! hash, which covers the declaration, and not [`CommandIntegration::statement`], which lists the
-//! command, every flag and every variable exactly, so no confirmation shows it.
+//! installation is confirmed against holds the capability names, the exact package hash, which
+//! covers the declaration, and, when the grant holds the capability,
+//! [`CommandIntegration::statement`], which lists the command, every flag, every variable and the
+//! application server's whole argument vector exactly, so an owner device shows it before the
+//! integration is granted.
 //!
-//! A declaration may also name a **backend**: an application whose terminal speaks to a server
-//! rather than to its own program (Codex's `--remote` terminal and its App Server). A host that
-//! runs backends starts that server as the session's backend, from the executable the shell
-//! resolved for the command and the arguments declared here, and replaces the flag element
-//! [`GATEWAY_PLACEHOLDER`], once the launch is committed, with the address of the gateway the
-//! terminal connects to. The integration applies only to a plain launch of the terminal: a launch
+//! A declaration may also name an **application server**: an application whose terminal speaks to
+//! a server rather than to its own program (Codex's `--remote` terminal and its App Server). What
+//! the declaration asks of a host that runs such a server is to start it from the executable the
+//! shell resolved for the command, with the arguments declared here, and to replace the flag
+//! element [`GATEWAY_PLACEHOLDER`], once the launch is committed, with the address at which the
+//! terminal reaches it. The integration applies only to a plain launch of the terminal: a launch
 //! that types an option, or whose first word is not one the declaration lists, runs as typed,
-//! because the server would not receive what was typed. A host that runs no backend runs the
+//! because the server would not receive what was typed. A host that runs no such server runs the
 //! command as typed.
 //!
 //! What a declaration may say is closed:
@@ -60,6 +62,10 @@ pub const MAX_LAUNCHING_WORDS: usize = 8;
 
 /// The longest one such word may be, in bytes.
 pub const MAX_LAUNCHING_WORD_BYTES: usize = 32;
+
+/// The most characters [`CommandIntegration::statement`] may take, the bound an owner's device
+/// shows it within.
+pub const MAX_STATEMENT_CHARS: usize = 4000;
 
 /// The text a flag holds, as a whole element, where the host writes the address of the gateway the
 /// terminal connects to.
@@ -109,24 +115,25 @@ pub struct CommandIntegration {
     pub variables: Vec<IntegrationVariable>,
     /// What the package says its integration does, in its own words.
     pub grant_statement: Summary,
-    /// The backend the worker starts for the integrated invocation, where the application's
-    /// terminal speaks to a server.
+    /// The application server the terminal speaks to, where the application has one.
     ///
-    /// A package that declares none leaves the member out, so a manifest written before the
-    /// member existed reads and hashes exactly as it did.
+    /// It states what the declaration asks of a host that runs such a server: the arguments the
+    /// command's own program is started with to make it, and which launches it serves. A host that
+    /// runs none runs the command as typed. A package that declares none leaves the member out, so
+    /// a manifest written before the member existed reads and hashes exactly as it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<IntegrationBackend>,
 }
 
-/// The backend a command integration starts.
+/// The application server a command integration declares for the terminal to speak to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct IntegrationBackend {
-    /// The arguments the application's own executable is started with to make the backend, in
+    /// The arguments the application's own executable is started with to make the server, in
     /// order, each one argument element. The executable is the one the shell resolved for the
     /// command; a package cannot name another.
     pub arguments: Vec<String>,
-    /// The words that may follow the command name for a launch the backend is started for.
+    /// The words that may follow the command name for a launch the server is declared for.
     ///
     /// A launch whose first word is absent, or one of these, and that types no option, is a plain
     /// launch of the terminal. Any other launch (a subcommand that is not a terminal, an option,
@@ -135,8 +142,8 @@ pub struct IntegrationBackend {
 }
 
 impl IntegrationBackend {
-    /// Returns why a launch typed as `typed`, the command name first, is not one the backend is
-    /// started for, where it is not.
+    /// Returns why a launch typed as `typed`, the command name first, is not one the declaration
+    /// applies to, where it is not.
     ///
     /// The reason names the element and what the declaration allows, and a caller ends it with
     /// what follows from it: the invocation runs as typed.
@@ -144,12 +151,12 @@ impl IntegrationBackend {
     pub fn refuses(&self, typed: &[String]) -> Option<String> {
         let mut rest = typed.iter().skip(1);
         if let Some(option) = typed.iter().skip(1).find(|word| word.starts_with('-')) {
-            // An option's value can be anything a person typed, so only its name is repeated.
-            let name = option.split('=').next().unwrap_or(option);
+            // What follows a dash can be anything a person typed (a value, a path, a prompt), so
+            // only a plain option's own name is repeated.
+            let what = option_name(option).map_or_else(|| "an option".to_owned(), quoted);
             return Some(format!(
-                "{} is an option, and the gateway serves a launch that types none, because the \
-                 backend this session starts does not receive it",
-                quoted(name)
+                "{what} is typed, and the integration applies only to a launch that types no \
+                 option, because what is typed for the terminal does not reach the server"
             ));
         }
         let first = rest.next()?;
@@ -171,13 +178,36 @@ impl IntegrationBackend {
         // A word that is not a bare word may be a prompt, which is repeated nowhere.
         if launching_word_problem(first).is_some() {
             return Some(format!(
-                "the first word typed is not a launch the gateway serves; it serves {serves}"
+                "the first word typed is not one the integration applies to; it applies to \
+                 {serves}"
             ));
         }
         Some(format!(
-            "{} is not a launch the gateway serves; it serves {serves}",
+            "{} is not a word the integration applies to; it applies to {serves}",
             quoted(first)
         ))
+    }
+}
+
+/// The longest option name a reason repeats, in bytes.
+const MAX_OPTION_NAME_BYTES: usize = 64;
+
+/// Returns the name of a plain option, `-x` or `--name`, where `word` is one and holds nothing
+/// else; a value attached with `=` is left off.
+fn option_name(word: &str) -> Option<&str> {
+    let name = word.split('=').next().unwrap_or(word);
+    let named = |text: &str, allowed: fn(&u8) -> bool| {
+        !text.is_empty() && text.len() <= MAX_OPTION_NAME_BYTES && text.bytes().all(|b| allowed(&b))
+    };
+    match name.strip_prefix("--") {
+        Some(long) => named(long, |b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')
+        })
+        .then_some(name),
+        None => name
+            .strip_prefix('-')
+            .is_some_and(|short| short.len() == 1 && named(short, u8::is_ascii_alphanumeric))
+            .then_some(name),
     }
 }
 
@@ -196,7 +226,9 @@ impl CommandIntegration {
     ///
     /// Every flag is written as a JSON string, in the order it is added, and every variable as its
     /// name and its value as a JSON string. Nothing is shortened: every flag and every variable
-    /// the host adds is in it.
+    /// the host adds is in it, and so is every argument of the application server the declaration
+    /// names. The text is one plain line: a character a person could not see or tell from a space
+    /// is written as an escape.
     #[must_use]
     pub fn statement(&self) -> String {
         let mut statement = format!("Runs {} in KalaReach sessions", quoted(&self.command));
@@ -229,8 +261,8 @@ impl CommandIntegration {
         }
         if let Some(backend) = &self.backend {
             statement.push_str(&format!(
-                " It also starts the program {} names, with these arguments, as the session's \
-                 backend, in this order: {}.",
+                " It also declares a server for the terminal to speak to, which a host that runs \
+                 one makes from the same program, {}, with these arguments, in this order: {}.",
                 quoted(&self.command),
                 backend
                     .arguments
@@ -240,8 +272,8 @@ impl CommandIntegration {
                     .join(" ")
             ));
             statement.push_str(&format!(
-                " {GATEWAY_PLACEHOLDER} is replaced by the address of the gateway this host \
-                 runs for that backend, which the terminal connects to."
+                " {GATEWAY_PLACEHOLDER} stands for the address at which the terminal reaches that \
+                 server."
             ));
             statement.push_str(&if backend.launching_words.is_empty() {
                 " All of this applies only when the command is typed alone; any other \
@@ -321,6 +353,13 @@ impl CommandIntegration {
             );
         }
         self.backend_problems(&mut problems);
+        let length = self.statement().chars().count();
+        if length > MAX_STATEMENT_CHARS {
+            problems.push(format!(
+                "the statement of what the integration does is {length} characters, over the \
+                 {MAX_STATEMENT_CHARS} an owner is shown whole"
+            ));
+        }
         problems
     }
 
@@ -507,8 +546,23 @@ fn flag_problem(flag: &str) -> Option<String> {
 }
 
 /// Writes text as a JSON string, which shows every character it holds.
+///
+/// A character that is hidden, that reorders text, or that is a space other than the plain one
+/// is written as its escape, so what comes back is never more than one visible line.
 fn quoted(text: &str) -> String {
-    serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"))
+    let json = serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
+    let mut written = String::with_capacity(json.len());
+    for character in json.chars() {
+        if is_forbidden_text_char(character) || (character.is_whitespace() && character != ' ') {
+            let mut units = [0_u16; 2];
+            for unit in character.encode_utf16(&mut units) {
+                written.push_str(&format!("\\u{unit:04x}"));
+            }
+        } else {
+            written.push(character);
+        }
+    }
+    written
 }
 
 #[cfg(test)]
@@ -651,7 +705,9 @@ mod tests {
         let hidden = integration("agent", &["--a\u{200B}"], &[]).problems(&rules);
         assert_eq!(hidden.len(), 1, "{hidden:?}");
         assert!(hidden[0].contains("U+200B"), "{hidden:?}");
-        let longest = "f".repeat(MAX_FLAG_BYTES);
+        // A flag has its own limit, and with the rest of the statement it has to fit what an owner
+        // is shown whole.
+        let longest = "f".repeat(MAX_STATEMENT_CHARS - 200);
         assert!(
             integration("agent", &[&longest], &[])
                 .problems(&rules)
@@ -883,17 +939,31 @@ mod tests {
         }
         // Each refusal names the element or the word, so the owner is told why it ran as typed.
         let reason = |words: &[&str]| backend.refuses(&typed(words)).expect("a refusal");
-        assert!(reason(&["codex", "-c", "x=y"]).contains("\"-c\" is an option"));
-        assert!(reason(&["codex", "resume", "--last"]).contains("\"--last\" is an option"));
-        assert!(reason(&["codex", "exec", "task"]).contains("\"exec\" is not a launch"));
+        assert!(reason(&["codex", "-c", "x=y"]).contains("\"-c\" is typed"));
+        assert!(reason(&["codex", "resume", "--last"]).contains("\"--last\" is typed"));
+        assert!(reason(&["codex", "exec", "task"]).contains("\"exec\" is not a word"));
         assert!(reason(&["codex", "x"]).contains("followed by \"resume\" or \"fork\""));
-        // What a person typed is not copied into the reason beyond the option's own name and a bare
-        // word: a value attached to an option, and a prompt, stay out of it.
+        // What a person typed is not copied into the reason beyond a plain option's own name and a
+        // bare word: a value attached to an option, a short option with its value joined to it,
+        // and a prompt that starts with a dash, stay out of it.
         let option = reason(&["codex", "--api-key=hunter2"]);
         assert!(
             option.contains("\"--api-key\"") && !option.contains("hunter2"),
             "{option}"
         );
+        for typed_option in [
+            "-C/home/me/secret",
+            "- fix the leak in ~/secret",
+            "-xsecret",
+            "--",
+            "-",
+        ] {
+            let said = reason(&["codex", typed_option]);
+            assert!(
+                said.starts_with("an option is typed") && !said.contains("secret"),
+                "{typed_option:?}: {said}"
+            );
+        }
         let prompt = reason(&["codex", "fix the failing test in /home/me/secret"]);
         assert!(
             !prompt.contains("secret") && prompt.contains("first word typed"),
@@ -924,7 +994,13 @@ mod tests {
             statement.contains("\"app-server\" \"--listen\" \"stdio://\""),
             "every backend argument is in the statement, in order: {statement}"
         );
-        assert!(statement.contains("{gateway} is replaced by the address of the gateway"));
+        assert!(
+            statement.contains("{gateway} stands for the address at which the terminal reaches")
+        );
+        assert!(
+            !statement.contains("starts") && !statement.contains("this host runs"),
+            "the statement says what the declaration asks, not what this host does: {statement}"
+        );
         assert!(
             statement.contains(
                 "only when the command is typed alone or followed by \"resume\" or \"fork\" and \
@@ -936,7 +1012,40 @@ mod tests {
         assert!(
             !integration("agent", &["--flag"], &[])
                 .statement()
-                .contains("backend")
+                .contains("server")
+        );
+    }
+
+    /// The statement an owner reads is one plain line whatever a flag holds, and one longer than
+    /// an owner is shown whole is a finding.
+    #[test]
+    fn the_statement_is_one_plain_line_within_the_bound_an_owner_is_shown() {
+        let rules = [rule("agent", &[])];
+        let spaced = integration("agent", &["--a\u{00A0}b", "--c\u{3000}d"], &[]).statement();
+        assert!(
+            spaced.contains("--a\\u00a0b") && spaced.contains("--c\\u3000d"),
+            "{spaced}"
+        );
+        assert!(
+            !spaced
+                .chars()
+                .any(|character| character.is_whitespace() && character != ' '),
+            "{spaced}"
+        );
+        let half = "x".repeat(MAX_STATEMENT_CHARS / 2);
+        let over = integration("agent", &["--a", &half, &half], &[]);
+        assert!(over.statement().chars().count() > MAX_STATEMENT_CHARS);
+        assert!(
+            over.problems(&rules)
+                .iter()
+                .any(|problem| problem.contains("an owner is shown whole")),
+            "{:?}",
+            over.problems(&rules)
+        );
+        assert!(
+            integration("agent", &["--a"], &[])
+                .problems(&rules)
+                .is_empty()
         );
     }
 }
