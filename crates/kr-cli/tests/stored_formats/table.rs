@@ -66,6 +66,19 @@ pub fn known() -> Vec<Known> {
         is: KnownIs::Source(file),
         pinned,
     };
+
+    let words = |store, name, words: Vec<String>, pinned| Known {
+        store,
+        name,
+        is: KnownIs::Words(words),
+        pinned,
+    };
+    let literal = |words: &[&str]| {
+        words
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect::<Vec<_>>()
+    };
     vec![
         // The update record: the release names, and the update channel's root metadata, which the
         // `tough` crate defines and its locked version stands for.
@@ -210,43 +223,131 @@ pub fn known() -> Vec<Known> {
             "PushUrgency",
             "e299a0789eb8e4f4c26d886628cc8d967bfdb5bee1f82f3ef89e3c95d6a36bd0",
         ),
-        known_protocol::<push::PushSuppressionReason>(
+        words(
             "delivery",
-            "PushSuppressionReason",
-            "d8cf6277ce4f76936cb45e5b5ce8856c6f6fdf8cb314706f5db45085e1490ef3",
+            "push suppression reasons",
+            literal(&["burst", "sustained"]),
+            "de82eba869b9dbf098a23a0a921d19ed77c21cbc7d4d563d1ca93d0085cc52a8",
         ),
-        Known {
-            store: "delivery",
-            name: "event sources",
-            is: KnownIs::Words(
-                kr_delivery::journal::EventSource::ALL
-                    .iter()
-                    .map(|source| source.as_str().to_owned())
-                    .collect(),
-            ),
-            pinned: "e59eb540e3a179fa14b6a3c0c3e55665967ad3a9d4a4be710fb096e3adf97ab2",
-        },
-        Known {
-            store: "delivery",
-            name: "delivery states",
-            is: KnownIs::Words(
-                kr_delivery::journal::DeliveryState::ALL
-                    .iter()
-                    .map(|state| state.as_str().to_owned())
-                    .collect(),
-            ),
-            pinned: "e12dd6b5cb95d82e6e30bc54b206ad3fea8f00076b827fe76a64a5e7338d21b7",
-        },
+        words(
+            "delivery",
+            "event sources",
+            kr_delivery::journal::EventSource::ALL
+                .iter()
+                .map(|source| source.as_str().to_owned())
+                .collect(),
+            "e59eb540e3a179fa14b6a3c0c3e55665967ad3a9d4a4be710fb096e3adf97ab2",
+        ),
+        words(
+            "delivery",
+            "delivery states",
+            kr_delivery::journal::DeliveryState::ALL
+                .iter()
+                .map(|state| state.as_str().to_owned())
+                .collect(),
+            "e12dd6b5cb95d82e6e30bc54b206ad3fea8f00076b827fe76a64a5e7338d21b7",
+        ),
+        words(
+            "delivery",
+            "destination kinds",
+            kr_delivery::destination::DestinationKind::ALL
+                .iter()
+                .map(|kind| kind.as_str().to_owned())
+                .collect(),
+            "3123a85b676f90000801236159af1bbc579cb2d26f772618f5a946dae158c050",
+        ),
+        words(
+            "delivery",
+            "next actions",
+            kr_delivery::push::NextAction::ALL
+                .iter()
+                .map(|next| next.as_str().to_owned())
+                .collect(),
+            "dc39b51d2095b584734fb1a33503909b1bace98db1606d43d273163b64b52305",
+        ),
         // The attention store: the words it matches stored text against.
-        known_protocol::<identity::ProcessStartSource>(
+        words(
             "attention",
-            "ProcessStartSource",
-            "9cc04dc86b97f91b55155fe61811bbbc9063773871311035d7fa5bf7c2fe15e3",
+            "process start sources",
+            literal(&[
+                "linux_proc_stat",
+                "macos_proc_bsd_info",
+                "windows_process_creation_time",
+                "windows_process_start_seconds",
+            ]),
+            "15d202f8f72fe6e3a3183e0454462e53a19ae06445785daa887695fb7b361cc9",
         ),
-        known_protocol::<attention::ReviewSubject>(
+        words(
             "attention",
-            "ReviewSubject",
-            "c57b88a504a5530ccca58cb6eb9b7b24a940dc08d93cb14fc14de069413db053",
+            "review subject kinds",
+            literal(&["turn", "change_set"]),
+            "b34a38aa076f20a913ec857d821cfb6f4ff9a75f9e2c3cc462faaf30cabab7de",
+        ),
+        words(
+            "attention",
+            "text kinds",
+            literal(&["host", "record"]),
+            "db5e9656329786e081f32a0daf648491c53b7d87bed7d8a49ec5437e68b1ae0b",
+        ),
+        words(
+            "attention",
+            "automation subject kinds",
+            literal(&["workflow", "chain"]),
+            "b166c0fbd1c39270bdf0c9397d28df767d53363579008941ac96c9bc461c1f91",
+        ),
+        words(
+            "attention",
+            "rules",
+            attention::AttentionRule::ALL
+                .iter()
+                .map(|word| word.as_str().to_owned())
+                .collect(),
+            "519c73683ee26b59fd65693a407c92add1673c029b372a0f55d6ab5d779ffcca",
+        ),
+        words(
+            "attention",
+            "levels",
+            attention::AttentionLevel::ALL
+                .iter()
+                .map(|word| word.as_str().to_owned())
+                .collect(),
+            "a94a1c95f39f0a6395f5eaf7256efe68c942f806129f494c7d0b6bb3c87c03fd",
+        ),
+        words(
+            "attention",
+            "routings",
+            attention::AttentionRouting::ALL
+                .iter()
+                .map(|word| word.as_str().to_owned())
+                .collect(),
+            "b48e4399501817c47f5b4c88c6b07705a7dd39c94f91be5bf0b193e495514bef",
+        ),
+        words(
+            "attention",
+            "notification states",
+            attention::NotificationState::ALL
+                .iter()
+                .map(|word| word.as_str().to_owned())
+                .collect(),
+            "09ebe720c0e2dd869bf8de29a9da7d3baf6c8e6cdf1bb4949a77808cdfc95855",
+        ),
+        words(
+            "attention",
+            "sources",
+            attention::AttentionSource::ALL
+                .iter()
+                .map(|word| word.as_str().to_owned())
+                .collect(),
+            "791ebfa23cf9f7cc8a70383a61166c41b573460ea570d2178bc3a333f387ee25",
+        ),
+        words(
+            "attention",
+            "semantic change kinds",
+            attention::SemanticChangeKind::ALL
+                .iter()
+                .map(|word| word.as_str().to_owned())
+                .collect(),
+            "61c6654c47ba6b0a774eb233be4c99d8aeec089608bc720e6deb1fd33a17eb9c",
         ),
         // The environment's presence record.
         known_protocol::<identity::EnvironmentPresence>(

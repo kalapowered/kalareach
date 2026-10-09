@@ -10005,8 +10005,12 @@ fn no_type_a_store_keeps_is_undeclared() {
         "a type a store keeps is neither declared nor known:\n{}",
         undeclared.join("\n")
     );
-    let changed =
-        stored_formats::known_that_changed(&table, &known).expect("the known types are read");
+    let answers: Vec<&str> = stored_formats::table::retained_answers()
+        .iter()
+        .map(|(_, answer)| *answer)
+        .collect();
+    let changed = stored_formats::known_that_changed(&table, &known, &answers)
+        .expect("the known types are read");
     assert!(changed.is_empty(), "{}", changed.join("\n"));
 
     // The answers the registry keeps.
@@ -10057,7 +10061,11 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
         .find(|line| line.name == "EventKey")
         .expect("listed")
         .pinned = "0000";
-    let found = stored_formats::known_that_changed(&table, &moved).expect("read");
+    let answers: Vec<&str> = stored_formats::table::retained_answers()
+        .iter()
+        .map(|(_, answer)| *answer)
+        .collect();
+    let found = stored_formats::known_that_changed(&table, &moved, &answers).expect("read");
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].starts_with("EventKey "), "{found:?}");
 
@@ -10072,7 +10080,7 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
             "0000",
         ),
     );
-    let found = stored_formats::known_that_changed(&table, &stale).expect("read");
+    let found = stored_formats::known_that_changed(&table, &stale, &answers).expect("read");
     assert!(
         found
             .iter()
@@ -10081,6 +10089,18 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
     );
     assert!(
         found.iter().any(|said| said.contains("no-such-store")),
+        "{found:?}"
+    );
+
+    // A known line for a type the store keeps nothing that holds.
+    let mut unheld = stored_formats::table::known();
+    unheld.push(stored_formats::known_protocol::<
+        kr_protocol::push::PushRatePolicy,
+    >("privacy", "PushRatePolicy", "0000"));
+    let found = stored_formats::known_that_changed(&table, &unheld, &answers).expect("read");
+    assert!(
+        found.iter().any(|said| said.contains("PushRatePolicy")
+            && said.contains("nothing the store keeps holds it")),
         "{found:?}"
     );
 
@@ -10103,6 +10123,155 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
     );
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("names that type nowhere"), "{found:?}");
+}
+
+/// KR-REQ-26.10: a type a stored item holds is followed to the file that defines it, and what cannot
+/// be followed is reported, never skipped. Two types of one name in two files are two types, a `use`
+/// that renames or groups or globs is followed, and an alias, a name nothing brings in, a type
+/// defined twice in one file, a trait object and a type made by a macro are each reported.
+#[test]
+fn a_held_type_is_followed_to_the_file_that_defines_it_and_what_cannot_be_followed_is_reported() {
+    use stored_formats::resolve::{Origin, Type, Workspace};
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let write = |path: &str, text: &str| {
+        let path = directory.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("directories");
+        std::fs::write(path, text).expect("a source");
+    };
+    write(
+        "crates/kr-protocol/src/ids.rs",
+        "macro_rules! ids {}\nids! {\n    SessionId,\n}\n",
+    );
+    write(
+        "crates/kr-protocol/src/scalars.rs",
+        "pub struct U64(u64);\n",
+    );
+    write(
+        "crates/kr-protocol/src/lib.rs",
+        "pub mod ids;\npub mod scalars;\n",
+    );
+    write(
+        "crates/kr-a/src/lib.rs",
+        "pub mod holder;\npub mod one;\npub mod two;\npub use one::Notice as Renamed;\n",
+    );
+    write(
+        "crates/kr-a/src/one.rs",
+        "pub struct Notice {}\npub struct Plain {}\n",
+    );
+    write("crates/kr-a/src/two.rs", "pub struct Notice {}\n");
+    write(
+        "crates/kr-a/src/holder.rs",
+        r#"
+use crate::one::{Notice, Plain as Simple};
+use crate::two::Notice as Other;
+use kr_protocol::ids::SessionId;
+use other_crate::schema::Signed;
+use super::one::*;
+
+pub struct Holds {
+    a: Notice,
+    b: Other,
+    c: Option<Vec<Notice>>,
+    d: (u8, String, SessionId),
+    e: &'static [Simple],
+    f: std::collections::BTreeMap<String, crate::two::Notice>,
+    g: crate::Renamed,
+    h: Signed<other_crate::schema::Root>,
+}
+
+pub enum Variants {
+    A(Notice),
+    B { inside: Other },
+}
+
+pub struct Opaque {
+    a: Box<dyn Fn()>,
+}
+
+pub struct Aliased {
+    a: Short,
+}
+type Short = Notice;
+
+pub struct Unbound {
+    a: Missing,
+}
+
+pub struct Twice {
+    a: u8,
+}
+mod inner {
+    pub struct Twice {
+        b: u8,
+    }
+}
+
+pub struct Made {
+    a: made!(),
+}
+"#,
+    );
+    let workspace = Workspace::at(directory.path().to_path_buf()).expect("the workspace");
+    let in_a = |file: &str| Origin::Defined(format!("crates/kr-a/src/{file}"));
+    let notice = |file: &str| Type {
+        origin: in_a(file),
+        name: "Notice".to_owned(),
+    };
+
+    let held = workspace
+        .held_by("crates/kr-a/src/holder.rs", "Holds")
+        .expect("everything it holds is followed");
+    // Two types of one name are two types, a rename is followed to the original, and a re-export
+    // to the file that defines it.
+    assert!(held.contains(&notice("one.rs")), "{held:?}");
+    assert!(held.contains(&notice("two.rs")), "{held:?}");
+    assert!(
+        held.contains(&Type {
+            origin: in_a("one.rs"),
+            name: "Plain".to_owned()
+        }),
+        "{held:?}"
+    );
+    assert!(
+        held.contains(&Type {
+            origin: Origin::Scalar,
+            name: "SessionId".to_owned()
+        }),
+        "{held:?}"
+    );
+    assert!(
+        held.contains(&Type {
+            origin: Origin::External("other_crate".to_owned()),
+            name: "Signed".to_owned()
+        }),
+        "{held:?}"
+    );
+    assert!(
+        held.iter()
+            .all(|held| !matches!(&held.origin, Origin::Defined(file) if file.ends_with("lib.rs"))),
+        "a re-export is followed to the file that defines the type: {held:?}"
+    );
+    let variants = workspace
+        .held_by("crates/kr-a/src/holder.rs", "Variants")
+        .expect("the fields of a variant are followed");
+    assert!(variants.contains(&notice("one.rs")) && variants.contains(&notice("two.rs")));
+
+    for (item, said) in [
+        ("Opaque", "trait object"),
+        ("Aliased", "alias"),
+        ("Unbound", "neither defined"),
+        ("Twice", "exactly once"),
+        ("Made", "macro"),
+    ] {
+        let problems = workspace
+            .held_by("crates/kr-a/src/holder.rs", item)
+            .expect_err(item);
+        assert!(
+            problems.iter().any(|problem| problem.contains(said)),
+            "{item}: {problems:?}"
+        );
+    }
 }
 
 /// KR-REQ-26.10: a state root's files are all named. After a daemon has run and a session has been
