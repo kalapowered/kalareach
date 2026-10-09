@@ -126,6 +126,8 @@ pub fn table() -> Vec<Store> {
                 protocol::<sharing::InvitationPreview>("InvitationPreview"),
                 protocol::<sharing::GrantCreateResult>("GrantCreateResult"),
                 protocol::<sharing::RevocationResult>("RevocationResult"),
+                protocol::<sharing::GrantRedeemResult>("GrantRedeemResult"),
+                protocol::<sharing::GrantTransferResult>("GrantTransferResult"),
                 protocol::<sharing::DeviceKeysCompleteResult>("DeviceKeysCompleteResult"),
                 protocol::<sharing::DevicePreviewKeyUpdateResult>("DevicePreviewKeyUpdateResult"),
                 protocol::<machine::MachineStepResult>("MachineStepResult"),

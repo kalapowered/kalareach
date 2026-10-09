@@ -371,10 +371,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 9,
+        "version": 10,
         "migrates_from": 1
       },
-      "digest": "40f57d367b542f15250c11b897cc931d55cefcec030269e9b6f66a71d43e9a78",
+      "digest": "f61594783ede62a455b5f4c74d12c7acbf089932d806f294d16f17b0b7823b2d",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -383,6 +383,8 @@
         "InvitationPreview",
         "GrantCreateResult",
         "RevocationResult",
+        "GrantRedeemResult",
+        "GrantTransferResult",
         "DeviceKeysCompleteResult",
         "DevicePreviewKeyUpdateResult",
         "MachineStepResult",
