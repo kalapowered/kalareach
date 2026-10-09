@@ -16,6 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use connect_proxy::ConnectProxy;
+use kr_controller::config::Outbound;
 use kr_controller::push::transport::{DeliveryTransports, ManagedTransports};
 use kr_controller::service::net::NetworkSetup;
 use kr_controller::service::net::rendezvous::Rendezvous;
@@ -42,8 +43,8 @@ async fn a_daemon_goes_through_the_proxy_its_document_selected_when_it_started()
     let unselected = kr_ipc::testing::TempHost::create();
     let controller = start_controller(&unselected.environment(), unselected.environment_id()).await;
     assert_eq!(
-        controller.started_proxy().expect("a usable selection"),
-        None,
+        controller.started_outbound().expect("a usable selection"),
+        Outbound::Direct,
         "a document that names no proxy selects none, whatever the environment says"
     );
     drop(controller);
@@ -57,16 +58,16 @@ async fn a_daemon_goes_through_the_proxy_its_document_selected_when_it_started()
     let controller = start_controller(&environment, selected.environment_id()).await;
     let named: ProxyUrl = NAMED_PROXY.parse().expect("a proxy address");
     assert_eq!(
-        controller.started_proxy().expect("a usable selection"),
-        Some(named.clone())
+        controller.started_outbound().expect("a usable selection"),
+        Outbound::Through(named.clone())
     );
 
     document.revision = 2;
     document.network.proxy_url = Nullable::null();
     write_document(&environment, &document);
     assert_eq!(
-        controller.started_proxy().expect("a usable selection"),
-        Some(named),
+        controller.started_outbound().expect("a usable selection"),
+        Outbound::Through(named),
         "an edit made while the daemon runs applies at its next start"
     );
     drop(controller);
@@ -190,7 +191,9 @@ async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivery_goes_through_the_proxy_the_daemon_started_with() {
     let proxy = ConnectProxy::refusing(502).await;
-    let transports = ManagedTransports::new(Some(proxy.url.parse().expect("a proxy address")));
+    let transports = ManagedTransports::new(Outbound::Through(
+        proxy.url.parse().expect("a proxy address"),
+    ));
     let hook = listening();
     let port = hook.local_addr().expect("an address").port();
     let origin = format!("http://127.0.0.1:{port}");
@@ -203,6 +206,85 @@ async fn delivery_goes_through_the_proxy_the_daemon_started_with() {
         .expect("the message ends");
     assert_eq!(proxy.asked(), vec![format!("POST {address} HTTP/1.1")]);
     heard_nothing(&hook);
+}
+
+/// KR-REQ-26.13, KR-REQ-26.14: a daemon that starts over a configuration document it cannot use
+/// leaves no route out. The proxy the document may have named is not known, and nothing goes
+/// around it: the delivery the daemon attaches makes no transport, so a webhook address, which a
+/// direct route would reach, hears nothing, and neither does the proxy named before. A document put
+/// right afterwards changes nothing until the daemon starts again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
+    let proxy = ConnectProxy::refusing(502).await;
+    let documents: [(&str, Vec<u8>, u32); 4] = [
+        (
+            "a version it does not know",
+            br#"{"version": 99}"#.to_vec(),
+            0o600,
+        ),
+        (
+            "a member the schema lacks",
+            br#"{"version": 2, "not_a_member": 1}"#.to_vec(),
+            0o600,
+        ),
+        (
+            "permissions wider than owner-only",
+            br#"{"version": 2}"#.to_vec(),
+            0o644,
+        ),
+        ("a document too large", vec![b' '; 70_000], 0o600),
+    ];
+    for (what, bytes, mode) in documents {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let mut accepted = ConfigurationDocument::empty();
+        accepted.revision = 1;
+        accepted.network.proxy_url = Nullable::some(proxy.url.clone());
+        write_document(&environment, &accepted);
+        write_bytes(&environment, &bytes, mode);
+        let controller = start_controller(&environment, host.environment_id()).await;
+        let Outbound::Closed(refusal) = controller.started_outbound().expect("a route") else {
+            panic!("{what}: a document the daemon cannot use leaves a route");
+        };
+        assert!(
+            refusal.contains("config.json") && refusal.contains("cannot be used"),
+            "{what}: the refusal names the document: {refusal}"
+        );
+        controller
+            .attach_managed_delivery()
+            .expect("the shipped daemon attaches its delivery by this route");
+
+        let hook = listening();
+        let origin = format!(
+            "http://127.0.0.1:{}",
+            hook.local_addr().expect("an address").port()
+        );
+        let transports = ManagedTransports::new(controller.started_outbound().expect("a route"));
+        let refused = transports
+            .to(&GatewayOrigin::new(origin).expect("a loopback origin"))
+            .expect_err("no transport reaches the address");
+        assert!(refused.contains("config.json"), "{what}: {refused}");
+        heard_nothing(&hook);
+        assert!(
+            proxy.asked().is_empty(),
+            "{what}: and the proxy named before hears nothing"
+        );
+
+        // Put right, the document changes nothing until the daemon starts again.
+        write_document(&environment, &accepted);
+        assert!(
+            matches!(controller.started_outbound(), Ok(Outbound::Closed(_))),
+            "{what}: a daemon takes its route when it starts"
+        );
+        drop(controller);
+        let restarted = start_controller(&environment, host.environment_id()).await;
+        assert_eq!(
+            restarted.started_outbound().expect("a route"),
+            Outbound::Through(proxy.url.parse().expect("a proxy address")),
+            "{what}: and the next start takes the document's proxy"
+        );
+    }
 }
 
 /// A loopback address that is listened on and never answered: its origin, its authority, and the
@@ -246,6 +328,17 @@ fn write_document(environment: &kr_ipc::paths::EnvironmentPaths, document: &Conf
         kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
     )
     .expect("the document");
+}
+
+/// Replaces the configuration document with `bytes` of `mode`, whatever they are.
+#[cfg(unix)]
+fn write_bytes(environment: &kr_ipc::paths::EnvironmentPaths, bytes: &[u8], mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let path = kr_worker::config::document_path(environment);
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, bytes).expect("the document");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("its mode");
 }
 
 /// Starts a daemon in-process on `environment`, launching no worker.

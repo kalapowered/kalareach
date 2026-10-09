@@ -113,7 +113,8 @@ impl Controller {
         // A proxy the document selects and this host cannot read is never gone around; the error
         // names `network.proxy_url` itself.
         let proxy = self
-            .started_proxy()
+            .started_outbound()
+            .and_then(|route| route.proxy().map(|proxy| proxy.cloned()))
             .inspect_err(|error| unavailable(error))
             .ok()?;
         let transport = Arc::new(crate::managed_transport::ManagedTransport::new(
