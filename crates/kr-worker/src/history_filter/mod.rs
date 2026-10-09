@@ -427,11 +427,11 @@ impl ViewerScope {
 
     /// The reach a notice's lines are checked against.
     ///
-    /// A notice is about a condition first seen at or after the grant's start, and a grant with no
-    /// history bound is told of it whether or not it includes the live screen. So a scope with no
-    /// bound reaches what was produced from `from_ms` on, and nothing older, and a scope with a
-    /// bound keeps its bound. A live view of the same grant reaches less: [`Self::live_from`]
-    /// gives a scope without the live screen no bound, and so no retained content.
+    /// A grant with no history bound is told of a condition first seen at or after its start,
+    /// whether or not it includes the live screen. So a scope with no bound reaches what was
+    /// produced from `from_ms`, the grant's start, on, and nothing older, and a scope with a bound
+    /// keeps its bound. A live view reaches less only for a grant with neither a bound nor the
+    /// live screen: [`Self::live_from`] leaves that scope with no bound, which admits no content.
     #[must_use]
     pub fn reaching_from(self, from_ms: u64) -> Self {
         if self.lower_bound_ms.is_none() {

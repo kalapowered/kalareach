@@ -4164,7 +4164,7 @@ async fn an_external_message_under_a_grant_with_no_history_bound_leaves_nothing_
     environment._worker.ask("deploy-1", "Deploy the release?");
     for name in ["with-screen", "without-screen"] {
         let url = format!("https://hooks.example.test/in/{name}");
-        until("the webhook being posted to", || {
+        until(&format!("the {name} webhook being posted to"), || {
             environment
                 .gateway
                 .posted()
