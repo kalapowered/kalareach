@@ -1163,17 +1163,17 @@ impl RemoteConnection {
                         );
                     }
                     // The rights this request was decided with are the grant as this host's
-                    // policy and its configured ceiling leave it, and a delegation hands on no
-                    // more than that: a right the ceiling removed is not delegated, and the
-                    // session text a share's preview carries is not read for a device that may
-                    // not view the session.
+                    // policy leaves it: its configured ceiling, and an organisation's lease where
+                    // the grant carries one. A delegation hands on no more than that, so a right
+                    // either removed is not delegated, and the session text a share's preview
+                    // carries is not read for a device that may not view the session.
                     if !params.selection.actions().is_subset(&rights) {
                         return failure(
                             mutation.request_id,
                             ProtocolError::new(
                                 ErrorCode::PermissionDenied,
-                                "a delegation hands on no right that this host's configuration \
-                                 removes from the grant it is made from",
+                                "a delegation hands on no right that this host's policy removes \
+                                 from the grant it is made from",
                             ),
                         );
                     }
