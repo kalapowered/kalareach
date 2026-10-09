@@ -2927,14 +2927,18 @@ what is left, and waits two seconds more. On Windows the worker's job object hel
 whole tree and closed with the worker; the cleanup waits for that, and ends by handle only what is
 left. A worker that ran as a systemd service also ran in that service's control group, named from
 the reservation and unable to name anything else. The cleanup reads the group from the kernel, asks
-the manager to kill what it still holds, and reaches a process the worker never saw.
+the manager to kill what it still holds, and reaches a process the worker never saw. A recorded
+process that the group held and the manager's delivered kill found is listed as forced; a kill the
+cleanup stopped waiting for is not counted, so the flag is the host's best reading, and a process
+the manager ended that the worker never recorded is not listed.
 
 **What it cannot reach, and what a survivor means.** On macOS, a process that left the terminal's
 session, a process the worker started outside it and a process that began after the worker's last
 record are not found; on a Linux host with no service manager, a process that left the session
-after its parent had ended, a process the worker started outside the session and a process that
-began after the last record are not. There the record and the worker's own tree or terminal are
-all there is, and a recorded process that left the session is still stopped. Where a service's
+and lost its parent before an observation saw it (and what such a process starts), a process the
+worker started outside the session and a process that began after the last record are not. There
+the record and the worker's own tree or terminal are all there is, and a recorded process that
+left the session is still stopped. Where a service's
 control group is read, those three are reached by the group, and a process that moved itself to
 another service or scope is the one that is not found. A process that outlasts the attempt, such as
 one the platform will not let this host signal, is fenced rather than stopped: the worker that
