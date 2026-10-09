@@ -179,7 +179,12 @@ pub fn dimensions(dimensions: kr_protocol::session::Dimensions) -> Document {
 
 /// The kinds of resource a closure record says survived, as a worker and this host's daemon write
 /// them. Any other kind is replaced.
-const SURVIVING_KINDS: [&str; 3] = ["process", "unestablished", "unaccounted_worker"];
+const SURVIVING_KINDS: [&str; 4] = [
+    "process",
+    "unestablished",
+    "unaccounted_worker",
+    "left_for_a_daemon",
+];
 
 /// Renders a session's closure record, whole: how it closed, what it terminated and what survived
 /// it.
