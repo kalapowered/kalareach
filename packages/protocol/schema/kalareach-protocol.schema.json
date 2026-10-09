@@ -18839,7 +18839,7 @@
               "type": "null"
             }
           ],
-          "description": "The organisation's chain, when it has moved since the host last accepted one. A chain\nthat is not newer changes nothing, and the lease beside it is still judged against the\nkeys the host already holds. A newer chain that does not verify refuses the presentation."
+          "description": "The organisation's chain, when it has moved since the host last accepted one. A chain\nthat is not newer changes nothing, and the lease beside it is still judged against the\nkeys the host already holds. A newer chain that does not verify refuses the presentation.\nThe host keeps a newer chain only with the lease beside it: a presentation that is refused\nkeeps nothing, and the device presents the chain again with its next lease."
         },
         "lease": {
           "$ref": "#/$defs/MembershipLease",

@@ -15865,6 +15865,8 @@ export interface MembershipPresentParams {
    * The organisation's chain, when it has moved since the host last accepted one. A chain
    * that is not newer changes nothing, and the lease beside it is still judged against the
    * keys the host already holds. A newer chain that does not verify refuses the presentation.
+   * The host keeps a newer chain only with the lease beside it: a presentation that is refused
+   * keeps nothing, and the device presents the chain again with its next lease.
    */
   authority: PolicyAuthority | null
   lease: MembershipLease1
