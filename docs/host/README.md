@@ -2617,8 +2617,10 @@ refuses a proposed grant that requires an organisation the host is not enrolled 
 revision, or carries a right above what the organisation's owner role may hold, so an invitation
 cannot be issued for access that nothing could use. The owner device that confirms such an
 invitation, or a device being added under such a grant, is told that the grant answers to an
-organisation's membership. Where the prompt's line has room it also names the organisation and the
-enrolment revision, and the companion lists both in full. `kr pair invite --organisation <id>` fills the requirement in.
+organisation's membership where the prompt's line has room: it names the organisation and the
+enrolment revision, or says only that the grant is for organisation members. A line with no room for
+that says nothing of it, and the companion always lists both in full. `kr pair invite --organisation
+<id>` fills the requirement in.
 
 `organisation.list`, served at both doors to a device that manages the host, lists the organisations
 the host is enrolled in. For each it reports the identifier of its first key, the anchor's revision

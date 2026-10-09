@@ -556,7 +556,8 @@ enum Membership {
 
 /// What a grant that requires an organisation's membership says of it in a prompt, or nothing for
 /// a personal grant: the access answers to the organisation's lease, so a person who confirms it
-/// is told so.
+/// is told so where the line has room. A line with none says nothing of it, and the page beside
+/// the line lists the organisation and the enrolment.
 fn membership(grant: &ProposedGrant, form: Membership) -> String {
     grant
         .organisation
@@ -1813,6 +1814,36 @@ mod tests {
                 line.contains(", only for members of organisation 2121 2121 (enrolment 7)"),
                 "{line}"
             );
+        }
+
+        // Each form is the fullest that fits. On "studio" for an hour, a viewer ceiling's invitation
+        // has room for the short clause, its device line for the organisation, and a reviewer
+        // ceiling's invitation for none.
+        for (role, make, clause) in [
+            (
+                TeamRole::Viewer,
+                &invitation as &dyn Fn(ProposedGrant) -> Subject,
+                Some(", only for organisation members"),
+            ),
+            (
+                TeamRole::Viewer,
+                &device as &dyn Fn(ProposedGrant) -> Subject,
+                Some(", only for members of organisation 2121 2121."),
+            ),
+            (
+                TeamRole::Reviewer,
+                &invitation as &dyn Fn(ProposedGrant) -> Subject,
+                None,
+            ),
+        ] {
+            let mut member = grant(&[], an_hour());
+            member.actions = role.maximum_grants();
+            member.organisation = Nullable::some(requirement);
+            let line = reason(&make(member), "studio", NOW).expect("a line");
+            match clause {
+                Some(clause) => assert!(line.contains(clause), "{role}: {line}"),
+                None => assert!(!line.contains("organisation"), "{role}: {line}"),
+            }
         }
     }
 

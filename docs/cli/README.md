@@ -1689,8 +1689,9 @@ turned off. A member's account name is shown as the organisation signed it.
 that organisation. The host refuses a proposal that requires an organisation it is not enrolled in,
 names another enrolment revision, or carries a right above what an owner of an organisation may
 hold. The owner device that is asked to confirm the invitation is told that it answers to the
-organisation's membership, and, where the prompt's line has room, which organisation and which
-enrolment revision.
+organisation's membership where the prompt's line has room, with the organisation and the enrolment
+revision or without them. A line with no room says nothing of it, and the companion always lists
+both in full.
 
 ## `kr host import-journals`
 
