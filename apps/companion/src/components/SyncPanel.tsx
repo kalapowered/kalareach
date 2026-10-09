@@ -11,10 +11,14 @@
  * Recovery is offered on a desktop. A phone shows the setting and no more: its save dialog cannot
  * write a file the person chooses.
  *
- * Nothing here moves, so there is no motion to reduce; a change of state replaces the words in place.
+ * Each card has one status line, a polite live region the panel moves focus to when a step ends, because
+ * the control the person pressed is disabled while the step runs and may be gone when it ends.
+ * The line says how the step ended, in the backend's words when it refused. A read that fails is
+ * said in place of the card's state, with a way to ask again, and never as an empty card. Nothing
+ * here moves of its own; the cards sit in the account panel's frame.
  */
 
-import { useCallback, useEffect, useId, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
 import { failureMessage, type HostPort, type RecoveryView, type SyncServiceView } from '../host/port'
 import { minimumTarget, type Surface } from '../mobile/platform'
@@ -25,9 +29,19 @@ import {
   SETTLE_HELP,
   SYNC_SERVICE_HELP,
   describeBlocker,
-  describeRecovery
+  describeRecovery,
+  describeStaysAt
 } from '../model/recovery'
 import { Button, Card } from './ui'
+
+/** Which card a step belongs to, so the status it ends with is said in that card. */
+type Place = 'service' | 'recovery'
+
+/** What the last step said. */
+interface Said {
+  readonly place: Place
+  readonly text: string
+}
 
 /** The sync service setting and, on a desktop, recovery. */
 export function SyncPanel({
@@ -43,25 +57,41 @@ export function SyncPanel({
   const target = minimumTarget(surface)
   const inputId = useId()
   const [service, setService] = useState<SyncServiceView | null>(null)
+  const [serviceProblem, setServiceProblem] = useState<string | null>(null)
   const [recovery, setRecovery] = useState<RecoveryView | null>(null)
+  const [recoveryProblem, setRecoveryProblem] = useState<string | null>(null)
   const [changing, setChanging] = useState(false)
   const [draft, setDraft] = useState('')
-  const [said, setSaid] = useState<string | null>(null)
+  const [said, setSaid] = useState<Said | null>(null)
   const [busy, setBusy] = useState(false)
+  const serviceStatus = useRef<HTMLDivElement | null>(null)
+  const recoveryStatus = useRef<HTMLDivElement | null>(null)
+  const finished = useRef<Place | null>(null)
   // A sign-in that changes what the account may do changes what stops recovery, so it is read again.
   const standing = account?.state === 'signed_in' ? account.generation : (account?.state ?? null)
 
   const refresh = useCallback(() => {
     port
       .syncServiceView()
-      .then(setService)
-      .catch(() => undefined)
+      .then((view) => {
+        setService(view)
+        setServiceProblem(null)
+      })
+      .catch((error: unknown) => {
+        // What was shown before may no longer be true, so it is not shown beside the problem.
+        setService(null)
+        setServiceProblem(failureMessage(error))
+      })
     if (desktop) {
       port
         .recoveryView()
-        .then(setRecovery)
-        .catch(() => {
+        .then((view) => {
+          setRecovery(view)
+          setRecoveryProblem(null)
+        })
+        .catch((error: unknown) => {
           setRecovery(null)
+          setRecoveryProblem(failureMessage(error))
         })
     }
   }, [port, desktop])
@@ -70,62 +100,95 @@ export function SyncPanel({
     refresh()
   }, [refresh, standing])
 
+  // When a step ends, focus goes to its card's status line: the pressed control may be disabled,
+  // or gone, and a person using a keyboard or a screen reader would otherwise be left on nothing.
+  useEffect(() => {
+    if (busy || finished.current === null) return
+    const status = finished.current === 'service' ? serviceStatus : recoveryStatus
+    finished.current = null
+    status.current?.focus()
+  }, [busy])
+
   /** Runs one step, says how it ended, and reads where things stand again. */
-  const step = (work: () => Promise<string | null>) => {
+  const step = (place: Place, work: () => Promise<string | null>) => {
     setBusy(true)
     setSaid(null)
     work()
       .then((text) => {
-        if (text !== null) setSaid(text)
+        if (text !== null) setSaid({ place, text })
       })
       .catch((error: unknown) => {
-        setSaid(failureMessage(error))
+        setSaid({ place, text: failureMessage(error) })
       })
       .finally(() => {
+        finished.current = place
         setBusy(false)
         refresh()
       })
   }
 
-  if (service === null) return null
+  if (service === null && serviceProblem === null) return null
 
   const blocker = recovery?.blocker ?? null
   const offersTurnOn =
     recovery !== null &&
     (recovery.state === 'off' || recovery.state === 'unfinished') &&
     blocker === null
+  const staysAt = recovery !== null ? describeStaysAt(recovery) : null
 
   return (
     <>
       <p className="account-section-title">Sync service</p>
       <Card>
         <div className="account-state">
-          <div className="account-actions">
-            <p className="account-lead">
-              Settings sync and recovery go through{' '}
-              <strong data-testid="sync-service">{service.host}</strong>.
-            </p>
-            <Button
-              data-testid="change-sync-service"
-              aria-expanded={changing}
-              style={{ minBlockSize: target }}
-              onClick={() => {
-                setDraft(service.origin)
-                setChanging((open) => !open)
-              }}
-            >
-              Change
-            </Button>
+          <div
+            className="account-status"
+            aria-live="polite"
+            tabIndex={-1}
+            ref={serviceStatus}
+            data-testid="sync-status"
+          >
+            {service !== null ? (
+              <p className="account-lead">
+                This device uses <strong data-testid="sync-service">{service.host}</strong> as its
+                sync service.
+              </p>
+            ) : null}
+            {serviceProblem !== null ? (
+              <p className="account-note" data-testid="sync-problem">
+                {serviceProblem}
+              </p>
+            ) : null}
+            {said?.place === 'service' ? <p className="account-note">{said.text}</p> : null}
           </div>
-          {changing ? (
+          <div className="account-actions">
+            {service !== null ? (
+              <Button
+                data-testid="change-sync-service"
+                aria-expanded={changing}
+                style={{ minBlockSize: target }}
+                onClick={() => {
+                  setDraft(service.origin)
+                  setChanging((open) => !open)
+                }}
+              >
+                Change
+              </Button>
+            ) : (
+              <Button style={{ minBlockSize: target }} onClick={refresh}>
+                Try again
+              </Button>
+            )}
+          </div>
+          {changing && service !== null ? (
             <form
               className="form-field"
               onSubmit={(event) => {
                 event.preventDefault()
-                step(() =>
+                step('service', () =>
                   port.syncServiceSet(draft).then((next) => {
                     setChanging(false)
-                    return `Sync now goes through ${next.host}.`
+                    return `This device now uses ${next.host} as its sync service.`
                   })
                 )
               }}
@@ -156,32 +219,61 @@ export function SyncPanel({
               </div>
             </form>
           ) : null}
-          <div aria-live="polite" data-testid="sync-status">
-            {said !== null ? <p className="account-note">{said}</p> : null}
-          </div>
         </div>
       </Card>
 
-      {desktop && recovery !== null ? (
+      {desktop && (recovery !== null || recoveryProblem !== null) ? (
         <>
           <p className="account-section-title">Recovery</p>
-          <Card data-testid="recovery">
-            <div className="account-state" key={recovery.state}>
-              <div className="account-status">
-                <p className="account-lead">{describeRecovery(recovery)}</p>
-                {recovery.state === 'unsettled' ? (
+          <Card data-testid="recovery" data-state={recovery?.state ?? 'unread'}>
+            <div className="account-state">
+              <div
+                className="account-status"
+                aria-live="polite"
+                tabIndex={-1}
+                ref={recoveryStatus}
+                data-testid="recovery-status"
+              >
+                {recovery !== null ? (
+                  <p className="account-lead">{describeRecovery(recovery)}</p>
+                ) : null}
+                {recovery?.state === 'unsettled' ? (
                   <p className="account-note">{SETTLE_HELP}</p>
                 ) : null}
+                {staysAt !== null ? (
+                  <p className="account-note" data-testid="recovery-stays-at">
+                    {staysAt}
+                  </p>
+                ) : null}
                 {blocker !== null ? (
-                  <p className="account-note" data-testid="recovery-blocker">
+                  <p
+                    className="account-note"
+                    data-testid="recovery-blocker"
+                    data-reason={blocker.reason}
+                  >
                     {describeBlocker(blocker)}
                   </p>
                 ) : null}
-                {recovery.state === 'off' ? (
+                {recovery?.state === 'off' ? (
                   <p className="account-note">{RECOVERY_HELP}</p>
+                ) : null}
+                {recoveryProblem !== null ? (
+                  <p className="account-note" data-testid="recovery-problem">
+                    {recoveryProblem}
+                  </p>
+                ) : null}
+                {said?.place === 'recovery' ? (
+                  <p className="account-note" data-testid="recovery-said">
+                    {said.text}
+                  </p>
                 ) : null}
               </div>
               <div className="account-actions">
+                {recoveryProblem !== null ? (
+                  <Button style={{ minBlockSize: target }} onClick={refresh}>
+                    Try again
+                  </Button>
+                ) : null}
                 {offersTurnOn ? (
                   <Button
                     tone="primary"
@@ -189,7 +281,7 @@ export function SyncPanel({
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
-                      step(() => port.recoveryTurnOn().then(() => null))
+                      step('recovery', () => port.recoveryTurnOn().then(() => null))
                     }}
                   >
                     Turn on recovery
@@ -202,32 +294,32 @@ export function SyncPanel({
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
-                      step(() => port.accountSignInForRecovery().then(() => null))
+                      step('recovery', () => port.accountSignInForRecovery().then(() => null))
                     }}
                   >
                     Sign in again
                   </Button>
                 ) : null}
-                {recovery.state === 'unsettled' && blocker === null ? (
+                {recovery?.state === 'unsettled' && blocker === null ? (
                   <Button
                     tone="primary"
                     data-testid="recovery-settle"
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
-                      step(() => port.recoverySettle().then(() => null))
+                      step('recovery', () => port.recoverySettle().then(() => null))
                     }}
                   >
                     Settle it
                   </Button>
                 ) : null}
-                {recovery.state === 'on' ? (
+                {recovery?.state === 'on' ? (
                   <Button
                     data-testid="recovery-save-kit"
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
-                      step(async () => {
+                      step('recovery', async () => {
                         // The platform's dialog answers, and the backend writes the kit only there.
                         const path = await port.chooseExportPath(KIT_FILE_NAME)
                         if (path === null) return null
