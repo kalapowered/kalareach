@@ -342,7 +342,6 @@ fn changed(environment: &EnvironmentPaths, startup: Option<ControllerStartup>) -
     #[cfg(windows)]
     let changed = changed_under(environment, startup, &change, &held, &configuration)?;
     drop(held);
-    drop(writers);
     Ok(changed)
 }
 

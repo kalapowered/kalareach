@@ -5499,7 +5499,6 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
         &permit,
     )
     .expect("the owner's choice");
-    drop(writers);
     let document = kr_cli::doctor::configuration::document_path(&environment);
     let written = std::fs::read(&document).expect("the document");
 

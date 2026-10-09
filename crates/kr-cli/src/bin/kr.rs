@@ -824,7 +824,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                         &kr_protocol::hostinfo::configuration::Change::SleepInhibition(chosen),
                         &permit,
                     )?;
-                    drop(writers);
                 }
                 // The daemon is asked what the setting is now doing, because the setting alone is
                 // a choice rather than a state: what is held depends on the work and the power

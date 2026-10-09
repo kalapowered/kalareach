@@ -92,17 +92,18 @@ async fn integration(
     let plugin = plugin_identifier(&arguments.plugin)?;
     let environment = crate::resolve::select(paths, arguments.selector.environment.as_deref())?;
     // Held for the write alone: the daemon is asked below, with nothing held.
-    let writers = crate::barrier::hold()?;
-    let permit = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)?;
-    let revision = crate::doctor::configuration::apply(
-        &environment.paths,
-        &Change::CommandIntegration {
-            plugin_id: plugin.as_str().to_owned(),
-            enabled,
-        },
-        &permit,
-    )?;
-    drop(writers);
+    let revision = {
+        let writers = crate::barrier::hold()?;
+        let permit = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)?;
+        crate::doctor::configuration::apply(
+            &environment.paths,
+            &Change::CommandIntegration {
+                plugin_id: plugin.as_str().to_owned(),
+                enabled,
+            },
+            &permit,
+        )?
+    };
     let mut daemon = Daemon::open(paths, &arguments.selector).await?;
     let diagnosed: HostDoctorResult = daemon.read(Method::HostDoctor, &()).await?;
     let in_force = diagnosed

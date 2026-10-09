@@ -1242,7 +1242,6 @@ async fn a_repository_added_from_a_terminal_asks_for_the_budgets_this_host_allow
             &permit,
         )
         .expect("a configuration document");
-        drop(writers);
         let root = temp.root().join("root.json");
         std::fs::write(&root, br#"{"signed":"a root"}"#).expect("a root file");
         let root = root.display().to_string();
