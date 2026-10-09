@@ -806,7 +806,6 @@ async fn an_effect_this_host_does_not_dispatch_is_reported_as_admitted() {
         .attach_interpreter(Arc::new(Always(Interpretation {
             spoken_destination: Some(SpokenDestination {
                 session_id: host.session_id,
-                spoken_text: "send it to this session".to_owned(),
             }),
             ..Interpretation::of(VoiceAction::SubmitPrompt, None)
         })));
@@ -2202,7 +2201,6 @@ impl RawVoice {
         Interpretation {
             spoken_destination: Some(SpokenDestination {
                 session_id: self.session_id(),
-                spoken_text: "send it to this session".to_owned(),
             }),
             ..Interpretation::of(VoiceAction::SubmitPrompt, None)
         }

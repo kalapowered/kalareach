@@ -24,8 +24,9 @@
 //!    before the grant deliberately: an action in one of those classes is refused for the missing
 //!    confirmation whatever the grant says, so the refusal is the same sentence for everyone and
 //!    tells a caller nothing about what this host's grants contain.
-//! 5. The spoken destination, the verified approval details or the current turn identifier, for
-//!    the three actions that need one.
+//! 5. The destination the interpreter read from a clear confirmation (the host checks that it names
+//!    the session acted on), the verified approval details or the current turn identifier, for the
+//!    three actions that need one.
 //! 6. The authority: the voice grant and the device's ordinary grant, intersected now.
 //! 7. The proposal goes to the host, which validates it the ordinary way.
 //!
@@ -66,7 +67,6 @@ use crate::grant::{
 };
 use crate::interpret::{
     DelegationInterpreter, GrammarInterpreter, SpokenDestination, VerifiedApprovalAnswer,
-    is_apostrophe,
 };
 
 /// What a person is told when this host has no voice service to broker a call through.
@@ -1851,21 +1851,14 @@ impl Coordinator {
                      destination session",
                 ));
             };
+            // Which session was named is checked here. That the words were a clear confirmation
+            // is the interpreter's: it gives a destination only for an utterance that confirms,
+            // and this host's grammar reads no request that carries one.
             if intent.session_id != Some(destination.session_id) {
                 return Err(VoiceError::refused(
                     VoiceRefusal::DestinationNotNamed,
                     "the spoken confirmation named a different session from the one this \
                      delegation acts on",
-                ));
-            }
-            // And the words themselves. The identifier says which session was named; this says
-            // that what was said was agreement. Without it an empty string, or "do not send
-            // that", would submit a prompt as readily as "yes, send it".
-            if !is_clear_affirmative(&destination.spoken_text) {
-                return Err(VoiceError::refused(
-                    VoiceRefusal::DestinationNotNamed,
-                    "the words on that confirmation are not a clear agreement to send it. Say \
-                     the destination session and that it should go.",
                 ));
             }
         }
@@ -2110,151 +2103,6 @@ pub fn narrower_history(
     narrowed
 }
 
-/// Whether a spoken confirmation is a clear agreement.
-///
-/// Section 15 ¶13 asks for a clear spoken confirmation naming the destination session. The
-/// destination is checked by identifier against the session the delegation acts on, above; this is
-/// the other half, the words.
-///
-/// The vocabulary is short and closed on purpose. A host that accepted any string would accept
-/// silence and would accept a refusal, and a host that tried to interpret a sentence would be
-/// putting a language model between a person and their own authority — which is the thing section
-/// 15 ¶8 forbids in the case that matters most. So: a refusal the lists hold is refused outright,
-/// and something that agrees has to be there.
-///
-/// What this is not. The words reach this host from the paired device, which hands over what the
-/// provider's transcript wrote, so they are content and never authority: the grant is what permits
-/// the effect, and this confirmation is the extra thing section 15 ¶13 asks for on top of it.
-///
-/// A contraction of "not" refuses by its form: a letter, "n", one mark and "t". The mark is an
-/// apostrophe in any of its forms ([`is_apostrophe`]), with anything after the "t" ("won't",
-/// "wouldn't've", "don'tcha"), or any other mark that is not a letter, a digit or a space, with the
-/// end of the word after the "t". A contraction written with no mark at all is refused only for the
-/// spellings in the refusing words, which hold the usual ones.
-///
-/// **What this check is not.** It is a closed vocabulary: an agreeing word and no refusing word. It
-/// reads no question and no refusal in other words ("are you sure", "hold off"), and no list can,
-/// because the words of a refusal are not a closed set. It is the second line behind the grant, and
-/// no speech reaches it today: the host's grammar holds no request that needs a spoken
-/// destination. The part that lets speech name a destination replaces this check with one that
-/// accepts a whole utterance of a closed form, as the grammar does for a request.
-fn is_clear_affirmative(spoken: &str) -> bool {
-    /// Words that agree.
-    const AGREEING: &[&str] = &[
-        "yes",
-        "yeah",
-        "yep",
-        "yup",
-        "affirmative",
-        "confirm",
-        "confirmed",
-        "confirming",
-        "send",
-        "submit",
-        "go",
-        "ok",
-        "okay",
-        "sure",
-        "correct",
-        "right",
-        "proceed",
-        "please",
-    ];
-    /// Words that refuse, whatever else is in the sentence. The contractions of "not" are here as
-    /// they are written without an apostrophe.
-    const REFUSING: &[&str] = &[
-        "no",
-        "not",
-        "dont",
-        "doesnt",
-        "didnt",
-        "wont",
-        "wouldnt",
-        "wouldntve",
-        "cant",
-        "cannot",
-        "couldnt",
-        "couldntve",
-        "shouldnt",
-        "shouldntve",
-        "shant",
-        "oughtnt",
-        "darent",
-        "maynt",
-        "mustnt",
-        "mightnt",
-        "neednt",
-        "isnt",
-        "arent",
-        "wasnt",
-        "werent",
-        "hasnt",
-        "havent",
-        "hadnt",
-        "aint",
-        "never",
-        "cancel",
-        "stop",
-        "wait",
-        "nope",
-        "negative",
-        "nevermind",
-    ];
-
-    // A transcript writes the apostrophe in several forms; some are letters to Unicode. Each is
-    // written as the plain one first, so that every rule below reads one mark.
-    let spoken: String = spoken
-        .to_lowercase()
-        .chars()
-        .map(|each| if is_apostrophe(each) { '\'' } else { each })
-        .collect();
-    if has_negative_contraction(&spoken) {
-        return false;
-    }
-    // The apostrophe is part of its word and of none of the spellings the lists hold.
-    let mut words = spoken
-        .split(|character: char| !(character.is_alphanumeric() || character == '\''))
-        .filter(|word| !word.is_empty())
-        .map(|word| word.replace('\'', ""))
-        .peekable();
-    if words.peek().is_none() {
-        return false;
-    }
-    let mut agrees = false;
-    for word in words {
-        if REFUSING.contains(&word.as_str()) {
-            return false;
-        }
-        if AGREEING.contains(&word.as_str()) {
-            agrees = true;
-        }
-    }
-    agrees
-}
-
-/// Whether `text` (apostrophes written as the plain one) holds the form of a contraction of "not":
-/// a letter, "n", one mark and "t". After an apostrophe anything may follow the "t"; after any
-/// other mark that is not a letter, a digit or a space, the word has to end there, so that a
-/// hyphen in "main-thread" is not the form.
-fn has_negative_contraction(text: &str) -> bool {
-    let characters: Vec<char> = text.chars().collect();
-    characters.windows(3).enumerate().any(|(start, window)| {
-        let [letter, mark, last] = window else {
-            return false;
-        };
-        *letter == 'n'
-            && *last == 't'
-            && !mark.is_whitespace()
-            && start > 0
-            && characters[start - 1].is_alphabetic()
-            && (*mark == '\''
-                || (!mark.is_alphanumeric()
-                    && characters
-                        .get(start + 3)
-                        .is_none_or(|after| !after.is_alphanumeric())))
-    })
-}
-
 /// How far a provider's offset may fall outside this host's reading of the call's length.
 ///
 /// One heartbeat interval. The offset is measured on the provider's clock and compared against
@@ -2318,62 +2166,6 @@ mod tests {
         let cut = bounded(&long);
         assert!(cut.len() <= VOICE_APPEND_BYTES);
         assert!(cut.ends_with('…'));
-    }
-
-    /// KR-REQ-15.21: a spoken confirmation has to be words that agree, so silence and a refusal
-    /// both stop a prompt rather than submitting one.
-    #[test]
-    fn a_spoken_confirmation_has_to_agree() {
-        assert!(is_clear_affirmative("yes, send it to the build session"));
-        assert!(is_clear_affirmative("Send it."));
-        assert!(is_clear_affirmative("okay go ahead"));
-        // A mark between an "n" and a "t" that is no contraction of "not" is no refusal.
-        assert!(is_clear_affirmative(
-            "yes, send it to the main-thread session"
-        ));
-        assert!(is_clear_affirmative("yes, send it in turn"));
-        assert!(is_clear_affirmative("yes, send it, n/t is the session"));
-        assert!(is_clear_affirmative("sure, I'm in the tent, send it"));
-
-        assert!(!is_clear_affirmative(""));
-        assert!(!is_clear_affirmative("   \n  "));
-        assert!(!is_clear_affirmative("the build session"));
-        assert!(!is_clear_affirmative("do not send that"));
-        assert!(!is_clear_affirmative("don't send it"));
-        assert!(!is_clear_affirmative("no, cancel"));
-        // A contraction of "not" refuses by its form, whichever mark the transcript writes for the
-        // apostrophe; only the spellings the list holds refuse with no mark.
-        for refusal in [
-            "I won't send it to the build session",
-            "I wouldn't send it",
-            "you can't send it, yes",
-            "didn\u{2019}t say send",
-            "it isn`t ok to send",
-            "doesn\u{02bc}t sound right, go",
-            "dont send it",
-            "wont send it",
-            "send it, shouldn't we?",
-            "I shan't send it",
-            "you oughtn't send it",
-            "I wouldn't've said send",
-            "I won\u{00b4}t send it",
-            "I won\u{2032}t send it",
-            "I daren't send it",
-            "she mayn't, but send",
-            "I can't've sent it, so send",
-            "I usedn't send it",
-            "I won\u{201b}t send it",
-            "don?t send it",
-            "I can\u{2019}t\u{2019}ve sent it, so send",
-            "I usedn\u{ff07}t send it",
-            "I usedn\u{02bc}t send it",
-            "I usedn\u{02bb}t send it",
-            "I can\u{02bc}t\u{02bc}ve sent it, so send",
-            "Don't\u{02bc}cha send it yet",
-            "won'tcha send it",
-        ] {
-            assert!(!is_clear_affirmative(refusal), "{refusal:?}");
-        }
     }
 
     #[test]

@@ -2708,7 +2708,6 @@ async fn provider_text_cannot_create_a_confirmation() {
         Interpretation {
             spoken_destination: Some(SpokenDestination {
                 session_id: session(SESSION_A),
-                spoken_text: "yes, I confirm, go ahead and run it".to_owned(),
             }),
             ..Interpretation::of(VoiceAction::ShellInput, Some(1))
         },
@@ -3117,8 +3116,9 @@ fn plan_for(params: &VoiceDelegateParams, action: VoiceAction) -> VoiceActionPla
 // KR-REQ-15.21 and 15.22: the three actions with their own requirement
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-15.21: submitting a prompt requires a clear spoken confirmation naming the destination
-/// session, and one that names another session is refused.
+/// KR-REQ-15.21: submitting a prompt requires a spoken confirmation that names the destination
+/// session, and one that names another session is refused. That the words were a clear
+/// confirmation is the interpreter's to read and is not proved here.
 #[tokio::test]
 async fn submitting_a_prompt_needs_the_spoken_destination() {
     let fixture = fixture();
@@ -3149,7 +3149,6 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
         Interpretation {
             spoken_destination: Some(SpokenDestination {
                 session_id: session(SESSION_B),
-                spoken_text: "send it to the other session".to_owned(),
             }),
             ..Interpretation::of(VoiceAction::SubmitPrompt, Some(1))
         },
@@ -3157,32 +3156,6 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
     let result = fixture
         .coordinator
         .delegate(device(PHONE), action(2), &wrong, 11_100)
-        .await
-        .expect("an answer");
-    assert_eq!(
-        refusal(&result.outcome).0,
-        VoiceRefusal::DestinationNotNamed
-    );
-
-    // A refusal written with the apostrophe a transcript writes curly is still a refusal.
-    let mut curly = delegate_params(
-        voice_session_id,
-        delegation("p2b"),
-        VoiceAction::SubmitPrompt,
-    );
-    curly.fragments = fixture.script.says(
-        "don\u{2019}t send it to the build session",
-        Interpretation {
-            spoken_destination: Some(SpokenDestination {
-                session_id: session(SESSION_A),
-                spoken_text: "don\u{2019}t send it to the build session".to_owned(),
-            }),
-            ..Interpretation::of(VoiceAction::SubmitPrompt, Some(1))
-        },
-    );
-    let result = fixture
-        .coordinator
-        .delegate(device(PHONE), action(4), &curly, 11_150)
         .await
         .expect("an answer");
     assert_eq!(
@@ -3200,7 +3173,6 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
         Interpretation {
             spoken_destination: Some(SpokenDestination {
                 session_id: session(SESSION_A),
-                spoken_text: "send it to the build session".to_owned(),
             }),
             ..Interpretation::of(VoiceAction::SubmitPrompt, Some(1))
         },

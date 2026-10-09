@@ -9,10 +9,8 @@
 //! | --- | --- |
 //! | KR-REQ-15.11 | `the_grammar_reads_the_requests_it_holds_and_nothing_else`, `a_mark_in_or_beside_a_number_leaves_no_number` |
 
-use kr_protocol::ids::SessionId;
-use kr_protocol::scalars::{U64, Uuid};
+use kr_protocol::scalars::U64;
 use kr_protocol::voice::{FragmentText, TranscriptFragment, VoiceAction};
-use kr_voice::interpret::SpokenDestination;
 use kr_voice::{DelegationInterpreter, GrammarInterpreter, Misread};
 
 fn fragments(texts: &[&str]) -> Vec<TranscriptFragment> {
@@ -279,15 +277,4 @@ fn a_mark_in_or_beside_a_number_leaves_no_number() {
             );
         }
     }
-}
-
-/// What a person said is content, and a destination the host holds prints without it, so that a
-/// log line or a panic message that shows one shows the session and not the words.
-#[test]
-fn a_spoken_destination_prints_without_the_words() {
-    let destination = SpokenDestination {
-        session_id: SessionId::new(Uuid::from_bytes([7; 16])),
-        spoken_text: "the words nobody should log".to_owned(),
-    };
-    assert!(!format!("{destination:?}").contains("nobody"));
 }
