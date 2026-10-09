@@ -759,6 +759,50 @@ impl DraftStore {
         outcome
     }
 
+    /// Removes a draft and its synchronisation note, when it is still the version `expected`.
+    ///
+    /// A removal a person chose from a version they were shown must not take a later version another
+    /// writer stored since, so reading the stored draft, comparing its revision and removing it
+    /// happen under one exclusive lock, as an update's comparison does.
+    ///
+    /// Answers whether a draft was removed: a draft that is not there is already gone, and nothing
+    /// was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DraftError::RevisionConflict`] when the stored draft has moved on,
+    /// [`DraftError::NotOwned`] when it belongs to another device, [`DraftError::Corrupt`] when its
+    /// file cannot be read, and [`DraftError::Storage`] when a file cannot be removed.
+    pub fn remove_at(&self, draft_id: DraftId, expected: DraftRevision) -> Result<bool> {
+        let guard = self.exclusive()?;
+        let outcome = (|| {
+            let stored = match self.read(draft_id) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    let gone = matches!(
+                        &error,
+                        ClientError::Draft(held) if matches!(**held, DraftError::Unknown { .. })
+                    );
+                    return if gone { Ok(false) } else { Err(error) };
+                }
+            };
+            self.check_owner(&stored)?;
+            if stored.revision != expected {
+                return Err(DraftError::RevisionConflict {
+                    draft_id,
+                    expected,
+                    current: stored.revision,
+                }
+                .into());
+            }
+            remove_if_present(&self.draft_path(draft_id))?;
+            self.remove_file(&self.checkpoint_path(draft_id))?;
+            Ok(true)
+        })();
+        drop(guard);
+        outcome
+    }
+
     /// Reads a draft and where it has reached on the service, together.
     ///
     /// Together, because a publication decides from both: the revision it is sending and the
@@ -2509,6 +2553,48 @@ mod tests {
             .expect_err("another device's draft");
         assert!(error.to_string().contains("belongs to device"));
         assert_eq!(mine.load(draft.draft_id).expect("the draft"), draft);
+    }
+
+    #[test]
+    fn a_removal_names_the_version_it_removes_and_never_takes_a_later_one() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let shown = store
+            .create(
+                open_target(),
+                "shown to the person".to_owned(),
+                TimestampMs::new(1),
+            )
+            .expect("a draft");
+        // Another writer stored a later version while the person looked at this one.
+        let later = store
+            .update(&edited(&shown, "a later version"), TimestampMs::new(2))
+            .expect("a later version");
+
+        let error = store
+            .remove_at(shown.draft_id, shown.revision)
+            .expect_err("the version shown is not the stored one");
+        assert!(
+            matches!(
+                &error,
+                ClientError::Draft(held) if matches!(**held, DraftError::RevisionConflict { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(store.load(shown.draft_id).expect("kept"), later);
+
+        assert!(
+            store
+                .remove_at(later.draft_id, later.revision)
+                .expect("removed")
+        );
+        assert!(drafts(&store).is_empty());
+        // A draft that is not there is already gone.
+        assert!(
+            !store
+                .remove_at(later.draft_id, later.revision)
+                .expect("nothing to remove")
+        );
     }
 
     #[test]
