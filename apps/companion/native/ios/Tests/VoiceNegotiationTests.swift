@@ -143,8 +143,8 @@ private final class AnsweringPeer: NSObject, RTCPeerConnectionDelegate, RTCDataC
             } else {
                 gatheringDone = done
                 lock.unlock()
-                // A peer that never reports gathering done answers with what it has, and the
-                // test then fails on the wait that needs the answer's candidates.
+                // A peer that never reports gathering done answers with what it has after this
+                // long, instead of holding the test forever.
                 DispatchQueue.global().asyncAfter(deadline: .now() + AnsweringPeer.gatherWithin) { [weak self] in
                     self?.gatheringEnded()
                 }

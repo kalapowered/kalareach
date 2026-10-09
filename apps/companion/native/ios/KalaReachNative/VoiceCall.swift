@@ -113,7 +113,8 @@ public final class VoiceCall: NSObject {
     /// process's audio before anything it does can reach it, and a second call, while one holds it,
     /// is refused without touching the first.
     ///
-    /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio, and
+    /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio,
+    ///   ``VoiceAudioError/answerNotApplicable(_:)`` when the connection cannot be made, and
     ///   ``VoiceAudioError/eventChannelNotOpened`` when the provider's channel cannot be made.
     public convenience init(observer: VoiceCallObserver) throws {
         try self.init(observer: observer, gathering: IceGatheringWait())
@@ -248,10 +249,11 @@ public final class VoiceCall: NSObject {
     /// Makes this call's SDP offer.
     ///
     /// Section 15 ¶3: the client creates the offer. The host forwards it and never generates one.
-    /// The offer is returned after the first round of candidate gathering, or after
-    /// ``gatheringBound``, so that it names the addresses this device can be reached at: the
-    /// provider is answered once, and a candidate found later is not sent. A call that ends before
-    /// the offer is complete makes none: this throws ``VoiceAudioError/callEnded``.
+    /// The offer is returned after ``gatheringBound``, or earlier if gathering reports itself done,
+    /// which continual gathering does not do, so that it names the addresses this device can be
+    /// reached at: the provider is answered once, and a candidate found later is not sent. A call
+    /// that ends before the offer is complete makes none: this throws ``VoiceAudioError/callEnded``
+    /// when the call ended during the wait, and WebRTC's own error when it ended before.
     public func offer() async throws -> String {
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
@@ -412,7 +414,8 @@ extension VoiceCall: RTCPeerConnectionDelegate {
     }
 
     public func peerConnection(_: RTCPeerConnection, didOpen channel: RTCDataChannel) {
-        // A channel the provider opened. This end reads it and never writes to it.
+        // The provider's protocol has this end make the channel, so none is expected. One that
+        // arrives is given this delegate and is never written to; this class does not keep it.
         channel.delegate = self
     }
 
