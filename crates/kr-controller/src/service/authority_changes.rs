@@ -32,16 +32,6 @@ pub(crate) enum AuthorityCaller {
     Device(kr_protocol::ids::DeviceId),
 }
 
-impl AuthorityCaller {
-    /// Who a revocation's answer is for when this caller made it.
-    const fn audience(self) -> Audience {
-        match self {
-            Self::Owner => Audience::Host,
-            Self::Device(_) => Audience::Device,
-        }
-    }
-}
-
 impl Controller {
     /// Answers an authority change this host already holds a claim on, before freshness is asked
     /// for.
@@ -63,7 +53,7 @@ impl Controller {
         {
             Ok(Some(record)) => Some(respond(
                 mutation.request_id,
-                self.recorded_authority_change(actor_id, Audience::Host, mutation, record)
+                self.recorded_authority_change(actor_id, mutation, record)
                     .await,
             )),
             Ok(None) => None,
@@ -126,24 +116,20 @@ impl Controller {
     pub(super) async fn recorded_authority_change(
         &self,
         actor_id: &ActorId,
-        audience: Audience,
         mutation: &MutationRequest,
         record: crate::grants::ActionRecord,
     ) -> Result<ParamsValue> {
         match self.answer_without_fence(actor_id, mutation, &record) {
             Some(answer) => answer,
-            None => {
-                self.revocation_on_record(actor_id, audience, mutation)
-                    .await
-            }
+            None => self.revocation_on_record(actor_id, mutation).await,
         }
     }
 
     /// The answer a record is owed, when nothing has to run first: every state but an unfinished
     /// revocation, whose answer waits for any fence it still owes.
     ///
-    /// A grant and the invitation that carries it take identities derived from the action and are
-    /// written in one commit, so finding them is finding what this action wrote, and the answer is
+    /// A grant and the invitation that carries it take identities derived from the actor and the
+    /// action and are written in one commit, so finding them is finding what this action wrote, and the answer is
     /// rebuilt from what was written rather than proposed again. Nothing else outside a revocation
     /// names the action that changed it: a device's record can hold the key a registration asked
     /// for because another action registered the same key, a destination's credential says nothing
@@ -203,12 +189,14 @@ impl Controller {
     async fn revocation_on_record(
         &self,
         actor_id: &ActorId,
-        audience: Audience,
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
+        // The grant a revocation names, whose sessions its answer may name to a device.
+        let mut named = None;
         let nothing_left = match mutation.method.method() {
             Some(Method::GrantRevoke) => {
                 let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
+                named = Some(params.grant_id);
                 self.sharing
                     .grants()
                     .record(params.grant_id)?
@@ -270,7 +258,8 @@ impl Controller {
         encode(
             &self
                 .complete_revocation(
-                    audience,
+                    Audience::of(actor_id),
+                    named,
                     withdrawn.into_iter().collect(),
                     self.publish_debts(&[]),
                 )
@@ -525,7 +514,7 @@ impl Controller {
                 // withdrawn, and without the deadline a receipt outlives. The answer is waited for
                 // first: it is the check made with the answer in hand that decides.
                 let answered = self
-                    .recorded_authority_change(actor_id, caller.audience(), mutation, record)
+                    .recorded_authority_change(actor_id, mutation, record)
                     .await;
                 #[cfg(feature = "testing")]
                 self.after_the_retained_lookup.wait().await;
@@ -542,7 +531,10 @@ impl Controller {
                     .await
             }
             Method::GrantRedeem => self.grant_redeem(mutation, caller, carried, &hold).await,
-            Method::GrantRevoke => self.grant_revoke(caller, mutation, carried, &hold).await,
+            Method::GrantRevoke => {
+                self.grant_revoke(actor_id, caller, mutation, carried, &hold)
+                    .await
+            }
             Method::GrantTransfer => {
                 self.grant_transfer(actor_id, mutation, carried, &hold)
                     .await
@@ -805,52 +797,74 @@ impl Controller {
         })
     }
 
-    /// The live grant `device_id` holds that `grant_id` was delegated from, however far up.
+    /// The live grant `device_id` holds that `grant_id` was delegated from, however far up, when
+    /// there is one.
     ///
     /// A grant is delegated from the grant its record names as its parent, and the parent's own
     /// record names its parent in turn. The nearest ancestor that this device holds, active, not
     /// revoked, is the one a revocation of `grant_id` is decided under. A grant the device holds
-    /// itself is not its own ancestor: a device does not revoke its own authority through this.
-    /// A grant that does not exist, and one with no such ancestor, are refused alike, so a refusal
+    /// itself is not its own ancestor. The walk goes to the top of the chain, however long it is,
+    /// so `None` always means that no grant above this one is held by the device, never that the
+    /// search stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when a record cannot be read, and a refusal when the records name
+    /// each other as parents, which no host writes.
+    pub(crate) fn delegating_ancestor(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        grant_id: kr_protocol::ids::GrantId,
+    ) -> Result<Option<kr_protocol::ids::GrantId>> {
+        let grants = self.sharing.grants();
+        let Some(mut below) = grants.record(grant_id)? else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::HashSet::from([grant_id]);
+        while let Some(parent_id) = below.grant.parent_grant_id.as_ref().copied() {
+            if !seen.insert(parent_id) {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "this host's grants name each other as parents".to_owned(),
+                });
+            }
+            let Some(parent) = grants.record(parent_id)? else {
+                return Ok(None);
+            };
+            if parent.grant.recipient_device_id == device_id
+                && parent.is_active()
+                && parent.revoked_at_ms.is_none()
+            {
+                return Ok(Some(parent_id));
+            }
+            below = parent;
+        }
+        Ok(None)
+    }
+
+    /// The live grant `device_id` holds that `grant_id` was delegated from, or a refusal.
+    ///
+    /// A grant that does not exist and one with no such ancestor are refused alike, so a refusal
     /// says nothing of which grants exist.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::PermissionDenied`] when this device holds no live grant that the
-    /// named one descends from, and a storage error when a record cannot be read.
-    pub(crate) fn delegating_ancestor(
+    /// named one descends from, and what [`Self::delegating_ancestor`] returns otherwise.
+    pub(crate) fn require_delegating_ancestor(
         &self,
         device_id: kr_protocol::ids::DeviceId,
         grant_id: kr_protocol::ids::GrantId,
     ) -> Result<kr_protocol::ids::GrantId> {
-        // The longest chain walked. A parent link never leads back, and a delegation narrows
-        // what it is made from, so a chain this long is not one a person made; a grant further
-        // below a share than this is revoked with the grant above it, which is within reach.
-        const GENERATIONS: usize = 256;
-        let denied = || ControllerError::PermissionDenied {
-            detail: "this device holds no grant that this one was delegated from".to_owned(),
-        };
-        let grants = self.sharing.grants();
-        let mut below = grants.record(grant_id)?.ok_or_else(denied)?;
-        for _ in 0..GENERATIONS {
-            let Some(parent_id) = below.grant.parent_grant_id.as_ref().copied() else {
-                return Err(denied());
-            };
-            let parent = grants.record(parent_id)?.ok_or_else(denied)?;
-            if parent.grant.recipient_device_id == device_id
-                && parent.is_active()
-                && parent.revoked_at_ms.is_none()
-            {
-                return Ok(parent_id);
-            }
-            below = parent;
-        }
-        Err(denied())
+        self.delegating_ancestor(device_id, grant_id)?
+            .ok_or_else(|| ControllerError::PermissionDenied {
+                detail: "this device holds no grant that this one was delegated from".to_owned(),
+            })
     }
 
     /// Revokes a grant, its descendants, and everything they were being used for.
     async fn grant_revoke(
         &self,
+        actor_id: &ActorId,
         caller: AuthorityCaller,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
@@ -863,13 +877,13 @@ impl Controller {
         // a share revoked after this point is caught where the revocation is written, which asks
         // the admission again and finds the share's revocation advanced the revision.
         if let AuthorityCaller::Device(device_id) = caller {
-            self.delegating_ancestor(device_id, params.grant_id)?;
+            self.require_delegating_ancestor(device_id, params.grant_id)?;
         }
         encode(
             &self
                 .revoke_grant(
                     params.grant_id,
-                    caller.audience(),
+                    Audience::of(actor_id),
                     Some(&carried),
                     Some(hold),
                 )
@@ -977,8 +991,8 @@ impl Controller {
         // would hand over nothing. Who holds an ancestor does not change, so it is settled here,
         // before an owner is asked to confirm.
         if self
-            .delegating_ancestor(from.device_id, source.grant.grant_id)
-            .is_ok()
+            .delegating_ancestor(from.device_id, source.grant.grant_id)?
+            .is_some()
         {
             return Err(denied(
                 "the transferring device holds a grant that this one was delegated from, so it \
@@ -1059,7 +1073,7 @@ impl Controller {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 return self
-                    .recorded_authority_change(actor_id, Audience::Device, mutation, record)
+                    .recorded_authority_change(actor_id, mutation, record)
                     .await;
             }
         };

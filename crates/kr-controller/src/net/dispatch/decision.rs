@@ -150,7 +150,7 @@ impl RemoteConnection {
                     .map_err(invalid)?;
                 let ancestor = self
                     .controller
-                    .delegating_ancestor(self.device.device_id, params.grant_id)
+                    .require_delegating_ancestor(self.device.device_id, params.grant_id)
                     .map_err(|error| error.to_protocol_error())?;
                 let acting = self.acting_as_share(ancestor)?;
                 self.ask_under(acting, session_id, entry, claims_geometry)

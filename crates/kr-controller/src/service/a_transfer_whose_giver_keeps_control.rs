@@ -132,3 +132,70 @@ async fn a_transfer_from_a_device_that_holds_the_grant_above_is_not_described() 
     assert_eq!(plan.source_grant_id, share.grant_id);
     assert_eq!(plan.parent_grant_id, Nullable::null());
 }
+
+/// KR-REQ-18.03: however long the chain between the grant the giving device holds and the one it
+/// gives up, the grant above is found. A chain of three hundred grants held by other devices sits
+/// between them, longer than any search a host could cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_grant_above_is_found_however_long_the_chain_below_it() {
+    let (_temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
+    let giver = paired(&controller, 1, None).device_id;
+    let taker = paired_with_all_keys(&controller);
+    let share = owner_share(&controller, session_id, giver);
+    let now_ms = kr_ipc::now_ms().get();
+
+    let mut parent = share.clone();
+    for link in 0_u32..300 {
+        let holder = if link == 299 {
+            giver
+        } else {
+            DeviceId::new(Uuid::from_bytes(
+                (0x1_0000 + u128::from(link)).to_be_bytes(),
+            ))
+        };
+        let child = kr_protocol::grant::Grant {
+            grant_id: GrantId::new(Uuid::from_bytes(
+                (0x2_0000 + u128::from(link)).to_be_bytes(),
+            )),
+            parent_grant_id: Nullable::some(parent.grant_id),
+            issuer_device_id: parent.recipient_device_id,
+            recipient_device_id: holder,
+            ..parent.clone()
+        };
+        controller
+            .sharing()
+            .grants()
+            .issue(
+                &crate::grants::GrantRecord {
+                    grant: child.clone(),
+                    session_id: Some(session_id),
+                    issued_at_ms: now_ms,
+                    activated_at_ms: Some(now_ms),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the chain is written");
+        parent = child;
+    }
+    assert_eq!(parent.recipient_device_id, giver);
+
+    let refused = controller
+        .transfer_plan(
+            &actor_id,
+            &GrantTransferParams {
+                session_id,
+                from_grant_id: parent.grant_id,
+                to_device_id: taker,
+            },
+            ActionId::new(Uuid::from_bytes([9; 16])),
+        )
+        .expect_err("the giving device holds the grant at the top of the chain");
+    assert!(
+        refused.to_string().contains("keep control"),
+        "refused for the grant above: {refused}"
+    );
+}
