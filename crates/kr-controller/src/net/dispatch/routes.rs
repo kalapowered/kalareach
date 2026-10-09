@@ -1127,9 +1127,10 @@ impl RemoteConnection {
                 settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
             // A device delegates a narrower grant from a share it holds, and revokes what lies
-            // below a share it holds. They are this daemon's own effects, once per actor's action, for the
-            // device that sends them and decided under a share: a pairing grant is not a grant to
-            // delegate from, and the grant a delegation is made from is the one it acts under.
+            // below a share it holds. They are this daemon's own effects, once per actor's action,
+            // for the device that sends them and decided under a share: a pairing grant is not a
+            // grant to delegate from, and the grant a delegation is made from is the one it acts
+            // under.
             Method::GrantCreate | Method::GrantRevoke => {
                 if decided.acting.held != super::acting::Held::Share {
                     return failure(
