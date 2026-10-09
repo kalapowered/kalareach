@@ -272,11 +272,30 @@ impl ArchiveService {
                         )
                 })
                 .collect();
+            // The processes of the group the worker never recorded: the manager's kill ends them as
+            // surely as the recorded ones, so the closure lists them with the rest. This daemon is
+            // not among them, and neither is the dead worker.
+            let unrecorded: Vec<ProcessStartIdentity> = held
+                .iter()
+                .filter(|identity| {
+                    !tracked.iter().any(|process| &process.identity == *identity)
+                        && **identity != ownership.ended
+                        && identity.pid.get() != u64::from(std::process::id())
+                })
+                .cloned()
+                .collect();
             match group.force().await {
                 Forced::Nothing => {}
                 Forced::Killed => {
                     for (process, standing) in tracked.iter_mut().zip(standing) {
                         process.forced |= standing;
+                    }
+                    for identity in unrecorded {
+                        tracked.push(Tracked {
+                            identity,
+                            forced: true,
+                            state: Standing::Pending,
+                        });
                     }
                 }
                 Forced::Refused(why) => group_refused = Some(why),

@@ -2453,20 +2453,19 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
             kr_ipc::identity::ProcessState::Ended,
             "{name} was still there when the closure was written: {closure:?}"
         );
+        // Every member is listed whoever ended it, the drifter, which the worker never recorded
+        // and only the unit's control group held, among them: the manager's kill ended it, and the
+        // closure says so.
         let listed = closure
             .terminated
             .iter()
-            .find(|terminated| terminated.identity == *identity);
-        if *name != "drifter" {
-            // The control group's members are ended by the manager, which this host does not list
-            // by identity; a process the worker recorded is listed whoever ended it.
-            let listed = listed.unwrap_or_else(|| panic!("{name} is named in the closure"));
-            assert_eq!(
-                listed.forced,
-                expect.forced.contains(name),
-                "{name} forced or not as expected: {closure:?}"
-            );
-        }
+            .find(|terminated| terminated.identity == *identity)
+            .unwrap_or_else(|| panic!("{name} is named in the closure: {closure:?}"));
+        assert_eq!(
+            listed.forced,
+            expect.forced.contains(name),
+            "{name} forced or not as expected: {closure:?}"
+        );
     }
     assert_eq!(
         closure.ownership_coverage,
