@@ -130,11 +130,11 @@ impl Controller {
     ///
     /// A grant and the invitation that carries it take identities derived from the actor and the
     /// action and are written in one commit, so finding them is finding what this action wrote, and
-    /// the answer is rebuilt from what was written rather than proposed again. Nothing else outside a
-    /// revocation
-    /// names the action that changed it: a device's record can hold the key a registration asked
-    /// for because another action registered the same key, a destination's credential says nothing
-    /// about which request set it, and a voice change is not an authority change.
+    /// the answer is rebuilt from what was written rather than proposed again. Nothing else outside
+    /// a revocation names the action that changed it: a device's record can hold the key a
+    /// registration asked for because another action registered the same key, a destination's
+    /// credential says nothing about which request set it, and a voice change is not an authority
+    /// change.
     fn answer_without_fence(
         &self,
         actor_id: &ActorId,
@@ -506,6 +506,19 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
+        // A device makes three of these: a share, its revocation and a redemption. The others are
+        // the owner's at this machine, and their answers are written for the owner: a device is
+        // refused before anything is claimed, whatever route sent it here.
+        if matches!(caller, AuthorityCaller::Device(_))
+            && !matches!(
+                method,
+                Method::GrantCreate | Method::GrantRevoke | Method::GrantRedeem
+            )
+        {
+            return Err(ControllerError::PermissionDenied {
+                detail: format!("{} is made by the owner at this machine", method.as_str()),
+            });
+        }
         let claimed_at_ms = kr_ipc::now_ms().get();
         let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
@@ -602,11 +615,12 @@ impl Controller {
 
     /// Shares a session: compiles the role, previews it, and writes the grant and its invitation.
     ///
-    /// The questions and approvals the share names are previewed as the session's worker holds
-    /// them now ([`Self::named_previews`]), before anything is written. The owner at this machine
-    /// shares as this host. A paired device shares as itself and only by delegation: from a share
-    /// it holds, to a grant that narrows it, and decided before the session's worker is asked for
-    /// anything, so what the device is shown never exceeds what the grant it delegates from reaches.
+    /// The questions and approvals the share names are previewed as the session's worker holds them
+    /// now ([`Self::named_previews`]), before anything is written. The owner at this machine shares
+    /// as this host. A paired device shares as itself and only by delegation: from a share it
+    /// holds, to a grant that narrows it, and decided before the session's worker is asked for
+    /// anything, so what the device is shown never exceeds what the grant it delegates from
+    /// reaches.
     async fn grant_create(
         &self,
         actor_id: &ActorId,
@@ -859,10 +873,20 @@ impl Controller {
         device_id: kr_protocol::ids::DeviceId,
         grant_id: kr_protocol::ids::GrantId,
     ) -> Result<kr_protocol::ids::GrantId> {
-        self.delegating_ancestor(device_id, grant_id)?
-            .ok_or_else(|| ControllerError::PermissionDenied {
-                detail: "this device holds no grant that this one was delegated from".to_owned(),
-            })
+        let denied = || ControllerError::PermissionDenied {
+            detail: "this device holds no grant that this one was delegated from".to_owned(),
+        };
+        match self.delegating_ancestor(device_id, grant_id) {
+            Ok(Some(ancestor)) => Ok(ancestor),
+            Ok(None) => Err(denied()),
+            // A chain this host cannot walk is the owner's to read, and says nothing to a device of
+            // which grants exist: it is refused in the words of every other refusal here.
+            Err(ControllerError::PermissionDenied { detail }) => {
+                eprintln!("kr-controller: a revocation by device {device_id} met {detail}");
+                Err(denied())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Revokes a grant, its descendants, and everything they were being used for.
@@ -961,9 +985,9 @@ impl Controller {
     ///
     /// Returns [`ControllerError::PermissionDenied`] for a grant this host does not hold or that
     /// carries no control to transfer, for a device that is not paired with all four of its keys
-    /// held, for a giving device that holds a grant the given-up one was delegated from, for a chain
-    /// of grants that cannot be walked to its top, and for a plan that hands over more than the
-    /// grant carries; and a storage error when a record cannot be read.
+    /// held, for a giving device that holds a grant the given-up one was delegated from, for a
+    /// chain of grants that cannot be walked to its top, and for a plan that hands over more than
+    /// the grant carries; and a storage error when a record cannot be read.
     pub(crate) fn transfer_plan(
         &self,
         actor_id: &ActorId,
