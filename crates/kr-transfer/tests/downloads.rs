@@ -1151,7 +1151,8 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
         .read_grant(grant.grant_id)
         .expect("the grant resolves while it holds");
 
-    // A typed submission needs no readable path and is given none.
+    // A typed submission is given no readable path when it is added; the claim of an offer gives
+    // it one.
     let typed_handle = harness.publish(&pattern(256), "image/png", "second.png");
     let bound = harness
         .service

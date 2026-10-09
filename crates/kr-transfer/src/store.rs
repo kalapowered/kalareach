@@ -772,14 +772,14 @@ impl Store {
         Ok(())
     }
 
-    /// The step to version 4: the table that records which sessions have ended, so that a binding or
-    /// a prompt for a draft of one is refused ([`Store::end_sessions`]).
+    /// The step that adds the table that records which sessions have ended, so that a binding or a
+    /// prompt for a draft of one is refused ([`Store::end_sessions`]).
     ///
     /// The table and the version are written in one transaction: a journal is never at version 3
-    /// with the table half made, and never at version 4 without it. `from` is the version the
-    /// journal is at, or `None` for one this build creates. A journal still at
-    /// [`UNSETTLED_VERSION`] gets the table and keeps its version, because the settling of the
-    /// sessions of earlier builds moves it. Once no supported upgrade starts from a journal at
+    /// with the table half made, and never at the current version ([`SCHEMA_VERSION`]) without it.
+    /// `from` is the version the journal is at, or `None` for one this build creates. A journal
+    /// still at [`UNSETTLED_VERSION`] gets the table and keeps its version, because the settling of
+    /// the sessions of earlier builds moves it. Once no supported upgrade starts from a journal at
     /// [`SETTLED_VERSION`] or below, the table moves into the batch above, this step goes, and the
     /// arm for a new journal writes the version row itself.
     fn add_ended_sessions(&self, from: Option<i64>) -> Result<()> {
@@ -3775,7 +3775,8 @@ mod tests {
     }
 
     #[test]
-    fn a_version_three_journal_gains_the_table_of_ended_sessions_and_moves_to_version_four() {
+    fn a_version_three_journal_gains_the_table_of_ended_sessions_and_moves_to_the_current_version()
+    {
         // A journal whose sessions of earlier builds were settled: nothing is owed, so the one
         // step adds the table and moves the version.
         let directory = tempfile::tempdir().expect("a temporary directory");
