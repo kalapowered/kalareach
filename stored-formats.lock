@@ -443,10 +443,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 4,
+        "version": 5,
         "migrates_from": 1
       },
-      "digest": "0de4cd24d45c59420ff100cc883787546aac3a4dfec2013b36b299f4457a4291",
+      "digest": "ad120754e50c7af247b3f52ed2ef52e2bd885cb34b595ed40cba314a0667043d",
       "kept": [
         "UploadBeginResult",
         "UploadChunkResult",
