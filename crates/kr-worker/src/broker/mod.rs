@@ -1960,11 +1960,12 @@ impl Broker {
     /// The native client and the upstream are two ends of one connection, and a frame the client
     /// writes changes upstream state exactly as a frame the upstream writes does. So it goes
     /// through the same admission rather than straight onto the socket: the method is classified
-    /// with the table this host pinned, the bytes are retained as a source event of the instance,
-    /// the intent is recorded before anything is written, and a method the table does not classify
-    /// suspends this instance's rich mutations *first*. Section 11 forbids an unclassified request
-    /// acting while rich mutations stay enabled, and the order here is what makes that true rather
-    /// than likely.
+    /// with the table this host pinned, the bytes are retained as a source event of the instance
+    /// (unless the method is one the table classes as carrying a credential, whose bytes are
+    /// forwarded whole and kept nowhere), the intent is recorded before anything is written, and a
+    /// method the table does not classify suspends this instance's rich mutations *first*. Section
+    /// 11 forbids an unclassified request acting while rich mutations stay enabled, and the order
+    /// here is what makes that true rather than likely.
     ///
     /// The caller writes the frame and then reports what happened through
     /// [`Broker::client_request_settled`].
@@ -1997,7 +1998,11 @@ impl Broker {
         let source_generation = instance.source_generation;
         let source = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
             .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
-        let source_frame = SourceFrame::new(source.clone(), source_generation, frame, now)?;
+        // A frame that carries a credential is forwarded as it is and kept nowhere, so the handle
+        // the intent names is one nothing was retained under.
+        let source_frame = (!classification.carries_credentials())
+            .then(|| SourceFrame::new(source.clone(), source_generation, frame, now))
+            .transpose()?;
         let intent = crate::broker::ledger::ClientIntent {
             intent_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
             application_instance_id,
@@ -2039,7 +2044,9 @@ impl Broker {
                      asked for is unknown"
                 ));
             }
-            instance.retain(source_frame, recorder);
+            if let Some(source_frame) = source_frame {
+                instance.retain(source_frame, recorder);
+            }
         }
         Ok(ClientRequest {
             intent_id: intent.intent_id,
@@ -4337,7 +4344,12 @@ impl BrokerState {
         let source_generation = instance.source_generation;
         let source = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
             .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
-        let source_frame = SourceFrame::new(source.clone(), source_generation, frame, now)?;
+        // A request that carries a credential is forwarded as it is and kept nowhere: no source
+        // event holds its bytes, so no decoder and no view can be given them.
+        let keeps_source = !forwarded.classification.carries_credentials();
+        let source_frame = keeps_source
+            .then(|| SourceFrame::new(source.clone(), source_generation, frame, now))
+            .transpose()?;
         if self.arbitration.holds_request(&request) {
             return Err(BrokerError::invalid(format!(
                 "{request} already names a pending resource"
@@ -4397,7 +4409,7 @@ impl BrokerState {
         self.remember(&event);
         self.publish(&resource, &event);
         self.arbitration
-            .record(resource.clone(), None, Some(source))?;
+            .record(resource.clone(), None, keeps_source.then_some(source))?;
         // A request recorded while a recovery is running belongs to an upstream that has not said
         // what it still holds, so it joins what that recovery owes.
         self.volatile.owe_one(application_instance_id, connection);
@@ -4406,7 +4418,10 @@ impl BrokerState {
                 .entry(connection)
                 .or_insert_with(|| recorder.clone());
         }
-        if let Some(instance) = self.instances.get_mut(&application_instance_id) {
+        if let (Some(instance), Some(source_frame)) = (
+            self.instances.get_mut(&application_instance_id),
+            source_frame,
+        ) {
             instance.retain(source_frame, recorder);
         }
         Ok(Some(resource))

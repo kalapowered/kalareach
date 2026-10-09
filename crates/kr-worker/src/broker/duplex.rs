@@ -1972,7 +1972,8 @@ impl Duplex {
     /// The frame is admitted before it is queued. The client is the person's own terminal and the
     /// upstream is the agent, and a frame the terminal writes changes upstream state exactly as a
     /// frame the agent writes does; so it is classified with the table this host pinned, its bytes
-    /// are retained, its intent is recorded, and a method the table does not classify suspends
+    /// are retained (unless the method carries a credential, which is forwarded whole and kept
+    /// nowhere), its intent is recorded, and a method the table does not classify suspends
     /// this instance's rich mutations before anything is written.
     ///
     /// A notification is then written as it is: there is nothing to correlate. A request is
