@@ -759,11 +759,10 @@ impl CommandBackends {
             if let Some(why) = backend.refuses(request.typed) {
                 return Err(format!("{why}, so this invocation runs as typed"));
             }
-            // This worker does not start a backend yet. Admitting the launch would run the
-            // terminal against a gateway nothing has opened.
+            // This host runs no backend. Admitting the launch would run the terminal against a
+            // gateway nothing has opened.
             return Err(format!(
-                "{} declares a backend, and this worker does not run one yet, so this invocation \
-                 runs as typed",
+                "{} declares a backend, and this host runs none, so this invocation runs as typed",
                 connector.plugin_id()
             ));
         }

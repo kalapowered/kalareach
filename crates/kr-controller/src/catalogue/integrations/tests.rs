@@ -445,50 +445,32 @@ fn the_doctor_reports_each_integration_and_its_resolution() {
 }
 
 /// KR-REQ-07.45: the doctor says why an invocation runs as typed where the first hit on the search
-/// path is a script, whatever the platform, since the worker reads no identity for a script; and it
-/// says it of an integration that starts a backend, which this worker does not run yet. Control:
-/// a program found first has neither reason, and the mode it runs in is the bridge's.
+/// path is a script, whatever the platform, since the worker reads no identity for a script. The
+/// mode it runs in is then the terminal's.
 #[cfg(unix)]
 #[test]
-fn the_doctor_says_why_a_script_or_a_backend_runs_as_typed() {
+fn the_doctor_says_why_a_script_runs_as_typed() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let store = Store::new("script");
     let bin = store.0.join("bin");
     let program = executable(&bin, "claude");
-    let reading = Integrations::new().read(&[
-        store.admitted(&fixture::Shape::claude_code(), |_| {}),
-        store.admitted(&fixture::Shape::codex_backend(), |_| {}),
-    ]);
-    let on = enabled(&["claude-code", "codex"]);
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
+    let on = enabled(&["claude-code"]);
     let found = || {
         report(Some(&reading), &[], &on, &able(vec![bin.clone()]))
             .reports
-            .into_iter()
-            .map(|report| (report.plugin_id.clone(), report))
-            .collect::<std::collections::BTreeMap<_, _>>()
+            .remove(0)
     };
-    let reports = found();
-    assert_eq!(reports["kalareach/claude-code"].reason.0, None);
     assert_eq!(
-        reports["kalareach/claude-code"].mode,
-        IntegrationMode::NativeBridge
+        found().reason.0,
+        None,
+        "a program found first has no reason"
     );
-    let backend = &reports["kalareach/codex"];
-    assert!(
-        backend.reason.0.as_deref().is_some_and(
-            |reason| reason.contains("starts a backend, which this worker does not run yet")
-        ),
-        "{:?}",
-        backend.reason
-    );
-    assert_eq!(backend.mode, IntegrationMode::NativeTerminal);
-
-    // The same command found as a script: the reason names it, and the mode is the terminal's.
     std::fs::write(&program, "#!/bin/sh\nexec true\n").expect("a script");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("runnable");
-    let reports = found();
-    let script = &reports["kalareach/claude-code"];
+    let script = found();
     assert!(
         script
             .reason
@@ -499,6 +481,37 @@ fn the_doctor_says_why_a_script_or_a_backend_runs_as_typed() {
         script.reason
     );
     assert_eq!(script.mode, IntegrationMode::NativeTerminal);
+}
+
+/// KR-REQ-07.45: the doctor says of an integration that declares a backend, and is on, that this
+/// host runs none and an invocation runs as typed; of one that is off it says nothing, since a
+/// session applies none of it either way.
+#[test]
+fn the_doctor_says_an_integration_that_declares_a_backend_runs_as_typed() {
+    let store = Store::new("backend");
+    let bin = store.0.join("bin");
+    executable(&bin, &format!("codex{}", std::env::consts::EXE_SUFFIX));
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::codex_backend(), |_| {})]);
+    let doctor = |on: &[String]| {
+        report(Some(&reading), &[], on, &able(vec![bin.clone()]))
+            .reports
+            .remove(0)
+    };
+    let on = doctor(&enabled(&["codex"]));
+    assert_eq!(on.state, CommandIntegrationState::On);
+    assert!(
+        on.reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.contains("declares a backend, and this host runs none")),
+        "{:?}",
+        on.reason
+    );
+    assert_eq!(on.mode, IntegrationMode::NativeTerminal);
+    let off = doctor(&[]);
+    assert_eq!(off.state, CommandIntegrationState::Off);
+    assert_eq!(off.reason.0, None);
 }
 
 /// KR-REQ-07.45: an integration the configuration turns on is reported as one a session created
@@ -1186,7 +1199,8 @@ fn the_suffixes_a_command_is_looked_for_under_are_the_platforms() {
 /// KR-REQ-12.07: where what the shell finds first is a shim and not a program, the doctor says so
 /// beside the integration: `first hit is <the shim>`. Where it finds a program the doctor says
 /// nothing of the kind, and a script ahead of a program in one directory is the first hit, as it is
-/// for PowerShell. Elsewhere there are no shims, and nothing is said.
+/// for PowerShell. Elsewhere there are no shims, and a script is the other reason, which
+/// `the_doctor_says_why_a_script_runs_as_typed` shows.
 #[test]
 fn the_doctor_names_a_shim_as_the_first_hit_and_a_program_not_at_all() {
     let store = Store::new("shim");

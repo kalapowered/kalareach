@@ -1883,7 +1883,7 @@
         },
         {
           "const": "integration_invalid",
-          "description": "A command integration names something other than a bare command of the package, adds a\nflag it may not, or sets a variable the contract does not permit.",
+          "description": "A command integration names something other than a bare command of the package, adds a\nflag it may not, sets a variable the contract does not permit, or declares a backend that\nbreaks the contract.",
           "type": "string"
         },
         {

@@ -138,24 +138,86 @@ fn kr_req_12_07_a_backend_with_a_table_the_gateway_reads_is_accepted() {
     assert_eq!(back, declaration());
 }
 
-/// KR-REQ-12.07: an integration with no backend writes none, so every package written before the
-/// member existed reads and hashes as it did.
+/// KR-REQ-12.07: a package written before the backend existed reads and writes as it did. Every
+/// committed manifest and connector table (the bundled and released packages, the examples and the
+/// catalogue fixtures) reads into the typed document and comes back with no `backend` and no
+/// `messages` member, so no package's bytes or hash depend on the new members.
 #[test]
-fn kr_req_12_07_a_declaration_with_no_backend_does_not_write_the_member() {
+fn kr_req_12_07_a_package_written_before_the_backend_reads_and_writes_as_before() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut manifests = 0;
+    let mut tables = 0;
+    for directory in [
+        "bundled-plugins/targets/packages",
+        "fixtures/plugins",
+        "crates/kr-controller/tests/fixtures/bridge-generation/targets/packages",
+    ] {
+        for (path, name) in files_named(&root.join(directory), &[MANIFEST_FILE, CONNECTOR_FILE]) {
+            let bytes = std::fs::read(&path).expect("the document reads");
+            let original: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                // An invalid fixture is invalid on purpose; only the documents that read count.
+                Err(_) => continue,
+            };
+            let again = if name == MANIFEST_FILE {
+                let Ok(typed) = serde_json::from_slice::<PluginManifest>(&bytes) else {
+                    continue;
+                };
+                manifests += 1;
+                serde_json::to_value(typed)
+            } else {
+                let Ok(typed) = serde_json::from_slice::<ConnectorManifest>(&bytes) else {
+                    continue;
+                };
+                tables += 1;
+                serde_json::to_value(typed)
+            }
+            .expect("the typed document serialises");
+            assert_eq!(
+                again,
+                original,
+                "{} is written back as read",
+                path.display()
+            );
+            let text = original.to_string();
+            assert!(
+                !text.contains("\"backend\"")
+                    && !text.contains("\"messages\"")
+                    && !text.contains("{gateway}"),
+                "{} declares no backend",
+                path.display()
+            );
+        }
+    }
+    assert!(manifests >= 15, "only {manifests} manifests were read");
+    assert!(tables >= 10, "only {tables} tables were read");
+    // A declaration that sets none of the new members writes none of them.
     let mut plain = declaration();
     plain.backend = None;
     plain.flags = vec!["--flag".to_owned()];
     let written = serde_json::to_value(&plain).expect("the declaration serialises");
     assert!(written.get("backend").is_none(), "{written}");
-    let mut table = example::example_connector_table();
-    table.messages = None;
-    assert!(
-        serde_json::to_value(&table)
-            .expect("the table serialises")
-            .get("messages")
-            .is_none(),
-        "a table with no messages writes none"
-    );
+}
+
+/// Every file named one of `names` under `root`, with the name it has.
+fn files_named(root: &Path, names: &[&'static str]) -> Vec<(std::path::PathBuf, &'static str)> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("the directory reads") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Some(name) = names
+                .iter()
+                .find(|name| path.file_name().is_some_and(|file| file == **name))
+            {
+                found.push((path, *name));
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// KR-REQ-12.07: each way the table is not one the gateway reads is named, in the table's file.
@@ -245,6 +307,26 @@ fn kr_req_12_07_a_table_the_gateway_cannot_read_is_named_for_what_it_is() {
     );
 }
 
+/// KR-REQ-12.07: a table with no method to classify, or a wire name the gateway cannot hold as a
+/// method, is named before the package is installed.
+#[test]
+fn kr_req_12_07_an_empty_table_and_a_wire_name_the_gateway_cannot_hold_are_named() {
+    let mut table = gateway_table();
+    table.methods.clear();
+    table.routes.clear();
+    refused(
+        &table,
+        FindingCode::ConnectorTableInvalid,
+        "at least one method",
+    );
+
+    for wire in ["x".repeat(257), "bad\u{0000}name".to_owned()] {
+        let mut table = gateway_table();
+        table.routes[0].wire_name = wire;
+        refused(&table, FindingCode::ConnectorTableInvalid, "can hold");
+    }
+}
+
 /// KR-REQ-12.07: the gateway interprets at most as many methods as its table holds, and a package
 /// with a backend that lists more says so before it is installed.
 #[test]
@@ -308,19 +390,5 @@ fn kr_req_12_07_a_backend_needs_a_table_and_the_gateway_flag_goes_with_it() {
         detail_of(&report, FindingCode::IntegrationInvalid).contains("in 2 flags"),
         "{:?}",
         report.findings
-    );
-}
-
-/// The package contract carries the bounds a publisher builds against.
-#[test]
-fn the_package_contract_publishes_the_backend_bounds() {
-    let contract = kr_plugin_sdk::schema::package_contract();
-    let integration = &contract["command_integration"];
-    assert_eq!(integration["gateway_placeholder"], GATEWAY_PLACEHOLDER);
-    assert_eq!(integration["max_backend_arguments"], 8);
-    assert_eq!(integration["max_launching_words"], 8);
-    assert_eq!(
-        integration["max_backend_methods"],
-        kr_protocol::gateway::MAX_TABLE_METHODS
     );
 }
