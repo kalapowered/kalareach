@@ -2143,7 +2143,7 @@ fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
         .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
         .expect("a version");
     assert_eq!(version, kr_attention::store::SCHEMA_VERSION);
-    // The next open reads it as it is, and one older than the oldest is refused.
+    // One older than the oldest is refused.
     raw.execute("UPDATE attention_schema SET version = 8", [])
         .expect("an older schema");
     drop(raw);
