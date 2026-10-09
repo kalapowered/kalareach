@@ -520,8 +520,9 @@ struct Particulars {
 }
 
 /// The facts, the host's notice, the publisher's statement and the host's reading for an
-/// enrolment or an installation, and nothing for any other request. `None` when a word the host or
-/// the publisher wrote could not be shown exactly as it was written.
+/// enrolment or an installation, the organisation a grant answers to for an invitation or a
+/// device, and nothing for any other request. `None` when a word the host or the publisher wrote
+/// could not be shown exactly as it was written.
 fn particulars(subject: &Subject) -> Option<Particulars> {
     match subject {
         Subject::CatalogueAdd(plan) => Some(Particulars {
