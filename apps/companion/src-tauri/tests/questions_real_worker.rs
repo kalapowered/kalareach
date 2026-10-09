@@ -254,7 +254,7 @@ async fn a_question_the_worker_holds_is_read_and_its_answer_recorded_as_given() 
     );
 }
 
-/// Two people answer one question: the worker resolves it for the first, and the second is told so
+/// KR-REQ-11.60, KR-REQ-23.32: two people answer one question: the worker resolves it for the first, and the second is told so
 /// and has no answer recorded. The page shows the refusal the worker gave, and keeps nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_answer_resolves_the_question_and_the_second_is_refused() {
@@ -303,7 +303,7 @@ async fn the_first_answer_resolves_the_question_and_the_second_is_refused() {
         .await
         .expect("the kept answers");
     assert_eq!(
-        kept,
+        kept["answers"],
         json!([]),
         "a refusal is the worker's word, and nothing is kept"
     );

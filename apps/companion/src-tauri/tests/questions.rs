@@ -193,7 +193,11 @@ async fn an_answer_names_the_revision_shown_and_the_session_alone() {
     let kept = answered(page.call("question_kept", json!({})))
         .await
         .expect("the kept answers");
-    assert_eq!(kept, json!([]), "an answer the worker took is not kept");
+    assert_eq!(
+        kept["answers"],
+        json!([]),
+        "an answer the worker took is not kept"
+    );
 }
 
 /// A question the page was never shown is not answered, and neither is one at another revision than
@@ -266,7 +270,7 @@ async fn an_answer_that_does_not_fit_the_question_is_refused_and_not_kept() {
     let kept = answered(page.call("question_kept", json!({})))
         .await
         .expect("the kept answers");
-    assert_eq!(kept, json!([]));
+    assert_eq!(kept["answers"], json!([]));
 }
 
 /// The worker refuses the answer: another device answered first. The refusal is the page's to show,
@@ -300,11 +304,11 @@ async fn an_answer_the_worker_refuses_is_shown_and_not_kept() {
     let kept = answered(page.call("question_kept", json!({})))
         .await
         .expect("the kept answers");
-    assert_eq!(kept, json!([]));
+    assert_eq!(kept["answers"], json!([]));
 }
 
-/// A worker that goes away before it answers the answer: the answer is kept on this device, the
-/// page is told it is kept and not sent, and when the worker is back a settling only says whether
+/// KR-REQ-11.63: a worker that goes away before it answers the answer: a copy is kept on this
+/// device, the page is told the host did not confirm it, and when the worker is back a settling only says whether
 /// the question can still take it. Nothing but the person's own send goes to the worker, and that
 /// reads the question again first.
 #[tokio::test(flavor = "multi_thread")]
@@ -338,8 +342,8 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_only_the_person_sends_i
     let kept = answered(page.call("question_kept", json!({})))
         .await
         .expect("the kept answers");
-    assert_eq!(kept.as_array().map(Vec::len), Some(1));
-    assert_eq!(kept[0]["question_id"], question_id().to_string());
+    assert_eq!(kept["answers"].as_array().map(Vec::len), Some(1));
+    assert_eq!(kept["answers"][0]["question_id"], question_id().to_string());
 
     // Contact is back. Settling reads the session's questions and sends nothing.
     let settling = page.call(
@@ -392,13 +396,13 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_only_the_person_sends_i
         .await
         .expect("the kept answers");
     assert_eq!(
-        kept,
+        kept["answers"],
         json!([]),
         "an answer the worker took is no longer kept"
     );
 }
 
-/// A question that ended or moved while the answer was kept is not answered, and the answer is not
+/// KR-REQ-11.63: a question that ended or moved while the answer was kept is not answered, and the answer is not
 /// lost: it stays kept, with what became of the question, until the person dismisses it. A dismissal
 /// that names an older copy of the answer than the one kept removes nothing.
 #[tokio::test(flavor = "multi_thread")]
@@ -458,7 +462,7 @@ async fn an_answer_whose_question_ended_is_kept_until_it_is_dismissed() {
     let kept = answered(page.call("question_kept", json!({})))
         .await
         .expect("the kept answers");
-    assert_eq!(kept.as_array().map(Vec::len), Some(1));
+    assert_eq!(kept["answers"].as_array().map(Vec::len), Some(1));
     let older = answered(page.call(
         "question_dismiss_kept",
         json!({ "params": { "questionId": question_id().to_string(), "draftedAtMs": "1" } }),
@@ -476,10 +480,10 @@ async fn an_answer_whose_question_ended_is_kept_until_it_is_dismissed() {
     let kept = answered(page.call("question_kept", json!({})))
         .await
         .expect("the kept answers");
-    assert_eq!(kept, json!([]));
+    assert_eq!(kept["answers"], json!([]));
 }
 
-/// A new application over the same place finds the answer a previous run kept: it lives on this
+/// KR-REQ-11.63: a new application over the same place finds the answer a previous run kept: it lives on this
 /// device and not in the page.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kept_answer_outlives_the_application() {
@@ -506,11 +510,225 @@ async fn a_kept_answer_outlives_the_application() {
     drop(window);
     drop(app);
     let state = companion_tauri::AppState::new();
-    state.questions().keep_at(kept.path().to_path_buf());
+    state.keep_under(kept.path());
     let next = Page::over(state, worker.paths(), kept);
     let kept = answered(next.call("question_kept", json!({})))
         .await
         .expect("the kept answers");
-    assert_eq!(kept.as_array().map(Vec::len), Some(1));
-    assert_eq!(kept[0]["answer"]["choice_id"], "main");
+    assert_eq!(kept["answers"].as_array().map(Vec::len), Some(1));
+    assert_eq!(kept["answers"][0]["answer"]["choice_id"], "main");
+}
+
+/// KR-REQ-11.63: a second window of the application is a second process over the same kept answers. While it is in
+/// the middle of changing them, this window changes nothing: a dismissal of a copy that window has
+/// replaced since, or a send of an answer that window is removing, would lose or repeat a person's
+/// answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_answers_are_not_changed_while_another_window_is_changing_them() {
+    use tauri::Manager as _;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("main")),
+    );
+    link.expect(Method::QuestionAnswer).await;
+    drop(link);
+    let told = answered(asked).await.expect("kept");
+    let drafted_at = told["draft"]["drafted_at_ms"].clone();
+
+    // Another window holds the kept answers, as the file every window holds says.
+    let other_window = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(page.kept.path().join("kept-answers").join(".windows.lock"))
+        .expect("the file every window holds");
+    other_window.try_lock().expect("the other window has it");
+    page.app
+        .state::<companion_tauri::AppState>()
+        .questions()
+        .wait_at_most(Duration::from_millis(100));
+
+    let params =
+        json!({ "params": { "questionId": question_id().to_string(), "draftedAtMs": drafted_at } });
+    let refused = answered(page.call("question_dismiss_kept", params.clone()))
+        .await
+        .expect_err("the other window is changing the kept answers");
+    assert_eq!(code_of(&refused), "RESOURCE_UNAVAILABLE");
+    let refused = answered(page.call("question_send_kept", params.clone()))
+        .await
+        .expect_err("a send waits for the other window too");
+    assert_eq!(code_of(&refused), "RESOURCE_UNAVAILABLE");
+    let kept = answered(page.call("question_kept", json!({})))
+        .await
+        .expect("the kept answers");
+    assert_eq!(
+        kept["answers"].as_array().map(Vec::len),
+        Some(1),
+        "nothing was changed"
+    );
+
+    drop(other_window);
+    let dismissed = answered(page.call("question_dismiss_kept", params))
+        .await
+        .expect("the other window is done");
+    assert_eq!(dismissed, json!(true));
+}
+
+/// Keeps an answer by hand, as another host's application or an earlier run would have, in the
+/// directory for `environment_id`.
+fn keep_by_hand(
+    root: &std::path::Path,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: kr_protocol::ids::SessionId,
+) -> kr_client::answers::AnswerDraft {
+    use kr_client::answers::{ANSWER_FORMAT, AnswerDraft, AnswerDrafts, WRITTEN};
+    use kr_protocol::envelope::ActionTarget;
+
+    let draft = AnswerDraft {
+        version: ANSWER_FORMAT,
+        target: ActionTarget {
+            environment_id,
+            session_id: Nullable::some(session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        },
+        session_id,
+        question_id: question_id(),
+        question_revision: QuestionRevision::new(2),
+        answer: choice("main"),
+        drafted_at_ms: TimestampMs::new(5),
+    };
+    let store = AnswerDrafts::open(root.join("kept-answers").join(environment_id.to_string()))
+        .expect("a store");
+    let writers = kr_ipc::install::hold_writers(&mut || {}).expect("the writers lock");
+    let permit = writers.permit(&WRITTEN).expect("the leave to write");
+    store.keep(&draft, &permit).expect("kept");
+    draft
+}
+
+/// KR-REQ-11.63: an answer is sent only to the host it was given to. One kept for another host is
+/// not settled against this one (nothing is said of it) and is not sent to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_kept_for_another_host_is_neither_settled_nor_sent_here() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let elsewhere = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16]));
+    let draft = keep_by_hand(page.kept.path(), elsewhere, worker.session_id);
+
+    let settling = page.call(
+        "question_settle",
+        json!({ "params": { "sessionId": worker.session_id.to_string() } }),
+    );
+    let mut link = worker.link().await;
+    let settled = answered(settling).await.expect("nothing to say");
+    assert_eq!(
+        settled,
+        json!([]),
+        "an answer for another host is not settled here"
+    );
+
+    let sending = page.call(
+        "question_send_kept",
+        json!({ "params": { "questionId": question_id().to_string(),
+                            "draftedAtMs": draft.drafted_at_ms.get().to_string() } }),
+    );
+    let refused = answered(sending)
+        .await
+        .expect_err("it was given to another host");
+    assert_eq!(code_of(&refused), "RESOURCE_UNAVAILABLE");
+    assert!(
+        link.quiet_for(Duration::from_millis(300)).await,
+        "nothing was asked of this host"
+    );
+    let kept = answered(page.call("question_kept", json!({})))
+        .await
+        .expect("the kept answers");
+    assert_eq!(
+        kept["answers"].as_array().map(Vec::len),
+        Some(1),
+        "it is still kept"
+    );
+}
+
+/// KR-REQ-11.63: an environment whose kept answers cannot be read does not hide another's, and the
+/// page is told that some could not be read.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_environments_unreadable_answers_do_not_hide_anothers() {
+    let worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    keep_by_hand(
+        page.kept.path(),
+        kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([8; 16])),
+        worker.session_id,
+    );
+    let damaged = page
+        .kept
+        .path()
+        .join("kept-answers")
+        .join(kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([7; 16])).to_string());
+    std::fs::create_dir_all(&damaged).expect("a directory");
+    std::fs::write(
+        damaged.join(format!("{}.answer", Uuid::from_bytes([6; 16]))),
+        b"not an answer",
+    )
+    .expect("a damaged file");
+
+    let kept = answered(page.call("question_kept", json!({})))
+        .await
+        .expect("the kept answers");
+    assert_eq!(kept["answers"].as_array().map(Vec::len), Some(1));
+    assert_eq!(kept["unreadable"], 1);
+}
+
+/// KR-REQ-11.63: a worker that takes an answer and never replies leaves an outcome nobody knows.
+/// The exchange ends within its time, the answer is kept as one the host did not confirm, and the
+/// next thing the application does is not left waiting behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_the_worker_never_replies_to_is_kept_within_the_time_an_exchange_has() {
+    use tauri::Manager as _;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    page.app
+        .state::<companion_tauri::AppState>()
+        .questions()
+        .exchange_within(Duration::from_millis(200));
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("main")),
+    );
+    // The worker has the answer and says nothing, and the link stays open.
+    link.expect(Method::QuestionAnswer).await;
+    let told = answered(asked).await.expect("the answer is kept");
+    assert_eq!(told["outcome"], "kept");
+
+    // Nothing waits behind it: the kept answers are listed at once.
+    let kept = answered(page.call("question_kept", json!({})))
+        .await
+        .expect("the kept answers");
+    assert_eq!(kept["answers"].as_array().map(Vec::len), Some(1));
 }

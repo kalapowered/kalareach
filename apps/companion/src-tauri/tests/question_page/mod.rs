@@ -25,7 +25,7 @@ impl Page {
     pub fn new(paths: kr_ipc::paths::EnvironmentPaths) -> Self {
         let state = companion_tauri::AppState::new();
         let kept = tempfile::tempdir().expect("a place for the kept answers");
-        state.questions().keep_at(kept.path().to_path_buf());
+        state.keep_under(kept.path());
         Self::over(state, paths, kept)
     }
 

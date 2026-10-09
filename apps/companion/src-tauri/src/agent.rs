@@ -56,6 +56,8 @@ const MAX_RESOURCE_RESTARTS: usize = 2;
 pub(crate) struct Link {
     pub(crate) session: Session,
     pub(crate) descriptor: WorkerDescriptor,
+    /// The build the worker stated when the link was made, when it stated one.
+    pub(crate) build: Option<kr_protocol::local::LocalBuild>,
 }
 
 /// The place one session's link is held, which the calls for that session take turns with while
@@ -260,6 +262,7 @@ impl WorkerLinks {
         let link = Arc::new(Link {
             session,
             descriptor: reached.descriptor,
+            build: reached.build,
         });
         *held = Some(Arc::clone(&link));
         Ok(link)

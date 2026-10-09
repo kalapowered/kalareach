@@ -20,6 +20,8 @@ pub struct Reached {
     pub client: LocalClient,
     /// The descriptor the worker proved.
     pub descriptor: WorkerDescriptor,
+    /// The build the worker stated in its answer to the hello, when it stated one.
+    pub build: Option<kr_protocol::local::LocalBuild>,
 }
 
 /// Why a worker was not reached.
@@ -93,7 +95,12 @@ pub async fn reach(paths: &EnvironmentPaths, session_id: SessionId) -> Result<Re
             Shown::ipc(&error)
         ))
     })?;
-    Ok(Reached { client, descriptor })
+    let build = client.acknowledgement().build.clone();
+    Ok(Reached {
+        client,
+        descriptor,
+        build,
+    })
 }
 
 /// Whether `session_id` has a worker's descriptor on the host `paths` names: whether its worker is

@@ -650,12 +650,13 @@ mutate_command!(
     description_download, Method::DescriptionDownload,
     kr_protocol::describe::DescriptionDownloadParams
 );
-/// Reads a session's questions on its own worker.
+/// Reads a session's questions.
 ///
-/// The daemon on this machine does not carry `question.read` for this computer: a session's
-/// questions are its worker's, so they are read over the link held for its agent calls. What is
-/// read is remembered with the place an answer goes, because the answer is checked against the
-/// question as the person was shown it.
+/// On this machine's own host the questions are the session's worker's, and are read over the link
+/// held for its agent calls: the daemon here carries neither `question.read` nor `question.answer`
+/// for this computer. On a host this device is paired with, the daemon forwards them. What is read
+/// is remembered with the place an answer goes, because the answer is checked against the question
+/// as the person was shown it.
 #[tauri::command]
 pub async fn question_read(
     links: State<'_, crate::agent::WorkerLinks>,
@@ -663,19 +664,10 @@ pub async fn question_read(
     params: Value,
 ) -> Result<Value> {
     let typed: kr_protocol::question::QuestionReadParams = decode(params)?;
-    let link = links.link(typed.session_id).await?;
-    let answer: std::result::Result<kr_protocol::question::QuestionReadResult, _> =
-        link.session.read(Method::QuestionRead, &typed).await;
-    let result = links.settle(typed.session_id, &link, answer)?;
-    crate::questions::remember(
-        &state,
-        &result.questions,
-        &crate::questions::target_of(&link),
-    );
-    encode(&result)
+    encode(&crate::questions::read(&state, &links, typed).await?)
 }
 
-/// Answers a question, or keeps the answer on this device when the worker cannot take it.
+/// Answers a question, or keeps the answer on this device when the host did not confirm that it took it.
 ///
 /// The page names the question and the revision it was shown; the question itself and the place
 /// the answer goes are the ones read. An answer kept is sent only by [`question_send_kept`].
@@ -693,7 +685,7 @@ pub async fn question_answer(
 /// Lists the answers kept on this device, in every environment.
 #[tauri::command]
 pub async fn question_kept(state: State<'_, AppState>) -> Result<Value> {
-    encode(&crate::questions::kept(&state).await?)
+    encode(&crate::questions::kept(&state))
 }
 
 /// Says where the questions of the answers kept for one session stand now. Sends and removes

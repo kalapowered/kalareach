@@ -419,9 +419,15 @@ impl Companion {
     ) -> Self {
         use tauri::Listener as _;
 
+        let state = companion_tauri::AppState::new();
+        state.keep_under(data);
         let app = tauri::test::mock_builder()
-            .manage(companion_tauri::AppState::new())
+            .manage(state)
+            .manage(companion_tauri::agent::WorkerLinks::local())
             .invoke_handler(tauri::generate_handler![
+                companion_tauri::commands::question_read,
+                companion_tauri::commands::question_answer,
+                companion_tauri::commands::question_kept,
                 companion_tauri::commands::pairing_set_origin,
                 companion_tauri::commands::pairing_view,
                 companion_tauri::commands::pairing_start_code,

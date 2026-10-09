@@ -393,6 +393,12 @@ impl AppState {
         &self.questions
     }
 
+    /// Gives what this application keeps on this device its place under the data directory. The
+    /// application does this once, at start, before any command can run.
+    pub fn keep_under(&self, data: &std::path::Path) {
+        self.questions.keep_at(crate::questions::kept_in(data));
+    }
+
     /// Opens, or reuses, this device's draft store.
     ///
     /// A draft belongs to the device, so the store lives under this application's own per-user
