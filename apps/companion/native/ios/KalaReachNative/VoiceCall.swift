@@ -253,6 +253,8 @@ public final class VoiceCall: NSObject {
 
         func epochMs() -> UInt64 { UInt64(Date().timeIntervalSince1970 * 1_000) }
 
+        func answerApplied() -> Bool { true }
+
         func activate() throws { try AudioSession.shared.activate(for: call) }
 
         func deactivate() { try? AudioSession.shared.deactivate(for: call) }

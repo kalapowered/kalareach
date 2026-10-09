@@ -48,6 +48,9 @@ class VoiceCallControlTest {
         var grantsFocus = true
         var startsService = true
         var serviceThrows = false
+
+        /** Whether the provider's answer has been applied to the connection. */
+        var answered = true
         var whileTakingFocus: () -> Unit = {}
         var focusHeld = false
         var serviceRunning = false
@@ -60,6 +63,8 @@ class VoiceCallControlTest {
         override fun nowMs() = now
 
         override fun epochMs() = epochAtStart + now
+
+        override fun answerApplied() = answered
 
         override fun acquireFocus(): Boolean {
             whileTakingFocus()
@@ -121,6 +126,29 @@ class VoiceCallControlTest {
         control.servicePromoted()
         control.recorder(true)
         return Triple(control, platform, switches)
+    }
+
+    /**
+     * KR-REQ-15.34: the host's answer to a start does not open the microphone until the provider's
+     * answer to the offer has been applied to the connection. The refusal changes nothing: the call
+     * is not ended, no focus is taken and no service is asked for, and the same answer is taken once
+     * the provider's is.
+     */
+    @Test
+    fun a_host_answer_is_not_taken_before_the_providers_answer_is_applied() {
+        val platform = Platform().apply { answered = false }
+        val control = VoiceCallControl(platform, Switches())
+        val closes = platform.closesIn(60)
+
+        assertFalse(control.permit("voice-session-1", closes))
+        assertFalse(control.isStopped)
+        assertFalse(platform.focusHeld)
+        assertFalse(platform.serviceRunning)
+        assertEquals(0, platform.ends)
+
+        platform.answered = true
+        assertTrue(control.permit("voice-session-1", closes))
+        assertTrue(platform.focusHeld)
     }
 
     /** KR-REQ-15.34: every switch starts off, and nothing but a promoted, permitted call turns one on. */
