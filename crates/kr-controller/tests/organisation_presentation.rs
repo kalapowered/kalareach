@@ -24,7 +24,7 @@ use kr_protocol::confirmation::{ConfirmationSubject, OrganisationEnrolPlan};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::OrganisationRequirement;
-use kr_protocol::ids::{AccountId, ActionId, AuthorityRevision, SessionId};
+use kr_protocol::ids::{AccountId, ActionId, AuthorityRevision, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
     MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
@@ -243,6 +243,7 @@ async fn close_a_session(fixture: &Fixture, raw: &RawDevice) -> ProtocolError {
     let session_id = SessionId::new(Uuid::from_bytes([0x5e; 16]));
     let target = ActionTarget {
         session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(SessionEpoch::new(1)),
         ..ActionTarget::environment(fixture.host.environment_id)
     };
     net_support::refusal(
