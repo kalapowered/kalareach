@@ -252,6 +252,12 @@ impl Controller {
                 {
                     return Err(crate::grants::continuity_lost());
                 }
+                // An invitation proposes only access this host can answer for. A requirement the
+                // host cannot honour is refused before anyone is asked to confirm it.
+                if let ConfirmationSubject::IssueInvitation { proposed_grant, .. } = &params.subject
+                {
+                    self.check_organisation_proposal(proposed_grant)?;
+                }
                 if matches!(params.subject, ConfirmationSubject::EstablishClock) {
                     let owner = Arc::clone(&self.owner);
                     let on_the_network = self.network_guard().is_some();
@@ -272,6 +278,18 @@ impl Controller {
                     .await;
                 }
                 let pairing = self.pairing_service()?;
+                // An organisation's enrolment is described by this host's policy: the chain is
+                // verified first, and an owner is shown the keys it pins.
+                if let ConfirmationSubject::EnrolOrganisation(enrol) = &params.subject {
+                    let controller = Arc::clone(self);
+                    let enrol = enrol.clone();
+                    return blocking(move || {
+                        pairing.require_owner(&caller)?;
+                        let resolved = controller.organisation_enrol_resolved(&enrol)?;
+                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
+                    })
+                    .await;
+                }
                 // A repository's root and an installation are described by the catalogue, from
                 // the exact request and the records it holds, and the pairing service issues the
                 // challenge for what it resolved.
@@ -312,6 +330,7 @@ impl Controller {
             Method::PairInvite => {
                 let pairing = self.pairing_service()?;
                 let params: PairInviteParams = decode(&mutation.params)?;
+                self.check_organisation_proposal(&params.proposed_grant)?;
                 let network_config = self
                     .network_guard()
                     .ok_or_else(not_on_network)?

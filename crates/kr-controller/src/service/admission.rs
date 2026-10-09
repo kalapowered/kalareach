@@ -739,6 +739,18 @@ impl Controller {
                     ));
                 }
             }
+            // An organisation's policy is this host's, not a session's. A request that named a
+            // session here would be asking for a policy scoped to something it does not have.
+            Method::OrganisationEnrol => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "an organisation's policy belongs to this host, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                let _: kr_protocol::organisation::OrganisationEnrolParams =
+                    parse(&mutation.params)?;
+            }
             // A machine group step changes this environment's own record, not a session's. A
             // request that named a session here would be asking for a record scoped to something
             // the record does not have.

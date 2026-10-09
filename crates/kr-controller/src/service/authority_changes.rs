@@ -454,6 +454,15 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
+        // An enrolment is confirmed by the owner for exactly one chain, so the confirmation is
+        // spent before the action is claimed. A request that finds none is refused here, with
+        // nothing written under its action, and an owner's client may ask again with a new
+        // identifier for each poll.
+        let enrolment = if method == Method::OrganisationEnrol {
+            Some(self.organisation_enrol_intent(mutation)?)
+        } else {
+            None
+        };
         let claimed_at_ms = kr_ipc::now_ms().get();
         let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
@@ -474,22 +483,27 @@ impl Controller {
                 return answered;
             }
         };
-        let outcome = match method {
-            Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
-            Method::GrantRevoke => self.grant_revoke(mutation, carried, &hold).await,
-            Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
-            Method::DevicePreviewKeyUpdate => {
-                self.device_preview_key_update(actor_id, mutation, carried)
-                    .await
+        let outcome = match (method, enrolment) {
+            (Method::OrganisationEnrol, Some(intent)) => {
+                self.organisation_enrol(carried, &hold, intent).await
             }
-            Method::DeliveryDestinationSecretSet => {
-                self.delivery_destination_secret_set(mutation, carried)
-                    .await
-            }
-            _ => Err(ControllerError::InvalidArgument(format!(
-                "{} is not an authority change this daemon serves",
-                method.as_str()
-            ))),
+            (method, _) => match method {
+                Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
+                Method::GrantRevoke => self.grant_revoke(mutation, carried, &hold).await,
+                Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
+                Method::DevicePreviewKeyUpdate => {
+                    self.device_preview_key_update(actor_id, mutation, carried)
+                        .await
+                }
+                Method::DeliveryDestinationSecretSet => {
+                    self.delivery_destination_secret_set(mutation, carried)
+                        .await
+                }
+                _ => Err(ControllerError::InvalidArgument(format!(
+                    "{} is not an authority change this daemon serves",
+                    method.as_str()
+                ))),
+            },
         };
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
         // neither an answer nor an attempt behind it.

@@ -200,6 +200,7 @@ impl Controller {
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
                 | Method::DeliveryDestinationSecretSet
+                | Method::OrganisationEnrol
                 | Method::PrivacySet
                 | Method::SessionRename
                 | Method::DescriptionConfigure

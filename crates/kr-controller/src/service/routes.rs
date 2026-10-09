@@ -270,6 +270,7 @@ impl Controller {
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
+            Method::OrganisationList => self.organisation_list(),
             Method::PrivacyStatus => self.privacy_status().await,
             Method::DescriptionSetup => self.description_setup(),
             _ => Err(ControllerError::InvalidArgument(format!(
@@ -710,7 +711,8 @@ impl Controller {
             | Method::GrantRevoke
             | Method::DeviceRevoke
             | Method::DevicePreviewKeyUpdate
-            | Method::DeliveryDestinationSecretSet => {
+            | Method::DeliveryDestinationSecretSet
+            | Method::OrganisationEnrol => {
                 self.authority_change(actor_id, mutation, method, carried)
                     .await
             }

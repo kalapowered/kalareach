@@ -60,6 +60,7 @@ mod host;
 mod inhibition;
 mod local;
 mod machine_group;
+mod organisation;
 pub mod plugin_runtime;
 mod prompt;
 mod reads;
