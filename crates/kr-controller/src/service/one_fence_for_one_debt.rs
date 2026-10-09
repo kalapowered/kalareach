@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use kr_protocol::ids::GrantId;
 
+use super::Audience;
+
 /// Two barriers raised at once over one published debt fence the host once: the one that
 /// takes the registry first captures the debt and advances the revision, and the other finds
 /// nothing to capture and answers with the revision the first advanced to.
@@ -25,7 +27,7 @@ async fn two_settlements_of_one_debt_fence_once() {
         tokio::spawn(async move {
             let own = controller.publish_debts(&[(debt, super::Reach::Host)]);
             controller
-                .complete_revocation([withdrawn].into_iter().collect(), own)
+                .complete_revocation(Audience::Host, [withdrawn].into_iter().collect(), own)
                 .await
                 .map(|result| result.authority_revision)
         })

@@ -106,8 +106,10 @@ pub enum ResultContent {
     /// A result an application source reads about its own question or alert. Only the local caller
     /// that created it is shown it.
     Source,
-    /// A result that quotes questions, approvals or a session's description, which is shown to the
-    /// owner and kept for no one else.
+    /// A result that quotes questions, approvals, a session's description or the text of a share's
+    /// preview, which this table shows to the owner alone. A device that delegated a share is
+    /// answered its own delegation by the control daemon, from the record it keeps of the action,
+    /// and reads none of it back through the worker.
     Owner,
     /// A method this table does not name. It is shown to the owner alone.
     Unclassified,

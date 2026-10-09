@@ -2334,7 +2334,7 @@ async fn kr_req_25_10_a_shares_revocation_stops_the_answers_decided_under_it_alo
             queued(under_the_pairing_grant.output(), 1).await;
             queued(&owners, 1).await;
             controller
-                .revoke_grant(parent.grant_id, None, None)
+                .revoke_grant(parent.grant_id, crate::service::Audience::Host, None, None)
                 .await
                 .expect("the parent is revoked, and the child with it");
             drop((child_turn, pairing_turn, owners_turn));

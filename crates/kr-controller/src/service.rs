@@ -79,6 +79,7 @@ pub use create::RENDEZVOUS_TIMEOUT;
 pub use inhibition::{DEMAND_BUDGET, DEMAND_PATIENCE, POWER_REVIEW_INTERVAL};
 pub use local::{LOCAL_KEEPALIVE, WINDOW_RENEWAL};
 pub use rendezvous::LAUNCH_IDENTITY_TIMEOUT;
+pub use revocation::Audience;
 pub use routes::local_actor;
 pub use start::{BOOT_FILE, ControllerSetup, JOB_SWEEP_BOUND};
 
@@ -1085,6 +1086,14 @@ mod a_delegation_that_is_asked_again;
 /// A transfer of control whose attempt ended before its answer was recorded.
 #[cfg(test)]
 mod a_transfer_left_unanswered;
+
+/// A transfer of control from a device that holds a grant the given-up grant was delegated from.
+#[cfg(test)]
+mod a_transfer_whose_giver_keeps_control;
+
+/// The answer to a revocation made by a paired device.
+#[cfg(test)]
+mod a_revocation_answered_to_a_device;
 
 /// A transfer of control to a device that was revoked after the transfer was planned.
 #[cfg(test)]

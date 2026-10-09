@@ -1140,18 +1140,40 @@ impl RemoteConnection {
                     );
                 }
                 if entry.method == Method::GrantCreate {
-                    let from = mutation
+                    let Ok(params) = mutation
                         .params
                         .to_typed::<kr_protocol::sharing::GrantCreateParams>()
-                        .ok()
-                        .and_then(|params| params.parent_grant_id.0);
-                    if from != Some(decided.acting.grant.grant_id) {
+                    else {
+                        return failure(
+                            mutation.request_id,
+                            ProtocolError::new(
+                                ErrorCode::InvalidArgument,
+                                "grant.create takes the parameters of a share",
+                            ),
+                        );
+                    };
+                    if params.parent_grant_id.0 != Some(decided.acting.grant.grant_id) {
                         return failure(
                             mutation.request_id,
                             ProtocolError::new(
                                 ErrorCode::PermissionDenied,
                                 "a delegation names the grant it is made from, and the request \
                                  acts under that grant",
+                            ),
+                        );
+                    }
+                    // The rights this request was decided with are the grant as this host's
+                    // policy and its configured ceiling leave it, and a delegation hands on no
+                    // more than that: a right the ceiling removed is not delegated, and the
+                    // session text a share's preview carries is not read for a device that may
+                    // not view the session.
+                    if !params.selection.actions().is_subset(&rights) {
+                        return failure(
+                            mutation.request_id,
+                            ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                "a delegation hands on no right that this host's configuration \
+                                 removes from the grant it is made from",
                             ),
                         );
                     }

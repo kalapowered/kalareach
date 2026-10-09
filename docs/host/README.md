@@ -4825,19 +4825,24 @@ one commit. It changes who holds authority, so it takes the owner's confirmation
 only the person at this machine asks for it: `grant.transfer` is served on local IPC alone, and a
 paired device that asks for the confirmation or for the transfer is refused.
 
-The host describes the transfer based on its local state. `owner.confirmation.request` names the
+The host describes the transfer from its own records. `owner.confirmation.request` names the
 session, the grant given up, the receiving device and the identifier of the action that will make
 the transfer, and the host answers with a challenge for a plan that holds the two devices and their
 names, the receiving device's keys, the identity of the grant that will be written, and everything
-that grant carries. That identity comes from the action, so a confirmation is for one action and no
-other. An owner device must respond to the confirmation request before the action can be sent,
-otherwise the action will be refused and the refusal stored against the action. An owner device
-builds the plan's digest again from what it is shown and signs it with the receiving device's keys
-and the rights it is given beside it. `grant.transfer` then spends the answer recorded for exactly
-that plan, once. A receiving device that is not paired with all four of its keys held, a grant that
-is not the transferring device's or carries no `session.share`, and a plan that hands
-over more than the grant carries are each refused before the answer is spent. If the action is sent
-again the response will be the same as the original response, but nothing will be spent.
+that grant carries. The identity of the grant will come from the action, this ensures that the
+confirmation will only be for this action and no others. Before the action is sent a response to the
+confirmation must be sent from a owner device or the action will be refused and the refusal will be
+stored with the action. A client can tell that the owner device has responded by looking for the
+challenge in `owner.confirmation.pending` with `answered` set to true. An owner device builds the
+plan's digest again from what it is shown and signs it with the receiving device's keys and the
+rights it is given beside it. `grant.transfer` then spends the answer recorded for exactly that
+plan, once. A receiving device that is not paired with all four of its keys held, a grant that is
+not the transferring device's or carries no `session.share`, a transferring device that holds a
+grant this one was delegated from (it would keep control of the session), and a plan that hands over
+more than the grant carries are each refused before the answer is spent. A grant that has run out,
+or a device that was revoked, after the plan was built is refused where the transfer writes, after
+the answer is spent, and the action keeps that refusal. If the action is sent again then instead of
+spending anything it will return the same response as the original response.
 
 A confirmation is accepted only against the expectation this host builds from its own records: its
 device identity and endpoint, the receiving device's public keys, the rights the plan hands over and
@@ -4869,16 +4874,25 @@ delegates from (naming one is not holding one), and that grant has to carry `ses
 Only this host's own device issues a grant that delegates from nothing.
 
 A paired device delegates with `grant.create` over its own connection, as itself, from a share it
-holds. The request names that share as its parent and is decided under that share's rights; a
-pairing grant is not a grant to delegate from. All narrowing of the parent (rights, sessions,
-history, screen, named questions, named approvals and lifetime) will be done based solely on the
-grants before the worker of the session is queried for the preview text, so that what a device is
-shown of a session never exceeds what the grant it delegates from reaches. The grant written will
-not authorise anything until it is redeemed by the device it names, and it ends with its parent. A
-device revokes with `grant.revoke` whatever descends from a grant it holds, decided under that grant
-and again where the revocation is made, and lists what it issued with `grant.list`. A grant it holds
-itself, one that descends from another device's grant, and one that does not exist are refused
-alike.
+holds. The request names that share as its parent and is decided under that share's rights as this
+host's configuration leaves them: a pairing grant is not a grant to delegate from, and no right the
+configuration removed is handed on. All narrowing of the parent (rights, sessions, history, screen,
+named questions, named approvals and lifetime) is decided from the grants alone before the worker of
+the session is queried for the preview text, so that what a device is shown of a session never
+exceeds what the grant it delegates from reaches. The grant written authorises nothing until the
+device it names redeems it, and it ends with its parent.
+
+A device revokes with `grant.revoke` whatever descends from a grant it holds, however far down. The
+revocation is decided under that grant, and a share revoked while the request waits is caught where
+the revocation is written. The response lists the workers for any sessions that grants being revoked
+included, and no other workers.
+
+A revocation is refused alike when the grant does not exist or no share the device holds is above
+it, as it is for a grant the device holds itself or one that descends from another device's grant.
+Paired devices can use `grant.list` to view grants they have issued.
+
+Each action is associated with the actor that sent it. If two actors send the same action, two
+grants will be written.
 
 ### Revocation
 
