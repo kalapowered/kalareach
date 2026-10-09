@@ -2197,7 +2197,7 @@ mod tests {
 
         let host = kr_ipc::testing::TempHost::create();
         let label = worker_label(ReservationId::new(kr_ipc::new_uuid()));
-        let reason = "kr-worker: claude runs as typed, with no backend: this host refused it";
+        let reason = "kr-worker: claude is not integrated for this launch: this host refused it";
         let outcome = detached_shell(
             &host,
             &label,

@@ -138,14 +138,17 @@ written before the member existed reads and hashes as it did.
   adding a pair is a new contract version.
 - The declaration adds at least one flag or sets at least one variable, and the package requests
   `command_integration.launch`.
+- The statement an owner is shown for the integration, which the host writes from the declaration
+  (see below), is at most 4,000 characters, so the flags and the server's arguments have to fit it.
 
 #### A backend
 
-An application whose terminal can communicate with a server (in Codex, a `--remote` terminal with an
-App Server) adds a `backend` member. A host that has backends starts the server as the session's
-backend, from the executable the shell resolved for the command and the arguments declared here, and
-runs the terminal against a gateway of its own. A host that has none runs the command as typed, and
-its diagnostics say why.
+An application whose terminal can communicate with a server (in Codex, a `--remote` terminal that
+talks to the App Server) adds a `backend` member that informs a host capable of running such a
+server how to start the server (namely, with the same executable that a shell would resolve for the
+command and the arguments declared here) and run the terminal against a gateway of its own. This
+host does not run such a server, so it merely checks the declaration and runs each invocation as
+typed, and `kr doctor` says why.
 
 ```json
 "command_integration": {
@@ -160,13 +163,15 @@ its diagnostics say why.
 }
 ```
 
-- `arguments` are what the server is started with: one to eight, each 1 to 256 bytes and one visible
-  line, provided as they stand. A package cannot name the executable, which is always the one the
-  shell resolved, and it must be a program the host can read and hash, not a script.
-- `{gateway}` is the one flag element, exactly, that the host replaces, once the launch is
-  committed, with the address of the gateway the terminal connects to. A backend declares it exactly
-  once. It's a finding if a flag holds it and does not stand alone, or if it is declared with no
-  backend.
+- `arguments` are what the server is started with: there must be between 1 and 8 of them, each must
+  contain between 1 and 256 bytes and not extend over more than one visible line, and they are
+  written as they stand, so none holds `{gateway}` or `{kr_hook}`. The package cannot specify which
+  executable to run, this will always be the one resolved by a shell for the command. This
+  executable must be a program that the host will be able to read and hash, not a script.
+- `{gateway}` is a special token that must be declared in exactly one flag, as the whole element and
+  exactly once, which a host running the server replaces, once the launch is committed, with the
+  address of its gateway. It is a finding if a flag holds it and does not stand alone, or if it is
+  declared with no backend.
 - `launching_words` are the bare words (letters, digits, `_` and `-`, at most 32 bytes, none
   starting with `-`, none listed twice, at most eight) that may follow the command for a launch the
   backend is started for. The launch has to type no option, and its first word has to be absent or
@@ -511,12 +516,12 @@ component fault disables rich meaning without stalling or discarding valid nativ
   component interprets them. A table that answers none gives its package no such trust, so a
   protocol whose answer is a response to the request itself, rather than a request of its own, is
   answered by the native client alone.
-- **Messages:** for a table a backend is read with, the top-level members a message is read by
-  beyond its identifier and method: `params`, `result` and `error`. A request names the method
-  member, a response names exactly one of the result and error members, and the five names differ
-  (a request and a response may share their identifier member, as JSON-RPC's do). A table that
-  does not need the member leaves it out, and a package whose table declares it states
-  `"sdk_range": ">=0.1.5, <0.2.0"`.
+- **Messages:** The table describes the messages sent between an application and one of its servers.
+  The top level members, other than the message identifier and method, are named `params`, `result`
+  and `error`. A request names the method member, and a response names exactly one of the result and
+  error members. All five names must be different, except that a request and response may share
+  their identifier member, as is the case with JSON-RPC. A table that does not need the member
+  leaves it out, and a package whose table declares it states `"sdk_range": ">=0.1.5, <0.2.0"`.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
@@ -711,7 +716,7 @@ report the same code for the same defect.
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 | `integration_without_capability` | A command integration without `command_integration.launch` |
-| `integration_invalid` | A command integration names another command, adds a flag it may not, sets a variable the contract does not permit, or declares a backend that breaks the contract (a missing or repeated `{gateway}`, arguments or launching words out of bounds, no table to read) |
+| `integration_invalid` | A command integration names another command, adds a flag it may not, sets a variable the contract does not permit, has a statement of what it does that is longer than an owner is shown whole, or declares a backend that breaks the contract (a missing or repeated `{gateway}`, arguments or launching words out of bounds, no table to read) |
 | `launch_probe_without_capability` | A launch probe without `launch.probe` |
 | `launch_probe_invalid` | A launch probe passes no argument or too many, carries an option that is not a name, or names a mode that is not a JSON Pointer |
 

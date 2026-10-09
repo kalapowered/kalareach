@@ -705,8 +705,19 @@ fn an_integration_turned_off_carries_no_flags() {
     assert!(entries[0].flags.is_empty(), "{:?}", entries[0].flags);
 }
 
-/// Sixteen flags of the most bytes a flag may have.
+/// One flag of the most bytes a package's integration may take: an owner is shown what the
+/// integration does whole, and that is at most `MAX_STATEMENT_CHARS` characters, the flag and the
+/// rest of the statement together.
 fn largest_flags() -> Vec<String> {
+    vec![format!(
+        "--{}",
+        "x".repeat(kr_plugin_sdk::integration::MAX_STATEMENT_CHARS - 400)
+    )]
+}
+
+/// Sixteen flags of the most bytes a flag may have, which no package passes its check with: for
+/// the entries a test writes by hand.
+fn oversized_flags() -> Vec<String> {
     (0..kr_plugin_sdk::integration::MAX_FLAGS)
         .map(|index| {
             format!(
@@ -715,6 +726,12 @@ fn largest_flags() -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// How many integrations with [`largest_flags`] one session carries, whole.
+fn largest_that_fit_a_session() -> usize {
+    kr_protocol::session::MAX_COMMAND_INTEGRATION_FLAG_BYTES
+        / largest_flags().iter().map(String::len).sum::<usize>()
 }
 
 /// A launch specification whose create request carries `entries`.
@@ -784,7 +801,7 @@ fn a_launch_specification_leaves_out_the_integrations_a_frame_cannot_carry() {
         enabled: true,
     };
     let mut entries: Vec<CommandIntegration> = (0..20)
-        .map(|index| entry(&format!("big{index}"), largest_flags()))
+        .map(|index| entry(&format!("big{index}"), oversized_flags()))
         .collect();
     entries.push(entry("small", vec!["--small".to_owned()]));
     let mut specification = specification(entries);
@@ -866,8 +883,9 @@ fn flag_bytes(entries: &[CommandIntegration]) -> usize {
 #[test]
 fn a_session_carries_the_flags_of_its_integrations_within_a_bound() {
     let store = Store::new("session-flags");
-    let reading = Integrations::new().read(&many(&store, "big", 21, &largest_flags()));
-    let fill = fill(&reading, &many_named("big", 21));
+    let count = 100;
+    let reading = Integrations::new().read(&many(&store, "big", count, &largest_flags()));
+    let fill = fill(&reading, &many_named("big", count));
     assert!(
         flag_bytes(&fill.entries) <= kr_protocol::session::MAX_COMMAND_INTEGRATION_FLAG_BYTES,
         "{} bytes of flags",
@@ -875,13 +893,13 @@ fn a_session_carries_the_flags_of_its_integrations_within_a_bound() {
     );
     assert_eq!(
         fill.omitted.len(),
-        17,
-        "four integrations with the most flags a package may declare fit"
+        count - largest_that_fit_a_session(),
+        "only as many integrations with the most flags a package may declare as fit are carried"
     );
-    assert_eq!(fill.entries.len() + fill.omitted.len(), 21);
+    assert_eq!(fill.entries.len() + fill.omitted.len(), count);
     for entry in &fill.entries {
         assert!(entry.enabled);
-        assert_eq!(entry.flags.len(), 16, "an entry is carried whole");
+        assert_eq!(entry.flags, largest_flags(), "an entry is carried whole");
         assert!(!fill.omitted.contains(&entry.plugin_id));
     }
 }
@@ -936,12 +954,13 @@ fn one_note_names_every_integration_a_launch_leaves_out() {
 #[test]
 fn the_doctor_marks_an_integration_a_session_is_launched_without() {
     let store = Store::new("too-large");
-    let reading = Integrations::new().read(&many(&store, "big", 5, &largest_flags()));
-    let enabled = many_named("big", 5);
+    let count = largest_that_fit_a_session() + 1;
+    let reading = Integrations::new().read(&many(&store, "big", count, &largest_flags()));
+    let enabled = many_named("big", count);
     let left_out = fill(&reading, &enabled).omitted;
     assert_eq!(left_out.len(), 1);
     let reported = report(Some(&reading), &[], &enabled, &able(Vec::new()));
-    assert_eq!(reported.reports.len(), 5);
+    assert_eq!(reported.reports.len(), count);
     for report in &reported.reports {
         assert_eq!(report.state, CommandIntegrationState::On);
         assert_eq!(
@@ -966,22 +985,27 @@ fn encoded(value: &impl serde::Serialize) -> usize {
 #[test]
 fn the_doctor_carries_whole_reports_within_its_bytes() {
     let store = Store::new("report-bytes");
-    let reading = Integrations::new().read(&many(&store, "big", 8, &largest_flags()));
+    let count = 130;
+    let reading = Integrations::new().read(&many(&store, "big", count, &largest_flags()));
     let reported = report(Some(&reading), &[], &[], &able(Vec::new()));
-    assert_eq!(
-        reported.reports.len(),
-        5,
-        "five of the largest declarations fit, and a sixth would not"
+    assert!(
+        reported.omitted > 0,
+        "the reports are more than their bytes"
     );
-    assert_eq!(reported.omitted, 3);
-    let carried: usize = reported
+    assert_eq!(reported.reports.len() + reported.omitted, count);
+    let sizes: Vec<usize> = reported
         .reports
         .iter()
         .map(|report| encoded(report).max(encoded(&report.withheld_form())))
-        .sum();
+        .collect();
+    let carried: usize = sizes.iter().sum();
     assert!(carried <= MAX_REPORT_BYTES, "{carried} bytes");
+    assert!(
+        carried + sizes.iter().max().copied().unwrap_or_default() > MAX_REPORT_BYTES,
+        "one more of the largest declarations would not fit"
+    );
     for report in &reported.reports {
-        assert_eq!(report.flags.len(), 16, "a report is carried whole");
+        assert_eq!(report.flags, largest_flags(), "a report is carried whole");
     }
     let check = check(&reported, &[]);
     assert_eq!(check.status, DoctorStatus::Warning);
@@ -1031,10 +1055,10 @@ fn the_doctor_answer_fits_one_response_frame() {
     use kr_protocol::hostinfo::export::ForExport as _;
 
     let store = Store::new("answer");
-    let mut packages = many(&store, "big", 8, &largest_flags());
+    let mut packages = many(&store, "big", 100, &largest_flags());
     packages.extend(many(&store, "small", MAX_REPORTS, &["--small".to_owned()]));
     let reading = Integrations::new().read(&packages);
-    let enabled = many_named("big", 8);
+    let enabled = many_named("big", 100);
     let reported = report(Some(&reading), &[], &enabled, &able(Vec::new()));
     let carried: usize = reported
         .reports

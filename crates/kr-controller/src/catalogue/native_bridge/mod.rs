@@ -3104,40 +3104,72 @@ fn same(kind: Kind, staged: &Identity, found: &Identity) -> bool {
     }
 }
 
-/// What [`read_executable`] says of a script, after its path: the program it runs is its
-/// interpreter, so no identity is read for it.
-pub(crate) const SCRIPT_READ: &str = "is a script, and the program it runs is its interpreter";
+/// Why [`read_executable`] read no digest.
+#[derive(Debug)]
+pub(crate) enum ExecutableError {
+    /// The file is a script: the program it runs is its interpreter, so no identity is read for
+    /// it. Holds the file's path.
+    Script(String),
+    /// The file could not be read as one whole executable, for the reason given.
+    Unreadable(String),
+}
+
+impl ExecutableError {
+    /// True when the file is a script.
+    pub(crate) const fn is_script(&self) -> bool {
+        matches!(self, Self::Script(_))
+    }
+}
+
+impl std::fmt::Display for ExecutableError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Script(path) => write!(
+                formatter,
+                "{path} is a script, and the program it runs is its interpreter"
+            ),
+            Self::Unreadable(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl From<ExecutableError> for String {
+    fn from(error: ExecutableError) -> Self {
+        error.to_string()
+    }
+}
 
 /// Reads one executable, never running it: a regular file, not a script, read within the size
 /// its file reports and read again when it changed meanwhile.
-pub(crate) fn read_executable(path: &Path) -> std::result::Result<Digest256, String> {
+pub(crate) fn read_executable(path: &Path) -> std::result::Result<Digest256, ExecutableError> {
     use std::io::Read as _;
+    let unreadable = |error: std::io::Error| {
+        ExecutableError::Unreadable(format!("{} cannot be read: {error}", path.display()))
+    };
     for _ in 0..3 {
-        let file = std::fs::File::open(path)
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-        let before = file
-            .metadata()
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let before = file.metadata().map_err(unreadable)?;
         if !before.is_file() {
-            return Err(format!("{} is not a regular file", path.display()));
+            return Err(ExecutableError::Unreadable(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
         }
         if before.len() > EXECUTABLE_LIMIT {
-            return Err(format!(
+            return Err(ExecutableError::Unreadable(format!(
                 "{} is larger than the {EXECUTABLE_LIMIT} bytes this host reads of it",
                 path.display()
-            ));
+            )));
         }
         let mut bytes = Vec::new();
         (&file)
             .take(before.len() + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+            .map_err(unreadable)?;
         if bytes.starts_with(b"#!") {
-            return Err(format!("{} {SCRIPT_READ}", path.display()));
+            return Err(ExecutableError::Script(path.display().to_string()));
         }
-        let after = file
-            .metadata()
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+        let after = file.metadata().map_err(unreadable)?;
         let unchanged = u64::try_from(bytes.len()).ok() == Some(before.len())
             && after.len() == before.len()
             && after.modified().ok() == before.modified().ok();
@@ -3145,10 +3177,10 @@ pub(crate) fn read_executable(path: &Path) -> std::result::Result<Digest256, Str
             return Ok(Digest256::from_bytes(kr_cbor::sha256(&bytes)));
         }
     }
-    Err(format!(
+    Err(ExecutableError::Unreadable(format!(
         "{} kept changing while it was read",
         path.display()
-    ))
+    )))
 }
 
 /// What no longer matches an applied release, in words a person reads.

@@ -525,7 +525,7 @@ fn resolved(
         let script = read
             .as_ref()
             .and_then(|read| read.as_ref().err())
-            .is_some_and(|error| error.ends_with(super::native_bridge::SCRIPT_READ));
+            .is_some_and(super::native_bridge::ExecutableError::is_script);
         if (!kr_worker::broker::commands::starts_directly(&executable) || script)
             && report.reason.0.is_none()
         {

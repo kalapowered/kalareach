@@ -1089,10 +1089,10 @@ impl Session {
         }) {
             Ok(backend) => Some(backend),
             Err(why) => {
-                // The shell is told only that no backend could be established, and the invocation
+                // The shell is told only that no launch could be integrated, and the invocation
                 // runs as typed. Why goes to this worker's own diagnostics, where a person looking
                 // into a command that ran without its integration finds it.
-                eprintln!("kr-worker: {command} runs as typed, with no backend: {why}");
+                eprintln!("kr-worker: {command} is not integrated for this launch: {why}");
                 None
             }
         }

@@ -1359,10 +1359,10 @@ export interface ConnectorManifest {
    */
   manifest_version: number
   /**
-   * The members a message is read by beyond its identifier and method, for a table the
-   * worker's gateway reads.
+   * The members a message is read by beyond its identifier and method, for a table of an
+   * application server a native terminal speaks to.
    *
-   * A table that declares a backend in its package's command integration states them. A table
+   * A table for a server that its package's command integration declares states them. A table
    * that does not leaves the member out, so a connector written before the member existed
    * reads and hashes exactly as it did.
    */
@@ -1482,12 +1482,12 @@ export interface FieldPath1 {
 /**
  * The top-level members a message is read by, beyond its identifier and its method.
  *
- * A table that the worker's gateway reads for a native terminal and the backend behind it names
- * them here: the member a request carries its parameters in, the member a successful response
- * carries its result in, and the member a failed response carries its error in. The gateway
- * treats a frame that names the method member as a request, a frame that names exactly one of the
- * result and error members as a response, and anything else as neither, so the three names and
- * the identifier and method members all differ.
+ * A table for the application server a native terminal speaks to names them here: the member a
+ * request carries its parameters in, the member a successful response carries its result in, and
+ * the member a failed response carries its error in. A host that runs such a server treats a
+ * frame that names the method member as a request, a frame that names exactly one of the result
+ * and error members as a response, and anything else as neither, so the three names and the
+ * identifier and method members all differ.
  */
 export interface MessageMembers {
   /**
@@ -3356,11 +3356,12 @@ export interface AttachmentContribution {
  */
 export interface CommandIntegration {
   /**
-   * The backend the worker starts for the integrated invocation, where the application's
-   * terminal speaks to a server.
+   * The application server the terminal speaks to, where the application has one.
    *
-   * A package that declares none leaves the member out, so a manifest written before the
-   * member existed reads and hashes exactly as it did.
+   * It states what the declaration asks of a host that runs such a server: the arguments the
+   * command's own program is started with to make it, and which launches it serves. A host that
+   * runs none runs the command as typed. A package that declares none leaves the member out, so
+   * a manifest written before the member existed reads and hashes exactly as it did.
    */
   backend?: IntegrationBackend | null
   /**
@@ -3382,17 +3383,17 @@ export interface CommandIntegration {
   variables: IntegrationVariable[]
 }
 /**
- * The backend a command integration starts.
+ * The application server a command integration declares for the terminal to speak to.
  */
 export interface IntegrationBackend {
   /**
-   * The arguments the application's own executable is started with to make the backend, in
+   * The arguments the application's own executable is started with to make the server, in
    * order, each one argument element. The executable is the one the shell resolved for the
    * command; a package cannot name another.
    */
   arguments: string[]
   /**
-   * The words that may follow the command name for a launch the backend is started for.
+   * The words that may follow the command name for a launch the server is declared for.
    *
    * A launch whose first word is absent, or one of these, and that types no option, is a plain
    * launch of the terminal. Any other launch (a subcommand that is not a terminal, an option,

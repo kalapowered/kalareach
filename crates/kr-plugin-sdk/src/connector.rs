@@ -173,12 +173,12 @@ pub enum BrokerTransport {
 
 /// The top-level members a message is read by, beyond its identifier and its method.
 ///
-/// A table that the worker's gateway reads for a native terminal and the backend behind it names
-/// them here: the member a request carries its parameters in, the member a successful response
-/// carries its result in, and the member a failed response carries its error in. The gateway
-/// treats a frame that names the method member as a request, a frame that names exactly one of the
-/// result and error members as a response, and anything else as neither, so the three names and
-/// the identifier and method members all differ.
+/// A table for the application server a native terminal speaks to names them here: the member a
+/// request carries its parameters in, the member a successful response carries its result in, and
+/// the member a failed response carries its error in. A host that runs such a server treats a
+/// frame that names the method member as a request, a frame that names exactly one of the result
+/// and error members as a response, and anything else as neither, so the three names and the
+/// identifier and method members all differ.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct MessageMembers {
@@ -357,10 +357,10 @@ pub struct ConnectorManifest {
     pub method_path: FieldPath,
     /// How a response is matched to its request.
     pub response_correlation: ResponseCorrelation,
-    /// The members a message is read by beyond its identifier and method, for a table the
-    /// worker's gateway reads.
+    /// The members a message is read by beyond its identifier and method, for a table of an
+    /// application server a native terminal speaks to.
     ///
-    /// A table that declares a backend in its package's command integration states them. A table
+    /// A table for a server that its package's command integration declares states them. A table
     /// that does not leaves the member out, so a connector written before the member existed
     /// reads and hashes exactly as it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
