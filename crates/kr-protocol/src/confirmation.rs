@@ -155,12 +155,15 @@ pub struct TransferControlSubject {
 
 /// Handing a session's control to another device, as the owner is asked to confirm it.
 ///
-/// Every member of what is written is a member of this plan, and the digest covers the whole of it:
-/// the grant given up, the device it is taken from and the device and keys it goes to, the
-/// identity of the grant written, and every right, history bound, lifetime, selector and
-/// organisation requirement the receiving device holds. A confirmation obtained for one transfer
-/// authorises no other. The host writes the grant [`Self::replacement`] builds, so what is written
-/// is what was confirmed; an owner device builds the digest again from what it is shown.
+/// Every member of the grant that is written is a member of this plan but the authority revision it
+/// is written under, and the digest covers the whole of the plan: the grant given up, the device it
+/// is taken from and the device and keys it goes to, the identity of the grant written, and every
+/// right, history bound, lifetime, selector and organisation requirement the receiving device
+/// holds. The host adds only what grants nothing: the revision the grant is written at, the time it
+/// is written, and the continuous-clock deadline copied from the grant given up, which can only
+/// shorten it. A confirmation obtained for one transfer authorises no other. The host writes the
+/// grant [`Self::replacement`] builds, so what is written is what was confirmed; an owner device
+/// builds the digest again from what it is shown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransferControlPlan {

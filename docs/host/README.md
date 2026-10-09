@@ -4825,28 +4825,29 @@ one commit. It changes who holds authority, so it takes the owner's confirmation
 only the person at this machine asks for it: `grant.transfer` is served on local IPC alone, and a
 paired device that asks for the confirmation or for the transfer is refused.
 
-The host describes the transfer from its own records. `owner.confirmation.request` names the
+The host describes the transfer based on its local state. `owner.confirmation.request` names the
 session, the grant given up, the receiving device and the identifier of the action that will make
 the transfer, and the host answers with a challenge for a plan that holds the two devices and their
 names, the receiving device's keys, the identity of the grant that will be written, and everything
 that grant carries. That identity comes from the action, so a confirmation is for one action and no
-other, and it has to be asked for before the action is sent: a transfer sent first is refused and
-the refusal is kept for its action. An owner device builds the plan's digest again from what it is
-shown and signs it with the receiving device's keys and the rights it is given beside it.
-`grant.transfer` then spends the answer recorded for exactly that plan, once. A receiving device
-that is not paired with all four of its keys held, a grant that is not the transferring device's or
-carries no `session.share`, and a plan that hands over more than the grant carries are each refused
-before the answer is spent. A repeat of the action is answered as it was and spends nothing.
+other. An owner device must respond to the confirmation request before the action can be sent,
+otherwise the action will be refused and the refusal stored against the action. An owner device
+builds the plan's digest again from what it is shown and signs it with the receiving device's keys
+and the rights it is given beside it. `grant.transfer` then spends the answer recorded for exactly
+that plan, once. A receiving device that is not paired with all four of its keys held, a grant that
+is not the transferring device's or carries no `session.share`, and a plan that hands
+over more than the grant carries are each refused before the answer is spent. If the action is sent
+again the response will be the same as the original response, but nothing will be spent.
 
-The confirmation is accepted against an expectation built from what the caller states this host is:
-its device identity, its endpoint, the recipient's public keys, the rights the plan hands over and a
-digest covering the whole plan. A challenge that supplied its own answers to those does not satisfy
-it. The signer and the outstanding-challenge ledger are the caller's too, so the acceptance is only
-as strong as the caller's own enrolment record. What comes out of that acceptance is evidence bound
-to the host it was accepted for, to the boot it was accepted in, and to the ceremony's own monotonic
-deadline, and the transfer checks all three before it does anything and again where it writes.
-Confirmations accepted for other hosts, previous boots of the host, or which are now out of date
-will not be accepted.
+A confirmation is accepted only against the expectation this host builds from its own records: its
+device identity and endpoint, the receiving device's public keys, the rights the plan hands over and
+a digest covering the whole plan. A challenge that supplied its own answers to those does not
+satisfy it. The confirmation must be signed by one of the host's owner devices at the time the
+answer is spent, confirmations signed by devices that no longer have authority will not be spent.
+What comes out of that acceptance is evidence bound to the host it was accepted for, to the boot it
+was accepted in, and to the ceremony's own monotonic deadline. The transfer will check these at the
+start and again when persisting the change, confirmations accepted for other hosts, previous boots
+of the host or that are now out of date will not be accepted.
 
 The rights transferred will not include more rights than the grant being transferred carries. Like
 any other revocation, the transfer advances the revision and fences.

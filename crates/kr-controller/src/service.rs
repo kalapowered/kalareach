@@ -1086,6 +1086,10 @@ mod a_delegation_that_is_asked_again;
 #[cfg(test)]
 mod a_transfer_left_unanswered;
 
+/// A transfer of control to a device that was revoked after the transfer was planned.
+#[cfg(test)]
+mod a_transfer_to_a_device_revoked_since;
+
 /// An action an earlier build claimed in the grant store alone, as the route check finds it.
 #[cfg(test)]
 mod a_voice_receipt_from_an_earlier_build;
