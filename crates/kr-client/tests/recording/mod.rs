@@ -219,7 +219,7 @@ impl ServiceSigner for Keyed {
     }
 }
 
-/// An account token, as a source hands it over.
+/// A key of its own for the caller to sign as, and the signer kind it signs as.
 pub fn keyed(signer: ServiceRequestSigner) -> Arc<Keyed> {
     Arc::new(Keyed {
         key: AuthorisationKeyPair::generate().expect("a key"),
