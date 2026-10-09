@@ -535,13 +535,7 @@ async fn a_lease_a_rule_refuses_installs_nothing_and_names_the_rule() {
         .into_iter()
         .collect();
     let above_ceiling = organisation.sign(2, above_ceiling_payload);
-    let from_the_future = organisation.lease(
-        2,
-        &ada.account.clone().into(),
-        ada.key(),
-        issued + 60_000,
-        SERVED,
-    );
+    let from_the_future = organisation.lease(2, &ada.account, ada.key(), issued + 60_000, SERVED);
     let for_another_device = fixture.lease(2, &bea, SERVED);
     let another_member = organisation.lease(2, &member("cai"), ada.key(), issued + 3_000, SERVED);
     let unknown_revision = {
