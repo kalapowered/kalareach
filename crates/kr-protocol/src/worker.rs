@@ -429,7 +429,7 @@ pub struct AuthorityRevisionNotice {
     pub environment_id: EnvironmentId,
     /// The revision now in force.
     pub revision: AuthorityRevision,
-    /// Whose authority the revision withdrew, when the host can name it.
+    /// Whose authority the revisions up to this one withdrew, when the host can name it.
     ///
     /// It is absent from the wire when it is the whole host, which is what a worker that does not
     /// state [`crate::local::AUTHORITY_REVISION_REACH`] is always sent.
@@ -455,18 +455,23 @@ fn is_first_page(evidence_from: &u64) -> bool {
 }
 
 /// How many grants and devices together a revision's reach may name before it is the whole host.
-pub const MAX_REVISION_REACH_NAMES: usize = 256;
+///
+/// A name costs about eighteen bytes of a control frame, which holds a mebibyte, so this leaves the
+/// rest of a notice a great deal of room. A device can only reach it by holding that many redeemed
+/// grants below one it withdraws.
+pub const MAX_REVISION_REACH_NAMES: usize = 16_384;
 
-/// Whose authority one revision withdrew.
+/// Whose authority the revisions after one revision withdrew.
 ///
 /// A revision invalidates the host's dispatch leases wholesale, but what it takes away from a
 /// session's workers is the authority held under the grants and by the devices it withdrew. A
-/// worker fences the input of the callers it names and leaves every other caller's, so one
+/// worker fences the input of the callers a reach names and leaves every other caller's, so one
 /// device's own grant changes do not take the input lease another device holds.
 ///
-/// A worker applies a named reach only to the revision that follows the one it last acknowledged:
-/// a worker that missed a revision, that was refused for its dispatch boundary, or that has
-/// acknowledged none fences every caller acting under a grant, as it does for [`Self::Host`].
+/// A reach describes the revisions after [`Self::Within::since`] up to the notice's own, and a
+/// worker applies it only when it has fenced every revision up to `since`: it has acknowledged
+/// `since` or a later one. A worker that missed an earlier revision, or has acknowledged none,
+/// fences every caller acting under a grant, as it does for [`Self::Host`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RevisionReach {
@@ -475,9 +480,12 @@ pub enum RevisionReach {
     Host,
     /// Only the authority held under these grants and by these devices.
     Within {
-        /// The grants the revision withdrew, with everything delegated from them.
+        /// The last revision before the ones this describes, which the worker must have fenced.
+        since: AuthorityRevision,
+        /// The grants the revisions withdrew, with everything delegated from them that anyone
+        /// held.
         grants: CanonicalSet<GrantId>,
-        /// The devices the revision withdrew.
+        /// The devices the revisions withdrew.
         devices: CanonicalSet<DeviceId>,
     },
 }
@@ -489,17 +497,79 @@ impl RevisionReach {
         matches!(self, Self::Host)
     }
 
+    /// Returns the reach a worker that has acknowledged `held` applies to the announcement of
+    /// `revision`: this one when it describes only revisions the worker has not fenced, and the
+    /// whole host's otherwise.
+    #[must_use]
+    pub fn applied_by_a_worker_at(
+        &self,
+        held: Option<AuthorityRevision>,
+        revision: AuthorityRevision,
+    ) -> &Self {
+        const HOST: &RevisionReach = &RevisionReach::Host;
+        match (self, held) {
+            (Self::Within { since, .. }, Some(held))
+                if since.get() < revision.get() && held.get() >= since.get() =>
+            {
+                self
+            }
+            _ => HOST,
+        }
+    }
+
     /// Returns whether a caller acting under `grant_id`, or from `device_id`, is within this
     /// reach. A caller that carries neither is within every reach.
     #[must_use]
     pub fn names(&self, grant_id: Option<GrantId>, device_id: Option<DeviceId>) -> bool {
         match self {
             Self::Host => true,
-            Self::Within { grants, devices } => {
+            Self::Within {
+                grants, devices, ..
+            } => {
                 (grant_id.is_none() && device_id.is_none())
                     || grant_id.is_some_and(|grant| grants.contains(&grant))
                     || device_id.is_some_and(|device| devices.contains(&device))
             }
+        }
+    }
+
+    /// Returns what a worker owes for this reach and then also for `later`, the reach of a later
+    /// revision it was refused: the reach of both, or the whole host when they do not join up.
+    ///
+    /// They join when `later` describes everything after the revision this one ends at, so the
+    /// union describes every revision from the earlier `since` to the later one; a gap between
+    /// them is a revision whose reach nothing here names.
+    #[must_use]
+    pub fn then(&self, ends_at: AuthorityRevision, later: &Self) -> Self {
+        let (
+            Self::Within {
+                since: first,
+                grants,
+                devices,
+            },
+            Self::Within {
+                since: second,
+                grants: more_grants,
+                devices: more_devices,
+            },
+        ) = (self, later)
+        else {
+            return Self::Host;
+        };
+        if second.get() > ends_at.get() {
+            return Self::Host;
+        }
+        let grants: CanonicalSet<GrantId> =
+            grants.iter().chain(more_grants.iter()).copied().collect();
+        let devices: CanonicalSet<DeviceId> =
+            devices.iter().chain(more_devices.iter()).copied().collect();
+        if grants.len() + devices.len() > MAX_REVISION_REACH_NAMES {
+            return Self::Host;
+        }
+        Self::Within {
+            since: AuthorityRevision::new(first.get().min(second.get())),
+            grants,
+            devices,
         }
     }
 }
@@ -811,6 +881,20 @@ mod tests {
         );
     }
 
+    fn reach(since: u64, grants: &[u8], devices: &[u8]) -> RevisionReach {
+        RevisionReach::Within {
+            since: AuthorityRevision::new(since),
+            grants: grants
+                .iter()
+                .map(|byte| GrantId::new(Uuid::from_bytes([*byte; 16])))
+                .collect(),
+            devices: devices
+                .iter()
+                .map(|byte| DeviceId::new(Uuid::from_bytes([*byte; 16])))
+                .collect(),
+        }
+    }
+
     /// A worker built before a revision's reach existed reads this notice, and ends the link of a
     /// frame with a member it does not know: the whole host's reach is therefore not on the wire
     /// at all, and a notice that names one round-trips.
@@ -830,12 +914,7 @@ mod tests {
         assert!(map.get("evidence_from").is_none());
 
         let named = AuthorityRevisionNotice {
-            reach: RevisionReach::Within {
-                grants: [GrantId::new(Uuid::from_bytes([1; 16]))]
-                    .into_iter()
-                    .collect(),
-                devices: CanonicalSet::new(),
-            },
+            reach: reach(3, &[1], &[]),
             ..whole
         };
         let encoded = kr_cbor::to_canonical_value(&named).expect("encodes");
@@ -850,14 +929,61 @@ mod tests {
     fn a_reach_names_what_it_holds_and_a_caller_that_carries_neither() {
         let grant = GrantId::new(Uuid::from_bytes([1; 16]));
         let device = DeviceId::new(Uuid::from_bytes([2; 16]));
-        let named = RevisionReach::Within {
-            grants: [grant].into_iter().collect(),
-            devices: CanonicalSet::new(),
-        };
+        let named = reach(0, &[1], &[]);
         assert!(named.names(None, None));
         assert!(named.names(Some(grant), None));
         assert!(!named.names(Some(GrantId::new(Uuid::from_bytes([3; 16]))), Some(device)));
         assert!(RevisionReach::Host.names(Some(grant), Some(device)));
+    }
+
+    /// A worker applies a reach only when it has fenced every revision up to its `since`.
+    #[test]
+    fn a_worker_applies_a_reach_only_from_a_revision_it_has_fenced() {
+        let revision = AuthorityRevision::new(6);
+        let at = |held: Option<u64>, since: u64| {
+            let named = reach(since, &[1], &[]);
+            named.applied_by_a_worker_at(held.map(AuthorityRevision::new), revision) == &named
+        };
+        assert!(at(Some(5), 5), "the one before");
+        assert!(
+            at(Some(5), 3),
+            "a reach that reaches back past what it holds"
+        );
+        assert!(!at(Some(4), 5), "a revision it missed");
+        assert!(!at(None, 0), "a worker that has acknowledged none");
+        assert!(
+            !at(Some(9), 6),
+            "a reach that describes no revision after its own"
+        );
+        assert!(
+            RevisionReach::Host
+                .applied_by_a_worker_at(Some(AuthorityRevision::new(5)), revision)
+                .is_host()
+        );
+    }
+
+    /// The reaches of two refused announcements join when the later one describes everything after
+    /// the earlier one, and are the whole host's when a revision between them is described by
+    /// neither.
+    #[test]
+    fn the_reaches_of_refused_announcements_join_or_become_the_whole_host() {
+        let first = reach(2, &[1], &[]);
+        let ends_at = AuthorityRevision::new(3);
+        assert_eq!(
+            first.then(ends_at, &reach(3, &[2], &[9])),
+            reach(2, &[1, 2], &[9])
+        );
+        assert_eq!(
+            first.then(ends_at, &reach(1, &[2], &[])),
+            reach(1, &[1, 2], &[]),
+            "a later reach that reaches further back joins at the earlier since"
+        );
+        assert!(
+            first.then(ends_at, &reach(4, &[2], &[])).is_host(),
+            "revision 4 is described by neither"
+        );
+        assert!(first.then(ends_at, &RevisionReach::Host).is_host());
+        assert!(RevisionReach::Host.then(ends_at, &first).is_host());
     }
 
     #[test]
