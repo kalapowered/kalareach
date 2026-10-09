@@ -869,7 +869,7 @@ mod cases {
         assert_unmarked("a kept answer", &debug_renderings(&kept));
         assert_unmarked(
             "an answer kept",
-            &debug_renderings(&crate::answers::Answered::NotSent(kept)),
+            &debug_renderings(&crate::answers::Answered::Unconfirmed(kept)),
         );
 
         let label = crate::sync::PinnedLabel {

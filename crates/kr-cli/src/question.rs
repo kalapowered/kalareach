@@ -152,10 +152,12 @@ pub async fn answer(
         Ok(Answered::Sent(resolved)) => shown(*resolved),
         // The answer is a stored record: keeping it holds the writers' lock and asks for the leave to
         // write it, which no send does.
-        Ok(Answered::NotSent(draft)) => match keep_answer(&drafts, &draft) {
-            Ok(()) => Err(kept(&workers, draft.question_id, "was kept")),
-            Err(why) => Err(lost(&workers, draft.question_id, &why)),
-        },
+        Ok(Answered::Unconfirmed(draft)) => {
+            match keep_answer(&drafts, &draft, crate::barrier::hold()) {
+                Ok(()) => Err(kept(&workers, draft.question_id, "was kept")),
+                Err(refused) => Err(lost_when_not_kept(&workers, draft.question_id, refused)),
+            }
+        }
         // What the failure says of the answer is what the attempt established, not what the
         // failure's kind suggests.
         Err(error) => Err(match (workers.delivery(), error) {
@@ -304,15 +306,29 @@ fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerE
     }
 }
 
-/// Keeps an answer on this device, under the writers' lock and the leave to write a kept answer,
-/// and says why it could not be.
-fn keep_answer(drafts: &AnswerDrafts, draft: &AnswerDraft) -> std::result::Result<(), Shown> {
-    let writers = crate::barrier::hold().map_err(|refused| refused.said())?;
-    let permit =
-        crate::barrier::permit(&writers, &answers::WRITTEN).map_err(|refused| refused.said())?;
+/// Keeps an answer on this device, under the writers' lock `writers` (or the reason it could not be
+/// held) and the leave to write a kept answer, and says why it could not be.
+fn keep_answer(
+    drafts: &AnswerDrafts,
+    draft: &AnswerDraft,
+    writers: Result<kr_ipc::install::Writers>,
+) -> Result<()> {
+    let writers = writers?;
+    let permit = crate::barrier::permit(&writers, &answers::WRITTEN)?;
     drafts
         .keep(draft, &permit)
-        .map_err(|error| shown!("{}", error))
+        .map_err(|error| CliError::Other(shown!("{}", error)))
+}
+
+/// The failure reported for an answer that was not sent and was not kept because `refused`, with
+/// the exit status of the refusal: an update that held the writers' lock for the whole wait is exit 9
+/// here as it is for every command.
+fn lost_when_not_kept(workers: &Workers, question_id: QuestionId, refused: CliError) -> CliError {
+    let lost = lost(workers, question_id, &refused.said());
+    match refused {
+        CliError::UpdateDeferred(_) => CliError::UpdateDeferred(lost.said()),
+        _ => lost,
+    }
 }
 
 /// Opens the answers kept on this device, in this user's state directory, readable only by its
@@ -1530,6 +1546,88 @@ mod tests {
     use kr_protocol::scalars::{TimestampMs, Uuid};
 
     use super::*;
+
+    /// KR-REQ-26.10: an answer that was not sent is kept only where the release `current` names reads
+    /// kept answers at the format this build writes them in, or does not read them. Where it lists
+    /// another format, nothing is kept and the earlier answer is as it was; whatever it lists, an
+    /// earlier answer of a later format is not replaced. A refusal because an update holds the writers'
+    /// lock keeps its exit status 9, and says the answer was neither sent nor kept.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_is_kept_only_where_the_current_release_allows_and_the_exit_follows_the_refusal() {
+        use crate::barrier::testing::Listing;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let drafts = AnswerDrafts::open(directory.path().join("answers")).expect("a store");
+        let draft = AnswerDraft {
+            version: answers::ANSWER_FORMAT,
+            target: crate::attach::target(&descriptor()),
+            session_id: descriptor().session_id,
+            question_id: question(QuestionState::Pending).question_id,
+            question_revision: QuestionRevision::new(1),
+            answer: QuestionAnswer::Decision { decided: true },
+            drafted_at_ms: TimestampMs::new(5),
+        };
+        let kept = directory
+            .path()
+            .join("answers")
+            .join(format!("{}.answer", draft.question_id));
+
+        let elsewhere = Listing::of(&[(answers::WRITTEN.store, answers::WRITTEN.version + 1)]);
+        assert!(keep_answer(&drafts, &draft, Ok(elsewhere.writers)).is_err());
+        assert!(
+            !kept.exists(),
+            "nothing is kept in a format the release does not list"
+        );
+
+        for (what, listing) in [
+            (
+                "the format it lists",
+                Listing::of(&[(answers::WRITTEN.store, answers::WRITTEN.version)]),
+            ),
+            ("no kept answers", Listing::of(&[("registry", 7)])),
+        ] {
+            keep_answer(&drafts, &draft, Ok(listing.writers))
+                .unwrap_or_else(|error| panic!("kept where the release lists {what}: {error}"));
+            assert_eq!(drafts.drafts().expect("reads"), vec![draft.clone()]);
+        }
+
+        // An earlier answer of a later format stays, whatever the release lists.
+        let later = b"an answer of a later format".to_vec();
+        std::fs::write(&kept, &later).expect("planted");
+        for listing in [
+            Listing::of(&[(answers::WRITTEN.store, answers::WRITTEN.version)]),
+            Listing::of(&[("registry", 7)]),
+        ] {
+            assert!(keep_answer(&drafts, &draft, Ok(listing.writers)).is_err());
+            assert_eq!(std::fs::read(&kept).expect("reads"), later);
+        }
+
+        // The exit status follows the refusal.
+        let host = kr_ipc::testing::TempHost::create();
+        let workers = Workers::new(
+            host.paths(),
+            BuildId::new("kr/0").expect("a build identifier"),
+        );
+        let deferred = keep_answer(
+            &drafts,
+            &draft,
+            Err(CliError::UpdateDeferred(Shown::said("an update waits"))),
+        )
+        .expect_err("refused");
+        let reported = lost_when_not_kept(&workers, draft.question_id, deferred);
+        assert_eq!(reported.exit_code(), 9, "{reported}");
+        assert!(
+            reported.said().as_str().contains("could not be kept"),
+            "it says the answer is not kept: {reported}"
+        );
+        let other = lost_when_not_kept(
+            &workers,
+            draft.question_id,
+            CliError::Other(Shown::said("the lock could not be used")),
+        );
+        assert_eq!(other.exit_code(), 1);
+    }
 
     fn descriptor() -> WorkerDescriptor {
         WorkerDescriptor {

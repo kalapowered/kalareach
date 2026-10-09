@@ -263,7 +263,7 @@ async fn answer_offline(drafts: &AnswerDrafts, question: &Question) -> AnswerDra
     .await
     .expect("the answer is kept")
     {
-        Answered::NotSent(draft) => {
+        Answered::Unconfirmed(draft) => {
             keep(drafts, &draft);
             draft
         }
@@ -527,7 +527,7 @@ async fn an_answer_lost_with_its_connection_is_kept_and_never_sent_twice() {
     )
     .await
     .expect("kept");
-    let Answered::NotSent(kept) = outcome else {
+    let Answered::Unconfirmed(kept) = outcome else {
         panic!("an answer whose outcome is unknown is kept: {outcome:?}");
     };
     keep(&drafts, &kept);
@@ -569,7 +569,7 @@ async fn keeps_then_retires(byte: u8, line: Line) {
     )
     .await
     .expect("kept");
-    let Answered::NotSent(kept) = outcome else {
+    let Answered::Unconfirmed(kept) = outcome else {
         panic!("an answer whose outcome is not known is kept ({line:?}): {outcome:?}");
     };
     keep(&drafts, &kept);
@@ -702,7 +702,7 @@ async fn the_store_keeps_one_owner_only_file_per_question_and_writes_through_not
     )
     .await
     .expect("kept");
-    let Answered::NotSent(later) = later else {
+    let Answered::Unconfirmed(later) = later else {
         panic!("kept");
     };
     keep(&drafts, &later);
@@ -798,8 +798,8 @@ async fn a_kept_answer_states_its_format_and_one_of_a_later_format_is_not_read()
 
 /// KR-REQ-26.10: keeping an answer reads the answer it replaces first. One of an earlier format, or
 /// of none, is replaced; one of a later format and one that cannot be read are left as they are and
-/// the new answer is not kept, whatever the release `current` names lists; a link or a pipe at the
-/// name holds no answer this build wrote and is replaced.
+/// the new answer is not kept; a link or a pipe at the name holds no answer this build wrote and is
+/// replaced.
 #[cfg(unix)]
 #[tokio::test]
 async fn keeping_an_answer_does_not_replace_one_it_cannot_read() {
