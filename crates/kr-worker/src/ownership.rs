@@ -141,7 +141,9 @@ pub struct OwnedProcesses {
     /// session's history. A process stays in it until the kernel says it has ended, whether or not
     /// the boundary still lists it: one that left the boundary after it was seen is still the
     /// session's to stop. The exception is a process that has left for a control daemon's own
-    /// scope, which is never the session's: it is not in this set, and `seen` says it left.
+    /// scope, which is never the session's: it is not in this set, and `seen` says it left. A
+    /// process read as having left through a shared reference is still in the set until the next
+    /// observation, and [`Self::record`] leaves it out.
     live: BTreeMap<(u64, u64), ProcessStartIdentity>,
     /// The boot this session began in. A process identity is only a statement about one boot.
     boot: Option<BootIdentity>,
@@ -250,7 +252,12 @@ impl OwnedProcesses {
         OwnedRecord {
             boot: self.boot.clone(),
             root: self.root.clone(),
-            processes: self.live.values().cloned().collect(),
+            processes: self
+                .live
+                .iter()
+                .filter(|(this, _)| !self.is_flagged(this))
+                .map(|(_, identity)| identity.clone())
+                .collect(),
             cgroup: self.cgroup.clone(),
             boundary: self.boundary.describe(),
             limits: self.unestablished(),
@@ -258,47 +265,48 @@ impl OwnedProcesses {
     }
 
     /// Notes processes found in the boundary, each already tied to the boundary by the reading
-    /// that gave its start, with whether that reading found it in a control daemon's own scope, and
-    /// forgets those the kernel now says have ended.
+    /// that gave its start, and forgets those the kernel now says have ended.
     ///
-    /// A process that has left the session for a control daemon's own scope is noted as having
-    /// left, whether it is new or was recorded before it moved, and is not among the processes the
-    /// session stops: a control daemon a command of the session started is the daemon of another
-    /// environment, which the session did not start for itself. That it left is kept once read,
-    /// because the process can end before the closure and then cannot be read again.
-    fn take(&mut self, found: impl IntoIterator<Item = (ProcessStartIdentity, bool)>) {
-        use std::sync::atomic::Ordering::Relaxed;
-
+    /// A process that has left the session for a control daemon's own scope is not among the
+    /// processes the session stops: a control daemon a command of the session started is the
+    /// daemon of another environment, which the session did not start for itself. A reading that
+    /// finds one is applied by [`Self::note_left`] when it is made, not here, because a reading
+    /// can be followed by a failure that ends the observation, and the process can end before
+    /// anything reads it again.
+    fn take(&mut self, found: impl IntoIterator<Item = ProcessStartIdentity>) {
         let mut read = std::collections::BTreeSet::new();
-        for (identity, left) in found {
+        for identity in found {
             let this = key(&identity);
             read.insert(this);
-            let recorded = self.seen.entry(this).or_insert(Recorded {
+            self.seen.entry(this).or_insert(Recorded {
                 identity: identity.clone(),
                 forced: false,
                 left: std::sync::atomic::AtomicBool::new(false),
             });
-            if left {
-                recorded.left.store(true, Relaxed);
-            }
-            if recorded.left.load(Relaxed) {
-                self.live.remove(&this);
-            } else {
+            if !self.is_flagged(&this) {
                 self.live.insert(this, identity);
             }
         }
+        // A process read as having left since the last look, through a shared reference, is no
+        // longer among those that are live.
+        let flagged: Vec<(u64, u64)> = self
+            .live
+            .keys()
+            .filter(|this| self.is_flagged(this))
+            .copied()
+            .collect();
+        for this in flagged {
+            self.live.remove(&this);
+        }
         // One recorded earlier and not found this time is read again: it may have moved.
-        let moved: Vec<(u64, u64)> = self
+        let moved: Vec<ProcessStartIdentity> = self
             .live
             .iter()
-            .filter(|(key, identity)| !read.contains(*key) && self.in_a_daemons_scope(identity))
-            .map(|(key, _)| *key)
+            .filter(|(this, identity)| !read.contains(*this) && self.in_a_daemons_scope(identity))
+            .map(|(_, identity)| identity.clone())
             .collect();
-        for key in moved {
-            self.live.remove(&key);
-            if let Some(recorded) = self.seen.get(&key) {
-                recorded.left.store(true, Relaxed);
-            }
+        for identity in moved {
+            self.note_left(&identity);
         }
         self.live.retain(|_, identity| {
             !matches!(
@@ -306,6 +314,39 @@ impl OwnedProcesses {
                 kr_ipc::identity::ProcessState::Ended
             )
         });
+    }
+
+    /// Applies a reading that found a process in a control daemon's own scope: the process is
+    /// noted as having left, whether it is new or was recorded before it moved, and is not among
+    /// the processes the session stops.
+    ///
+    /// Applied at once and kept, so that no later failure of an observation, and no end of the
+    /// process, takes the reading back.
+    fn note_left(&mut self, identity: &ProcessStartIdentity) {
+        let this = key(identity);
+        self.seen
+            .entry(this)
+            .or_insert(Recorded {
+                identity: identity.clone(),
+                forced: false,
+                left: std::sync::atomic::AtomicBool::new(false),
+            })
+            .left
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.live.remove(&this);
+    }
+
+    /// Whether a recorded process has been read as having left the session.
+    fn is_flagged(&self, this: &(u64, u64)) -> bool {
+        self.seen
+            .get(this)
+            .is_some_and(|recorded| recorded.left.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Whether a process is not one of the session's: it was read in a control daemon's own scope
+    /// at some reading, or is in one now. What it started is not the session's either.
+    fn left_the_session(&self, identity: &ProcessStartIdentity) -> bool {
+        self.is_flagged(&key(identity)) || self.in_a_daemons_scope(identity)
     }
 
     /// Whether a recorded process is, now, in a control daemon's own scope outside this session's
@@ -318,7 +359,7 @@ impl OwnedProcesses {
     }
 
     /// Whether a recorded process is no longer one of the session's: it was read in a control
-    /// daemon's scope when it was last observed, or is in one now.
+    /// daemon's scope at some reading, or is in one now.
     fn has_left(&self, recorded: &Recorded) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -472,7 +513,7 @@ impl OwnedProcesses {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let tree = self.tree();
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let tree: Option<Vec<(ProcessStartIdentity, bool)>> = None;
+        let tree: Option<Vec<ProcessStartIdentity>> = None;
         if let Some(tree) = tree {
             self.take(tree);
             return;
@@ -511,12 +552,12 @@ impl OwnedProcesses {
             };
             agrees.then_some(lineage.identity)
         });
-        let agreeing: Vec<(ProcessStartIdentity, bool)> = agreeing
-            .map(|identity| {
-                let left = self.in_a_daemons_scope(&identity);
-                (identity, left)
-            })
-            .collect();
+        let agreeing: Vec<ProcessStartIdentity> = agreeing.collect();
+        for identity in &agreeing {
+            if self.left_the_session(identity) {
+                self.note_left(identity);
+            }
+        }
         self.take(agreeing);
     }
 
@@ -540,7 +581,7 @@ impl OwnedProcesses {
     /// they hold nothing new: a process whose parent exits while the tree is being read is the
     /// worker's child by then, so it is in one reading or the other.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn tree(&self) -> Option<Vec<(ProcessStartIdentity, bool)>> {
+    fn tree(&mut self) -> Option<Vec<ProcessStartIdentity>> {
         if !matches!(rustix::process::child_subreaper(), Ok(Some(_))) {
             return None;
         }
@@ -556,7 +597,7 @@ impl OwnedProcesses {
                 .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
                 == Some(session)
         };
-        let mut members: Vec<(ProcessStartIdentity, bool)> = Vec::new();
+        let mut members: Vec<ProcessStartIdentity> = Vec::new();
         let mut walked = std::collections::BTreeSet::new();
         let mut pending: Vec<(u32, ProcessStartIdentity)> = Vec::new();
         // The root shell, if it is still the process that was recorded. A shell that has gone
@@ -569,11 +610,16 @@ impl OwnedProcesses {
                 if !walked.insert(pid) {
                     continue;
                 }
-                // Read once, here, and carried to `take`: a process that left for a control daemon's
-                // own scope is read about no further (what it started is its own, not the
-                // session's), and a second reading could find it gone.
-                let left = self.in_a_daemons_scope(&identity);
-                members.push((identity.clone(), left));
+                // A process that left for a control daemon's own scope is read about no further
+                // (what it started is its own, not the session's), whether it is in the scope now
+                // or was read there before. The reading is applied here, when it is made: a later
+                // read of this walk can fail and end it, and a second reading of the process could
+                // find it gone.
+                let left = self.left_the_session(&identity);
+                if left {
+                    self.note_left(&identity);
+                }
+                members.push(identity.clone());
                 if left {
                     continue;
                 }
@@ -674,7 +720,7 @@ impl OwnedProcesses {
                  describe, so they are not in the record"
             ));
         }
-        self.take(found.into_iter().map(|identity| (identity, false)));
+        self.take(found);
     }
 
     /// Records that an agent of this session ran under the reduced-ownership profile, which keeps
@@ -1321,6 +1367,90 @@ mod tests {
         );
         let _ = stranger.kill();
         let _ = stranger.wait();
+    }
+
+    /// KR-REQ-07.13: a process read as having left for a control daemon's own scope is never named
+    /// by the record a later daemon stops from, and no later observation puts it back. Here the
+    /// reading is the one a closure makes through a shared reference, which cannot touch what is
+    /// live, so the record has to leave the process out by the flag it left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_read_as_having_left_is_never_named_by_the_record() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("starts a process");
+        let found = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_002),
+        );
+        owned.take([found.clone()]);
+        assert!(
+            owned.record().processes.contains(&found),
+            "a process of the session is in the record"
+        );
+
+        owned.seen[&key(&found)]
+            .left
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !owned.record().processes.contains(&found),
+            "once read as having left, the record does not name it"
+        );
+        owned.take([]);
+        owned.take([found.clone()]);
+        assert!(
+            !owned.live.contains_key(&key(&found)) && !owned.record().processes.contains(&found),
+            "and a later observation that finds it again does not put it back"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// KR-REQ-07.13: a reading that found a process in a control daemon's own scope holds when the
+    /// process ends before anything reads it again, and for a process the record had not yet seen,
+    /// and what it started is not read as the session's either.
+    #[cfg(unix)]
+    #[test]
+    fn a_reading_that_found_a_process_left_survives_its_end() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("starts a process");
+        let found = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_002),
+        );
+        assert!(
+            !owned.left_the_session(&found),
+            "outside any scope of a daemon, nothing says it left"
+        );
+        owned.note_left(&found);
+        child.kill().expect("ends the process");
+        child.wait().expect("collects the process");
+        assert!(
+            owned.left_the_session(&found),
+            "read once as having left, it has left, whatever its scope reads now"
+        );
+        assert!(
+            owned
+                .terminated()
+                .iter()
+                .all(|ended| ended.identity != found),
+            "a process that left and then ended was not ended by the session"
+        );
+        assert!(
+            owned.surviving().iter().all(|alive| *alive != found),
+            "and it is not among those the session stops"
+        );
     }
 
     /// KR-REQ-07.57: an owned process is its identifier and its start value together, so a process
