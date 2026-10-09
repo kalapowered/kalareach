@@ -68,6 +68,7 @@ pub mod context;
 pub mod delegate;
 pub mod error;
 pub mod grant;
+pub mod interpret;
 pub mod seams;
 pub mod session;
 
@@ -79,6 +80,10 @@ pub use crate::delegate::{Coordinator, Proposal, UnclosedCall, narrower_history}
 pub use crate::error::{Result, VoiceError};
 pub use crate::grant::{
     GrantBinding, VoiceGrantPlan, permits, permitted_actions, plan_voice_grant,
+};
+pub use crate::interpret::{
+    DelegationInterpreter, GrammarInterpreter, Interpretation, Misread, SpokenDestination,
+    VerifiedApprovalAnswer,
 };
 pub use crate::seams::{
     ActionSubmitter, Admission, ContextItem, ContextRequest, ContextSource, GatheredContext,

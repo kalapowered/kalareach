@@ -1829,11 +1829,11 @@ mod tests {
             delegation_id: kr_protocol::voice::VoiceDelegationId::new("d-1".to_owned())
                 .expect("a delegation identifier"),
             offset_ms: kr_protocol::scalars::U64::new(1_200),
-            action: kr_protocol::voice::VoiceAction::ApplyDiff,
-            session_id: Nullable::null(),
-            spoken_destination: Nullable::null(),
-            approval: Nullable::null(),
-            turn_id: Nullable::null(),
+            fragments: vec![kr_protocol::voice::TranscriptFragment {
+                start_ms: kr_protocol::scalars::U64::new(1_000),
+                end_ms: kr_protocol::scalars::U64::new(1_200),
+                text: kr_protocol::voice::FragmentText::new("apply the diff").expect("a fragment"),
+            }],
             confirmation: Nullable(proof),
         }
     }

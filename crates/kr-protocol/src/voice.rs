@@ -8,8 +8,9 @@
 //!
 //! * **Content is never authority** (section 19). A provider delegation identifier is correlation
 //!   data, a transcript is data, and a model statement that somebody agreed to something is data
-//!   too. [`VoiceDelegateParams`] therefore carries an identifier and a timeline offset and has no
-//!   field for task text, and [`VoiceConfirmationProof`] is a signature by the paired device's
+//!   too. [`VoiceDelegateParams`] therefore carries the fragments of what the person said, which
+//!   the host reads itself with a grammar of its own, and has no field in which the model or the
+//!   device names the action; [`VoiceConfirmationProof`] is a signature by the paired device's
 //!   identity key, which no amount of provider text can produce.
 //! * **A voice session is not a terminal session.** [`VoiceSessionId`] is its own identity, and
 //!   stopping one leaves the terminal sessions it reached running.
@@ -37,10 +38,7 @@ use kr_cbor::CborError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{
-    ActionId, AgentTurnId, ApprovalRequestId, ConfirmationId, DeviceId, GrantId, SessionId,
-    VoiceSessionId,
-};
+use crate::ids::{ActionId, ConfirmationId, DeviceId, GrantId, SessionId, VoiceSessionId};
 use crate::rights::ActionRight;
 use crate::scalars::{
     CanonicalSet, Digest256, KeyId, Nonce256, Nullable, Signature64, TimestampMs, U64,
@@ -57,6 +55,18 @@ pub const VOICE_CONTEXT_TOKEN_CAP: u32 = 8_000;
 
 /// How many semantic messages the default context carries (section 15 ¶12).
 pub const VOICE_CONTEXT_MESSAGE_COUNT: u32 = 20;
+
+/// Most fragments one delegation carries.
+pub const VOICE_FRAGMENTS_MAX: usize = 16;
+
+/// Most bytes the text of one fragment takes.
+pub const VOICE_FRAGMENT_BYTES_MAX: usize = 512;
+
+/// Most bytes the text of all of one delegation's fragments takes together.
+pub const VOICE_FRAGMENTS_BYTES_MAX: usize = 2_048;
+
+/// How far before its offset a delegation's fragments may reach, in milliseconds.
+pub const VOICE_LOOK_BACK_MS: u64 = 30_000;
 
 /// Largest append, in UTF-8 bytes, the managed broker carries in one context request.
 ///
@@ -919,9 +929,13 @@ pub struct VoiceStopResult {
 
 /// Parameters of `voice.delegate`.
 ///
-/// Section 15 ¶7: the delegation event supplies an identifier and a timeline offset, not task
-/// text. There is deliberately no field for what the model said the user wants; the coordinator
-/// uses the accumulated transcripts and current host state.
+/// Section 15 ¶7 and ¶22: the delegation event supplies an identifier and a timeline offset, and
+/// the coordinator uses the accumulated transcripts and the host's state. The paired device is the
+/// only thing that sees the provider's data channel, so it is the one that hands the host the
+/// transcript: the fragments of what the person said, which the device vouches for from its own
+/// record of when the microphone was open. **The host reads them.** There is no field in which the
+/// device or the model names the action, the session or anything else the host acts on; the host's
+/// grammar derives those once, from the words, and says what it derived in the answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VoiceDelegateParams {
@@ -931,47 +945,182 @@ pub struct VoiceDelegateParams {
     pub delegation_id: VoiceDelegationId,
     /// Where in the call it happened, in milliseconds from the start.
     pub offset_ms: U64,
-    /// The action the device asks the coordinator to propose.
-    pub action: VoiceAction,
-    /// The session it acts on, when it acts on one.
-    pub session_id: Nullable<SessionId>,
-    /// The spoken confirmation naming the destination session, when the action needs one.
-    pub spoken_destination: Nullable<SpokenDestination>,
-    /// The approval the answer belongs to, when the action answers one.
-    pub approval: Nullable<VerifiedApprovalAnswer>,
-    /// The turn being cancelled, when the action cancels one.
-    pub turn_id: Nullable<AgentTurnId>,
+    /// What the person said that this delegation answers, in the order it was said.
+    ///
+    /// At most [`VOICE_FRAGMENTS_MAX`] fragments of at most [`VOICE_FRAGMENT_BYTES_MAX`] bytes, and
+    /// [`VOICE_FRAGMENTS_BYTES_MAX`] bytes in all. A set over a limit is refused and never cut.
+    /// See [`Self::check_fragments`] for the rest.
+    pub fragments: Vec<TranscriptFragment>,
     /// The confirmation from the device's unlocked screen, when the action needs one.
     pub confirmation: Nullable<VoiceConfirmationProof>,
 }
 
-/// A spoken confirmation that names the destination session.
+/// The text of one transcript fragment.
 ///
-/// Section 15 ¶13 requires the confirmation to name the destination, so the host checks the name
-/// against the session it is about to submit to rather than accepting that one was given.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SpokenDestination {
-    /// The session the speaker named.
-    pub session_id: SessionId,
-    /// The words the speaker used, as the transcript recorded them. Data, never authority.
-    pub spoken_text: String,
+/// Data, never authority, and never quoted: its `Debug` prints nothing of it, so a log line or a
+/// panic message that formats a request cannot carry what a person said. It is bounded and holds
+/// no control character, and a text that is not is refused rather than cut.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct FragmentText(String);
+
+impl FragmentText {
+    /// Wraps a fragment's text, rejecting an empty, over-long or control-bearing one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FragmentsRefused`] when the text is empty, longer than
+    /// [`VOICE_FRAGMENT_BYTES_MAX`] bytes or contains a control character.
+    pub fn new(value: impl Into<String>) -> Result<Self, FragmentsRefused> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(FragmentsRefused("a fragment says nothing"));
+        }
+        if value.len() > VOICE_FRAGMENT_BYTES_MAX {
+            return Err(FragmentsRefused("a fragment is at most 512 bytes"));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(FragmentsRefused(
+                "a fragment must not contain control characters",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// The text as it was said.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// An approval answer, with the details of the request it answers.
-///
-/// Section 15 ¶13: an approval decision requires the verified request's details and an explicit
-/// answer. The host compares the details against the approval it holds, so a model that invented
-/// them is refused rather than believed.
+impl fmt::Debug for FragmentText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FragmentText(..)")
+    }
+}
+
+impl<'de> Deserialize<'de> for FragmentText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::new(text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for FragmentText {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FragmentText".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "kalareach::FragmentText".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": VOICE_FRAGMENT_BYTES_MAX,
+            "description": "What a person said, as the provider's transcript wrote it. Data, never authority."
+        })
+    }
+}
+
+/// One fragment of what the person said, with the moments on the provider's timeline it covers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct VerifiedApprovalAnswer {
-    /// The approval being answered.
-    pub approval_request_id: ApprovalRequestId,
-    /// The digest of the request's details as the host read them out.
-    pub details_digest: Digest256,
-    /// The explicit answer. Nothing is inferred from a transcript.
-    pub approved: bool,
+pub struct TranscriptFragment {
+    /// Where on the call's timeline it starts, in milliseconds.
+    pub start_ms: U64,
+    /// Where it ends, in milliseconds.
+    pub end_ms: U64,
+    /// What was said.
+    pub text: FragmentText,
+}
+
+/// A set of fragments, or one fragment's text, that the host refuses.
+///
+/// Says which rule refused it and never quotes the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentsRefused(&'static str);
+
+impl fmt::Display for FragmentsRefused {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for FragmentsRefused {}
+
+impl VoiceDelegateParams {
+    /// Checks the set of fragments, which serde cannot: how many, how large in all, in what order
+    /// and how far back.
+    ///
+    /// A delegation answers what was said up to its offset and a bounded time before it, so every
+    /// fragment starts at or before the offset and no earlier than [`VOICE_LOOK_BACK_MS`] before
+    /// it, ends no earlier than it starts, and starts no earlier than the one before it did. The
+    /// set is never cut to fit: a set that does not is refused whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rule that refuses the set.
+    pub fn check_fragments(&self) -> Result<(), FragmentsRefused> {
+        if self.fragments.is_empty() {
+            return Err(FragmentsRefused("a delegation carries what was said"));
+        }
+        if self.fragments.len() > VOICE_FRAGMENTS_MAX {
+            return Err(FragmentsRefused(
+                "a delegation carries at most 16 fragments",
+            ));
+        }
+        let bytes: usize = self.fragments.iter().map(|f| f.text.as_str().len()).sum();
+        if bytes > VOICE_FRAGMENTS_BYTES_MAX {
+            return Err(FragmentsRefused("a delegation carries at most 2048 bytes"));
+        }
+        let offset = self.offset_ms.get();
+        let mut previous_start = 0;
+        for fragment in &self.fragments {
+            let (start, end) = (fragment.start_ms.get(), fragment.end_ms.get());
+            if end < start {
+                return Err(FragmentsRefused("a fragment ends before it starts"));
+            }
+            if start < previous_start {
+                return Err(FragmentsRefused("the fragments are not in the order said"));
+            }
+            if start > offset {
+                return Err(FragmentsRefused(
+                    "a fragment starts after the delegation it belongs to",
+                ));
+            }
+            if offset - start > VOICE_LOOK_BACK_MS {
+                return Err(FragmentsRefused(
+                    "a fragment is further back than a delegation reaches",
+                ));
+            }
+            previous_start = start;
+        }
+        Ok(())
+    }
+
+    /// The digest of everything the host acts on in this delegation, which a confirmation's plan
+    /// binds to: the call, the delegation, where it happened and what was said. The confirmation
+    /// is not in it, because a confirmation cannot be part of what it confirms.
+    ///
+    /// Public so that the device that signs a challenge can compute the digest it is asked to
+    /// sign over from the delegation it sent, and need not take the host's word for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the parameters cannot be represented in KR-CBOR-1.
+    pub fn payload_digest(&self) -> Result<Digest256, CborError> {
+        let material = Self {
+            confirmation: Nullable::null(),
+            ..self.clone()
+        };
+        Ok(Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+            &kr_cbor::to_canonical_value(&material)?,
+        ))))
+    }
 }
 
 /// The result of `voice.delegate`.
@@ -980,6 +1129,13 @@ pub struct VerifiedApprovalAnswer {
 pub struct VoiceDelegateResult {
     /// The delegation this answers.
     pub delegation_id: VoiceDelegationId,
+    /// What the host read the fragments to ask for, when it read them to ask for anything.
+    ///
+    /// Kept with the answer, so that a repeat is answered from what was derived then and not from
+    /// a grammar that may have changed since.
+    pub action: Nullable<VoiceAction>,
+    /// The session the host read the fragments to name, when they named one.
+    pub session_id: Nullable<SessionId>,
     /// What the coordinator proposed and what the host did about it.
     pub outcome: VoiceDelegationOutcome,
 }
@@ -1064,6 +1220,11 @@ pub enum VoiceRefusal {
     TurnNotNamed,
     /// The session named is not one this voice session may reach.
     SessionOutsideVoiceSession,
+    /// The host does not read the fragments as a request it carries out.
+    NotUnderstood,
+    /// The set of fragments breaks a rule of the delegation: how many, how large, in what order or
+    /// how far back.
+    FragmentsRefused,
 }
 
 impl VoiceRefusal {
@@ -1083,6 +1244,8 @@ impl VoiceRefusal {
             Self::ApprovalNotVerified => "approval_not_verified",
             Self::TurnNotNamed => "turn_not_named",
             Self::SessionOutsideVoiceSession => "session_outside_voice_session",
+            Self::NotUnderstood => "not_understood",
+            Self::FragmentsRefused => "fragments_refused",
         }
     }
 }
@@ -1409,6 +1572,8 @@ mod tests {
         });
         round_trip(&VoiceDelegateResult {
             delegation_id: VoiceDelegationId::new("item_one").expect("an identifier"),
+            action: Nullable::some(VoiceAction::Status),
+            session_id: Nullable::some(SessionId::new(Uuid::from_bytes([0xc0; 16]))),
             outcome: VoiceDelegationOutcome::Performed {
                 action_id: ActionId::new(Uuid::from_bytes([0xd0; 16])),
                 summary: "session 3 is live".to_owned(),
@@ -1416,6 +1581,8 @@ mod tests {
         });
         round_trip(&VoiceDelegateResult {
             delegation_id: VoiceDelegationId::new("item_two").expect("an identifier"),
+            action: Nullable::null(),
+            session_id: Nullable::null(),
             outcome: VoiceDelegationOutcome::ConfirmationRequired {
                 request: Box::new(VoiceConfirmationRequest {
                     confirmation_id: ConfirmationId::new(Uuid::from_bytes([0xe0; 16])),
@@ -1589,6 +1756,128 @@ mod tests {
             plan.digest().expect("a digest"),
             other.digest().expect("a digest"),
             "two different actions hash differently"
+        );
+    }
+
+    fn delegation_of(offset_ms: u64, fragments: &[(u64, u64, &str)]) -> VoiceDelegateParams {
+        use crate::scalars::Uuid;
+
+        VoiceDelegateParams {
+            voice_session_id: VoiceSessionId::new(Uuid::from_bytes([1; 16])),
+            delegation_id: VoiceDelegationId::new("item_one").expect("an identifier"),
+            offset_ms: U64::new(offset_ms),
+            fragments: fragments
+                .iter()
+                .map(|(start, end, text)| TranscriptFragment {
+                    start_ms: U64::new(*start),
+                    end_ms: U64::new(*end),
+                    text: FragmentText::new(*text).expect("a fragment"),
+                })
+                .collect(),
+            confirmation: Nullable::null(),
+        }
+    }
+
+    #[test]
+    fn a_set_of_fragments_is_held_to_its_rules_and_never_cut() {
+        let within = delegation_of(
+            40_000,
+            &[(10_000, 11_000, "status"), (12_000, 13_000, "three")],
+        );
+        assert_eq!(within.check_fragments(), Ok(()));
+
+        // Each rule, with the words that say it, and the set that breaks it.
+        let big = "x".repeat(VOICE_FRAGMENT_BYTES_MAX);
+        let crowd = [(900, 1_000, "a"); VOICE_FRAGMENTS_MAX + 1];
+        let heavy = [(900, 1_000, big.as_str()); 5];
+        let broken: &[(VoiceDelegateParams, &str)] = &[
+            (delegation_of(1_000, &[]), "carries what was said"),
+            (delegation_of(1_000, &crowd), "at most 16"),
+            (delegation_of(1_000, &heavy), "at most 2048"),
+            (
+                delegation_of(1_000, &[(900, 800, "a")]),
+                "ends before it starts",
+            ),
+            (
+                delegation_of(5_000, &[(4_000, 4_100, "a"), (3_000, 3_100, "b")]),
+                "not in the order",
+            ),
+            (
+                delegation_of(1_000, &[(1_001, 1_100, "a")]),
+                "after the delegation",
+            ),
+            (
+                delegation_of(40_000, &[(9_999, 10_000, "a")]),
+                "further back",
+            ),
+        ];
+        for (params, rule) in broken {
+            let refused = params.check_fragments().expect_err(rule);
+            assert!(refused.to_string().contains(rule), "{refused} for {rule}");
+        }
+    }
+
+    #[test]
+    fn a_fragments_text_is_bounded_and_prints_as_nothing() {
+        assert!(FragmentText::new("").is_err());
+        assert!(FragmentText::new("x".repeat(VOICE_FRAGMENT_BYTES_MAX + 1)).is_err());
+        assert!(FragmentText::new("a\u{7}b").is_err());
+        assert!(FragmentText::new("x".repeat(VOICE_FRAGMENT_BYTES_MAX)).is_ok());
+
+        let text = FragmentText::new("close session three for me").expect("a fragment");
+        assert!(!format!("{text:?}").contains("close"));
+        let params = delegation_of(1_000, &[(900, 1_000, "close session three for me")]);
+        assert!(!format!("{params:?}").contains("close"));
+        assert!(
+            !format!(
+                "{:?}",
+                crate::envelope::ParamsValue::from_typed(&params).expect("encodes")
+            )
+            .contains("close")
+        );
+
+        // It reads back as it was said, and a text over a bound does not decode.
+        let json = serde_json::to_string(&params).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<VoiceDelegateParams>(&json).expect("decodes"),
+            params
+        );
+        let over = json.replace(
+            "close session three for me",
+            &"x".repeat(VOICE_FRAGMENT_BYTES_MAX + 1),
+        );
+        assert!(serde_json::from_str::<VoiceDelegateParams>(&over).is_err());
+    }
+
+    #[test]
+    fn the_digest_a_confirmation_binds_to_covers_what_was_said_and_not_the_proof() {
+        let said = delegation_of(1_000, &[(900, 1_000, "status")]);
+        let other = delegation_of(1_000, &[(900, 1_000, "brief")]);
+        assert_ne!(
+            said.payload_digest().expect("a digest"),
+            other.payload_digest().expect("a digest"),
+            "two utterances are two payloads"
+        );
+        let mut proved = said.clone();
+        proved.confirmation = Nullable::some(VoiceConfirmationProof {
+            request: VoiceConfirmationRequest {
+                confirmation_id: ConfirmationId::new(crate::scalars::Uuid::from_bytes([7; 16])),
+                voice_session_id: said.voice_session_id,
+                action: VoiceAction::ShellInput,
+                action_digest: Digest256::from_bytes([3; 32]),
+                action_id: ActionId::new(crate::scalars::Uuid::from_bytes([8; 16])),
+                host_device_id: DeviceId::new(crate::scalars::Uuid::from_bytes([1; 16])),
+                device_id: DeviceId::new(crate::scalars::Uuid::from_bytes([2; 16])),
+                nonce: Nonce256::from_bytes([4; 32]),
+                expires_at_ms: TimestampMs::new(1_700_000_000_000),
+            },
+            signer_key_id: KeyId::from_bytes([5; 32]),
+            signature: Signature64::from_bytes([6; 64]),
+        });
+        assert_eq!(
+            said.payload_digest().expect("a digest"),
+            proved.payload_digest().expect("a digest"),
+            "a confirmation cannot be part of what it confirms"
         );
     }
 }

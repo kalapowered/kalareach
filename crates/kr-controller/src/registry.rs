@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -944,6 +944,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -954,6 +955,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -963,6 +965,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -971,6 +974,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -978,23 +982,31 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
-            Some(9) => self.migrate_9_to_10()?,
+            Some(9) => {
+                self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
+            }
+            Some(10) => self.migrate_10_to_11()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1310,6 +1322,24 @@ impl Registry {
     fn migrate_9_to_10(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 10", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 10 to 11: a delegation's kept answer names the action and the session the spoken
+    /// words were read to ask for.
+    ///
+    /// The answers a device is given again live in the grants' receipts table, which the grants'
+    /// own open brings to this shape before the version is written here (the other writers first,
+    /// as every step above relies on): an answer an earlier build kept gains the two fields as
+    /// nothing, and one that carried a session's content is forgotten, because it names no session
+    /// to read again. No row of this file's own tables changes.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_10_to_11(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 11", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }

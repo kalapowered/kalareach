@@ -36,8 +36,25 @@ use crate::scalars::{DurationMs, Nullable, to_base64url};
 /// the way out. Reading JSON back cannot tell which strings were byte strings or integers, which
 /// is why nothing is ever signed from JSON: signing input is built from the canonical bytes, never
 /// from a re-serialised diagnostic document.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ParamsValue(CanonicalValue);
+
+/// Prints how large the value is and a prefix of its digest, and nothing it holds.
+///
+/// Parameters can carry what a person said, and a log line or a panic message that formats a
+/// request must not carry it. The size and the digest are enough to tell two values apart.
+impl core::fmt::Debug for ParamsValue {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let encoded = kr_cbor::encode(&self.0);
+        let digest = kr_cbor::sha256(&encoded);
+        write!(
+            formatter,
+            "ParamsValue({} bytes, sha256 {}..)",
+            encoded.len(),
+            to_base64url(&digest[..6])
+        )
+    }
+}
 
 impl ParamsValue {
     /// Wraps a validated canonical value.

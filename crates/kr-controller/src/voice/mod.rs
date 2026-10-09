@@ -329,13 +329,14 @@ impl VoiceModule {
         &self,
         device_id: DeviceId,
         mutation: &MutationRequest,
+        kept: &kr_protocol::voice::VoiceDelegateResult,
         now_ms: u64,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
         value(
             &self
                 .coordinator
-                .restate(device_id, mutation.action_id, &params, now_ms)
+                .restate(device_id, mutation.action_id, &params, kept, now_ms)
                 .await
                 .map_err(voice_error)?,
         )

@@ -134,6 +134,21 @@ pub trait ContextSource: Send + Sync + fmt::Debug {
         session_id: SessionId,
         approval_request_id: &'a ApprovalRequestId,
     ) -> VoiceFuture<'a, Option<Digest256>>;
+
+    /// Reads the display number of each of `sessions`, as a person says it.
+    ///
+    /// A person names a session by its number ("session 3"), and a call reaches a set of sessions
+    /// by identity. This is how the coordinator finds which of the call's own sessions the number
+    /// named; it asks about no session the call does not reach. A session that cannot be read has
+    /// no entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sessions cannot be read at all.
+    fn display_numbers<'a>(
+        &'a self,
+        sessions: &'a [SessionId],
+    ) -> VoiceFuture<'a, Vec<(SessionId, u64)>>;
 }
 
 /* -------------------------------------------------------------------------- */
