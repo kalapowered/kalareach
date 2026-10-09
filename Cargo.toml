@@ -90,6 +90,9 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["sin
 hex = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", features = ["zeroize"] }
+# The gateway reads a terminal's upgrade request and vets it before the WebSocket library answers
+# it, with the parser that library reads it with.
+httparse = "=1.10.1"
 # The preview module runs PNG, JPEG and GIF and nothing else, and these are the decoders it asks for.
 # WebP is withheld by the module's allowlist, not by this list: the lossless decoder derives its
 # Huffman group count from a sixteen-bit metadata field and allocates tables from it, which no
