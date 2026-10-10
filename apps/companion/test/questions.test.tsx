@@ -220,6 +220,25 @@ describe('a question that changed or ended while a person was answering', () => 
   })
 })
 
+describe('a question panel that opens after contact with the host ended', () => {
+  it('can be answered on the rights this device last held, and the answer goes to the worker', async () => {
+    const { controls } = start({ view: 'sessions' })
+    const person = userEvent.setup()
+    // The rights are read while the host is in contact.
+    await screen.findByTestId('session-row-2')
+    act(() => {
+      controls.setConnected(false)
+    })
+    await person.click(screen.getByTestId('session-row-2'))
+    const question = await questionAbout(WHICH_BRANCH)
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    expect(within(question).getByRole('button', { name: 'Send answer' })).toBeEnabled()
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    expect(await screen.findByText('Your answer was recorded.')).toBeInTheDocument()
+    expect(controls.questions.sent).toHaveLength(1)
+  })
+})
+
 describe('who may answer (KR-REQ-23.32)', () => {
   it('offers no answer to a device that was not granted the right, and says why', async () => {
     const { controls } = start()
