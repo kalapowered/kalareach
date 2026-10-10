@@ -572,9 +572,9 @@ impl Controller {
         // nothing written under its action, and an owner's client may ask again with a new
         // identifier for each poll.
         let intent = match method {
-            Method::OrganisationEnrol => Some(OrganisationIntent::Enrol(
+            Method::OrganisationEnrol => Some(OrganisationIntent::Enrol(Box::new(
                 self.organisation_enrol_intent(mutation)?,
-            )),
+            ))),
             Method::OrganisationExclusiveSet => Some(OrganisationIntent::Exclusive(
                 self.organisation_exclusive_intent(mutation)?,
             )),
@@ -602,7 +602,7 @@ impl Controller {
         };
         let outcome = match (method, intent) {
             (Method::OrganisationEnrol, Some(OrganisationIntent::Enrol(intent))) => {
-                self.organisation_enrol(carried, &hold, intent).await
+                self.organisation_enrol(carried, &hold, *intent).await
             }
             (Method::OrganisationExclusiveSet, Some(OrganisationIntent::Exclusive(intent))) => {
                 self.organisation_exclusive(carried, &hold, intent).await

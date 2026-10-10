@@ -54,7 +54,7 @@ pub(super) struct ExclusiveIntent {
 /// its action.
 pub(super) enum OrganisationIntent {
     /// `organisation.enrol`.
-    Enrol(EnrolIntent),
+    Enrol(Box<EnrolIntent>),
     /// `organisation.exclusive.set`.
     Exclusive(ExclusiveIntent),
 }
