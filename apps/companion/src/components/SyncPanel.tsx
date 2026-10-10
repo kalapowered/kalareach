@@ -11,11 +11,15 @@
  * Recovery is offered on a desktop. A phone shows the setting and no more: its save dialog cannot
  * write a file the person chooses.
  *
- * Each card has one status line, a polite live region the panel moves focus to when a step ends, because
- * the control the person pressed is disabled while the step runs and may be gone when it ends.
- * The line says how the step ended, in the backend's words when it refused. A read that fails is
- * said in place of the card's state, with a way to ask again, and never as an empty card. Nothing
- * here moves of its own; the cards sit in the account panel's frame.
+ * Each card has one status line, a polite live region the panel moves focus to when a step ends,
+ * because the control the person pressed is disabled while the step runs and may be gone when it
+ * ends. A step ends when the card's state has been read again, so the line a person lands on says
+ * where things now stand. Focus is moved only when it is on nothing or already in the card that
+ * ran the step: a person who went on to type in the other card keeps the field they are in, and a
+ * service the backend refused keeps focus in the field to correct, marked invalid and described by
+ * the line. The line says how the step ended, in the backend's words when it refused. A read that
+ * fails is said in place of the card's state, with a way to ask again, and never as an empty card.
+ * Nothing here moves of its own; the cards sit in the account panel's frame.
  */
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
@@ -41,6 +45,14 @@ type Place = 'service' | 'recovery'
 interface Said {
   readonly place: Place
   readonly text: string
+  /** Whether the step was refused or failed. */
+  readonly failed: boolean
+}
+
+/** Where a step that has ended leaves focus. */
+interface Finished {
+  readonly place: Place
+  readonly failed: boolean
 }
 
 /** The sync service setting and, on a desktop, recovery. */
@@ -56,6 +68,7 @@ export function SyncPanel({
   const desktop = surface === 'desktop'
   const target = minimumTarget(surface)
   const inputId = useId()
+  const serviceStatusId = useId()
   const [service, setService] = useState<SyncServiceView | null>(null)
   const [serviceProblem, setServiceProblem] = useState<string | null>(null)
   const [recovery, setRecovery] = useState<RecoveryView | null>(null)
@@ -66,64 +79,92 @@ export function SyncPanel({
   const [busy, setBusy] = useState(false)
   const serviceStatus = useRef<HTMLDivElement | null>(null)
   const recoveryStatus = useRef<HTMLDivElement | null>(null)
-  const finished = useRef<Place | null>(null)
+  const serviceInput = useRef<HTMLInputElement | null>(null)
+  const finished = useRef<Finished | null>(null)
   // A sign-in that changes what the account may do changes what stops recovery, so it is read again.
   const standing = account?.state === 'signed_in' ? account.generation : (account?.state ?? null)
 
-  const refresh = useCallback(() => {
-    port
-      .syncServiceView()
-      .then((view) => {
-        setService(view)
-        setServiceProblem(null)
-      })
-      .catch((error: unknown) => {
-        // What was shown before may no longer be true, so it is not shown beside the problem.
-        setService(null)
-        setServiceProblem(failureMessage(error))
-      })
-    if (desktop) {
+  /** Reads both cards again; the promise is settled once each read has answered or failed. */
+  const refresh = useCallback((): Promise<void> => {
+    const reads: Promise<void>[] = [
       port
-        .recoveryView()
+        .syncServiceView()
         .then((view) => {
-          setRecovery(view)
-          setRecoveryProblem(null)
+          setService(view)
+          setServiceProblem(null)
         })
         .catch((error: unknown) => {
-          setRecovery(null)
-          setRecoveryProblem(failureMessage(error))
+          // What was shown before may no longer be true, so it is not shown beside the problem.
+          setService(null)
+          setServiceProblem(failureMessage(error))
         })
+    ]
+    if (desktop) {
+      reads.push(
+        port
+          .recoveryView()
+          .then((view) => {
+            setRecovery(view)
+            setRecoveryProblem(null)
+          })
+          .catch((error: unknown) => {
+            setRecovery(null)
+            setRecoveryProblem(failureMessage(error))
+          })
+      )
     }
+    return Promise.all(reads).then(() => undefined)
   }, [port, desktop])
 
   useEffect(() => {
-    refresh()
+    void refresh()
   }, [refresh, standing])
 
   // When a step ends, focus goes to its card's status line: the pressed control may be disabled,
   // or gone, and a person using a keyboard or a screen reader would otherwise be left on nothing.
+  // It is not taken from a field the person went on to use in the other card, and a refused change
+  // of the service leaves it in the field the person has to correct.
   useEffect(() => {
     if (busy || finished.current === null) return
-    const status = finished.current === 'service' ? serviceStatus : recoveryStatus
+    const { place, failed } = finished.current
     finished.current = null
-    status.current?.focus()
+    if (place === 'service' && failed && serviceInput.current !== null) {
+      serviceInput.current.focus()
+      return
+    }
+    const status = place === 'service' ? serviceStatus : recoveryStatus
+    const card = status.current?.closest('[data-card]') ?? null
+    const active = document.activeElement
+    const free = active === null || active === document.body || (card?.contains(active) ?? false)
+    if (free) status.current?.focus()
   }, [busy])
 
-  /** Runs one step, says how it ended, and reads where things stand again. */
-  const step = (place: Place, work: () => Promise<string | null>) => {
+  /**
+   * Runs one step, says how it ended, and reads where things stand again; the step has ended, and
+   * focus moves, once that read has answered. A step that has another owner of focus (the sign-in,
+   * which the account card follows from the browser back to its own status line) moves none.
+   */
+  const step = (place: Place, work: () => Promise<string | null>, moveFocus = true) => {
     setBusy(true)
     setSaid(null)
+    let failed = false
     work()
       .then((text) => {
-        if (text !== null) setSaid({ place, text })
+        if (text !== null) setSaid({ place, text, failed: false })
       })
       .catch((error: unknown) => {
-        setSaid({ place, text: failureMessage(error) })
+        failed = true
+        setSaid({ place, text: failureMessage(error), failed: true })
       })
-      .finally(() => {
-        finished.current = place
+      .then(() => refresh())
+      .then(() => {
+        finished.current = moveFocus ? { place, failed } : null
         setBusy(false)
-        refresh()
+      })
+      .catch(() => {
+        // A read cannot reject (each says its own failure), but a step must always end.
+        finished.current = moveFocus ? { place, failed } : null
+        setBusy(false)
       })
   }
 
@@ -139,13 +180,14 @@ export function SyncPanel({
   return (
     <>
       <p className="account-section-title">Sync service</p>
-      <Card>
+      <Card data-card="service">
         <div className="account-state">
           <div
             className="account-status"
             aria-live="polite"
             tabIndex={-1}
             ref={serviceStatus}
+            id={serviceStatusId}
             data-testid="sync-status"
           >
             {service !== null ? (
@@ -175,7 +217,13 @@ export function SyncPanel({
                 Change
               </Button>
             ) : (
-              <Button style={{ minBlockSize: target }} onClick={refresh}>
+              <Button
+                disabled={busy}
+                style={{ minBlockSize: target }}
+                onClick={() => {
+                  step('service', () => Promise.resolve(null))
+                }}
+              >
                 Try again
               </Button>
             )}
@@ -196,7 +244,10 @@ export function SyncPanel({
               <label htmlFor={inputId}>Sync service</label>
               <input
                 id={inputId}
+                ref={serviceInput}
                 data-testid="sync-service-input"
+                aria-invalid={said?.place === 'service' && said.failed ? true : undefined}
+                aria-describedby={serviceStatusId}
                 value={draft}
                 autoCapitalize="off"
                 autoCorrect="off"
@@ -225,7 +276,7 @@ export function SyncPanel({
       {desktop && (recovery !== null || recoveryProblem !== null) ? (
         <>
           <p className="account-section-title">Recovery</p>
-          <Card data-testid="recovery" data-state={recovery?.state ?? 'unread'}>
+          <Card data-card="recovery" data-testid="recovery" data-state={recovery?.state ?? 'unread'}>
             <div className="account-state">
               <div
                 className="account-status"
@@ -270,7 +321,13 @@ export function SyncPanel({
               </div>
               <div className="account-actions">
                 {recoveryProblem !== null ? (
-                  <Button style={{ minBlockSize: target }} onClick={refresh}>
+                  <Button
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      step('recovery', () => Promise.resolve(null))
+                    }}
+                  >
                     Try again
                   </Button>
                 ) : null}
@@ -294,7 +351,7 @@ export function SyncPanel({
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
-                      step('recovery', () => port.accountSignInForRecovery().then(() => null))
+                      step('recovery', () => port.accountSignInForRecovery().then(() => null), false)
                     }}
                   >
                     Sign in again
