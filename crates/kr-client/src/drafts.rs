@@ -561,14 +561,35 @@ impl DraftStore {
     /// Returns [`DraftError::Storage`] when the file cannot be written, and
     /// [`DraftError::TooLarge`] when the text does not fit the contract.
     pub fn create(&self, target: DraftTarget, text: String, now: TimestampMs) -> Result<Draft> {
+        self.create_whole(target, text, Vec::new(), DraftState::Open, now)
+    }
+
+    /// Creates a draft that already has its files and its mark, and writes it in one record.
+    ///
+    /// A draft that does not fit as a whole is not stored at all: no record holds only the part that
+    /// did, so what a caller is told is stored is all of what it asked to store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DraftError::Storage`] when the file cannot be written, and
+    /// [`DraftError::TooLarge`] or [`DraftError::TooManyAttachments`] when the draft does not fit
+    /// the contract.
+    pub fn create_whole(
+        &self,
+        target: DraftTarget,
+        text: String,
+        attachments: Vec<AttachmentHandle>,
+        state: DraftState,
+        now: TimestampMs,
+    ) -> Result<Draft> {
         let draft = Draft {
             draft_id: DraftId::new(fresh_uuid()?),
             revision: DraftRevision::new(1),
             device_id: self.device_id,
             target,
-            state: DraftState::Open,
+            state,
             text,
-            attachments: Vec::new(),
+            attachments,
             conflict_of: Nullable::null(),
             retained: Nullable::null(),
             created_at_ms: now,
@@ -733,6 +754,48 @@ impl DraftStore {
         drop(guard);
         written?;
         Ok(copy)
+    }
+
+    /// Writes `content` as a copy kept beside the stored draft `of`, with the state `mark` decides
+    /// from that draft as it is stored when the copy is written.
+    ///
+    /// The draft is read under the same exclusive lock the copy is written under, so a mark another
+    /// window gave it a moment ago is the mark the copy is decided from, and a draft another window
+    /// removed has nothing to be kept beside.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DraftError::Unknown`] when `of` is not stored, [`DraftError::Storage`] when the
+    /// file cannot be written, and [`DraftError::TooLarge`] when the content does not fit the
+    /// storage bound.
+    pub fn keep_copy_beside(
+        &self,
+        of: DraftId,
+        content: &Draft,
+        now: TimestampMs,
+        mark: impl FnOnce(&Draft) -> DraftState,
+    ) -> Result<Draft> {
+        let guard = self.exclusive()?;
+        let outcome = (|| {
+            let stored = self.read(of)?;
+            let copy = Draft {
+                draft_id: DraftId::new(fresh_uuid()?),
+                revision: DraftRevision::new(1),
+                device_id: self.device_id,
+                target: content.target.clone(),
+                state: mark(&stored),
+                text: content.text.clone(),
+                attachments: content.attachments.clone(),
+                conflict_of: Nullable::some(of),
+                retained: Nullable::null(),
+                created_at_ms: now,
+                updated_at_ms: now,
+            };
+            self.write(&copy)?;
+            Ok(copy)
+        })();
+        drop(guard);
+        outcome
     }
 
     /// Removes a draft and its synchronisation note.
@@ -2102,6 +2165,24 @@ mod tests {
         listing.drafts
     }
 
+    /// A completed upload, named by `index`.
+    fn a_file(index: u8) -> kr_protocol::transfer::AttachmentHandle {
+        kr_protocol::transfer::AttachmentHandle {
+            environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([1; 16])),
+            transfer_id: kr_protocol::ids::TransferId::new(Uuid::from_bytes([index; 16])),
+            session_id: Nullable::null(),
+            byte_len: kr_protocol::scalars::U64::new(10),
+            content_digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+            declared_media_type: "image/png".to_owned(),
+            original_file_name: format!("file-{index}.png"),
+            preview: Nullable::null(),
+            presented_as_image: true,
+            published_at_ms: TimestampMs::new(10),
+            expires_at_ms: TimestampMs::new(20),
+            submitted: false,
+        }
+    }
+
     /// The same draft with different text, which is what an edit is.
     fn edited(draft: &Draft, text: &str) -> Draft {
         Draft {
@@ -2553,6 +2634,90 @@ mod tests {
             .expect_err("another device's draft");
         assert!(error.to_string().contains("belongs to device"));
         assert_eq!(mine.load(draft.draft_id).expect("the draft"), draft);
+    }
+
+    #[test]
+    fn a_draft_with_files_and_a_mark_is_written_whole_or_not_at_all() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let made = store
+            .create_whole(
+                open_target(),
+                "with a mark".to_owned(),
+                Vec::new(),
+                DraftState::Conflicted,
+                TimestampMs::new(1),
+            )
+            .expect("a whole draft");
+        assert_eq!(made.state, DraftState::Conflicted);
+        assert_eq!(store.load(made.draft_id).expect("stored"), made);
+
+        // Too many files for one draft: nothing is stored, not even the text.
+        let before = drafts(&store).len();
+        let refused = store.create_whole(
+            open_target(),
+            "text that fits".to_owned(),
+            (0..=MAX_DRAFT_ATTACHMENTS)
+                .map(|index| a_file(u8::try_from(index % 200).expect("a small number")))
+                .collect(),
+            DraftState::Open,
+            TimestampMs::new(2),
+        );
+        assert!(refused.is_err(), "more files than a draft may hold");
+        assert_eq!(
+            drafts(&store).len(),
+            before,
+            "no record holds only the text"
+        );
+    }
+
+    #[test]
+    fn a_copy_takes_the_mark_the_stored_draft_has_when_it_is_written() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let stored = store
+            .create(
+                open_target(),
+                "the first window's".to_owned(),
+                TimestampMs::new(1),
+            )
+            .expect("a draft");
+        let content = edited(&stored, "the second window's");
+        // The other window marks the draft after the second one read it: the copy is decided from
+        // the draft as stored when the copy is written, not from what was read.
+        let marked = store
+            .update(
+                &Draft {
+                    state: DraftState::Orphaned,
+                    ..stored.clone()
+                },
+                TimestampMs::new(2),
+            )
+            .expect("marked");
+        let copy = store
+            .keep_copy_beside(stored.draft_id, &content, TimestampMs::new(3), |held| {
+                held.state.max(content.state)
+            })
+            .expect("a copy");
+        assert_eq!(copy.state, DraftState::Orphaned);
+        assert_eq!(copy.conflict_of, Nullable::some(stored.draft_id));
+        assert_eq!(copy.text, "the second window's");
+        assert_eq!(store.load(stored.draft_id).expect("kept"), marked);
+
+        // A draft that is gone has nothing to be kept beside.
+        store.remove(stored.draft_id).expect("removed");
+        let error = store
+            .keep_copy_beside(stored.draft_id, &content, TimestampMs::new(4), |held| {
+                held.state
+            })
+            .expect_err("nothing to keep it beside");
+        assert!(
+            matches!(
+                &error,
+                ClientError::Draft(held) if matches!(**held, DraftError::Unknown { .. })
+            ),
+            "{error}"
+        );
     }
 
     #[test]
