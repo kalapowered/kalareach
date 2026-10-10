@@ -14,6 +14,7 @@ mod organisation_support;
 
 use std::time::Duration;
 
+use kr_crypto::keys::DeviceKeys;
 use kr_protocol::confirmation::{
     ConfirmationSubject, OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
     OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
@@ -1037,5 +1038,260 @@ async fn only_a_device_that_can_recover_the_host_reaches_what_recovers_it_and_a_
         "the host is exclusive already: {with_a_lease:?}"
     );
     raw.close();
+    fixture.host.stop().await;
+}
+
+/// The owner at the host's terminal answers `subject` with a key made for that one answer, which is
+/// what `kr` does when the host says the terminal can confirm it, and returns whether the host
+/// said so.
+async fn at_the_terminal(
+    fixture: &Fixture,
+    client: &mut kr_ipc::client::LocalClient,
+    subject: ConfirmationSubject,
+) -> (bool, Result<(), kr_protocol::error::ProtocolError>) {
+    let challenge = calls::request(fixture.host.environment_id, client, subject)
+        .await
+        .expect("the host issues the challenge");
+    let key = DeviceKeys::generate().expect("a key for this one answer");
+    let (proof, presented) =
+        calls::sign(&challenge.request, &Signer::Bootstrap(&key.authorisation));
+    let answered = calls::complete(fixture.host.environment_id, client, proof, presented)
+        .await
+        .map(|_| ());
+    (challenge.initial_bootstrap, answered)
+}
+
+/// KR-REQ-17.54: when exclusive management is on and no device is left that can confirm for the
+/// host, its owner at the host's terminal ends it, and nothing else. The host says the terminal can
+/// confirm it only in that state; while a device that can confirm exists, or for any other subject,
+/// the terminal's proof is refused. The turning off is on record as the terminal's, and the
+/// organisation hears of it with the next lease it asks the host about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_terminal_confirms_the_end_of_exclusive_management_when_no_device_can_and_nothing_else()
+{
+    let fixture = Fixture::start().await;
+    let ada = fixture.member("ada", SERVED).await;
+    let organisation_id = fixture.organisation.organisation_id;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+
+    // While an owner device that can confirm exists, the terminal confirms nothing.
+    let mut client = fixture.host.client().await;
+    let (offered, answered) = at_the_terminal(
+        &fixture,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+    )
+    .await;
+    assert!(
+        !offered,
+        "the host does not offer the terminal while a device can confirm"
+    );
+    let refused = answered.expect_err("the terminal's proof is refused");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+    drop(client);
+
+    // The owner's one device is revoked, which no rule refuses.
+    let owner_id = fixture
+        .host
+        .owner
+        .as_ref()
+        .expect("the owner's record")
+        .device_id;
+    let mut client = fixture.host.client().await;
+    calls::mutate::<_, RevocationResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: owner_id,
+        },
+    )
+    .await
+    .expect("the owner's device is revoked");
+    drop(client);
+
+    // Nothing but the end of exclusive management is confirmed at the terminal.
+    let mut client = fixture.host.client().await;
+    let (offered, answered) =
+        at_the_terminal(&fixture, &mut client, ConfirmationSubject::EstablishClock).await;
+    assert!(!offered, "the clock is not the terminal's here");
+    let refused = answered.expect_err("the terminal's proof for the clock is refused");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+    let (_, answered) = at_the_terminal(
+        &fixture,
+        &mut client,
+        ConfirmationSubject::IssueInvitation {
+            mode: kr_protocol::invitation::InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::PersonalOwner,
+            proposed_grant: kr_pairing::grants::personal_owner_grant(),
+        },
+    )
+    .await;
+    let refused = answered.expect_err("an owner invitation is not the terminal's either");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+
+    // The end of exclusive management is.
+    let (offered, answered) = at_the_terminal(
+        &fixture,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+    )
+    .await;
+    assert!(
+        offered,
+        "the host offers the terminal when no device can confirm"
+    );
+    answered.expect("the terminal confirms the end of exclusive management");
+    let off: OrganisationExclusiveSetResult = calls::mutate(
+        fixture.host.environment_id,
+        &mut client,
+        Method::OrganisationExclusiveSet,
+        &OrganisationExclusiveSetParams { exclusive: false },
+    )
+    .await
+    .expect("the host spends the terminal's answer");
+    assert!(!off.exclusive);
+    drop(client);
+
+    let listed = fixture.listed().await;
+    assert!(!listed.exclusive);
+    assert_eq!(listed.exclusive_events.len(), 1);
+    let event = &listed.exclusive_events[0];
+    assert_eq!(
+        event.channel,
+        kr_protocol::pairing::ConfirmationChannel::LocalBootstrapTerminal
+    );
+    assert_eq!(
+        event.organisation_ids.iter().copied().collect::<Vec<_>>(),
+        vec![organisation_id]
+    );
+
+    // A member's next presentation carries the time to the organisation.
+    let raw = ada.connect(&fixture).await;
+    let presented = ada
+        .present(&fixture, &raw, fixture.lease(2, &ada, SERVED), None)
+        .await
+        .expect("the member's lease");
+    assert!(!presented.exclusive);
+    assert_eq!(
+        presented.exclusive_ended_at_terminal_ms.0,
+        Some(event.at_ms),
+        "the organisation is told when the terminal ended it"
+    );
+    raw.close();
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: the terminal's answer is good only while the host is in the state that offered it.
+/// A device that can confirm appears after the terminal answered, and the host refuses to spend
+/// the answer: the device is the one to ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_can_confirm_appearing_after_the_terminal_answered_stops_the_terminal() {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+
+    // A device whose grant ends can still confirm a pairing, which a lasting one can then make.
+    let helper = Device::create().await;
+    net_support::pair_with(
+        &fixture.host,
+        &helper,
+        &fixture.owner,
+        net_support::proposal(&[ActionRight::HostManage]),
+    )
+    .await;
+    let owner_id = fixture
+        .host
+        .owner
+        .as_ref()
+        .expect("the owner's record")
+        .device_id;
+    let mut client = fixture.host.client().await;
+    calls::mutate::<_, RevocationResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: owner_id,
+        },
+    )
+    .await
+    .expect("the owner's device is revoked");
+    drop(client);
+
+    let mut client = fixture.host.client().await;
+    let (offered, answered) = at_the_terminal(
+        &fixture,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+    )
+    .await;
+    assert!(offered);
+    answered.expect("the terminal answers");
+
+    // The helper confirms a new owner device's pairing.
+    let successor = Device::create().await;
+    let signer = Signer::OwnerDevice(helper.keys());
+    let invited = calls::invite_direct(
+        fixture.host.environment_id,
+        &mut client,
+        InviteGrantKind::PersonalOwner,
+        &kr_pairing::grants::personal_owner_grant(),
+        &signer,
+    )
+    .await
+    .expect("the helper confirms an owner invitation");
+    let (connection, _candidate, _value) = calls::redeem(&successor.candidate(), &invited).await;
+    calls::confirm_candidate(
+        fixture.host.environment_id,
+        &mut client,
+        invited.invitation_id,
+        &signer,
+    )
+    .await
+    .expect("the helper confirms the new owner device");
+    connection.close(0u32.into(), b"paired");
+    drop(client);
+
+    // The answer the terminal gave belonged to a host that nothing else could confirm for.
+    let mut client = fixture.host.client().await;
+    let refused = calls::mutate::<_, OrganisationExclusiveSetResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::OrganisationExclusiveSet,
+        &OrganisationExclusiveSetParams { exclusive: false },
+    )
+    .await
+    .expect_err("the terminal's answer is not spent");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+    assert!(fixture.listed().await.exclusive);
+    assert!(fixture.listed().await.exclusive_events.is_empty());
+    drop(client);
     fixture.host.stop().await;
 }

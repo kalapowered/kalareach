@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use kr_controller::service::net::devices::DeviceDirectory;
 use kr_controller::service::net::invitations::{
-    ActionSubject, HostOwner, InvitationRows, IssueTerms, PairingAction, device_record, prepare,
+    ActionSubject, HostOwner, InvitationRows, IssueTerms, PairingAction, TerminalStanding,
+    device_record, prepare,
 };
 use kr_controller::service::net::lifetimes::GrantLifetimes;
 use kr_crypto::keys::DeviceKeys;
@@ -1230,6 +1231,68 @@ fn a_host_with_no_owner_commits_only_its_first_owner() {
     );
     let refused = rows
         .record_consumed(&late.proof, "the clock", TimestampMs::new(20))
+        .expect_err("the bootstrap is over");
+    assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
+}
+
+/// KR-REQ-17.54: the terminal's answer ends exclusive organisation management on a host that has an
+/// owner, and is spent only where nothing else can confirm for it. The consuming transaction reads
+/// the devices from its own file: with a device that can confirm, or with the host not exclusive, it
+/// spends nothing; with the owner's last device revoked and the host exclusive, it spends the answer
+/// once.
+#[test]
+fn the_terminal_answer_is_spent_for_the_end_of_exclusive_management_only_where_nothing_else_can_confirm()
+ {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (directory, rows) = open_unowned(&path);
+    let mut owner_host = Harness::bootstrap(rows.clone());
+    owner_host.grant = kr_pairing::grants::personal_owner_grant();
+    owner_host.grant_kind = GrantKind::PersonalOwner;
+    let mut invitation = owner_host.issue();
+    bind(&owner_host, &mut invitation);
+    let commitment = approve(&owner_host, &mut invitation).expect("the first owner commits");
+    let environment_id = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16]));
+    let ending = |n: u8| {
+        owner_host
+            .approval(
+                SensitiveAction::ChangeHostAuthority,
+                Digest256::from_bytes([n; 32]),
+                None,
+            )
+            .proof
+    };
+    let under = |exclusive| TerminalStanding::Recovery {
+        environment_id,
+        exclusive,
+    };
+
+    // The owner's device is live and never expires, so it can confirm, and the terminal cannot.
+    let refused = rows
+        .record_consumed_under(&ending(2), "ending", TimestampMs::new(20), under(true))
+        .expect_err("a device can confirm for this host");
+    assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
+
+    // Its last device is revoked. A host that is not exclusive has nothing to end.
+    directory
+        .revoke(commitment.device_id, TimestampMs::new(21))
+        .expect("revoked");
+    let refused = rows
+        .record_consumed_under(&ending(3), "ending", TimestampMs::new(22), under(false))
+        .expect_err("the host is not exclusively organisation-managed");
+    assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
+
+    // Exclusive and with nothing left that can confirm, the terminal's answer is spent, once, and
+    // the old terminal bootstrap still spends nothing here.
+    let answer = ending(4);
+    rows.record_consumed_under(&answer, "ending", TimestampMs::new(23), under(true))
+        .expect("the terminal confirms the end of exclusive management");
+    assert!(
+        rows.record_consumed_under(&answer, "again", TimestampMs::new(24), under(true))
+            .is_err()
+    );
+    let refused = rows
+        .record_consumed(&ending(5), "the clock", TimestampMs::new(25))
         .expect_err("the bootstrap is over");
     assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
 }
