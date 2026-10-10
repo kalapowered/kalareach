@@ -628,7 +628,6 @@ fn said(error: RecoveryError) -> CommandError {
     }
 }
 
-/// The time on this machine's clock, in UTC milliseconds.
 /// Writes `body` as the whole of the file the person chose for the kit, readable by this user alone
 /// where the platform has such a thing.
 ///
@@ -659,6 +658,7 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// The time on this machine's clock, in UTC milliseconds.
 fn now() -> TimestampMs {
     TimestampMs::new(
         std::time::SystemTime::now()
