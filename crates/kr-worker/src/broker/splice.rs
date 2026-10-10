@@ -184,10 +184,10 @@ mod tests {
             ),
             (
                 // A name written with an escape is the name it decodes to.
-                r#"{"id":1,"k":null}"#,
+                r#"{"\u0069d":1,"k":null}"#,
                 "id",
                 "2",
-                r#"{"id":2,"k":null}"#,
+                r#"{"\u0069d":2,"k":null}"#,
             ),
             (
                 // The value is an object, and so is what replaces it.
@@ -218,7 +218,8 @@ mod tests {
         );
         assert!(replace_member(br#"{"a":1}"#, "id", "1").is_err());
         assert!(find_member(br#"{"id":1,"id":2}"#, "id").is_err());
-        assert!(find_member(br#"{"id":1,"id":2}"#, "id").is_err());
+        // The same member written two ways is named twice.
+        assert!(find_member(br#"{"id":1,"\u0069d":2}"#, "id").is_err());
         assert!(find_member(b"[1]", "id").is_err());
         assert!(find_member(br#"{"id":"#, "id").is_err());
     }

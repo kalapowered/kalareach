@@ -42,13 +42,16 @@ pub const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 /// The most header lines an upgrade request may carry.
 pub const MAX_REQUEST_HEADERS: usize = 64;
 
-/// How many ping and pong messages in a row the gateway reads from a terminal before it ends the
-/// connection.
+/// How many ping and pong messages the gateway reads from a terminal in one window before it ends
+/// the connection.
 ///
 /// The library queues an answer to every ping it reads, and sends them while the terminal reads.
-/// A terminal that pings and reads nothing would have them held without end, so the run of them
-/// has a bound, and an application message ends the run.
-pub const MAX_CONTROL_MESSAGES_IN_A_ROW: usize = 256;
+/// A terminal that pings and reads nothing would have them held without end, so the rate of them
+/// has a bound. A keepalive, which sends a ping every few seconds at the most, is far below it.
+pub const MAX_CONTROL_MESSAGES_PER_WINDOW: usize = 256;
+
+/// How long one window of ping and pong messages is.
+pub const CONTROL_WINDOW: Duration = Duration::from_secs(60);
 
 /// How long a terminal has to send its upgrade request and have it answered.
 pub const UPGRADE_DEADLINE: Duration = Duration::from_secs(5);
@@ -245,8 +248,11 @@ pub struct TextLines<S: AsyncRead + AsyncWrite + Unpin> {
     socket: WebSocketStream<S>,
     /// Why the gateway ended the connection, when it did so for a message it refused.
     closing: Option<CloseCode>,
-    /// How many ping and pong messages have been read since the last application message.
-    control_in_a_row: usize,
+    /// When the window the ping and pong messages are counted in began, and how many have been
+    /// read in it.
+    control_window: Option<(std::time::Instant, usize)>,
+    /// Whether the terminal has sent a close, after which anything that goes wrong is its leaving.
+    peer_closed: bool,
     /// The most bytes a message that is read may have.
     read_limit: usize,
     /// The most bytes a message that is written may have.
@@ -263,7 +269,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TextLines<S> {
         Self {
             socket,
             closing: None,
-            control_in_a_row: 0,
+            control_window: None,
+            peer_closed: false,
             read_limit: framing.limit(),
             write_limit: framing.largest_body(),
             reading: Vec::new(),
@@ -345,6 +352,15 @@ where
             let this = &mut *self;
             let message = match ready!(Pin::new(&mut this.socket).poll_next(cx)) {
                 None => return Poll::Ready(Ok(())),
+                // A terminal that closed and then went away before the answer reached it has left,
+                // and that is how a person quitting looks.
+                Some(Err(_)) if this.peer_closed => return Poll::Ready(Ok(())),
+                Some(Err(tokio_websockets::Error::PayloadTooLong { len, max_len })) => {
+                    return Poll::Ready(Err(this.end(
+                        CloseCode::MESSAGE_TOO_BIG,
+                        &format!("a message of {len} bytes is more than the {max_len} carried"),
+                    )));
+                }
                 Some(Err(error)) => return Poll::Ready(Err(failed(error))),
                 Some(Ok(message)) => message,
             };
@@ -353,19 +369,23 @@ where
             // here would take that waker away from a writer that is waiting on the socket. A
             // close is read to its end, so that the answer to it goes out before this reads one.
             if message.is_close() {
+                this.peer_closed = true;
                 continue;
             }
             if message.is_ping() || message.is_pong() {
-                this.control_in_a_row += 1;
-                if this.control_in_a_row > MAX_CONTROL_MESSAGES_IN_A_ROW {
-                    return Poll::Ready(Err(this.end(
-                        CloseCode::POLICY_VIOLATION,
-                        "too many control messages in a row",
-                    )));
+                let now = std::time::Instant::now();
+                let (since, counted) = this.control_window.get_or_insert((now, 0));
+                if now.duration_since(*since) >= CONTROL_WINDOW {
+                    (*since, *counted) = (now, 0);
+                }
+                *counted += 1;
+                if *counted > MAX_CONTROL_MESSAGES_PER_WINDOW {
+                    return Poll::Ready(Err(
+                        this.end(CloseCode::POLICY_VIOLATION, "too many control messages")
+                    ));
                 }
                 continue;
             }
-            this.control_in_a_row = 0;
             let Some(text) = message.as_text() else {
                 return Poll::Ready(Err(this.end(
                     CloseCode::UNSUPPORTED_DATA,
