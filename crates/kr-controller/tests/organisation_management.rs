@@ -1375,3 +1375,42 @@ async fn a_change_of_exclusive_management_with_no_answer_yet_leaves_no_claim_and
     drop(client);
     fixture.host.stop().await;
 }
+
+/// KR-REQ-17.54: leaving an organisation and changing exclusive management are the owner's at the
+/// host: a paired device, an owner device included, does not reach either over its own connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_does_not_reach_withdrawal_or_exclusive_management() {
+    let fixture = Fixture::start().await;
+    let owner = OwnerDevice::of(&fixture).await;
+    let raw = owner.connect().await;
+    let environment = ActionTarget::environment(fixture.host.environment_id);
+    let organisation_id = fixture.organisation.organisation_id;
+    let withdrawn = net_support::refusal(
+        raw.mutate(
+            Method::OrganisationWithdraw,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment.clone(),
+            &OrganisationWithdrawParams { organisation_id },
+        )
+        .await,
+    );
+    assert_eq!(withdrawn.code, ErrorCode::PermissionDenied, "{withdrawn:?}");
+    let exclusive = net_support::refusal(
+        raw.mutate(
+            Method::OrganisationExclusiveSet,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment,
+            &OrganisationExclusiveSetParams { exclusive: true },
+        )
+        .await,
+    );
+    assert_eq!(exclusive.code, ErrorCode::PermissionDenied, "{exclusive:?}");
+    raw.close();
+    assert_eq!(
+        fixture.listed().await.enrolments.len(),
+        1,
+        "nothing was withdrawn"
+    );
+    assert!(!fixture.listed().await.exclusive);
+    fixture.host.stop().await;
+}
