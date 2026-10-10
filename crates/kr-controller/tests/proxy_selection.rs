@@ -16,6 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use connect_proxy::ConnectProxy;
+use kr_client::services::account::{AccountToken, IssuedGrant, RefreshToken};
 use kr_controller::config::Outbound;
 use kr_controller::push::transport::{DeliveryTransports, ManagedTransports};
 use kr_controller::service::net::NetworkSetup;
@@ -340,6 +341,73 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
     }
 }
 
+/// KR-REQ-26.13, KR-REQ-26.14: a daemon that starts over a configuration document it cannot use
+/// reaches the managed account service no more than it reaches the other routes. The sign-in an
+/// earlier daemon kept, which a direct route would sign out at the service, is signed out nowhere
+/// and the service hears nothing; once the document is put right and the daemon has started again,
+/// the same sign-in reaches the service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_started_over_a_document_it_cannot_use_reaches_no_account_service() {
+    let (service_origin, _, service) = unreached();
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    let mut usable = ConfigurationDocument::empty();
+    usable.revision = 1;
+    write_document(&environment, &usable);
+
+    // A daemon over a usable document keeps a sign-in at the service, and stops.
+    let signed_in =
+        start_with_account_at(&service_origin, &environment, host.environment_id()).await;
+    signed_in
+        .host_account()
+        .keep_for_test(IssuedGrant {
+            access_token: AccountToken::new("access").expect("a token"),
+            expires_in_seconds: 3600,
+            refresh_token: RefreshToken::new("refresh").expect("a token"),
+            scopes: vec!["openid".to_owned()],
+            subject: "account-1".to_owned(),
+        })
+        .await;
+    drop(signed_in);
+
+    // The next one starts over a document it cannot use.
+    write_bytes(&environment, br#"{"version": 99}"#, 0o600);
+    let controller =
+        start_with_account_at(&service_origin, &environment, host.environment_id()).await;
+    let refused = tokio::time::timeout(WATCHDOG, controller.host_account().sign_out())
+        .await
+        .expect("the sign-out ends: it reached no service")
+        .expect_err("a host over an unusable document signs out nowhere");
+    assert!(
+        matches!(refused, kr_controller::ControllerError::NotConfigured(_)),
+        "{refused:?}"
+    );
+    heard_nothing(&service);
+    drop(controller);
+
+    // The control: over the document put right, the same sign-in reaches the service.
+    write_document(&environment, &usable);
+    let restarted =
+        start_with_account_at(&service_origin, &environment, host.environment_id()).await;
+    let account = restarted.host_account().clone();
+    let signing_out = tokio::spawn(async move { account.sign_out().await });
+    let began = std::time::Instant::now();
+    loop {
+        match service.accept() {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    began.elapsed() < WATCHDOG,
+                    "the sign-out never reached the service"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("the listener: {error}"),
+        }
+    }
+    signing_out.abort();
+}
+
 /// Fetches `address` through `transport` and reads the whole answer: the stream the transport always
 /// returns carries every failure, so a fetch that fails is an error at the end of it.
 async fn fetch_error(
@@ -430,6 +498,19 @@ fn write_bytes(environment: &kr_ipc::paths::EnvironmentPaths, bytes: &[u8], mode
     }
     #[cfg(not(unix))]
     let _ = mode;
+}
+
+/// Starts a daemon with the managed account service stood at `origin`.
+async fn start_with_account_at(
+    origin: &str,
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> std::sync::Arc<kr_controller::service::Controller> {
+    kr_controller::testing::with_account_origin(
+        Some(origin.to_owned()),
+        start_controller(environment, environment_id),
+    )
+    .await
 }
 
 /// Starts a daemon in-process on `environment`, launching no worker. A daemon dropped a moment ago
