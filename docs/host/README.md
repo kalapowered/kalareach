@@ -5003,12 +5003,12 @@ on typing at the epoch it holds, though a batch it had in flight when the revisi
 refused and sent again. The host tells each worker whose authority the revisions it has not yet
 fenced withdrew. It names the grants and devices, and when a subtree has more grants than one notice
 carries (4,096 names), it names the devices that hold them instead. The host keeps this for the last
-16 revisions. A worker that was refused an announcement because it was inside a dispatch transition
+256 revisions. A worker that was refused an announcement because it was inside a dispatch transition
 keeps what it was refused and fences it together with the next announcement, however many there are,
 up to 65,536 names. The worker takes the input lease of every caller acting under a grant when the
 host cannot say whose authority was withdrawn: when a revision reached the whole host (revoking a
 device, or changing the rights ceiling), when the host restarted since the revision, when the worker
-is more than 16 revisions behind, when the devices to name outnumber what a notice carries, or when
+is more than 256 revisions behind, when the devices to name outnumber what a notice carries, or when
 the worker missed a revision the notice does not describe. Revoking a device still reaches every
 connection.
 

@@ -149,7 +149,13 @@ impl Named {
 }
 
 /// How many revisions' reaches the daemon keeps for their announcements.
-const KEPT_REVISION_REACHES: usize = 16;
+///
+/// A worker is told every revision at the barrier that advances it, and one it was refused keeps
+/// the reach it was refused with, so it needs more than the revision before the one it holds only
+/// when it answered none of this many announcements in a row, each of which a device would have to
+/// cause by a revocation of its own. A worker further behind than this is fenced as the whole
+/// host's, which is safe.
+const KEPT_REVISION_REACHES: usize = 256;
 
 /// One published debt ([`Debts`]).
 #[derive(Clone, Debug)]
