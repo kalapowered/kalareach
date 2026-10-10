@@ -4596,6 +4596,68 @@ async fn kr_req_11_32_a_last_frame_the_terminal_does_not_read_ends_the_connectio
     up.drained.abort();
 }
 
+/// KR-REQ-11.32: what the gateway forwards is what was written, with the identifier and nothing
+/// else changed: the order of the members, the spelling of the numbers and the identifier the
+/// terminal used all come back exactly as they went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_frame_is_forwarded_as_it_was_written_but_for_its_identifier() {
+    let broker = broker();
+    let (owner, mut upstream, client, writes) = duplex_over_pipes(&broker, 1 << 20);
+    let driving = tokio::spawn(writes);
+    let mut upstream = tokio::io::BufReader::new(&mut upstream);
+    let mut client = tokio::io::BufReader::new(client);
+
+    let sent = r#"{"method":"session/update","params":{"b":1e9,"big":123456789012345678901234567890,"k":[1.50,"\u00e9"]},"id":"a\u0062"}"#;
+    owner
+        .from_client(sent.as_bytes(), TimestampMs::new(2))
+        .await
+        .expect("the terminal's request is carried");
+    let arrived = next_line_from(&mut upstream).await;
+    assert_eq!(
+        arrived.trim_end(),
+        sent.replace(r#""id":"a\u0062""#, r#""id":"kr-1""#),
+        "only the identifier was changed on the way out"
+    );
+
+    let reply = r#"{"result":{"x":1E3,"y":[0.10]},"id":"kr-1"}"#;
+    owner
+        .from_upstream(reply.as_bytes(), TimestampMs::new(3))
+        .await
+        .expect("the reply is carried");
+    let returned = next_line_from(&mut client).await;
+    assert_eq!(
+        returned.trim_end(),
+        reply.replace(r#""id":"kr-1""#, r#""id":"a\u0062""#),
+        "and only the identifier on the way back, under the spelling the terminal used"
+    );
+    owner.shutdown();
+    driving.abort();
+}
+
+/// KR-REQ-11.32: a notification at the frame bound crosses as it was written, though every number
+/// in it would be longer if it were written again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_notification_at_the_bound_crosses_byte_for_byte() {
+    let bound = kr_worker::broker::gateway::MAX_NATIVE_FRAME_BYTES;
+    let head = r#"{"method":"session/update","params":{"n":["#;
+    let tail = "]}}";
+    let numbers = "1e9,".repeat((bound - head.len() - tail.len()) / 4);
+    // Whatever the numbers do not fill is made up with spaces, so the frame is exactly the bound.
+    let mut frame = format!("{head}{}1e9{tail}", numbers);
+    frame.insert_str(head.len(), &" ".repeat(bound - frame.len()));
+    assert_eq!(frame.len(), bound);
+    let Crossing::Carried(line) =
+        cross(Framing::new(NativeFraming::JsonLines), false, &frame).await
+    else {
+        panic!("a notification at the bound was not carried");
+    };
+    assert_eq!(
+        line.trim_end_matches('\n'),
+        frame,
+        "and it crossed as written"
+    );
+}
+
 /// KR-REQ-12.13 and section 9: the client's own requests are bounded, given up on a deadline, and
 /// cleared when the connection ends.
 ///
