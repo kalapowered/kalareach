@@ -279,7 +279,7 @@ async fn a_paired_host_answers_the_commands_the_page_calls() {
     host.stop().await;
 }
 
-/// KR-REQ-23.32: on a host this device is paired with, a session's questions go through the host's
+/// On a host this device is paired with, a session's questions go through the host's
 /// daemon, which serves them to a paired device under the rights its grant carries, and not over a
 /// link to a worker on this computer, which a phone does not have. The host's own answer is what the
 /// page is told: here a session no worker serves.

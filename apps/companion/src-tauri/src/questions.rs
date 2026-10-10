@@ -210,19 +210,32 @@ impl QuestionDesk {
             .collect())
     }
 
-    /// Remembers what a read of one session's questions found, with where an answer to each goes.
+    /// Remembers what a read of a session's questions found, with where an answer to each goes.
     ///
-    /// What was remembered of that session before is replaced: a question the worker no longer lists
-    /// is not one the page can answer.
-    fn remember(&self, session_id: SessionId, questions: &[Question], target: &ActionTarget) {
+    /// A read of every question replaces what was remembered of the session: a question the worker
+    /// no longer lists is not one the page can answer. A read of one question replaces only that
+    /// one, so reading a single question does not make the session's others unanswerable until the
+    /// next full read.
+    fn remember(
+        &self,
+        session_id: SessionId,
+        only: Option<QuestionId>,
+        questions: &[Question],
+        target_for: impl Fn(&Question) -> ActionTarget,
+    ) {
         let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
-        shown.retain(|_, held| held.question.session_id != session_id);
+        match only {
+            None => shown.retain(|_, held| held.question.session_id != session_id),
+            Some(question_id) => {
+                shown.remove(&question_id);
+            }
+        }
         for question in questions {
             shown.insert(
                 question.question_id,
                 Shown {
                     question: question.clone(),
-                    target: target.clone(),
+                    target: target_for(question),
                 },
             );
         }
@@ -373,7 +386,13 @@ impl<'a> Host<'a> {
         session_id: SessionId,
     ) -> std::result::Result<EnvironmentId, ClientError> {
         match &self.route {
-            Route::Local => Ok(self.link(session_id).await?.descriptor.environment_id),
+            // The daemon on this machine stamps its environment on the connection, and that is the
+            // environment of every session here, so a session whose worker has gone is still
+            // known to belong to it. With no daemon connection the worker's own descriptor says.
+            Route::Local => match self.state.environment_id() {
+                Ok(environment_id) => Ok(environment_id),
+                Err(_) => Ok(self.link(session_id).await?.descriptor.environment_id),
+            },
             Route::Paired { environment_id, .. } => Ok(*environment_id),
         }
     }
@@ -653,7 +672,7 @@ pub async fn read(
 ) -> Result<QuestionReadResult> {
     let host = Host::new(links, state);
     let session_id = params.session_id;
-    let (result, target) = match &host.route {
+    let (result, target_for): (QuestionReadResult, TargetFor) = match &host.route {
         Route::Local => {
             let link = host.link(session_id).await.map_err(CommandError::from)?;
             let answer = host
@@ -662,7 +681,8 @@ pub async fn read(
             let result: QuestionReadResult = host
                 .settle(session_id, &link, answer)
                 .map_err(CommandError::from)?;
-            (result, target_of(&link))
+            let target = target_of(&link);
+            (result, Box::new(move |_: &Question| target.clone()))
         }
         Route::Paired {
             environment_id,
@@ -672,13 +692,19 @@ pub async fn read(
                 .within(session.read(Method::QuestionRead, &params))
                 .await
                 .map_err(CommandError::from)?;
-            let target = target_on(*environment_id, &result.questions);
-            (result, target)
+            let environment_id = *environment_id;
+            (
+                result,
+                Box::new(move |question: &Question| target_on(environment_id, question)),
+            )
         }
     };
-    state
-        .questions()
-        .remember(session_id, &result.questions, &target);
+    state.questions().remember(
+        session_id,
+        params.question_id.0,
+        &result.questions,
+        target_for,
+    );
     Ok(result)
 }
 
@@ -990,26 +1016,17 @@ pub(crate) fn target_of(link: &Link) -> ActionTarget {
     }
 }
 
+/// The target an answer to a question goes to, for each question a read listed.
+type TargetFor = Box<dyn Fn(&Question) -> ActionTarget>;
+
 /// The target a paired host's daemon takes a question's answer on: the session at the epoch the
 /// question carries, in the host's environment.
-///
-/// A read of one session's questions names that session in every question it lists; with none
-/// listed there is nothing to answer, and the target names no session.
 #[must_use]
-fn target_on(environment_id: EnvironmentId, questions: &[Question]) -> ActionTarget {
-    let (session_id, session_epoch) =
-        questions
-            .first()
-            .map_or((Nullable::null(), Nullable::null()), |question| {
-                (
-                    Nullable::some(question.session_id),
-                    Nullable::some(question.session_epoch),
-                )
-            });
+fn target_on(environment_id: EnvironmentId, question: &Question) -> ActionTarget {
     ActionTarget {
         environment_id,
-        session_id,
-        session_epoch,
+        session_id: Nullable::some(question.session_id),
+        session_epoch: Nullable::some(question.session_epoch),
         application_instance_id: Nullable::null(),
         agent_binding_revision: Nullable::null(),
     }
