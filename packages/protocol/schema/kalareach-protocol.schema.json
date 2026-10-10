@@ -16622,7 +16622,7 @@
               "type": "null"
             }
           ],
-          "description": "The earliest content this grant may see: the moment its history cursor names.\n\nNull means the grant's own start, and nothing earlier: what a pairing grant reaches is what\nwas first recorded or seen at or after the moment the host committed the pairing. A host\nreads that start where it reads the grant ([`Self::from_start`]), so a reader that decides\nanything from this sees one moment. A reader that has no start to read it against reaches\nno earlier history. A session share never holds a null: it takes the moment it was issued."
+          "description": "The earliest content this grant may see: the moment its history cursor names.\n\nNull means the grant's own start, and nothing earlier: what a pairing grant reaches is what\nwas first recorded or seen at or after the moment the host committed the pairing. A host\nreads that start where it reads the grant ([`Self::from_start`]), so a reader that decides\nanything from this sees one moment. A reader that has no start to read it against reaches\nno earlier history. A session share this build issues never holds a null: it takes the\nmoment it was issued."
         },
         "named_approvals": {
           "description": "Current approvals named explicitly, on the same terms, each by the identity of the one\nresource the broker arbitrates for it.\n\nAn upstream's own request identifier does not pick out one request: two connections both\ncall their first request `1`. A resource identity names exactly one.",
@@ -31730,7 +31730,7 @@
               "additionalProperties": false,
               "properties": {
                 "devices": {
-                  "description": "The devices the revisions withdrew.",
+                  "description": "The devices the revisions withdrew, or that hold the grants of a subtree too large to\nname grant by grant.",
                   "items": {
                     "$ref": "#/$defs/DeviceId"
                   },
@@ -31738,7 +31738,7 @@
                   "uniqueItems": true
                 },
                 "grants": {
-                  "description": "The grants the revisions withdrew, with everything delegated from them that anyone\nheld.",
+                  "description": "The grants the revisions withdrew, with everything delegated from them that anyone\nheld. None when the revisions withdrew more than [`MAX_REVISION_REACH_NAMES`], which\n`devices` then names by the devices that hold them.",
                   "items": {
                     "$ref": "#/$defs/GrantId"
                   },

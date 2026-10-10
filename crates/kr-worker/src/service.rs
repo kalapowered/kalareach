@@ -3709,6 +3709,15 @@ impl WorkerService {
             .lock()
             .expect("the authority lock is not poisoned");
         Self::check_bound(state, &authority)?;
+        // An announcement of a revision this worker has already fenced owes nothing, and recording
+        // it would join its reach, which is the whole host's for a repeat or a continuation page,
+        // with the reach of the next revision it is refused for.
+        if authority
+            .acknowledged_revision
+            .is_some_and(|held| held.get() >= notice.revision.get())
+        {
+            return Ok(());
+        }
         authority.owed = match authority.owed.take() {
             None => Some(Owed {
                 revision: notice.revision,

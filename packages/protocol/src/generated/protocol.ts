@@ -6331,12 +6331,14 @@ export interface AuthorityRevisionNotice {
     | {
         within: {
           /**
-           * The devices the revisions withdrew.
+           * The devices the revisions withdrew, or that hold the grants of a subtree too large to
+           * name grant by grant.
            */
           devices: DeviceId[]
           /**
            * The grants the revisions withdrew, with everything delegated from them that anyone
-           * held.
+           * held. None when the revisions withdrew more than [`MAX_REVISION_REACH_NAMES`], which
+           * `devices` then names by the devices that hold them.
            */
           grants: GrantId[]
           /**
@@ -8700,7 +8702,8 @@ export interface HistoryScope {
    * was first recorded or seen at or after the moment the host committed the pairing. A host
    * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
    * anything from this sees one moment. A reader that has no start to read it against reaches
-   * no earlier history. A session share never holds a null: it takes the moment it was issued.
+   * no earlier history. A session share this build issues never holds a null: it takes the
+   * moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -14962,7 +14965,8 @@ export interface HistoryScope1 {
    * was first recorded or seen at or after the moment the host committed the pairing. A host
    * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
    * anything from this sees one moment. A reader that has no start to read it against reaches
-   * no earlier history. A session share never holds a null: it takes the moment it was issued.
+   * no earlier history. A session share this build issues never holds a null: it takes the
+   * moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -15223,7 +15227,8 @@ export interface HistoryScope2 {
    * was first recorded or seen at or after the moment the host committed the pairing. A host
    * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
    * anything from this sees one moment. A reader that has no start to read it against reaches
-   * no earlier history. A session share never holds a null: it takes the moment it was issued.
+   * no earlier history. A session share this build issues never holds a null: it takes the
+   * moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -17956,7 +17961,8 @@ export interface HistoryScope3 {
    * was first recorded or seen at or after the moment the host committed the pairing. A host
    * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
    * anything from this sees one moment. A reader that has no start to read it against reaches
-   * no earlier history. A session share never holds a null: it takes the moment it was issued.
+   * no earlier history. A session share this build issues never holds a null: it takes the
+   * moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -18188,7 +18194,8 @@ export interface HistoryScope4 {
    * was first recorded or seen at or after the moment the host committed the pairing. A host
    * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
    * anything from this sees one moment. A reader that has no start to read it against reaches
-   * no earlier history. A session share never holds a null: it takes the moment it was issued.
+   * no earlier history. A session share this build issues never holds a null: it takes the
+   * moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**
@@ -26843,7 +26850,8 @@ export interface HistoryScope5 {
    * was first recorded or seen at or after the moment the host committed the pairing. A host
    * reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
    * anything from this sees one moment. A reader that has no start to read it against reaches
-   * no earlier history. A session share never holds a null: it takes the moment it was issued.
+   * no earlier history. A session share this build issues never holds a null: it takes the
+   * moment it was issued.
    */
   lower_bound_ms: TimestampMs | null
   /**

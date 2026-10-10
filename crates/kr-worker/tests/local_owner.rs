@@ -77,7 +77,7 @@ use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, 
 use kr_protocol::session::{
     ClosureReason, Dimensions, DisplayNumber, SessionReadParams, SessionReadResult, ShellMode,
 };
-use kr_protocol::worker::{AuthorityRevisionNotice, RevisionReach};
+use kr_protocol::worker::{AuthorityRevisionNotice, MAX_REVISION_REACH_NAMES, RevisionReach};
 use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::qualification::ShellKind;
@@ -2580,6 +2580,98 @@ async fn a_refused_revision_is_fenced_by_the_worker_for_the_reach_it_was_announc
         None,
         "revision 10 may have withdrawn the phone's grant"
     );
+    typing.close();
+}
+
+/// KR-REQ-10.45: an announcement of a revision the worker has already fenced, which the daemon
+/// repeats on every proxy it opens and for every page of evidence, owes nothing when it is refused
+/// for the boundary. Recorded, its reach, which is the whole host's, would join the reach of the
+/// next revision refused and take the lease of a caller that revision never named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_repeat_of_a_revision_already_fenced_widens_no_later_reach() {
+    let mut typing = Typing::start().await;
+    let (stranger_grant, _) = a_stranger();
+
+    let boundary = HeldBoundary::take(&typing.wired).await;
+    typing
+        .wired
+        .announced_and_refused(&mut typing.authority, 2, RevisionReach::Host)
+        .await;
+    typing
+        .wired
+        .announced_and_refused(&mut typing.authority, 3, grant_reach(2, stranger_grant))
+        .await;
+    boundary.release();
+    typing.wired.service.fence_what_is_owed_for_tests();
+    assert_eq!(
+        typing.wired.service.acknowledged_revision(),
+        Some(AuthorityRevision::new(3))
+    );
+    assert!(
+        typing.holds_the_lease(),
+        "revision 3 named a stranger's grant, and the repeat of revision 2 owed nothing"
+    );
+    typing.close();
+}
+
+/// KR-REQ-10.45: the reaches of any number of revisions a worker was refused join into one, so
+/// what the daemon keeps of old revisions does not decide whether a refused worker fences by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reaches_of_many_refused_revisions_join_into_one() {
+    let mut typing = Typing::start().await;
+    let (stranger_grant, _) = a_stranger();
+
+    let boundary = HeldBoundary::take(&typing.wired).await;
+    for revision in 3..=40 {
+        typing
+            .wired
+            .announced_and_refused(
+                &mut typing.authority,
+                revision,
+                grant_reach(revision - 1, stranger_grant),
+            )
+            .await;
+    }
+    boundary.release();
+    typing.wired.service.fence_what_is_owed_for_tests();
+    assert_eq!(
+        typing.wired.service.acknowledged_revision(),
+        Some(AuthorityRevision::new(40))
+    );
+    assert!(
+        typing.holds_the_lease(),
+        "thirty-eight revisions named a stranger's grant"
+    );
+    typing.close();
+}
+
+/// KR-REQ-10.45: a reach that names as many grants as a notice may carry reaches the worker over
+/// its control connection, and a lease it does not name stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reach_of_the_most_names_a_notice_may_carry_is_read_by_the_worker() {
+    let mut typing = Typing::start().await;
+    let strangers: CanonicalSet<GrantId> = (1..=MAX_REVISION_REACH_NAMES as u128)
+        .map(|name| GrantId::new(Uuid::from_bytes((name << 64).to_be_bytes())))
+        .collect();
+    assert_eq!(strangers.len(), MAX_REVISION_REACH_NAMES);
+
+    typing
+        .wired
+        .revise_within(
+            &mut typing.authority,
+            3,
+            RevisionReach::Within {
+                since: AuthorityRevision::new(2),
+                grants: strangers,
+                devices: CanonicalSet::new(),
+            },
+        )
+        .await;
+    assert_eq!(
+        typing.wired.service.acknowledged_revision(),
+        Some(AuthorityRevision::new(3))
+    );
+    assert!(typing.holds_the_lease());
     typing.close();
 }
 

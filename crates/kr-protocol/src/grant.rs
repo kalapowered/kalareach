@@ -117,7 +117,8 @@ pub struct HistoryScope {
     /// was first recorded or seen at or after the moment the host committed the pairing. A host
     /// reads that start where it reads the grant ([`Self::from_start`]), so a reader that decides
     /// anything from this sees one moment. A reader that has no start to read it against reaches
-    /// no earlier history. A session share never holds a null: it takes the moment it was issued.
+    /// no earlier history. A session share this build issues never holds a null: it takes the
+    /// moment it was issued.
     pub lower_bound_ms: Nullable<TimestampMs>,
     /// Whether the currently visible screen is included. This exception never grants inactive
     /// screen buffers, scrollback or the backing transcript.
