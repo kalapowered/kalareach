@@ -320,3 +320,51 @@ async fn an_invitation_for_an_organisation_the_host_is_not_enrolled_in_is_refuse
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(said.contains("larger than any chain"), "{said}");
 }
+
+/// KR-REQ-17.54: a withdrawal names an organisation by its identifier, and the host leaves none it
+/// is not enrolled in: a mistake in the identifier is the person's, said before the host is asked,
+/// and an organisation the host holds nothing of is refused by the host with nothing fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_from_an_organisation_the_host_is_not_enrolled_in_is_refused() {
+    let host = Host::start().await;
+    let output = host.kr(&["organisation", "withdraw", "not-an-identifier"]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("not an organisation identifier"), "{said}");
+
+    let organisation = OrganisationId::new(Uuid::from_bytes([0x21; 16])).to_string();
+    let output = host.kr(&["organisation", "withdraw", &organisation]);
+    assert!(!output.status.success(), "the host holds nothing of it");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("not enrolled in that organisation"),
+        "{said}\n{}",
+        host.log()
+    );
+}
+
+/// KR-REQ-17.54: exclusive management is put to nobody for confirmation while the host would
+/// refuse it: a host enrolled in nothing has no organisation to manage it, and one that is not
+/// exclusive has nothing to end. Both are the host's refusal, with nothing changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exclusive_management_is_refused_where_the_host_would_refuse_it() {
+    let host = Host::start().await;
+    let output = host.kr(&["organisation", "exclusive", "on"]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("enrolled in no organisation"),
+        "{said}\n{}",
+        host.log()
+    );
+    let output = host.kr(&["organisation", "exclusive", "off"]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("not exclusively organisation-managed"),
+        "{said}\n{}",
+        host.log()
+    );
+    let listed = host.kr_json(&["organisation", "list", "--json"]);
+    assert_eq!(listed["exclusive"], false, "{listed}");
+}

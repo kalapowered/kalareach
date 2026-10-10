@@ -11,15 +11,21 @@ use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::account::PolicyAuthority;
 use kr_protocol::confirmation::{ConfirmationDisplay, ConfirmationSubject};
+use kr_protocol::ids::OrganisationId;
 use kr_protocol::limits::MAX_CONTROL_FRAME_LEN;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
-    OrganisationEnrolParams, OrganisationEnrolResult, OrganisationListParams,
-    OrganisationListResult,
+    OrganisationEnrolParams, OrganisationEnrolResult, OrganisationExclusiveSetParams,
+    OrganisationExclusiveSetResult, OrganisationListParams, OrganisationListResult,
+    OrganisationWithdrawParams,
 };
+use kr_protocol::sharing::RevocationResult;
 
-use crate::cli::{OrganisationCommand, OrganisationEnrolArguments, PrivacyArguments};
-use crate::daemon::Daemon;
+use crate::cli::{
+    OrganisationCommand, OrganisationEnrolArguments, OrganisationExclusiveCommand,
+    OrganisationWithdrawArguments, PrivacyArguments,
+};
+use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Request, closed};
 use crate::plugin::confirmed_on_an_owner_device;
@@ -35,7 +41,109 @@ pub async fn run(paths: &HostPaths, command: OrganisationCommand, json: bool) ->
     match command {
         OrganisationCommand::Enrol(arguments) => enrol(paths, &arguments, json).await,
         OrganisationCommand::List(arguments) => list(paths, &arguments, json).await,
+        OrganisationCommand::Withdraw(arguments) => withdraw(paths, &arguments, json).await,
+        OrganisationCommand::Exclusive(OrganisationExclusiveCommand::On(arguments)) => {
+            exclusive_on(paths, &arguments, json).await
+        }
+        OrganisationCommand::Exclusive(OrganisationExclusiveCommand::Off(arguments)) => {
+            crate::pair::end_exclusive_management(paths, &arguments.selector, json).await
+        }
     }
+}
+
+/// `kr organisation withdraw`.
+async fn withdraw(
+    paths: &HostPaths,
+    arguments: &OrganisationWithdrawArguments,
+    json: bool,
+) -> Result<()> {
+    let organisation_id: OrganisationId = identifier(&arguments.organisation, "an organisation")?;
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let withdrawn: RevocationResult = daemon
+        .mutate(
+            Method::OrganisationWithdraw,
+            &OrganisationWithdrawParams { organisation_id },
+        )
+        .await?;
+    let pending = crate::device::pending_fence(
+        shown!("the withdrawal from organisation {}", organisation_id),
+        &withdrawn.barrier,
+    );
+    if json {
+        let document = crate::device::revocation_document(&withdrawn);
+        output::document(&match &pending {
+            Some(error) => crate::report::with_failure(document, error),
+            None => document,
+        });
+    } else {
+        output::lines(&crate::device::barrier_lines(
+            stdout_line!(
+                "This host left organisation {}, at authority revision {}. Nothing that required \
+                 it is honoured now.",
+                organisation_id,
+                withdrawn.authority_revision
+            ),
+            &withdrawn.barrier,
+        ));
+        if let Some(error) = &pending {
+            crate::report::failed(error);
+        }
+    }
+    pending.map_or(Ok(()), Err)
+}
+
+/// `kr organisation exclusive on`.
+async fn exclusive_on(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Result<()> {
+    let params = OrganisationExclusiveSetParams { exclusive: true };
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let (made, _challenge): (OrganisationExclusiveSetResult, _) = confirmed_on_an_owner_device(
+        &mut daemon,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+        Method::OrganisationExclusiveSet,
+        &params,
+        json,
+        say_what_is_asked,
+    )
+    .await?;
+    report_exclusive(&made, json)
+}
+
+/// What a change of exclusive management reports.
+pub(crate) fn report_exclusive(made: &OrganisationExclusiveSetResult, json: bool) -> Result<()> {
+    let pending = made.barrier.0.as_ref().and_then(|barrier| {
+        crate::device::pending_fence(Shown::said("making this host exclusive"), barrier)
+    });
+    if json {
+        let mut document = Document::new()
+            .with("ok", true)
+            .with("exclusive", made.exclusive)
+            .with("authority_revision", closed(&made.authority_revision));
+        if let Some(barrier) = made.barrier.0.as_ref() {
+            document.set("barrier_workers_total", closed(&barrier.workers_total));
+        }
+        output::document(&match &pending {
+            Some(error) => crate::report::with_failure(document, error),
+            None => document,
+        });
+    } else if made.exclusive {
+        let first = stdout_line!(
+            "This host is exclusively organisation-managed, at authority revision {}: a personal \
+             grant answers to a membership lease now.",
+            made.authority_revision
+        );
+        match made.barrier.0.as_ref() {
+            Some(barrier) => output::lines(&crate::device::barrier_lines(first, barrier)),
+            None => output::line(&first),
+        }
+        if let Some(error) = &pending {
+            crate::report::failed(error);
+        }
+    } else {
+        output::line(&stdout_line!(
+            "Exclusive management is off: a personal grant is served on its own again."
+        ));
+    }
+    pending.map_or(Ok(()), Err)
 }
 
 /// Reads the chain a member exported.
@@ -151,6 +259,26 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
 
 /// The line `say_what_is_asked` writes, for the display of an enrolment.
 fn what_is_asked(display: &ConfirmationDisplay) -> Option<output::Line> {
+    if let ConfirmationDisplay::ExclusiveManagement {
+        exclusive,
+        organisation_ids,
+    } = display
+    {
+        let organisations =
+            Shown::joined(organisation_ids.iter().map(|id| shown!("{}", *id)), ", ");
+        return Some(if *exclusive {
+            stdout_line!(
+                "An owner device is asked to make this host exclusively managed by {}. A personal \
+                 grant, its own included, then answers to a membership lease like a member's.",
+                organisations
+            )
+        } else {
+            stdout_line!(
+                "An owner device is asked to end the exclusive management of this host by {}.",
+                organisations
+            )
+        });
+    }
     let ConfirmationDisplay::EnrolOrganisation {
         organisation_id,
         root,
@@ -343,5 +471,26 @@ mod tests {
         let other = what_is_asked(&later.display()).expect("a line");
         assert_ne!(text, other.text(), "activation times are printed");
         assert!(what_is_asked(&ConfirmationDisplay::EstablishClock).is_none());
+    }
+
+    /// KR-REQ-17.54: what an owner device is asked about exclusive management names every
+    /// organisation, in the order the host shows them, and says which way the change goes.
+    #[test]
+    fn the_command_names_the_organisations_a_change_of_exclusive_management_is_about() {
+        let first = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+        let second = OrganisationId::new(Uuid::from_bytes([0x22; 16]));
+        let plan = |exclusive| kr_protocol::confirmation::ExclusiveManagementPlan {
+            exclusive,
+            organisation_ids: [first, second].into_iter().collect(),
+        };
+        let on = what_is_asked(&plan(true).display()).expect("a line");
+        let off = what_is_asked(&plan(false).display()).expect("a line");
+        let (on, off) = (on.text(), off.text());
+        for text in [&on, &off] {
+            assert!(text.contains(&first.to_string()), "{text}");
+            assert!(text.contains(&second.to_string()), "{text}");
+        }
+        assert!(on.contains("make this host exclusively managed"), "{on}");
+        assert!(off.contains("end the exclusive management"), "{off}");
     }
 }

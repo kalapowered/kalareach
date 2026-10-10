@@ -52,7 +52,10 @@ use kr_protocol::invitation::{
     PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
 };
 use kr_protocol::method::Method;
-use kr_protocol::organisation::{OrganisationListParams, OrganisationListResult};
+use kr_protocol::organisation::{
+    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationListParams,
+    OrganisationListResult,
+};
 use kr_protocol::pairing::{
     ConfirmationChannel, DevicePlatform, PairStatus, PairingConsumedReason, ProposedGrant,
     RendezvousOrigin,
@@ -77,6 +80,9 @@ pub const ISSUE_WORD: &str = "pair";
 
 /// What a person types to establish the host's clock again.
 pub const CLOCK_WORD: &str = "clock";
+
+/// What a person types to end the host's exclusive organisation management at the terminal.
+pub const END_WORD: &str = "end";
 
 /// The most of one typed line the command reads.
 const MAX_TYPED_LINE: u64 = 256;
@@ -328,6 +334,7 @@ enum Effect {
     Invite(PairInviteParams),
     Confirm(PairConfirmParams),
     EstablishClock(HostClockEstablishParams),
+    EndExclusive(OrganisationExclusiveSetParams),
 }
 
 /// What the person at this terminal confirms, when the host has no owner yet.
@@ -338,6 +345,8 @@ enum Ceremony<'a> {
     Approve { candidate: &'a PairCandidateView },
     /// Trusting this host's clock again, which reads `reading_ms` now.
     EstablishClock { reading_ms: u64 },
+    /// Ending exclusive management by `organisations`, when no device is left that can confirm it.
+    EndExclusive { organisations: Vec<OrganisationId> },
 }
 
 impl Ceremony<'_> {
@@ -349,9 +358,10 @@ impl Ceremony<'_> {
                 ErrorCode::PermissionDenied,
                 "this host has no owner yet: pair its first owner with `kr pair invite --owner`",
             )),
-            Self::Issue { owner: true } | Self::Approve { .. } | Self::EstablishClock { .. } => {
-                Ok(())
-            }
+            Self::Issue { owner: true }
+            | Self::Approve { .. }
+            | Self::EstablishClock { .. }
+            | Self::EndExclusive { .. } => Ok(()),
         }
     }
 
@@ -371,6 +381,7 @@ impl Ceremony<'_> {
                  now.",
                 crate::shown::utc_moment(*reading_ms)
             )),
+            Self::EndExclusive { .. } => None,
         }
     }
 
@@ -420,6 +431,23 @@ impl Ceremony<'_> {
                 ))?;
                 if typed.trim() != CLOCK_WORD {
                     return Err(not_confirmed("the clock was not established"));
+                }
+            }
+            Self::EndExclusive { organisations } => {
+                let names = Shown::joined(organisations.iter().map(|id| shown!("{}", *id)), ", ");
+                terminal.say(&stdout_line!(
+                    "This host is exclusively managed by {}, and no owner device is left that can \
+                     confirm for it. Ending exclusive management serves a personal grant, the \
+                     owner's own devices included, without a membership lease. The host records \
+                     that it was ended here, and the organisation is told.",
+                    names
+                ))?;
+                let typed = terminal.ask(&stdout_line!(
+                    "Type {} to end exclusive management: ",
+                    END_WORD
+                ))?;
+                if typed.trim() != END_WORD {
+                    return Err(not_confirmed("exclusive management was not ended"));
                 }
             }
         }
@@ -521,7 +549,59 @@ async fn perform(
                 .mutate(Method::HostClockEstablish, action, target, params)
                 .await?
         }
+        Effect::EndExclusive(params) => {
+            client
+                .mutate(Method::OrganisationExclusiveSet, action, target, params)
+                .await?
+        }
     })
+}
+
+/// `kr organisation exclusive off`: the owner ends the host's exclusive organisation management.
+///
+/// An owner device confirms it in its own ceremony. When none is left that can confirm for the
+/// host, which the host says in its answer to the request for the confirmation, the person at
+/// this terminal confirms it, under the guard every terminal confirmation here is: an interactive
+/// terminal outside every session. The host records which of the two it was.
+///
+/// # Errors
+///
+/// Returns the host's refusal, a refusal of the terminal guard, or a transport failure.
+pub async fn end_exclusive_management(
+    paths: &HostPaths,
+    selector: &crate::cli::EnvironmentSelector,
+    json: bool,
+) -> Result<()> {
+    let build_id = crate::build_id();
+    let environment = resolve::select(paths, selector.environment.as_deref())?;
+    let target = ActionTarget::environment(environment.environment_id);
+    let mut client = resolve::open_controller(&environment.paths, build_id.clone()).await?;
+    let listed: OrganisationListResult = bind::read(
+        &mut client,
+        Method::OrganisationList,
+        &OrganisationListParams::default(),
+    )
+    .await?;
+    let ceremony = Ceremony::EndExclusive {
+        organisations: listed
+            .enrolments
+            .iter()
+            .map(|enrolment| enrolment.organisation_id)
+            .collect(),
+    };
+    let params = OrganisationExclusiveSetParams { exclusive: false };
+    let effect = Effect::EndExclusive(params);
+    let answer = confirmed(
+        &mut client,
+        target,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+        &ceremony,
+        &effect,
+        &build_id,
+    )
+    .await?;
+    let ended: OrganisationExclusiveSetResult = decode(&answer)?;
+    crate::organisation::report_exclusive(&ended, json)
 }
 
 /// Refuses unless this is where a host with no owner may be confirmed at a terminal: at an

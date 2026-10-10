@@ -134,19 +134,31 @@ async fn revoke(
 /// The failure a revocation some worker has not fenced yet is reported as, or none when every
 /// affected worker's barrier holds.
 fn pending(device: DeviceId, revoked: &RevocationResult) -> Option<CliError> {
-    let waiting = revoked.barrier.pending();
+    pending_fence(
+        shown!("the revocation of device {}", device),
+        &revoked.barrier,
+    )
+}
+
+/// The failure a change that fences the host is reported as, or none when every affected worker's
+/// barrier holds. `what` names the change as the sentence's subject.
+pub(crate) fn pending_fence(
+    what: Shown,
+    barrier: &kr_protocol::action::RevocationBarrier,
+) -> Option<CliError> {
+    let waiting = barrier.pending();
     if waiting.is_empty() {
         return None;
     }
     // A cut list names the workers still waiting before any that is not, so what it shows is a
     // floor: how many are waiting in all is not said.
-    let cut = revoked.barrier.workers_total.get() > revoked.barrier.workers.len() as u64;
+    let cut = barrier.workers_total.get() > barrier.workers.len() as u64;
     Some(CliError::Unfinished {
         code: ErrorCode::ResourceUnavailable,
         message: shown!(
-            "the revocation of device {} is recorded and still pending: {}{} session \
+            "{} is recorded and still pending: {}{} session \
              worker{} {} not fenced it yet, and asking again reports how far it has got",
-            device,
+            what,
             if cut { "at least " } else { "" },
             waiting.len(),
             if waiting.len() == 1 { "" } else { "s" },
@@ -196,7 +208,7 @@ fn list_document(listed: &DeviceListResult) -> Document {
 /// A revocation, for a script, in the shape the protocol answers it: the actors and the methods of
 /// the actions it names are what the host recorded for the person revoking, and a worker's detail
 /// is the host's sentence, said as its class and length.
-fn revocation_document(revoked: &RevocationResult) -> Document {
+pub(crate) fn revocation_document(revoked: &RevocationResult) -> Document {
     Document::new()
         .with("authority_revision", closed(&revoked.authority_revision))
         .with("revoked_grants", closed(&revoked.revoked_grants))
@@ -304,8 +316,7 @@ fn revocation_document(revoked: &RevocationResult) -> Document {
 /// not run before the revocation reached it is named too.
 fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
     let grants = usize::try_from(revoked.revoked_grants_total.get()).unwrap_or(usize::MAX);
-    let barrier = &revoked.barrier;
-    let mut lines = vec![if barrier.holds() {
+    let first = if revoked.barrier.holds() {
         stdout_line!(
             "Revoked device {} and {} grant{}, at authority revision {}.",
             device,
@@ -322,7 +333,17 @@ fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
             grants,
             if grants == 1 { "" } else { "s" }
         )
-    }];
+    };
+    barrier_lines(first, &revoked.barrier)
+}
+
+/// What a change that fences the host did, as lines for a person: `first`, then how far each
+/// affected session's worker has got.
+pub(crate) fn barrier_lines(
+    first: Line,
+    barrier: &kr_protocol::action::RevocationBarrier,
+) -> Vec<Line> {
+    let mut lines = vec![first];
     let workers_left_out = barrier
         .workers_total
         .get()

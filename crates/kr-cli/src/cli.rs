@@ -629,6 +629,39 @@ pub enum OrganisationCommand {
     /// Show the organisations this host is enrolled in, the devices bound to their members, and
     /// whether exclusive management is on.
     List(PrivacyArguments),
+    /// Leave an organisation's policy.
+    ///
+    /// Every grant that requires the organisation stops being honoured and every lease installed
+    /// under the enrolment ends with it, and the host fences the connections admitted under it.
+    /// A host that is exclusively organisation-managed keeps its last organisation until
+    /// exclusive management is ended.
+    Withdraw(OrganisationWithdrawArguments),
+    /// Make this host exclusively organisation-managed, or end that.
+    ///
+    /// While it is on, a personal grant, the owner's own devices included, answers to a membership
+    /// lease like a member's. Ending it needs an owner device's confirmation, or this terminal's
+    /// when no device is left that can confirm for the host.
+    #[command(subcommand)]
+    Exclusive(OrganisationExclusiveCommand),
+}
+
+/// `kr organisation withdraw`.
+#[derive(Args)]
+pub struct OrganisationWithdrawArguments {
+    /// The organisation, by identifier, as `kr organisation list` shows it.
+    pub organisation: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr organisation exclusive`.
+#[derive(Subcommand)]
+pub enum OrganisationExclusiveCommand {
+    /// Make this host exclusively organisation-managed, on an owner device's confirmation.
+    On(PrivacyArguments),
+    /// End exclusive management.
+    Off(PrivacyArguments),
 }
 
 /// `kr organisation enrol`.
