@@ -13,18 +13,20 @@
  *
  * Each card has one status line, a polite live region the panel moves focus to when a step ends,
  * because the control the person pressed is disabled while the step runs and may be gone when it
- * ends. A step ends when the card's state has been read again, so the line a person lands on says
- * where things now stand. Focus is moved only when it is on nothing or already in the card that
- * ran the step: a person who went on to type in the other card keeps the field they are in, and a
- * service the backend refused keeps focus in the field to correct, marked invalid and described by
- * the line. The line says how the step ended, in the backend's words when it refused. A read that
- * fails is said in place of the card's state, with a way to ask again, and never as an empty card.
- * Nothing here moves of its own; the cards sit in the account panel's frame.
+ * ends. A step ends when its own card's state has been read again, so the line a person lands on
+ * says where things now stand, and a card does not wait for the other card's read. Focus is moved
+ * only when it is on nothing or already in the card that ran the step: a person who went on to use
+ * something else keeps it. A service the backend refused as unusable has focus put in the field
+ * to correct, marked invalid and described by the line; any other failure is said in the line
+ * alone, because the field holds nothing to mend. The line says how the step ended, in the
+ * backend's words when it refused. A read that fails is said in place of the card's state, with a
+ * way to ask again, and never as an empty card. Nothing here moves of its own; the cards sit in
+ * the account panel's frame.
  */
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
-import { failureMessage, type HostPort, type RecoveryView, type SyncServiceView } from '../host/port'
+import { failureCode, failureMessage, type HostPort, type RecoveryView, type SyncServiceView } from '../host/port'
 import { minimumTarget, type Surface } from '../mobile/platform'
 import type { AccountView } from '../model/account'
 import {
@@ -45,14 +47,14 @@ type Place = 'service' | 'recovery'
 interface Said {
   readonly place: Place
   readonly text: string
-  /** Whether the step was refused or failed. */
-  readonly failed: boolean
+  /** Whether the backend refused what the person typed as unusable, so that the field is the one thing to mend. */
+  readonly invalid: boolean
 }
 
 /** Where a step that has ended leaves focus. */
 interface Finished {
   readonly place: Place
-  readonly failed: boolean
+  readonly invalid: boolean
 }
 
 /** The sync service setting and, on a desktop, recovery. */
@@ -84,24 +86,24 @@ export function SyncPanel({
   // A sign-in that changes what the account may do changes what stops recovery, so it is read again.
   const standing = account?.state === 'signed_in' ? account.generation : (account?.state ?? null)
 
-  /** Reads both cards again; the promise is settled once each read has answered or failed. */
-  const refresh = useCallback((): Promise<void> => {
-    const reads: Promise<void>[] = [
-      port
-        .syncServiceView()
-        .then((view) => {
-          setService(view)
-          setServiceProblem(null)
-        })
-        .catch((error: unknown) => {
-          // What was shown before may no longer be true, so it is not shown beside the problem.
-          setService(null)
-          setServiceProblem(failureMessage(error))
-        })
-    ]
-    if (desktop) {
-      reads.push(
-        port
+  /**
+   * Reads both cards again. Each promise is settled once its card's read has answered or failed;
+   * recovery's read waits for any other companion's step to end, so a card never waits on the other.
+   */
+  const refresh = useCallback((): Readonly<Record<Place, Promise<void>>> => {
+    const service = port
+      .syncServiceView()
+      .then((view) => {
+        setService(view)
+        setServiceProblem(null)
+      })
+      .catch((error: unknown) => {
+        // What was shown before may no longer be true, so it is not shown beside the problem.
+        setService(null)
+        setServiceProblem(failureMessage(error))
+      })
+    const recovery = desktop
+      ? port
           .recoveryView()
           .then((view) => {
             setRecovery(view)
@@ -111,61 +113,56 @@ export function SyncPanel({
             setRecovery(null)
             setRecoveryProblem(failureMessage(error))
           })
-      )
-    }
-    return Promise.all(reads).then(() => undefined)
+      : Promise.resolve()
+    return { service, recovery }
   }, [port, desktop])
 
   useEffect(() => {
-    void refresh()
+    refresh()
   }, [refresh, standing])
 
   // When a step ends, focus goes to its card's status line: the pressed control may be disabled,
   // or gone, and a person using a keyboard or a screen reader would otherwise be left on nothing.
-  // It is not taken from a field the person went on to use in the other card, and a refused change
-  // of the service leaves it in the field the person has to correct.
+  // It is not taken from something the person went on to use elsewhere, and a service the backend
+  // refused as unusable leaves it in the field the person has to correct.
   useEffect(() => {
     if (busy || finished.current === null) return
-    const { place, failed } = finished.current
+    const { place, invalid } = finished.current
     finished.current = null
-    if (place === 'service' && failed && serviceInput.current !== null) {
-      serviceInput.current.focus()
-      return
-    }
     const status = place === 'service' ? serviceStatus : recoveryStatus
     const card = status.current?.closest('[data-card]') ?? null
     const active = document.activeElement
     const free = active === null || active === document.body || (card?.contains(active) ?? false)
-    if (free) status.current?.focus()
+    if (!free) return
+    const field = place === 'service' && invalid ? serviceInput.current : null
+    const landing = field ?? status.current
+    landing?.focus()
   }, [busy])
 
   /**
    * Runs one step, says how it ended, and reads where things stand again; the step has ended, and
-   * focus moves, once that read has answered. A step that has another owner of focus (the sign-in,
-   * which the account card follows from the browser back to its own status line) moves none.
+   * focus moves, once its own card has been read. A step that has another owner of focus (the
+   * sign-in, which the account card follows from the browser back to its own status line) moves
+   * none.
    */
   const step = (place: Place, work: () => Promise<string | null>, moveFocus = true) => {
     setBusy(true)
     setSaid(null)
-    let failed = false
+    let invalid = false
+    const end = () => {
+      finished.current = moveFocus ? { place, invalid } : null
+      setBusy(false)
+    }
     work()
       .then((text) => {
-        if (text !== null) setSaid({ place, text, failed: false })
+        if (text !== null) setSaid({ place, text, invalid: false })
       })
       .catch((error: unknown) => {
-        failed = true
-        setSaid({ place, text: failureMessage(error), failed: true })
+        invalid = failureCode(error) === 'INVALID_ARGUMENT'
+        setSaid({ place, text: failureMessage(error), invalid })
       })
-      .then(() => refresh())
-      .then(() => {
-        finished.current = moveFocus ? { place, failed } : null
-        setBusy(false)
-      })
-      .catch(() => {
-        // A read cannot reject (each says its own failure), but a step must always end.
-        finished.current = moveFocus ? { place, failed } : null
-        setBusy(false)
-      })
+      .then(() => refresh()[place])
+      .then(end, end)
   }
 
   if (service === null && serviceProblem === null) return null
@@ -246,7 +243,7 @@ export function SyncPanel({
                 id={inputId}
                 ref={serviceInput}
                 data-testid="sync-service-input"
-                aria-invalid={said?.place === 'service' && said.failed ? true : undefined}
+                aria-invalid={said?.place === 'service' && said.invalid ? true : undefined}
                 aria-describedby={serviceStatusId}
                 value={draft}
                 autoCapitalize="off"
