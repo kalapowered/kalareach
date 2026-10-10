@@ -84,7 +84,41 @@ describe('the phone’s composer and the device’s store (KR-REQ-13.13)', () =>
   })
 })
 
+describe('a phone whose drafts could not be opened', () => {
+  it('opens them again when the person asks, and keeps what was typed meanwhile', async () => {
+    const device = new FakeDraftStore()
+    device.breakOpening()
+    const person = userEvent.setup()
+    open(device)
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'typed meanwhile')
+    expect(screen.getByText('This device will not keep what you write')).toBeInTheDocument()
+
+    device.mendOpening()
+    await person.click(screen.getByTestId('drafts-retry'))
+    await waitFor(() => {
+      expect(screen.queryByText('This device will not keep what you write')).toBeNull()
+    })
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text)).toEqual(['typed meanwhile'])
+    })
+    expect(screen.getByLabelText('Message this session')).toHaveValue('typed meanwhile')
+  })
+})
+
 describe('the drafts no composer shows, on a phone (KR-REQ-13.13)', () => {
+  it('says so when some drafts could not be read, and has the entry for it', async () => {
+    const device = new FakeDraftStore()
+    device.leaveUnreadable(2)
+    const person = userEvent.setup()
+    open(device)
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByTestId('kept-drafts-entry'))
+    expect(await screen.findByText('Some drafts could not be read')).toBeInTheDocument()
+    expect(screen.getByText(/2 stored drafts could not be read/)).toBeInTheDocument()
+  })
+
   it('are reached from the sessions, and listed with what became of their session', async () => {
     const device = new FakeDraftStore()
     leave(device, GONE, 'for a session that went', 'orphaned')

@@ -817,6 +817,18 @@ export function MobileSession({
             tone="warning"
             title="This device will not keep what you write"
             detail="Storage refused it. The draft is here and you can still send it; it will not survive the application being closed."
+            action={
+              draftsStatus === 'memory-only' ? (
+                <Button
+                  data-testid="drafts-retry"
+                  onClick={() => {
+                    void book.hydrate()
+                  }}
+                >
+                  Try again
+                </Button>
+              ) : undefined
+            }
           />
         )}
         <Segmented

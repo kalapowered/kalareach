@@ -15,6 +15,7 @@ import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { useApp } from '../app/state'
 import { useBook } from '../app/drafts'
+import { keptEntry } from '../model/draft-book'
 import { useConnectionRights } from '../app/rights'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
@@ -68,7 +69,7 @@ export function sessionDescription(session: Session): string {
 export function Sessions(): ReactNode {
   const { port, go } = useApp()
   const rights = useConnectionRights()
-  const { kept: keptDrafts } = useBook()
+  const keptEntryLine = keptEntry(useBook())
   const [list, setList] = useState<SessionListResult | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [query, setQuery] = useState('')
@@ -150,7 +151,7 @@ export function Sessions(): ReactNode {
         ) : null}
       </header>
 
-      {keptDrafts.length === 0 ? null : (
+      {keptEntryLine === null ? null : (
         <p className="small" data-testid="kept-drafts-entry">
           <Button
             tone="quiet"
@@ -158,9 +159,9 @@ export function Sessions(): ReactNode {
               go({ view: 'drafts' })
             }}
           >
-            {keptDrafts.length === 1 ? 'One kept draft' : `${keptDrafts.length} kept drafts`}
+            {keptEntryLine.label}
           </Button>{' '}
-          <span className="muted">are not in a composer.</span>
+          <span className="muted">{keptEntryLine.rest}</span>
         </p>
       )}
 

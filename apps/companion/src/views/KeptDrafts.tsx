@@ -55,7 +55,7 @@ export function KeptDrafts({
 }): ReactNode {
   const { port, say } = useApp()
   const book = useDraftBook()
-  const { kept, status, problem } = useBook()
+  const { kept, status, problem, unreadable } = useBook()
   const [sessions, setSessions] = useState<readonly Session[] | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
 
@@ -120,8 +120,25 @@ export function KeptDrafts({
           tone="warning"
           title="This device is not keeping drafts"
           detail={`${problem ?? 'The place for them could not be opened.'} What you write is here, and it will not survive the application being closed.`}
+          action={
+            <Button
+              data-testid="kept-drafts-retry"
+              onClick={() => {
+                void book.hydrate()
+              }}
+            >
+              Try again
+            </Button>
+          }
         />
       ) : null}
+      {unreadable === 0 ? null : (
+        <Banner
+          tone="warning"
+          title="Some drafts could not be read"
+          detail={`${unreadable === 1 ? 'One stored draft' : `${String(unreadable)} stored drafts`} could not be read by this version of the application. ${unreadable === 1 ? 'It was' : 'They were'} left as ${unreadable === 1 ? 'it is' : 'they are'}, and nothing was removed.`}
+        />
+      )}
       {sessions === null && kept.length > 0 ? (
         <p className="small muted" data-testid="kept-drafts-offline">
           This device cannot ask the host which sessions there are, so a draft cannot be moved to
@@ -143,6 +160,9 @@ export function KeptDrafts({
               onMove={(sessionId) => {
                 run(each.id, () => book.moveTo(each.id, sessionId), 'The draft was not moved')
               }}
+              onUse={() => {
+                run(each.id, () => book.useHere(each.id), 'The draft was not put in its composer')
+              }}
               onDiscard={() => {
                 run(each.id, () => book.discard(each.id), 'The draft was not discarded')
               }}
@@ -160,12 +180,14 @@ function KeptRow({
   sessions,
   busy,
   onMove,
+  onUse,
   onDiscard
 }: {
   readonly kept: KeptDraft
   readonly sessions: readonly Session[] | null
   readonly busy: boolean
   readonly onMove: (sessionId: string) => void
+  readonly onUse: () => void
   readonly onDiscard: () => void
 }): ReactNode {
   const [choice, setChoice] = useState('')
@@ -186,6 +208,11 @@ function KeptRow({
         </p>
       ) : null}
       <div className="row wrap">
+        {home !== null && !kept.inComposer ? (
+          <Button data-testid="kept-draft-use" disabled={busy} onClick={onUse}>
+            Put it in its composer
+          </Button>
+        ) : null}
         {choices.length > 0 ? (
           <>
             <label>

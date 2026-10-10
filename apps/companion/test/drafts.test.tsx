@@ -188,7 +188,154 @@ describe('a prompt from a draft leaves the stored draft until the host took it (
   })
 })
 
+/** A host answer a test settles when it chooses, for a prompt that is on its way. */
+function held<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: unknown) => void } {
+  let resolve: (value: T) => void = () => undefined
+  let reject: (reason: unknown) => void = () => undefined
+  const promise = new Promise<T>((accept, refuse) => {
+    resolve = accept
+    reject = refuse
+  })
+  return { promise, resolve, reject }
+}
+
+describe('a prompt the host did not take, and the text it was sent from (KR-REQ-13.13, 24.13)', () => {
+  it('keeps what was sent and what was written meanwhile, and the person finds the first in the kept drafts', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    const answer = held<never>()
+    startOver(device, IN_MAIN, (port) => ({
+      ...port,
+      composerSubmit: () => answer.promise
+    }))
+    await person.type(await screen.findByTestId('composer-input'), 'send this')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-send')).toBeEnabled()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+    // The composer is empty and the person writes the next thing while the prompt is on its way.
+    await person.type(screen.getByTestId('composer-input'), 'the next thing')
+    answer.reject({ code: 'UNAVAILABLE', message: 'The host did not answer.', user_action: 'retry' })
+
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text).sort()).toEqual(['send this', 'the next thing'])
+    })
+    expect(screen.getByTestId('composer-input')).toHaveValue('the next thing')
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByRole('button', { name: 'One kept draft' }))
+    expect(await screen.findByTestId('kept-draft-text')).toHaveTextContent('send this')
+  })
+
+  it('gives the text back when the tab it was sent from was closed before the answer', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    const answer = held<never>()
+    startOver(device, IN_MAIN, (port) => ({
+      ...port,
+      composerSubmit: () => answer.promise
+    }))
+    await person.type(await screen.findByTestId('composer-input'), 'sent from a tab that closed')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-send')).toBeEnabled()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+    // The strip of tabs shows with two open, and the person closes the one the prompt came from.
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-2'))
+    await person.click(await screen.findByRole('button', { name: 'Close the tab for session 01' }))
+    answer.reject({ code: 'UNAVAILABLE', message: 'The host did not answer.', user_action: 'retry' })
+
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text)).toEqual(['sent from a tab that closed'])
+    })
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    expect(await screen.findByTestId('composer-input')).toHaveValue('sent from a tab that closed')
+  })
+})
+
 describe('the drafts no composer shows (KR-REQ-13.13)', () => {
+  it('says "is" of one kept draft and "are" of several', async () => {
+    const device = new FakeDraftStore()
+    leave(device, 'aaaaaaaa-aaaa-4aaa-8aaa-00000000dead', 'one', 'orphaned')
+    startOver(device, { view: 'sessions' })
+    expect(await screen.findByTestId('kept-drafts-entry')).toHaveTextContent('One kept draft is not in a composer.')
+  })
+
+  it('puts a copy in its own session’s composer, and keeps what the composer held beside it', async () => {
+    const device = new FakeDraftStore()
+    const theirs = leave(device, SESSION_MAIN, 'theirs')
+    // A save of an older version is kept beside: this is another window's text, as a copy.
+    device.save({
+      id: theirs.id,
+      expectedRevision: '0',
+      sessionId: SESSION_MAIN,
+      applicationInstanceId: null,
+      agentBindingRevision: null,
+      state: 'open',
+      text: 'mine',
+      attachments: []
+    })
+    const person = userEvent.setup()
+    startOver(device, { view: 'drafts' })
+
+    const entry = await screen.findByTestId('kept-draft')
+    expect(within(entry).getByTestId('kept-draft-text')).toHaveTextContent('mine')
+    await waitFor(() => {
+      expect(within(entry).getByTestId('kept-draft-use')).toBeEnabled()
+    })
+    await person.click(within(entry).getByTestId('kept-draft-use'))
+    // Theirs stays kept, and is now the one listed apart.
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-draft-text')).toHaveTextContent('theirs')
+    })
+    expect(device.all().map((draft) => draft.text).sort()).toEqual(['mine', 'theirs'])
+  })
+
+  it('lists and discards a draft with no host to ask, and says it cannot offer a session to move it to', async () => {
+    const device = new FakeDraftStore()
+    leave(device, 'aaaaaaaa-aaaa-4aaa-8aaa-00000000dead', 'for a session that went', 'orphaned')
+    const person = userEvent.setup()
+    startOver(device, { view: 'drafts' }, (port) => ({
+      ...port,
+      sessionList: () => Promise.reject({ code: 'UNAVAILABLE', message: 'No host.', user_action: 'retry' })
+    }))
+    const entry = await screen.findByTestId('kept-draft')
+    expect(await screen.findByTestId('kept-drafts-offline')).toBeInTheDocument()
+    expect(within(entry).queryByTestId('kept-draft-session')).toBeNull()
+    expect(within(entry).queryByTestId('kept-draft-use')).toBeNull()
+
+    await person.click(within(entry).getByTestId('kept-draft-discard'))
+    await waitFor(() => {
+      expect(device.all()).toEqual([])
+    })
+  })
+
+  it('says so when some drafts could not be read, and does not call the list empty without saying why', async () => {
+    const device = new FakeDraftStore()
+    device.leaveUnreadable(1)
+    const person = userEvent.setup()
+    startOver(device, { view: 'sessions' })
+    await person.click(await screen.findByRole('button', { name: 'Some drafts' }))
+    expect(await screen.findByText('Some drafts could not be read')).toBeInTheDocument()
+    expect(screen.getByText(/One stored draft could not be read/)).toBeInTheDocument()
+  })
+
+  it('opens the store again when the person asks', async () => {
+    const device = new FakeDraftStore()
+    device.breakOpening()
+    const person = userEvent.setup()
+    startOver(device, { view: 'drafts' })
+    expect(await screen.findByText('This device is not keeping drafts')).toBeInTheDocument()
+    device.mendOpening()
+    await person.click(screen.getByTestId('kept-drafts-retry'))
+    await waitFor(() => {
+      expect(screen.queryByText('This device is not keeping drafts')).toBeNull()
+    })
+  })
+
   it('lists a draft whose session has gone, and moves it to a session the person chooses', async () => {
     const device = new FakeDraftStore()
     leave(device, 'aaaaaaaa-aaaa-4aaa-8aaa-00000000dead', 'for a session that went', 'orphaned')
