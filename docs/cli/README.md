@@ -43,7 +43,7 @@ worker directly for what a session owns.
 | `kr destination [list/configure/remove]` | — | The places this host sends notifications besides paired devices: a webhook, Slack, Discord, Telegram or email |
 | `kr account [sign-in/sign-out/show]` | — | Sign this host in to the managed account service, in a browser, sign it out, or show where the sign-in stands |
 | `kr host paths` | — | Show where this installation keeps its runtime files and its state |
-| `kr organisation [enrol/list]` | — | Enrol this host in an organisation's policy, or show what it holds for each organisation |
+| `kr organisation [enrol/list/withdraw/exclusive]` | — | Enrol this host in an organisation's policy, show what it holds for each organisation, leave one, or make the host exclusively organisation-managed or end that |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
@@ -1779,6 +1779,9 @@ host; this is about the owner's side of it.
 ```sh
 kr organisation enrol chain.json     # pin the keys that sign an organisation's policy
 kr organisation list                 # what this host holds for each organisation
+kr organisation withdraw <id>        # leave an organisation's policy
+kr organisation exclusive on         # make this host exclusively organisation-managed
+kr organisation exclusive off        # end that
 ```
 
 `kr organisation enrol` reads the organisation's policy-signing chain from a JSON file that a member
@@ -1804,6 +1807,12 @@ requiring the organisation names. It shows the devices bound to member accounts 
 organisation, and the lease last recorded for each. It also shows whether the host is exclusively
 organisation-managed, and whether it trusts its clock. It shows each time exclusive management was
 turned off. A member's account name is shown as the organisation signed it.
+
+To withdraw a host from an organisation, use `kr organisation withdraw <id>`, where `<id>` is the identifier `kr organisation list` shows. This operation, being only a restriction, does not need any confirmation. The host refuses an organisation it is not enrolled in, and its last one while exclusive management is on. The command reports the authority revision the host is fenced at and how far each affected session's worker has got, and it fails with a pending result when a worker has not fenced it yet. With `--json` it returns the revocation result: `authority_revision`, `revoked_grants`, `revoked_grants_total` and the `barrier`.
+
+`kr organisation exclusive on` makes the host exclusively organisation-managed, and `kr organisation exclusive off` ends that. An owner device confirms either, as it confirms an enrolment: `kr` says so, says what that device is asked to confirm, and asks the host again every second until the confirmation arrives or the challenge times out. The host refuses `on` when it is enrolled in no organisation, or when no owner device is left that could confirm for it, and it refuses `off` when exclusive management is not on, in both cases before anyone is asked.
+
+When exclusive management is on and no owner device is left that could confirm for the host, the host tells `kr organisation exclusive off` that the terminal can confirm it. `kr` then asks the person to type `end` at the controlling terminal, which must be interactive and outside every KalaReach session, as for `kr host clock --establish`. The terminal confirms nothing else in that state. With `--json`, `on` and `off` return `ok`, `exclusive`, `authority_revision` and, for `on`, `barrier_workers_total`.
 
 `kr pair invite --view --organisation <id>` fills in the requirement from the host's enrolment in
 that organisation. The host refuses a proposal that requires an organisation it is not enrolled in,

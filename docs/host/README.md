@@ -2871,6 +2871,32 @@ It also says whether this host is exclusively organisation-managed, and when exc
 was last turned off at the host's terminal, so that a member's client can carry that to the
 organisation with its next lease request.
 
+### Leaving an organisation
+
+`organisation.withdraw` takes the host out of an organisation. It is only available on the local socket and requires the `host.manage` right. It needs no owner confirmation, because it only restricts. `kr organisation withdraw <id>` names the organisation as `kr organisation list` shows it. The host refuses an organisation it is not enrolled in. It also refuses to leave its last organisation while it is exclusively organisation-managed, because nothing would answer for it.
+
+The enrolment goes with its member bindings. Every grant that requires the organisation stops being honoured at once, and every lease installed under the enrolment ends. The lease records stay, so a lease the host installed before is never installed again after a new enrolment. A later enrolment in the same organisation takes a later authority revision, and it brings back none of the earlier grants or invitations.
+
+A withdrawal restricts work the host already admitted, so it owes a fence. The host writes the debt for the fence before the policy changes. It holds the registry from the admission to the publication of that debt, so an enrolment cannot read the revision the fence is about to replace. The policy goes to the store in one transaction with a marker on the action, the debt is published, and the answer is built from the barrier: the revision now in force and, for each session's worker, how far its fence has got. A repeat of the action is answered from the marker with the barrier as it stands, after a restart too. If the registry cannot raise the fence, the withdrawal stays written and the fence stays owed. The host admits nobody until a barrier retires it, and a restart finishes it.
+
+### Exclusive management
+
+`organisation.exclusive.set` makes the host exclusively organisation-managed, or ends that. It is only available on the local socket, requires the `host.manage` right, and always requires a fresh confirmation from an owner. The owner is shown the new state and the organisations the host is enrolled in, and the confirmation covers exactly those, so it is not carried to a host that has since enrolled elsewhere. While exclusive management is on, a personal grant answers to a membership lease like a member's, the owner's own devices included.
+
+The host refuses to turn it on when it is enrolled in no organisation, and when no owner device is left that could confirm for it once the leases end. Such a device holds a grant that carries `host.manage`, never expires, requires no organisation and reaches this host's environment. Both are asked again inside the transaction that writes the change, which reads the devices from the file it writes to. Turning it on restricts work already admitted, so it fences the host as a withdrawal does, and the answer carries the barrier. Turning it off enlarges what the host serves and fences nothing. Exclusive management never stops a revocation.
+
+Turning it off writes a record in the same transaction as the policy: when it happened, how the owner's confirmation reached the host, and the organisations the host was enrolled in. `organisation.list` shows these records at both doors, oldest first. The answer to `membership.present` carries the last time it was turned off at the host's terminal, so a member's client can tell the organisation with its next lease request.
+
+Exclusive management does not protect a host against its own operating-system account, which can already delete the host's state.
+
+### Recovering an exclusive host
+
+A lease can end while the organisation's service cannot be reached, and then the owner's own devices have none. A device that holds a grant of the kind described above still reaches what recovers the host: `membership.present`, `organisation.list`, `host.clock.establish` and the owner confirmation methods. Of the confirmations it serves only the clock's and the end of exclusive management. A device whose lease is in force keeps every confirmation. Any other device is refused as before.
+
+The owner ends exclusive management from such a device. The device asks for the confirmation, is shown it, and answers it over its own connection. The owner at the host then spends the answer with `kr organisation exclusive off`.
+
+When no device is left that could confirm, the controlling terminal of the person at the host confirms instead. `kr organisation exclusive off` says so, and asks the person to type `end` at an interactive terminal outside every session. This holds only for the end of exclusive management, and only while the host is exclusive, has an owner, and has no device that could confirm. The host decides that again when it issues the challenge, when it takes the answer, when it spends it, in the transaction that records the spend, and in the transaction that writes the change. A device that appears in between stops the terminal's answer from being spent. The ceremony works when the host is off the network, as the clock's does, and the record of the turning off names the terminal as the channel.
+
 ## What the host owes the transport
 
 Two contracts `docs/transport/README.md` names, and where they are kept:
