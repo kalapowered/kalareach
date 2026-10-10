@@ -974,7 +974,17 @@ impl Acting {
                     .await
                     .expect("the worker installs the revision");
             }
-            Change::Connection => drop(asking.take()),
+            // The socket is shut down before it is dropped: a process another case has started
+            // holds a copy of the descriptor until it executes, and the connection does not end
+            // while a copy is held.
+            Change::Connection => {
+                if let Some(mut client) = asking.take() {
+                    client
+                        .writer()
+                        .shut_down()
+                        .expect("shuts the client's socket down");
+                }
+            }
         }
     }
 }

@@ -344,6 +344,26 @@ impl FrameWriter {
         self.sent > 0
     }
 
+    /// Shuts the connection down in both directions, so that the peer finds it ended and can
+    /// write nothing more to it.
+    ///
+    /// Dropping this end does not end the connection while another holder keeps a descriptor on
+    /// the socket, and a process that was started while it was open does until it executes. A
+    /// shutdown acts on the socket and not on a descriptor, so a test that needs a client to be gone
+    /// at a moment it names ends it this way and then drops it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the socket is already gone or refuses the shutdown.
+    #[cfg(all(unix, feature = "testing"))]
+    pub fn shut_down(&self) -> Result<()> {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return Err(IpcError::PeerClosed);
+        };
+        rustix::net::shutdown(descriptor, rustix::net::Shutdown::Both)
+            .map_err(|error| IpcError::socket("shut down", error.into()))
+    }
+
     /// Takes back a frame none of whose bytes the peer has taken, and answers whether it did.
     ///
     /// A frame the socket took none of is still wholly this writer's, so a caller that no longer

@@ -902,7 +902,13 @@ async fn kr_req_23_30_an_offer_claimed_when_its_connection_ends_is_rejected_and_
     })
     .await;
 
-    // The client goes, and the loop is let go to find it so.
+    // The client goes, and the loop is let go to find it so. Closing the client's end is not
+    // enough to end the connection when a process that another case of this file has started holds
+    // a copy of the descriptor until it executes, so the socket is shut down first.
+    asking
+        .writer()
+        .shut_down()
+        .expect("shuts the client's socket down");
     drop(asking);
     release.send(()).expect("lets the repeat go");
     let receipt = until_settled(&mut watcher, action_id).await;
