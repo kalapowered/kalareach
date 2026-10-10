@@ -35,6 +35,8 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
     // not know about.
     #[cfg(unix)]
     let descriptor = connection.writability().ok();
+    #[cfg(windows)]
+    let probe = connection.probe_handle();
     let (reader, writer) = tokio::io::split(connection);
     (
         FrameReader {
@@ -54,6 +56,8 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
             writable,
             #[cfg(unix)]
             descriptor,
+            #[cfg(windows)]
+            probe,
         },
     )
 }
@@ -324,6 +328,10 @@ pub struct FrameWriter {
     /// This connection's own descriptor, which is what the attempt writes through.
     #[cfg(unix)]
     descriptor: Option<std::os::fd::OwnedFd>,
+    /// The handle of this connection's pipe, which the peer check asks. It is valid for as long as
+    /// the connection's halves live, and the writer is one of them.
+    #[cfg(windows)]
+    probe: isize,
 }
 
 impl FrameWriter {
@@ -344,24 +352,71 @@ impl FrameWriter {
         self.sent > 0
     }
 
-    /// Shuts the connection down in both directions, so that the peer finds it ended and can
-    /// write nothing more to it.
+    /// Shuts the connection down in the direction `how` says, so that the peer finds it ended.
     ///
     /// Dropping this end does not end the connection while another holder keeps a descriptor on
     /// the socket, and a process that was started while it was open does until it executes. A
     /// shutdown acts on the socket and not on a descriptor, so a test that needs a client to be gone
-    /// at a moment it names ends it this way and then drops it.
+    /// at a moment it names ends it this way and then drops it. A shutdown of the writing
+    /// direction alone is the end of what the client sends: the peer reads the end and can still
+    /// write to it.
     ///
     /// # Errors
     ///
     /// Returns an error when the socket is already gone or refuses the shutdown.
     #[cfg(all(unix, feature = "testing"))]
-    pub fn shut_down(&self) -> Result<()> {
+    pub fn shut_down(&self, how: std::net::Shutdown) -> Result<()> {
         let Some(descriptor) = self.descriptor.as_ref() else {
             return Err(IpcError::PeerClosed);
         };
-        rustix::net::shutdown(descriptor, rustix::net::Shutdown::Both)
+        let how = match how {
+            std::net::Shutdown::Read => rustix::net::Shutdown::Read,
+            std::net::Shutdown::Write => rustix::net::Shutdown::Write,
+            std::net::Shutdown::Both => rustix::net::Shutdown::Both,
+        };
+        rustix::net::shutdown(descriptor, how)
             .map_err(|error| IpcError::socket("shut down", error.into()))
+    }
+
+    /// Asks the operating system whether the peer has gone, reading nothing and waiting for nothing.
+    ///
+    /// The answer is the system's own. A runtime learns that a peer closed only when it has turned
+    /// its reactor, so a reader polled before that says nothing yet; this says it at once. A peer
+    /// that has ended what it sends, or has closed, is gone; a writer with no descriptor of its own
+    /// can write nothing, so its peer is gone too. Anything else the system cannot say is taken as
+    /// a peer that is still there.
+    ///
+    /// The system reports the end only behind the bytes the peer sent before it: while some are
+    /// unread the peer is not yet gone, and the reader finds the end once it has read them.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn peer_is_gone(&self) -> bool {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return true;
+        };
+        let mut byte = [0_u8; 1];
+        match rustix::net::recv(
+            descriptor,
+            &mut byte,
+            rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+        ) {
+            Ok((received, _)) => received == 0,
+            Err(
+                rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN,
+            ) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Asks the operating system whether the peer has gone, reading nothing and waiting for nothing.
+    ///
+    /// A named pipe that has lost its other end reports a broken pipe once the bytes the peer sent
+    /// before it have been read. Anything else the system cannot say is taken as a peer that is
+    /// still there.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn peer_is_gone(&self) -> bool {
+        pipe_probe::peer_is_gone(self.probe)
     }
 
     /// Takes back a frame none of whose bytes the peer has taken, and answers whether it did.
@@ -1049,5 +1104,50 @@ mod tests {
             server.await.expect("server task"),
             IpcError::PeerClosed
         ));
+    }
+}
+
+/// The one place in this file that calls the operating system without a safe interface.
+///
+/// The crate denies unsafe code and relaxes the rule for the modules that need it, as the clock
+/// does: no safe interface asks a named pipe whether its other end has gone without reading from
+/// it.
+#[cfg(windows)]
+mod pipe_probe {
+    #![expect(
+        unsafe_code,
+        reason = "a named pipe can be asked whether its peer has gone only through PeekNamedPipe"
+    )]
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    /// Whether the pipe `handle` names has lost its other end.
+    ///
+    /// A peek with no buffer reports only the pipe's state, and fails with a broken or closed pipe
+    /// once the other end is gone. Anything the system cannot say is taken as a peer that is still
+    /// there.
+    pub fn peer_is_gone(handle: isize) -> bool {
+        // SAFETY: the handle is the connection's own pipe, which the writer calling this keeps
+        // alive, and no buffer or count is given: the call writes nothing through a pointer.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                handle as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if peeked != 0 {
+            return false;
+        }
+        let error = std::io::Error::last_os_error().raw_os_error();
+        [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED]
+            .into_iter()
+            .any(|gone| error == Some(gone.cast_signed()))
     }
 }
