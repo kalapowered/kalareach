@@ -1,5 +1,5 @@
 //! The drafts a person has written and not sent, kept by the application on this device and read
-//! back by the page, through the commands the page calls.
+//! back by the page, through the commands the page calls (KR-REQ-13.13, 24.13).
 //!
 //! The store is the client library's real one, in a directory of the test's own. A restart is a new
 //! application state over the same directory; a second window is a second state over it too.
@@ -126,7 +126,7 @@ fn drafts_of(read: &Value) -> &Vec<Value> {
     read["drafts"].as_array().expect("a list of drafts")
 }
 
-/// A draft the application kept is there after the application starts again, with its text, its
+/// KR-REQ-13.13 and 24.13: a draft the application kept is there after the application starts again, with its text, its
 /// session and the version the next save names, and a second start reads the same owner.
 #[test]
 fn a_draft_is_still_there_when_the_application_starts_again() {
@@ -161,7 +161,7 @@ fn a_draft_is_still_there_when_the_application_starts_again() {
     assert_eq!(again["draft"]["revision"], "2");
 }
 
-/// A save that names a version that is no longer the stored one means another window wrote in
+/// KR-REQ-13.13: a save that names a version that is no longer the stored one means another window wrote in
 /// between. The stored draft stays as that window left it, and what this window has is kept beside
 /// it as a copy, so neither text is lost and neither replaces the other.
 #[test]
@@ -242,7 +242,7 @@ fn a_save_of_an_older_version_is_kept_beside_the_draft_and_replaces_nothing() {
     );
 }
 
-/// A window that is behind the stored draft keeps its text even when what it would save also breaks
+/// KR-REQ-13.13: a window that is behind the stored draft keeps its text even when what it would save also breaks
 /// a rule: it is kept beside the stored draft, not refused. A person's text is never the price of
 /// another window having moved the draft on.
 #[test]
@@ -285,7 +285,7 @@ fn a_save_from_behind_is_kept_even_when_it_also_breaks_a_rule() {
     assert_eq!(behind["draft"]["state"], "conflicted");
 }
 
-/// A copy does not take a draft back to open: when another window marked the draft while this one
+/// KR-REQ-13.13: a copy does not take a draft back to open: when another window marked the draft while this one
 /// held an older version, what this window wrote is kept with the stricter mark.
 #[test]
 fn a_copy_keeps_the_mark_another_window_gave_the_draft() {
@@ -323,7 +323,7 @@ fn a_copy_keeps_the_mark_another_window_gave_the_draft() {
     );
 }
 
-/// Another window removed the draft this window still holds, because it sent it or because the
+/// KR-REQ-13.13: another window removed the draft this window still holds, because it sent it or because the
 /// person discarded it there. What this window has is kept as a draft again, with an identity of its
 /// own, and the page takes that identity; its next save does not fail on the one that is gone.
 #[test]
@@ -416,7 +416,7 @@ fn the_limit_on_a_draft_counts_the_bytes_it_is_stored_as() {
     assert_eq!(code_of(&refused), "QUOTA_EXCEEDED");
 }
 
-/// The rules the page cannot be left to keep: a draft keeps its session, never goes back to open by
+/// KR-REQ-13.13: the rules the page cannot be left to keep: a draft keeps its session, never goes back to open by
 /// a save, and does not move to another conversation while it holds text for one.
 #[test]
 fn a_save_keeps_the_session_the_mark_and_the_conversation_a_draft_was_written_for() {
@@ -500,7 +500,7 @@ fn a_save_keeps_the_session_the_mark_and_the_conversation_a_draft_was_written_fo
     assert_eq!(still["draft"]["text"], "and a little more");
 }
 
-/// Retargeting names the version the person was shown, is the one way back to open, and makes a
+/// KR-REQ-13.13: retargeting names the version the person was shown, is the one way back to open, and makes a
 /// copy an ordinary draft of the session it was sent to.
 #[test]
 fn retargeting_is_the_way_back_to_open_and_names_the_version_it_was_shown() {
@@ -577,7 +577,33 @@ fn sending_a_copy_to_a_session_makes_it_a_draft_of_that_session() {
     );
 }
 
-/// A discard removes the version the person was shown and no later one.
+/// Another window removed the draft this window is about to send to another conversation: the
+/// refusal is the one that tells a window to let go of the version it holds (the draft was changed
+/// by another window), not a refusal that repeats however often the person tries.
+#[test]
+fn a_retarget_of_a_draft_another_window_removed_is_refused_as_changed() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let one = Window::over(data.path());
+    let two = Window::over(data.path());
+    let made = one.write("written in the first window");
+    let id = made["draft"]["id"].as_str().expect("an id").to_owned();
+    two.call(
+        "device_draft_discard",
+        json!({ "id": id, "expectedRevision": "1" }),
+    )
+    .expect("discarded in the second window");
+
+    let refused = one
+        .call(
+            "device_draft_retarget",
+            json!({ "id": id, "expectedRevision": "1", "sessionId": OTHER_SESSION,
+                    "applicationInstanceId": null, "agentBindingRevision": null }),
+        )
+        .expect_err("the draft is gone");
+    assert_eq!(code_of(&refused), "DRAFT_CONFLICT");
+}
+
+/// KR-REQ-13.13: a discard removes the version the person was shown and no later one.
 #[test]
 fn a_discard_removes_the_version_that_was_shown_and_no_later_one() {
     let data = tempfile::tempdir().expect("a data directory");

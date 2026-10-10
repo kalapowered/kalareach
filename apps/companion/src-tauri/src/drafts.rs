@@ -148,7 +148,7 @@ impl DraftDesk {
             ..stored.clone()
         };
         if stored.revision != expected {
-            return copy(&store, id, &stored, &wanted, now);
+            return copy(&store, id, &wanted, now);
         }
         let next = rules(&stored, &wanted)?;
         let edited = Draft {
@@ -158,7 +158,7 @@ impl DraftDesk {
         };
         match store.update(&edited, now) {
             Ok(updated) => Ok(Saved::stored(&updated)),
-            Err(error) if is_revision_conflict(&error) => copy(&store, id, &stored, &wanted, now),
+            Err(error) if is_revision_conflict(&error) => copy(&store, id, &wanted, now),
             Err(error) => Err(failure(error)),
         }
     }
@@ -171,7 +171,18 @@ impl DraftDesk {
     /// failure.
     pub fn retarget(&self, params: RetargetParams, now: TimestampMs) -> Result<StoredDraft> {
         let store = self.store()?;
-        let mut draft = store.load(params.id).map_err(failure)?;
+        let mut draft = match store.load(params.id) {
+            Ok(draft) => draft,
+            // Another window removed it: the same refusal as a draft it changed, which tells this
+            // window to let go of the version it holds and not to try the same thing again.
+            Err(error) if is_unknown(&error) => {
+                return Err(CommandError::new(
+                    ErrorCode::DraftConflict,
+                    format!("draft {} was removed by another window", params.id),
+                ));
+            }
+            Err(error) => return Err(failure(error)),
+        };
         if draft.revision != params.expected_revision {
             return Err(stale(params.id, params.expected_revision, draft.revision));
         }
@@ -202,7 +213,7 @@ impl DraftDesk {
     }
 }
 
-/// Creates a draft, with its files and its mark when it has any.
+/// Creates a draft, with its files and its mark, in one record: stored whole, or refused.
 fn create(
     store: &DraftStore,
     target: DraftTarget,
@@ -211,45 +222,44 @@ fn create(
     state: DraftState,
     now: TimestampMs,
 ) -> Result<Saved> {
-    let created = store.create(target, text, now).map_err(failure)?;
-    if attachments.is_empty() && state == DraftState::Open {
-        return Ok(Saved::stored(&created));
-    }
-    let complete = Draft {
-        attachments,
-        state,
-        ..created.clone()
-    };
-    // A draft is answered as stored only when all of it is: the page counts what it asked for as
-    // kept, and a record that holds the text and lacks the files would never be written again. So
-    // when the whole does not fit, the part that did is taken back, and the failure is the answer.
-    match store.update(&complete, now) {
-        Ok(updated) => Ok(Saved::stored(&updated)),
-        Err(error) => {
-            let _ = store.remove_at(created.draft_id, created.revision);
-            Err(failure(error))
-        }
-    }
+    let created = store
+        .create_whole(target, text, attachments, state, now)
+        .map_err(failure)?;
+    Ok(Saved::stored(&created))
 }
 
 /// Keeps what this window has beside the stored draft, which stays as the other window wrote it.
 ///
 /// The copy carries the mark a save would have left: what another window marked stays marked, and
 /// text written for a conversation the stored draft is not for needs a person's choice. A copy is
-/// kept whole whatever it breaks, and it is never open when a save of it would not have been.
-fn copy(
-    store: &DraftStore,
-    of: DraftId,
-    stored: &Draft,
-    wanted: &Draft,
-    now: TimestampMs,
-) -> Result<Saved> {
-    let mut content = wanted.clone();
-    content.state = wanted.state.max(stored.state);
-    if writes_for_another_conversation(stored, wanted) {
-        content.state = content.state.max(DraftState::Conflicted);
-    }
-    let kept = store.keep_copy(of, &content, None, now).map_err(failure)?;
+/// kept whole whatever it breaks, and it is never open when a save of it would not have been. The
+/// mark is decided from the draft as stored when the copy is written, under the store's own lock,
+/// so a mark given a moment ago is not missed. A draft another window removed meanwhile has nothing
+/// to be kept beside, and what this window has is stored as a draft of its own.
+fn copy(store: &DraftStore, of: DraftId, wanted: &Draft, now: TimestampMs) -> Result<Saved> {
+    let kept = store.keep_copy_beside(of, wanted, now, |stored| {
+        let mut state = wanted.state.max(stored.state);
+        if writes_for_another_conversation(stored, wanted) {
+            state = state.max(DraftState::Conflicted);
+        }
+        state
+    });
+    let kept = match kept {
+        Ok(kept) => kept,
+        Err(error) if is_unknown(&error) => {
+            let created = store
+                .create_whole(
+                    wanted.target.clone(),
+                    wanted.text.clone(),
+                    wanted.attachments.clone(),
+                    wanted.state,
+                    now,
+                )
+                .map_err(failure)?;
+            return Ok(Saved::stored(&created));
+        }
+        Err(error) => return Err(failure(error)),
+    };
     Ok(Saved {
         outcome: SaveOutcome::Copied,
         of: Some(of),
