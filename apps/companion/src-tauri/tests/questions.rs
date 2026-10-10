@@ -645,6 +645,7 @@ fn keep_by_hand(
     root: &std::path::Path,
     environment_id: kr_protocol::ids::EnvironmentId,
     session_id: kr_protocol::ids::SessionId,
+    drafted_at_ms: u64,
 ) -> kr_client::answers::AnswerDraft {
     use kr_client::answers::{ANSWER_FORMAT, AnswerDraft, AnswerDrafts, WRITTEN};
     use kr_protocol::envelope::ActionTarget;
@@ -662,7 +663,7 @@ fn keep_by_hand(
         question_id: question_id(),
         question_revision: QuestionRevision::new(2),
         answer: choice("main"),
-        drafted_at_ms: TimestampMs::new(5),
+        drafted_at_ms: TimestampMs::new(drafted_at_ms),
     };
     let store = AnswerDrafts::open(root.join("kept-answers").join(environment_id.to_string()))
         .expect("a store");
@@ -679,7 +680,7 @@ async fn an_answer_kept_for_another_host_is_neither_settled_nor_sent_here() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let elsewhere = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16]));
-    let draft = keep_by_hand(page.kept.path(), elsewhere, worker.session_id);
+    let draft = keep_by_hand(page.kept.path(), elsewhere, worker.session_id, 5);
 
     let settling = page.call(
         "question_settle",
@@ -716,6 +717,59 @@ async fn an_answer_kept_for_another_host_is_neither_settled_nor_sent_here() {
     );
 }
 
+/// KR-REQ-11.63: an answer is named, to be sent or dismissed, by its question and the time it was
+/// kept at. An answer kept to a question that already has one kept is never kept at the same time or
+/// earlier, so the name of the older answer is never the name of the newer one and a dismissal of
+/// the older removes nothing of the newer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_kept_over_an_older_one_is_kept_at_a_later_time() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    // An older answer to the same question, kept at a time that has not come yet, as a clock that
+    // was set back (or a second answer inside one millisecond) leaves it.
+    let ahead = kr_ipc::now_ms().get() + 3_600_000;
+    keep_by_hand(
+        page.kept.path(),
+        worker.descriptor.environment_id,
+        worker.session_id,
+        ahead,
+    );
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("release")),
+    );
+    link.expect(Method::QuestionAnswer).await;
+    drop(link);
+    let told = answered(asked).await.expect("the answer is kept");
+    assert_eq!(told["outcome"], "kept");
+    assert_eq!(
+        told["draft"]["drafted_at_ms"],
+        json!((ahead + 1).to_string()),
+        "later than the answer it replaces"
+    );
+    let older = answered(page.call(
+        "question_dismiss_kept",
+        json!({ "params": { "questionId": question_id().to_string(),
+                            "draftedAtMs": ahead.to_string() } }),
+    ))
+    .await
+    .expect("a dismissal of the older answer");
+    assert_eq!(
+        older,
+        json!(false),
+        "the older name removes nothing of the newer answer"
+    );
+}
+
 /// KR-REQ-11.63: an environment whose kept answers cannot be read does not hide another's, and the
 /// page is told that some could not be read.
 #[tokio::test(flavor = "multi_thread")]
@@ -726,6 +780,7 @@ async fn one_environments_unreadable_answers_do_not_hide_anothers() {
         page.kept.path(),
         kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([8; 16])),
         worker.session_id,
+        5,
     );
     let damaged = page
         .kept

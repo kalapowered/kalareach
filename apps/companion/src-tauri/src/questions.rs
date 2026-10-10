@@ -738,13 +738,23 @@ pub async fn answer(
     }
     let store = desk.store(shown.target.environment_id).map_err(failure)?;
     let host = Host::new(links, state);
+    // An answer is named by its question and the time it was kept at, and that name is what a send
+    // or a dismissal is held to. So a new answer to a question that already has one kept is kept
+    // later than that one, whatever the clock says, and an older name never names a newer answer.
+    let now = kr_ipc::now_ms();
+    let drafted_at = match desk.kept_for(params.question_id) {
+        Ok(Some(earlier)) if earlier.drafted_at_ms >= now => {
+            TimestampMs::new(earlier.drafted_at_ms.get().saturating_add(1))
+        }
+        _ => now,
+    };
     let answered = answers::answer(
         Some(&host),
         &store,
         shown.target.clone(),
         &shown.question,
         params.answer,
-        kr_ipc::now_ms(),
+        drafted_at,
     )
     .await;
     match (answered, host.taken()) {
