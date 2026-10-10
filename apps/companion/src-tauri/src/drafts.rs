@@ -159,6 +159,15 @@ impl DraftDesk {
         match store.update(&edited, now) {
             Ok(updated) => Ok(Saved::stored(&updated)),
             Err(error) if is_revision_conflict(&error) => copy(&store, id, &wanted, now),
+            // Removed between the read and the write: the window's text is a draft again.
+            Err(error) if is_unknown(&error) => create(
+                &store,
+                wanted.target.clone(),
+                wanted.text.clone(),
+                wanted.attachments.clone(),
+                wanted.state,
+                now,
+            ),
             Err(error) => Err(failure(error)),
         }
     }
@@ -194,7 +203,17 @@ impl DraftDesk {
         // A person who sends a draft somewhere has chosen it, so it is no longer a copy kept beside
         // another: it is a draft of the session it now goes to.
         draft.conflict_of = Nullable::null();
-        let updated = store.update(&draft, now).map_err(failure)?;
+        let updated = match store.update(&draft, now) {
+            Ok(updated) => updated,
+            // Removed between the read and the write, which is the same refusal as removed before it.
+            Err(error) if is_unknown(&error) => {
+                return Err(CommandError::new(
+                    ErrorCode::DraftConflict,
+                    format!("draft {} was removed by another window", params.id),
+                ));
+            }
+            Err(error) => return Err(failure(error)),
+        };
         Ok(StoredDraft::of(&updated))
     }
 

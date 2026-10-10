@@ -577,7 +577,7 @@ fn sending_a_copy_to_a_session_makes_it_a_draft_of_that_session() {
     );
 }
 
-/// Another window removed the draft this window is about to send to another conversation: the
+/// KR-REQ-13.13: another window removed the draft this window is about to send to another conversation: the
 /// refusal is the one that tells a window to let go of the version it holds (the draft was changed
 /// by another window), not a refusal that repeats however often the person tries.
 #[test]
