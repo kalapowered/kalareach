@@ -776,8 +776,12 @@ impl Coordinator {
             } => (call_expiry(closes_at_ms), authority_revision),
             PlanFor::Description => (standing.expiry, standing.authority_revision),
         };
+        // The call's grant is delegated from the standing voice grant, so it reads no earlier than
+        // the later of the two histories: the same bound a context read applies
+        // ([`narrower_history`]), and one the standing grant can always narrow, which the device's
+        // own history alone may not be when the voice grant began after the device's.
         let planned = plan_voice_grant(
-            &device_grant,
+            &narrower_history(&device_grant, &standing),
             Some(&permitted_actions(&standing)),
             &GrantBinding {
                 parent_grant_id: Some(standing.grant_id),

@@ -684,6 +684,56 @@ async fn stopping_voice_leaves_the_session_running() {
     host.clients.abort();
 }
 
+/// KR-REQ-15.02 and KR-REQ-10.49: a call starts under a standing voice grant that an earlier build
+/// stored with no history cursor and that began after the device's own grant. The cursor reads as
+/// the voice grant's start, and the call's grant, delegated from it, reads from there and no
+/// earlier, so the voice grant can narrow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_starts_under_a_voice_grant_stored_with_no_history_cursor() {
+    let host = host().await;
+    let grants = host.controller.sharing().grants();
+    let written = host.grant_voice(None).await;
+    let stored = grants
+        .record(written)
+        .expect("the store answers")
+        .expect("the voice grant");
+    grants
+        .revoke(written, kr_ipc::now_ms().get(), || Ok(()))
+        .expect("the voice grant is replaced");
+
+    // The same grant as an earlier build wrote it: no history cursor, redeemed after the device's
+    // own grant began.
+    let began = kr_ipc::now_ms().get();
+    let mut earlier_build = stored.grant.clone();
+    earlier_build.grant_id = GrantId::new(kr_ipc::new_uuid());
+    earlier_build.history.lower_bound_ms = Nullable::null();
+    grants
+        .issue(
+            &kr_controller::grants::GrantRecord {
+                grant: earlier_build.clone(),
+                session_id: stored.session_id,
+                issued_at_ms: began,
+                activated_at_ms: Some(began),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the earlier build's voice grant");
+
+    host.start_voice().await;
+    let call = voice_grants_of(&host.controller, host.device_id)
+        .into_iter()
+        .find(|grant| grant.parent_grant_id.0 == Some(earlier_build.grant_id))
+        .expect("the call's grant is delegated from the standing voice grant");
+    assert_eq!(
+        call.history.lower_bound_ms.0.map(TimestampMs::get),
+        Some(began),
+        "the call reads from the moment the voice grant began, not from the device's own grant"
+    );
+    host.clients.abort();
+}
+
 /// KR-REQ-15.11: a delegation is decided against the grants this host already holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delegation_runs_under_the_grant_the_host_already_holds() {
