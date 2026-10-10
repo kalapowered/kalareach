@@ -47,6 +47,23 @@ pub struct OrganisationEnrolResult {
     pub root_key_id: KeyId,
 }
 
+/// The parameters of `organisation.exclusive.set`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganisationExclusiveSetParams {
+    /// True to make the host exclusively organisation-managed, false to end that.
+    pub exclusive: bool,
+}
+
+/// The parameters of `organisation.withdraw`. Its result is the revocation result every fence
+/// reports: the revision now in force and the per-worker completion of the fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganisationWithdrawParams {
+    /// The organisation the host leaves.
+    pub organisation_id: OrganisationId,
+}
+
 /// The result of `organisation.exclusive.set`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

@@ -2431,11 +2431,14 @@ export interface KalaReachProtocol {
   organisation_enrol_params?: OrganisationEnrolParams
   organisation_enrol_result?: OrganisationEnrolResult
   organisation_enrolment_view?: OrganisationEnrolmentView
+  organisation_exclusive_set_params?: OrganisationExclusiveSetParams
+  organisation_exclusive_set_result?: OrganisationExclusiveSetResult
   organisation_lease_view?: OrganisationLeaseView
   organisation_list_params?: OrganisationListParams
   organisation_list_result?: OrganisationListResult
   organisation_member_view?: OrganisationMemberView
   organisation_policy?: OrganisationPolicy
+  organisation_withdraw_params?: OrganisationWithdrawParams
   output_event?: OutputEvent
   owner_confirmation_complete_params?: OwnerConfirmationCompleteParams
   owner_confirmation_complete_result?: OwnerConfirmationCompleteResult
@@ -17312,6 +17315,8 @@ export interface MethodEntry {
     | 'machine.split'
     | 'organisation.enrol'
     | 'organisation.list'
+    | 'organisation.exclusive.set'
+    | 'organisation.withdraw'
     | 'membership.present'
     | 'pair.invite'
     | 'pair.redeem'
@@ -17869,6 +17874,59 @@ export interface OrganisationLeaseView {
   issued_at_ms: string
 }
 /**
+ * The parameters of `organisation.exclusive.set`.
+ */
+export interface OrganisationExclusiveSetParams {
+  /**
+   * True to make the host exclusively organisation-managed, false to end that.
+   */
+  exclusive: boolean
+}
+/**
+ * The result of `organisation.exclusive.set`.
+ */
+export interface OrganisationExclusiveSetResult {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * The per-worker completion of the fence that making a host exclusive owes, because it
+   * restricts work already admitted. Null when the change was to end exclusive management,
+   * which restricts nothing.
+   */
+  barrier: RevocationBarrier1 | null
+  /**
+   * Whether the host is exclusively organisation-managed now.
+   */
+  exclusive: boolean
+}
+/**
+ * The result of installing an authority revision across every affected worker.
+ *
+ * Until every barrier holds, this is `pending` with per-worker status. Cutting a network path or
+ * waiting for a lease timer is not completion, because a paused worker could already be inside a
+ * dispatch transition, so nothing here treats the absence of an answer as an answer.
+ */
+export interface RevocationBarrier1 {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * One entry per affected worker, in session order, cut to what one answer carries.
+   *
+   * A cut takes the workers whose barrier has not held before any that has, and always keeps
+   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
+   * when it holds on the whole. `workers_total` says how many there were.
+   */
+  workers: WorkerBarrier[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workers_total: string
+}
+/**
  * The parameters of `organisation.list`. There are none.
  */
 export interface OrganisationListParams {}
@@ -17989,6 +18047,16 @@ export interface OrganisationRecoveryRecipient {
    * The recipient's stored-envelope key identifier.
    */
   recipient_key_id: string
+}
+/**
+ * The parameters of `organisation.withdraw`. Its result is the revocation result every fence
+ * reports: the revision now in force and the per-worker completion of the fence.
+ */
+export interface OrganisationWithdrawParams {
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
 }
 /**
  * One batch of output bytes on the output stream.
@@ -25173,31 +25241,6 @@ export interface RevocationAcknowledgement {
   request_id: string
 }
 /**
- * The result of installing an authority revision across every affected worker.
- *
- * Until every barrier holds, this is `pending` with per-worker status. Cutting a network path or
- * waiting for a lease timer is not completion, because a paused worker could already be inside a
- * dispatch transition, so nothing here treats the absence of an answer as an answer.
- */
-export interface RevocationBarrier1 {
-  /**
-   * The host's ordered authority revision. Only the host issues its own revisions.
-   */
-  authority_revision: string
-  /**
-   * One entry per affected worker, in session order, cut to what one answer carries.
-   *
-   * A cut takes the workers whose barrier has not held before any that has, and always keeps
-   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
-   * when it holds on the whole. `workers_total` says how many there were.
-   */
-  workers: WorkerBarrier[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  workers_total: string
-}
-/**
  * The result of `grant.revoke` and `device.revoke`.
  *
  * A revocation is not complete when the host records it. It is complete for a worker once that
@@ -26137,6 +26180,8 @@ export interface ServiceRequestPayload {
     | 'machine.split'
     | 'organisation.enrol'
     | 'organisation.list'
+    | 'organisation.exclusive.set'
+    | 'organisation.withdraw'
     | 'membership.present'
     | 'pair.invite'
     | 'pair.redeem'

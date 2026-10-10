@@ -559,6 +559,23 @@ methods! {
           bound to member accounts and the lease each holds, whether exclusive management is on, \
           and every time it was turned off, with how the owner confirmed it.";
 
+    OrganisationExclusiveSet = "organisation.exclusive.set", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: Always, idempotency: ACTION,
+    doc: "Make this host exclusively organisation-managed, so a personal grant answers to a \
+          membership lease like any other, or end that, on an owner confirmation. Turning it on \
+          is refused while no enrolment or no owner device that can recover the host exists; \
+          turning it off records how the owner confirmed it.";
+
+    OrganisationWithdraw = "organisation.withdraw", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Leave an organisation's policy: every grant that requires it stops being honoured, and \
+          the host fences the connections admitted under it. A restriction, so it needs no \
+          owner confirmation.";
+
     MembershipPresent = "membership.present", HostAndEnvironment,
     effect: Write, ingress: [PairedDevice], rights: [basis(ResourceOwner)], selectors: [Device],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,

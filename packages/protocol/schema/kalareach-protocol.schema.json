@@ -20234,6 +20234,16 @@
           "type": "string"
         },
         {
+          "const": "organisation.exclusive.set",
+          "description": "Make this host exclusively organisation-managed, so a personal grant answers to a membership lease like any other, or end that, on an owner confirmation. Turning it on is refused while no enrolment or no owner device that can recover the host exists; turning it off records how the owner confirmed it.",
+          "type": "string"
+        },
+        {
+          "const": "organisation.withdraw",
+          "description": "Leave an organisation's policy: every grant that requires it stops being honoured, and the host fences the connections admitted under it. A restriction, so it needs no owner confirmation.",
+          "type": "string"
+        },
+        {
           "const": "membership.present",
           "description": "Present the membership lease the organisation signed for this device, with the organisation's chain when it has moved, so the host answers for the device while the lease lasts. The device acts on its own standing and proves its own key.",
           "type": "string"
@@ -22390,6 +22400,51 @@
       ],
       "type": "object"
     },
+    "OrganisationExclusiveSetParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `organisation.exclusive.set`.",
+      "properties": {
+        "exclusive": {
+          "description": "True to make the host exclusively organisation-managed, false to end that.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exclusive"
+      ],
+      "type": "object"
+    },
+    "OrganisationExclusiveSetResult": {
+      "additionalProperties": false,
+      "description": "The result of `organisation.exclusive.set`.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The authority revision in force when the change was answered."
+        },
+        "barrier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevocationBarrier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The per-worker completion of the fence that making a host exclusive owes, because it\nrestricts work already admitted. Null when the change was to end exclusive management,\nwhich restricts nothing."
+        },
+        "exclusive": {
+          "description": "Whether the host is exclusively organisation-managed now.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exclusive",
+        "authority_revision",
+        "barrier"
+      ],
+      "type": "object"
+    },
     "OrganisationId": {
       "description": "One organisation whose signed policy a host has opted into.",
       "format": "uuid",
@@ -22650,6 +22705,20 @@
       "required": [
         "organisation_id",
         "policy_revision"
+      ],
+      "type": "object"
+    },
+    "OrganisationWithdrawParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `organisation.withdraw`. Its result is the revocation result every fence\nreports: the revision now in force and the per-worker completion of the fence.",
+      "properties": {
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation the host leaves."
+        }
+      },
+      "required": [
+        "organisation_id"
       ],
       "type": "object"
     },
@@ -41044,6 +41113,12 @@
     "organisation_enrolment_view": {
       "$ref": "#/$defs/OrganisationEnrolmentView"
     },
+    "organisation_exclusive_set_params": {
+      "$ref": "#/$defs/OrganisationExclusiveSetParams"
+    },
+    "organisation_exclusive_set_result": {
+      "$ref": "#/$defs/OrganisationExclusiveSetResult"
+    },
     "organisation_lease_view": {
       "$ref": "#/$defs/OrganisationLeaseView"
     },
@@ -41058,6 +41133,9 @@
     },
     "organisation_policy": {
       "$ref": "#/$defs/OrganisationPolicy"
+    },
+    "organisation_withdraw_params": {
+      "$ref": "#/$defs/OrganisationWithdrawParams"
     },
     "output_event": {
       "$ref": "#/$defs/OutputEvent"

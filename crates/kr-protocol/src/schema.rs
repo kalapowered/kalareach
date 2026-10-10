@@ -144,7 +144,9 @@ use crate::method::REGISTRY;
 use crate::organisation::{
     ExclusiveManagementEvent, MembershipPresentParams, MembershipPresentResult,
     OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
-    OrganisationLeaseView, OrganisationListParams, OrganisationListResult, OrganisationMemberView,
+    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationLeaseView,
+    OrganisationListParams, OrganisationListResult, OrganisationMemberView,
+    OrganisationWithdrawParams,
 };
 use crate::pairing::{
     AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
@@ -866,10 +868,13 @@ pub fn protocol_schema() -> Value {
         "organisation_enrol_params" => OrganisationEnrolParams,
         "organisation_enrol_result" => OrganisationEnrolResult,
         "organisation_enrolment_view" => OrganisationEnrolmentView,
+        "organisation_exclusive_set_params" => OrganisationExclusiveSetParams,
+        "organisation_exclusive_set_result" => OrganisationExclusiveSetResult,
         "organisation_lease_view" => OrganisationLeaseView,
         "organisation_list_params" => OrganisationListParams,
         "organisation_list_result" => OrganisationListResult,
         "organisation_member_view" => OrganisationMemberView,
+        "organisation_withdraw_params" => OrganisationWithdrawParams,
     }
     properties.insert(
         "identifiers".to_owned(),

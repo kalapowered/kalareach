@@ -756,6 +756,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     let organisation = [
         ("organisation.enrol", EffectClass::Write),
         ("organisation.list", EffectClass::Read),
+        ("organisation.exclusive.set", EffectClass::Write),
+        ("organisation.withdraw", EffectClass::Write),
     ];
     for (name, effect) in organisation {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
@@ -774,11 +776,14 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             &[RequiredRight::right(ActionRight::HostManage)],
             "{name} asks for host management and nothing else"
         );
-        let expected_confirmation = if name == "organisation.enrol" {
-            ConfirmationRequirement::Always
-        } else {
-            ConfirmationRequirement::None
-        };
+        // Withdrawing restricts what the host answers to, and a list changes nothing. Turning
+        // exclusive management on or off is the owner's, whichever way it goes.
+        let expected_confirmation =
+            if matches!(name, "organisation.enrol" | "organisation.exclusive.set") {
+                ConfirmationRequirement::Always
+            } else {
+                ConfirmationRequirement::None
+            };
         assert_eq!(
             entry.confirmation, expected_confirmation,
             "{name} needs an owner confirmation exactly when it enlarges what the host answers to"
@@ -1297,6 +1302,8 @@ fn host_management_methods_require_the_host_manage_right() {
         "machine.split",
         "organisation.enrol",
         "organisation.list",
+        "organisation.exclusive.set",
+        "organisation.withdraw",
     ] {
         let entry = lookup(name).expect("listed");
         assert!(
@@ -1320,6 +1327,7 @@ fn owner_confirmation_covers_the_sensitive_operations() {
         "owner.confirmation.complete",
         "grant.transfer",
         "organisation.enrol",
+        "organisation.exclusive.set",
     ] {
         assert_eq!(
             lookup(name).expect("listed").confirmation,
@@ -1346,6 +1354,7 @@ fn owner_confirmation_covers_the_sensitive_operations() {
         "grant.revoke",
         "session.close",
         "action.cancel",
+        "organisation.withdraw",
     ] {
         assert_eq!(
             lookup(name).expect("listed").confirmation,

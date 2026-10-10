@@ -121,9 +121,11 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
             at(HOST, "Account sign-in")
         }
         Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),
-        Method::OrganisationEnrol | Method::OrganisationList | Method::MembershipPresent => {
-            at(HOST, "Organisation policy")
-        }
+        Method::OrganisationEnrol
+        | Method::OrganisationList
+        | Method::OrganisationExclusiveSet
+        | Method::OrganisationWithdraw
+        | Method::MembershipPresent => at(HOST, "Organisation policy"),
         Method::DescriptionSetup | Method::DescriptionConfigure | Method::DescriptionDownload => {
             at(DESCRIBE, "Setup")
         }
