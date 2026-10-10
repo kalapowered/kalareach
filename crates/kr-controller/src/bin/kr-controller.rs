@@ -95,7 +95,19 @@ impl From<SecretStoreChoice> for StoreSelection {
 }
 
 fn main() -> ExitCode {
-    let arguments = Arguments::parse();
+    // A program whose release is being removed starts nothing, not even the printing of its version
+    // or of a usage error, so the release is asked about before the command line is allowed to
+    // end the process.
+    let arguments = match Arguments::try_parse() {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            if let Err(refusal) = kr_ipc::install::this_process() {
+                eprintln!("kr-controller: {refusal}");
+                return ExitCode::FAILURE;
+            }
+            error.exit()
+        }
+    };
     // Before any thread exists, and before the release is held, which can take a while: a session is
     // the calling process's to leave, and nothing the terminal does may reach the daemon from here
     // on. A process that already leads its session is the image a start replaced itself with
