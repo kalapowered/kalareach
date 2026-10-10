@@ -86,10 +86,6 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["status session twenty\u{2011}three"], (Status, Some(23))),
         (&["status session twenty\u{2010}three"], (Status, Some(23))),
         (
-            &["What\u{00b4}s the status of session 3"],
-            (Status, Some(3)),
-        ),
-        (
             &["What\u{02bc}s the status of session 3"],
             (Status, Some(3)),
         ),
@@ -225,6 +221,26 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["status session 3-"], Misread::UnreadableNumber),
         (&["status session 3+"], Misread::UnreadableNumber),
         (&["status session 3%"], Misread::UnreadableNumber),
+        // A mark after a number that is neither a stop nor a closing quotation or bracket says
+        // something else (a prime, an acute accent, a unit), and the number is not read.
+        (&["status of session 3\u{2032}"], Misread::UnreadableNumber),
+        (&["status of session 3\u{00b4}"], Misread::UnreadableNumber),
+        (
+            &["open session 3\u{2032}\u{2032}"],
+            Misread::UnreadableNumber,
+        ),
+        (
+            &["go to session twenty-three\u{2032}"],
+            Misread::UnreadableNumber,
+        ),
+        (
+            &["status of session 3\u{2032} please"],
+            Misread::UnreadableNumber,
+        ),
+        (
+            &["What\u{00b4}s the status of session 3"],
+            Misread::NotARequest,
+        ),
         // A bracket round a number sets it apart from the word before it.
         (&["\"Open session (6)\""], Misread::UnreadableNumber),
     ];
@@ -242,10 +258,28 @@ fn a_mark_in_or_beside_a_number_leaves_no_number() {
     const MARKS: &[&str] = &[
         "(", "\"", "'", "\u{201c}", "\u{2018}", "\u{201d}", "\u{2019}", ".", ",", ";", ":", "!",
         "?", "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}", "\u{2013}", "\u{2014}",
-        "\u{2011}", "\u{2010}", ")", "\u{00b4}", "\u{02bc}",
+        "\u{2011}", "\u{2010}", ")", "\u{00b4}", "\u{02bc}", "\u{2032}",
+    ];
+    // Marks that are neither a stop nor a closing quotation or bracket: at the end of what was said
+    // they stay in the last word, which is then no number.
+    const NOT_CLOSING: &[&str] = &[
+        "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}", "\u{2013}", "\u{2014}",
+        "\u{2011}", "\u{2010}", "\u{00b4}", "\u{2032}",
     ];
     const HYPHENS: &[&str] = &["-", "\u{2010}", "\u{2011}"];
     for (first, second) in [("3", "3"), ("twenty", "three")] {
+        for mark in NOT_CLOSING {
+            let utterance = format!("open session {first}{mark}");
+            assert!(
+                read(&[&utterance]).is_err(),
+                "{utterance:?} names no session"
+            );
+            let utterance = format!("open session {first} {second}{mark}");
+            assert!(
+                read(&[&utterance]).is_err(),
+                "{utterance:?} names no session"
+            );
+        }
         for mark in MARKS {
             // "twenty-three" is the one number written across a mark.
             let one_number = first == "twenty" && HYPHENS.contains(mark);
