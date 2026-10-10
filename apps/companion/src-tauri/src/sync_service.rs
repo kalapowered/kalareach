@@ -68,9 +68,17 @@ impl SyncService {
     #[must_use]
     pub fn open(data: &Path) -> Self {
         let file = data.join(FILE);
-        let origin = read_owner_only_file(&file, ORIGIN_LIMIT)
-            .ok()
-            .flatten()
+        let kept = match read_owner_only_file(&file, ORIGIN_LIMIT) {
+            Ok(kept) => kept,
+            Err(error) => {
+                // A file this build will not read (a link, another owner's, wider than owner-only)
+                // is not followed to a service the person chose, and the managed one stands; the
+                // log says why, so that a person whose choice seems lost can find the cause.
+                tracing::warn!(%error, "the sync service setting could not be read, so the managed service stands");
+                None
+            }
+        };
+        let origin = kept
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|text| GatewayOrigin::new(text.trim()).ok())
             .unwrap_or_else(managed);
@@ -101,7 +109,9 @@ impl SyncService {
     /// # Errors
     ///
     /// Returns `INVALID_ARGUMENT` for anything that is not one, and a local failure when the choice
-    /// cannot be kept, in which case the earlier choice stands.
+    /// cannot be kept, in which case the earlier choice stands in this run. A failure after the
+    /// file was replaced (the directory could not be flushed) leaves the new choice in the file,
+    /// and the next start reads it.
     pub fn set(&self, typed: &str) -> Result<SyncServiceView> {
         let trimmed = typed.trim();
         let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
