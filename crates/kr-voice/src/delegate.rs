@@ -180,7 +180,7 @@ struct Intent {
     action: VoiceAction,
     /// The session it acts on, when it acts on one.
     session_id: Option<SessionId>,
-    /// The spoken confirmation naming the destination, for an action that needs one.
+    /// The session a clear spoken confirmation named, for an action that needs one.
     destination: Option<SpokenDestination>,
     /// The approval answer, for an action that answers one.
     approval: Option<VerifiedApprovalAnswer>,
