@@ -97,6 +97,27 @@ fn save(
     })
 }
 
+/// A completed upload with no preview, whose file name is `name`.
+fn a_handle(index: u8, name: &str) -> kr_protocol::transfer::AttachmentHandle {
+    use kr_protocol::ids::{EnvironmentId, TransferId};
+    use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
+
+    kr_protocol::transfer::AttachmentHandle {
+        environment_id: EnvironmentId::new(Uuid::from_bytes([1; 16])),
+        transfer_id: TransferId::new(Uuid::from_bytes([index + 10; 16])),
+        session_id: Nullable::null(),
+        byte_len: U64::new(4096),
+        content_digest: Digest256::from_bytes([3; 32]),
+        declared_media_type: "image/png".to_owned(),
+        original_file_name: name.to_owned(),
+        preview: Nullable::null(),
+        presented_as_image: true,
+        published_at_ms: TimestampMs::new(10),
+        expires_at_ms: TimestampMs::new(20),
+        submitted: false,
+    }
+}
+
 fn code_of(refusal: &Value) -> &str {
     refusal["code"].as_str().unwrap_or("not a refusal")
 }
@@ -259,6 +280,140 @@ fn a_save_from_behind_is_kept_even_when_it_also_breaks_a_rule() {
         .expect("kept, not refused");
     assert_eq!(behind["outcome"], "copied");
     assert_eq!(behind["draft"]["text"], "a thought the first window had");
+    // It is kept apart as a draft that needs a choice, not as one that is open: the stored draft
+    // holds text for one conversation and this text was written for another.
+    assert_eq!(behind["draft"]["state"], "conflicted");
+}
+
+/// A copy does not take a draft back to open: when another window marked the draft while this one
+/// held an older version, what this window wrote is kept with the stricter mark.
+#[test]
+fn a_copy_keeps_the_mark_another_window_gave_the_draft() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let one = Window::over(data.path());
+    let two = Window::over(data.path());
+    let made = one.write("begun in the first window");
+    let id = made["draft"]["id"].as_str().expect("an id");
+    let mut orphaned = save(
+        Some(id),
+        Some("1"),
+        SESSION,
+        None,
+        "begun in the first window",
+    );
+    orphaned["state"] = json!("orphaned");
+    two.call("device_draft_save", orphaned).expect("marked");
+
+    let behind = one
+        .call(
+            "device_draft_save",
+            save(
+                Some(id),
+                Some("1"),
+                SESSION,
+                None,
+                "and the first window went on",
+            ),
+        )
+        .expect("kept, not refused");
+    assert_eq!(behind["outcome"], "copied");
+    assert_eq!(
+        behind["draft"]["state"], "orphaned",
+        "an open copy of an orphaned draft would reach a composer without a choice"
+    );
+}
+
+/// Another window removed the draft this window still holds, because it sent it or because the
+/// person discarded it there. What this window has is kept as a draft again, with an identity of its
+/// own, and the page takes that identity; its next save does not fail on the one that is gone.
+#[test]
+fn a_save_of_a_draft_another_window_removed_makes_it_again() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let one = Window::over(data.path());
+    let two = Window::over(data.path());
+    let made = one.write("written in the first window");
+    let id = made["draft"]["id"].as_str().expect("an id").to_owned();
+    two.call(
+        "device_draft_discard",
+        json!({ "id": id, "expectedRevision": "1" }),
+    )
+    .expect("discarded in the second window");
+
+    let again = one
+        .call(
+            "device_draft_save",
+            save(
+                Some(&id),
+                Some("1"),
+                SESSION,
+                None,
+                "written in the first window, and more",
+            ),
+        )
+        .expect("kept again, not refused");
+    assert_eq!(again["outcome"], "stored");
+    assert_ne!(again["draft"]["id"], json!(id), "a draft of its own");
+    assert_eq!(again["draft"]["revision"], "1");
+    assert_eq!(again["draft"]["copyOf"], Value::Null);
+    let read = one.read();
+    let drafts = drafts_of(&read);
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0]["text"], "written in the first window, and more");
+}
+
+/// A first save with files is all stored or none of it: a record that holds the text and lacks the
+/// files would be answered as the whole draft, and the page would not write the files again.
+#[test]
+fn a_first_save_with_files_stores_all_of_it_or_none() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let window = Window::over(data.path());
+    // The text alone fits a draft; the text with these files does not.
+    let text = "a".repeat(60 * 1024);
+    let mut request = save(None, None, SESSION, None, &text);
+    request["attachments"] = json!(
+        (0..3)
+            .map(
+                |index| serde_json::to_value(a_handle(index, &"n".repeat(4 * 1024)))
+                    .expect("a handle")
+            )
+            .collect::<Vec<_>>()
+    );
+    let refused = window
+        .call("device_draft_save", request)
+        .expect_err("the draft with its files does not fit");
+    assert_eq!(code_of(&refused), "QUOTA_EXCEEDED");
+    assert!(
+        drafts_of(&window.read()).is_empty(),
+        "no record holds only the text"
+    );
+    // The text on its own is kept.
+    let alone = window
+        .call("device_draft_save", save(None, None, SESSION, None, &text))
+        .expect("the text alone fits");
+    assert_eq!(alone["outcome"], "stored");
+}
+
+/// The limit is on the bytes a draft is stored as, not on characters: text of two-byte letters
+/// reaches it at half the length.
+#[test]
+fn the_limit_on_a_draft_counts_the_bytes_it_is_stored_as() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let window = Window::over(data.path());
+    let letters = "e".repeat(60 * 1024);
+    window
+        .call(
+            "device_draft_save",
+            save(None, None, SESSION, None, &letters),
+        )
+        .expect("sixty thousand one-byte letters fit");
+    let accented = "é".repeat(40 * 1024);
+    let refused = window
+        .call(
+            "device_draft_save",
+            save(None, None, OTHER_SESSION, None, &accented),
+        )
+        .expect_err("forty thousand two-byte letters do not");
+    assert_eq!(code_of(&refused), "QUOTA_EXCEEDED");
 }
 
 /// The rules the page cannot be left to keep: a draft keeps its session, never goes back to open by

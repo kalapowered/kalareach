@@ -13,13 +13,18 @@
 //!   the page says they are not kept.
 //! * **A save names the version it replaces.** A save whose version is no longer the stored one
 //!   means another window of this application wrote in between. Nothing is overwritten: what this
-//!   window has is kept beside as a copy, and the stored draft stays the other window's.
+//!   window has is kept beside as a copy, and the stored draft stays the other window's. The copy
+//!   carries the mark a save would have left, so it is never open when the draft is not. A save of a
+//!   draft another window removed makes the window's text a draft again, under an identity of its
+//!   own, which the answer names.
 //! * **A draft keeps its session.** Moving one to another session is retargeting, a person's
 //!   choice; a save refuses it. A save never takes a draft back to open, and refuses to change the
 //!   conversation a draft holds text for: the page marks it conflicted instead, and only
 //!   retargeting clears that.
 //! * **A file is a completed upload.** The handle a draft stores has no preview: a stored record
 //!   is bounded, and a preview can fill it.
+//! * **A save is stored whole or refused.** A new draft whose text fits and whose files do not is
+//!   not stored at all, so what the page is told is stored is stored.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -125,7 +130,16 @@ impl DraftDesk {
         let expected = params.expected_revision.ok_or_else(|| {
             CommandError::invalid("a save of a stored draft names the version it replaces")
         })?;
-        let stored = store.load(id).map_err(failure)?;
+        let stored = match store.load(id) {
+            Ok(stored) => stored,
+            // Another window removed it, because it sent the draft or the person discarded it there.
+            // What this window holds is still the person's, so it is kept as a draft again, and the
+            // page takes the identity this gives it.
+            Err(error) if is_unknown(&error) => {
+                return create(&store, target, params.text, attachments, params.state, now);
+            }
+            Err(error) => return Err(failure(error)),
+        };
         let wanted = Draft {
             target,
             state: params.state,
@@ -134,7 +148,7 @@ impl DraftDesk {
             ..stored.clone()
         };
         if stored.revision != expected {
-            return copy(&store, id, &wanted, now);
+            return copy(&store, id, &stored, &wanted, now);
         }
         let next = rules(&stored, &wanted)?;
         let edited = Draft {
@@ -144,7 +158,7 @@ impl DraftDesk {
         };
         match store.update(&edited, now) {
             Ok(updated) => Ok(Saved::stored(&updated)),
-            Err(error) if is_revision_conflict(&error) => copy(&store, id, &wanted, now),
+            Err(error) if is_revision_conflict(&error) => copy(&store, id, &stored, &wanted, now),
             Err(error) => Err(failure(error)),
         }
     }
@@ -206,17 +220,36 @@ fn create(
         state,
         ..created.clone()
     };
-    // The text is kept even when the rest is not: what is answered is what is stored, and the page
-    // saves the rest again.
+    // A draft is answered as stored only when all of it is: the page counts what it asked for as
+    // kept, and a record that holds the text and lacks the files would never be written again. So
+    // when the whole does not fit, the part that did is taken back, and the failure is the answer.
     match store.update(&complete, now) {
         Ok(updated) => Ok(Saved::stored(&updated)),
-        Err(_) => Ok(Saved::stored(&created)),
+        Err(error) => {
+            let _ = store.remove_at(created.draft_id, created.revision);
+            Err(failure(error))
+        }
     }
 }
 
 /// Keeps what this window has beside the stored draft, which stays as the other window wrote it.
-fn copy(store: &DraftStore, of: DraftId, wanted: &Draft, now: TimestampMs) -> Result<Saved> {
-    let kept = store.keep_copy(of, wanted, None, now).map_err(failure)?;
+///
+/// The copy carries the mark a save would have left: what another window marked stays marked, and
+/// text written for a conversation the stored draft is not for needs a person's choice. A copy is
+/// kept whole whatever it breaks, and it is never open when a save of it would not have been.
+fn copy(
+    store: &DraftStore,
+    of: DraftId,
+    stored: &Draft,
+    wanted: &Draft,
+    now: TimestampMs,
+) -> Result<Saved> {
+    let mut content = wanted.clone();
+    content.state = wanted.state.max(stored.state);
+    if writes_for_another_conversation(stored, wanted) {
+        content.state = content.state.max(DraftState::Conflicted);
+    }
+    let kept = store.keep_copy(of, &content, None, now).map_err(failure)?;
     Ok(Saved {
         outcome: SaveOutcome::Copied,
         of: Some(of),
@@ -234,16 +267,25 @@ fn rules(stored: &Draft, wanted: &Draft) -> Result<DraftState> {
     // A draft that needs a person's choice stays so whatever a stale window thinks: the state moves
     // from open to conflicted to orphaned, and back to open only by retargeting.
     let next = stored.state.max(wanted.state);
-    let moved = stored.target.application_instance_id != wanted.target.application_instance_id
-        || stored.target.agent_binding_revision != wanted.target.agent_binding_revision;
-    let holds_nothing = stored.text.is_empty() && stored.attachments.is_empty();
-    if moved && stored.target.application_instance_id.is_present() && !holds_nothing {
+    if writes_for_another_conversation(stored, wanted) {
         return Err(CommandError::new(
             ErrorCode::DraftConflict,
             "the draft was written for another conversation; mark it conflicted instead of moving it",
         ));
     }
     Ok(next)
+}
+
+/// Whether `wanted` moves a draft that holds text for one conversation to another.
+fn writes_for_another_conversation(stored: &Draft, wanted: &Draft) -> bool {
+    let moved = stored.target.application_instance_id != wanted.target.application_instance_id
+        || stored.target.agent_binding_revision != wanted.target.agent_binding_revision;
+    let holds_nothing = stored.text.is_empty() && stored.attachments.is_empty();
+    moved && stored.target.application_instance_id.is_present() && !holds_nothing
+}
+
+fn is_unknown(error: &ClientError) -> bool {
+    matches!(error, ClientError::Draft(draft) if matches!(**draft, DraftError::Unknown { .. }))
 }
 
 /// A handle as a draft stores it: whole, with no preview.
@@ -297,11 +339,13 @@ fn owner_of(path: &Path) -> Result<DeviceId> {
 
 /// Makes the owner for this install and puts it in place only if none is there.
 ///
-/// It is written whole to a file of its own and linked to its name, which fails when the name is
-/// taken, so a second process starting at the same moment reads the first one's identifier and
-/// never half of one.
+/// It is published whole by the library that makes the other identifiers of this install: written
+/// and flushed under a name of its own, given its name only if nobody has, and the directory
+/// flushed so the name survives a crash. A second process starting at the same moment reads the
+/// first one's identifier and never half of one, and a name lost to a crash cannot make a new owner
+/// of drafts already stored.
 fn make_owner(path: &Path) -> Result<DeviceId> {
-    let unavailable = |error: std::io::Error| {
+    let unavailable = |error: &dyn std::fmt::Display| {
         CommandError::local_failure(format!(
             "the device that owns the drafts on this device cannot be recorded: {error}"
         ))
@@ -313,29 +357,16 @@ fn make_owner(path: &Path) -> Result<DeviceId> {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let owner = DeviceId::new(Uuid::from_bytes(bytes));
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(unavailable)?;
+        std::fs::create_dir_all(parent).map_err(|error| unavailable(&error))?;
     }
-    let partial = path.with_extension(format!("{owner}.partial"));
-    {
-        use std::io::Write as _;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&partial).map_err(unavailable)?;
-        file.write_all(owner.to_string().as_bytes())
-            .map_err(unavailable)?;
-        file.sync_all().map_err(unavailable)?;
-    }
-    let linked = std::fs::hard_link(&partial, path);
-    let _ = std::fs::remove_file(&partial);
-    match linked {
+    match kr_ipc::paths::create_new_owner_only_file(path, owner.to_string().as_bytes()) {
         Ok(()) => Ok(owner),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => owner_of(path),
-        Err(error) => Err(unavailable(error)),
+        Err(kr_ipc::IpcError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            owner_of(path)
+        }
+        Err(error) => Err(unavailable(&error)),
     }
 }
 
