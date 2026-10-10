@@ -333,7 +333,10 @@ async fn barrier_for(controller: &Controller, reach: Reach) -> kr_protocol::ids:
 }
 
 fn grants_reach(bytes: &[u8]) -> Reach {
-    Reach::Grants(bytes.iter().map(|byte| a_grant(*byte)).collect())
+    Reach::Grants {
+        grants: bytes.iter().map(|byte| a_grant(*byte)).collect(),
+        held_by: std::collections::BTreeSet::new(),
+    }
 }
 
 fn within(
@@ -495,46 +498,73 @@ async fn a_revision_is_announced_with_the_reach_of_the_revisions_before_it_that_
     drop(controller);
 }
 
-/// KR-REQ-10.45: a reach is never larger than a notice should carry: one revision that names too
-/// many is the whole host's, and a revision joins to the ones before it only while the joined reach
-/// is within the bound, the notice following the first it could not take.
+/// KR-REQ-10.45: a reach is never larger than a notice can carry, and a subtree too large to name
+/// grant by grant is named by the devices that hold its grants, so a device that delegates a great
+/// many grants takes the input of the devices it delegated to and of no other. Only more holding
+/// devices than a notice names make the reach the whole host's, and a revision joins the ones before
+/// it by the same rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reach_that_names_too_many_is_the_host_and_a_join_stops_at_the_bound() {
+async fn a_subtree_too_large_to_name_is_named_by_the_devices_that_hold_it() {
+    use kr_protocol::worker::RevisionReach;
+
     let temp = kr_ipc::testing::TempHost::create();
     let controller = super::a_floor_owed_its_record::daemon(&temp).await;
-    let many = |first: u32, count: u32| {
-        Reach::Grants(
-            (first..first + count)
-                .map(|number| {
-                    let mut bytes = [0_u8; 16];
-                    bytes[..4].copy_from_slice(&number.to_be_bytes());
-                    kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
-                })
-                .collect(),
-        )
+    let a_device = |number: u32| {
+        let mut bytes = [0xd0_u8; 16];
+        bytes[..4].copy_from_slice(&number.to_be_bytes());
+        kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+    };
+    let held = |first: u32, count: u32, holders: std::ops::Range<u32>| Reach::Grants {
+        grants: (first..first + count)
+            .map(|number| {
+                let mut bytes = [0_u8; 16];
+                bytes[..4].copy_from_slice(&number.to_be_bytes());
+                kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+            })
+            .collect(),
+        held_by: holders.map(a_device).collect(),
     };
     let bound = u32::try_from(kr_protocol::worker::MAX_REVISION_REACH_NAMES).expect("fits");
+    let named = |notice: kr_protocol::worker::AuthorityRevisionNotice| match notice.reach {
+        RevisionReach::Within {
+            since,
+            grants,
+            devices,
+        } => (since, grants, devices),
+        RevisionReach::Host => panic!("the revision names whose authority it withdrew"),
+    };
 
-    let over = barrier_for(&controller, many(1, bound + 1)).await;
+    // More grants than a notice names, held by two devices: the two devices are named.
+    let over = barrier_for(&controller, held(1, bound + 1, 1..3)).await;
+    let (since, grants, devices) = named(controller.revision_notice(over, 0, &stating()));
+    assert_eq!(since.get(), over.get() - 1);
+    assert!(grants.is_empty(), "no grant is named");
+    assert_eq!(
+        devices.iter().copied().collect::<Vec<_>>(),
+        vec![a_device(1), a_device(2)]
+    );
+
+    // As many holding devices as there are grants: more than a notice names, so the whole host's.
+    let hosted = barrier_for(&controller, held(1, bound + 1, 1..bound + 2)).await;
     assert!(
         controller
-            .revision_notice(over, 0, &stating())
+            .revision_notice(hosted, 0, &stating())
             .reach
             .is_host()
     );
 
-    let big = barrier_for(&controller, many(1, bound - 10)).await;
-    let small = barrier_for(&controller, many(1_000_000, 20)).await;
-    let kr_protocol::worker::RevisionReach::Within { since, grants, .. } =
-        controller.revision_notice(small, 0, &stating()).reach
-    else {
-        panic!("the revision names its grants");
-    };
+    // A revision that fits joins to one before it that fits; the join passes the bound and is
+    // named by the devices of both, and stops at the revision that is the whole host's.
+    barrier_for(&controller, held(1, bound - 10, 3..4)).await;
+    let small = barrier_for(&controller, held(1_000_000, 20, 4..5)).await;
+    let (since, grants, devices) = named(controller.revision_notice(small, 0, &stating()));
+    assert_eq!(since, hosted, "the join stops where the host's own begins");
+    assert!(grants.is_empty());
     assert_eq!(
-        since, big,
-        "the revision before it would take the notice over the bound"
+        devices.iter().copied().collect::<Vec<_>>(),
+        vec![a_device(3), a_device(4)],
+        "the devices of the two revisions"
     );
-    assert_eq!(grants.len(), 20);
     drop(controller);
 }
 
