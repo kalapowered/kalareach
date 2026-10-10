@@ -9,7 +9,7 @@
  */
 
 import { act, cleanup, renderHook } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useState, type ReactNode } from 'react'
 
 import { useRebind } from '../../src/app/drafts'
@@ -107,9 +107,12 @@ describe('an answer about where a draft stands (KR-ACC-012)', () => {
       { wrapper: wrapperFor(port) }
     )
 
+    // The book is offered the rebind once, and the draft it holds is bound.
+    const offered = vi.spyOn(result.current, 'setDrafts')
     release()
     await untilAnswered()
 
+    expect(offered).toHaveBeenCalledTimes(1)
     expect(result.current.snapshot().drafts[0]?.state).toBe('bound')
   })
 
@@ -125,10 +128,12 @@ describe('an answer about where a draft stands (KR-ACC-012)', () => {
     )
 
     // The application comes back to the front again; the page has rendered nothing yet.
+    const offered = vi.spyOn(result.current, 'setDrafts')
     resume()
     release()
     await untilAnswered()
 
+    expect(offered).not.toHaveBeenCalled()
     expect(result.current.snapshot().drafts[0]?.state).toBe('detached')
   })
 
@@ -143,9 +148,11 @@ describe('an answer about where a draft stands (KR-ACC-012)', () => {
       { wrapper: wrapperFor(port) }
     )
 
+    const offered = vi.spyOn(result.current, 'setDrafts')
     release()
     await untilAnswered()
 
+    expect(offered).not.toHaveBeenCalled()
     expect(result.current.snapshot().drafts[0]?.state).toBe('detached')
   })
 })

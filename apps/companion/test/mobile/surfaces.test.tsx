@@ -552,15 +552,15 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
     expect(document.body).not.toHaveTextContent('OUTCOME_UNKNOWN')
   })
 
-  it('says so when the device refuses to keep what was written', async () => {
+  it('says so when the device’s store refuses to keep a draft, and says nothing when nothing is refused', async () => {
     const person = userEvent.setup()
-    // The device's store will not keep a draft: native code's save is refused.
+    // The device keeps submissions in storage that works, so only the store of drafts refuses.
     const drafts = new FakeDraftStore()
     drafts.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
     const { port } = fakeHost({ drafts })
-    render(
+    const run = render(
       <AppProvider port={port}>
-        <MobileApp surface="ios" storage={null} />
+        <MobileApp surface="ios" storage={fakeStorage()} />
       </AppProvider>
     )
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
@@ -571,6 +571,60 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
     })
     // It is a warning about durability, not about the draft: the text is still there.
     expect(screen.getByLabelText('Message this session')).toHaveValue('a')
+    run.unmount()
+
+    // The control: the same steps over a store that keeps the draft warn of nothing.
+    const kept = new FakeDraftStore()
+    const second = fakeHost({ drafts: kept })
+    render(
+      <AppProvider port={second.port}>
+        <MobileApp surface="ios" storage={fakeStorage()} />
+      </AppProvider>
+    )
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'a')
+    await waitFor(() => {
+      expect(kept.all().map((draft) => draft.text)).toEqual(['a'])
+    })
+    expect(screen.queryByText('This device will not keep what you write')).toBeNull()
+  })
+
+  it('says so when the device refuses to keep a submission the host has not settled', async () => {
+    const person = userEvent.setup()
+    // The store of drafts works; the device's storage for submissions will not take a write.
+    const refusing = {
+      getItem: () => null,
+      setItem: () => {
+        throw new Error('quota')
+      },
+      removeItem: () => undefined,
+      key: () => null,
+      clear: () => undefined,
+      length: 0
+    } as unknown as Storage
+    const kept = new FakeDraftStore()
+    const { port } = fakeHost({ drafts: kept })
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={refusing} />
+      </AppProvider>
+    )
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'send me')
+    await waitFor(() => {
+      expect(kept.all().map((draft) => draft.text)).toEqual(['send me'])
+    })
+    expect(screen.queryByText('This device will not keep what you write')).toBeNull()
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(screen.getByText('This device will not keep what you write')).toBeInTheDocument()
+    })
   })
 })
 

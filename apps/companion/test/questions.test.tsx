@@ -275,6 +275,34 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     })
   })
 
+  it('is kept when contact with the host is lost and the worker cannot be reached either, and is offered when both are back', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    act(() => {
+      controls.setConnected(false)
+      controls.questions.setReachable(false)
+    })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    expect(await screen.findByTestId('kept-answer')).toBeInTheDocument()
+    expect(controls.questions.sent).toHaveLength(0)
+
+    act(() => {
+      controls.setConnected(true)
+      controls.questions.setReachable(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'offered')
+    })
+    // Contact coming back sent nothing: the person sends it.
+    expect(controls.questions.sent).toHaveLength(0)
+    await person.click(screen.getByRole('button', { name: 'Send it now' }))
+    await waitFor(() => {
+      expect(controls.questions.sent).toHaveLength(1)
+    })
+  })
+
   it('is taken by the worker when only the connection to the daemon is lost', async () => {
     const { controls } = start()
     const question = await questionAbout(WHICH_BRANCH)
