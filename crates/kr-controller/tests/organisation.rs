@@ -1590,7 +1590,18 @@ fn a_stored_grant_with_an_earlier_organisation_requirement_still_reads() {
         .record_for_device(paired.device_id)
         .expect("readable")
         .expect("the row still reads");
-    assert_eq!(read.grant, paired.grant);
+    // A grant that names no history cursor is read from the moment of the pairing.
+    assert_eq!(
+        read.grant,
+        Grant {
+            history: paired
+                .grant
+                .history
+                .clone()
+                .from_start(paired.paired_at_ms.get()),
+            ..paired.grant.clone()
+        }
+    );
     let record = GrantRecord {
         grant: read.grant.clone(),
         session_id: None,

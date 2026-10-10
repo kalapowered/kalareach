@@ -1365,18 +1365,20 @@ mod tests {
             scope.rights,
             [ActionRight::SessionView].into_iter().collect()
         );
+        // The grant has no history cursor, so it is read from its own start.
+        let from_its_start = |actions: &[ActionRight]| {
+            let mut grant = grant(45, SessionSelector::Any, actions);
+            grant.history = grant.history.from_start(NOW - 500);
+            ViewerScope::from_grant(&grant)
+        };
         assert_eq!(
             scope.viewer,
-            ViewerScope::from_grant(&grant(
-                45,
-                SessionSelector::Any,
-                &[ActionRight::SessionView]
-            )),
+            from_its_start(&[ActionRight::SessionView]),
             "the viewer reads through the rights the lease leaves, which keep no files.read"
         );
         assert_ne!(
             scope.viewer,
-            ViewerScope::from_grant(&grant(45, SessionSelector::Any, &held_rights)),
+            from_its_start(&held_rights),
             "and not through the ones the grant held"
         );
     }

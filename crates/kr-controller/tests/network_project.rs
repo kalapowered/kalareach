@@ -2127,7 +2127,7 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
     }
 
     // The history: a grant that reaches back only to a moment after the capture reaches neither,
-    // and one with no lower bound retains none.
+    // and one with no lower bound reaches back to its own pairing, which came after the capture.
     let (_c, later) = recorded
         .device(|grant| grant.history.lower_bound_ms = Nullable::some(beyond))
         .await;
@@ -2145,8 +2145,12 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
         .await;
     let (read, materialised) = read_and_materialise(&none, env, recorded.plain).await;
     for refusal in [read.err(), materialised.err()] {
-        let refusal = refusal.expect("a grant with no history");
-        assert!(said(&refusal).contains("retains no history"), "{refusal}");
+        let refusal = refusal.expect("a version captured before the grant's own pairing");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(
+            said(&refusal).contains("captured before the moment"),
+            "{refusal}"
+        );
     }
 
     // The session: a grant that names sessions reaches a version captured for one of them and no

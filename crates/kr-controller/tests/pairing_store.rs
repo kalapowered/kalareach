@@ -736,7 +736,14 @@ fn a_completed_pairing_writes_its_device_commitment_event_and_confirmation_toget
         .record_for_device(commitment.device_id)
         .expect("readable")
         .expect("the device row");
-    assert_eq!(device, device_record(&commitment).expect("a record"));
+    // The row holds the grant as the pairing gave it, and a grant with no history cursor is read
+    // from the moment of the pairing.
+    let mut committed = device_record(&commitment).expect("a record");
+    committed.grant.history = committed
+        .grant
+        .history
+        .from_start(committed.paired_at_ms.get());
+    assert_eq!(device, committed);
     let event = rows
         .event_for(commitment.invitation_id)
         .expect("readable")
