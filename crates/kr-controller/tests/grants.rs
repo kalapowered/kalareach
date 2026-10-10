@@ -15,7 +15,7 @@
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
 //! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
 //! | KR-REQ-10.44 | `the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen`, `an_expired_grant_is_refused_rather_than_downgraded_to_view_only` |
-//! | KR-REQ-10.45 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker` |
+//! | KR-REQ-10.45 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_device` |
 //! | KR-REQ-10.49 | `a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_redeemed` |
 //! | KR-REQ-17.54 | `an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport`, `personal_access_survives_an_organisation_outage_unless_the_host_is_exclusively_managed` |
 //! | KR-REQ-19.02 | `a_delegation_cannot_grant_a_right_the_delegating_actor_lacks` |
@@ -1197,6 +1197,99 @@ fn a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_red
     );
     assert_eq!(read(2), Some(7), "a cursor the grant names stands");
     assert_eq!(read(3), None, "a proposal has no start");
+}
+
+/// KR-REQ-10.45: what a revocation reaches is every grant of its subtree that can still hold input
+/// at a worker, each with the device it was issued to, and no more. A grant revoked earlier, whose
+/// fence is done, one that ran out and a proposal nobody redeemed are not in it, so a subtree's old
+/// rows do not widen a fence; a grant a concurrent revocation withdrew a moment before is, for as
+/// long as that revocation's debt is on disk.
+#[test]
+fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_device() {
+    let now = kr_ipc::now_ms().get();
+    let issued_to = |byte: u8, id: u8, expiry: GrantExpiry| Grant {
+        recipient_device_id: device_id(byte),
+        ..grant(id, Some(grant_id(1)), VIEW, expiry)
+    };
+    let runs_out = GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(now + DAY_MS),
+    };
+    // The subtree below the root: two live children held by two devices, one that runs out after a
+    // day, one revoked in each test, and a proposal.
+    let build = |directory: &GrantDirectory| {
+        let root = grant(1, None, VIEW, GrantExpiry::Never);
+        directory.issue(&record(root), || Ok(())).expect("root");
+        for (grant, activated) in [
+            (issued_to(0x21, 2, GrantExpiry::Never), true),
+            (issued_to(0x22, 3, GrantExpiry::Never), true),
+            (issued_to(0x23, 4, GrantExpiry::Never), true),
+            (issued_to(0x24, 5, runs_out), true),
+            (issued_to(0x25, 6, GrantExpiry::Never), false),
+        ] {
+            let stored = if activated {
+                record(grant)
+            } else {
+                proposal(grant)
+            };
+            directory.issue(&stored, || Ok(())).expect("a descendant");
+        }
+    };
+    let reached = |revocation: &kr_controller::grants::GrantRevocation| {
+        revocation
+            .reached
+            .iter()
+            .map(|(grant, device)| (*grant, *device))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    // Grant 4 is revoked and its fence completed: nothing is owed for it. A day and more later
+    // grant 5 has run out, and the worker takes its lease at its deadline.
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    build(&directory);
+    let early = directory
+        .revoke(grant_id(4), now - 3_000, || Ok(()))
+        .expect("the child is revoked");
+    directory
+        .fence_completed(&early.debt.into_iter().collect::<Vec<_>>())
+        .expect("its fence is done");
+    let revocation = directory
+        .revoke(grant_id(1), now + 2 * DAY_MS, || Ok(()))
+        .expect("the root is revoked");
+    assert_eq!(
+        reached(&revocation),
+        [
+            (grant_id(1), device_id(0xf1)),
+            (grant_id(2), device_id(0x21)),
+            (grant_id(3), device_id(0x22)),
+        ]
+        .into_iter()
+        .collect(),
+        "the live ones, each with the device it was issued to: not the one revoked and fenced, the \
+         one that ran out or the proposal"
+    );
+
+    // The same with grant 4 revoked a moment before and its fence still owed.
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    build(&directory);
+    directory
+        .revoke(grant_id(4), now - 1_000, || Ok(()))
+        .expect("the child is revoked, and its debt stays on disk");
+    let revocation = directory
+        .revoke(grant_id(1), now, || Ok(()))
+        .expect("the root is revoked");
+    assert_eq!(
+        reached(&revocation),
+        [
+            (grant_id(1), device_id(0xf1)),
+            (grant_id(2), device_id(0x21)),
+            (grant_id(3), device_id(0x22)),
+            (grant_id(4), device_id(0x23)),
+            (grant_id(5), device_id(0x24)),
+        ]
+        .into_iter()
+        .collect(),
+        "a grant revoked a moment before, whose fence is owed, is reached; the proposal is not"
+    );
 }
 
 #[test]
