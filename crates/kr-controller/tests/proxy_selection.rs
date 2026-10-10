@@ -432,11 +432,31 @@ fn write_bytes(environment: &kr_ipc::paths::EnvironmentPaths, bytes: &[u8], mode
     let _ = mode;
 }
 
-/// Starts a daemon in-process on `environment`, launching no worker.
+/// Starts a daemon in-process on `environment`, launching no worker. A daemon dropped a moment ago
+/// holds the environment until its tasks have ended, so a start that meets it is made again until
+/// the watchdog ends.
 async fn start_controller(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: kr_protocol::ids::EnvironmentId,
 ) -> std::sync::Arc<kr_controller::service::Controller> {
+    let began = std::time::Instant::now();
+    loop {
+        match start_controller_once(environment, environment_id).await {
+            Ok(controller) => return controller,
+            Err(kr_controller::ControllerError::AlreadyRunning { .. })
+                if began.elapsed() < WATCHDOG =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("the daemon starts: {error:?}"),
+        }
+    }
+}
+
+async fn start_controller_once(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> kr_controller::Result<std::sync::Arc<kr_controller::service::Controller>> {
     let secrets = environment.secrets_dir();
     kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
         paths: environment.clone(),
@@ -461,5 +481,4 @@ async fn start_controller(
         terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
-    .expect("the daemon starts")
 }
