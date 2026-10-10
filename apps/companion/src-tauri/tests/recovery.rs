@@ -512,6 +512,37 @@ async fn turning_recovery_on_puts_the_bundle_at_the_service_and_hands_over_a_kit
     }
 }
 
+/// The kit holds the recovery seed. A file the person chose that already exists, whatever its mode
+/// and however long its earlier content, ends as the kit alone and readable by them alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kit_saved_over_an_existing_file_leaves_that_file_private_and_whole() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({}))
+        .expect("recovery is turned on");
+
+    let out = tempfile::tempdir().expect("a directory");
+    let path = out.path().join("recovery-kit.txt");
+    std::fs::write(&path, "earlier words ".repeat(2000)).expect("an earlier file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("a wide mode");
+
+    page.kit(out.path());
+
+    let text = std::fs::read_to_string(&path).expect("the kit file");
+    assert!(
+        !text.contains("earlier words"),
+        "none of the earlier content is left in the file"
+    );
+    let mode = std::fs::metadata(&path)
+        .expect("the file")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the kit is private to its owner");
+}
+
 /// KR-REQ-20.15: a writer is declared recovery-enabled only with the evidence that the bundle
 /// naming it has landed, and a fresh device then reads the writer from the bundle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
