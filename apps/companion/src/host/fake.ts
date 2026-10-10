@@ -230,6 +230,22 @@ export interface FakeRecovery {
    * does that is still talking to the service.
    */
   holdTurnOn(): () => void
+  /**
+   * Holds the answer of the next read of recovery until the returned function is called, as a
+   * backend does that waits for another companion's step to end.
+   */
+  holdNextRead(): () => void
+}
+
+/** The sync service setting, as the backend reports it. */
+export interface FakeSyncService {
+  /**
+   * Makes every change of the service fail as one does that could not be kept on disk, with these
+   * words, until it is given none. An origin that is not one is still refused as such.
+   */
+  failKeeping(message: string | null): void
+  /** Holds the answer of the next read of the setting until the returned function is called. */
+  holdNextRead(): () => void
 }
 
 /** What the fake host can be told to do before a test drives the interface. */
@@ -238,6 +254,8 @@ export interface FakeHostControls {
   readonly account: FakeAccount
   /** Recovery. */
   readonly recovery: FakeRecovery
+  /** The sync service setting. */
+  readonly syncService: FakeSyncService
   /** Pushes one event to every subscriber. */
   emit(event: HostEvent): void
   /**
@@ -696,6 +714,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let recoverySignIns = 0
   let recoveryReadFails: string | null = null
   let heldTurnOn: Promise<void> | null = null
+  let heldRecoveryRead: Promise<void> | null = null
+  let heldSyncServiceRead: Promise<void> | null = null
+  let syncServiceKeepFails: string | null = null
   const kitsSaved: string[] = []
   const recoveryView = (): RecoveryView => ({ sync_service: syncService, ...recovery })
 
@@ -1666,7 +1687,12 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         : Promise.resolve(accountUsage),
     onAccount: (listener) => register(accountListeners, listener),
 
-    syncServiceView: () => Promise.resolve(syncService),
+    syncServiceView: () => {
+      if (heldSyncServiceRead === null) return Promise.resolve(syncService)
+      const waiting = heldSyncServiceRead
+      heldSyncServiceRead = null
+      return waiting.then(() => syncService)
+    },
     syncServiceSet: (origin) => {
       const trimmed = origin.trim().replace(/\/$/, '')
       if (!/^(https:\/\/[a-z0-9.-]+|http:\/\/(127\.0\.0\.1|localhost))(:[0-9]+)?$/.test(trimmed)) {
@@ -1675,14 +1701,21 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           'The sync service setting needs an https origin such as https://sync.example.'
         )
       }
+      if (syncServiceKeepFails !== null) return refused('RESOURCE_UNAVAILABLE', syncServiceKeepFails)
       const host = trimmed.slice(trimmed.indexOf('://') + 3)
       syncService = { origin: trimmed, host, is_default: trimmed === 'https://reach.kala.to' }
       return Promise.resolve(syncService)
     },
-    recoveryView: () =>
-      recoveryReadFails === null
-        ? Promise.resolve(recoveryView())
-        : refused('RESOURCE_UNAVAILABLE', recoveryReadFails),
+    recoveryView: () => {
+      const answer = (): Promise<RecoveryView> =>
+        recoveryReadFails === null
+          ? Promise.resolve(recoveryView())
+          : refused('RESOURCE_UNAVAILABLE', recoveryReadFails)
+      if (heldRecoveryRead === null) return answer()
+      const waiting = heldRecoveryRead
+      heldRecoveryRead = null
+      return waiting.then(answer)
+    },
     recoveryTurnOn: () => {
       recoveryTurnOns += 1
       if (recovery.blocker !== null) {
@@ -1737,6 +1770,25 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       holdTurnOn() {
         let release: () => void = () => undefined
         heldTurnOn = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        return release
+      },
+      holdNextRead() {
+        let release: () => void = () => undefined
+        heldRecoveryRead = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        return release
+      }
+    },
+    syncService: {
+      failKeeping(message) {
+        syncServiceKeepFails = message
+      },
+      holdNextRead() {
+        let release: () => void = () => undefined
+        heldSyncServiceRead = new Promise<void>((resolve) => {
           release = resolve
         })
         return release
