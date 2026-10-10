@@ -468,8 +468,8 @@ const _: () = assert!(
 
 /// How many grants and devices a worker keeps for the reaches of the announcements it was refused,
 /// joined, before it fences every caller under a grant instead. It only bounds a worker's memory:
-/// each announcement carries at most [`MAX_REVISION_REACH_NAMES`], so it takes sixteen refused
-/// announcements of a full reach each to pass it.
+/// each announcement carries at most [`MAX_REVISION_REACH_NAMES`], so it takes more than sixteen
+/// refused announcements of a full reach each to pass it.
 pub const MAX_OWED_REACH_NAMES: usize = 16 * MAX_REVISION_REACH_NAMES;
 
 /// Whose authority the revisions after one revision withdrew.
@@ -494,11 +494,12 @@ pub enum RevisionReach {
         /// The last revision before the ones this describes, which the worker must have fenced.
         since: AuthorityRevision,
         /// The grants the revisions withdrew, with everything delegated from them that anyone
-        /// held. None when the revisions withdrew more than [`MAX_REVISION_REACH_NAMES`], which
-        /// `devices` then names by the devices that hold them.
+        /// held. A revision that withdrew more than [`MAX_REVISION_REACH_NAMES`] names, and the
+        /// older revisions of a join that passes it, are named by the devices that hold their
+        /// grants instead, in `devices`.
         grants: CanonicalSet<GrantId>,
-        /// The devices the revisions withdrew, or that hold the grants of a subtree too large to
-        /// name grant by grant.
+        /// The devices the revisions withdrew, and the devices that hold the grants of the
+        /// revisions named by device.
         devices: CanonicalSet<DeviceId>,
     },
 }

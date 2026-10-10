@@ -2645,6 +2645,66 @@ async fn the_reaches_of_many_refused_revisions_join_into_one() {
     typing.close();
 }
 
+/// KR-REQ-10.45: a worker that was refused revisions for its dispatch boundary and then accepts an
+/// announcement joins what it was refused to that announcement's reach, so a notice that begins
+/// after the revisions it was refused still describes all of them and a caller none of them named
+/// keeps its lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announcement_accepted_after_refused_ones_is_joined_to_what_was_refused() {
+    let mut typing = Typing::start().await;
+    let (stranger_grant, _) = a_stranger();
+
+    let boundary = HeldBoundary::take(&typing.wired).await;
+    for revision in 3..=10 {
+        typing
+            .wired
+            .announced_and_refused(
+                &mut typing.authority,
+                revision,
+                grant_reach(revision - 1, stranger_grant),
+            )
+            .await;
+    }
+    boundary.release();
+
+    // The worker accepts revision 11 before its own maintenance has run. The notice begins after
+    // revision 10, which it was refused and holds the reach of.
+    typing
+        .wired
+        .revise_within(&mut typing.authority, 11, grant_reach(10, stranger_grant))
+        .await;
+    assert_eq!(
+        typing.wired.service.acknowledged_revision(),
+        Some(AuthorityRevision::new(11))
+    );
+    assert!(
+        typing.holds_the_lease(),
+        "the nine revisions it holds and the one it was told named a stranger's grant"
+    );
+
+    // The same sequence where one of the refused revisions names the phone's grant takes the lease.
+    let boundary = HeldBoundary::take(&typing.wired).await;
+    typing
+        .wired
+        .announced_and_refused(&mut typing.authority, 12, grant_reach(11, devices_grant()))
+        .await;
+    typing
+        .wired
+        .announced_and_refused(&mut typing.authority, 13, grant_reach(12, stranger_grant))
+        .await;
+    boundary.release();
+    typing
+        .wired
+        .revise_within(&mut typing.authority, 14, grant_reach(13, stranger_grant))
+        .await;
+    assert_eq!(
+        typing.wired.lease_holder(),
+        None,
+        "revision 12 named the phone's grant"
+    );
+    typing.close();
+}
+
 /// KR-REQ-10.45: a reach that names as many grants as a notice may carry reaches the worker over
 /// its control connection, and a lease it does not name stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
