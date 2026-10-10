@@ -430,14 +430,14 @@ impl Recovery {
                 .map_err(said)?
         };
         let destination = destination.to_path_buf();
-        tauri::async_runtime::spawn_blocking(move || {
-            write_owner_only_file(&destination, kit.as_bytes())
-        })
-        .await
-        .map_err(|error| CommandError::local_failure(format!("the kit was not written: {error}")))?
-        .map_err(|error| {
-            CommandError::local_failure(format!("the kit could not be written: {error}"))
-        })
+        tauri::async_runtime::spawn_blocking(move || write_private(&destination, kit.as_bytes()))
+            .await
+            .map_err(|error| {
+                CommandError::local_failure(format!("the kit was not written: {error}"))
+            })?
+            .map_err(|error| {
+                CommandError::local_failure(format!("the kit could not be written: {error}"))
+            })
     }
 
     /* ---------------------------------------------------------------------- */
@@ -629,6 +629,36 @@ fn said(error: RecoveryError) -> CommandError {
 }
 
 /// The time on this machine's clock, in UTC milliseconds.
+/// Writes `body` as the whole of the file the person chose for the kit, readable by this user alone
+/// where the platform has such a thing.
+///
+/// It writes the file in place, and does not go through a temporary file beside it as the record
+/// and the setting do: the person's save dialog grants this program that one file and not the
+/// folder it is in, so a second file made beside it would ask for the folder on a system that
+/// guards its personal folders, and a crash between the write and the rename would leave a hidden
+/// copy of the seed that nothing removes. A kit that a crash tears is a visible file that the
+/// page never said it saved.
+fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        // A file that already existed keeps the mode it had, so it is set again.
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(body)?;
+    file.sync_all()
+}
+
 fn now() -> TimestampMs {
     TimestampMs::new(
         std::time::SystemTime::now()
