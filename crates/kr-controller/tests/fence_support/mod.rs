@@ -5,6 +5,8 @@
 //! disk or a damaged file would, so the acceptance cannot raise the fence and the host refuses
 //! dispatch until it can. Everything is in the test's own temporary host tree.
 
+#![allow(dead_code)]
+
 use kr_controller::service::Controller;
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::rights::ActionRight;
@@ -42,7 +44,7 @@ fn narrowing_document(rights: &[ActionRight]) -> ConfigurationDocument {
 
 /// Makes this environment's registry refuse the revision advance a fence needs, until the returned
 /// connection drops the trigger.
-fn refuse_fences(environment: &kr_ipc::paths::EnvironmentPaths) -> rusqlite::Connection {
+pub fn refuse_fences(environment: &kr_ipc::paths::EnvironmentPaths) -> rusqlite::Connection {
     let registry =
         rusqlite::Connection::open(environment.registry_database()).expect("opens the registry");
     registry
