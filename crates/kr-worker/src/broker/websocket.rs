@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use futures_util::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use tokio_websockets::{Limits, Message, ServerBuilder, WebSocketStream};
+use tokio_websockets::{CloseCode, Limits, Message, ServerBuilder, WebSocketStream};
 
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
@@ -41,6 +41,14 @@ pub const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 
 /// The most header lines an upgrade request may carry.
 pub const MAX_REQUEST_HEADERS: usize = 64;
+
+/// How many ping and pong messages in a row the gateway reads from a terminal before it ends the
+/// connection.
+///
+/// The library queues an answer to every ping it reads, and sends them while the terminal reads.
+/// A terminal that pings and reads nothing would have them held without end, so the run of them
+/// has a bound, and an application message ends the run.
+pub const MAX_CONTROL_MESSAGES_IN_A_ROW: usize = 256;
 
 /// How long a terminal has to send its upgrade request and have it answered.
 pub const UPGRADE_DEADLINE: Duration = Duration::from_secs(5);
@@ -229,9 +237,16 @@ fn vet(head: &[u8]) -> Result<()> {
 }
 
 /// A WebSocket connection read and written as lines of JSON.
+///
+/// When it is dropped, the gateway has ended the connection: the terminal is sent a close with the
+/// reason the gateway had, if it had one, so that it reads an end and not a reset.
 #[derive(Debug)]
-pub struct TextLines<S> {
+pub struct TextLines<S: AsyncRead + AsyncWrite + Unpin> {
     socket: WebSocketStream<S>,
+    /// Why the gateway ended the connection, when it did so for a message it refused.
+    closing: Option<CloseCode>,
+    /// How many ping and pong messages have been read since the last application message.
+    control_in_a_row: usize,
     /// The most bytes a message that is read may have.
     read_limit: usize,
     /// The most bytes a message that is written may have.
@@ -243,10 +258,12 @@ pub struct TextLines<S> {
     writing: Vec<u8>,
 }
 
-impl<S> TextLines<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> TextLines<S> {
     fn new(socket: WebSocketStream<S>, framing: Framing) -> Self {
         Self {
             socket,
+            closing: None,
+            control_in_a_row: 0,
             read_limit: framing.limit(),
             write_limit: framing.largest_body(),
             reading: Vec::new(),
@@ -292,6 +309,13 @@ where
         Poll::Ready(Ok(()))
     }
 
+    /// Notes why the connection is ending, for the close the terminal is sent, and returns the
+    /// error that says so.
+    fn end(&mut self, code: CloseCode, why: &str) -> io::Error {
+        self.closing = Some(code);
+        refused(why)
+    }
+
     /// How many bytes of a line that has not ended are held.
     fn partial_line(&self) -> usize {
         self.writing
@@ -324,25 +348,40 @@ where
                 Some(Err(error)) => return Poll::Ready(Err(failed(error))),
                 Some(Ok(message)) => message,
             };
+            // A close, and the answer to a ping, are the library's to send: it sends them from
+            // the next poll, with the waker of whichever task is writing, and a flush started
+            // here would take that waker away from a writer that is waiting on the socket. A
+            // close is read to its end, so that the answer to it goes out before this reads one.
             if message.is_close() {
-                return Poll::Ready(Ok(()));
-            }
-            if message.is_ping() || message.is_pong() {
-                // The library queued the answer to a ping when it read it. It goes out now, and
-                // whether it finishes is for the next flush to say.
-                let _ = Pin::new(&mut this.socket).poll_flush(cx);
                 continue;
             }
+            if message.is_ping() || message.is_pong() {
+                this.control_in_a_row += 1;
+                if this.control_in_a_row > MAX_CONTROL_MESSAGES_IN_A_ROW {
+                    return Poll::Ready(Err(this.end(
+                        CloseCode::POLICY_VIOLATION,
+                        "too many control messages in a row",
+                    )));
+                }
+                continue;
+            }
+            this.control_in_a_row = 0;
             let Some(text) = message.as_text() else {
-                return Poll::Ready(Err(refused("only text messages are carried")));
+                return Poll::Ready(Err(this.end(
+                    CloseCode::UNSUPPORTED_DATA,
+                    "only text messages are carried",
+                )));
             };
             if text.len() > this.read_limit {
-                return Poll::Ready(Err(refused(
+                return Poll::Ready(Err(this.end(
+                    CloseCode::MESSAGE_TOO_BIG,
                     "a message is larger than the connection carries",
                 )));
             }
             if text.bytes().any(|byte| byte == b'\n') {
-                return Poll::Ready(Err(refused("a message holds a line break")));
+                return Poll::Ready(Err(
+                    this.end(CloseCode::POLICY_VIOLATION, "a message holds a line break")
+                ));
             }
             this.reading.clear();
             this.reading.extend_from_slice(text.as_bytes());
@@ -389,5 +428,20 @@ where
         let this = &mut *self;
         ready!(this.send_lines(cx))?;
         Pin::new(&mut this.socket).poll_close(cx).map_err(failed)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Drop for TextLines<S> {
+    /// Sends the terminal a close, if there is room for it in the socket at once.
+    ///
+    /// Nothing waits here: the gateway has ended the connection and has no task left to wait in.
+    /// A close the connection has already sent is not sent again, and one the socket has no room
+    /// for is not sent at all. Anything the library queued before this, a reply to the terminal's
+    /// own close among it, is sent now if the socket takes it.
+    fn drop(&mut self) {
+        let code = self.closing.unwrap_or(CloseCode::NORMAL_CLOSURE);
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let _ = Pin::new(&mut self.socket).start_send(Message::close(Some(code), ""));
+        let _ = Pin::new(&mut self.socket).poll_flush(&mut context);
     }
 }
