@@ -1386,7 +1386,24 @@ impl WorkerService {
             let protected = !withdrawn.is_set();
             let reply = match next {
                 Next::Frame(message) => self.handle(&mut state, &peer, message).await,
-                Next::Prepared(ready) => Some(self.dispatch_prepared(&mut state, *ready)),
+                Next::Prepared(ready) => {
+                    // Asked of the operating system and not of the runtime, which learns that a
+                    // peer closed only when it next turns its reactor, and whichever of the
+                    // reader and the finished preparation the loop picks: an action whose client
+                    // has gone is rejected, as one whose connection ended while it was prepared
+                    // is, and is not dispatched to an effect nobody is waiting for. The system
+                    // reports the end only once the bytes the client sent before it have been
+                    // read, so a client that sent a frame and then went is found by the reader.
+                    let gone = writer
+                        .lock()
+                        .expect("the connection writer is not poisoned")
+                        .peer_is_gone();
+                    if gone {
+                        self.abandon_prepared(*ready);
+                        break;
+                    }
+                    Some(self.dispatch_prepared(&mut state, *ready))
+                }
             };
             // An accepted action to be prepared is prepared on a task of its own, for the reason a
             // launch and an upstream operation are answered on one: this socket carries the same

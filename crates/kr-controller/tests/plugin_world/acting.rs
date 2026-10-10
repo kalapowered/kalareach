@@ -981,7 +981,7 @@ impl Acting {
                 if let Some(mut client) = asking.take() {
                     client
                         .writer()
-                        .shut_down()
+                        .shut_down(std::net::Shutdown::Both)
                         .expect("shuts the client's socket down");
                 }
             }

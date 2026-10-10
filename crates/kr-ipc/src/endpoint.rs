@@ -172,6 +172,15 @@ impl Connection {
         rustix::io::fcntl_dupfd_cloexec(self.0.as_fd(), 0)
             .map_err(|error| IpcError::socket("duplicate the connection", error.into()))
     }
+
+    /// Returns the operating system's handle on the pipe, for asking it whether the peer has gone.
+    ///
+    /// It is the handle of this connection's own pipe object, not a duplicate, and the caller
+    /// keeps it only for as long as one of the connection's halves lives.
+    #[cfg(windows)]
+    pub(crate) fn probe_handle(&self) -> isize {
+        self.0.probe_handle()
+    }
 }
 
 impl AsyncRead for Connection {
@@ -777,6 +786,19 @@ mod platform {
     }
 
     impl Connection {
+        /// The handle of the pipe object this connection reads, writes and waits on.
+        pub(super) fn probe_handle(&self) -> isize {
+            use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+
+            match self {
+                Self::Client(client) => client.as_raw_handle() as isize,
+                Self::Server(accepted) => {
+                    let PipeServer::NamedPipe(pipe) = &accepted.stream;
+                    pipe.as_handle().as_raw_handle() as isize
+                }
+            }
+        }
+
         pub(super) async fn connect(endpoint: &Endpoint) -> Result<Self> {
             let path = format!(r"\\.\pipe\{}", endpoint.as_text());
             // `ClientOptions` opens for identification only (`SECURITY_IDENTIFICATION`), so a server

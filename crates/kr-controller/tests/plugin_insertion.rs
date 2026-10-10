@@ -855,17 +855,44 @@ async fn write(
         .expect("writes the mutation");
 }
 
+/// How the client of an offer goes while the connection's loop is held.
+#[derive(Clone, Copy)]
+enum Departure {
+    /// It closes its connection. Where the system says so, the worker's next write to it fails.
+    Closed,
+    /// It ends what it sends and stays to read: the worker's writes to it still go through, and the
+    /// end is a frame the loop has not read yet.
+    Ended,
+}
+
 /// KR-REQ-23.30: an offer that was prepared and claimed when its connection ended is rejected, its
 /// claim is settled, and nothing is written to the upstream.
 ///
 /// The connection's loop is inside the dispatch boundary with a repeat of the offer when the
-/// component answers, so the finished preparation waits for the loop. The client then goes, and the
-/// loop finds the connection ended with the preparation unfinished. Which of the two ways the
+/// component answers, so the finished preparation waits for the loop. The client then closes its
+/// connection, and the loop finds it so with the preparation unfinished. Which of the two ways the
 /// worker ends such an action is the loop's to decide: it settles what is waiting for it when it
 /// leaves, and a preparation that finishes later finds the connection gone and settles its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_claimed_when_its_connection_ends_is_rejected_and_its_claim_settled()
 {
+    an_offer_whose_client_goes(Departure::Closed).await;
+}
+
+/// KR-REQ-23.30: an offer that was prepared and claimed when its client had ended what it sends is
+/// rejected, its claim is settled, and nothing is written to the upstream.
+///
+/// The reply to the repeat of the offer still goes through to such a client, so the loop comes
+/// back to its choice with the end of the stream and the finished preparation both waiting, or
+/// with the end not yet told to the runtime. The end wins either way: the stream's end ends the
+/// connection, as the reader ends it, and the action is not dispatched on a connection that is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_claimed_when_its_client_has_ended_its_stream_is_rejected_and_its_claim_settled()
+ {
+    an_offer_whose_client_goes(Departure::Ended).await;
+}
+
+async fn an_offer_whose_client_goes(departure: Departure) {
     let Some((acting, draft, handle)) = offering().await else {
         return;
     };
@@ -905,11 +932,23 @@ async fn kr_req_23_30_an_offer_claimed_when_its_connection_ends_is_rejected_and_
     // The client goes, and the loop is let go to find it so. Closing the client's end is not
     // enough to end the connection when a process that another case of this file has started holds
     // a copy of the descriptor until it executes, so the socket is shut down first.
-    asking
-        .writer()
-        .shut_down()
-        .expect("shuts the client's socket down");
-    drop(asking);
+    let _staying = match departure {
+        Departure::Closed => {
+            asking
+                .writer()
+                .shut_down(std::net::Shutdown::Both)
+                .expect("shuts the client's socket down");
+            drop(asking);
+            None
+        }
+        Departure::Ended => {
+            asking
+                .writer()
+                .shut_down(std::net::Shutdown::Write)
+                .expect("ends what the client sends");
+            Some(asking)
+        }
+    };
     release.send(()).expect("lets the repeat go");
     let receipt = until_settled(&mut watcher, action_id).await;
     assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
