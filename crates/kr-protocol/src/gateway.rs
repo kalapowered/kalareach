@@ -420,8 +420,13 @@ impl DeclarativeTable {
         // A request and a response may name their identifier the same way, as JSON-RPC does. The
         // other four say different things about a frame, so sharing a name would make one frame
         // two things at once: a table whose result member is also its identifier member turns
-        // every bare identifier into a successful answer.
+        // every bare identifier into a successful answer, and one whose request identifier is also
+        // its parameters member has this host write an identifier over what the request asks.
         for (first, second) in [
+            ("request_id_field", "method_field"),
+            ("request_id_field", "params_field"),
+            ("request_id_field", "result_field"),
+            ("request_id_field", "error_field"),
             ("response_id_field", "method_field"),
             ("response_id_field", "params_field"),
             ("response_id_field", "result_field"),
@@ -1308,11 +1313,14 @@ mod tests {
             ("result_field", "id"),
             ("error_field", "method"),
             ("method_field", "result"),
+            // The identifier a request carries is written over whatever is in that member.
+            ("request_id_field", "params"),
         ] {
             let mut collided = table();
             match field {
                 "result_field" => collided.result_field = value.to_owned(),
                 "error_field" => collided.error_field = value.to_owned(),
+                "request_id_field" => collided.request_id_field = value.to_owned(),
                 _ => collided.method_field = value.to_owned(),
             }
             assert!(
