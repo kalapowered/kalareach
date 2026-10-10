@@ -322,7 +322,8 @@ impl Page {
             .allow_export_to(path.to_path_buf());
     }
 
-    /// Saves the kit to a new file and reads it back.
+    /// Saves the kit to `recovery-kit.txt` in `directory`, over a file that is already there if
+    /// there is one, and reads it back.
     fn kit(&self, directory: &Path) -> (std::path::PathBuf, RecoveryKit) {
         let path = directory.join("recovery-kit.txt");
         self.dialog_returns(&path);
