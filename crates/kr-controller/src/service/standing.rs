@@ -183,25 +183,24 @@ impl Controller {
             return Ok(Ok(installed));
         }
         let narrowed = matches!(installed.change, LeaseChange::Installed { narrowed: true });
-        let reach = if dropped_a_lease {
-            Some(super::barrier::Reach::Host)
+        let restriction = if dropped_a_lease {
+            Some((
+                super::barrier::Reach::Host,
+                "a policy-signing chain that dropped membership leases".to_owned(),
+            ))
         } else if narrowed {
-            Some(super::barrier::Reach::Device(device_id))
+            Some((
+                super::barrier::Reach::Device(device_id),
+                format!("a membership lease that narrows device {device_id}'s access"),
+            ))
         } else {
             None
         };
         // The debt is on disk before the restriction it covers is.
-        let owed = reach
-            .map(|reach| {
-                let covers = match reach {
-                    super::barrier::Reach::Host => {
-                        "a policy-signing chain that dropped membership leases".to_owned()
-                    }
-                    super::barrier::Reach::Device(_) => {
-                        format!("a membership lease that narrows device {device_id}'s access")
-                    }
-                };
-                self.owe_debt(&covers, reach).map(|debt| (debt, reach))
+        let owed = restriction
+            .map(|(reach, covers)| {
+                self.owe_debt(&covers, reach.clone())
+                    .map(|debt| (debt, reach))
             })
             .transpose()?;
         let snapshot = candidate.snapshot();

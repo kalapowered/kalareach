@@ -134,6 +134,12 @@ impl Controller {
         mutation: &MutationRequest,
         record: crate::grants::ActionRecord,
     ) -> Result<ParamsValue> {
+        // An organisation change that restricts work already admitted keeps a marker for its
+        // answer, which is built from the barrier as it stands now: the marker says the change
+        // committed, and the fence it owed is raised or finished before the caller is told.
+        if let Some(marker) = self.organisation_marker(mutation, &record) {
+            return self.answered_from_the_barrier(marker).await;
+        }
         match self.answer_without_fence(actor_id, mutation, &record) {
             Some(answer) => answer,
             None => self.revocation_on_record(actor_id, mutation).await,
@@ -608,6 +614,9 @@ impl Controller {
                         .await
                 }
                 Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
+                Method::OrganisationWithdraw => {
+                    self.organisation_withdraw(mutation, carried, &hold).await
+                }
                 Method::DevicePreviewKeyUpdate => {
                     self.device_preview_key_update(actor_id, mutation, carried)
                         .await
@@ -632,7 +641,10 @@ impl Controller {
         // neither an answer nor an attempt behind it. An enrolment that succeeded wrote its answer
         // in the transaction that enrolled this host, and a second write of it could only report
         // a storage failure for an action that is done.
-        let kept = method == Method::OrganisationEnrol && outcome.is_ok();
+        let kept = matches!(
+            method,
+            Method::OrganisationEnrol | Method::OrganisationWithdraw
+        ) && outcome.is_ok();
         if !kept {
             self.settle_claim(&hold, &outcome)?;
         }

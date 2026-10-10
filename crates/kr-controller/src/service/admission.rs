@@ -843,6 +843,21 @@ impl Controller {
                 let _: kr_protocol::organisation::OrganisationEnrolParams =
                     parse(&mutation.params)?;
             }
+            Method::OrganisationExclusiveSet | Method::OrganisationWithdraw => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "an organisation's policy belongs to this host, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                if method == Method::OrganisationWithdraw {
+                    let _: kr_protocol::organisation::OrganisationWithdrawParams =
+                        parse(&mutation.params)?;
+                } else {
+                    let _: kr_protocol::organisation::OrganisationExclusiveSetParams =
+                        parse(&mutation.params)?;
+                }
+            }
             // A machine group step changes this environment's own record, not a session's. A
             // request that named a session here would be asking for a record scoped to something
             // the record does not have.

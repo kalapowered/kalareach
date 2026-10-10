@@ -12,10 +12,13 @@
 use kr_protocol::confirmation::{ConfirmationDisplay, OrganisationEnrolPlan};
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::OrganisationId;
+use kr_protocol::method::Method;
 use kr_protocol::organisation::{
-    MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
-    OrganisationEnrolResult, OrganisationEnrolmentView, OrganisationLeaseView,
-    OrganisationListResult, OrganisationMemberView,
+    MembershipPresentParams, MembershipPresentResult, OrganisationChangeMarker,
+    OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
+    OrganisationExclusiveSetResult, OrganisationLeaseView, OrganisationListResult,
+    OrganisationMemberView, OrganisationWithdrawParams,
 };
 use kr_protocol::pairing::{KeyPurpose, SensitiveAction, key_id};
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, TimestampMs};
@@ -26,6 +29,8 @@ use crate::grants::organisation::{ChainRefused, LeaseInstalled};
 use crate::grants::{CLOCK_DISTRUSTED, FLOOR_UNRECORDED};
 use crate::sharing::ConfirmedAction;
 
+use super::Audience;
+use super::barrier::Reach;
 use super::{Controller, encode, parse};
 
 /// What `organisation.enrol` has settled before it claims the action: the chain, the plan the
@@ -62,6 +67,26 @@ pub(super) fn chain_refusal(refused: ChainRefused) -> ControllerError {
     }
 }
 
+/// Whether this policy lets the host leave `organisation_id`.
+fn check_withdrawal(
+    policy: &crate::grants::HostPolicy,
+    organisation_id: OrganisationId,
+) -> Result<()> {
+    if policy.enrolment(organisation_id).is_none() {
+        return Err(ControllerError::InvalidArgument(
+            "this host is not enrolled in that organisation".to_owned(),
+        ));
+    }
+    if policy.is_exclusively_managed() && policy.enrolments().count() == 1 {
+        return Err(ControllerError::InvalidArgument(
+            "this host is exclusively organisation-managed, and leaving its last organisation \
+             would leave nothing to answer for it; end exclusive management first"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The refusal a lease that a rule refuses is reported as: `PERMISSION_DENIED` naming the rule,
 /// except where the clock decided it, which keeps the code every other decision of the clock has.
 fn lease_refusal(refused: LeaseRefused) -> ControllerError {
@@ -80,6 +105,20 @@ fn lease_refusal(refused: LeaseRefused) -> ControllerError {
 }
 
 impl Controller {
+    /// Arms the pause a withdrawal from an organisation, or making the host exclusively
+    /// organisation-managed, stops at once its policy is written, before its fence is published.
+    /// Returns the end that says the change has arrived, and the end that lets it go. The pause
+    /// holds the thread, not the task, and the registry's guard with it. It fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_organisation_restriction_after_commit(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.after_an_organisation_restriction_commits.arm()
+    }
+
     /// Verifies the chain an owner asks to enrol this host in and states the plan whose digest the
     /// owner confirms.
     ///
@@ -220,6 +259,122 @@ impl Controller {
         )?;
         drop(registry);
         encode(&answer)
+    }
+
+    /// `organisation.withdraw`: this host leaves an organisation's policy, and is fenced for it.
+    ///
+    /// A withdrawal restricts work already admitted: every grant that requires the organisation
+    /// stops being honoured and every lease installed under the enrolment ends with it. So it
+    /// follows the order of every restriction. The registry's guard is taken first and held through
+    /// the publication of the debt, because a debt that is only owed refuses nothing, and a guard
+    /// let go earlier would let an enrolment pass the fence and read the revision the barrier is
+    /// about to replace. The debt is written first, one for the whole host on every withdrawal,
+    /// which also advances the revision when no grant required the organisation. The enrolment is
+    /// removed and the claim's marker is written in one transaction, so a repeat of the action can
+    /// tell a withdrawal that committed from one that never began; the debt is published whether
+    /// or not the write landed; and the answer is built from the barrier, which is raised once the
+    /// guard is let go.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` when this host is not enrolled in the organisation, or when it is
+    /// exclusively organisation-managed and this is its last enrolment, and what the admission, the
+    /// store or the barrier refuse with.
+    pub(super) async fn organisation_withdraw(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+        hold: &crate::grants::ClaimHold,
+    ) -> Result<ParamsValue> {
+        let params: OrganisationWithdrawParams = parse(&mutation.params)?;
+        let organisation_id = params.organisation_id;
+        let marker = kr_cbor::encode(
+            encode(&OrganisationChangeMarker::Withdrawn { organisation_id })?.as_value(),
+        );
+        let (written, own) = {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+            // Refused before anything is owed: a fence for a withdrawal that cannot happen is a
+            // revision advanced and every connection fenced for nothing.
+            check_withdrawal(&self.policy(), organisation_id)?;
+            let debt = self.owe_debt(
+                &format!("the withdrawal of organisation {organisation_id}"),
+                Reach::Host,
+            )?;
+            let written = self.update_policy_claimed(
+                hold,
+                |policy| {
+                    check_withdrawal(policy, organisation_id)?;
+                    policy.withdraw(organisation_id);
+                    Ok(((), marker))
+                },
+                || self.check_admission(&registry, &carried),
+            );
+            // Nothing is awaited between the write and the publication of its debt, here or in a
+            // test that stops the thread between them.
+            #[cfg(feature = "testing")]
+            self.after_an_organisation_restriction_commits.wait();
+            (written, self.publish_debts(&[(debt, Reach::Host)]))
+        };
+        match written {
+            Ok(()) => {
+                let completed = self.complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
+                    .await?;
+                encode(&completed)
+            }
+            // The debt is published and its barrier is the debt pass's.
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The marker a recorded answer to an organisation change that restricts keeps, when `record`
+    /// is one: the change committed, and its answer is built from the barrier.
+    pub(super) fn organisation_marker(
+        &self,
+        mutation: &MutationRequest,
+        record: &crate::grants::ActionRecord,
+    ) -> Option<OrganisationChangeMarker> {
+        let crate::grants::ActionRecord::Answered { result } = record else {
+            return None;
+        };
+        if !matches!(
+            mutation.method.method(),
+            Some(Method::OrganisationWithdraw | Method::OrganisationExclusiveSet)
+        ) {
+            return None;
+        }
+        kr_cbor::decode(result, &kr_cbor::Limits::DEFAULT)
+            .ok()
+            .and_then(|value| ParamsValue::new(value).to_typed().ok())
+    }
+
+    /// The answer to an organisation change whose marker is recorded: the revision and the
+    /// per-worker completion of the fence as the barrier stands now, raised again if it is still
+    /// owed.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the barrier refuses with.
+    pub(super) async fn answered_from_the_barrier(
+        &self,
+        marker: OrganisationChangeMarker,
+    ) -> Result<ParamsValue> {
+        let completed = self
+            .complete_revocation(
+                Audience::Host,
+                None,
+                CanonicalSet::new(),
+                self.publish_debts(&[]),
+            )
+            .await?;
+        match marker {
+            OrganisationChangeMarker::Withdrawn { .. } => encode(&completed),
+            OrganisationChangeMarker::ExclusiveOn => encode(&OrganisationExclusiveSetResult {
+                exclusive: true,
+                authority_revision: completed.authority_revision,
+                barrier: Nullable::some(completed.barrier),
+            }),
+        }
     }
 
     /// Whether the chain's head is still current, and this host still trusts the clock that said

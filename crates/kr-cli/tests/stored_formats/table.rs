@@ -567,6 +567,11 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
         ),
         (Method::DevicePushRegister, "DevicePushRegisterResult"),
         (Method::OrganisationEnrol, "OrganisationEnrolResult"),
+        (
+            Method::OrganisationExclusiveSet,
+            "OrganisationExclusiveSetResult",
+        ),
+        (Method::OrganisationWithdraw, "RevocationResult"),
         (Method::PrivacySet, "PrivacyReport"),
         (Method::AccountSignIn, "AccountSignInStarted"),
         (Method::AccountSignOut, "AccountSignedOut"),

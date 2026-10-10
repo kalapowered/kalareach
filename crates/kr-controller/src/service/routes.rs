@@ -717,7 +717,9 @@ impl Controller {
             | Method::DeliveryDestinationConfigure
             | Method::DeliveryDestinationRemove
             | Method::DeliveryDestinationSecretSet
-            | Method::OrganisationEnrol => {
+            | Method::OrganisationEnrol
+            | Method::OrganisationExclusiveSet
+            | Method::OrganisationWithdraw => {
                 self.authority_change(
                     actor_id,
                     super::authority_changes::AuthorityCaller::Owner,

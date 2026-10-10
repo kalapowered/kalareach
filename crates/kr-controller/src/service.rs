@@ -444,6 +444,12 @@ pub struct Controller {
     /// waits for the policy's lock. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_presentation_lock: crate::attention::Pause,
+    /// Where this host's own tests stop a withdrawal from an organisation, or making the host
+    /// exclusively organisation-managed, once its policy is written and before its fence is
+    /// published, so that another change can try to land in between. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    after_an_organisation_restriction_commits: crate::attention::Pause,
     /// Where this host's own tests stop a worker's rendezvous once its claim is committed, before
     /// its specification is made. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
