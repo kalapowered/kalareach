@@ -129,8 +129,8 @@ become authority by arriving over a channel the host trusts for something else.
 - Submitting a prompt needs a spoken confirmation that names the destination session. The host
   checks the session the interpreter read against the one it is about to submit to; that the words
   were a clear confirmation is for the interpreter, which gives a destination only for an utterance
-  that is one. The host's grammar reads status, briefing and going to a session, none of which
-  needs a destination, so what a person says cannot submit a prompt.
+  that is one. The host's grammar reads status, briefing, going to a session and closing one, none of
+  which needs a destination, so what a person says cannot submit a prompt.
 - An approval decision needs the verified request's details and an explicit answer. Details the host
   does not hold are refused rather than believed.
 - Cancelling a coding task uses the agent's typed request and its current turn identifier.
@@ -145,13 +145,15 @@ the provider's data channel, so it hands the host the transcript it vouches for.
 action, no session and no destination: **the host reads the words itself**, with a grammar of its
 own, and no model is called.
 
-At present the host reads three requests, said on their own: the status of a session, a briefing on
-one, and going to one. A session is named by its number, in digits or in words, and a request that
-names none means the call's one session when the call reaches only one. A question is the same
-request. The whole utterance has to be one of those; negation, a second request, a word the grammar
-does not hold and a number that cannot be read are each refused, and the refusal says what the host
-does read and never quotes what was said. A delegation answers with the action and the session the
-words were read to ask for, and a repeat of it is answered from what was read then.
+The host reads four requests, each said on its own: the status of a session, a briefing on one,
+going to one, and closing one. A session may be indicated by a session number, either in digits or
+spelled out. A status or a briefing that names no session means the call's one session when the call
+reaches only one; a close always names its session. A question is the same request, except for a
+close, which is a statement: "close session 3?" and "could you close session 3" are not read. The
+whole utterance has to be one of those. Negation, a second request, a word the grammar does not hold
+and a number that cannot be read are each refused, and the refusal says what the host does read and
+never quotes what was said. A delegation answers with the action and the session the words were read
+to ask for, and a repeat of it is answered from what was read then.
 
 The fragments are bounded: at most 16, of at most 512 bytes each and 2,048 in all, each starting no
 later than the delegation's offset and no more than thirty seconds before it, in the order they were
@@ -194,10 +196,11 @@ two requests can never each decide about the authority the other is writing.
 
 ## What this daemon performs and supplies
 
-The daemon performs one kind of voice action itself, the reading of a session, which covers
-navigating, status queries and briefing: the three requests it reads from what is said. For every
-other action that has a method it admits the proposal and reports it as admitted and not done,
-because the daemon does not dispatch to a session's worker, and a receipt stands for what was done.
+The daemon performs two kinds of voice action itself: the reading of a session, which covers
+navigating, status queries and briefing, and the closing of one
+([Closing a session by voice](#closing-a-session-by-voice)). For every other action that has a
+method it admits the proposal and reports it as admitted and not done, because the daemon does not
+dispatch to a session's worker for it, and a receipt stands for what was done.
 Delivering something externally has no method, so a proposal for it is refused. A decision on an
 approval is refused: the daemon holds no approval's details to check a spoken decision against.
 
@@ -233,6 +236,30 @@ or description host information.
 It has its own identity and its own end. Stopping a voice session names the terminal sessions it
 reached and closes none of them; nothing in the coordinator can close one without an unlocked-screen
 confirmation of its own. Voice can stop while the agent keeps working.
+
+## Closing a session by voice
+
+To close a session the user may say, e.g., "close session 3". The host reads the words and answers
+with the challenge that the paired device signs on its unlocked screen. Nothing is closed until the
+signed delegation comes back, and no amount of provider text stands in for the signature. The host
+then sends the close to the session's worker the way that device's own close goes: as that device,
+over a link opened for the close, under the action identifier of the delegation, carrying the right
+to close and no voice right. It checks the grants once more just before it sends, and sends nothing
+if either the call's voice grant or the device's own grant no longer reaches that session. The call
+keeps running, and only the session it named is closed.
+
+The worker's answer is the receipt. A session that is closing or already closed is reported as done,
+and a worker that refuses is reported as refusing. A worker that does not answer in time leaves the
+outcome uncertain, and the close is then not sent again.
+
+A close runs on a task of its own, so a connection that goes away does not call it back. The task
+records what the worker answered under the delegation's claim, and a device that asks again is given
+that receipt. While a worker can still take a close up, withdrawing the voice grant it was sent
+under owes a fence for the device that holds the call: the host advances the authority revision,
+withdraws that device's connections and leaves every other connection admitted. A worker that has
+installed the new revision refuses a close it had not started. Once the worker has answered, or the
+deadline the close was sent with has passed, stopping the call owes nothing and withdraws no
+connection.
 
 ## The rate a call runs under
 

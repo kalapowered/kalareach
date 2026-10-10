@@ -5472,6 +5472,13 @@ answer is not replayed from the record. The read is performed again using the cu
 history bound. In particular, if the call has ended or a grant has gone, the answer to the action is
 a refusal.
 
+A delegation that closes a session runs on a task that outlives the connection it arrived on. The
+task keeps the claim and records the worker's answer before it lets go, so a retry after a dropped
+connection is given the receipt and the session is closed once. A voice grant withdrawn while a
+worker can still take its close up writes a fence debt for the device that holds the call, and the
+barrier that retires it withdraws that device's connections and no others. See [Closing a session by
+voice](../voice/README.md#closing-a-session-by-voice).
+
 The fence this daemon takes withdraws the registrations the change reaches, and the connections that
 kept their authority are re-admitted at the revision now in force. A change to this host's policy
 or a revocation of authority that is not one device's or one share's reaches every registration;
