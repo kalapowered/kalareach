@@ -170,7 +170,8 @@ fn kr_req_10_51_an_earlier_device_row_that_names_nothing_reads_and_writes_back_u
     assert_eq!(
         read.grant,
         Grant {
-            history: grant.history.clone().from_start(read.paired_at_ms.get()),
+            // The device was paired at the moment `device_record` gives it.
+            history: grant.history.clone().from_start(1_000),
             ..grant
         }
     );
@@ -539,10 +540,8 @@ fn kr_req_10_51_an_earlier_grant_row_reads_unchanged_or_permits_nothing() {
     assert_eq!(
         read.grant,
         Grant {
-            history: grant
-                .history
-                .clone()
-                .from_start(read.activated_at_ms.expect("redeemed")),
+            // The grant was redeemed at the moment `record` gives it.
+            history: grant.history.clone().from_start(1_000),
             ..grant
         }
     );
