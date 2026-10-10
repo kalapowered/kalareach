@@ -54,6 +54,8 @@ struct Host {
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
     app: tauri::App<MockRuntime>,
     window: tauri::WebviewWindow<MockRuntime>,
+    /// Where the application keeps the answers a host did not confirm.
+    kept: tempfile::TempDir,
 }
 
 impl Drop for Host {
@@ -142,6 +144,8 @@ impl Host {
                 companion_tauri::commands::description_setup,
                 companion_tauri::commands::description_configure,
                 companion_tauri::commands::description_download,
+                companion_tauri::commands::question_kept,
+                companion_tauri::commands::question_settle,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
@@ -151,6 +155,9 @@ impl Host {
         app.state::<companion_tauri::AppState>().connected(
             companion_tauri::connection::Connection::over(transport).expect("a connection"),
         );
+        let kept = tempfile::tempdir().expect("a place for the kept answers");
+        app.state::<companion_tauri::AppState>()
+            .keep_under(kept.path());
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");
@@ -161,6 +168,7 @@ impl Host {
             clients,
             app,
             window,
+            kept,
         }
     }
 
@@ -480,6 +488,61 @@ async fn an_ended_sessions_history_is_the_hosts_to_answer() {
             );
         }
     }
+}
+
+/// An answer kept for a session whose worker is gone is settled by what the daemon on this machine
+/// says of the session, as it was before the application checked which host an answer was given to:
+/// the worker's descriptor is not needed to know which machine the session ran on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_kept_for_a_session_whose_worker_has_gone_is_settled_as_gone() {
+    use kr_client::answers::{ANSWER_FORMAT, AnswerDraft, AnswerDrafts, WRITTEN};
+    use kr_protocol::envelope::ActionTarget;
+    use kr_protocol::ids::{QuestionId, QuestionRevision, SessionEpoch, SessionId};
+    use kr_protocol::question::QuestionAnswer;
+    use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
+
+    let host = Host::start().await;
+    let environment_id = host.tree.environment_id();
+    let session_id = SessionId::new(Uuid::from_bytes([7; 16]));
+    let question_id = QuestionId::new(Uuid::from_bytes([5; 16]));
+    let draft = AnswerDraft {
+        version: ANSWER_FORMAT,
+        target: ActionTarget {
+            environment_id,
+            session_id: Nullable::some(session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        },
+        session_id,
+        question_id,
+        question_revision: QuestionRevision::new(2),
+        answer: QuestionAnswer::Choice {
+            choice_id: "main".to_owned(),
+        },
+        drafted_at_ms: TimestampMs::new(5),
+    };
+    let store = AnswerDrafts::open(
+        host.kept
+            .path()
+            .join("kept-answers")
+            .join(environment_id.to_string()),
+    )
+    .expect("a store");
+    let writers = kr_ipc::install::hold_writers(&mut || {}).expect("the writers lock");
+    let permit = writers.permit(&WRITTEN).expect("the leave to write");
+    store.keep(&draft, &permit).expect("kept");
+
+    // No worker is serving the session, and the daemon has no such session either.
+    let settled = host
+        .call(
+            "question_settle",
+            json!({ "params": { "sessionId": session_id.to_string() } }),
+        )
+        .await
+        .expect("the standing of the kept answer");
+    assert_eq!(settled.as_array().map(Vec::len), Some(1), "{settled}");
+    assert_eq!(settled[0]["standing"], "gone", "{settled}");
 }
 
 /// KR-REQ-07.21: a creation of a stock shell, written as the page writes it, reaches the host's own

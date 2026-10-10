@@ -237,6 +237,58 @@ async fn a_question_not_shown_or_shown_at_another_revision_is_not_answered() {
     );
 }
 
+/// Reading one question does not make the session's other questions unanswerable: what the page
+/// was shown of them is still what it was shown until a read of them all says otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_one_question_leaves_the_sessions_others_answerable() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let first = question(&worker, 2, QuestionState::Pending);
+    let mut second = question(&worker, 2, QuestionState::Pending);
+    second.question_id = QuestionId::new(Uuid::from_bytes([6; 16]));
+
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(&call, &reads(&worker, vec![first.clone(), second.clone()]))
+        .await;
+    answered(read).await.expect("both questions");
+
+    // The page reads the first alone.
+    let one = page.call(
+        "question_read",
+        json!({ "params": {
+            "session_id": worker.session_id.to_string(),
+            "question_id": first.question_id.to_string(),
+            "include_resolved": true
+        } }),
+    );
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(&call, &reads(&worker, vec![first.clone()]))
+        .await;
+    answered(one).await.expect("the one question");
+
+    // The second is still the question the person was shown.
+    let asked = page.call(
+        "question_answer",
+        json!({ "params": {
+            "session_id": worker.session_id.to_string(),
+            "question_id": second.question_id.to_string(),
+            "expected_revision": "2",
+            "answer": serde_json::to_value(choice("main")).expect("an answer's JSON")
+        } }),
+    );
+    let call = link.expect(Method::QuestionAnswer).await;
+    let mut resolved = resolution(&worker, QuestionState::Answered);
+    resolved.question_id = second.question_id;
+    if let Some(each) = resolved.question.0.as_mut() {
+        each.question_id = second.question_id;
+    }
+    link.answer(&call, &resolved).await;
+    let told = answered(asked).await.expect("the worker's answer");
+    assert_eq!(told["outcome"], "taken");
+}
+
 /// An answer that does not fit the question's form is refused where the person is, and nothing is
 /// sent or kept: a listed choice cannot be "something else", and a choice the question does not
 /// offer is not one.
