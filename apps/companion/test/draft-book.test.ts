@@ -355,7 +355,7 @@ describe('a prompt sent from a draft (the draft goes only once the host took it)
       // text is a draft of its own that a person finds in the kept drafts.
       expect(store.all().map((draft) => draft.text).sort()).toEqual(['send this', 'the next thing'])
       expect(book.draft(MAIN).text).toBe('the next thing')
-      expect(book.snapshot().kept.map((kept) => [kept.text, kept.why])).toEqual([['send this', 'other']])
+      expect(book.snapshot().kept.map((kept) => [kept.text, kept.why])).toEqual([['send this', 'sent']])
       expect(notices.join(' ')).toMatch(/kept/i)
 
       // After a restart the composer holds the newer text and the older one is still listed.
@@ -483,14 +483,15 @@ describe('the drafts nobody has open', () => {
       ['for a session that went', 'orphaned']
     ])
 
-    const id = book.snapshot().kept[0]?.id ?? ''
-    await book.moveTo(id, MAIN)
+    const row = book.snapshot().kept[0]
+    await book.moveTo(row?.id ?? '', MAIN, row?.revision ?? '')
     expect(store.all()[0]).toMatchObject({ sessionId: MAIN, state: 'open' })
     expect(book.snapshot().kept).toEqual([])
     expect(book.draft(MAIN).text).toBe('for a session that went')
 
     // The composer of the new session holds it now, and discarding it empties that composer.
-    await book.discard(book.draft(MAIN).stored?.id ?? '')
+    const held = book.draft(MAIN).stored
+    await book.discard(held?.id ?? '', held?.revision ?? '')
     expect(store.all()).toEqual([])
     expect(book.draft(MAIN).text).toBe('')
   })
@@ -532,7 +533,7 @@ describe('moving a draft to another session', () => {
     type(book, MAIN, 'newer, and too large to keep')
     await book.settled()
 
-    await expect(book.moveTo(id, BUILD)).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    await expect(book.moveTo(id, BUILD, '1')).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
     // Nothing moved, and the newer text is still in the composer.
     expect(store.all().map((draft) => [draft.sessionId, draft.text])).toEqual([[MAIN, 'older']])
     expect(book.draft(MAIN).text).toBe('newer, and too large to keep')
@@ -551,10 +552,13 @@ describe('moving a draft to another session', () => {
       attachments: []
     })
     const book = await opened(store)
-    const id = book.snapshot().kept[0]?.id ?? ''
+    const shown = book.snapshot().kept[0]
+    const id = shown?.id ?? ''
     store.writeAsAnotherWindow(id, { text: 'changed in the other window' })
 
-    await expect(book.moveTo(id, MAIN)).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+    await expect(book.moveTo(id, MAIN, shown?.revision ?? '')).rejects.toMatchObject({
+      code: 'DRAFT_CONFLICT'
+    })
     // The list shows what is stored now, so the person decides on what they see. What this window
     // held is kept too: the other window's version did not replace it.
     await book.settled()
@@ -564,7 +568,7 @@ describe('moving a draft to another session', () => {
       'for a session that went'
     ])
     const theirs = listed.find((kept) => kept.text === 'changed in the other window')
-    await book.moveTo(theirs?.id ?? '', MAIN)
+    await book.moveTo(theirs?.id ?? '', MAIN, theirs?.revision ?? '')
     expect(store.all().find((draft) => draft.sessionId === MAIN)).toMatchObject({
       text: 'changed in the other window'
     })
@@ -572,7 +576,12 @@ describe('moving a draft to another session', () => {
 })
 
 describe('a draft another window changed, when this window settles it', () => {
-  async function conflicted(): Promise<{ store: FakeDraftStore; book: DraftBook; id: string }> {
+  async function conflicted(): Promise<{
+    store: FakeDraftStore
+    book: DraftBook
+    id: string
+    revision: string
+  }> {
     const store = new FakeDraftStore()
     const book = await opened(store)
     book.update(MAIN, (draft) => ({
@@ -582,8 +591,9 @@ describe('a draft another window changed, when this window settles it', () => {
     }))
     await book.settled()
     const id = store.all()[0]?.id ?? ''
+    const revision = store.all()[0]?.revision ?? ''
     store.writeAsAnotherWindow(id, { text: 'theirs' })
-    return { store, book, id }
+    return { store, book, id, revision }
   }
 
   it('lets a retarget go through on the second try, with the text of this window kept apart from theirs', async () => {
@@ -606,8 +616,8 @@ describe('a draft another window changed, when this window settles it', () => {
   })
 
   it('lets a discard go through on the second try, once the list shows what is stored', async () => {
-    const { store, book, id } = await conflicted()
-    await expect(book.discard(id)).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+    const { store, book, id, revision } = await conflicted()
+    await expect(book.discard(id, revision)).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
     // Nothing was removed, and the text this window holds was not lost to the refusal.
     expect(store.all().map((draft) => draft.text)).toContain('theirs')
     expect(book.draft(MAIN).text).toBe('for the old conversation')
@@ -615,7 +625,7 @@ describe('a draft another window changed, when this window settles it', () => {
 
     const theirs = book.snapshot().kept.find((kept) => kept.text === 'theirs')
     expect(theirs).toBeDefined()
-    await book.discard(theirs?.id ?? '')
+    await book.discard(theirs?.id ?? '', theirs?.revision ?? '')
     expect(store.all().map((draft) => draft.text)).toEqual(['for the old conversation'])
   })
 })
@@ -637,7 +647,7 @@ describe('a kept draft of a session that is listed', () => {
     const mine = restarted.snapshot().kept.find((kept) => kept.text === 'mine')
     expect(mine?.why).toBe('copy')
 
-    await restarted.useHere(mine?.id ?? '')
+    await restarted.useHere(mine?.id ?? '', mine?.revision ?? '')
     await restarted.settled()
     expect(restarted.draft(MAIN).text).toBe('mine')
     // Their text is not lost to putting mine in the composer.
@@ -706,5 +716,248 @@ describe('what a draft sends the store', () => {
     await book.settled()
     expect(seen).toHaveLength(1)
     expect((seen[0] as { preview: unknown }[])[0]?.preview).toBeNull()
+  })
+})
+
+describe('a store read while a prompt is on its way', () => {
+  for (const outcome of ['taken', 'refused', 'unknown'] as const) {
+    it(`does not hand the prompt's stored text back to the composer before it ends (${outcome})`, async () => {
+      const store = new FakeDraftStore()
+      const book = await opened(store)
+      type(book, MAIN, 'send this')
+      await book.settled()
+      const token = book.beginSend(MAIN)
+      type(book, MAIN, '')
+      await book.settled()
+
+      // Something reads the store again: a discard in the kept drafts, a copy another window made.
+      await book.reload()
+      expect(book.draft(MAIN).text).toBe('')
+      expect(book.snapshot().kept).toEqual([])
+
+      book.endSend(token, outcome)
+      await book.settled()
+      const restarted = await opened(store)
+      if (outcome === 'taken') {
+        expect(store.all()).toEqual([])
+        expect(book.draft(MAIN).text).toBe('')
+        expect(restarted.draft(MAIN).text).toBe('')
+      } else {
+        expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+        expect(book.draft(MAIN).text).toBe('send this')
+        expect(restarted.draft(MAIN).text).toBe('send this')
+      }
+    })
+  }
+
+  it('keeps the text that was sent when the returned text is edited before the refusal', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    await book.settled()
+    await book.reload()
+    type(book, MAIN, 'written meanwhile')
+    await book.settled()
+
+    book.endSend(token, 'refused')
+    await book.settled()
+    expect(store.all().map((draft) => draft.text).sort()).toEqual(['send this', 'written meanwhile'])
+    expect(book.draft(MAIN).text).toBe('written meanwhile')
+  })
+
+  it('keeps both texts when another window changed the stored prompt meanwhile', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    await book.settled()
+    store.writeAsAnotherWindow(store.all()[0]?.id ?? '', { text: 'the other window’s' })
+
+    book.endSend(token, 'refused')
+    await book.settled()
+    expect(book.draft(MAIN).text).toBe('send this')
+    expect(store.all().map((draft) => draft.text).sort()).toEqual(['send this', 'the other window’s'])
+  })
+})
+
+describe('a prompt whose text could not be stored when it ended', () => {
+  it('keeps the older stored version, and stores the prompt’s text apart once the store takes it', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send')
+    await book.settled()
+    store.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    type(book, MAIN, 'the next thing')
+    await book.settled()
+    // The store still refuses when the prompt ends: nothing may be removed that it holds.
+    book.endSend(token, 'refused')
+    await book.settled()
+    expect(store.all().map((draft) => draft.text)).toEqual(['send'])
+
+    store.refuseSaves(null)
+    book.writeAll()
+    await book.settled()
+    expect(store.all().map((draft) => draft.text).sort()).toEqual(['send this', 'the next thing'])
+    expect(book.draft(MAIN).text).toBe('the next thing')
+  })
+})
+
+describe('a kept draft acted on after the list moved under the person', () => {
+  it('moves what the composer holds now, when a save made a copy between the press and the move', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    book.update(MAIN, (draft) => ({ ...edit(draft, 'older', 1), state: 'conflicted' }))
+    await book.settled()
+    const row = book.snapshot().kept[0]
+    store.writeAsAnotherWindow(row?.id ?? '', { text: 'theirs' })
+    // The person types, and presses Move before the write that follows has ended: it makes a copy.
+    type(book, MAIN, 'newer')
+    const moving = book.moveTo(row?.id ?? '', BUILD, row?.revision ?? '')
+    await moving
+    await book.settled()
+
+    expect(store.all().map((draft) => [draft.sessionId, draft.text]).sort()).toEqual([
+      [MAIN, 'theirs'],
+      [BUILD, 'newer']
+    ])
+  })
+
+  it('refuses to discard another window’s version that the row did not show', async () => {
+    const store = new FakeDraftStore()
+    for (const text of ['older', 'newer']) {
+      store.save({
+        id: null,
+        expectedRevision: null,
+        sessionId: MAIN,
+        applicationInstanceId: null,
+        agentBindingRevision: null,
+        state: 'open',
+        text,
+        attachments: []
+      })
+    }
+    const book = await opened(store)
+    const row = book.snapshot().kept[0]
+    expect(row?.text).toBe('older')
+    // Another window changed it, and this window read the store again before the press.
+    store.writeAsAnotherWindow(row?.id ?? '', { text: 'changed since it was shown' })
+    await book.reload()
+
+    await expect(book.discard(row?.id ?? '', row?.revision ?? '')).rejects.toMatchObject({
+      code: 'DRAFT_CONFLICT'
+    })
+    expect(store.all().map((draft) => draft.text).sort()).toEqual(['changed since it was shown', 'newer'])
+  })
+
+  it('does not reuse an edit number: a composer put in place of another starts above it', async () => {
+    const store = new FakeDraftStore()
+    const one = await opened(store)
+    type(one, MAIN, 'begun')
+    await one.settled()
+    const two = await opened(store)
+    type(two, MAIN, 'theirs')
+    await two.settled()
+    type(one, MAIN, 'mine')
+    await one.settled()
+    type(one, MAIN, 'mine, and more')
+    await one.settled()
+
+    const restarted = await opened(store)
+    const before = restarted.draft(MAIN).revision
+    const copy = restarted.snapshot().kept.find((kept) => kept.why === 'copy')
+    await restarted.useHere(copy?.id ?? '', copy?.revision ?? '')
+    expect(restarted.draft(MAIN).revision).toBeGreaterThan(before)
+
+    // And a composer made new after its draft was moved away starts above where that one ended.
+    const row = restarted.snapshot().kept[0]
+    const ended = restarted.draft(MAIN).revision
+    await restarted.moveTo(restarted.draft(MAIN).stored?.id ?? '', BUILD, restarted.draft(MAIN).stored?.revision ?? '')
+    expect(restarted.draft(MAIN).revision).toBeGreaterThan(ended)
+    expect(row).toBeDefined()
+  })
+
+  it('keeps the text written while a kept draft was being put in the composer', async () => {
+    const store = new FakeDraftStore()
+    const one = await opened(store)
+    type(one, MAIN, 'begun')
+    await one.settled()
+    const two = await opened(store)
+    type(two, MAIN, 'theirs')
+    await two.settled()
+    type(one, MAIN, 'mine')
+    await one.settled()
+
+    const real = portOver(store)
+    let release: () => void = () => undefined
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let reached: () => void = () => undefined
+    const asked = new Promise<void>((resolve) => {
+      reached = resolve
+    })
+    const book = new DraftBook({
+      ...real,
+      deviceDraftRetarget: async (request: DraftRetargetRequest) => {
+        const answer = await real.deviceDraftRetarget(request)
+        reached()
+        await held
+        return answer
+      }
+    })
+    await book.hydrate()
+    const copy = book.snapshot().kept.find((kept) => kept.why === 'copy')
+    const using = book.useHere(copy?.id ?? '', copy?.revision ?? '')
+    await asked
+    // The person comes back to the composer and writes while the store is answering.
+    type(book, MAIN, 'written while it was being put there')
+    release()
+    await using
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('written while it was being put there')
+    // What was written replaced the text it was written over, as writing does, and the kept draft
+    // is stored and listed, not lost and not put over it.
+    expect(store.all().map((draft) => draft.text).sort()).toEqual([
+      'mine',
+      'written while it was being put there'
+    ])
+    expect(book.snapshot().kept.map((kept) => kept.text)).toEqual(['mine'])
+  })
+})
+
+describe('a retarget of a draft another window removed', () => {
+  it('goes through on the second try, with the text kept as a draft again', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    book.update(MAIN, (draft) => ({
+      ...edit(draft, 'for the old conversation', 1),
+      target: { sessionId: MAIN, applicationInstanceId: 'a-1', agentBindingRevision: '3' },
+      state: 'conflicted'
+    }))
+    await book.settled()
+    const [stored] = store.all()
+    store.discard({ id: stored?.id ?? '', expectedRevision: stored?.revision ?? '' })
+
+    book.retarget(MAIN, { sessionId: MAIN, applicationInstanceId: 'a-2', agentBindingRevision: '1' })
+    await book.settled()
+    expect(book.draft(MAIN).state).toBe('conflicted')
+    expect(book.draft(MAIN).text).toBe('for the old conversation')
+
+    book.retarget(MAIN, { sessionId: MAIN, applicationInstanceId: 'a-2', agentBindingRevision: '1' })
+    await book.settled()
+    expect(book.draft(MAIN).state).toBe('bound')
+    expect(store.all().map((draft) => [draft.text, draft.state])).toEqual([
+      ['for the old conversation', 'open']
+    ])
   })
 })

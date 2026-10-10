@@ -183,7 +183,8 @@ export class FakeDraftStore {
   retarget(request: DraftRetargetRequest): StoredDraft {
     this.calls.push({ kind: 'retarget' })
     const held = this.#drafts.get(request.id)
-    if (held === undefined) refuse('INVALID_ARGUMENT', `no draft ${request.id} is stored`)
+    // Another window removed it: refused as a draft it changed is, which a window lets go on.
+    if (held === undefined) refuse('DRAFT_CONFLICT', `draft ${request.id} was removed by another window`)
     if (held.revision !== request.expectedRevision) {
       refuse('DRAFT_CONFLICT', `draft ${request.id} is at version ${held.revision}, not ${request.expectedRevision}: another window changed it`)
     }

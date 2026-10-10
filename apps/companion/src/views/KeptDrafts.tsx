@@ -36,6 +36,8 @@ function whyWords(why: KeptWhy): string {
       return 'Another window of this application changed this draft while you were writing in it, so what you wrote here is kept as its own draft.'
     case 'other':
       return 'This session’s composer holds a different draft.'
+    case 'sent':
+      return 'The host did not take this prompt, or could not say it did. It is kept so that nothing you wrote is lost.'
   }
 }
 
@@ -158,13 +160,13 @@ export function KeptDrafts({
               sessions={sessions}
               busy={busy === each.id}
               onMove={(sessionId) => {
-                run(each.id, () => book.moveTo(each.id, sessionId), 'The draft was not moved')
+                run(each.id, () => book.moveTo(each.id, sessionId, each.revision), 'The draft was not moved')
               }}
               onUse={() => {
-                run(each.id, () => book.useHere(each.id), 'The draft was not put in its composer')
+                run(each.id, () => book.useHere(each.id, each.revision), 'The draft was not put in its composer')
               }}
               onDiscard={() => {
-                run(each.id, () => book.discard(each.id), 'The draft was not discarded')
+                run(each.id, () => book.discard(each.id, each.revision), 'The draft was not discarded')
               }}
             />
           ))}
