@@ -60,15 +60,9 @@ pub(crate) enum Reach {
     /// revision the barrier advances to, so one device's revocation is not everybody's reconnect.
     Device(kr_protocol::ids::DeviceId),
     /// The connections acting under these grants, which a share's revocation withdrew with its
-    /// descendants. A connection that acts under any other grant, and the owner's own, are
-    /// admitted again at the revision the barrier advances to.
-    Grants {
-        /// The grants withdrawn.
-        grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
-        /// The devices those grants were issued to, which a notice names in place of the grants
-        /// when the subtree is too large for it to name them.
-        held_by: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
-    },
+    /// descendants, each with the device it was issued to. A connection that acts under any other
+    /// grant, and the owner's own, are admitted again at the revision the barrier advances to.
+    Grants(std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::ids::DeviceId>),
 }
 
 /// The restrictive changes whose fence debt no barrier has retired (section 26).
@@ -99,16 +93,15 @@ pub(super) struct Debts {
     ///
     /// A daemon that restarts keeps none, and a revision with no entry is announced as the whole
     /// host's, which fences every caller under a grant.
-    reaches: BTreeMap<u64, Option<Named>>,
+    reaches: BTreeMap<u64, Option<std::sync::Arc<Named>>>,
 }
 
 /// The grants and the devices one revision withdrew authority from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Named {
-    grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
+    /// The grants, each with the device it was issued to, which is the device that acts under it.
+    grants: std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::ids::DeviceId>,
     devices: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
-    /// The devices the named grants were issued to.
-    held_by: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
 }
 
 impl Named {
@@ -123,28 +116,39 @@ impl Named {
 
     fn joined(&self, other: &Self) -> Self {
         Self {
-            grants: self.grants.union(&other.grants).copied().collect(),
+            grants: self
+                .grants
+                .iter()
+                .chain(other.grants.iter())
+                .map(|(grant, device)| (*grant, *device))
+                .collect(),
             devices: self.devices.union(&other.devices).copied().collect(),
-            held_by: self.held_by.union(&other.held_by).copied().collect(),
         }
     }
 
-    /// This as a notice can carry it: as it is when it fits, and otherwise as the devices that
-    /// hold the grants, which are the devices of one subtree and no others, so a device that
-    /// delegates a great many grants takes the input of the devices it delegated to and of no
-    /// device outside them. Only more devices than a notice can name make it none: the whole
+    /// This named by devices alone: the devices it names and the devices that hold its grants.
+    /// A device that took part in what was withdrawn loses its input under every grant it holds.
+    fn by_devices(&self) -> Self {
+        Self {
+            grants: std::collections::BTreeMap::new(),
+            devices: self
+                .devices
+                .iter()
+                .chain(self.grants.values())
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// This as a notice can carry it: as it is when it fits, and otherwise by devices
+    /// ([`Self::by_devices`]). Only more devices than a notice can name make it none: the whole
     /// host's, which no device can bring about, since the owner pairs every device.
     fn fitted(self) -> Option<Self> {
         if self.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES {
             return Some(self);
         }
-        let devices: std::collections::BTreeSet<_> =
-            self.devices.union(&self.held_by).copied().collect();
-        (devices.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES).then_some(Self {
-            grants: std::collections::BTreeSet::new(),
-            devices,
-            held_by: std::collections::BTreeSet::new(),
-        })
+        Some(self.by_devices())
+            .filter(|named| named.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES)
     }
 }
 
@@ -408,14 +412,15 @@ impl Controller {
         // still durably recorded: a revocation is not complete for a worker this daemon cannot
         // account for, and reporting over the directory alone would let a replacement daemon that
         // has reached nobody report success.
-        let known: Vec<SessionId> = {
+        let recorded: BTreeMap<SessionId, AuthorityRevision> = {
             let registry = self.registry.lock().await;
             registry
                 .workers()?
                 .into_iter()
-                .map(|worker| worker.session_id)
+                .map(|worker| (worker.session_id, worker.acknowledged_revision))
                 .collect()
         };
+        let known: Vec<SessionId> = recorded.keys().copied().collect();
         let mut attempted: Vec<SessionId> = Vec::new();
         // The workers that acknowledged, with the binding each acknowledged under: the pages of
         // evidence that follow an acknowledgement are asked for once every worker has been asked
@@ -443,6 +448,10 @@ impl Controller {
                         // opposite of completion.
                         let notice = self.revision_notice(
                             revision,
+                            recorded
+                                .get(&session_id)
+                                .copied()
+                                .unwrap_or_else(|| AuthorityRevision::new(0)),
                             0,
                             &link.client().acknowledgement().capabilities,
                         );
@@ -832,7 +841,9 @@ impl Controller {
     /// A debt that reaches every connection is the whole host. The others are the grants and the
     /// devices they name, or the devices that hold the grants when there are too many to name
     /// ([`Named::fitted`]).
-    fn reach_of(captured: &BTreeMap<crate::grants::store::DebtId, Reach>) -> Option<Named> {
+    fn reach_of(
+        captured: &BTreeMap<crate::grants::store::DebtId, Reach>,
+    ) -> Option<std::sync::Arc<Named>> {
         let mut named = Named::default();
         for reach in captured.values() {
             match reach {
@@ -840,49 +851,79 @@ impl Controller {
                 Reach::Device(device_id) => {
                     named.devices.insert(*device_id);
                 }
-                Reach::Grants { grants, held_by } => {
-                    named.grants.extend(grants.iter().copied());
-                    named.held_by.extend(held_by.iter().copied());
+                Reach::Grants(grants) => {
+                    named
+                        .grants
+                        .extend(grants.iter().map(|(grant, device)| (*grant, *device)));
                 }
             }
         }
-        named.fitted().filter(|named| !named.is_empty())
+        named
+            .fitted()
+            .filter(|named| !named.is_empty())
+            .map(std::sync::Arc::new)
     }
 
-    /// What the revisions up to `revision` withdrew, as far back as this daemon can say.
+    /// What the revisions a worker has not fenced withdrew, up to `revision`.
     ///
-    /// The reaches of the consecutive revisions before it that each name their authority are joined
-    /// to its own, so a worker that has missed some of them, or that announces a later revision
-    /// than the one that was written, is still told. The reach describes the revisions after
-    /// `since`, the first one back that this daemon cannot name or that would make the notice too
-    /// large; a worker that has fenced that one applies it, and any other fences every caller under
-    /// a grant. A revision this daemon holds no reach for, because it restarted since, is the
-    /// whole host's.
-    fn reach_up_to(&self, revision: AuthorityRevision) -> kr_protocol::worker::RevisionReach {
-        let debts = self.debts();
-        let Some(Some(newest)) = debts.reaches.get(&revision.get()) else {
+    /// `held` is the revision the worker last acknowledged, as this daemon recorded it, so the
+    /// reach joins the revisions after it and no older ones: a lease the worker holds from before
+    /// is a lease its holder took after those revisions, and a notice that named the holders of an
+    /// older revision again would take it. The reaches of consecutive revisions that each name
+    /// their authority are joined, back to the first one this daemon cannot name; the reach says it
+    /// follows that one, and a worker that has fenced it applies the reach, while any other fences
+    /// every caller under a grant. A join that passes what a notice can name is named by the
+    /// devices of its older revisions first ([`Named::by_devices`]), and the newest are kept by
+    /// grant for as long as they fit. A revision this daemon holds no reach for, because it
+    /// restarted since, is the whole host's.
+    fn reach_up_to(
+        &self,
+        revision: AuthorityRevision,
+        held: AuthorityRevision,
+    ) -> kr_protocol::worker::RevisionReach {
+        // The entries are taken under the lock and joined outside it: they are shared, not copied.
+        let entries: Vec<std::sync::Arc<Named>> = {
+            let debts = self.debts();
+            let mut entries = Vec::new();
+            let mut at = revision.get();
+            while at > held.get() {
+                let Some(Some(entry)) = debts.reaches.get(&at) else {
+                    break;
+                };
+                entries.push(std::sync::Arc::clone(entry));
+                at -= 1;
+            }
+            entries
+        };
+        let Some((newest, older)) = entries.split_first() else {
             return kr_protocol::worker::RevisionReach::Host;
         };
-        let mut named = newest.clone();
-        let mut since = revision.get().saturating_sub(1);
-        while since > 0 {
-            let Some(Some(earlier)) = debts.reaches.get(&since) else {
-                break;
-            };
-            let Some(joined) = named.joined(earlier).fitted() else {
+        let bound = kr_protocol::worker::MAX_REVISION_REACH_NAMES;
+        let mut named = Named::clone(newest);
+        let mut lowest = revision.get();
+        for entry in older {
+            // As it is when it fits. Past what a notice can name, the older revision is named by
+            // its devices and the newer ones stay by grant while that fits, and then all are
+            // named by devices.
+            let fits = |joined: Named| Some(joined).filter(|joined| joined.len() <= bound);
+            let joined = fits(named.joined(entry))
+                .or_else(|| fits(named.joined(&entry.by_devices())))
+                .or_else(|| fits(named.by_devices().joined(&entry.by_devices())));
+            let Some(joined) = joined else {
                 break;
             };
             named = joined;
-            since -= 1;
+            lowest -= 1;
         }
         kr_protocol::worker::RevisionReach::Within {
-            since: AuthorityRevision::new(since),
-            grants: named.grants.into_iter().collect(),
+            since: AuthorityRevision::new(lowest.saturating_sub(1)),
+            grants: named.grants.into_keys().collect(),
             devices: named.devices.into_iter().collect(),
         }
     }
 
-    /// The announcement of `revision` to a worker that said `capabilities` in its hello.
+    /// The announcement of `revision` to a worker that said `capabilities` in its hello and last
+    /// acknowledged `held`, as this daemon recorded it.
     ///
     /// It names whose authority the revisions withdrew ([`Self::reach_up_to`]) only to a worker
     /// that reads that, and only for the first page of the revision's evidence: a continuation asks
@@ -890,12 +931,13 @@ impl Controller {
     pub(crate) fn revision_notice(
         &self,
         revision: AuthorityRevision,
+        held: AuthorityRevision,
         evidence_from: u64,
         capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> kr_protocol::worker::AuthorityRevisionNotice {
         let reach = if evidence_from == 0 && kr_protocol::local::reads_revision_reach(capabilities)
         {
-            self.reach_up_to(revision)
+            self.reach_up_to(revision, held)
         } else {
             kr_protocol::worker::RevisionReach::Host
         };
@@ -946,7 +988,7 @@ impl Controller {
                     captured
                         .values()
                         .filter_map(|reach| match reach {
-                            Reach::Grants { grants, .. } => Some(grants.iter().copied()),
+                            Reach::Grants(grants) => Some(grants.keys().copied()),
                             Reach::Host | Reach::Device(_) => None,
                         })
                         .flatten()
@@ -961,7 +1003,7 @@ impl Controller {
                             Reach::Device(device_id) => {
                                 Some(kr_transport::listener::device_principal(device_id))
                             }
-                            Reach::Host | Reach::Grants { .. } => None,
+                            Reach::Host | Reach::Grants(_) => None,
                         })
                         .collect();
                     // The connections that were not withdrawn hold authority these changes did not

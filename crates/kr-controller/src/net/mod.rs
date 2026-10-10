@@ -1649,7 +1649,20 @@ impl Controller {
         // A worker that ends while this exchange is on the wire is held until it is over, so the
         // names its acknowledgement carries still have a record to go to.
         let _exchange = self.leases.begin_round();
-        let revision = self.registry.lock().await.authority_revision()?;
+        // The revision the worker last acknowledged, as this daemon recorded it, is where the
+        // reach it is told begins.
+        let (revision, held) = {
+            let registry = self.registry.lock().await;
+            let held = registry
+                .workers()?
+                .into_iter()
+                .find(|worker| worker.session_id == session_id)
+                .map_or_else(
+                    || kr_protocol::ids::AuthorityRevision::new(0),
+                    |worker| worker.acknowledged_revision,
+                );
+            (registry.authority_revision()?, held)
+        };
         let worker = self
             .directory
             .lock()
@@ -1678,8 +1691,12 @@ impl Controller {
             let mut link = self.worker_client(&worker).await?;
             // The first page of whatever its fence named: this worker has said nothing about this
             // revocation yet, so there is nothing to continue from.
-            let notice =
-                self.revision_notice(revision, 0, &link.client().acknowledgement().capabilities);
+            let notice = self.revision_notice(
+                revision,
+                held,
+                0,
+                &link.client().acknowledgement().capabilities,
+            );
             #[cfg(feature = "testing")]
             self.record_announcement(session_id, &notice);
             let answered = link.client().announce_revision(notice).await;
