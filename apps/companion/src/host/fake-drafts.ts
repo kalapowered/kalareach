@@ -8,7 +8,8 @@
  *
  * The rules are the real store's, in the same words where a page reads them:
  * - a save names the version it replaces; when it is not the stored one, this window's text is
- *   kept as a copy beside and the stored draft stays as it is;
+ *   kept as a copy beside, carrying the stricter mark, and the stored draft stays as it is;
+ * - a save of a draft that is no longer stored makes it again, under an identity of its own;
  * - a save keeps the draft's session, never takes it back to open, and moves the conversation it
  *   was written for only while it is empty or has none yet;
  * - a retarget names the version it was shown and is the one way back to open.
@@ -49,6 +50,7 @@ export class FakeDraftStore {
   #counter = 0
   #clock = 0
   #opens = true
+  #unreadable = 0
   #refuseSaves: { code: string; message: string } | null = null
   readonly #disk: DraftDisk | null
   /** Every save and discard this store was asked for, for a test to read. */
@@ -75,6 +77,16 @@ export class FakeDraftStore {
   /** Makes the store refuse to open, as a device whose store cannot be read does. */
   breakOpening(): void {
     this.#opens = false
+  }
+
+  /** Makes the store report `count` files it could not read, which it leaves where they are. */
+  leaveUnreadable(count: number): void {
+    this.#unreadable = count
+  }
+
+  /** Lets the store open again, as a device whose store was mended does. */
+  mendOpening(): void {
+    this.#opens = true
   }
 
   /** Makes every save refuse with `code` until it is cleared. */
@@ -109,7 +121,7 @@ export class FakeDraftStore {
     if (!this.#opens) {
       refuse('STORAGE_UNAVAILABLE', 'the drafts kept on this device could not be opened')
     }
-    return { drafts: this.all(), unreadable: 0 }
+    return { drafts: this.all(), unreadable: this.#unreadable }
   }
 
   save(request: DraftSaveRequest): DraftSaved {
@@ -122,13 +134,24 @@ export class FakeDraftStore {
       this.#put(made)
       return { outcome: 'stored', of: null, draft: made }
     }
-    const held = this.#drafts.get(request.id)
-    if (held === undefined) refuse('INVALID_ARGUMENT', `no draft ${request.id} is stored`)
     if (request.expectedRevision === null) {
       refuse('INVALID_ARGUMENT', 'a save of a stored draft names the version it replaces')
     }
+    const held = this.#drafts.get(request.id)
+    if (held === undefined) {
+      // Another window removed it: what this window has is a draft again.
+      const again = this.#make(request, files)
+      this.#put(again)
+      return { outcome: 'stored', of: null, draft: again }
+    }
     if (held.revision !== request.expectedRevision) {
-      const copy = this.#make(request, files, held.id)
+      const movedAway =
+        (held.applicationInstanceId !== request.applicationInstanceId ||
+          held.agentBindingRevision !== request.agentBindingRevision) &&
+        held.applicationInstanceId !== null &&
+        (held.text.length > 0 || held.attachments.length > 0)
+      const mark = stricterMark(held.state, movedAway ? 'conflicted' : request.state, request.state)
+      const copy = { ...this.#make(request, files, held.id), state: mark }
       this.#put(copy)
       return { outcome: 'copied', of: held.id, draft: copy }
     }
@@ -224,6 +247,11 @@ export class FakeDraftStore {
       JSON.stringify({ drafts: [...this.#drafts.values()], counter: this.#counter, clock: this.#clock })
     )
   }
+}
+
+/** The strictest of the marks a copy could take. */
+function stricterMark(...marks: readonly StoredMark[]): StoredMark {
+  return marks.reduce((strictest, mark) => (RANK[mark] > RANK[strictest] ? mark : strictest), 'open')
 }
 
 /** A handle as the store keeps it: whole, with no preview. */

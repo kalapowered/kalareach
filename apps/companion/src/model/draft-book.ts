@@ -17,9 +17,16 @@
  *   draft first, the store keeps this window's text as a separate draft and leaves the other
  *   window's alone. Neither text is lost, and a person chooses between them in the list of kept
  *   drafts. A copy is never put in a composer on its own.
- * - **A draft that was sent is removed only once the host took it.** While a prompt is on its way the
- *   stored draft stays as it was. When the host took the prompt, it is removed (or replaced by
- *   what was typed since); when the host refused it or its outcome is unknown, it stays.
+ * - **A draft that was sent is removed only once the host took it.** A prompt sent from a draft
+ *   takes the stored draft with it, as it stood when the person pressed Send, and what is typed
+ *   after that is a draft of its own. When the host took the prompt, the stored draft is removed.
+ *   When the host refused it or its outcome is unknown, the book gives the text back to the
+ *   composer if the composer is empty, and otherwise keeps it as a draft apart, so that neither
+ *   the text that was sent nor the text written since is replaced by the other. The book does this
+ *   itself: it does not wait for the screen the prompt was sent from to be open.
+ * - **A window that cannot save says so, and does not act on what it could not save.** A move to
+ *   another session or a removal acts on the stored draft, so it first needs the draft's newest
+ *   text stored, and goes no further when that fails.
  *
  * Nothing here sends anything.
  */
@@ -40,7 +47,8 @@ import {
   startDraft,
   type Draft,
   type DraftAttachment,
-  type DraftTarget
+  type DraftTarget,
+  type StoredRef
 } from './drafts'
 
 /** Whether the store has been read yet, and whether it could be. */
@@ -74,6 +82,8 @@ export interface KeptDraft {
   readonly files: number
   readonly why: KeptWhy
   readonly updatedAtMs: number
+  /** True when a composer holds it and waits for the person to retarget it. */
+  readonly inComposer: boolean
 }
 
 /** What the book holds at one moment. */
@@ -89,6 +99,30 @@ export interface BookSnapshot {
   readonly problem: string | null
 }
 
+/**
+ * What the entry to the kept drafts says, or null when there is nothing to enter for.
+ *
+ * `title` stands alone (a phone's row); `label` and `rest` are the two halves of a sentence whose
+ * first half is the control (a desktop's line). Drafts that could not be read are reported too: a
+ * person whose drafts are unreadable is told, rather than shown an empty list.
+ */
+export function keptEntry(
+  book: Pick<BookSnapshot, 'kept' | 'unreadable'>
+): { readonly title: string; readonly label: string; readonly rest: string } | null {
+  const count = book.kept.length
+  if (count === 0) {
+    return book.unreadable === 0
+      ? null
+      : { title: 'Some drafts could not be read', label: 'Some drafts', rest: 'could not be read.' }
+  }
+  const label = count === 1 ? 'One kept draft' : `${String(count)} kept drafts`
+  return {
+    title: label,
+    label,
+    rest: count === 1 ? 'is not in a composer.' : 'are not in a composer.'
+  }
+}
+
 /** How a prompt that was sent from a draft ended. */
 export type SendOutcome =
   /** The host took it. */
@@ -98,33 +132,56 @@ export type SendOutcome =
   /** Nobody knows. */
   | 'unknown'
 
-/** A prompt on its way, which holds the draft's writes until it ends. */
+/** A prompt on its way. */
 export interface SendToken {
   readonly key: string
 }
+
+/** A prompt sent from a draft, from the press to the host's answer. */
+interface Flight {
+  /** The composer it was sent from. */
+  readonly composer: string
+  /** The draft as it stood when the person pressed Send. */
+  readonly sent: Draft
+  /** The stored draft that holds exactly that, once there is one. */
+  record: StoredRef | null
+}
+
+/** How a write of a draft ended. */
+type Written =
+  /** The store holds the draft now. */
+  | 'stored'
+  /** There was nothing to write: the store already holds it, or the store is not open. */
+  | 'unchanged'
+  /** The store refused, and the draft is held in this window only. */
+  | 'failed'
 
 /** What the writer knows of one draft. */
 interface Track {
   /** The content the store holds, or is known to need no write for. */
   savedKey: string | null
-  /** How many prompts sent from this draft have not ended. */
-  holds: number
   /** True while a retarget the person chose is on its way. */
   retargeting: boolean
   /** The writes of this draft, one after another. */
   chain: Promise<void>
 }
 
-/** The files on a draft that a store can hold: completed uploads. */
+/** The files on a draft that a store can hold: completed uploads, without their previews. */
 function storable(draft: Draft): readonly AttachmentHandle[] {
   return draft.attachments.flatMap((file) =>
-    file.upload === 'uploaded' && file.handle !== null ? [file.handle] : []
+    file.upload === 'uploaded' && file.handle !== null ? [{ ...file.handle, preview: null }] : []
   )
 }
 
 /** The mark the store keeps for a draft: detachment is a fact about the connection, not the draft. */
 function markOf(draft: Draft): StoredMark {
   return draft.state === 'conflicted' || draft.state === 'orphaned' ? draft.state : 'open'
+}
+
+/** Whether two drafts hold the same files. */
+function sameFiles(a: Draft, b: Draft): boolean {
+  const ids = (draft: Draft) => storable(draft).map((handle) => handle.transfer_id)
+  return JSON.stringify(ids(a)) === JSON.stringify(ids(b))
 }
 
 /** Whether the store has anything to keep of a draft. */
@@ -204,8 +261,10 @@ export class DraftBook {
   #others: readonly StoredDraft[] = []
   #unreadable = 0
   #problem: string | null = null
-  readonly #failed = new Map<string, string>()
+  readonly #failed = new Map<string, { readonly code: string; readonly message: string }>()
   readonly #tracks = new Map<string, Track>()
+  readonly #flights = new Map<string, Flight>()
+  #sends = 0
   readonly #listeners = new Set<() => void>()
   readonly #notices = new Set<(words: string) => void>()
   #cached: BookSnapshot | null = null
@@ -328,7 +387,9 @@ export class DraftBook {
    * Sends a draft to a conversation a person chose, which is the one thing that clears a conflict.
    *
    * The page shows it at once. The store is told in its own turn, and when the store refuses, the
-   * draft goes back to what it was and the person is told.
+   * draft goes back to what it was and the person is told. When the refusal is that another window
+   * changed the draft since, this window lets go of that version and keeps what it holds as a draft
+   * of its own, so that the person can try again on a draft this window can write.
    */
   retarget(sessionId: string, target: DraftTarget): void {
     const before = this.draft(sessionId)
@@ -360,6 +421,7 @@ export class DraftBook {
           state: before.state
         }))
         this.#say(`The draft was not moved: ${failureMessage(failure)}`)
+        if (failureCode(failure) === 'DRAFT_CONFLICT') this.#letGo(before.draftId)
         void this.reload()
       } finally {
         track.retargeting = false
@@ -369,47 +431,155 @@ export class DraftBook {
   }
 
   /**
-   * Notes that a prompt is on its way from a session's draft.
+   * Notes that a prompt is on its way from a session's draft, and takes the stored draft with it.
    *
-   * The stored draft is brought up to what is being sent, and then held as it is until
-   * [`endSend`] says how the prompt ended. Call this before the composer is cleared.
+   * The stored draft is brought up to what is being sent and set apart as the prompt's own: what is
+   * typed from now on is a draft of its own. Call this before the composer is cleared, and say how
+   * the prompt ended with [`endSend`].
    */
   beginSend(sessionId: string): SendToken {
-    const draft = this.draft(sessionId)
-    const track = this.#track(draft.draftId)
-    track.holds += 1
-    this.#enqueue(draft.draftId, () => this.#save(draft.draftId, draft))
-    return { key: draft.draftId }
+    const sent = this.draft(sessionId)
+    const key = sent.draftId
+    this.#sends += 1
+    const flight: Flight = { composer: key, sent, record: null }
+    const token = `send-${String(this.#sends)}`
+    this.#flights.set(token, flight)
+    this.#enqueue(key, async () => {
+      if (this.#status === 'ready' && !holdsNothing(sent)) {
+        const written = await this.#write(key, sent)
+        if (written !== 'failed') flight.record = this.#find(key)?.stored ?? null
+      }
+      // The composer lets go of the record: the next thing written is a draft of its own, and a
+      // composer that still holds what was sent (a phone keeps it until the answer) needs no write.
+      const now = this.#find(key)
+      if (now === undefined) return
+      this.#mutate(key, (draft) => ({ ...draft, stored: null }))
+      this.#track(key).savedKey = contentKey(now) === contentKey(sent) ? contentKey(now) : null
+    })
+    return { key: token }
   }
 
   /** Says how a prompt that was sent from a draft ended. */
   endSend(token: SendToken, outcome: SendOutcome): void {
-    const track = this.#track(token.key)
-    this.#enqueue(token.key, async () => {
-      track.holds = Math.max(0, track.holds - 1)
-      if (track.holds > 0) return
-      const draft = this.#find(token.key)
-      if (draft === undefined) return
-      if (outcome === 'unknown' && holdsNothing(draft)) {
-        // The prompt may not have been sent, so what is stored stays. The next thing the person
-        // writes replaces it.
-        track.savedKey = contentKey(draft)
+    const flight = this.#flights.get(token.key)
+    if (flight === undefined) return
+    this.#enqueue(flight.composer, async () => {
+      this.#flights.delete(token.key)
+      if (outcome === 'taken') {
+        await this.#dropRecord(flight)
         return
       }
-      if (outcome === 'taken' && holdsNothing(draft)) {
-        track.savedKey = null
-      }
-      await this.#save(token.key)
+      await this.#giveBack(flight)
     })
+  }
+
+  /** Removes the stored draft of a prompt the host took, unless another window changed it since. */
+  async #dropRecord(flight: Flight): Promise<void> {
+    const record = flight.record
+    if (record === null) return
+    try {
+      await this.#port.deviceDraftDiscard({ id: record.id, expectedRevision: record.revision })
+    } catch (failure) {
+      if (failureCode(failure) === 'DRAFT_CONFLICT') {
+        // Another window changed it since: it is theirs now.
+        void this.reload()
+        return
+      }
+      this.#fail(flight.composer, failure)
+    }
+  }
+
+  /**
+   * Keeps the text of a prompt the host did not take.
+   *
+   * It goes back to the composer when the composer holds nothing, or holds exactly this text. When
+   * the composer holds something else, the text of the prompt stays a stored draft of its own and is
+   * listed with the kept drafts.
+   */
+  async #giveBack(flight: Flight): Promise<void> {
+    const key = flight.composer
+    const sent = flight.sent
+    let record = flight.record
+    if (record === null && this.#status === 'ready' && !holdsNothing(sent)) {
+      // The first write failed, or the draft was never stored: try again now that the text matters.
+      record = await this.#keepApart(key, sent)
+    }
+    const composer = this.#find(key)
+    const same = composer !== undefined && composer.text === sent.text && sameFiles(composer, sent)
+    if (composer === undefined || (composer.stored === null && (holdsNothing(composer) || same))) {
+      this.#adopt(key, sent, composer, record)
+      return
+    }
+    if (same) {
+      // The screen put the text back and it was stored under the composer's own record: the one set
+      // apart for the prompt says the same, and goes.
+      if (record !== null) await this.#dropRecord({ ...flight, record })
+      return
+    }
+    if (record === null) {
+      this.#say('The prompt that was sent could not be kept apart from what you have written since.')
+      return
+    }
+    this.#say(
+      'The prompt that was sent is kept in Kept drafts, because you have written something new here since.'
+    )
+    await this.reload()
+  }
+
+  /** Stores a draft as a record of its own, whatever the composer holds, and says where it is. */
+  async #keepApart(key: string, draft: Draft): Promise<StoredRef | null> {
+    try {
+      const saved = await this.#port.deviceDraftSave({
+        id: null,
+        expectedRevision: null,
+        sessionId: draft.target.sessionId,
+        applicationInstanceId: draft.target.applicationInstanceId,
+        agentBindingRevision: draft.target.agentBindingRevision,
+        state: markOf(draft),
+        text: draft.text,
+        attachments: storable(draft)
+      })
+      return { id: saved.draft.id, revision: saved.draft.revision }
+    } catch (failure) {
+      this.#fail(key, failure)
+      return null
+    }
+  }
+
+  /** Puts the text of a prompt back in a composer that holds nothing else, under its stored record. */
+  #adopt(key: string, sent: Draft, composer: Draft | undefined, record: StoredRef | null): void {
+    const base = composer ?? sent
+    const back: Draft = {
+      ...sent,
+      draftId: key,
+      revision: base.revision + 1,
+      // A break in contact since the press is a fact about the connection, which the text keeps.
+      state: composer?.state === 'detached' ? 'detached' : sent.state,
+      updatedAtMs: Date.now(),
+      stored: record
+    }
+    this.#drafts = this.#drafts.some((draft) => draft.draftId === key)
+      ? this.#drafts.map((draft) => (draft.draftId === key ? back : draft))
+      : [...this.#drafts, back]
+    this.#track(key).savedKey = record === null ? null : contentKey(back)
+    this.#changed()
+    if (record === null) this.#schedule(key)
   }
 
   /** Removes a stored draft a person chose to throw away. */
   async discard(id: string): Promise<void> {
-    const composer = this.#drafts.find((draft) => draft.stored?.id === id)
+    const keyed = this.#drafts.find((draft) => draft.stored?.id === id)?.draftId
     const run = async (): Promise<void> => {
-      const revision = composer?.stored?.revision ?? this.#others.find((other) => other.id === id)?.revision
+      const composer = this.#drafts.find((draft) => draft.stored?.id === id)
+      const revision =
+        composer?.stored?.revision ?? this.#others.find((other) => other.id === id)?.revision
       if (revision === undefined) return
-      await this.#port.deviceDraftDiscard({ id, expectedRevision: revision })
+      try {
+        await this.#port.deviceDraftDiscard({ id, expectedRevision: revision })
+      } catch (failure) {
+        await this.#sawTheirs(composer?.draftId, failure)
+        throw failure
+      }
       if (composer) {
         this.#mutate(composer.draftId, (draft) => ({
           ...draft,
@@ -423,34 +593,113 @@ export class DraftBook {
       }
       await this.reload()
     }
-    if (composer) await this.#enqueueAwait(composer.draftId, run)
+    if (keyed !== undefined) await this.#enqueueAwait(keyed, run)
     else await run()
   }
 
   /** Moves a stored draft to a session a person chose. */
   async moveTo(id: string, sessionId: string): Promise<void> {
-    const composer = this.#drafts.find((draft) => draft.stored?.id === id)
+    const keyed = this.#drafts.find((draft) => draft.stored?.id === id)?.draftId
     const run = async (): Promise<void> => {
-      if (composer) await this.#save(composer.draftId)
-      const revision =
-        (composer ? this.#find(composer.draftId)?.stored?.revision : undefined) ??
-        this.#others.find((other) => other.id === id)?.revision
+      const composer = this.#drafts.find((draft) => draft.stored?.id === id)
+      // What the composer holds is stored first, so that the move acts on all of it.
+      if (composer && (await this.#write(composer.draftId)) === 'failed') {
+        // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
+        throw this.#unsaved(composer.draftId)
+      }
+      const held = composer ? this.#find(composer.draftId)?.stored?.revision : undefined
+      const revision = held ?? this.#others.find((other) => other.id === id)?.revision
       if (revision === undefined) return
-      await this.#port.deviceDraftRetarget({
-        id,
-        expectedRevision: revision,
-        sessionId,
-        applicationInstanceId: null,
-        agentBindingRevision: null
-      })
+      try {
+        await this.#port.deviceDraftRetarget({
+          id,
+          expectedRevision: revision,
+          sessionId,
+          applicationInstanceId: null,
+          agentBindingRevision: null
+        })
+      } catch (failure) {
+        await this.#sawTheirs(composer?.draftId, failure)
+        throw failure
+      }
       if (composer) {
         this.#drafts = this.#drafts.filter((draft) => draft.draftId !== composer.draftId)
         this.#tracks.delete(composer.draftId)
       }
       await this.reload()
     }
-    if (composer) await this.#enqueueAwait(composer.draftId, run)
+    if (keyed !== undefined) await this.#enqueueAwait(keyed, run)
     else await run()
+  }
+
+  /**
+   * Puts a kept draft in the composer of its own session.
+   *
+   * The draft becomes an ordinary draft of the session: not a copy, and open. What the composer held
+   * is stored first and stays a stored draft, listed with the kept drafts, so neither is lost to the
+   * other.
+   */
+  async useHere(id: string): Promise<void> {
+    const sessionId = this.#others.find((other) => other.id === id)?.sessionId
+    if (sessionId === undefined) return
+    const key = composerKey(sessionId)
+    await this.#enqueueAwait(key, async () => {
+      const composer = this.#find(key)
+      if (composer && !holdsNothing(composer) && (await this.#write(key)) === 'failed') {
+        // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
+        throw this.#unsaved(key)
+      }
+      const other = this.#others.find((each) => each.id === id)
+      if (other === undefined) return
+      let moved: StoredDraft
+      try {
+        moved = await this.#port.deviceDraftRetarget({
+          id,
+          expectedRevision: other.revision,
+          sessionId,
+          applicationInstanceId: null,
+          agentBindingRevision: null
+        })
+      } catch (failure) {
+        await this.#sawTheirs(undefined, failure)
+        throw failure
+      }
+      const chosen = draftOf(moved)
+      this.#drafts = this.#drafts.some((draft) => draft.draftId === key)
+        ? this.#drafts.map((draft) => (draft.draftId === key ? chosen : draft))
+        : [...this.#drafts, chosen]
+      this.#track(key).savedKey = contentKey(chosen)
+      this.#changed()
+      await this.reload()
+    })
+  }
+
+  /**
+   * Notes that the store refused an act on a draft because another window changed it since.
+   *
+   * The list is read again, so the person decides on what is stored now, and a composer that held
+   * the old version lets go of it and keeps its text as a draft of its own.
+   */
+  async #sawTheirs(composer: string | undefined, failure: unknown): Promise<void> {
+    if (failureCode(failure) !== 'DRAFT_CONFLICT') return
+    if (composer !== undefined) this.#letGo(composer)
+    await this.reload()
+  }
+
+  /** A composer lets go of the stored version it holds: its text is written as a draft of its own. */
+  #letGo(key: string): void {
+    this.#mutate(key, (draft) => ({ ...draft, stored: null }))
+    this.#track(key).savedKey = null
+    this.#schedule(key)
+  }
+
+  /** The failure to give for a draft the store would not take, when a move waits on it. */
+  #unsaved(key: string): { readonly code: string; readonly message: string } {
+    const failed = this.#failed.get(key)
+    return {
+      code: failed?.code ?? 'STORAGE_UNAVAILABLE',
+      message: `What is in the composer could not be kept first, so nothing was moved: ${failed?.message ?? 'the store refused it'}`
+    }
   }
 
   /** Writes whatever is not written yet, for a window that is about to be hidden or closed. */
@@ -471,7 +720,7 @@ export class DraftBook {
   #track(key: string): Track {
     let track = this.#tracks.get(key)
     if (!track) {
-      track = { savedKey: null, holds: 0, retargeting: false, chain: Promise.resolve() }
+      track = { savedKey: null, retargeting: false, chain: Promise.resolve() }
       this.#tracks.set(key, track)
     }
     return track
@@ -521,25 +770,28 @@ export class DraftBook {
     for (const draft of this.#drafts) this.#schedule(draft.draftId)
   }
 
+  /** Writes a composer's draft if it is not what the store holds, unless a retarget is on its way. */
+  async #save(key: string): Promise<void> {
+    if (this.#track(key).retargeting) return
+    await this.#write(key)
+  }
+
   /**
-   * Writes a draft if it is not what the store holds.
+   * Writes a draft if it is not what the store holds, and says how that went.
    *
-   * `snapshot` is a draft as it stood when a prompt was sent from it: written even though the
-   * prompt now holds the writes, because that is what the host was sent.
+   * `draft` is the composer's draft as it is now, unless a caller gives another: the draft as it
+   * stood when a prompt was sent is written to the record the composer holds, even though the
+   * composer has moved on since.
    */
-  async #save(key: string, snapshot?: Draft): Promise<void> {
-    if (this.#status !== 'ready') return
+  async #write(key: string, given?: Draft): Promise<Written> {
+    if (this.#status !== 'ready') return 'unchanged'
     const track = this.#track(key)
-    const draft = snapshot ?? this.#find(key)
-    if (draft === undefined) return
-    if (snapshot === undefined && (track.holds > 0 || track.retargeting)) return
+    const draft = given ?? this.#find(key)
+    if (draft === undefined) return 'unchanged'
     const wanted = contentKey(draft)
-    if (wanted === track.savedKey) return
+    if (wanted === track.savedKey) return 'unchanged'
     const stored = this.#find(key)?.stored ?? draft.stored
-    if (holdsNothing(draft)) {
-      await this.#removeStored(key, stored, wanted)
-      return
-    }
+    if (holdsNothing(draft)) return await this.#removeStored(key, stored, wanted)
     let saved: DraftSaved
     try {
       saved = await this.#port.deviceDraftSave({
@@ -554,7 +806,7 @@ export class DraftBook {
       })
     } catch (failure) {
       this.#fail(key, failure)
-      return
+      return 'failed'
     }
     track.savedKey = wanted
     this.#recovered(key)
@@ -571,24 +823,21 @@ export class DraftBook {
       )
       void this.reload()
     }
+    return 'stored'
   }
 
-  async #removeStored(
-    key: string,
-    stored: Draft['stored'],
-    wanted: string
-  ): Promise<void> {
+  async #removeStored(key: string, stored: Draft['stored'], wanted: string): Promise<Written> {
     const track = this.#track(key)
     if (stored === null) {
       track.savedKey = wanted
-      return
+      return 'unchanged'
     }
     try {
       await this.#port.deviceDraftDiscard({ id: stored.id, expectedRevision: stored.revision })
     } catch (failure) {
       if (failureCode(failure) !== 'DRAFT_CONFLICT') {
         this.#fail(key, failure)
-        return
+        return 'failed'
       }
       // Another window changed the draft since: it is theirs now, and this window lets go of it.
       void this.reload()
@@ -596,17 +845,21 @@ export class DraftBook {
     track.savedKey = wanted
     this.#recovered(key)
     this.#mutate(key, (draft) => (draft.stored?.id === stored.id ? { ...draft, stored: null } : draft))
+    return 'stored'
   }
 
   #fail(key: string, failure: unknown): void {
-    this.#failed.set(key, failureMessage(failure))
+    this.#failed.set(key, {
+      code: failureCode(failure) ?? 'STORAGE_UNAVAILABLE',
+      message: failureMessage(failure)
+    })
     this.#problem = failureMessage(failure)
     this.#changed()
   }
 
   #recovered(key: string): void {
     if (!this.#failed.delete(key)) return
-    this.#problem = [...this.#failed.values()][0] ?? null
+    this.#problem = [...this.#failed.values()][0]?.message ?? null
     this.#changed()
   }
 
@@ -660,7 +913,8 @@ export class DraftBook {
       text: stored.text,
       files: stored.attachments.length,
       why: why(stored),
-      updatedAtMs: Number(stored.updatedAtMs)
+      updatedAtMs: Number(stored.updatedAtMs),
+      inComposer: false
     }))
     const waiting = this.#drafts.flatMap<KeptDraft>((draft) =>
       draft.stored !== null && (draft.state === 'conflicted' || draft.state === 'orphaned')
@@ -671,7 +925,8 @@ export class DraftBook {
               text: draft.text,
               files: storable(draft).length,
               why: draft.state,
-              updatedAtMs: draft.updatedAtMs
+              updatedAtMs: draft.updatedAtMs,
+              inComposer: true
             }
           ]
         : []
