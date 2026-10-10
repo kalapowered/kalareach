@@ -454,12 +454,23 @@ fn is_first_page(evidence_from: &u64) -> bool {
     *evidence_from == 0
 }
 
-/// How many grants and devices together a revision's reach may name before it is the whole host.
+/// How many grants and devices together a revision's reach may name.
 ///
-/// A name costs about eighteen bytes of a control frame, which holds a mebibyte, so this leaves the
-/// rest of a notice a great deal of room. A device can only reach it by holding that many redeemed
-/// grants below one it withdraws.
-pub const MAX_REVISION_REACH_NAMES: usize = 16_384;
+/// It is the most members one list of a control frame may hold, so a notice at the bound is one
+/// the receiving end reads. A host that has more to name than this names the devices that hold the
+/// grants instead, and only more devices than this make the reach the whole host's.
+pub const MAX_REVISION_REACH_NAMES: usize = 4_096;
+
+const _: () = assert!(
+    MAX_REVISION_REACH_NAMES <= kr_cbor::Limits::DEFAULT.max_collection_len,
+    "a notice at the bound must be one a control frame can carry"
+);
+
+/// How many grants and devices a worker keeps for the reaches of the announcements it was refused,
+/// joined, before it fences every caller under a grant instead. It only bounds a worker's memory:
+/// each announcement carries at most [`MAX_REVISION_REACH_NAMES`], so it takes sixteen refused
+/// announcements of a full reach each to pass it.
+pub const MAX_OWED_REACH_NAMES: usize = 16 * MAX_REVISION_REACH_NAMES;
 
 /// Whose authority the revisions after one revision withdrew.
 ///
@@ -483,9 +494,11 @@ pub enum RevisionReach {
         /// The last revision before the ones this describes, which the worker must have fenced.
         since: AuthorityRevision,
         /// The grants the revisions withdrew, with everything delegated from them that anyone
-        /// held.
+        /// held. None when the revisions withdrew more than [`MAX_REVISION_REACH_NAMES`], which
+        /// `devices` then names by the devices that hold them.
         grants: CanonicalSet<GrantId>,
-        /// The devices the revisions withdrew.
+        /// The devices the revisions withdrew, or that hold the grants of a subtree too large to
+        /// name grant by grant.
         devices: CanonicalSet<DeviceId>,
     },
 }
@@ -563,7 +576,7 @@ impl RevisionReach {
             grants.iter().chain(more_grants.iter()).copied().collect();
         let devices: CanonicalSet<DeviceId> =
             devices.iter().chain(more_devices.iter()).copied().collect();
-        if grants.len() + devices.len() > MAX_REVISION_REACH_NAMES {
+        if grants.len() + devices.len() > MAX_OWED_REACH_NAMES {
             return Self::Host;
         }
         Self::Within {
