@@ -14,7 +14,10 @@ mod organisation_support;
 
 use std::time::Duration;
 
-use kr_protocol::confirmation::ConfirmationSubject;
+use kr_protocol::confirmation::{
+    ConfirmationSubject, OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
+    OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
+};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::OrganisationRequirement;
@@ -23,7 +26,8 @@ use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
     MembershipPresentParams, OrganisationEnrolParams, OrganisationEnrolResult,
-    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationWithdrawParams,
+    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationListParams,
+    OrganisationListResult, OrganisationWithdrawParams,
 };
 use kr_protocol::pairing::ProposedGrant;
 use kr_protocol::rights::ActionRight;
@@ -464,40 +468,38 @@ async fn an_enrolment_racing_a_withdrawal_cannot_take_the_revision_the_fence_rep
 
 /// The owner's own device, on a connection of its own, and the lease the organisation signs for it
 /// once the host is exclusively managed.
+///
+/// It is rebuilt from the owner's keys, so it stays the same device across a restart of the host.
 struct OwnerDevice<'a> {
     fixture: &'a Fixture,
+    device: Device,
 }
 
-impl OwnerDevice<'_> {
+impl<'a> OwnerDevice<'a> {
+    async fn of(fixture: &'a Fixture) -> Self {
+        Self {
+            fixture,
+            device: Device::with_keys(fixture.owner.clone()).await,
+        }
+    }
+
     async fn connect(&self) -> RawDevice {
-        let device = self
-            .fixture
-            .host
-            .owner_device
-            .as_ref()
-            .expect("the owner device");
         let record = self
             .fixture
             .host
             .owner
             .as_ref()
             .expect("the owner's record");
-        let raw = RawDevice::connect(&self.fixture.host, device, record).await;
+        let raw = RawDevice::connect(&self.fixture.host, &self.device, record).await;
         raw.claim();
         raw
     }
 
     fn lease(&self) -> kr_protocol::account::MembershipLease {
-        let device = self
-            .fixture
-            .host
-            .owner_device
-            .as_ref()
-            .expect("the owner device");
         self.fixture.organisation.lease(
             2,
             &organisation_support::member("owner"),
-            *device.keys().authorisation.public(),
+            *self.device.keys().authorisation.public(),
             self.fixture.now(),
             &[ActionRight::SessionView],
         )
@@ -526,7 +528,7 @@ impl OwnerDevice<'_> {
 async fn the_owners_device_keeps_its_access_until_the_host_is_made_exclusive_and_then_answers_to_a_lease()
  {
     let fixture = Fixture::start().await;
-    let owner = OwnerDevice { fixture: &fixture };
+    let owner = OwnerDevice::of(&fixture).await;
     let raw = owner.connect().await;
     read_host_info(&raw).await.expect("served on its own grant");
     let before = fixture.authority_revision();
@@ -824,5 +826,216 @@ async fn making_the_host_exclusive_when_its_fence_fails_stays_owed_and_a_restart
     assert_eq!(answered.authority_revision, fixture.authority_revision());
     assert!(answered.barrier.0.is_some());
     drop(client);
+    fixture.host.stop().await;
+}
+
+/// Recovers an exclusively organisation-managed host whose owner's device no lease serves: the
+/// device reads what the host holds, asks for the confirmation of ending exclusive management and
+/// answers it, all over its own connection, and the owner at the host's own socket spends the
+/// answer. Everything else the device asks is refused for want of a lease.
+async fn recover_by_a_confirmed_ending(fixture: &Fixture) {
+    let owner = OwnerDevice::of(fixture).await;
+    let raw = owner.connect().await;
+    assert!(
+        denied(&net_support::refusal(read_host_info(&raw).await)),
+        "an ordinary read is refused for want of a lease"
+    );
+    let listed: OrganisationListResult = raw
+        .read(Method::OrganisationList, &OrganisationListParams::default())
+        .await
+        .expect("the host's organisations are read without a lease")
+        .to_typed()
+        .expect("a list");
+    assert!(listed.exclusive);
+
+    // A confirmation of anything but the clock and the end of exclusive management is refused.
+    let environment = ActionTarget::environment(fixture.host.environment_id);
+    let refused = net_support::refusal(
+        raw.mutate(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment.clone(),
+            &OwnerConfirmationRequestParams {
+                subject: ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+            },
+        )
+        .await,
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    let challenge: OwnerConfirmationRequestResult = raw
+        .mutate(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment.clone(),
+            &OwnerConfirmationRequestParams {
+                subject: ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+            },
+        )
+        .await
+        .expect("the confirmation of ending it is asked for")
+        .to_typed()
+        .expect("a challenge");
+    let pending: OwnerConfirmationPendingResult = raw
+        .read(
+            Method::OwnerConfirmationPending,
+            &OwnerConfirmationPendingParams {},
+        )
+        .await
+        .expect("the challenge is listed")
+        .to_typed()
+        .expect("a list");
+    assert!(
+        pending
+            .pending
+            .iter()
+            .any(|shown| shown.request == challenge.request),
+        "the owner device is shown what it is asked to confirm"
+    );
+    let (proof, _) = calls::sign(&challenge.request, &Signer::OwnerDevice(&fixture.owner));
+    raw.mutate(
+        Method::OwnerConfirmationComplete,
+        ActionId::new(kr_ipc::new_uuid()),
+        environment,
+        &OwnerConfirmationCompleteParams {
+            proof,
+            bootstrap_signer: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the owner device answers its own ceremony");
+    raw.close();
+
+    // The owner at the host spends the answer: exclusive management ends, with the event.
+    let mut client = fixture.host.client().await;
+    let off: OrganisationExclusiveSetResult = calls::mutate(
+        fixture.host.environment_id,
+        &mut client,
+        Method::OrganisationExclusiveSet,
+        &OrganisationExclusiveSetParams { exclusive: false },
+    )
+    .await
+    .expect("the host spends the answered confirmation");
+    assert!(!off.exclusive);
+    let listed = fixture.listed().await;
+    assert!(!listed.exclusive);
+    assert_eq!(listed.exclusive_events.len(), 1);
+
+    // And the owner's device is served on its own grant again.
+    let raw = owner.connect().await;
+    read_host_info(&raw).await.expect("served on its own grant");
+    raw.close();
+}
+
+/// KR-REQ-17.54: a host made exclusive recovers at once, with no lease ever presented, by the
+/// confirmed ending of exclusive management over the owner's device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exclusive_host_recovers_by_a_confirmed_ending_right_after_it_was_made_exclusive() {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+    recover_by_a_confirmed_ending(&fixture).await;
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: and after the leases it had ended, and after a restart that took them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exclusive_host_recovers_after_its_leases_ended_and_after_a_restart() {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+    let owner = OwnerDevice::of(&fixture).await;
+    let raw = owner.connect().await;
+    owner.present(&raw).await.expect("the owner's lease");
+    read_host_info(&raw).await.expect("served under the lease");
+    fixture.pass(Duration::from_millis(
+        organisation_support::LEASE_MS + 1_000,
+    ));
+    assert!(denied(&net_support::refusal(read_host_info(&raw).await)));
+    raw.close();
+
+    // After a restart no lease is held either.
+    let fixture = fixture.restart().await;
+    recover_by_a_confirmed_ending(&fixture).await;
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: what recovers the host is for the device that can recover it. An owner's device
+/// whose grant ends is refused on a lapsed exclusive host, a leased owner device keeps every
+/// confirmation, and the confirmation of ending exclusive management is not carried by a device
+/// that no lease serves to a change it cannot see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_device_that_can_recover_the_host_reaches_what_recovers_it_and_a_leased_one_confirms_everything()
+ {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+
+    // A device with host management whose grant expires does not qualify.
+    let helper = Device::create().await;
+    let helper_record = net_support::pair_with(
+        &fixture.host,
+        &helper,
+        &fixture.owner,
+        net_support::proposal(&[ActionRight::HostManage]),
+    )
+    .await;
+    let helper_raw = RawDevice::connect(&fixture.host, &helper, &helper_record).await;
+    helper_raw.claim();
+    let refused = net_support::refusal(
+        helper_raw
+            .read(Method::OrganisationList, &OrganisationListParams::default())
+            .await,
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    helper_raw.close();
+
+    // A leased owner device is asked for any confirmation: the request reaches the host's own
+    // check and is refused for what is wrong with it, not for want of a lease.
+    let owner = OwnerDevice::of(&fixture).await;
+    let raw = owner.connect().await;
+    let environment = ActionTarget::environment(fixture.host.environment_id);
+    let without_a_lease = net_support::refusal(
+        raw.mutate(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment.clone(),
+            &OwnerConfirmationRequestParams {
+                subject: ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+            },
+        )
+        .await,
+    );
+    assert_eq!(without_a_lease.code, ErrorCode::PermissionDenied);
+    owner.present(&raw).await.expect("the owner's lease");
+    let with_a_lease = net_support::refusal(
+        raw.mutate(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment,
+            &OwnerConfirmationRequestParams {
+                subject: ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        with_a_lease.code,
+        ErrorCode::InvalidArgument,
+        "the host is exclusive already: {with_a_lease:?}"
+    );
+    raw.close();
     fixture.host.stop().await;
 }
