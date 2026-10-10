@@ -140,7 +140,8 @@ fn device_record(device: [u8; 16], transport: u8, grant: Grant) -> DeviceRecord 
 }
 
 /// KR-REQ-10.51: a device row an earlier build wrote naming no approval is read as it was, the
-/// device connects, and this build writes the same grant back to the same bytes.
+/// device connects, and this build writes the same grant to the same bytes and leaves them as they
+/// were. A grant with no history cursor is read from the moment of the pairing.
 #[test]
 fn kr_req_10_51_an_earlier_device_row_that_names_nothing_reads_and_writes_back_unchanged() {
     let temp = tempfile::tempdir().expect("a directory on the internal disk");
@@ -166,8 +167,22 @@ fn kr_req_10_51_an_earlier_device_row_that_names_nothing_reads_and_writes_back_u
         .record_for_device(DeviceId::new(device))
         .expect("readable")
         .expect("the record");
-    assert_eq!(read.grant, grant);
-    assert_eq!(encode(&read.grant), row.empty);
+    assert_eq!(
+        read.grant,
+        Grant {
+            history: grant.history.clone().from_start(read.paired_at_ms.get()),
+            ..grant
+        }
+    );
+    assert_eq!(
+        stored(
+            &database,
+            "SELECT grant FROM network_devices WHERE device_id = ?1",
+            device
+        ),
+        row.empty,
+        "reading the row leaves the bytes the earlier build wrote"
+    );
     assert!(
         directory
             .paired_peer(&EndpointKey::from_bytes([0x31; 32]))
@@ -492,9 +507,10 @@ fn record(grant: Grant) -> GrantRecord {
 }
 
 /// KR-REQ-10.51: a grant row an earlier build wrote naming no approval reads as it was, and this
-/// build writes it to the same bytes. Named by text, the grant permits nothing: its record is
-/// refused with the table and the grant named, and every listing that would read it, the device's
-/// and the host's, fails whole.
+/// build writes it to the same bytes and leaves them as they were. A grant with no history cursor
+/// is read from the moment its invitation was redeemed. Named by text, the grant permits nothing:
+/// its record is refused with the table and the grant named, and every listing that would read it,
+/// the device's and the host's, fails whole.
 #[test]
 fn kr_req_10_51_an_earlier_grant_row_reads_unchanged_or_permits_nothing() {
     let temp = tempfile::tempdir().expect("a directory on the internal disk");
@@ -516,13 +532,28 @@ fn kr_req_10_51_an_earlier_grant_row_reads_unchanged_or_permits_nothing() {
         row.empty,
         "this build writes the grant as the earlier build wrote it"
     );
+    let read = directory
+        .record(grant_id)
+        .expect("readable")
+        .expect("the grant");
     assert_eq!(
-        directory
-            .record(grant_id)
-            .expect("readable")
-            .expect("the grant")
-            .grant,
-        grant
+        read.grant,
+        Grant {
+            history: grant
+                .history
+                .clone()
+                .from_start(read.activated_at_ms.expect("redeemed")),
+            ..grant
+        }
+    );
+    assert_eq!(
+        stored(
+            &database,
+            "SELECT grant FROM grants WHERE grant_id = ?1",
+            grant_id.get()
+        ),
+        row.empty,
+        "reading the row leaves the bytes the earlier build wrote"
     );
 
     hold(

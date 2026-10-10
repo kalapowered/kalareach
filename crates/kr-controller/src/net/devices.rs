@@ -1809,11 +1809,18 @@ mod tests {
         let device = record(7);
         directory.commit(&device).expect("the row is written");
 
+        // The record is read back as it was committed, and its grant, which names no history
+        // cursor, reaches from the moment of the pairing.
+        let mut read_back = device.clone();
+        read_back.grant.history = read_back
+            .grant
+            .history
+            .from_start(device.paired_at_ms.get());
         assert_eq!(
             directory
                 .record_for_endpoint(&device.endpoint_id)
                 .expect("a read"),
-            Some(device.clone())
+            Some(read_back)
         );
         assert_eq!(
             directory

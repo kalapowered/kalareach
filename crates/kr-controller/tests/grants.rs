@@ -16,6 +16,7 @@
 //! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
 //! | KR-REQ-10.44 | `the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen`, `an_expired_grant_is_refused_rather_than_downgraded_to_view_only` |
 //! | KR-REQ-10.45 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker` |
+//! | KR-REQ-10.49 | `a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_redeemed` |
 //! | KR-REQ-17.54 | `an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport`, `personal_access_survives_an_organisation_outage_unless_the_host_is_exclusively_managed` |
 //! | KR-REQ-19.02 | `a_delegation_cannot_grant_a_right_the_delegating_actor_lacks` |
 //! | KR-REQ-23.27 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_device_revocation_takes_every_grant_that_device_held` |
@@ -1159,6 +1160,43 @@ fn a_grant_carries_every_field_section_ten_names() {
     assert!(read.permits(ActionRight::SessionView));
     assert_eq!(read.expiry, GrantExpiry::Never);
     assert!(read.organisation.is_present());
+}
+
+/// KR-REQ-10.49: earlier history is opt-in, so a stored grant that names no history cursor reaches
+/// what was first seen at or after the moment its invitation was redeemed, whoever reads it. A
+/// cursor it names stands, and a proposal nobody redeemed has no start to read it against.
+#[test]
+fn a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_redeemed() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let held = GrantRecord {
+        activated_at_ms: Some(4_000),
+        ..record(grant(1, None, VIEW, GrantExpiry::Never))
+    };
+    let mut named = grant(2, None, VIEW, GrantExpiry::Never);
+    named.history.lower_bound_ms = Nullable::some(TimestampMs::new(7));
+    let waiting = proposal(grant(3, None, VIEW, GrantExpiry::Never));
+    for stored in [&held, &record(named), &waiting] {
+        directory.issue(stored, || Ok(())).expect("written");
+    }
+
+    let read = |id: u8| {
+        directory
+            .record(grant_id(id))
+            .expect("readable")
+            .expect("present")
+            .grant
+            .history
+            .lower_bound_ms
+            .as_ref()
+            .map(|cursor| cursor.get())
+    };
+    assert_eq!(
+        read(1),
+        Some(4_000),
+        "the moment the invitation was redeemed"
+    );
+    assert_eq!(read(2), Some(7), "a cursor the grant names stands");
+    assert_eq!(read(3), None, "a proposal has no start");
 }
 
 #[test]

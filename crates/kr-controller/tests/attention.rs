@@ -1330,14 +1330,15 @@ async fn a_paired_device_is_served_the_group_under_its_grant() {
     let owner_keys = DeviceKeys::generate().expect("owner keys");
     let host = net_support::Host::start(&owner_keys).await;
     let session_id = SessionId::new(kr_ipc::new_uuid());
+
+    // A grant with no history cursor reaches what is first seen after the pairing.
+    let (_viewer, viewing) =
+        net_support::paired_device(&host, &owner_keys, &[ActionRight::SessionView]).await;
     let (turn, subject) = completed_turn(session_id);
     host.controller()
         .attention()
         .observe(&[approval(session_id, "req-1"), turn])
         .expect("the store records the approval and the turn");
-
-    let (_viewer, viewing) =
-        net_support::paired_device(&host, &owner_keys, &[ActionRight::SessionView]).await;
     let read = device_inbox(&viewing).await;
     assert_eq!(read.items.len(), 2, "its grant admits every session");
     assert!(
@@ -1447,14 +1448,6 @@ async fn a_device_s_batch_acknowledges_only_what_its_grant_shows_it() {
     let host = net_support::Host::start(&owner_keys).await;
     let admitted = SessionId::new(kr_ipc::new_uuid());
     let other = SessionId::new(kr_ipc::new_uuid());
-    host.controller()
-        .attention()
-        .observe(&[approval(admitted, "req-1"), approval(other, "req-2")])
-        .expect("the store records both approvals");
-    let mut control = host.client().await;
-    let everything = owner_inbox(&mut control).await;
-    assert_eq!(everything.len(), 2);
-
     let mut proposal = net_support::proposal(&[ActionRight::SessionView]);
     proposal.session_selector = SessionSelector::These {
         session_ids: [admitted].into_iter().collect(),
@@ -1462,6 +1455,15 @@ async fn a_device_s_batch_acknowledges_only_what_its_grant_shows_it() {
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(&host, &device, &owner_keys, proposal).await;
     let viewing = net_support::connect(&host, &device, &record).await;
+
+    // The grant has no history cursor: it reaches what is first seen after the pairing.
+    host.controller()
+        .attention()
+        .observe(&[approval(admitted, "req-1"), approval(other, "req-2")])
+        .expect("the store records both approvals");
+    let mut control = host.client().await;
+    let everything = owner_inbox(&mut control).await;
+    assert_eq!(everything.len(), 2);
     let seen = device_inbox(&viewing).await;
     assert_eq!(seen.items.len(), 1);
     assert_eq!(seen.items[0].session_id, Nullable::some(admitted));

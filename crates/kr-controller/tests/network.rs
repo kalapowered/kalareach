@@ -4760,6 +4760,106 @@ async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until
     daemon.stop().await;
 }
 
+/// KR-REQ-10.49, KR-REQ-10.51 and KR-REQ-25.01 over the real network path: earlier history is
+/// opt-in. Two devices are paired under the same grant, which has no history cursor and no live
+/// screen. One is paired before an application inside a session asks a question, the other after.
+/// The first reads the question from the worker and is shown its item in the inbox; the second reads
+/// none of it and is shown no item, though both are admitted to the session; the owner reads and is
+/// shown it.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_49_a_device_under_a_grant_with_no_cursor_reads_what_is_first_seen_after_its_pairing()
+ {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let grant = || proposing(&[ActionRight::SessionView], SessionSelector::Any);
+
+    let early = Device::create(&loopback()).await;
+    let early_record = pair_with(&daemon, &early, &owner, grant()).await;
+    let early_session = connect(&daemon, &early, &early_record).await;
+
+    let Asked {
+        created,
+        question: asked,
+        terminal,
+        reader,
+        ..
+    } = asked_in_a_new_session(&host, &mut local).await;
+    let session_id = created.session.session_id;
+
+    let late = Device::create(&loopback()).await;
+    let late_record = pair_with(&daemon, &late, &owner, grant()).await;
+    let late_session = connect(&daemon, &late, &late_record).await;
+
+    let questions = kr_protocol::question::QuestionReadParams {
+        session_id,
+        question_id: Nullable::null(),
+        include_resolved: true,
+    };
+    let early_read: kr_protocol::question::QuestionReadResult = early_session
+        .read(Method::QuestionRead, &questions)
+        .await
+        .expect("the device is admitted to the session and reads its questions");
+    let late_read: kr_protocol::question::QuestionReadResult = late_session
+        .read(Method::QuestionRead, &questions)
+        .await
+        .expect("the device is admitted to the session and reads its questions");
+    assert_eq!(
+        asked_ids(&early_read),
+        vec![asked.question_id],
+        "the device paired before the question reads it"
+    );
+    assert!(
+        asked_ids(&late_read).is_empty(),
+        "the device paired after it reads none of it"
+    );
+
+    // The inbox: the daemon raises the item once it has read the question from the worker.
+    let page = kr_protocol::attention::AttentionReadParams {
+        session_id: Nullable::null(),
+        include_acknowledged: true,
+        max_items: kr_protocol::scalars::U64::new(50),
+        after: Nullable::null(),
+    };
+    let started = tokio::time::Instant::now();
+    loop {
+        let owners: kr_protocol::attention::AttentionReadResult = local
+            .request(Method::AttentionRead, &page)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner reads the inbox")
+            .to_typed()
+            .expect("decodes");
+        if !owners.items.is_empty() {
+            break;
+        }
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the question never reached the owner's inbox"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let early_items: kr_protocol::attention::AttentionReadResult = early_session
+        .read(Method::AttentionRead, &page)
+        .await
+        .expect("the device reads the inbox");
+    let late_items: kr_protocol::attention::AttentionReadResult = late_session
+        .read(Method::AttentionRead, &page)
+        .await
+        .expect("the device reads the inbox");
+    assert_eq!(early_items.items.len(), 1, "{early_items:?}");
+    assert!(late_items.items.is_empty(), "{late_items:?}");
+
+    early_session.close();
+    late_session.close();
+    drop(reader);
+    drop(terminal);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
 /// KR-REQ-10.51, KR-REQ-25.10 and KR-REQ-18.03 over the real network path: the local owner shares
 /// a session with a paired device, naming a question an application inside the session asked
 /// before the history bound the share sets. The owner is shown the question as the session's own
