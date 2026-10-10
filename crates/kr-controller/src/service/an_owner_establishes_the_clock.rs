@@ -37,7 +37,7 @@ use crate::service::net::tests::{daemon_on, manual_clocks, stopped};
 const STANDING: Duration = Duration::from_secs(60);
 
 /// What a mutation of this module asks for by default, in milliseconds.
-const TTL_MS: u64 = 30_000;
+pub(super) const TTL_MS: u64 = 30_000;
 
 /// One caller at the local door: the connection it registered and the principal it acts as.
 #[derive(Clone)]

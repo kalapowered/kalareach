@@ -1367,6 +1367,8 @@ mod tests {
         assert_closed::<kr_protocol::ids::ChangeSetVersion>();
         assert_closed::<kr_protocol::ids::EnvironmentId>();
         assert_closed::<kr_protocol::ids::MaterialisationId>();
+        assert_closed::<kr_protocol::ids::OrganisationId>();
+        assert_closed::<kr_protocol::ids::PolicyKeyRevision>();
         assert_closed::<kr_protocol::ids::ProjectRepositoryId>();
         assert_closed::<kr_protocol::ids::RepositoryGeneration>();
         assert_closed::<kr_protocol::ids::WorkflowRunId>();

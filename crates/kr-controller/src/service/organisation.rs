@@ -845,7 +845,7 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::an_owner_establishes_the_clock::distrusting;
+    use crate::service::an_owner_establishes_the_clock::{Door, TTL_MS, distrusting};
     use crate::service::net::devices::ObservedUtc;
     use crate::service::net::tests::{daemon_on, manual_clocks, stopped};
     use kr_protocol::error::ErrorCode;
@@ -903,6 +903,77 @@ mod tests {
             .head_holds_still(TimestampMs::new(now + 10 * MINUTE_MS), Some(&reading(now)))
             .expect_err("a clock that is not trusted judges no head");
         assert_eq!(refused.code(), ErrorCode::ClockUntrusted, "{refused:?}");
+        stopped(controller).await;
+    }
+    /// KR-REQ-17.54: a host that is not on the network and has an owner is exclusively managed with
+    /// no owner device to confirm for it, and its owner at its terminal ends that: the request, the
+    /// answer and the spend all go through the host's own owner authority, which no network
+    /// service stands between, and the change is written and ends exclusive management.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_off_the_network_ends_exclusive_management_at_its_terminal() {
+        use kr_protocol::confirmation::{
+            ConfirmationSubject, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
+        };
+        use kr_protocol::ids::ActionId;
+        use kr_protocol::organisation::{
+            OrganisationExclusiveSetParams, OrganisationExclusiveSetResult,
+        };
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, _wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
+        controller
+            .update_policy(|policy| policy.set_exclusively_managed(true))
+            .expect("the host is exclusively organisation-managed");
+        rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("opens the registry")
+            .execute(
+                "INSERT INTO host_owner (id, how, established_at_ms) VALUES (0, 'migrated', 1)",
+                [],
+            )
+            .expect("the host has an owner");
+        let door = Door::open(&temp, &controller).await;
+
+        let challenge: OwnerConfirmationRequestResult = door
+            .perform(door.mutation(
+                Method::OwnerConfirmationRequest,
+                ActionId::new(kr_ipc::new_uuid()),
+                TTL_MS,
+                &OwnerConfirmationRequestParams {
+                    subject: ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+                },
+            ))
+            .await
+            .expect("the host asks its terminal, with no network");
+        assert!(
+            challenge.initial_bootstrap,
+            "no device is left that could confirm: the terminal does"
+        );
+        door.answer(&challenge.request)
+            .await
+            .expect("the terminal answers");
+        let ended: OrganisationExclusiveSetResult = door
+            .perform(door.mutation(
+                Method::OrganisationExclusiveSet,
+                ActionId::new(kr_ipc::new_uuid()),
+                TTL_MS,
+                &OrganisationExclusiveSetParams { exclusive: false },
+            ))
+            .await
+            .expect("the host spends the terminal's answer");
+        assert!(!ended.exclusive);
+        assert!(!controller.policy().is_exclusively_managed());
+        let events = controller
+            .sharing()
+            .grants()
+            .exclusive_management_events()
+            .expect("readable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].channel,
+            kr_protocol::pairing::ConfirmationChannel::LocalBootstrapTerminal
+        );
+        drop(door);
         stopped(controller).await;
     }
 }

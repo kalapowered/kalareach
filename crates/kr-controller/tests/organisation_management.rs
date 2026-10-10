@@ -1295,3 +1295,83 @@ async fn a_device_that_can_confirm_appearing_after_the_terminal_answered_stops_t
     drop(client);
     fixture.host.stop().await;
 }
+
+/// The number of actions this host holds a claim on: the rows a request that is asked again for a
+/// confirmation not yet given must not leave behind.
+fn claims(fixture: &Fixture) -> i64 {
+    rusqlite::Connection::open(fixture.host.registry_database())
+        .expect("the registry opens")
+        .query_row("SELECT COUNT(*) FROM authority_receipts", [], |row| {
+            row.get(0)
+        })
+        .expect("counts the claims")
+}
+
+/// KR-REQ-17.54: a request to change exclusive management that finds no answered confirmation of
+/// exactly that change is refused before anything is claimed, so an owner's client that asks again
+/// with a new identifier for each poll leaves no row behind per attempt, and a confirmation of the
+/// other change is neither spent nor accepted for this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_of_exclusive_management_with_no_answer_yet_leaves_no_claim_and_spends_nothing_else()
+ {
+    let fixture = Fixture::start().await;
+    let before = claims(&fixture);
+    let mut client = fixture.host.client().await;
+    for _ in 0..3 {
+        let refused = calls::mutate::<_, OrganisationExclusiveSetResult>(
+            fixture.host.environment_id,
+            &mut client,
+            Method::OrganisationExclusiveSet,
+            &OrganisationExclusiveSetParams { exclusive: true },
+        )
+        .await
+        .expect_err("no confirmation has been given");
+        assert_eq!(
+            refused.code,
+            ErrorCode::OwnerConfirmationRequired,
+            "{refused:?}"
+        );
+    }
+    assert_eq!(claims(&fixture), before, "a poll leaves nothing behind");
+
+    // A confirmation of the end of exclusive management is not one for making the host exclusive.
+    // The host is not exclusive, so the end cannot be asked for; the confirmation of making it
+    // exclusive is for another host's state once an organisation is withdrawn.
+    calls::confirm_subject(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+        &Signer::OwnerDevice(&fixture.owner),
+    )
+    .await
+    .expect("the owner device confirms making the host exclusive");
+    drop(client);
+    let mut client = fixture.host.client().await;
+    let organisation_id = fixture.organisation.organisation_id;
+    fixture
+        .withdraw(
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            organisation_id,
+        )
+        .await
+        .expect("the host leaves the organisation");
+    drop(client);
+    let mut client = fixture.host.client().await;
+    let refused = calls::mutate::<_, OrganisationExclusiveSetResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::OrganisationExclusiveSet,
+        &OrganisationExclusiveSetParams { exclusive: true },
+    )
+    .await
+    .expect_err("the confirmation was for a host enrolled in the organisation");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+    assert!(!fixture.listed().await.exclusive);
+    drop(client);
+    fixture.host.stop().await;
+}
