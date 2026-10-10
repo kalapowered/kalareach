@@ -1290,6 +1290,26 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
         .collect(),
         "a grant revoked a moment before, whose fence is owed, is reached; the proposal is not"
     );
+
+    // Revoking the device that holds the root takes its grants and everything delegated from them,
+    // each reached with the device it was issued to.
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    build(&directory);
+    let revocation = directory
+        .revoke_device(device_id(0xf1), now, || Ok(()), None)
+        .expect("the device is revoked");
+    assert_eq!(
+        reached(&revocation),
+        [
+            (grant_id(1), device_id(0xf1)),
+            (grant_id(2), device_id(0x21)),
+            (grant_id(3), device_id(0x22)),
+            (grant_id(4), device_id(0x23)),
+            (grant_id(5), device_id(0x24)),
+        ]
+        .into_iter()
+        .collect(),
+    );
 }
 
 #[test]
