@@ -153,6 +153,29 @@ describe('a draft that came back is bound again when the host has said where it 
     expect(controls.actions).toEqual([])
   })
 
+  it('binds a draft again after the network changed under a connection that stayed up', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    render(shell(port, fakeStorage()))
+    await person.type(await openMainSession(person), 'kept through a network change')
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+
+    act(() => {
+      window.dispatchEvent(new Event('offline'))
+    })
+    // The change took the association away, and it stays away until the host has been asked.
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    act(() => {
+      window.dispatchEvent(new Event('online'))
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+    expect(screen.getByLabelText('Message this session')).toHaveValue('kept through a network change')
+    expect(controls.actions).toEqual([])
+  })
+
   it('asks the host about a draft in a session that is not on screen', async () => {
     const person = userEvent.setup()
     const { port } = fakeHost()

@@ -381,3 +381,62 @@ describe('the desktop port and an agent’s questions', () => {
     ])
   })
 })
+
+describe('the desktop port and the drafts this device keeps', () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
+  const DRAFT = 'c1000000-0000-4000-8000-000000000001'
+
+  it('names a draft, the version it replaces and nothing else the native commands refuse', async () => {
+    const port = tauriPort()
+    await port.deviceDrafts()
+    await port.deviceDraftSave({
+      id: DRAFT,
+      expectedRevision: '2',
+      sessionId: SESSION,
+      applicationInstanceId: null,
+      agentBindingRevision: null,
+      state: 'open',
+      text: 'half a thought',
+      attachments: []
+    })
+    await port.deviceDraftRetarget({
+      id: DRAFT,
+      expectedRevision: '3',
+      sessionId: SESSION,
+      applicationInstanceId: null,
+      agentBindingRevision: null
+    })
+    await port.deviceDraftDiscard({ id: DRAFT, expectedRevision: '4' })
+    expect(shell.invoked).toEqual([
+      { command: 'device_drafts', args: {} },
+      {
+        command: 'device_draft_save',
+        args: {
+          params: {
+            id: DRAFT,
+            expectedRevision: '2',
+            sessionId: SESSION,
+            applicationInstanceId: null,
+            agentBindingRevision: null,
+            state: 'open',
+            text: 'half a thought',
+            attachments: []
+          }
+        }
+      },
+      {
+        command: 'device_draft_retarget',
+        args: {
+          params: {
+            id: DRAFT,
+            expectedRevision: '3',
+            sessionId: SESSION,
+            applicationInstanceId: null,
+            agentBindingRevision: null
+          }
+        }
+      },
+      { command: 'device_draft_discard', args: { params: { id: DRAFT, expectedRevision: '4' } } }
+    ])
+  })
+})
