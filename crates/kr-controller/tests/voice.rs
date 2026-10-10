@@ -685,9 +685,10 @@ async fn stopping_voice_leaves_the_session_running() {
 }
 
 /// KR-REQ-15.02 and KR-REQ-10.49: a call starts under a standing voice grant that an earlier build
-/// stored with no history cursor and that began after the device's own grant. The cursor reads as
-/// the voice grant's start, and the call's grant, delegated from it, reads from there and no
-/// earlier, so the voice grant can narrow it.
+/// stored with no history cursor, that began after the device's own grant and that leaves out the
+/// live screen the device's grant has. The cursor reads as the voice grant's start, and the call's
+/// grant, delegated from it, reads from there and no earlier and shows no live screen, so the voice
+/// grant can narrow it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_starts_under_a_voice_grant_stored_with_no_history_cursor() {
     let host = host().await;
@@ -707,6 +708,7 @@ async fn a_call_starts_under_a_voice_grant_stored_with_no_history_cursor() {
     let mut earlier_build = stored.grant.clone();
     earlier_build.grant_id = GrantId::new(kr_ipc::new_uuid());
     earlier_build.history.lower_bound_ms = Nullable::null();
+    earlier_build.history.include_live_screen = false;
     grants
         .issue(
             &kr_controller::grants::GrantRecord {
@@ -730,6 +732,10 @@ async fn a_call_starts_under_a_voice_grant_stored_with_no_history_cursor() {
         call.history.lower_bound_ms.0.map(TimestampMs::get),
         Some(began),
         "the call reads from the moment the voice grant began, not from the device's own grant"
+    );
+    assert!(
+        !call.history.include_live_screen,
+        "and shows no live screen the voice grant leaves out"
     );
     host.clients.abort();
 }
