@@ -27,7 +27,7 @@ mod pairing_calls;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
@@ -38,7 +38,7 @@ use kr_client::transport::NetworkTransport;
 use kr_controller::registry::Registry;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
 use kr_controller::supervision::DetachedSupervisor;
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
@@ -50,9 +50,12 @@ use kr_pairing::direct::CandidateIdentity;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
 };
+use kr_protocol::confirmation::ConfirmationSubject;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+use kr_protocol::grant::{
+    EnvironmentSelector, GrantExpiry, HistoryScope, OrganisationRequirement, SessionSelector,
+};
 use kr_protocol::hostinfo::configuration::Change;
 use kr_protocol::ids::{
     ActionId, AttachmentId, BuildId, DeviceId, DeviceKeyRevision, EnvironmentId, SessionId,
@@ -64,6 +67,10 @@ use kr_protocol::input::{
 use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
+use kr_protocol::organisation::{
+    MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
+    OrganisationEnrolResult,
+};
 use kr_protocol::pairing::{DeviceName, DevicePlatform, ProposedGrant};
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::recovery::{EventStream, EventsSubscribeResult, OutputEvent};
@@ -73,10 +80,12 @@ use kr_protocol::session::{
     Presentation, SessionCloseParams, SessionCreateParams, SessionCreateResult, SessionReadParams,
     SessionReadResult, SessionState, ShellMode,
 };
+use kr_transport::clock::ManualClock;
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::LocalIdentity;
 use kr_transport::scheduler::SendLimits;
 
+mod organisation_support;
 mod teardown;
 
 /// How long a test waits for something the machine has to do before it calls it a failure.
@@ -150,12 +159,31 @@ impl Host {
 
     /// Starts the daemon and puts it on the network with the endpoint configuration given.
     async fn start(&self, endpoint: EndpointConfig, owner: &DeviceKeys) -> RunningDaemon {
+        self.start_on(endpoint, owner, None).await
+    }
+
+    /// Starts the daemon as [`Self::start`] does, on the clocks a test moves by hand.
+    async fn start_on_clocks(
+        &self,
+        endpoint: EndpointConfig,
+        owner: &DeviceKeys,
+        clocks: Clocks,
+    ) -> RunningDaemon {
+        self.start_on(endpoint, owner, Some(clocks)).await
+    }
+
+    async fn start_on(
+        &self,
+        endpoint: EndpointConfig,
+        owner: &DeviceKeys,
+        clocks: Option<Clocks>,
+    ) -> RunningDaemon {
         // The owner device dials from an endpoint configured like the host's own.
         let endpoint_for_owner = endpoint.clone();
         let environment = self.paths();
         let environment_id = self.environment_id;
         let secrets = environment.secrets_dir();
-        let controller = Controller::start(ControllerSetup {
+        let setup = ControllerSetup {
             paths: environment.clone(),
             environment_id,
             identity: Box::new(move || {
@@ -173,8 +201,11 @@ impl Host {
             release: "0".to_owned(),
             shell_packages: None,
             terminal: Box::new(kr_controller::supervision::NoTerminal),
-        })
-        .await
+        };
+        let controller = match clocks {
+            Some(clocks) => Controller::start_on_clocks(setup, clocks).await,
+            None => Controller::start(setup).await,
+        }
         .expect("the daemon starts");
         let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
             .expect("binds the rendezvous");
@@ -1820,6 +1851,409 @@ async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_gran
 
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
+}
+
+/// The clocks of a daemon that a test moves by hand: a continuous clock that starts at zero, and a
+/// wall clock that reads the machine's, offset by what the test has let pass.
+struct Moved {
+    continuous: ManualClock,
+    offset: Arc<AtomicI64>,
+}
+
+impl Moved {
+    fn new() -> Self {
+        Self {
+            continuous: ManualClock::new(),
+            offset: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
+    /// The clocks to start a daemon on.
+    fn clocks(&self) -> Clocks {
+        let offset = Arc::clone(&self.offset);
+        Clocks {
+            continuous: Arc::new(self.continuous.clone()),
+            wall: WallClock::from_fn(move || {
+                kr_ipc::now_ms()
+                    .get()
+                    .saturating_add_signed(offset.load(Ordering::SeqCst))
+            }),
+        }
+    }
+
+    /// The daemon's reading of UTC, in milliseconds.
+    fn now_ms(&self) -> u64 {
+        kr_ipc::now_ms()
+            .get()
+            .saturating_add_signed(self.offset.load(Ordering::SeqCst))
+    }
+
+    /// Lets `minutes` pass on both clocks, as time does.
+    fn pass(&self, minutes: u64) {
+        let by = minutes * organisation_support::MINUTE_MS;
+        self.continuous.advance(Duration::from_millis(by));
+        self.offset
+            .fetch_add(i64::try_from(by).expect("a short time"), Ordering::SeqCst);
+    }
+}
+
+/// The rights of a member's grant and of each lease signed for it: the most an organisation's owner
+/// role may hold that a session needs.
+const MEMBER_RIGHTS: [ActionRight; 3] = [
+    ActionRight::SessionView,
+    ActionRight::TerminalInput,
+    ActionRight::SessionClose,
+];
+
+/// A host enrolled in an organisation, a running session on it, and a member's device paired
+/// under a grant that answers to the organisation, on clocks the test moves.
+///
+/// The organisation is a stand-in that signs with real keys: it issues the leases and publishes
+/// the chain, which is all the managed service does for the host. Nothing here presents a lease.
+struct Membership {
+    host: Host,
+    daemon: RunningDaemon,
+    moved: Moved,
+    organisation: organisation_support::Organisation,
+    account: kr_protocol::ids::AccountId,
+    device: Device,
+    record: DeviceRecord,
+    session_id: SessionId,
+}
+
+impl Membership {
+    async fn start() -> Self {
+        let host = Host::create();
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let moved = Moved::new();
+        let daemon = host
+            .start_on_clocks(loopback(), &owner, moved.clocks())
+            .await;
+        let environment_id = host.environment_id;
+
+        // The owner enrols the host in the organisation through a confirmation, the way a person
+        // does.
+        let day_ms = 24 * 60 * organisation_support::MINUTE_MS;
+        let organisation = organisation_support::Organisation::new(
+            0x21,
+            moved.now_ms().saturating_sub(2 * day_ms),
+        );
+        let params = OrganisationEnrolParams {
+            authority: organisation.authority(moved.now_ms() - 1_000),
+        };
+        let mut local = host.client().await;
+        pairing_calls::confirm_subject(
+            environment_id,
+            &mut local,
+            ConfirmationSubject::EnrolOrganisation(Box::new(params.clone())),
+            &pairing_calls::Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("the owner confirms the chain");
+        let enrolled: OrganisationEnrolResult = pairing_calls::mutate_as(
+            environment_id,
+            &mut local,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::OrganisationEnrol,
+            &params,
+        )
+        .await
+        .expect("the host enrols");
+
+        let created = create(&mut local, &host).await;
+        let device = Device::create(&loopback()).await;
+        let record = pair_with(
+            &daemon,
+            &device,
+            &owner,
+            ProposedGrant {
+                actions: MEMBER_RIGHTS.into_iter().collect(),
+                organisation: Nullable::some(OrganisationRequirement {
+                    organisation_id: organisation.organisation_id,
+                    policy_revision: enrolled.enrolment_revision,
+                }),
+                ..proposal()
+            },
+        )
+        .await;
+        Self {
+            host,
+            daemon,
+            moved,
+            organisation,
+            account: organisation_support::member("ada"),
+            device,
+            record,
+            session_id: created.session.session_id,
+        }
+    }
+
+    fn environment_id(&self) -> EnvironmentId {
+        self.host.environment_id
+    }
+
+    /// A connection of the member's device, with an action window of its own.
+    async fn connect(&self) -> Session {
+        connect(&self.daemon, &self.device, &self.record).await
+    }
+
+    /// Presents a lease the organisation signs now, on `session`, as a member's client does.
+    async fn present(&self, session: &Session) -> MembershipPresentResult {
+        let lease = self.organisation.lease(
+            1,
+            &self.account,
+            *self.device.keys.authorisation.public(),
+            self.moved.now_ms(),
+            &MEMBER_RIGHTS,
+        );
+        session
+            .mutate(
+                Method::MembershipPresent,
+                ActionTarget::environment(self.environment_id()),
+                None,
+                &ParamsValue::empty(),
+                &MembershipPresentParams {
+                    lease,
+                    authority: Nullable::null(),
+                },
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect("the host settles the presentation")
+            .to_typed()
+            .expect("the answer of the method")
+    }
+
+    /// Reads the session the member's device was given a grant to.
+    async fn read(&self, session: &Session) -> kr_client::Result<SessionReadResult> {
+        session
+            .read(
+                Method::SessionRead,
+                &SessionReadParams {
+                    session_id: self.session_id,
+                },
+            )
+            .await
+    }
+
+    /// Ends the session and the daemon. The owner's connection is a new one, because the clocks
+    /// have moved since any it held before.
+    async fn finish(self) {
+        let mut local = self.host.client().await;
+        close_session(&mut local, &self.host, self.session_id).await;
+        self.daemon.stop().await;
+    }
+}
+
+/// A loop in the shell's foreground that prints `TICK` every fifth of a second and, once the test
+/// has written a file, that file's content beside it. What the test writes is then something the
+/// member can be sent that was printed after the test wrote it, and not before.
+///
+/// Printed through format strings, so the echo of the command itself matches neither.
+fn flag_loop(flag: &Path) -> String {
+    format!(
+        "while :; do printf 'kala%s-tick\\n' reach; if [ -f '{path}' ]; then \
+         printf 'kala%s-flag-%s\\n' reach \"$(cat '{path}')\"; fi; sleep 0.2; done\n",
+        path = flag.display()
+    )
+}
+
+/// KR-REQ-17.54: a running subscription of a member's device ends when the membership lease it was
+/// admitted under runs out, and nothing about the grant ends with it.
+///
+/// A real host, a real worker and a real shell, on a continuous clock and a wall clock the test
+/// moves. A member whose grant answers to an organisation presents a lease, attaches to a session
+/// and follows its output while the shell prints. The device renews at ten minutes, so the first
+/// lease's end at fifteen passes with output still flowing: it is the renewal that serves it, and
+/// time alone does not end anything. After the renewal's end the next batch is not written and the
+/// connection goes, with the grant as it was: the device connects again, is refused for want of a
+/// lease although its transport is up, and is served by the next lease it presents.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serves_the_device_again()
+ {
+    let world = Membership::start().await;
+    let environment_id = world.environment_id();
+    let session_id = world.session_id;
+
+    // The first lease serves the device, and it follows the shell's output.
+    let session = world.connect().await;
+    world.present(&session).await;
+    let attached = attach(&session, environment_id, session_id).await;
+    let seen = type_and_observe(
+        &session,
+        environment_id,
+        session_id,
+        attached.typing,
+        MARKER_COMMAND,
+    )
+    .await;
+    assert!(seen.contains(MARKER));
+    let mut events = session.events();
+    let flag = world.host.tree().root().join("flag");
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(flag_loop(&flag).into_bytes()),
+        })
+        .await
+        .expect("the loop is typed");
+    received_without_applying(&mut events, TICK).await;
+
+    // A renewal at ten minutes, on a connection of its own, carries the device past the first
+    // lease's end. What the device is sent after that end proves the renewal, not the clock, is
+    // what serves it.
+    world.moved.pass(10);
+    let renewing = world.connect().await;
+    world.present(&renewing).await;
+    renewing.close();
+    world.moved.pass(6);
+    std::fs::write(&flag, "past-the-first-lease").expect("the flag is written");
+    received_without_applying(&mut events, "kalareach-flag-past-the-first-lease").await;
+
+    // No renewal comes. The renewal's end passes, and the next batch the shell prints is not
+    // written to the device. Until then a request on the connection is refused for the lease.
+    world.moved.pass(10);
+    std::fs::write(&flag, "after-the-last-lease").expect("the flag is written");
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        match world.read(&session).await {
+            Err(refused) if refused.code() == ErrorCode::ResourceUnavailable => break,
+            Err(refused) => assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}"),
+            Ok(_) => panic!("a read was served after the last lease ran out"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the running subscription's output was never stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut after = String::new();
+    while let Ok(notification) = events.try_recv() {
+        if notification.event_type.as_str() == "session.output" {
+            let event: OutputEvent = notification.payload.to_typed().expect("an output event");
+            after.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+        }
+    }
+    assert!(
+        !after.contains("kalareach-flag-after-the-last-lease"),
+        "nothing printed after the lease ran out reached the device: {after:?}"
+    );
+    session.close();
+
+    // The grant is as it was: no expiry and no revocation is written for a lapsed lease.
+    let stored = world
+        .daemon
+        .controller
+        .devices()
+        .devices()
+        .expect("reads the devices")
+        .into_iter()
+        .find(|stored| stored.device_id == world.record.device_id)
+        .expect("the device's record");
+    assert!(
+        stored.is_paired() && stored.expired_at_ms.is_none(),
+        "{stored:?}"
+    );
+
+    // The device connects again. Its transport is up and the host refuses it for want of a lease;
+    // the next lease it presents serves it the session again.
+    let again = world.connect().await;
+    let refused = world.read(&again).await.expect_err("no lease is in force");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    world.present(&again).await;
+    let read = world
+        .read(&again)
+        .await
+        .expect("the session is read under the new lease");
+    assert_eq!(read.session.session_id, session_id);
+    again.close();
+
+    world.finish().await;
+}
+
+/// KR-REQ-17.54: a read and a mutation sent after a membership lease has run out are refused on a
+/// connection that is still up, and the same connection serves the device again once it presents
+/// a new lease.
+///
+/// Section 17 has expired membership block further organisation-mediated reads and mutations even
+/// if the transport remains connected, so the block does not wait for the transport to close. No
+/// subscription is running here, so nothing but the lease decides: a real host with a real session
+/// behind it, a connection opened a minute before the lease's end, and a read of the session and
+/// an attach to it, which the worker serves, each answered before the end and refused after it.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_once_its_lease_ends()
+{
+    let world = Membership::start().await;
+    let environment_id = world.environment_id();
+    let session_id = world.session_id;
+
+    let first = world.connect().await;
+    world.present(&first).await;
+    first.close();
+
+    // A minute before the lease ends, on a connection opened then, the session is read and
+    // attached to.
+    world.moved.pass(14);
+    let session = world.connect().await;
+    world.read(&session).await.expect("a read under the lease");
+    attach_one(
+        &session,
+        environment_id,
+        session_id,
+        &[AttachmentCapability::ObserveTerminal],
+    )
+    .await;
+
+    // The lease ends. The connection and its action window are still there, and the host answers
+    // both requests on it with a refusal for the lease.
+    world.moved.pass(2);
+    let refused = world
+        .read(&session)
+        .await
+        .expect_err("a read after the lease ended");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    let refused = session
+        .mutate(
+            Method::SessionAttach,
+            ActionTarget {
+                environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &ParamsValue::empty(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Semantic,
+                claim_geometry: false,
+                dimensions: Nullable::null(),
+                terminal_profile_id: Nullable::null(),
+                requested: [AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("a mutation after the lease ended");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+
+    // The same connection serves the device again with the next lease it presents.
+    world.present(&session).await;
+    world
+        .read(&session)
+        .await
+        .expect("the connection that stayed up serves the read again");
+    session.close();
+
+    world.finish().await;
 }
 
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
