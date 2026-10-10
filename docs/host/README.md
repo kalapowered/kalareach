@@ -2693,7 +2693,7 @@ Every grant keeps the rights it names. A device keeps the four reads, and `proje
 
 A paired device is served three of the change-set group's methods: `changeset.read`, `changeset.materialize`, and `diff.read` of a recorded version. None of them runs Git or reads a working tree. `diff.read` and `changeset.materialize` answer from the version's captured content in the change-set store, and `changeset.materialize` writes it into a private directory of the service's own, inside the daemon's hold of the connection's admission, so a grant withdrawn while it waits leaves nothing behind.
 
-A device names a version, and the daemon serves it only when the version is inside the device's grant. `changeset.read` is held to the same check. Its environment has to be one the grant selects. Its session has to be one the grant selects, and where the grant names sessions rather than every session, a version that records no session is out of scope. It has to have been captured at or after the moment the grant's history reaches back to, and a grant with no lower bound retains none. A version outside the grant's environments or sessions and a version that does not exist are refused in the same words, so a device learns nothing about which identifiers exist; a version that is inside them but older than the history reaches is refused with a sentence that says so. A workflow is held to the same rule, with its own scope in place of a grant's.
+A device names a version, and the daemon serves it only when the version is inside the device's grant. `changeset.read` is held to the same check. Its environment has to be one the grant selects. Its session has to be one the grant selects, and where the grant names sessions rather than every session, a version that records no session is out of scope. It has to have been captured at or after the moment the grant's history reaches back to, and a grant with no lower bound reaches back to the moment its pairing was committed. A version outside the grant's environments or sessions and a version that does not exist are refused in the same words, so a device learns nothing about which identifiers exist; a version that is inside them but older than the history reaches is refused with a sentence that says so. A workflow is held to the same rule, with its own scope in place of a grant's.
 
 No answer to a device names the directory of a materialisation. A materialisation is shown by its identity, and the directory's path is replaced by a marker that gives only its class and length. That holds for the answer to `changeset.materialize`, for a repeat of it answered from the record, and for the materialisations that `changeset.read` lists, and a refusal that comes out of the change-set service reaches a device with its code and the class and length of its text.
 
@@ -5000,11 +5000,17 @@ authority revision. That refuses the actions each worker admitted and did not di
 the input lease of the callers acting under a grant the revocation withdrew, or from a device it
 named. A device that was typing under a grant the revocation did not touch keeps its lease and goes
 on typing at the epoch it holds, though a batch it had in flight when the revision advanced is
-refused and sent again. The host tells each worker which grants and devices the revisions since the
-last one that worker fenced withdrew. Where it cannot say, because a revision reached the whole host
-(revoking a device, or changing the rights ceiling) or the worker missed one the notice does not
-describe, the worker takes the input lease of every caller acting under a grant. Revoking a device
-still reaches every connection.
+refused and sent again. The host tells each worker whose authority the revisions it has not yet
+fenced withdrew. It names the grants and devices, and when a subtree has more grants than one notice
+carries (4,096 names), it names the devices that hold them instead. The host keeps this for the last
+16 revisions. A worker that was refused an announcement because it was inside a dispatch transition
+keeps what it was refused and fences it together with the next announcement, however many there are,
+up to 65,536 names. The worker takes the input lease of every caller acting under a grant when the
+host cannot say whose authority was withdrawn: when a revision reached the whole host (revoking a
+device, or changing the rights ceiling), when the host restarted since the revision, when the worker
+is more than 16 revisions behind, when the devices to name outnumber what a notice carries, or when
+the worker missed a revision the notice does not describe. Revoking a device still reaches every
+connection.
 
 `grants::decide` takes the intersection in this order:
 

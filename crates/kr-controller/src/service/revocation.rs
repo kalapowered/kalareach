@@ -99,10 +99,7 @@ impl Controller {
             }
             None => self.sharing.revoke(grant_id, now_ms, || Ok(()), claim)?,
         };
-        let own = self.publish_debts(&Self::under_the_grants(
-            revocation.debt,
-            &revocation.reached,
-        ));
+        let own = self.publish_debts(&Self::under_the_grants(&revocation));
         self.complete_revocation(
             audience,
             Some(grant_id),
@@ -127,11 +124,20 @@ impl Controller {
     /// concurrent revocation withdrew just before this one read the subtree is fenced by whichever
     /// barrier runs first.
     fn under_the_grants(
-        debt: Option<crate::grants::store::DebtId>,
-        reached: &[kr_protocol::ids::GrantId],
+        revocation: &crate::grants::GrantRevocation,
     ) -> Vec<(crate::grants::store::DebtId, Reach)> {
-        debt.into_iter()
-            .map(|debt| (debt, Reach::Grants(reached.iter().copied().collect())))
+        revocation
+            .debt
+            .into_iter()
+            .map(|debt| {
+                (
+                    debt,
+                    Reach::Grants {
+                        grants: revocation.reached.iter().copied().collect(),
+                        held_by: revocation.held_by.clone(),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -342,10 +348,7 @@ impl Controller {
         };
         self.settle_floor();
         let transfer = transfer?;
-        let own = self.publish_debts(&Self::under_the_grants(
-            transfer.revoked.debt,
-            &transfer.revoked.reached,
-        ));
+        let own = self.publish_debts(&Self::under_the_grants(&transfer.revoked));
         self.complete_transfer(
             transfer.issued,
             transfer.revoked.revoked.iter().copied().collect(),

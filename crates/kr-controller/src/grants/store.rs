@@ -208,7 +208,10 @@ pub struct GrantRevocation {
     /// named only what this call revoked would leave it out. A proposal nobody redeemed has no
     /// holder and is not in here.
     pub reached: Vec<GrantId>,
-    /// The devices that held them, which is what a revocation has to fence.
+    /// The devices those grants were issued to, which hold the input a fence takes. A fence that
+    /// cannot name every grant of a very large subtree names these instead.
+    pub held_by: BTreeSet<DeviceId>,
+    /// The devices that held what this call revoked, which is what a revocation has to fence.
     pub devices: BTreeSet<DeviceId>,
     /// The sessions those grants covered, which is what a revocation has to close subscriptions
     /// for. Empty when a revoked grant covered every session.
@@ -903,6 +906,7 @@ impl GrantDirectory {
                 ),
                 revoked: Vec::new(),
                 reached: Vec::new(),
+                held_by: BTreeSet::new(),
                 devices: BTreeSet::new(),
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
@@ -944,6 +948,7 @@ impl GrantDirectory {
                 )?;
                 merged.revoked.extend(one.revoked);
                 merged.reached.extend(one.reached);
+                merged.held_by.extend(one.held_by);
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
                 merged.covers_every_session |= one.covers_every_session;
@@ -1001,6 +1006,7 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
         let mut reached = Vec::new();
+        let mut held_by = BTreeSet::new();
         let mut devices = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
@@ -1008,6 +1014,7 @@ impl GrantDirectory {
         for record in subtree {
             if record.is_active() && owes_a_fence(&record.grant) {
                 reached.push(record.grant.grant_id);
+                held_by.insert(record.grant.recipient_device_id);
             }
             let is_the_named_one = record.grant.grant_id == grant_id;
             let changed = connection
@@ -1063,6 +1070,7 @@ impl GrantDirectory {
             grant_id,
             revoked,
             reached,
+            held_by,
             devices,
             sessions,
             covers_every_session,

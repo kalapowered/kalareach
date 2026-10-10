@@ -62,7 +62,13 @@ pub(crate) enum Reach {
     /// The connections acting under these grants, which a share's revocation withdrew with its
     /// descendants. A connection that acts under any other grant, and the owner's own, are
     /// admitted again at the revision the barrier advances to.
-    Grants(std::collections::BTreeSet<kr_protocol::ids::GrantId>),
+    Grants {
+        /// The grants withdrawn.
+        grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
+        /// The devices those grants were issued to, which a notice names in place of the grants
+        /// when the subtree is too large for it to name them.
+        held_by: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
+    },
 }
 
 /// The restrictive changes whose fence debt no barrier has retired (section 26).
@@ -101,18 +107,44 @@ pub(super) struct Debts {
 pub(super) struct Named {
     grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
     devices: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
+    /// The devices the named grants were issued to.
+    held_by: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
 }
 
 impl Named {
+    /// How many names a notice carries for this.
     fn len(&self) -> usize {
         self.grants.len() + self.devices.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn joined(&self, other: &Self) -> Self {
         Self {
             grants: self.grants.union(&other.grants).copied().collect(),
             devices: self.devices.union(&other.devices).copied().collect(),
+            held_by: self.held_by.union(&other.held_by).copied().collect(),
         }
+    }
+
+    /// This as a notice can carry it: as it is when it fits, and otherwise as the devices that
+    /// hold the grants, which are the devices of one subtree and no others, so a device that
+    /// delegates a great many grants takes the input of the devices it delegated to and of no
+    /// device outside them. Only more devices than a notice can name make it none: the whole
+    /// host's, which no device can bring about, since the owner pairs every device.
+    fn fitted(self) -> Option<Self> {
+        if self.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+            return Some(self);
+        }
+        let devices: std::collections::BTreeSet<_> =
+            self.devices.union(&self.held_by).copied().collect();
+        (devices.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES).then_some(Self {
+            grants: std::collections::BTreeSet::new(),
+            devices,
+            held_by: std::collections::BTreeSet::new(),
+        })
     }
 }
 
@@ -792,8 +824,8 @@ impl Controller {
     /// host's or cannot be named.
     ///
     /// A debt that reaches every connection is the whole host. The others are the grants and the
-    /// devices they name; more names than a notice should carry is the whole host too, which is
-    /// the reach every worker fences by when it knows no better.
+    /// devices they name, or the devices that hold the grants when there are too many to name
+    /// ([`Named::fitted`]).
     fn reach_of(captured: &BTreeMap<crate::grants::store::DebtId, Reach>) -> Option<Named> {
         let mut named = Named::default();
         for reach in captured.values() {
@@ -802,11 +834,13 @@ impl Controller {
                 Reach::Device(device_id) => {
                     named.devices.insert(*device_id);
                 }
-                Reach::Grants(grants) => named.grants.extend(grants.iter().copied()),
+                Reach::Grants { grants, held_by } => {
+                    named.grants.extend(grants.iter().copied());
+                    named.held_by.extend(held_by.iter().copied());
+                }
             }
         }
-        let names = named.len();
-        (names > 0 && names <= kr_protocol::worker::MAX_REVISION_REACH_NAMES).then_some(named)
+        named.fitted().filter(|named| !named.is_empty())
     }
 
     /// What the revisions up to `revision` withdrew, as far back as this daemon can say.
@@ -829,10 +863,9 @@ impl Controller {
             let Some(Some(earlier)) = debts.reaches.get(&since) else {
                 break;
             };
-            let joined = named.joined(earlier);
-            if joined.len() > kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+            let Some(joined) = named.joined(earlier).fitted() else {
                 break;
-            }
+            };
             named = joined;
             since -= 1;
         }
@@ -907,7 +940,7 @@ impl Controller {
                     captured
                         .values()
                         .filter_map(|reach| match reach {
-                            Reach::Grants(grants) => Some(grants.iter().copied()),
+                            Reach::Grants { grants, .. } => Some(grants.iter().copied()),
                             Reach::Host | Reach::Device(_) => None,
                         })
                         .flatten()
@@ -922,7 +955,7 @@ impl Controller {
                             Reach::Device(device_id) => {
                                 Some(kr_transport::listener::device_principal(device_id))
                             }
-                            Reach::Host | Reach::Grants(_) => None,
+                            Reach::Host | Reach::Grants { .. } => None,
                         })
                         .collect();
                     // The connections that were not withdrawn hold authority these changes did not
