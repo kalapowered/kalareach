@@ -52,12 +52,15 @@ describe('the sync service setting', () => {
     await person.clear(input)
     await person.type(input, 'http://sync.example')
     await person.click(within(sheet).getByTestId('save-sync-service'))
-    // The refusal is said in the card's status line, which takes focus, and the choice stands.
+    // The refusal is said in the card's status line, the choice stands, and focus stays in the
+    // field to correct, marked invalid and described by that line.
     const status = within(sheet).getByTestId('sync-status')
     await waitFor(() => {
-      expect(status).toHaveFocus()
+      expect(status).toHaveTextContent('https')
     })
-    expect(status).toHaveTextContent('https')
+    expect(input).toHaveFocus()
+    expect(input).toHaveAttribute('aria-invalid', 'true')
+    expect(input).toHaveAttribute('aria-describedby', status.id)
     expect(within(sheet).getByTestId('sync-service')).toHaveTextContent('reach.kala.to')
     expect(within(sheet).getByLabelText('Sync service')).toBeInTheDocument()
 
@@ -96,10 +99,19 @@ describe('recovery', () => {
     expect(recovery).toHaveAttribute('data-state', 'off')
     expect(within(recovery).queryByTestId('recovery-save-kit')).toBeNull()
 
+    // Focus lands once the card has been read again: the line a person is left on says where
+    // things now stand, not where they stood.
+    const stateAtFocus: (string | null)[] = []
+    within(recovery)
+      .getByTestId('recovery-status')
+      .addEventListener('focus', () => {
+        stateAtFocus.push(recovery.getAttribute('data-state'))
+      })
     await person.click(within(recovery).getByTestId('recovery-turn-on'))
     await waitFor(() => {
       expect(recovery).toHaveAttribute('data-state', 'on')
     })
+    expect(stateAtFocus).toEqual(['on'])
     expect(controls.recovery.turnedOn).toBe(1)
     expect(within(recovery).getByTestId('recovery-status')).toHaveTextContent('reach.kala.to')
     expect(within(recovery).queryByTestId('recovery-turn-on')).toBeNull()
@@ -152,6 +164,13 @@ describe('recovery', () => {
     await waitFor(() => {
       expect(within(recovery).getByTestId('recovery-turn-on')).toBeInTheDocument()
     })
+    // The account card follows the sign-in from the browser back to its own status line, and
+    // recovery leaves focus there.
+    const accountPanel = within(sheet).getByTestId('account-panel')
+    await waitFor(() => {
+      expect(accountPanel).toContainElement(document.activeElement as HTMLElement)
+    })
+    expect(within(recovery).getByTestId('recovery-status')).not.toHaveFocus()
 
     act(() => {
       controls.recovery.set({
@@ -188,6 +207,10 @@ describe('recovery', () => {
       expect(recovery).toHaveAttribute('data-state', 'on')
     })
     expect(controls.recovery.settled).toBe(1)
+    // The pressed control is gone, so focus is on the line that says what happened.
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-status')).toHaveFocus()
+    })
   })
 
   it('says that a bundle stays where it was made when another sync service is chosen', async () => {
@@ -227,6 +250,43 @@ describe('recovery', () => {
       expect(recovery).toHaveAttribute('data-state', 'off')
     })
     expect(within(recovery).queryByTestId('recovery-problem')).toBeNull()
+    // The control that was pressed is gone, so focus is on the line that says where things stand.
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-status')).toHaveFocus()
+    })
+  })
+
+  it('does not take focus from a field the person went on to type in', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    const release = controls.recovery.holdTurnOn()
+    await person.click(within(recovery).getByTestId('recovery-turn-on'))
+
+    // While the backend is still working, the person opens the other card and types.
+    await person.click(within(sheet).getByTestId('change-sync-service'))
+    const input = within(sheet).getByLabelText('Sync service')
+    await person.clear(input)
+    await person.type(input, 'https://sync.exa')
+    expect(input).toHaveFocus()
+
+    act(() => {
+      release()
+    })
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
+    // The step ended with the person still in the field, and the field kept focus without the
+    // person clicking it again.
+    await waitFor(() => {
+      expect(within(recovery).queryByTestId('recovery-turn-on')).toBeNull()
+    })
+    expect(input).toHaveFocus()
+    expect(within(recovery).getByTestId('recovery-status')).not.toHaveFocus()
+    await person.keyboard('mple')
+    expect(input).toHaveValue('https://sync.example')
   })
 
   it('names nothing to buy in any state', async () => {
