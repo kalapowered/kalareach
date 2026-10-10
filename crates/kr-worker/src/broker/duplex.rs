@@ -51,6 +51,7 @@ use crate::broker::ledger::ClientRequestOutcome;
 use crate::broker::methods::{
     PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
 };
+use crate::broker::splice;
 use crate::broker::{Broker, settled};
 
 /// How many bytes may be waiting to be written to one end of a connection.
@@ -308,8 +309,8 @@ impl Sink {
     ///
     /// # Errors
     ///
-    /// Returns what [`Sink::queue`] does. The work is not run when the frame is refused here,
-    /// because nothing was taken.
+    /// Returns what [`Sink::queue`] does. A frame refused here is a frame that did not go, so the
+    /// work runs, as it does for any frame that did not go: with [`Delivery::Unsent`].
     fn queue_then(&self, body: &[u8], after: Option<Completion>) -> Result<Queued> {
         if body.len() > self.framing.largest_body() {
             return Err(BrokerError::invalid(format!(
@@ -438,21 +439,28 @@ fn refusal_frame(
     broker: &Broker,
     connection: GatewayConnectionId,
     id: &UpstreamRequestId,
-    client: &serde_json::Value,
+    client: &ClientId,
     why: &str,
 ) -> Option<Vec<u8>> {
     let held = broker.connection(connection)?;
-    let mut body = serde_json::Map::new();
-    body.insert(held.table.response_id_field.clone(), client.clone());
-    body.insert(
-        held.table.error_field.clone(),
-        serde_json::json!({
-            "code": -32_603,
-            "message": format!("{why} ({id})"),
-        }),
+    let error = serde_json::json!({
+        "code": -32_603,
+        "message": format!("{why} ({id})"),
+    });
+    let body = format!(
+        "{{{}:{},{}:{}}}",
+        serde_json::to_string(&held.table.response_id_field).ok()?,
+        client.0,
+        serde_json::to_string(&held.table.error_field).ok()?,
+        error
     );
-    serde_json::to_vec(&serde_json::Value::Object(body)).ok()
+    Some(body.into_bytes())
 }
+
+/// A request identifier as the client wrote it: the text of its JSON value, kept as it came so
+/// that the reply carries back the very identifier the client sent, whatever its spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClientId(String);
 
 /// The end one writer closes when it has finished with its own.
 ///
@@ -759,7 +767,7 @@ pub struct UpstreamReply {
 #[derive(Clone, Debug)]
 struct Forwarded {
     /// The identifier the client used, which its reply goes back under.
-    client: serde_json::Value,
+    client: ClientId,
     /// When this host stops waiting for the upstream to answer it.
     expires_at: tokio::time::Instant,
 }
@@ -832,7 +840,7 @@ impl Outstanding {
     ///
     /// Returns [`BrokerError::UpstreamUnavailable`] when this connection already holds
     /// [`MAX_FORWARDED_CLIENT_REQUESTS`] requests the upstream has not answered.
-    fn forwarding(&self, id: &UpstreamRequestId, client: serde_json::Value) -> Result<()> {
+    fn forwarding(&self, id: &UpstreamRequestId, client: ClientId) -> Result<()> {
         let mut mapped = self.mapped();
         if mapped.len() >= MAX_FORWARDED_CLIENT_REQUESTS {
             return Err(BrokerError::UpstreamUnavailable {
@@ -853,12 +861,12 @@ impl Outstanding {
     }
 
     /// Returns the client's own identifier for one request this host forwarded.
-    fn client_identifier(&self, id: &UpstreamRequestId) -> Option<serde_json::Value> {
+    fn client_identifier(&self, id: &UpstreamRequestId) -> Option<ClientId> {
         self.mapped().remove(id).map(|forwarded| forwarded.client)
     }
 
     /// Takes every client request whose deadline has passed.
-    fn expired(&self) -> Vec<(UpstreamRequestId, serde_json::Value)> {
+    fn expired(&self) -> Vec<(UpstreamRequestId, ClientId)> {
         let now = tokio::time::Instant::now();
         let mut mapped = self.mapped();
         let over: Vec<UpstreamRequestId> = mapped
@@ -872,7 +880,7 @@ impl Outstanding {
     }
 
     /// Takes every client request that is still waiting, because this connection is ending.
-    fn abandon(&self) -> Vec<(UpstreamRequestId, serde_json::Value)> {
+    fn abandon(&self) -> Vec<(UpstreamRequestId, ClientId)> {
         std::mem::take(&mut *self.mapped())
             .into_iter()
             .map(|(id, forwarded)| (id, forwarded.client))
@@ -1734,7 +1742,7 @@ impl Duplex {
     ///
     /// Returns true when the terminal was told. A refusal that cannot be handed over is a person
     /// left waiting on a reply that is not coming, so its caller ends the connection instead.
-    fn give_up(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) -> bool {
+    fn give_up(&self, id: &UpstreamRequestId, client: &ClientId, why: &str) -> bool {
         refusal_frame(&self.broker, self.connection, id, client, why)
             .is_some_and(|encoded| self.ends.client.queue(&encoded).is_ok())
     }
@@ -1804,7 +1812,7 @@ impl Duplex {
     }
 
     /// Tells the client one of its requests is refused, and ends the connection if it cannot be.
-    fn refuse_to_client(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) {
+    fn refuse_to_client(&self, id: &UpstreamRequestId, client: &ClientId, why: &str) {
         if !self.give_up(id, client, why) {
             self.fail("a refusal could not be handed to the terminal");
         }
@@ -1984,20 +1992,30 @@ impl Duplex {
         // The client is not the upstream, and it does not get to mint identifiers in this host's
         // namespace either: an identifier that looked like one of this host's would come back as
         // an answer to something this host asked for.
-        let identifier = members.get(&held.table.request_id_field).cloned();
-        if let Some(raw) = identifier.as_ref()
-            && serde_json::to_string(raw)
-                .ok()
-                .and_then(|text| UpstreamRequestId::new(text).ok())
-                .is_some_and(|id| is_host_minted(&id))
-        {
-            return Err(BrokerError::invalid(format!(
-                "{raw} begins with {HOST_REQUEST_PREFIX}, which names the requests this host \
-                 sends, and a client request cannot be one of those"
-            )));
-        }
+        let identifier = match members.get(&held.table.request_id_field) {
+            None => None,
+            Some(raw) => {
+                if serde_json::to_string(raw)
+                    .ok()
+                    .and_then(|text| UpstreamRequestId::new(text).ok())
+                    .is_some_and(|id| is_host_minted(&id))
+                {
+                    return Err(BrokerError::invalid(format!(
+                        "{raw} begins with {HOST_REQUEST_PREFIX}, which names the requests this \
+                         host sends, and a client request cannot be one of those"
+                    )));
+                }
+                // The text as the client wrote it, so the reply carries back the same one.
+                let span =
+                    splice::find_member(frame, &held.table.request_id_field)?.ok_or_else(|| {
+                        BrokerError::invalid("this frame's identifier could not be read as written")
+                    })?;
+                let text = std::str::from_utf8(&frame[span])
+                    .map_err(|_| BrokerError::invalid("this frame's identifier is not text"))?;
+                Some(ClientId(text.to_owned()))
+            }
+        };
         Ok(Some(ClientFrame {
-            body,
             identifier,
             request_id_field: held.table.request_id_field.clone(),
             frame: frame.to_vec(),
@@ -2018,7 +2036,6 @@ impl Duplex {
     /// the upstream's answer comes back to the client under the identifier the client used.
     async fn forward_to_upstream(&self, named: ClientFrame, now: TimestampMs) -> Result<Carried> {
         let ClientFrame {
-            mut body,
             identifier,
             request_id_field,
             frame,
@@ -2027,14 +2044,12 @@ impl Duplex {
             let admitted = self
                 .broker
                 .admit_client_request(self.connection, &frame, None, now)?;
-            let encoded = serde_json::to_vec(&body).map_err(|error| {
-                BrokerError::invalid(format!("this notification will not encode: {error}"))
-            })?;
             let carried = Carried::ClientNotification {
                 classification: admitted.classification,
                 suspended_rich_mutations: admitted.suspends_rich_mutations,
             };
-            self.queue_client_frame(&encoded, admitted, None)?;
+            // A notification has nothing to rewrite, and goes out as the terminal wrote it.
+            self.queue_client_frame(&frame, admitted, None)?;
             return Ok(carried);
         };
         let upstream_request_id = self.outstanding.allocate()?;
@@ -2049,17 +2064,11 @@ impl Duplex {
             classification: admitted.classification,
             suspended_rich_mutations: admitted.suspends_rich_mutations,
         };
-        let minted: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
-            .map_err(|error| {
-                BrokerError::invalid(format!("this identifier will not encode: {error}"))
-            })?;
-        let Some(members) = body.as_object_mut() else {
-            return Err(BrokerError::invalid("a native frame is a JSON object"));
-        };
-        members.insert(request_id_field, minted);
-        let encoded = serde_json::to_vec(&body).map_err(|error| {
-            BrokerError::invalid(format!("this request will not encode: {error}"))
-        })?;
+        // Only the identifier is replaced, in the bytes the terminal wrote. The rest of the frame,
+        // the spelling of its numbers and the order of its members included, goes out as it was
+        // written and as the source event retained it.
+        let encoded =
+            splice::replace_member(&frame, &request_id_field, upstream_request_id.as_str())?;
         // The mapping goes in before the bytes, so an answer that arrives at once finds it. It is
         // bounded: a client that asks more than this connection can have outstanding is refused
         // here, with its intent recorded as unsent, rather than growing a map only the upstream
@@ -2299,27 +2308,13 @@ impl Duplex {
     }
 
     /// Writes one upstream reply back to the client under the identifier the client used.
-    fn return_to_client(
-        &self,
-        frame: &[u8],
-        client_identifier: &serde_json::Value,
-    ) -> Result<bool> {
+    fn return_to_client(&self, frame: &[u8], client_identifier: &ClientId) -> Result<bool> {
         let held = self.broker.connection(self.connection).ok_or_else(|| {
             BrokerError::unknown(format!("no gateway connection {}", self.connection))
         })?;
-        let mut body: serde_json::Value = serde_json::from_slice(frame).map_err(|error| {
-            BrokerError::invalid(format!("this reply is not readable: {error}"))
-        })?;
-        let Some(members) = body.as_object_mut() else {
-            return Err(BrokerError::invalid("a native frame is a JSON object"));
-        };
-        members.insert(
-            held.table.response_id_field.clone(),
-            client_identifier.clone(),
-        );
-        let encoded = serde_json::to_vec(&body).map_err(|error| {
-            BrokerError::invalid(format!("this reply will not encode: {error}"))
-        })?;
+        // The reply goes back as the upstream wrote it, under the identifier the terminal wrote.
+        let encoded =
+            splice::replace_member(frame, &held.table.response_id_field, &client_identifier.0)?;
         // Queued, not awaited: this runs inside the upstream reader, and waiting here for the
         // client to drain would hold every frame behind it. The delivery is still watched, so a
         // reply that does not reach the client ends the connection rather than disappearing.
@@ -2345,9 +2340,10 @@ impl Duplex {
     /// Reads one end for as long as it has frames, carrying each one.
     ///
     /// `upstream` says which end this is. The loop ends when the end closes, when the owner is
-    /// asked to stop, or when the end sends something this framing cannot be reading; a refusal of
-    /// one frame does not end the connection, because one malformed or unanswerable frame is not a
-    /// reason to take a working terminal away.
+    /// asked to stop, when the end cannot be read, and when a frame it sent was taken and not
+    /// carried. Those last two end the connection too: both ends close, and the terminal is told,
+    /// under its own identifiers, about what it was waiting on. A frame refused in place and
+    /// answered in place was carried, and does not end anything.
     pub async fn serve<R: AsyncRead + Unpin>(self: &Arc<Self>, reader: R, upstream: bool) {
         self.serve_after(reader, upstream, Vec::new()).await;
     }
@@ -2406,7 +2402,11 @@ impl Duplex {
                 () = self.stopping.notified() => return,
             };
             match read {
-                Ok(0) | Err(_) => return,
+                Ok(0) => return,
+                Err(error) => {
+                    self.fail(&format!("the connection could not be read: {error}"));
+                    return;
+                }
                 Ok(read) => buffer.extend_from_slice(&chunk[..read]),
             }
         }
@@ -2422,8 +2422,7 @@ impl Drop for Duplex {
 /// One frame the native client sent that is a request or a notification of its own.
 #[derive(Debug)]
 struct ClientFrame {
-    body: serde_json::Value,
-    identifier: Option<serde_json::Value>,
+    identifier: Option<ClientId>,
     request_id_field: String,
     /// The bytes as the client wrote them, which is what the admission classifies and retains.
     frame: Vec<u8>,
