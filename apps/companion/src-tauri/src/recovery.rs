@@ -412,7 +412,8 @@ impl Recovery {
     /* ---------------------------------------------------------------------- */
 
     /// Writes the recovery kit to `destination`, flushed to disk, with the owner-only mode (0600)
-    /// on Unix. On Windows it has the permissions of the folder the destination is in.
+    /// on Unix. On Windows a new file has the permissions of the folder the destination is in, and
+    /// a file that already existed keeps its own.
     ///
     /// # Errors
     ///
@@ -637,11 +638,17 @@ fn said(error: RecoveryError) -> CommandError {
 /// guards its personal folders, and a crash between the write and the rename would leave a hidden
 /// copy of the seed that nothing removes. A kit that a crash tears is a visible file that the
 /// page never said it saved.
+///
+/// An existing file is not emptied until it has been made private to this user, so a file whose
+/// mode this user cannot change is left as it was and the save fails. Two limits remain. A process
+/// that opened an earlier, wider file before the save keeps what that open gave it, and only a
+/// new file would take that back, which needs the folder. On Windows a file that already exists
+/// keeps its own access list.
 fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -654,6 +661,7 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    file.set_len(0)?;
     file.write_all(body)?;
     file.sync_all()
 }
