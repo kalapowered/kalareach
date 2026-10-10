@@ -225,6 +225,11 @@ export interface FakeRecovery {
   set(view: Partial<Omit<RecoveryView, 'sync_service'>>): void
   /** Makes every read of recovery refuse with these words until it is given none. */
   failReads(message: string | null): void
+  /**
+   * Holds the answer of the next turn-on until the returned function is called, as a backend
+   * does that is still talking to the service.
+   */
+  holdTurnOn(): () => void
 }
 
 /** What the fake host can be told to do before a test drives the interface. */
@@ -690,6 +695,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let recoverySettles = 0
   let recoverySignIns = 0
   let recoveryReadFails: string | null = null
+  let heldTurnOn: Promise<void> | null = null
   const kitsSaved: string[] = []
   const recoveryView = (): RecoveryView => ({ sync_service: syncService, ...recovery })
 
@@ -1682,8 +1688,16 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       if (recovery.blocker !== null) {
         refuse('PERMISSION_DENIED', 'Recovery cannot be turned on yet.')
       }
-      recovery = { ...recovery, state: 'on', kept_at: syncService.host }
-      return Promise.resolve(recoveryView())
+      const turnOn = (): RecoveryView => {
+        recovery = { ...recovery, state: 'on', kept_at: syncService.host }
+        return recoveryView()
+      }
+      if (heldTurnOn !== null) {
+        const waiting = heldTurnOn
+        heldTurnOn = null
+        return waiting.then(turnOn)
+      }
+      return Promise.resolve(turnOn())
     },
     recoverySettle: () => {
       recoverySettles += 1
@@ -1719,6 +1733,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       },
       failReads(message) {
         recoveryReadFails = message
+      },
+      holdTurnOn() {
+        let release: () => void = () => undefined
+        heldTurnOn = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        return release
       }
     },
     account: {
