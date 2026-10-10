@@ -165,9 +165,21 @@
   overflow-wrap: anywhere;
 }
 
+/*
+ * The session a draft moves to is named by its directory, which can be longer than the screen. The
+ * label may shrink below the longest name, on a line of its own when there is no room beside the
+ * buttons, and the menu fills it and cuts the name it shows.
+ */
+.kept-draft label {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
 .kept-draft select {
   min-block-size: var(--target);
+  inline-size: 100%;
   max-inline-size: 100%;
+  text-overflow: ellipsis;
 }
 
 /* ---- Questions ------------------------------------------------------------------------------- */
