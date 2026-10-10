@@ -75,6 +75,7 @@ pub mod probe;
 pub mod process;
 pub mod profiles;
 pub mod semantic;
+mod splice;
 pub mod tokens;
 pub mod volatile;
 pub mod websocket;
