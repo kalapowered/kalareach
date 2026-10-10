@@ -6,7 +6,7 @@
  * test does here may send a prompt, and each one that could checks that nothing was.
  */
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -224,6 +224,49 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     await person.click(screen.getByRole('button', { name: 'Sessions' }))
     await person.click(await screen.findByRole('button', { name: 'One kept draft' }))
     expect(await screen.findByTestId('kept-draft-text')).toHaveTextContent('send this')
+  })
+
+  it('keeps the text of a prompt whose outcome nobody knows, and the text written meanwhile beside it', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    const answer = held<{ receipt: null; value: null; action_id: null }>()
+    startOver(device, IN_MAIN, (port) => ({
+      ...port,
+      // The host answers with neither a receipt nor a result: what became of the prompt is unknown.
+      composerSubmit: () => answer.promise
+    }))
+    await person.type(await screen.findByTestId('composer-input'), 'send this')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-send')).toBeEnabled()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+    await person.type(screen.getByTestId('composer-input'), 'the next thing')
+    answer.resolve({ receipt: null, value: null, action_id: null })
+
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text).sort()).toEqual(['send this', 'the next thing'])
+    })
+    expect(screen.getByTestId('composer-input')).toHaveValue('the next thing')
+  })
+
+  it('writes again what the store refused when the page is hidden', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    startOver(device)
+    device.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    await person.type(await screen.findByTestId('composer-input'), 'written while the disk was full')
+    await waitFor(() => {
+      expect(screen.getByTestId('drafts-not-kept')).toBeInTheDocument()
+    })
+    expect(device.all()).toEqual([])
+
+    device.refuseSaves(null)
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'))
+    })
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text)).toEqual(['written while the disk was full'])
+    })
   })
 
   it('gives the text back when the tab it was sent from was closed before the answer', async () => {
