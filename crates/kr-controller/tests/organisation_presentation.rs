@@ -209,6 +209,30 @@ impl Member {
         raw
     }
 
+    /// Presents `lease` as [`Self::present`] does, and returns `None` when the host ended the
+    /// connection instead of answering: a presentation whose fence withdraws the presenter may
+    /// lose its answer to the withdrawal, though the lease is installed.
+    async fn try_present(
+        &self,
+        fixture: &Fixture,
+        raw: &RawDevice,
+        lease: MembershipLease,
+        authority: Option<PolicyAuthority>,
+    ) -> Option<Result<MembershipPresentResult, ProtocolError>> {
+        let answered = raw
+            .try_mutate(
+                Method::MembershipPresent,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(fixture.host.environment_id),
+                &MembershipPresentParams {
+                    lease,
+                    authority: authority.map_or_else(Nullable::null, Nullable::some),
+                },
+            )
+            .await?;
+        Some(answered.map(|value| value.to_typed().expect("the answer of the method")))
+    }
+
     /// Presents `lease`, and a chain when there is one, under a new action.
     async fn present(
         &self,
@@ -478,9 +502,13 @@ async fn a_narrower_renewal_narrows_what_is_served_and_the_presenter_reconnects(
     // The next lease is newer and says less: no right to close a session.
     fixture.pass(Duration::from_secs(1));
     let narrow = fixture.lease(2, &ada, VIEW_ONLY);
-    ada.present(&fixture, &raw, narrow.clone(), None)
-        .await
-        .expect("the narrower lease installs");
+    // The answer is written once the lease is installed and the debt is published. The pass that
+    // retires the debt withdraws the presenter's registration and may reach its connection before
+    // the answer does, so the presenter may be told nothing: the reads below show the lease is
+    // installed either way.
+    if let Some(answer) = ada.try_present(&fixture, &raw, narrow.clone(), None).await {
+        answer.expect("the narrower lease installs");
+    }
     fixture.until_the_fence_is_retired().await;
     // The fence the narrowing owed withdrew the presenter's registration: the connection it was
     // made on stays up and is served nothing more, though the lease still allows reads.
@@ -823,7 +851,7 @@ async fn a_chain_that_drops_another_devices_lease_fences_the_host() {
     // Ada presents revision 3's chain. Both leases were issued after it took over, so both go.
     fixture.pass(Duration::from_secs(1));
     let outcome = ada
-        .present(
+        .try_present(
             &fixture,
             &ada_raw,
             fixture.lease(3, &ada, SERVED),
@@ -831,7 +859,9 @@ async fn a_chain_that_drops_another_devices_lease_fences_the_host() {
         )
         .await;
     // The barrier may withdraw the connection the answer was on; the lease is installed either way.
-    drop(outcome);
+    if let Some(answer) = outcome {
+        answer.expect("the chain and lease are accepted");
+    }
     fixture.until_the_fence_is_retired().await;
     // The fence reached the whole host: ada's own connection was admitted before the chain, her new
     // lease is live, and it is served nothing more, because only the barrier stood in its way.
