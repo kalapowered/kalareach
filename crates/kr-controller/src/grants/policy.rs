@@ -1288,7 +1288,13 @@ impl HostPolicy {
                     _ => None,
                 };
                 Ok(PolicyIntersection {
-                    rights: grant.actions.clone(),
+                    // Presenting a lease asks for no right, so nothing a later change reads from
+                    // this decision grants one.
+                    rights: if request.method == Method::MembershipPresent {
+                        CanonicalSet::new()
+                    } else {
+                        grant.actions.clone()
+                    },
                     organisation_id: None,
                     lease,
                     offline,
