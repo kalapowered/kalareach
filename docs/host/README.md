@@ -2654,8 +2654,10 @@ earlier: no lease survives a restart, and the member's client fetches a new one.
 
 The lease ends on both clocks, the host's continuous clock and its reading of UTC, whichever comes
 first, and a device that does not present another is refused every read and mutation from then on
-while its connection stays up. The member's client refreshes every five minutes, so a renewal
-reaches the host about ten minutes before the lease it replaces ends.
+while its connection stays up. A connection that carries a running subscription is closed at the
+first batch the lease no longer allows, and the device connects again and presents a lease. The
+member's client refreshes every five minutes, so a renewal reaches the host about ten minutes
+before the lease it replaces ends.
 
 The organisation's chain may travel beside the lease. The host follows a newer one before it judges
 the lease, so a lease signed by a revision the host has not heard of is accepted with the chain that
