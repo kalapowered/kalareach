@@ -85,6 +85,12 @@ pub const MAX_QUEUED_OBSERVATIONS: usize = 64;
 /// asking, so the bound is what a terminal can have outstanding and the rest are refused in place.
 pub const MAX_FORWARDED_CLIENT_REQUESTS: usize = 256;
 
+/// The most bytes a request identifier of the client's may have, when it is a string.
+///
+/// It is the bound the upstream's identifiers have, and the client's is held until the upstream
+/// answers, as many as [`MAX_FORWARDED_CLIENT_REQUESTS`] at a time.
+pub const MAX_CLIENT_IDENTIFIER_BYTES: usize = 256;
+
 /// How long one of the client's own requests waits for the upstream before it is given up.
 ///
 /// It is generous, because an agent answering a person's request may be thinking for a long time,
@@ -1995,6 +2001,17 @@ impl Duplex {
         let identifier = match members.get(&held.table.request_id_field) {
             None => None,
             Some(raw) => {
+                let well_formed = match raw {
+                    serde_json::Value::String(text) => text.len() <= MAX_CLIENT_IDENTIFIER_BYTES,
+                    serde_json::Value::Number(number) => number.is_i64() || number.is_u64(),
+                    _ => false,
+                };
+                if !well_formed {
+                    return Err(BrokerError::invalid(format!(
+                        "a request identifier is an integer or a string of at most \
+                         {MAX_CLIENT_IDENTIFIER_BYTES} bytes"
+                    )));
+                }
                 if serde_json::to_string(raw)
                     .ok()
                     .and_then(|text| UpstreamRequestId::new(text).ok())
