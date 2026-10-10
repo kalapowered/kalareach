@@ -536,6 +536,33 @@ impl Controller {
         .map(|(value, _)| value)
     }
 
+    /// Changes this host's policy for the action `hold` claimed as [`Self::update_policy_claimed`]
+    /// does, writing the event of exclusive management having ended with it when `ending` names
+    /// one, and giving `still_admitted` the transaction's own connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update_policy_claimed`].
+    pub fn update_policy_checked<T>(
+        &self,
+        hold: &crate::grants::ClaimHold,
+        change: impl FnOnce(&mut crate::grants::HostPolicy) -> Result<(T, Vec<u8>)>,
+        ending: Option<&crate::grants::ExclusiveEnding>,
+        still_admitted: impl FnOnce(&rusqlite::Connection) -> Result<()>,
+    ) -> Result<T> {
+        self.commit_policy(change, |grants, snapshot, (_, answer)| {
+            grants.store_policy_checked(
+                snapshot,
+                hold,
+                answer,
+                kr_ipc::now_ms().get(),
+                ending,
+                still_admitted,
+            )
+        })
+        .map(|(value, _)| value)
+    }
+
     /// The one way a change to the policy is made, written and put in force.
     ///
     /// The lock is held across the write. Releasing it first would let two accepted changes reach

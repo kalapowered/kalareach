@@ -9,7 +9,9 @@
 //! action changes is the policy, which is written together with the action's answer in one
 //! transaction, so a host never holds an enrolment it cannot answer for.
 
-use kr_protocol::confirmation::{ConfirmationDisplay, OrganisationEnrolPlan};
+use kr_protocol::confirmation::{
+    ConfirmationDisplay, ExclusiveManagementPlan, OrganisationEnrolPlan,
+};
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::OrganisationId;
@@ -17,8 +19,8 @@ use kr_protocol::method::Method;
 use kr_protocol::organisation::{
     MembershipPresentParams, MembershipPresentResult, OrganisationChangeMarker,
     OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
-    OrganisationExclusiveSetResult, OrganisationLeaseView, OrganisationListResult,
-    OrganisationMemberView, OrganisationWithdrawParams,
+    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationLeaseView,
+    OrganisationListResult, OrganisationMemberView, OrganisationWithdrawParams,
 };
 use kr_protocol::pairing::{KeyPurpose, SensitiveAction, key_id};
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, TimestampMs};
@@ -39,6 +41,22 @@ pub(super) struct EnrolIntent {
     params: OrganisationEnrolParams,
     plan: OrganisationEnrolPlan,
     confirmed: ConfirmedAction,
+}
+
+/// What `organisation.exclusive.set` has settled before it claims the action: the plan the owner
+/// confirmed and the confirmation this host spent.
+pub(super) struct ExclusiveIntent {
+    plan: ExclusiveManagementPlan,
+    confirmed: ConfirmedAction,
+}
+
+/// What an organisation change that needs the owner's confirmation has settled before it claims
+/// its action.
+pub(super) enum OrganisationIntent {
+    /// `organisation.enrol`.
+    Enrol(EnrolIntent),
+    /// `organisation.exclusive.set`.
+    Exclusive(ExclusiveIntent),
 }
 
 /// The identifier of a policy-signing key, which is how an administrator reads one out.
@@ -85,6 +103,63 @@ fn check_withdrawal(
         ));
     }
     Ok(())
+}
+
+/// Whether this policy lets the host change exclusive management as `plan` says.
+///
+/// Turning it on needs an enrolment, because a personal grant answers to an organisation's lease
+/// there and a host with none has nothing to answer to, and a device that can recover the host,
+/// because the owner's own devices stop being served when their lease ends. Either way the change
+/// has to be a change, and the organisations the owner confirmed are the ones the host is enrolled
+/// in.
+fn check_exclusive_change(
+    policy: &crate::grants::HostPolicy,
+    plan: &ExclusiveManagementPlan,
+    recoverable: bool,
+) -> Result<()> {
+    if policy.is_exclusively_managed() == plan.exclusive {
+        return Err(ControllerError::InvalidArgument(if plan.exclusive {
+            "this host is exclusively organisation-managed already".to_owned()
+        } else {
+            "this host is not exclusively organisation-managed".to_owned()
+        }));
+    }
+    let enrolled: CanonicalSet<OrganisationId> = policy
+        .enrolments()
+        .map(|(organisation_id, _)| organisation_id)
+        .collect();
+    if enrolled != plan.organisation_ids {
+        return Err(ControllerError::PermissionDenied {
+            detail: "the organisations this host is enrolled in are not the ones the owner \
+                     confirmed"
+                .to_owned(),
+        });
+    }
+    if plan.exclusive {
+        if enrolled.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "this host is enrolled in no organisation, so there is nothing to manage it \
+                 exclusively"
+                    .to_owned(),
+            ));
+        }
+        require_a_device_that_can_recover(recoverable)?;
+    }
+    Ok(())
+}
+
+/// Refuses making the host exclusive when no owner device could confirm for it once its leases
+/// ended.
+fn require_a_device_that_can_recover(recoverable: bool) -> Result<()> {
+    if recoverable {
+        Ok(())
+    } else {
+        Err(ControllerError::InvalidArgument(
+            "no owner device of this host has a grant that never expires and reaches this \
+             environment, so nothing could confirm for it once its leases ended; pair one first"
+                .to_owned(),
+        ))
+    }
 }
 
 /// The refusal a lease that a rule refuses is reported as: `PERMISSION_DENIED` naming the rule,
@@ -359,13 +434,18 @@ impl Controller {
         &self,
         marker: OrganisationChangeMarker,
     ) -> Result<ParamsValue> {
+        self.answered_from_the_barrier_with(self.publish_debts(&[]), marker)
+            .await
+    }
+
+    /// The answer to an organisation change whose fence `own` is raised now.
+    async fn answered_from_the_barrier_with(
+        &self,
+        own: super::barrier::OwnBarrier,
+        marker: OrganisationChangeMarker,
+    ) -> Result<ParamsValue> {
         let completed = self
-            .complete_revocation(
-                Audience::Host,
-                None,
-                CanonicalSet::new(),
-                self.publish_debts(&[]),
-            )
+            .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
             .await?;
         match marker {
             OrganisationChangeMarker::Withdrawn { .. } => encode(&completed),
@@ -375,6 +455,185 @@ impl Controller {
                 barrier: Nullable::some(completed.barrier),
             }),
         }
+    }
+
+    /// The plan whose digest the owner confirms for making the host exclusively
+    /// organisation-managed, or ending that: the new value and the organisations the host is
+    /// enrolled in now, so a confirmation for one state of the host is not carried to another.
+    fn exclusive_plan(&self, exclusive: bool) -> ExclusiveManagementPlan {
+        ExclusiveManagementPlan {
+            exclusive,
+            organisation_ids: self
+                .policy()
+                .enrolments()
+                .map(|(organisation_id, _)| organisation_id)
+                .collect(),
+        }
+    }
+
+    /// The challenge's description, for `owner.confirmation.request` of a change of exclusive
+    /// management.
+    ///
+    /// A change this host would refuse is refused here, before anyone is asked to confirm it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host cannot make the change now.
+    pub(crate) fn organisation_exclusive_resolved(
+        &self,
+        exclusive: bool,
+    ) -> Result<crate::service::net::owner::Resolved> {
+        let plan = self.exclusive_plan(exclusive);
+        let recoverable = self
+            .owner
+            .an_owner_device_can_recover(self.paths.environment_id())?;
+        check_exclusive_change(&self.policy(), &plan, recoverable)?;
+        Ok(crate::service::net::owner::Resolved {
+            action: ExclusiveManagementPlan::sensitive_action(),
+            digest: plan
+                .action_digest()
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+            destination: None,
+            rights: CanonicalSet::new(),
+            display: plan.display(),
+            bootstrap: false,
+        })
+    }
+
+    /// Settles what `organisation.exclusive.set` needs before it claims the action: parses it and
+    /// spends the owner's answered confirmation of exactly this change.
+    ///
+    /// As an enrolment's, the confirmation is spent first and a request that finds none is refused
+    /// before anything is claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OWNER_CONFIRMATION_REQUIRED` when no answered confirmation of exactly this change
+    /// stands.
+    pub(super) fn organisation_exclusive_intent(
+        &self,
+        mutation: &MutationRequest,
+    ) -> Result<ExclusiveIntent> {
+        let params: OrganisationExclusiveSetParams = parse(&mutation.params)?;
+        let plan = self.exclusive_plan(params.exclusive);
+        let digest = plan
+            .action_digest()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let rights = CanonicalSet::new();
+        let expectation = self.owner.expectation(
+            ExclusiveManagementPlan::sensitive_action(),
+            digest,
+            None,
+            &rights,
+        );
+        let confirmed = self.owner.spend_answered(
+            &expectation,
+            &|display| matches!(display, ConfirmationDisplay::ExclusiveManagement { .. }),
+            "change exclusive organisation management",
+        )?;
+        Ok(ExclusiveIntent { plan, confirmed })
+    }
+
+    /// `organisation.exclusive.set`: makes this host exclusively organisation-managed, or ends
+    /// that, under the claim of the action that asked.
+    ///
+    /// Turning it off enlarges what the host serves and restricts nothing, so it writes the policy,
+    /// the action's answer and the event of its having ended in one transaction and has no fence to
+    /// raise. Turning it on restricts work already admitted, as a withdrawal does, and follows the
+    /// same order: the registry's guard to the publication of the debt, the debt first, the policy
+    /// and the claim's marker in one transaction, and an answer built from the barrier. Inside the
+    /// transaction the admission, the owner's confirmation and, for turning it on, a device that
+    /// can recover the host are asked again, after every wait for a lock and before the first
+    /// write.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the admission, the confirmation, the policy or the store refuses with. Nothing
+    /// is changed then.
+    pub(super) async fn organisation_exclusive(
+        &self,
+        carried: crate::authority::AdmittedMutation,
+        hold: &crate::grants::ClaimHold,
+        intent: ExclusiveIntent,
+    ) -> Result<ParamsValue> {
+        let ExclusiveIntent { plan, confirmed } = intent;
+        let digest = plan
+            .action_digest()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let environment_id = self.paths.environment_id();
+        if !plan.exclusive {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+            check_exclusive_change(&self.policy(), &plan, true)?;
+            let answer = OrganisationExclusiveSetResult {
+                exclusive: false,
+                authority_revision: registry.authority_revision()?,
+                barrier: Nullable::null(),
+            };
+            let bytes = kr_cbor::encode(encode(&answer)?.as_value());
+            let ending = crate::grants::ExclusiveEnding {
+                channel: confirmed.channel(),
+                organisation_ids: plan.organisation_ids.clone(),
+            };
+            self.update_policy_checked(
+                hold,
+                |policy| {
+                    check_exclusive_change(policy, &plan, true)?;
+                    policy.set_exclusively_managed(false);
+                    Ok(((), bytes))
+                },
+                Some(&ending),
+                |_connection| {
+                    self.check_admission(&registry, &carried)?;
+                    self.owner
+                        .covers(&confirmed, digest, "change of exclusive management")
+                },
+            )?;
+            drop(registry);
+            return encode(&answer);
+        }
+        let marker = kr_cbor::encode(encode(&OrganisationChangeMarker::ExclusiveOn)?.as_value());
+        let (written, own) = {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+            // Refused before anything is owed: a fence for a change that cannot happen is a
+            // revision advanced and every connection fenced for nothing.
+            let recoverable = self.owner.an_owner_device_can_recover(environment_id)?;
+            check_exclusive_change(&self.policy(), &plan, recoverable)?;
+            let debt = self.owe_debt(
+                "making this host exclusively organisation-managed",
+                Reach::Host,
+            )?;
+            let written = self.update_policy_checked(
+                hold,
+                |policy| {
+                    check_exclusive_change(policy, &plan, true)?;
+                    policy.set_exclusively_managed(true);
+                    Ok(((), marker))
+                },
+                None,
+                |connection| {
+                    self.check_admission(&registry, &carried)?;
+                    self.owner
+                        .covers(&confirmed, digest, "change of exclusive management")?;
+                    // The devices are read from the transaction's own file, so an enablement
+                    // never commits after the last device that can recover the host has been
+                    // revoked.
+                    require_a_device_that_can_recover(crate::grants::an_owner_device_can_recover(
+                        connection,
+                        environment_id,
+                    )?)
+                },
+            );
+            // Nothing is awaited between the write and the publication of its debt, here or in a
+            // test that stops the thread between them.
+            #[cfg(feature = "testing")]
+            self.after_an_organisation_restriction_commits.wait();
+            (written, self.publish_debts(&[(debt, Reach::Host)]))
+        };
+        written?;
+        self.answered_from_the_barrier_with(own, OrganisationChangeMarker::ExclusiveOn)
+            .await
     }
 
     /// Whether the chain's head is still current, and this host still trusts the clock that said

@@ -204,6 +204,58 @@ impl Drop for ClaimHold {
 /// refused when it is created and again when it is redeemed.
 pub const MAX_GRANTS_PER_TREE: usize = kr_protocol::worker::MAX_REVISION_REACH_NAMES;
 
+/// The event kept when exclusive management is turned off: how the owner confirmed it and the
+/// organisations the host was enrolled in, written with the policy that turned it off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExclusiveEnding {
+    /// How the owner's confirmation reached this host.
+    pub channel: kr_protocol::pairing::ConfirmationChannel,
+    /// The organisations the host was enrolled in.
+    pub organisation_ids: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::OrganisationId>,
+}
+
+/// Whether a paired device in this file can confirm for an exclusively organisation-managed host
+/// that no lease serves: one whose grant carries host management, never expires, requires no
+/// organisation and reaches this host's environment.
+///
+/// The rows are read through `connection`, so a caller inside a transaction on this file reads the
+/// devices from the snapshot it writes under.
+///
+/// # Errors
+///
+/// Returns a storage error when the rows cannot be read.
+pub fn an_owner_device_can_recover(
+    connection: &Connection,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> Result<bool> {
+    let mut statement = connection
+        .prepare(
+            "SELECT grant FROM network_devices
+              WHERE revoked_at_ms IS NULL AND expired_at_ms IS NULL",
+        )
+        .map_err(ControllerError::registry)?;
+    let grants = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(ControllerError::registry)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ControllerError::registry)?;
+    Ok(grants.iter().any(|stored| {
+        kr_cbor::from_canonical_slice::<Grant>(stored, &kr_cbor::Limits::DEFAULT)
+            .is_ok_and(|grant| can_recover(&grant, environment_id))
+    }))
+}
+
+/// Whether `grant` is one an exclusively organisation-managed host can be recovered with when no
+/// lease serves: the host's own management, with no end, answering to no organisation, reaching
+/// this environment.
+#[must_use]
+pub fn can_recover(grant: &Grant, environment_id: kr_protocol::ids::EnvironmentId) -> bool {
+    grant.permits(kr_protocol::rights::ActionRight::HostManage)
+        && grant.expiry == GrantExpiry::Never
+        && !grant.organisation.is_present()
+        && grant.environment_selector.admits(environment_id)
+}
+
 /// What one revocation did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantRevocation {
@@ -1968,6 +2020,30 @@ impl GrantDirectory {
         now_ms: u64,
         still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        self.store_policy_checked(policy, hold, result, now_ms, None, |_| still_admitted())
+    }
+
+    /// Writes this host's policy together with the result of the action `hold` claimed, as
+    /// [`Self::store_policy_claimed`] does, and with the event of exclusive management having
+    /// ended when `ending` names one, in one transaction.
+    ///
+    /// `still_admitted` is given the transaction's own connection, so a precondition that depends
+    /// on rows in this file, such as the devices that can recover the host, is read from the same
+    /// snapshot the policy is written under and not from another connection that may be waiting
+    /// for this one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::store_policy_claimed`]; the event is not written then either.
+    pub fn store_policy_checked(
+        &self,
+        policy: &StoredPolicy,
+        hold: &ClaimHold,
+        result: &[u8],
+        now_ms: u64,
+        ending: Option<&ExclusiveEnding>,
+        still_admitted: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(policy)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The pause is before the store's locks, so a test moves a clock or a confirmation's
@@ -1976,14 +2052,37 @@ impl GrantDirectory {
         // function's own order, and the store test of a refused callback shows nothing is written.
         #[cfg(feature = "testing")]
         self.before_effect.wait();
+        let event = ending
+            .map(|ending| {
+                Ok::<_, ControllerError>((
+                    kr_cbor::to_canonical_vec(&ending.channel)
+                        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+                    kr_cbor::to_canonical_vec(&ending.organisation_ids)
+                        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+                ))
+            })
+            .transpose()?;
         self.in_transaction(|connection| {
-            still_admitted()?;
+            still_admitted(connection)?;
             connection
                 .execute(
                     "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
                     params![encoded],
                 )
                 .map_err(ControllerError::registry)?;
+            if let Some((channel, organisation_ids)) = &event {
+                connection
+                    .execute(
+                        "INSERT INTO exclusive_management_events (at_ms, channel, organisation_ids)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            i64::try_from(now_ms).unwrap_or(i64::MAX),
+                            channel,
+                            organisation_ids
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
             let kept = connection
                 .execute(
                     "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4

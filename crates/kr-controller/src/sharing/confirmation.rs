@@ -19,7 +19,8 @@ use kr_pairing::confirm::{ConfirmationExpectation, ConfirmationLedger, HostEnrol
 use kr_pairing::platform::{BootIdentity, PairingClock};
 use kr_protocol::ids::DeviceId;
 use kr_protocol::pairing::{
-    DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction,
+    ConfirmationChannel, DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest,
+    SensitiveAction,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256};
@@ -44,6 +45,8 @@ pub struct ConfirmedAction {
     /// tied to a boot, because a clock wound back would otherwise lengthen a confirmation.
     boot: BootIdentity,
     expires_at_monotonic_ms: u64,
+    /// How the confirmation reached this host: an owner device, or the interactive terminal.
+    channel: ConfirmationChannel,
 }
 
 impl ConfirmedAction {
@@ -95,7 +98,14 @@ impl ConfirmedAction {
             host_device_id: expectation.host_device_id,
             boot,
             expires_at_monotonic_ms,
+            channel: proof.channel,
         })
+    }
+
+    /// How the owner's confirmation reached this host.
+    #[must_use]
+    pub const fn channel(&self) -> ConfirmationChannel {
+        self.channel
     }
 
     /// The digest this confirmation is about.

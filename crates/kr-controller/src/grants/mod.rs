@@ -55,8 +55,8 @@ pub use feed::{AuthorityFeed, FeedRefusal, RetainedRevocation};
 pub use organisation::LeaseRefused;
 pub use policy::{HostPolicy, PolicyIntersection};
 pub use store::{
-    ActionClaim, ActionRecord, ClaimHold, GrantDirectory, GrantRecord, GrantRevocation,
-    MAX_GRANTS_PER_TREE,
+    ActionClaim, ActionRecord, ClaimHold, ExclusiveEnding, GrantDirectory, GrantRecord,
+    GrantRevocation, MAX_GRANTS_PER_TREE, an_owner_device_can_recover, can_recover,
 };
 pub use vocabulary::{rights_for, unconditional_rights_for};
 

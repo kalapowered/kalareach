@@ -328,6 +328,19 @@ impl Controller {
                     })
                     .await;
                 }
+                // Making the host exclusively organisation-managed, or ending that, is described by
+                // this host's policy: the organisations it is enrolled in are what the owner is
+                // shown, and a change this host would refuse is not put to the owner.
+                if let ConfirmationSubject::SetExclusiveManagement { exclusive } = &params.subject {
+                    let controller = Arc::clone(self);
+                    let exclusive = *exclusive;
+                    return blocking(move || {
+                        pairing.require_owner(&caller)?;
+                        let resolved = controller.organisation_exclusive_resolved(exclusive)?;
+                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
+                    })
+                    .await;
+                }
                 // A repository's root and an installation are described by the catalogue, from
                 // the exact request and the records it holds, and the pairing service issues the
                 // challenge for what it resolved.

@@ -20,6 +20,7 @@ use kr_protocol::sharing::{
 
 use crate::error::{ControllerError, Result};
 
+use super::organisation::OrganisationIntent;
 use super::revocation::Audience;
 use super::{Controller, encode, net, parse, respond};
 
@@ -570,10 +571,14 @@ impl Controller {
         // spent before the action is claimed. A request that finds none is refused here, with
         // nothing written under its action, and an owner's client may ask again with a new
         // identifier for each poll.
-        let enrolment = if method == Method::OrganisationEnrol {
-            Some(self.organisation_enrol_intent(mutation)?)
-        } else {
-            None
+        let intent = match method {
+            Method::OrganisationEnrol => Some(OrganisationIntent::Enrol(
+                self.organisation_enrol_intent(mutation)?,
+            )),
+            Method::OrganisationExclusiveSet => Some(OrganisationIntent::Exclusive(
+                self.organisation_exclusive_intent(mutation)?,
+            )),
+            _ => None,
         };
         let claimed_at_ms = kr_ipc::now_ms().get();
         let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms)? {
@@ -595,9 +600,12 @@ impl Controller {
                 return answered;
             }
         };
-        let outcome = match (method, enrolment) {
-            (Method::OrganisationEnrol, Some(intent)) => {
+        let outcome = match (method, intent) {
+            (Method::OrganisationEnrol, Some(OrganisationIntent::Enrol(intent))) => {
                 self.organisation_enrol(carried, &hold, intent).await
+            }
+            (Method::OrganisationExclusiveSet, Some(OrganisationIntent::Exclusive(intent))) => {
+                self.organisation_exclusive(carried, &hold, intent).await
             }
             (method, _) => match method {
                 Method::GrantCreate => {
@@ -643,7 +651,9 @@ impl Controller {
         // a storage failure for an action that is done.
         let kept = matches!(
             method,
-            Method::OrganisationEnrol | Method::OrganisationWithdraw
+            Method::OrganisationEnrol
+                | Method::OrganisationWithdraw
+                | Method::OrganisationExclusiveSet
         ) && outcome.is_ok();
         if !kept {
             self.settle_claim(&hold, &outcome)?;

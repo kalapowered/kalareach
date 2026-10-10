@@ -346,6 +346,22 @@ impl OwnerAuthority {
         })
     }
 
+    /// Whether a paired device can confirm for this host when its organisation's lease serves
+    /// nothing: one whose grant carries host management, never expires, requires no organisation
+    /// and reaches `environment_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error when the device records cannot be read.
+    pub fn an_owner_device_can_recover(
+        &self,
+        environment_id: kr_protocol::ids::EnvironmentId,
+    ) -> Result<bool> {
+        Ok(self.devices().devices()?.iter().any(|device| {
+            device.is_paired() && crate::grants::can_recover(&device.grant, environment_id)
+        }))
+    }
+
     /// Returns the endpoint a challenge names as the host's.
     fn endpoint(&self) -> EndpointKey {
         *self
