@@ -4280,12 +4280,22 @@ struct Upgraded {
 
 /// Upgrades a terminal's connection as the gateway does, and starts an owner over it.
 async fn upgraded(broker: &Arc<Broker>, framing: Framing) -> Upgraded {
+    upgraded_with(broker, framing, tokio_websockets::Config::default()).await
+}
+
+/// The same, with the terminal's WebSocket library configured as given.
+async fn upgraded_with(
+    broker: &Arc<Broker>,
+    framing: Framing,
+    terminal: tokio_websockets::Config,
+) -> Upgraded {
     let (terminal_end, gateway_end) = socket_pair();
     let accepting =
         tokio::spawn(
             async move { kr_worker::broker::websocket::accept(gateway_end, framing).await },
         );
     let (terminal, _response) = tokio_websockets::ClientBuilder::new()
+        .config(terminal)
         .uri("ws://localhost/rpc")
         .expect("a URI")
         .connect_on(terminal_end)
@@ -4551,9 +4561,25 @@ async fn kr_req_11_32_only_a_text_message_of_one_line_within_the_bound_crosses_a
             tokio_websockets::Message::text(request_of(4, "session/update", bound + 1)),
             tokio_websockets::CloseCode::MESSAGE_TOO_BIG,
         ),
+        (
+            // Each of its frames is within the bound, and the message they make is not.
+            "a message above the bound in frames within it",
+            tokio_websockets::Message::text(request_of(5, "session/update", bound + 1)),
+            tokio_websockets::CloseCode::MESSAGE_TOO_BIG,
+        ),
     ] {
         let broker = broker();
-        let mut up = upgraded(&broker, framing).await;
+        let fragmented = what.contains("in frames");
+        let mut up = upgraded_with(
+            &broker,
+            framing,
+            if fragmented {
+                tokio_websockets::Config::default().frame_size(1024)
+            } else {
+                tokio_websockets::Config::default()
+            },
+        )
+        .await;
         up.terminal.send(message).await.expect("the terminal sends");
         // The connection ends of itself: the reader, then the writers.
         for reader in &mut up.serving {
@@ -4744,7 +4770,7 @@ async fn kr_req_11_32_a_terminal_that_only_pings_is_cut_off() {
     use futures_util::SinkExt as _;
     let broker = broker();
     let mut up = upgraded(&broker, Framing::new(NativeFraming::JsonLines)).await;
-    for _ in 0..=kr_worker::broker::websocket::MAX_CONTROL_MESSAGES_IN_A_ROW {
+    for _ in 0..=kr_worker::broker::websocket::MAX_CONTROL_MESSAGES_PER_WINDOW {
         up.terminal
             .send(tokio_websockets::Message::ping("x"))
             .await
@@ -4814,6 +4840,36 @@ async fn kr_req_11_32_a_frame_is_forwarded_as_it_was_written_but_for_its_identif
         reply.replace(r#""id":"kr-1""#, r#""id":"a\u0062""#),
         "and only the identifier on the way back, under the spelling the terminal used"
     );
+    owner.shutdown();
+    driving.abort();
+}
+
+/// KR-REQ-11.32: a request identifier of the terminal's is an integer or a string of a bounded
+/// length, because the terminal's identifiers are held until the upstream answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_32_a_request_identifier_that_is_not_an_integer_or_a_short_string_is_refused() {
+    let broker = broker();
+    let (owner, _upstream, _client, writes) = duplex_over_pipes(&broker, 1 << 20);
+    let driving = tokio::spawn(writes);
+    let longest = "i".repeat(kr_worker::broker::MAX_CLIENT_IDENTIFIER_BYTES);
+    let request = |id: &str| format!(r#"{{"id":{id},"method":"session/update","params":{{}}}}"#);
+    for (what, id, carried) in [
+        ("an integer", "9007199254740993".to_owned(), true),
+        (
+            "a string of the longest length",
+            format!("\"{longest}\""),
+            true,
+        ),
+        ("a string above it", format!("\"{longest}i\""), false),
+        ("a fraction", "1.5".to_owned(), false),
+        ("a null", "null".to_owned(), false),
+        ("an object", r#"{"a":1}"#.to_owned(), false),
+    ] {
+        let outcome = owner
+            .from_client(request(&id).as_bytes(), TimestampMs::new(2))
+            .await;
+        assert_eq!(outcome.is_ok(), carried, "{what}: {outcome:?}");
+    }
     owner.shutdown();
     driving.abort();
 }
