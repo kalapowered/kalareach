@@ -4036,12 +4036,20 @@ pub fn sync_service_view(
 }
 
 /// Chooses another sync service. The page names an origin and nothing else: no path, no token.
+///
+/// The choice is flushed to disk twice, so it is kept on a thread of its own and does not hold the
+/// window.
 #[tauri::command]
-pub fn sync_service_set(
+pub async fn sync_service_set(
     state: State<'_, AppState>,
     origin: String,
 ) -> Result<crate::sync_service::SyncServiceView> {
-    state.sync_service()?.set(&origin)
+    let service = state.sync_service()?;
+    tauri::async_runtime::spawn_blocking(move || service.set(&origin))
+        .await
+        .map_err(|error| {
+            CommandError::local_failure(format!("the sync service setting was not kept: {error}"))
+        })?
 }
 
 /// Where recovery stands on this computer, and what stops the next step.
