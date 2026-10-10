@@ -4341,6 +4341,21 @@ async fn next_text(terminal: &mut TerminalClient) -> String {
         .to_owned()
 }
 
+/// The code of the close a terminal is sent, after any message that is not one.
+async fn next_close(terminal: &mut TerminalClient) -> tokio_websockets::CloseCode {
+    use futures_util::StreamExt as _;
+    loop {
+        let message = tokio::time::timeout(LIVENESS_DEADLINE, terminal.next())
+            .await
+            .expect("the terminal is sent a close")
+            .expect("the connection is open until it is closed")
+            .expect("the message is readable");
+        if let Some((code, _)) = message.as_close() {
+            return code;
+        }
+    }
+}
+
 /// KR-REQ-11.32 and KR-REQ-12.11: a terminal that upgrades its connection to a WebSocket is
 /// carried by the gateway as its lines are: each of its text messages is one frame to the upstream
 /// under an identifier of this host's, and each frame the upstream sends it is one text message.
@@ -4517,34 +4532,53 @@ async fn kr_req_11_32_only_a_text_message_of_one_line_within_the_bound_crosses_a
     use futures_util::SinkExt as _;
     let bound = 4096;
     let framing = Framing::within(NativeFraming::JsonLines, bound);
-    for (what, message) in [
+    let request = |id: u32| request_of(id, "session/update", 100);
+    // Each message here would be a request the gateway carries if it were allowed across, so
+    // nothing that ends the connection can be the frame being unreadable.
+    for (what, message, code) in [
         (
             "a binary message",
-            tokio_websockets::Message::binary(vec![1_u8, 2, 3]),
+            tokio_websockets::Message::binary(request(1).into_bytes()),
+            tokio_websockets::CloseCode::UNSUPPORTED_DATA,
         ),
         (
             "a text message with a line break",
-            tokio_websockets::Message::text(concat!(
-                r#"{"id":1,"method":"session/update","params":{}}"#,
-                "\n",
-                r#"{"id":2,"method":"session/update","params":{}}"#
-            )),
+            tokio_websockets::Message::text(format!("{}\n{}", request(2), request(3))),
+            tokio_websockets::CloseCode::POLICY_VIOLATION,
         ),
         (
             "a message above the bound",
-            tokio_websockets::Message::text(request_of(3, "session/update", bound + 1)),
+            tokio_websockets::Message::text(request_of(4, "session/update", bound + 1)),
+            tokio_websockets::CloseCode::MESSAGE_TOO_BIG,
         ),
     ] {
         let broker = broker();
         let mut up = upgraded(&broker, framing).await;
         up.terminal.send(message).await.expect("the terminal sends");
-        let [_, terminal_reader] = &mut up.serving;
-        tokio::time::timeout(LIVENESS_DEADLINE, terminal_reader)
+        // The connection ends of itself: the reader, then the writers.
+        for reader in &mut up.serving {
+            tokio::time::timeout(LIVENESS_DEADLINE, reader)
+                .await
+                .unwrap_or_else(|_| panic!("{what} ends the connection"))
+                .expect("the reader is joined");
+        }
+        tokio::time::timeout(LIVENESS_DEADLINE, &mut up.drained)
             .await
-            .unwrap_or_else(|_| panic!("{what} ends the gateway's reading of the terminal"))
-            .expect("the reader is joined");
-        up.owner.shutdown();
-        up.drained.abort();
+            .unwrap_or_else(|_| panic!("{what} ends the writers"))
+            .expect("the writers are joined");
+        assert!(up.owner.stopping(), "{what} ends the connection");
+        // None of it reached the upstream.
+        let mut carried = String::new();
+        tokio::time::timeout(
+            LIVENESS_DEADLINE,
+            tokio::io::AsyncReadExt::read_to_string(&mut up.upstream, &mut carried),
+        )
+        .await
+        .expect("the upstream's end reaches its end")
+        .expect("it is readable");
+        assert_eq!(carried, "", "{what} carried nothing to the upstream");
+        // And the terminal is told why, with a close, rather than left with a reset.
+        assert_eq!(next_close(&mut up.terminal).await, code, "{what}");
     }
     // The control: a message of exactly the bound is carried.
     let broker = broker();
@@ -4584,16 +4618,166 @@ async fn kr_req_11_32_a_last_frame_the_terminal_does_not_read_ends_the_connectio
         .from_upstream(big.as_bytes(), TimestampMs::new(2))
         .await
         .expect("the frame is queued for the terminal");
-    // The terminal reads nothing. The deadline for the write is the owner's.
-    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
-    while !up.owner.stopping() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    // The terminal reads nothing. The deadline for the write is the owner's, and the writers end
+    // when it has passed.
+    tokio::time::timeout(LIVENESS_DEADLINE, up.drained)
+        .await
+        .expect("a frame the terminal never read ends the writers")
+        .expect("they are joined");
     assert!(
         up.owner.stopping(),
         "a frame the terminal never read ended the connection"
     );
+}
+
+/// A text frame as a client writes it: masked, which a client's frames are.
+fn masked_text(payload: &str) -> Vec<u8> {
+    let mask = [3_u8, 1, 4, 1];
+    assert!(payload.len() < 126, "a short frame");
+    let mut frame = vec![
+        0x81,
+        0x80 | u8::try_from(payload.len()).expect("a short frame"),
+    ];
+    frame.extend(mask);
+    frame.extend(
+        payload
+            .bytes()
+            .enumerate()
+            .map(|(at, byte)| byte ^ mask[at % 4]),
+    );
+    frame
+}
+
+/// KR-REQ-11.32: an upgrade request that arrives in pieces, with the first frame of the terminal
+/// in the same write as its last bytes, is upgraded, and the frame is not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_32_an_upgrade_in_pieces_keeps_the_bytes_that_follow_it() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (mut terminal_end, gateway_end) = socket_pair();
+    let accepting = tokio::spawn(async move {
+        kr_worker::broker::websocket::accept(gateway_end, Framing::new(NativeFraming::JsonLines))
+            .await
+    });
+    let request = upgrade_request("");
+    let (first, rest) = request.as_bytes().split_at(25);
+    let (middle, last) = rest.split_at(rest.len() - 3);
+    terminal_end
+        .write_all(first)
+        .await
+        .expect("the first piece");
+    tokio::task::yield_now().await;
+    terminal_end.write_all(middle).await.expect("the middle");
+    tokio::task::yield_now().await;
+    let mut tail = last.to_vec();
+    tail.extend(masked_text(r#"{"method":"initialized"}"#));
+    terminal_end
+        .write_all(&tail)
+        .await
+        .expect("the end and a frame");
+    let mut answer = vec![0_u8; 1024];
+    let read = tokio::time::timeout(LIVENESS_DEADLINE, terminal_end.read(&mut answer))
+        .await
+        .expect("the gateway answers")
+        .expect("the answer is readable");
+    assert!(
+        String::from_utf8_lossy(&answer[..read]).starts_with("HTTP/1.1 101"),
+        "the request is upgraded"
+    );
+    let mut terminal = accepting
+        .await
+        .expect("the accept task is joined")
+        .expect("the gateway accepts the upgrade");
+    let mut line = vec![0_u8; 64];
+    let read = tokio::time::timeout(LIVENESS_DEADLINE, terminal.read(&mut line))
+        .await
+        .expect("the frame arrives")
+        .expect("it is readable");
+    assert_eq!(&line[..read], b"{\"method\":\"initialized\"}\n");
+}
+
+/// KR-REQ-11.32: a ping is answered while the gateway reads the terminal, a close is answered
+/// before the gateway's read ends, and the close the gateway sends when it ends the connection is
+/// the terminal's to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_websocket_ping_and_close_are_answered() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    let broker = broker();
+    let mut up = upgraded(&broker, Framing::new(NativeFraming::JsonLines)).await;
+    up.terminal
+        .send(tokio_websockets::Message::ping("alive"))
+        .await
+        .expect("the terminal pings");
+    let pong = tokio::time::timeout(LIVENESS_DEADLINE, up.terminal.next())
+        .await
+        .expect("the ping is answered")
+        .expect("the connection is open")
+        .expect("the answer is readable");
+    assert!(pong.is_pong(), "the answer to a ping is a pong");
+
+    // The terminal ends the connection as the pinned one does when a person quits: a close.
+    up.terminal
+        .send(tokio_websockets::Message::close(
+            Some(tokio_websockets::CloseCode::NORMAL_CLOSURE),
+            "",
+        ))
+        .await
+        .expect("the terminal closes");
+    let answer = tokio::time::timeout(LIVENESS_DEADLINE, up.terminal.next())
+        .await
+        .expect("the close is answered")
+        .expect("the answer arrives before the connection ends")
+        .expect("the answer is readable");
+    assert!(answer.is_close(), "the answer to a close is a close");
+    let [_, terminal_reader] = &mut up.serving;
+    tokio::time::timeout(LIVENESS_DEADLINE, terminal_reader)
+        .await
+        .expect("the gateway's read of the terminal ends with the close")
+        .expect("the reader is joined");
+    up.owner.shutdown();
     up.drained.abort();
+}
+
+/// KR-REQ-11.32: a terminal that does nothing but ping is cut off after a bound, so the answers
+/// the library keeps for the pings of a terminal that reads nothing are bounded too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_terminal_that_only_pings_is_cut_off() {
+    use futures_util::SinkExt as _;
+    let broker = broker();
+    let mut up = upgraded(&broker, Framing::new(NativeFraming::JsonLines)).await;
+    for _ in 0..=kr_worker::broker::websocket::MAX_CONTROL_MESSAGES_IN_A_ROW {
+        up.terminal
+            .send(tokio_websockets::Message::ping("x"))
+            .await
+            .expect("the terminal pings");
+    }
+    let [_, terminal_reader] = &mut up.serving;
+    tokio::time::timeout(LIVENESS_DEADLINE, terminal_reader)
+        .await
+        .expect("a run of pings without a message ends the connection")
+        .expect("the reader is joined");
+    assert_eq!(
+        next_close(&mut up.terminal).await,
+        tokio_websockets::CloseCode::POLICY_VIOLATION
+    );
+}
+
+/// KR-REQ-11.32: a gateway that ends a connection sends the terminal a close, so it reads an end
+/// and not a reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_connection_the_gateway_ends_is_closed_to_the_terminal() {
+    let broker = broker();
+    let mut up = upgraded(&broker, Framing::within(NativeFraming::JsonLines, 4096)).await;
+    // The upstream sends what the connection does not carry, so the gateway ends it.
+    tokio::io::AsyncWriteExt::write_all(
+        &mut up.upstream,
+        format!("{}\n", request_of(1, "session/update", 4097)).as_bytes(),
+    )
+    .await
+    .expect("the upstream writes");
+    assert_eq!(
+        next_close(&mut up.terminal).await,
+        tokio_websockets::CloseCode::NORMAL_CLOSURE
+    );
 }
 
 /// KR-REQ-11.32: what the gateway forwards is what was written, with the identifier and nothing
