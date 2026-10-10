@@ -153,7 +153,7 @@ export function Conversation({
   // The draft belongs to the window, not to this view: it is kept on this device as it is typed,
   // and it is the same draft whichever view of the session is open, and after the tab is closed.
   const { draft, ready: draftsOpen, change: changeDraft } = useSessionDraft(sessionId)
-  const { problem: draftsProblem } = useBook()
+  const { problem: draftsProblem, status: draftsStatus } = useBook()
   const { unread, refresh } = useSessionAgent(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
   // Why the host's event stream could not be followed, under the visit it was opened in: a failure
@@ -816,6 +816,20 @@ export function Conversation({
         <p className="banner warning" data-testid="drafts-not-kept">
           This device is not keeping what you write: {draftsProblem}. The draft is here and can
           still be sent; it will not survive this window being closed.
+          {draftsStatus === 'memory-only' ? (
+            <>
+              {' '}
+              <Button
+                tone="quiet"
+                data-testid="drafts-retry"
+                onClick={() => {
+                  void book.hydrate()
+                }}
+              >
+                Try again
+              </Button>
+            </>
+          ) : null}
         </p>
       )}
 

@@ -11,6 +11,7 @@ import type { EnvironmentListResult, SessionListResult } from '@kalareach/protoc
 
 import { useApp } from '../../app/state'
 import { useBook } from '../../app/drafts'
+import { keptEntry } from '../../model/draft-book'
 import { failureMessage, watch, type Watch } from '../../host/port'
 import { Banner } from '../../components/ui'
 import { PairingFlow } from '../../pairing/PairingFlow'
@@ -79,7 +80,7 @@ export function MobileSessions({
   readonly environmentId?: string | null
 }): ReactNode {
   const { port } = useApp()
-  const { kept: keptDrafts } = useBook()
+  const keptEntryLine = keptEntry(useBook())
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)
@@ -150,7 +151,7 @@ export function MobileSessions({
           <span className="m-row-title">Talk to your host</span>
         </button>
       )}
-      {onOpenDrafts === undefined || keptDrafts.length === 0 ? null : (
+      {onOpenDrafts === undefined || keptEntryLine === null ? null : (
         <button
           type="button"
           className="m-row"
@@ -158,9 +159,7 @@ export function MobileSessions({
           style={{ minBlockSize: target }}
           onClick={onOpenDrafts}
         >
-          <span className="m-row-title">
-            {keptDrafts.length === 1 ? 'One kept draft' : `${keptDrafts.length} kept drafts`}
-          </span>
+          <span className="m-row-title">{keptEntryLine.title}</span>
         </button>
       )}
       {error ? (
