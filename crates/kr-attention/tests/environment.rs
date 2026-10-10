@@ -1035,6 +1035,30 @@ fn a_device_is_shown_what_was_first_seen_at_or_after_its_history_and_a_reminder_
         .expect("the batch is decided");
     assert!(outcome.acknowledged.is_empty(), "{outcome:?}");
     assert_eq!(outcome.stale, vec![hidden.key.clone()]);
+
+    // Named at a revision it does not have yet, an item the device is not shown is stale too: a
+    // device is told no revision of an item it does not see, which would tell it the item exists.
+    let ahead = vec![AttentionItemRevision {
+        key: hidden.key.clone(),
+        revision: U64::new(hidden.revision.get() + 1),
+    }];
+    attention
+        .check_revisions(&device(NOON + 5_000), &ahead)
+        .expect("an item the device is not shown has no revision to be ahead of");
+    let outcome = attention
+        .acknowledge(
+            &actor("device:phone"),
+            &device(NOON + 5_000),
+            &ahead,
+            reading(due),
+        )
+        .expect("the batch is decided");
+    assert_eq!(outcome.stale, vec![hidden.key.clone()]);
+    assert!(
+        attention.check_revisions(&device(NOON), &ahead).is_err(),
+        "the control: a device shown the item is told it named a revision ahead"
+    );
+
     let outcome = attention
         .acknowledge(&actor("device:phone"), &device(NOON), &named, reading(due))
         .expect("the batch is decided");
