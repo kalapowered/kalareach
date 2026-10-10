@@ -257,6 +257,13 @@ async fn close_a_session(fixture: &Fixture, raw: &RawDevice) -> ProtocolError {
     )
 }
 
+/// Closes a session that does not exist and asserts the host got as far as finding that out, which
+/// it does for a device the lease serves and for no other.
+async fn reaches_its_session(fixture: &Fixture, raw: &RawDevice) {
+    let error = close_a_session(fixture, raw).await;
+    assert_eq!(error.code, ErrorCode::UnknownSession, "{error:?}");
+}
+
 fn denied(error: &ProtocolError) -> bool {
     error.code == ErrorCode::PermissionDenied
 }
@@ -379,7 +386,7 @@ async fn a_member_whose_lease_runs_out_is_refused_on_the_same_connection_and_ser
         .await
         .expect("served a minute before the end");
     let fresh = ada.connect(&fixture).await;
-    assert!(!denied(&close_a_session(&fixture, &fresh).await));
+    reaches_its_session(&fixture, &fresh).await;
     fresh.close();
 
     fixture.pass(Duration::from_millis(MINUTE_MS + 1_000));
@@ -466,7 +473,7 @@ async fn a_narrower_renewal_narrows_what_is_served_and_the_presenter_reconnects(
     ada.present(&fixture, &raw, fixture.lease(2, &ada, SERVED), None)
         .await
         .expect("the wide lease");
-    assert!(!denied(&close_a_session(&fixture, &raw).await));
+    reaches_its_session(&fixture, &raw).await;
 
     // The next lease is newer and says less: no right to close a session.
     fixture.pass(Duration::from_secs(1));

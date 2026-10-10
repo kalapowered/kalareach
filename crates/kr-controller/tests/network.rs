@@ -1905,11 +1905,30 @@ const MEMBER_RIGHTS: [ActionRight; 3] = [
     ActionRight::SessionClose,
 ];
 
+/// Whether `error` is the host's answer, which leaves its connection up, and not the client's own
+/// connection having ended.
+fn answered_by_the_host(error: &kr_client::ClientError) -> bool {
+    matches!(
+        error,
+        kr_client::ClientError::Host(_) | kr_client::ClientError::Refused { .. }
+    )
+}
+
+/// Asserts that the host refused a request for want of a membership lease that has ended.
+fn refused_for_the_lease(error: &kr_client::ClientError) {
+    assert_eq!(error.code(), ErrorCode::PermissionDenied, "{error}");
+    assert!(
+        error.to_string().contains("membership lease has expired"),
+        "the refusal names the lease: {error}"
+    );
+}
+
 /// A host enrolled in an organisation, a running session on it, and a member's device paired
 /// under a grant that answers to the organisation, on clocks the test moves.
 ///
 /// The organisation is a stand-in that signs with real keys: it issues the leases and publishes
-/// the chain, which is all the managed service does for the host. Nothing here presents a lease.
+/// the chain, which is all the managed service does for the host. `start` presents no lease; a
+/// test does, with [`Membership::present`].
 struct Membership {
     host: Host,
     daemon: RunningDaemon,
@@ -2118,19 +2137,22 @@ async fn a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serv
     // written to the device. Until then a request on the connection is refused for the lease.
     world.moved.pass(10);
     std::fs::write(&flag, "after-the-last-lease").expect("the flag is written");
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    loop {
-        match world.read(&session).await {
-            Err(refused) if refused.code() == ErrorCode::ResourceUnavailable => break,
-            Err(refused) => assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}"),
-            Ok(_) => panic!("a read was served after the last lease ran out"),
+    // The connection's end is the condition. Each read is answered, so the loop is paced by the
+    // host, and a refusal from the host is not the end: only the client's own connection ending is.
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            match world.read(&session).await {
+                Ok(_) => panic!("a read was served after the last lease ran out"),
+                Err(refused) if answered_by_the_host(&refused) => {
+                    refused_for_the_lease(&refused);
+                    tokio::task::yield_now().await;
+                }
+                Err(_ended) => break,
+            }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the running subscription's output was never stopped"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    })
+    .await
+    .expect("the running subscription's output was never stopped");
     let mut after = String::new();
     while let Ok(notification) = events.try_recv() {
         if notification.event_type.as_str() == "session.output" {
@@ -2163,7 +2185,7 @@ async fn a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serv
     // the next lease it presents serves it the session again.
     let again = world.connect().await;
     let refused = world.read(&again).await.expect_err("no lease is in force");
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    refused_for_the_lease(&refused);
     world.present(&again).await;
     let read = world
         .read(&again)
@@ -2216,7 +2238,7 @@ async fn a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_o
         .read(&session)
         .await
         .expect_err("a read after the lease ended");
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    refused_for_the_lease(&refused);
     let refused = session
         .mutate(
             Method::SessionAttach,
@@ -2243,7 +2265,7 @@ async fn a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_o
         )
         .await
         .expect_err("a mutation after the lease ended");
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    refused_for_the_lease(&refused);
 
     // The same connection serves the device again with the next lease it presents.
     world.present(&session).await;
