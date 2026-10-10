@@ -68,20 +68,20 @@ impl SyncService {
     #[must_use]
     pub fn open(data: &Path) -> Self {
         let file = data.join(FILE);
-        let kept = match read_owner_only_file(&file, ORIGIN_LIMIT) {
-            Ok(kept) => kept,
+        // A setting this build will not follow (a link, another owner's file, one wider than
+        // owner-only, text that is not an origin) is not taken to a service the person chose: the
+        // managed service stands, and the log says why.
+        let origin = match read_owner_only_file(&file, ORIGIN_LIMIT) {
+            Ok(None) => managed(),
+            Ok(Some(bytes)) => kept_origin(bytes).unwrap_or_else(|why| {
+                tracing::warn!(%why, "the sync service setting is not an origin, so the managed service stands");
+                managed()
+            }),
             Err(error) => {
-                // A file this build will not read (a link, another owner's, wider than owner-only)
-                // is not followed to a service the person chose, and the managed one stands; the
-                // log says why, so that a person whose choice seems lost can find the cause.
                 tracing::warn!(%error, "the sync service setting could not be read, so the managed service stands");
-                None
+                managed()
             }
         };
-        let origin = kept
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|text| GatewayOrigin::new(text.trim()).ok())
-            .unwrap_or_else(managed);
         Self {
             file,
             origin: Mutex::new(origin),
@@ -129,6 +129,12 @@ impl SyncService {
         *self.origin.lock().unwrap_or_else(PoisonError::into_inner) = origin.clone();
         Ok(SyncServiceView::of(&origin))
     }
+}
+
+/// The origin a kept setting names, or why it names none.
+fn kept_origin(bytes: Vec<u8>) -> std::result::Result<GatewayOrigin, String> {
+    let text = String::from_utf8(bytes).map_err(|_| "it is not text".to_owned())?;
+    GatewayOrigin::new(text.trim()).map_err(|error| error.to_string())
 }
 
 /// The managed service's origin, which the setting holds until the person chooses another.
