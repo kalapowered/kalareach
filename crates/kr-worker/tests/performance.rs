@@ -1539,10 +1539,11 @@ const OUTPUT_SAMPLES: usize = 1_000;
 
 /// Input round trips and the echo of every paste-delimiter prefix, beside KR-PERF-001 and
 /// KR-PERF-002's figures, through real worker processes: twenty sessions and thirty-two views on a
-/// daemon that starts each worker as its own process, the one typed into printing sustained output. The input benchmark builds its workers
-/// inside its own process, so it cannot show what the shipped worker executable does; this runs the
-/// executable itself. The figures are recorded, and the measurement asserts only that every
-/// exchange completed as it should: a keystroke forwarded whole, a prefix held, an echo seen.
+/// daemon that starts each worker as its own process, the one typed into printing sustained
+/// output. The input benchmark builds its workers inside its own process, so it cannot show what the
+/// shipped worker executable does; this runs the executable itself. The figures are recorded, and
+/// the measurement asserts only that every exchange completed as it should: a keystroke forwarded
+/// whole, a prefix held, an echo seen.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement rather than a test; run by hand with the worker program under test"]
@@ -1745,7 +1746,8 @@ async fn input_under_output(host: &Host, owned: &mut Owned) -> Result<(), String
             sequence += 1;
             if answer.held_prefix_bytes.get() != length as u64 {
                 return Err(format!(
-                    "a prefix of {length} bytes of the {name} delimiter was not held: {} held",
+                    "a prefix of {length} byte{} of the {name} delimiter was not held: {} held",
+                    if length == 1 { "" } else { "s" },
                     answer.held_prefix_bytes.get()
                 ));
             }
