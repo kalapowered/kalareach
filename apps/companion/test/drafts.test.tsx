@@ -269,6 +269,39 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     })
   })
 
+  it('keeps the prompt’s text when the kept drafts are changed while the prompt is on its way', async () => {
+    const device = new FakeDraftStore()
+    leave(device, 'aaaaaaaa-aaaa-4aaa-8aaa-00000000dead', 'for a session that went', 'orphaned')
+    const person = userEvent.setup()
+    const answer = held<never>()
+    startOver(device, IN_MAIN, (port) => ({
+      ...port,
+      composerSubmit: () => answer.promise
+    }))
+    await person.type(await screen.findByTestId('composer-input'), 'send this')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-send')).toBeEnabled()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+
+    // While the prompt is on its way the person discards a kept draft, which reads the store again.
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByRole('button', { name: 'One kept draft' }))
+    const entry = await screen.findByTestId('kept-draft')
+    await person.click(within(entry).getByTestId('kept-draft-discard'))
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-drafts-empty')).toBeInTheDocument()
+    })
+    answer.reject({ code: 'UNAVAILABLE', message: 'The host did not answer.', user_action: 'retry' })
+
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text)).toEqual(['send this'])
+    })
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    expect(await screen.findByTestId('composer-input')).toHaveValue('send this')
+  })
+
   it('gives the text back when the tab it was sent from was closed before the answer', async () => {
     const device = new FakeDraftStore()
     const person = userEvent.setup()
