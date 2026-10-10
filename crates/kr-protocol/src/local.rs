@@ -414,11 +414,12 @@ pub fn states_utc_deadlines(capabilities: &CanonicalSet<CapabilityId>) -> bool {
 /// `voice.use` in it.
 ///
 /// A voice grant is decided only inside the control daemon. The device door decides a forwarded
-/// method under the pairing grant with `voice.use` taken out, the methods that need it are the
-/// daemon's own voice methods, and the voice module performs its one effect as the daemon's own
-/// request, which carries no rights. So no worker holds work under a voice grant, and withdrawing
-/// one owes no fence. A forwarded mutation whose rights this answers false for is neither encoded
-/// nor decoded, and both builders of one refuse such a set before anything is sent.
+/// method under the pairing grant with `voice.use` taken out, and the methods that need it are the
+/// daemon's own voice methods. The one effect the voice module forwards, a close the device
+/// confirmed, names the voice grant and carries the right to close and no voice right; withdrawing
+/// that grant owes a fence while such a close can still run at a worker, and not otherwise. A
+/// forwarded mutation whose rights this answers false for is neither encoded nor decoded, and both
+/// builders of one refuse such a set before anything is sent.
 #[must_use]
 pub fn may_travel_to_a_worker(
     rights: &crate::scalars::CanonicalSet<crate::rights::ActionRight>,

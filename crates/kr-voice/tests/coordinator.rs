@@ -43,8 +43,8 @@ use kr_protocol::voice::{
     VoiceStopParams,
 };
 use kr_voice::seams::{
-    ActionSubmitter, ContextItem, ContextRequest, ContextSource, GatheredContext, HostReceipt,
-    SelectedItem, VoiceAuthority, VoiceFuture, WithheldRun,
+    ActionSubmitter, Admission, ContextItem, ContextRequest, ContextSource, GatheredContext,
+    HostReceipt, SelectedItem, VoiceAuthority, VoiceFuture, WithheldRun,
 };
 use kr_voice::{
     Coordinator, DelegationInterpreter, GrammarInterpreter, Interpretation, Misread, Proposal,
@@ -54,6 +54,11 @@ use kr_voice::{
 // ---------------------------------------------------------------------------------------------
 // Identities
 // ---------------------------------------------------------------------------------------------
+
+/// The admission of a delegation with no window of its own, which never runs out.
+fn unbounded() -> Arc<dyn Admission> {
+    Arc::new(kr_voice::Unbounded)
+}
 
 fn device(byte: u8) -> DeviceId {
     DeviceId::new(Uuid::from_bytes([byte; 16]))
@@ -626,7 +631,11 @@ impl Submitter {
 }
 
 impl ActionSubmitter for Submitter {
-    fn submit<'a>(&'a self, proposal: &'a Proposal) -> VoiceFuture<'a, HostReceipt> {
+    fn submit<'a>(
+        &'a self,
+        proposal: &'a Proposal,
+        _admission: &'a Arc<dyn Admission>,
+    ) -> VoiceFuture<'a, HostReceipt> {
         self.proposals
             .lock()
             .expect("the proposals")
@@ -2220,6 +2229,7 @@ async fn a_delegation_runs_under_the_intersection_of_both_grants() {
             action(1),
             &delegate_params(voice_session_id, delegation("one"), VoiceAction::Status),
             11_000,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2240,11 +2250,12 @@ async fn a_delegation_runs_under_the_intersection_of_both_grants() {
                 VoiceAction::SubmitPrompt,
             ),
             11_100,
+            &unbounded(),
         )
         .await
         .expect("an answer");
     let (reason, message) = refusal(&result.outcome);
-    assert_eq!(reason, VoiceRefusal::DestinationNotNamed, "{message}");
+    assert_eq!(reason, VoiceRefusal::OutsideVoiceGrant, "{message}");
 
     // Narrowing the device's own grant stops what the voice grant still lists.
     fixture.authority.narrow_device_grant(&[]);
@@ -2255,6 +2266,7 @@ async fn a_delegation_runs_under_the_intersection_of_both_grants() {
             action(3),
             &delegate_params(voice_session_id, delegation("three"), VoiceAction::Status),
             11_200,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2278,7 +2290,7 @@ async fn a_delegation_outside_this_calls_timeline_or_already_spent_is_refused() 
     params.fragments = said_at(10_000_000, VoiceAction::Status.as_str());
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2290,7 +2302,7 @@ async fn a_delegation_outside_this_calls_timeline_or_already_spent_is_refused() 
     let params = delegate_params(voice_session_id, delegation("once"), VoiceAction::Status);
     let first = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &params, 11_000)
+        .delegate(device(PHONE), action(2), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     assert!(matches!(
@@ -2299,7 +2311,7 @@ async fn a_delegation_outside_this_calls_timeline_or_already_spent_is_refused() 
     ));
     let again = fixture
         .coordinator
-        .delegate(device(PHONE), action(3), &params, 11_100)
+        .delegate(device(PHONE), action(3), &params, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2318,7 +2330,7 @@ async fn one_action_identifier_carries_one_delegation() {
     let params = delegate_params(voice_session_id, delegation("one"), VoiceAction::Status);
     let first = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     assert!(matches!(
@@ -2331,7 +2343,7 @@ async fn one_action_identifier_carries_one_delegation() {
     // for it, which is the daemon's own and is proved where that record lives.
     let again = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &params, 11_200)
+        .delegate(device(PHONE), action(2), &params, 11_200, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2364,7 +2376,7 @@ async fn one_action_identifier_carries_one_delegation() {
     let elsewhere = delegate_params(second, delegation("one"), VoiceAction::Status);
     let refused_again = fixture
         .coordinator
-        .delegate(device(PHONE), action(3), &elsewhere, 11_400)
+        .delegate(device(PHONE), action(3), &elsewhere, 11_400, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2387,7 +2399,7 @@ async fn a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_
     let params = delegate_params(first, delegation("one"), VoiceAction::Status);
     let answered = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     assert!(matches!(
@@ -2431,6 +2443,7 @@ async fn a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_
                 VoiceAction::Status,
             ),
             11_300,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2458,7 +2471,7 @@ async fn a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_
     );
     let asked = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     let VoiceDelegationOutcome::ConfirmationRequired { request, .. } = asked.outcome else {
@@ -2468,7 +2481,7 @@ async fn a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_
         Nullable::some(sign_confirmation(&fixture.key, &request).expect("the device signs"));
     let signed = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_100)
+        .delegate(device(PHONE), action(1), &params, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert!(
@@ -2479,7 +2492,7 @@ async fn a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_
     // And now it is spent: the same delegation under another action is refused.
     let again = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &params, 11_200)
+        .delegate(device(PHONE), action(2), &params, 11_200, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2498,7 +2511,7 @@ async fn a_delegation_answered_before_is_answered_again_under_the_authority_that
     let params = delegate_params(voice_session_id, delegation("one"), VoiceAction::Status);
     let first = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     assert!(matches!(
@@ -2539,7 +2552,7 @@ async fn a_delegation_answered_before_is_answered_again_under_the_authority_that
     );
     let refused = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &params, 11_150)
+        .delegate(device(PHONE), action(2), &params, 11_150, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2570,6 +2583,7 @@ async fn a_proposal_is_built_from_the_words_as_the_host_read_them() {
             action(1),
             &delegate_params(voice_session_id, delegation("one"), VoiceAction::Status),
             11_000,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2590,7 +2604,8 @@ async fn a_proposal_is_built_from_the_words_as_the_host_read_them() {
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-15.13: each of section 15 ¶13's five classes is refused without a confirmation, and the
-/// refusal names what is missing.
+/// refusal names what is missing. The class with no effect on this host is refused before anybody
+/// is asked to confirm it.
 #[tokio::test]
 async fn the_five_unlocked_screen_classes_are_refused_without_a_confirmation() {
     let fixture = fixture();
@@ -2618,9 +2633,19 @@ async fn the_five_unlocked_screen_classes_are_refused_without_a_confirmation() {
                     *voice_action,
                 ),
                 11_000,
+                &unbounded(),
             )
             .await
             .expect("an answer");
+        if *voice_action == VoiceAction::DeliverExternally {
+            assert_eq!(
+                refusal(&result.outcome).0,
+                VoiceRefusal::NoSuchEffect,
+                "{:?}",
+                result.outcome
+            );
+            continue;
+        }
         let VoiceDelegationOutcome::ConfirmationRequired { request, message } = &result.outcome
         else {
             panic!(
@@ -2641,6 +2666,63 @@ async fn the_five_unlocked_screen_classes_are_refused_without_a_confirmation() {
     );
 }
 
+/// KR-REQ-15.13: a person is asked to confirm only what this host would then admit. A class the
+/// voice grant does not carry, and one the device's own grant does not reach, are refused before a
+/// challenge is issued.
+#[tokio::test]
+async fn no_challenge_is_issued_for_an_action_the_grants_do_not_carry() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, Some(&[VoiceAction::Status])).await;
+
+    let result = fixture
+        .coordinator
+        .delegate(
+            device(PHONE),
+            action(1),
+            &delegate_params(
+                voice_session_id,
+                delegation("not-carried"),
+                VoiceAction::CloseSession,
+            ),
+            11_000,
+            &unbounded(),
+        )
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&result.outcome).0,
+        VoiceRefusal::OutsideVoiceGrant,
+        "{:?}",
+        result.outcome
+    );
+
+    let fixture = self::fixture();
+    let voice_session_id = started(&fixture, Some(&[VoiceAction::CloseSession])).await;
+    fixture.authority.narrow_device_grant(&[]);
+    let result = fixture
+        .coordinator
+        .delegate(
+            device(PHONE),
+            action(2),
+            &delegate_params(
+                voice_session_id,
+                delegation("not-reached"),
+                VoiceAction::CloseSession,
+            ),
+            11_100,
+            &unbounded(),
+        )
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&result.outcome).0,
+        VoiceRefusal::OutsideDeviceGrant,
+        "{:?}",
+        result.outcome
+    );
+    assert!(fixture.submitter.proposals().is_empty());
+}
+
 /// KR-REQ-15.13: the challenge comes back on the wire, and the delegation it belongs to is not
 /// spent by asking for it: the same delegation returns carrying the signature and becomes one
 /// action.
@@ -2652,7 +2734,7 @@ async fn the_challenge_comes_back_and_the_delegation_survives_it() {
 
     let asked = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     let VoiceDelegationOutcome::ConfirmationRequired { request, .. } = asked.outcome else {
@@ -2666,7 +2748,7 @@ async fn the_challenge_comes_back_and_the_delegation_survives_it() {
         Nullable::some(sign_confirmation(&fixture.key, &request).expect("a proof"));
     let performed = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_050)
+        .delegate(device(PHONE), action(1), &params, 11_050, &unbounded())
         .await
         .expect("an answer");
     assert!(
@@ -2678,7 +2760,7 @@ async fn the_challenge_comes_back_and_the_delegation_survives_it() {
     // And it is one action: the delegation is spent now.
     let again = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &params, 11_100)
+        .delegate(device(PHONE), action(2), &params, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2714,7 +2796,7 @@ async fn provider_text_cannot_create_a_confirmation() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     let VoiceDelegationOutcome::ConfirmationRequired { message, .. } = &result.outcome else {
@@ -2740,7 +2822,7 @@ async fn provider_text_cannot_create_a_confirmation() {
         Nullable::some(sign_confirmation(&fixture.key, &challenge).expect("a proof"));
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(3), &params, 11_100)
+        .delegate(device(PHONE), action(3), &params, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert!(
@@ -2781,7 +2863,7 @@ async fn a_confirmation_for_one_action_does_not_authorise_another() {
     other.confirmation = Nullable::some(proof);
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &other, 11_100)
+        .delegate(device(PHONE), action(1), &other, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -2815,7 +2897,7 @@ async fn an_action_this_host_has_no_effect_for_is_refused_even_when_confirmed() 
         Nullable::some(sign_confirmation(&fixture.key, &challenge).expect("a proof"));
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_100)
+        .delegate(device(PHONE), action(1), &params, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(refusal(&result.outcome).0, VoiceRefusal::NoSuchEffect);
@@ -2895,6 +2977,7 @@ async fn a_session_said_by_its_number_is_found_among_the_calls_own() {
             action(1),
             &saying(call, "one", "What's the status of session two?"),
             11_000,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2912,6 +2995,7 @@ async fn a_session_said_by_its_number_is_found_among_the_calls_own() {
             action(2),
             &saying(call, "two", "Brief me on session 1, please."),
             11_100,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2939,6 +3023,7 @@ async fn a_number_the_call_does_not_reach_names_no_session() {
             action(1),
             &saying(call, "one", "status of session two"),
             11_000,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2957,6 +3042,7 @@ async fn a_number_the_call_does_not_reach_names_no_session() {
             action(2),
             &saying(call, "two", "status"),
             11_100,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2975,6 +3061,7 @@ async fn a_number_the_call_does_not_reach_names_no_session() {
             action(3),
             &saying(both, "three", "status"),
             11_200,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -3006,6 +3093,7 @@ async fn words_the_grammar_does_not_hold_reach_nothing() {
                 action(u8::try_from(index).expect("a small index") + 1),
                 &saying(call, &format!("w{index}"), words),
                 11_000,
+                &unbounded(),
             )
             .await
             .expect("an answer");
@@ -3037,6 +3125,7 @@ async fn a_set_of_fragments_that_breaks_a_rule_is_refused_whole_and_spends_nothi
                 action(u8::try_from(index).expect("a small index") + 1),
                 params,
                 11_000,
+                &unbounded(),
             )
             .await
             .expect("an answer");
@@ -3050,6 +3139,7 @@ async fn a_set_of_fragments_that_breaks_a_rule_is_refused_whole_and_spends_nothi
             action(3),
             &saying(call, "one", "status"),
             11_100,
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -3090,7 +3180,7 @@ async fn a_confirmation_for_one_utterance_does_not_confirm_another() {
     said_second.confirmation = Nullable::some(proof);
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &said_second, 11_100)
+        .delegate(device(PHONE), action(1), &said_second, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -3131,7 +3221,7 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -3155,7 +3245,7 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &wrong, 11_100)
+        .delegate(device(PHONE), action(2), &wrong, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -3179,7 +3269,7 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(3), &right, 11_200)
+        .delegate(device(PHONE), action(3), &right, 11_200, &unbounded())
         .await
         .expect("an answer");
     assert!(matches!(
@@ -3206,7 +3296,7 @@ async fn an_approval_needs_the_verified_request_and_an_explicit_answer() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -3232,7 +3322,7 @@ async fn an_approval_needs_the_verified_request_and_an_explicit_answer() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &invented, 11_100)
+        .delegate(device(PHONE), action(2), &invented, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert_eq!(
@@ -3258,7 +3348,7 @@ async fn an_approval_needs_the_verified_request_and_an_explicit_answer() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(3), &verified, 11_200)
+        .delegate(device(PHONE), action(3), &verified, 11_200, &unbounded())
         .await
         .expect("an answer");
     assert!(matches!(
@@ -3278,7 +3368,7 @@ async fn cancelling_a_turn_needs_the_typed_request_and_the_current_turn() {
     let params = delegate_params(voice_session_id, delegation("c1"), VoiceAction::CancelTurn);
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_000)
+        .delegate(device(PHONE), action(1), &params, 11_000, &unbounded())
         .await
         .expect("an answer");
     let (reason, message) = refusal(&result.outcome);
@@ -3298,7 +3388,7 @@ async fn cancelling_a_turn_needs_the_typed_request_and_the_current_turn() {
     );
     let error = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &stale, 11_050)
+        .delegate(device(PHONE), action(2), &stale, 11_050, &unbounded())
         .await
         .expect_err("a stale turn cancels nothing");
     assert!(error.reason().is_none(), "the host refused it: {error}");
@@ -3313,7 +3403,7 @@ async fn cancelling_a_turn_needs_the_typed_request_and_the_current_turn() {
     );
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(3), &named, 11_100)
+        .delegate(device(PHONE), action(3), &named, 11_100, &unbounded())
         .await
         .expect("an answer");
     assert!(matches!(
@@ -3354,6 +3444,7 @@ async fn a_result_that_was_admitted_and_not_performed_is_reported_as_admitted() 
             action(1),
             &delegate_params(voice_session_id, delegation("one"), VoiceAction::Status),
             11_000,
+            &unbounded(),
         )
         .await
         .expect("an answer");

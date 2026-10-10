@@ -41,7 +41,7 @@ fn delegation_of(
 }
 
 /// The same, under the provider's identifier `name`.
-fn delegation_named(
+pub(super) fn delegation_named(
     name: &str,
     environment_id: kr_protocol::ids::EnvironmentId,
     voice_session_id: VoiceSessionId,
@@ -126,7 +126,7 @@ fn keep(
 }
 
 /// The delegation asked for again, on a connection this host admitted, as `actor_id`.
-async fn ask(
+pub(super) async fn ask(
     controller: &Arc<Controller>,
     actor_id: &kr_protocol::ids::ActorId,
     device_id: kr_protocol::ids::DeviceId,
@@ -146,7 +146,7 @@ async fn ask(
     controller
         .voice_mutation(
             VoiceIngress {
-                actor_id,
+                actor_id: actor_id.clone(),
                 actor: crate::voice::VoiceActor::Device(device_id),
                 route: None,
             },
@@ -274,7 +274,7 @@ async fn a_delegations_receipt_goes_back_only_to_a_device_that_is_still_paired()
 
 /// A call the device holds over `session_id`, started through the daemon's own voice service and a
 /// provider that makes no network call, under a standing voice grant that permits `actions`.
-async fn call_over(
+pub(super) async fn call_over(
     controller: &Arc<Controller>,
     device_id: kr_protocol::ids::DeviceId,
     session_id: SessionId,
@@ -690,21 +690,21 @@ async fn a_receipt_for_an_effect_is_given_back_as_it_was_kept() {
 
 /// The device directory's own route for one delegation, watched at the moment it is given back:
 /// the claim it was taken beside must still be held then.
-struct Route<'a> {
-    real: super::voice_actions::DeviceRoute<'a>,
-    controller: &'a Controller,
-    claim_held_when_given_back: std::sync::atomic::AtomicBool,
+struct Route {
+    real: super::voice_actions::DeviceRoute,
+    controller: Arc<Controller>,
+    claim_held_when_given_back: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl super::voice_actions::ClaimedRoute for Route<'_> {
+impl super::voice_actions::ClaimedRoute for Route {
     fn give_back(&self) -> crate::error::Result<()> {
-        let digest = kr_protocol::digest::mutation_digest(self.real.mutation, self.real.actor_id)
+        let digest = kr_protocol::digest::mutation_digest(&self.real.mutation, &self.real.actor_id)
             .expect("a digest");
         let held = self
             .controller
             .sharing()
             .grants()
-            .recorded_action(self.real.actor_id, self.real.mutation.action_id, &digest)
+            .recorded_action(&self.real.actor_id, self.real.mutation.action_id, &digest)
             .expect("the store answers");
         self.claim_held_when_given_back.store(
             matches!(held, Some(ActionRecord::InFlight)),
@@ -770,14 +770,15 @@ async fn a_challenges_route_goes_back_while_its_claim_is_still_held() {
             .expect("the route is claimed"),
         crate::service::net::devices::ActionRoute::Recorded
     );
+    let claim_held_when_given_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let route = Route {
         real: super::voice_actions::DeviceRoute {
-            devices: controller.devices(),
-            actor_id: &actor_id,
-            mutation: &mutation,
+            devices: Arc::clone(controller.devices()),
+            actor_id: actor_id.clone(),
+            mutation: mutation.clone(),
         },
-        controller: &controller,
-        claim_held_when_given_back: std::sync::atomic::AtomicBool::new(false),
+        controller: Arc::clone(&controller),
+        claim_held_when_given_back: Arc::clone(&claim_held_when_given_back),
     };
     let accepted = AcceptedDeadline {
         deadline: controller
@@ -792,9 +793,9 @@ async fn a_challenges_route_goes_back_while_its_claim_is_still_held() {
     let answered = controller
         .voice_mutation(
             VoiceIngress {
-                actor_id: &actor_id,
+                actor_id: actor_id.clone(),
                 actor: crate::voice::VoiceActor::Device(device.device_id),
-                route: Some(&route),
+                route: Some(Arc::new(route)),
             },
             &mutation,
             Method::VoiceDelegate,
@@ -814,9 +815,7 @@ async fn a_challenges_route_goes_back_while_its_claim_is_still_held() {
         "the challenge is the answer"
     );
     assert!(
-        route
-            .claim_held_when_given_back
-            .load(std::sync::atomic::Ordering::SeqCst),
+        claim_held_when_given_back.load(std::sync::atomic::Ordering::SeqCst),
         "the voice claim was still held when the route went back"
     );
     assert!(

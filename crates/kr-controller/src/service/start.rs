@@ -835,6 +835,8 @@ impl Controller {
             #[cfg(test)]
             before_a_proxy_is_opened: ReadPause::default(),
             #[cfg(test)]
+            after_a_voice_close_is_held: ReadPause::default(),
+            #[cfg(test)]
             before_a_close_asks_for_its_link: ReadPause::default(),
             #[cfg(test)]
             before_a_created_session_is_read: ReadPause::default(),
@@ -865,6 +867,7 @@ impl Controller {
             catalogue,
             sharing,
             voice: std::sync::OnceLock::new(),
+            voice_budgets: std::sync::Mutex::new(super::voice_actions::VoiceBudgets::STATED),
             privacy,
             descriptions,
             delivery,

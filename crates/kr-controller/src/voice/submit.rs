@@ -15,15 +15,19 @@ use std::sync::Arc;
 use kr_protocol::method::Method;
 use kr_protocol::voice::VoiceAction;
 use kr_voice::seams::{ActionSubmitter, HostReceipt, VoiceFuture};
-use kr_voice::{Proposal, VoiceError};
+use kr_voice::{Admission, Proposal, VoiceError};
 
 /// Where a proposal reaches this host's own dispatch.
 pub trait HostDispatch: Send + Sync + std::fmt::Debug {
     /// Performs one proposal under the method the registry lists for its effect.
+    ///
+    /// `admission` is the one the delegation arrived under: an effect that outlives the request
+    /// asks it again where it becomes possible.
     fn perform<'a>(
         &'a self,
         method: Method,
         proposal: &'a Proposal,
+        admission: &'a Arc<dyn Admission>,
     ) -> VoiceFuture<'a, HostReceipt>;
 }
 
@@ -67,7 +71,11 @@ pub const fn method_for(action: VoiceAction) -> Option<Method> {
 }
 
 impl ActionSubmitter for ProposalSubmitter {
-    fn submit<'a>(&'a self, proposal: &'a Proposal) -> VoiceFuture<'a, HostReceipt> {
+    fn submit<'a>(
+        &'a self,
+        proposal: &'a Proposal,
+        admission: &'a Arc<dyn Admission>,
+    ) -> VoiceFuture<'a, HostReceipt> {
         Box::pin(async move {
             let Some(method) = method_for(proposal.action) else {
                 return Err(VoiceError::refused(
@@ -75,7 +83,7 @@ impl ActionSubmitter for ProposalSubmitter {
                     "this host has no method for that effect",
                 ));
             };
-            self.dispatch.perform(method, proposal).await
+            self.dispatch.perform(method, proposal, admission).await
         })
     }
 }

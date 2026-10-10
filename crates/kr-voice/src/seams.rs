@@ -8,6 +8,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{ActionId, ApprovalRequestId, DeviceId, GrantId, SessionId};
@@ -315,6 +316,17 @@ pub trait Admission: Send + Sync + fmt::Debug {
     ///
     /// Returns the host's refusal when the change may not.
     fn still_admitted(&self) -> std::result::Result<(), kr_protocol::error::ProtocolError>;
+
+    /// How long the change has left under the deadline the host accepted it under, when it has
+    /// one. An effect that outlives the request is held to what is left.
+    fn time_left(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// The connection the change arrived on, when it arrived on one.
+    fn connection(&self) -> Option<kr_protocol::ids::ConnectionId> {
+        None
+    }
 }
 
 /// An admission that never runs out, for a caller with no window of its own.
@@ -353,12 +365,17 @@ pub struct HostReceipt {
 pub trait ActionSubmitter: Send + Sync + fmt::Debug {
     /// Submits one proposal and returns the host's receipt.
     ///
+    /// `admission` is the one the delegation arrived under. An effect that outlives the request
+    /// that asked for it asks it again where the effect becomes possible, because everything
+    /// between the coordinator's checks and that moment can wait.
+    ///
     /// # Errors
     ///
     /// Returns an error when the host refused the proposal or could not be reached.
     fn submit<'a>(
         &'a self,
         proposal: &'a crate::delegate::Proposal,
+        admission: &'a Arc<dyn Admission>,
     ) -> VoiceFuture<'a, HostReceipt>;
 }
 

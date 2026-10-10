@@ -20,15 +20,16 @@
 //! 1. The voice session exists and belongs to this device.
 //! 2. The delegation identifier belongs to this call's own timeline and has not been spent.
 //! 3. The session read is one this voice session may reach.
-//! 4. **The confirmation**, for the five classes of section 15 ¶13 that need one. It is checked
-//!    before the grant deliberately: an action in one of those classes is refused for the missing
-//!    confirmation whatever the grant says, so the refusal is the same sentence for everyone and
-//!    tells a caller nothing about what this host's grants contain.
-//! 5. The destination the interpreter read from a clear confirmation (the host checks that it names
+//! 4. The authority: the voice grant and the device's ordinary grant, intersected now. It comes
+//!    before the confirmation, so that a person is asked to confirm on the unlocked screen only
+//!    what this host would then admit: an action that no effect carries, or that the grants do not
+//!    reach, is refused without a challenge.
+//! 5. **The confirmation**, for the five classes of section 15 ¶13 that need one.
+//! 6. The destination the interpreter read from a clear confirmation (the host checks that it names
 //!    the session acted on), the verified approval details or the current turn identifier, for the
 //!    three actions that need one.
-//! 6. The authority: the voice grant and the device's ordinary grant, intersected now.
-//! 7. The proposal goes to the host, which validates it the ordinary way.
+//! 7. The proposal goes to the host, which validates it the ordinary way, with the admission the
+//!    delegation arrived under.
 //!
 //! # What cannot happen here
 //!
@@ -48,6 +49,7 @@ use kr_protocol::grant::Grant;
 use kr_protocol::ids::{
     ActionId, AuthorityRevision, DeviceId, EnvironmentId, GrantId, SessionId, VoiceSessionId,
 };
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64};
 use kr_protocol::voice::{
     VOICE_ADMISSION_NOTE, VOICE_APPEND_BYTES, VOICE_CONTEXT_MESSAGE_COUNT, VOICE_CONTEXT_TOKEN_CAP,
@@ -122,7 +124,9 @@ enum PlanFor {
     /// are the standing grant's own and are never read.
     Description,
 }
-use crate::seams::{ActionSubmitter, Admission, ContextRequest, ContextSource, VoiceAuthority};
+use crate::seams::{
+    ActionSubmitter, Admission, ContextRequest, ContextSource, Unbounded, VoiceAuthority,
+};
 use crate::session::{NewVoiceSession, VoiceSessionRecord, VoiceSessions};
 
 /// A call this host could not end at the provider that created it.
@@ -1535,7 +1539,9 @@ impl Coordinator {
     /// Reads what one delegation says and proposes what it means.
     ///
     /// The fragments are read here, by the host, into the one action they ask for; the answer says
-    /// what was read, so the person and a later repeat see the same thing.
+    /// what was read, so the person and a later repeat see the same thing. `admission` is the one
+    /// the delegation arrived under, and goes with the proposal to the host, which asks it again
+    /// where an effect that outlives the request becomes possible.
     ///
     /// # Errors
     ///
@@ -1552,6 +1558,7 @@ impl Coordinator {
         action_id: ActionId,
         params: &VoiceDelegateParams,
         now_ms: u64,
+        admission: &Arc<dyn Admission>,
     ) -> Result<VoiceDelegateResult> {
         let intent = match self.read(device_id, params).await {
             Ok(intent) => intent,
@@ -1592,7 +1599,7 @@ impl Coordinator {
                     ),
                 },
             )),
-            Ok(Proposed::Ready(proposal)) => self.submit(*proposal, params).await,
+            Ok(Proposed::Ready(proposal)) => self.submit(*proposal, params, admission).await,
             Err(VoiceError::Refused { reason, detail }) => Ok(answer(
                 params,
                 read,
@@ -1655,7 +1662,16 @@ impl Coordinator {
             )
             .await?
         {
-            Proposed::Ready(proposal) => self.submit(*proposal, params).await,
+            // A read made again has no window of its own to ask again: it is made from the grants
+            // as they stand now, and not from the window that admitted the first.
+            Proposed::Ready(proposal) => {
+                self.submit(
+                    *proposal,
+                    params,
+                    &(Arc::new(Unbounded) as Arc<dyn Admission>),
+                )
+                .await
+            }
             Proposed::NeedsConfirmation(_) => Err(VoiceError::InvalidArgument(
                 "only a read is answered again".to_owned(),
             )),
@@ -1738,8 +1754,9 @@ impl Coordinator {
         &self,
         proposal: Proposal,
         params: &VoiceDelegateParams,
+        admission: &Arc<dyn Admission>,
     ) -> Result<VoiceDelegateResult> {
-        let receipt = self.submitter.submit(&proposal).await?;
+        let receipt = self.submitter.submit(&proposal, admission).await?;
         let read = Some((proposal.action, proposal.session_id));
         Ok(answer(
             params,
@@ -1806,9 +1823,51 @@ impl Coordinator {
             payload_digest: params.payload_digest()?,
         };
 
-        // 4: the confirmation, before the grant. An action in one of the five classes is refused
-        // for the missing confirmation whatever this host's grants contain, so the refusal says
-        // the same thing to everybody.
+        // 4: the authority, intersected now rather than when the grant was written, and before a
+        // challenge is issued: a person is asked to confirm on the device's unlocked screen only
+        // what this host would then admit, so an action no effect carries, or one the grants do not
+        // reach, is refused without asking anybody to confirm it.
+        if intent.action.required_right().is_none() {
+            return Err(VoiceError::refused(
+                VoiceRefusal::NoSuchEffect,
+                "this host has no effect that does that, so no grant can carry it",
+            ));
+        }
+        let voice_grant = self.live_voice_grant(voice_grant_id)?;
+        let device_grant = self
+            .authority
+            .device_grant(device_id, intent.session_id)?
+            .ok_or_else(|| {
+                VoiceError::refused(
+                    VoiceRefusal::OutsideDeviceGrant,
+                    "this device's grant does not cover that session",
+                )
+            })?;
+        if !voice_grant.permits(ActionRight::VoiceUse)
+            || !permitted_actions(&voice_grant).contains(&intent.action)
+        {
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideVoiceGrant,
+                format!(
+                    "this voice grant does not permit {}. Broaden it in settings, where the \
+                     change states which actions it permits.",
+                    intent.action.as_str()
+                ),
+            ));
+        }
+        if !permits(&voice_grant, &device_grant, intent.action) {
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideDeviceGrant,
+                format!(
+                    "this device's own grant does not carry what {} needs, and a voice grant \
+                     narrows it rather than adding to it",
+                    intent.action.as_str()
+                ),
+            ));
+        }
+
+        // 5: the confirmation, for the classes that need one. An action in one of the five classes
+        // is never admitted without a signature over its plan, whatever the words said.
         if intent.action.needs_unlocked_screen() {
             let Some(proof) = params.confirmation.0.as_ref() else {
                 // The device has no other way to obtain the challenge this action needs, so the
@@ -1846,7 +1905,7 @@ impl Coordinator {
             )?;
         }
 
-        // 5: what the three remaining actions of section 15 ¶13 each need.
+        // 6: what the three remaining actions of section 15 ¶13 each need.
         if intent.action.needs_spoken_destination() {
             let Some(destination) = intent.destination.as_ref() else {
                 return Err(VoiceError::refused(
@@ -1897,46 +1956,6 @@ impl Coordinator {
                 VoiceRefusal::TurnNotNamed,
                 "cancelling an agent's work needs its typed request and the current turn \
                  identifier. Interrupting speech stops playback and nothing else.",
-            ));
-        }
-
-        // 6: the authority, intersected now rather than when the grant was written.
-        if intent.action.required_right().is_none() {
-            return Err(VoiceError::refused(
-                VoiceRefusal::NoSuchEffect,
-                "this host has no effect that does that, so no grant can carry it",
-            ));
-        }
-        let voice_grant = self.live_voice_grant(voice_grant_id)?;
-        let device_grant = self
-            .authority
-            .device_grant(device_id, intent.session_id)?
-            .ok_or_else(|| {
-                VoiceError::refused(
-                    VoiceRefusal::OutsideDeviceGrant,
-                    "this device's grant does not cover that session",
-                )
-            })?;
-        if !voice_grant.permits(kr_protocol::rights::ActionRight::VoiceUse)
-            || !permitted_actions(&voice_grant).contains(&intent.action)
-        {
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideVoiceGrant,
-                format!(
-                    "this voice grant does not permit {}. Broaden it in settings, where the \
-                     change states which actions it permits.",
-                    intent.action.as_str()
-                ),
-            ));
-        }
-        if !permits(&voice_grant, &device_grant, intent.action) {
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideDeviceGrant,
-                format!(
-                    "this device's own grant does not carry what {} needs, and a voice grant \
-                     narrows it rather than adding to it",
-                    intent.action.as_str()
-                ),
             ));
         }
 

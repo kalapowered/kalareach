@@ -1494,7 +1494,7 @@ impl Controller {
         mutation: &kr_protocol::envelope::MutationRequest,
         vouched: proxy::Vouched<'_>,
         accepted: AcceptedDeadline,
-        observer: &dispatch::ExpiryObserver,
+        observer: Option<&dispatch::ExpiryObserver>,
         answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
         delivered: tokio::sync::oneshot::Receiver<()>,
     ) {
@@ -1531,7 +1531,7 @@ impl Controller {
         mutation: &kr_protocol::envelope::MutationRequest,
         vouched: proxy::Vouched<'_>,
         accepted: AcceptedDeadline,
-        observer: &dispatch::ExpiryObserver,
+        observer: Option<&dispatch::ExpiryObserver>,
         link: &mut Option<Arc<WorkerProxy>>,
         retained: &mut Retained,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
@@ -1564,7 +1564,9 @@ impl Controller {
             // that finds the grant's own deadline spent. Section 9 has that written down wherever
             // it is observed, and the observer here belongs to the device rather than to the
             // connection. It records nothing unless the grant itself has run out.
-            observer.grant_expired();
+            if let Some(observer) = observer {
+                observer.grant_expired();
+            }
             ControllerError::WindowExpired {
                 detail: "the deadline this close was admitted under has passed".to_owned(),
             }

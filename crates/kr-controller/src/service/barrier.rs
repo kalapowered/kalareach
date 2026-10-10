@@ -843,15 +843,21 @@ impl Controller {
         }
     }
 
-    /// Publishes the debt of a change made where nothing can wait, and leaves its barrier to the
+    /// Publishes the debt a voice revocation wrote, if it wrote one, and leaves its barrier to the
     /// debt pass, which this wakes.
     ///
-    /// A voice revocation runs inside the voice coordinator's lock. A voice grant's withdrawal owes
-    /// no fence, but its cascade can also withdraw a grant delegated from it that is not a voice
-    /// grant, and that debt is published here the moment the store has committed, so every
-    /// admission and forward is refused until the barrier retires it.
-    pub(crate) fn publish_and_fence(&self, debt: crate::grants::store::DebtId) {
-        drop(self.publish_debts(&[(debt, Reach::Host)]));
+    /// A voice revocation runs where nothing can wait. A voice grant's withdrawal owes a fence only
+    /// while a close forwarded under it can still run at a worker, and then the barrier reaches the
+    /// connections of that one device and no other: a paired device's connection is not the call's.
+    /// A cascade that also withdrew a grant that is not a voice grant publishes it host-wide, as any
+    /// other restriction is. Either way the debt is published the moment the store has committed,
+    /// so every admission and forward is refused until the barrier retires it.
+    pub(crate) fn fence_voice_revocation(&self, revocation: &crate::grants::GrantRevocation) {
+        let Some(debt) = revocation.debt else {
+            return;
+        };
+        let reach = revocation.closes_of.map_or(Reach::Host, Reach::Device);
+        drop(self.publish_debts(&[(debt, reach)]));
     }
 
     pub(super) fn debts(&self) -> std::sync::MutexGuard<'_, Debts> {

@@ -70,13 +70,31 @@ pub(super) fn paired_holding(
     rights: &[ActionRight],
     expires_at_ms: Option<u64>,
 ) -> DeviceRecord {
+    paired_signing_as(
+        controller,
+        byte,
+        kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]),
+        rights,
+        expires_at_ms,
+    )
+}
+
+/// As [`paired_holding`], for a device whose identity key is `authorisation`, so that what it
+/// signs is checked against the key this host holds for it.
+pub(super) fn paired_signing_as(
+    controller: &Controller,
+    byte: u8,
+    authorisation: kr_protocol::scalars::AuthorisationKey,
+    rights: &[ActionRight],
+    expires_at_ms: Option<u64>,
+) -> DeviceRecord {
     let revision = controller.policy().authority_revision();
     let device_id = DeviceId::new(kr_ipc::new_uuid());
     let device = DeviceRecord {
         device_id,
         endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]),
         device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
-        authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]),
+        authorisation,
         stored_envelope: None,
         notification_preview: None,
         device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
@@ -441,7 +459,7 @@ async fn a_voice_change_is_dated_on_the_floor_and_not_the_wound_back_wall_clock(
             controller
                 .voice_mutation(
                     crate::service::voice_actions::VoiceIngress {
-                        actor_id: &actor_id,
+                        actor_id: actor_id.clone(),
                         actor: crate::voice::VoiceActor::Device(device_id),
                         route: None,
                     },

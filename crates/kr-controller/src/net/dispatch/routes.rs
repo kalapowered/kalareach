@@ -746,7 +746,7 @@ impl RemoteConnection {
                                 screen_basis: None,
                             },
                             accepted,
-                            &observer,
+                            Some(&observer),
                             answer,
                             delivered,
                         )
@@ -1019,13 +1019,13 @@ impl RemoteConnection {
                     .controller
                     .voice_mutation(
                         crate::service::voice_actions::VoiceIngress {
-                            actor_id: &actor_id,
+                            actor_id: actor_id.clone(),
                             actor: crate::voice::VoiceActor::Device(self.device.device_id),
-                            route: Some(&crate::service::voice_actions::DeviceRoute {
-                                devices: &self.devices,
-                                actor_id: &actor_id,
-                                mutation,
-                            }),
+                            route: Some(Arc::new(crate::service::voice_actions::DeviceRoute {
+                                devices: Arc::clone(&self.devices),
+                                actor_id: actor_id.clone(),
+                                mutation: mutation.clone(),
+                            })),
                         },
                         mutation,
                         entry.method,

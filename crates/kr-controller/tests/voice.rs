@@ -439,6 +439,11 @@ impl DelegationInterpreter for Always {
     }
 }
 
+/// The admission of a change with no window of its own, which never runs out.
+fn unbounded() -> Arc<dyn kr_voice::Admission> {
+    Arc::new(kr_voice::Unbounded)
+}
+
 /// What a person said, as one fragment that ends at the start of the call.
 fn said(words: &str) -> Vec<kr_protocol::voice::TranscriptFragment> {
     vec![kr_protocol::voice::TranscriptFragment {
@@ -762,6 +767,7 @@ async fn a_delegation_runs_under_the_grant_the_host_already_holds() {
                 confirmation: Nullable::null(),
             },
             clock(),
+            &unbounded(),
         )
         .await;
     // The session in this test has no worker, so the read this proposal becomes cannot complete.
@@ -822,6 +828,7 @@ async fn an_unlocked_screen_action_is_refused_without_a_signed_confirmation() {
                 confirmation: Nullable::null(),
             },
             clock(),
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -880,6 +887,7 @@ async fn an_effect_this_host_does_not_dispatch_is_reported_as_admitted() {
                 confirmation: Nullable::null(),
             },
             clock(),
+            &unbounded(),
         )
         .await
         .expect("an answer");
@@ -2005,7 +2013,7 @@ impl RawVoice {
                 Method::VoiceStart,
                 self.host.controller().policy().authority_revision(),
                 kr_ipc::now_ms().get(),
-                &kr_voice::Unbounded,
+                &unbounded(),
             )
             .await
             .expect("the first attempt's start")

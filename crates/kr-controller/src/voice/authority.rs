@@ -287,17 +287,18 @@ impl VoiceAuthority for GrantAuthority {
         let grant = record.grant.clone();
         // The withdrawal and the new grant are one transaction of the store, with the admission
         // asked inside it once both have been read and before either is written. A voice grant's
-        // withdrawal owes no fence, and this publishes what the cascade found it must (see
-        // [`Self::revoke`]), once the transaction has committed and not before.
+        // withdrawal owes a fence only while a close is outstanding under it or when the cascade
+        // withdrew a grant that is not a voice grant, and the debt it wrote is published once the
+        // transaction has committed and not before (see [`Self::revoke`]).
         let revocation = self
             .sharing
             .grants()
             .replace(Some(replaced), now_ms, &record, at_the_write(admission))
             .map_err(store)?;
-        if let Some(debt) = revocation.and_then(|revocation| revocation.debt)
+        if let Some(revocation) = revocation
             && let Some(daemon) = self.daemon.upgrade()
         {
-            daemon.publish_and_fence(debt);
+            daemon.fence_voice_revocation(&revocation);
         }
         Ok(grant)
     }
@@ -321,15 +322,14 @@ impl VoiceAuthority for GrantAuthority {
             .grants()
             .revoke(grant_id, now_ms, at_the_write(admission))
             .map_err(store)?;
-        // A voice grant's withdrawal owes no fence: no worker holds work under a grant that
-        // carries `voice.use`, so stopping a call or replacing a standing grant writes no debt and
-        // raises no barrier. The store writes one only when the cascade also withdrew a grant
-        // delegated from a voice grant that is not one itself, and that debt is published here,
-        // the moment the transaction that is its restriction has committed, and fenced.
-        if let Some(debt) = revocation.debt
-            && let Some(daemon) = self.daemon.upgrade()
-        {
-            daemon.publish_and_fence(debt);
+        // A voice grant's withdrawal owes a fence only while a close forwarded under it can still
+        // run at a worker, so stopping a call with no close outstanding writes no debt and raises
+        // no barrier. The store writes a debt when a close is outstanding under the grant, or when
+        // the cascade also withdrew a grant delegated from a voice grant that is not one itself,
+        // and that debt is published here, the moment the transaction that is its restriction has
+        // committed, and fenced.
+        if let Some(daemon) = self.daemon.upgrade() {
+            daemon.fence_voice_revocation(&revocation);
         }
         Ok(now_ms)
     }

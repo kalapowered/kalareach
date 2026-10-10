@@ -16,6 +16,24 @@ use crate::error::{ControllerError, Result};
 use super::authority_changes::decoded;
 use super::{Controller, parse};
 
+/// How long the voice service waits on a session's worker for one request.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VoiceBudgets {
+    /// A read of a session. The phone is told that the worker did not answer once it has passed.
+    pub(crate) read: std::time::Duration,
+    /// A close, from the start of its forward to the end of the time its worker may still take it
+    /// up: the deadline the close travels with.
+    pub(crate) close: std::time::Duration,
+}
+
+impl VoiceBudgets {
+    /// What this host waits.
+    pub(crate) const STATED: Self = Self {
+        read: std::time::Duration::from_secs(10),
+        close: crate::service::net::dispatch::EFFECT_WAIT,
+    };
+}
+
 /// The managed calls on this host, as the host's account sees them.
 ///
 /// Held weakly: the account is the daemon's, and the daemon holds the voice service.
@@ -49,6 +67,14 @@ impl crate::account::Calls for VoiceCalls {
 }
 
 impl Controller {
+    /// How long the voice service waits on a worker now.
+    pub(crate) fn voice_budgets(&self) -> VoiceBudgets {
+        *self
+            .voice_budgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Registers the voice coordinator beside the other services.
     ///
     /// After the daemon exists, because two of the coordinator's seams hold a weak reference back
@@ -181,7 +207,11 @@ impl Controller {
     ) -> Result<crate::voice::SessionSnapshot> {
         let params = ParamsValue::from_typed(&SessionReadParams { session_id })
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
+        let read: SessionReadResult = parse(
+            &self
+                .session_read_within(&params, Some(self.voice_budgets().read))
+                .await?,
+        )?;
         let described = self.voice_description_of(&read.session).await?;
         Ok(crate::voice::snapshot_with(
             &read.session,
@@ -244,6 +274,13 @@ impl Controller {
     /// confirmation and for this dispatch, and authority withdrawn inside any of those waits has
     /// to stop it: what the contract forbids is *serving* that state, not reading it.
     ///
+    /// A read waits on the session's worker for a stated time and no longer
+    /// ([`VoiceBudgets::read`]): a worker that does not answer is told to the phone as an error,
+    /// not waited on for ever.
+    ///
+    /// A close goes to the session's worker through the path a device's own close takes
+    /// ([`Self::voice_close`]), once the device has confirmed it on its unlocked screen.
+    ///
     /// Everything else belongs to the worker's own dispatch, which this daemon does not forward,
     /// so it is **admitted and not performed**: section 15 ¶10 makes the receipt the authority, and
     /// reporting an effect this daemon did not cause would be the exact mistake that paragraph
@@ -252,8 +289,12 @@ impl Controller {
         self: &Arc<Self>,
         method: Method,
         proposal: &kr_voice::Proposal,
+        admission: &Arc<dyn kr_voice::Admission>,
     ) -> Result<kr_voice::seams::HostReceipt> {
         let action_id = proposal.action_id;
+        if method == Method::SessionClose {
+            return self.voice_close(proposal, admission).await;
+        }
         if method == Method::SessionRead {
             let session_id = proposal.session_id.ok_or_else(|| {
                 ControllerError::InvalidArgument("that action names a session".to_owned())
@@ -261,7 +302,11 @@ impl Controller {
             let _ = self.voice_authority_now(proposal, session_id)?;
             let params = ParamsValue::from_typed(&SessionReadParams { session_id })
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-            let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
+            let read: SessionReadResult = parse(
+                &self
+                    .session_read_within(&params, Some(self.voice_budgets().read))
+                    .await?,
+            )?;
             // The session as the context names it, with the name a person pinned. What a model
             // wrote of it and what the description host observed are left out: a receipt leaves
             // this daemon with nothing that holds that text to the privacy state it was read
@@ -340,7 +385,7 @@ impl Controller {
     /// Returns the refusal the caller is given.
     pub(crate) async fn voice_mutation(
         self: &Arc<Self>,
-        from: VoiceIngress<'_>,
+        from: VoiceIngress,
         mutation: &MutationRequest,
         method: Method,
         authority_revision: AuthorityRevision,
@@ -359,11 +404,11 @@ impl Controller {
         // owes a fence it could not raise, whether the connection's registration still stands
         // under the revision the mutation was admitted at, and whether the deadline has passed on
         // this daemon's own continuous clock.
-        let admission = VoiceAdmission::new(Arc::clone(self), carried);
+        let admission = Arc::new(VoiceAdmission::new(Arc::clone(self), carried));
         // What this host already holds about this action, if anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict, and one whose
         // first attempt is running or ended unrecorded is told so rather than performed.
-        if let Some(answered) = self.voice_answered(actor_id, mutation).await? {
+        if let Some(answered) = self.voice_answered(&actor_id, mutation).await? {
             return Ok(answered);
         }
         // A first admission is asked before anything is claimed or created. A start asks the
@@ -375,21 +420,58 @@ impl Controller {
         if method != Method::VoiceStop {
             admission.check()?;
         }
-        let hold = match self.claim_voice_action(actor_id, mutation)? {
+        let hold = match self.claim_voice_action(&actor_id, mutation)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
-                return self.voice_recorded(actor_id, mutation, record).await;
+                return self.voice_recorded(&actor_id, mutation, record).await;
             }
         };
+        let attempt = VoiceAttempt {
+            hold,
+            actor,
+            route,
+            mutation: mutation.clone(),
+            method,
+            authority_revision,
+            admission,
+        };
+        // A delegation can have an effect that the request which asked for it does not wait out,
+        // and an effect is not stopped by the connection that asked for it going away: dropping a
+        // future is a cancellation, and a close that has reached a worker cannot be called back. So
+        // its attempt runs on a task of its own, which owns the claim and records what the effect
+        // came to under it, and a retry after a dropped connection is answered from that record.
+        if method == Method::VoiceDelegate {
+            let daemon = Arc::clone(self);
+            return match tokio::spawn(async move { daemon.voice_attempt(attempt).await }).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(ControllerError::Uncertain {
+                    detail: "this host could not report what happened to the delegation".to_owned(),
+                }),
+            };
+        }
+        self.voice_attempt(attempt).await
+    }
+
+    /// One claimed voice action, performed and recorded under its claim.
+    async fn voice_attempt(self: &Arc<Self>, attempt: VoiceAttempt) -> Result<ParamsValue> {
+        let VoiceAttempt {
+            hold,
+            actor,
+            route,
+            mutation,
+            method,
+            authority_revision,
+            admission,
+        } = attempt;
         let outcome = self
             .voice()
             .answer(
                 actor,
-                mutation,
+                &mutation,
                 method,
                 authority_revision,
                 self.settled_now_ms(),
-                &admission,
+                &(Arc::clone(&admission) as Arc<dyn kr_voice::Admission>),
             )
             .await;
         // The challenge a device signs admits nothing, so nothing is kept for it: the signed
@@ -399,11 +481,11 @@ impl Controller {
         // attempt can have taken the route in the meantime, and one that comes after takes both
         // afresh. If the claim then cannot be given back, both stay spent.
         if method == Method::VoiceDelegate && is_a_challenge(&outcome) {
-            if let Some(route) = route {
+            if let Some(route) = &route {
                 route.give_back()?;
             }
             if let Err(error) = self.sharing.grants().release_claim(hold) {
-                if let Some(route) = route {
+                if let Some(route) = &route {
                     route.take_again();
                 }
                 return Err(error);
@@ -636,14 +718,26 @@ impl Controller {
 }
 
 /// Who a voice mutation comes from, and what the ingress it came by holds for it.
-pub(crate) struct VoiceIngress<'a> {
+pub(crate) struct VoiceIngress {
     /// The verified actor the action is de-duplicated under.
-    pub(crate) actor_id: &'a ActorId,
+    pub(crate) actor_id: ActorId,
     /// The device, or the owner at this machine, it acts as.
     pub(crate) actor: crate::voice::VoiceActor,
     /// The route a network ingress claimed for the action, which a challenge gives back. None for
     /// the local door, which claims none.
-    pub(crate) route: Option<&'a dyn ClaimedRoute>,
+    pub(crate) route: Option<Arc<dyn ClaimedRoute>>,
+}
+
+/// One voice action that has been claimed, with everything its attempt needs: it may run on a task
+/// of its own, so it owns what it holds.
+struct VoiceAttempt {
+    hold: crate::grants::ClaimHold,
+    actor: crate::voice::VoiceActor,
+    route: Option<Arc<dyn ClaimedRoute>>,
+    mutation: MutationRequest,
+    method: Method,
+    authority_revision: AuthorityRevision,
+    admission: Arc<VoiceAdmission>,
 }
 
 /// The route a network ingress claimed for an action before it reached the voice service.
@@ -666,26 +760,26 @@ pub(crate) trait ClaimedRoute: Send + Sync {
 
 /// The route one action claimed in this host's device directory, which is what a network ingress
 /// holds for a voice mutation.
-pub(crate) struct DeviceRoute<'a> {
+pub(crate) struct DeviceRoute {
     /// The directory the route is recorded in.
-    pub(crate) devices: &'a crate::service::net::devices::DeviceDirectory,
+    pub(crate) devices: Arc<crate::service::net::devices::DeviceDirectory>,
     /// The verified actor the action is claimed under.
-    pub(crate) actor_id: &'a ActorId,
+    pub(crate) actor_id: ActorId,
     /// The mutation the route was claimed for.
-    pub(crate) mutation: &'a MutationRequest,
+    pub(crate) mutation: MutationRequest,
 }
 
-impl DeviceRoute<'_> {
+impl DeviceRoute {
     fn digest(&self) -> Result<kr_protocol::scalars::Digest256> {
-        kr_protocol::digest::mutation_digest(self.mutation, self.actor_id)
+        kr_protocol::digest::mutation_digest(&self.mutation, &self.actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 }
 
-impl ClaimedRoute for DeviceRoute<'_> {
+impl ClaimedRoute for DeviceRoute {
     fn give_back(&self) -> Result<()> {
         self.devices
-            .release_action_route(self.actor_id, self.mutation.action_id, self.digest()?)
+            .release_action_route(&self.actor_id, self.mutation.action_id, self.digest()?)
     }
 
     fn take_again(&self) {
@@ -693,7 +787,7 @@ impl ClaimedRoute for DeviceRoute<'_> {
         // keeps the identifier spent for voice, and this is the same fault again.
         if let Ok(digest) = self.digest() {
             let _ = self.devices.claim_action_route(
-                self.actor_id,
+                &self.actor_id,
                 self.mutation.action_id,
                 None,
                 digest,
@@ -751,6 +845,16 @@ impl std::fmt::Debug for VoiceAdmission {
 impl kr_voice::Admission for VoiceAdmission {
     fn still_admitted(&self) -> std::result::Result<(), ProtocolError> {
         self.check().map_err(|refusal| refusal.to_protocol_error())
+    }
+
+    fn time_left(&self) -> Option<std::time::Duration> {
+        self.carried
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(self.controller.clock.now()))
+    }
+
+    fn connection(&self) -> Option<kr_protocol::ids::ConnectionId> {
+        Some(self.carried.connection_id)
     }
 }
 

@@ -111,6 +111,17 @@ impl Controller {
         self: &Arc<Self>,
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
+        self.session_read_within(params, None).await
+    }
+
+    /// Reads one session as [`Self::session_read`] does, giving its worker `patience` to answer
+    /// when a caller states one. The bound is inside the read, where the link to the worker is
+    /// given up with it ([`Self::read_from_worker_within`]).
+    pub(super) async fn session_read_within(
+        self: &Arc<Self>,
+        params: &ParamsValue,
+        patience: Option<std::time::Duration>,
+    ) -> Result<ParamsValue> {
         let params: SessionReadParams = parse(params)?;
         // A worker that did not answer at startup is not gone; it was busy, or it started slowly.
         // Trying again here is what keeps a session readable without another daemon restart.
@@ -122,7 +133,7 @@ impl Controller {
         }
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         if let Some(worker) = worker {
-            match self.read_from_worker(&worker).await {
+            match self.read_from_worker_within(&worker, patience).await {
                 Ok(read) => {
                     return encode(&SessionReadResult {
                         session: read.session,

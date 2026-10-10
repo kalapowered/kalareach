@@ -89,6 +89,11 @@ pub(super) struct Scripted {
     accepts_prompts: AtomicBool,
     /// Where it holds the next prompt submission it is forwarded, once a test has set one.
     holding_a_prompt: std::sync::Mutex<Option<End>>,
+    /// Where it holds the next close it is forwarded, once a test has set one, before it takes the
+    /// close up.
+    holding_a_close: std::sync::Mutex<Option<End>>,
+    /// The authority revision it has installed, as a worker holds the one it last acknowledged.
+    installed: std::sync::Mutex<Option<kr_protocol::ids::AuthorityRevision>>,
     /// What it holds for the prompts it was forwarded, by the actor and the action: the digest of
     /// what was sent, and the failure its receipt records where the prompt was refused (none for
     /// one it accepted).
@@ -136,6 +141,8 @@ impl Scripted {
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
             accepts_prompts: AtomicBool::new(false),
             holding_a_prompt: std::sync::Mutex::new(None),
+            holding_a_close: std::sync::Mutex::new(None),
+            installed: std::sync::Mutex::new(None),
             prompt_receipts: std::sync::Mutex::new(BTreeMap::new()),
             receipts_unreadable: AtomicBool::new(false),
         })
@@ -152,6 +159,35 @@ impl Scripted {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(End { arrived, go: going });
         (arrival, go)
+    }
+
+    /// Has this worker hold the next close it is forwarded before it takes it up. The first half
+    /// says that the close has arrived, and the worker goes on with it once the second is sent or
+    /// dropped.
+    pub(super) fn hold_the_next_close(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (go, going) = oneshot::channel();
+        *self
+            .holding_a_close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(End { arrived, go: going });
+        (arrival, go)
+    }
+
+    /// How many closes this worker has taken up.
+    pub(super) fn closes_taken(&self) -> usize {
+        self.answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// The authority revision this worker has installed, when the daemon has announced one.
+    pub(super) fn installed_revision(&self) -> Option<kr_protocol::ids::AuthorityRevision> {
+        *self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Has this worker accept the prompt submissions it is forwarded, or stop accepting them.
@@ -750,22 +786,51 @@ fn serve_scripted(
                                     }),
                                 }]
                             } else {
-                                let (answer, kept) = script
-                                    .close(identity.session_id(), forwarded.mutation.action_id);
-                                let response = Response {
-                                    request_id: forwarded.mutation.request_id,
-                                    outcome: Outcome::Ok(answer),
-                                };
-                                // A forwarded action this worker has answered before is
-                                // answered from what it kept. The frame says so to a proxy, which
-                                // forwards for somebody whose receipts are not its own; the
-                                // daemon's own link is answered as a local caller's action
-                                // always is.
-                                vec![if kept && proxy {
-                                    ControlFrame::RetainedResponse(Box::new(response))
+                                let holding = script
+                                    .holding_a_close
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take();
+                                if let Some(holding) = holding {
+                                    let _ = holding.arrived.send(());
+                                    let _ = holding.go.await;
+                                }
+                                // A worker refuses an action validated under a revision older than
+                                // the one it has installed.
+                                let installed = script.installed_revision();
+                                let validated = forwarded.actor.grant_revision.as_ref().copied();
+                                if let (Some(installed), Some(validated)) = (installed, validated)
+                                    && installed.get() > validated.get()
+                                {
+                                    vec![ControlFrame::Response(Response {
+                                        request_id: forwarded.mutation.request_id,
+                                        outcome: Outcome::Error(ProtocolError::new(
+                                            ErrorCode::PermissionDenied,
+                                            format!(
+                                                "this action was admitted under authority \
+                                                 revision {validated}, and this worker holds a \
+                                                 later one"
+                                            ),
+                                        )),
+                                    })]
                                 } else {
-                                    ControlFrame::Response(response)
-                                }]
+                                    let (answer, kept) = script
+                                        .close(identity.session_id(), forwarded.mutation.action_id);
+                                    let response = Response {
+                                        request_id: forwarded.mutation.request_id,
+                                        outcome: Outcome::Ok(answer),
+                                    };
+                                    // A forwarded action this worker has answered before is
+                                    // answered from what it kept. The frame says so to a proxy, which
+                                    // forwards for somebody whose receipts are not its own; the
+                                    // daemon's own link is answered as a local caller's action
+                                    // always is.
+                                    vec![if kept && proxy {
+                                        ControlFrame::RetainedResponse(Box::new(response))
+                                    } else {
+                                        ControlFrame::Response(response)
+                                    }]
+                                }
                             }
                         }
                         (None, ControlFrame::ForwardedRead(forwarded))
@@ -776,6 +841,15 @@ fn serve_scripted(
                         // It installs a revision it is told of, with nothing to fence, as a
                         // device's link to it asks it to.
                         (None, ControlFrame::AuthorityRevision(notice)) => {
+                            {
+                                let mut installed = script
+                                    .installed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if installed.is_none_or(|held| held.get() < notice.revision.get()) {
+                                    *installed = Some(notice.revision);
+                                }
+                            }
                             vec![ControlFrame::AuthorityRevisionAck(
                                 kr_protocol::worker::AuthorityRevisionAck {
                                     session_id: identity.session_id(),

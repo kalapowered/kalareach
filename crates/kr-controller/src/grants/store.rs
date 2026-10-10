@@ -273,6 +273,36 @@ pub fn can_recover(grant: &Grant, environment_id: kr_protocol::ids::EnvironmentI
         && grant.environment_selector.admits(environment_id)
 }
 
+/// The closes forwarded under voice grants that can still run at a worker.
+#[derive(Debug, Default)]
+struct HeldCloses {
+    next: u64,
+    held: BTreeMap<u64, GrantId>,
+}
+
+/// One close forwarded to a worker under a voice grant ([`GrantDirectory::hold_close`]), held for
+/// as long as it can still start at that worker.
+///
+/// While one is held, withdrawing the voice grant it was forwarded under owes a fence, because
+/// the worker may not yet have refused it. It lets go when the worker has answered, or when the
+/// deadline the close was forwarded with has passed, whichever its holder reaches first.
+#[derive(Debug)]
+#[must_use = "a close is held until this is dropped"]
+pub struct CloseHold {
+    closes: Arc<std::sync::Mutex<HeldCloses>>,
+    id: u64,
+}
+
+impl Drop for CloseHold {
+    fn drop(&mut self) {
+        self.closes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .held
+            .remove(&self.id);
+    }
+}
+
 /// What one revocation did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantRevocation {
@@ -304,9 +334,14 @@ pub struct GrantRevocation {
     /// the session list.
     pub covers_every_session: bool,
     /// The debt this revocation wrote in the transaction that revoked, when it withdrew live
-    /// authority a worker can hold work under (every grant but a voice grant): one row for the
-    /// whole change, retired only by a barrier that follows it.
+    /// authority a worker can hold work under (every grant but a voice grant, and a voice grant
+    /// while a close forwarded under it can still run at a worker): one row for the whole change,
+    /// retired only by a barrier that follows it.
     pub debt: Option<DebtId>,
+    /// The one device whose voice grants this revocation withdrew with a close outstanding, when
+    /// that is all the debt is for: the barrier that retires it reaches that device's connections
+    /// and no others. Nothing for a debt that is owed for any other grant as well.
+    pub closes_of: Option<DeviceId>,
 }
 
 /// The identity of one restrictive change's fence debt.
@@ -343,6 +378,9 @@ pub struct GrantDirectory {
     connection: std::sync::Mutex<Connection>,
     /// The action claims whose attempts are running in this daemon.
     live: Arc<LiveClaims>,
+    /// The closes forwarded to a worker under a voice grant that can still run there
+    /// ([`Self::hold_close`]).
+    closes: Arc<std::sync::Mutex<HeldCloses>>,
     /// This host's clocks and every grant's anchor, once the daemon has bound them
     /// ([`Self::bind_host_clock`]).
     host_clock: std::sync::OnceLock<HostClock>,
@@ -483,6 +521,7 @@ impl GrantDirectory {
         Ok(Self {
             connection: std::sync::Mutex::new(connection),
             live: Arc::new(LiveClaims::default()),
+            closes: Arc::new(std::sync::Mutex::new(HeldCloses::default())),
             host_clock: std::sync::OnceLock::new(),
             #[cfg(feature = "testing")]
             before_effect: crate::attention::Pause::default(),
@@ -833,6 +872,7 @@ impl GrantDirectory {
                     now_ms,
                     &mut None,
                     &format!("the replacement of grant {grant_id}"),
+                    &self.held_closes(),
                 )?),
                 _ => None,
             };
@@ -962,6 +1002,7 @@ impl GrantDirectory {
                 now_ms,
                 &mut None,
                 &format!("the revocation of grant {grant_id}"),
+                &self.held_closes(),
             )?;
             if let Some(hold) = claim {
                 record_withdrawal(connection, hold, &revocation.revoked)?;
@@ -1005,6 +1046,7 @@ impl GrantDirectory {
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
                 debt: None,
+                closes_of: None,
             };
             merged.devices.insert(device_id);
             // Every subtree is read before any of them is written, so the check below is the last
@@ -1037,9 +1079,10 @@ impl GrantDirectory {
             let covers = format!("the revocation of device {device_id}'s grants");
             let now_ms = next_moment(connection, now_ms)?;
             let mut debt = None;
+            let held = self.held_closes();
             for (grant_id, subtree) in &subtrees {
                 let one = Self::revoke_subtree(
-                    connection, *grant_id, subtree, now_ms, &mut debt, &covers,
+                    connection, *grant_id, subtree, now_ms, &mut debt, &covers, &held,
                 )?;
                 merged.revoked.extend(one.revoked);
                 merged.reached.extend(one.reached);
@@ -1070,7 +1113,17 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         let subtree = Self::subtree_to_revoke(connection, grant_id)?;
         let now_ms = next_moment(connection, now_ms)?;
-        Self::revoke_subtree(connection, grant_id, &subtree, now_ms, &mut None, covers)
+        // A proposal that was never redeemed and a grant control is transferred away from are not
+        // voice grants, so no close is outstanding under either.
+        Self::revoke_subtree(
+            connection,
+            grant_id,
+            &subtree,
+            now_ms,
+            &mut None,
+            covers,
+            &BTreeSet::new(),
+        )
     }
 
     /// The grants one revocation would withdraw: the named one and everything below it.
@@ -1089,9 +1142,10 @@ impl GrantDirectory {
 
     /// Withdraws a subtree [`Self::subtree_to_revoke`] read, inside the caller's transaction.
     ///
-    /// The first live grant it withdraws writes the change's one debt row into `debt`, which names
-    /// what the change was (`covers`); a later subtree of the same change finds it written and
-    /// writes nothing more.
+    /// The first live grant it withdraws that owes a fence writes the change's one debt row into
+    /// `debt`, which names what the change was (`covers`); a later subtree of the same change
+    /// finds it written and writes nothing more. `held` is the voice grants with a close
+    /// outstanding, read while the caller holds the store's lock ([`Self::held_closes`]).
     fn revoke_subtree(
         connection: &Connection,
         grant_id: GrantId,
@@ -1099,6 +1153,7 @@ impl GrantDirectory {
         now_ms: u64,
         debt: &mut Option<DebtId>,
         covers: &str,
+        held: &BTreeSet<GrantId>,
     ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
         let mut reached = Vec::new();
@@ -1107,6 +1162,8 @@ impl GrantDirectory {
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
         let owed = moments_a_fence_is_owed(connection)?;
+        let mut owed_for_others = false;
+        let mut owed_for_closes = BTreeSet::new();
         let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
         for record in subtree {
             if record.is_active()
@@ -1163,16 +1220,29 @@ impl GrantDirectory {
             if let Some(session_id) = record.session_id {
                 sessions.insert(session_id);
             }
-            if record.is_active() && debt.is_none() && owes_a_fence(&record.grant) {
-                // Debt only for authority that was live, and one row for the change, written in
-                // the transaction that is its restriction. Withdrawing a proposal nobody redeemed
-                // takes nothing away from anybody, so there is nothing to fence, and recording it
-                // would make an ordinary cancellation fence the host later. Nor does a voice
-                // grant's withdrawal, since no worker holds work under one.
-                *debt = Some(owe_within(connection, covers, now_ms)?);
+            // Debt only for authority that was live, and one row for the change, written in the
+            // transaction that is its restriction. Withdrawing a proposal nobody redeemed takes
+            // nothing away from anybody, so there is nothing to fence, and recording it would make
+            // an ordinary cancellation fence the host later. Nor does a voice grant's withdrawal,
+            // unless a close forwarded under it can still run at a worker.
+            let owes = owes_a_fence(&record.grant);
+            let closing = !owes && held.contains(&record.grant.grant_id);
+            if record.is_active() && (owes || closing) {
+                if owes {
+                    owed_for_others = true;
+                } else {
+                    owed_for_closes.insert(record.grant.recipient_device_id);
+                }
+                if debt.is_none() {
+                    *debt = Some(owe_within(connection, covers, now_ms)?);
+                }
             }
             revoked.push(record.grant.grant_id);
         }
+        let closes_of = match (owed_for_others, owed_for_closes.len()) {
+            (false, 1) => owed_for_closes.first().copied(),
+            _ => None,
+        };
         Ok(GrantRevocation {
             grant_id,
             revoked,
@@ -1182,7 +1252,57 @@ impl GrantDirectory {
             sessions,
             covers_every_session,
             debt: *debt,
+            closes_of,
         })
+    }
+
+    /// The voice grants a close is outstanding under, read in a transaction: the caller holds the
+    /// store's lock, which [`Self::hold_close`] takes to enter, so a close is either in this set or
+    /// reads its grant after the transaction that revoked it.
+    fn held_closes(&self) -> BTreeSet<GrantId> {
+        self.closes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .held
+            .values()
+            .copied()
+            .collect()
+    }
+
+    /// How many closes are held against a voice grant now.
+    #[cfg(test)]
+    pub(crate) fn closes_held(&self) -> usize {
+        self.closes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .held
+            .len()
+    }
+
+    /// Records that a close is being forwarded to a worker under the voice grant `grant_id`, and
+    /// holds it until the returned hold is dropped.
+    ///
+    /// The store's lock is taken to enter and let go as soon as the entry is in. A revocation reads
+    /// the entries inside the transaction that holds that lock, so a revocation is wholly before
+    /// this entry or wholly after it: before, and the close's next read of the grant finds it gone
+    /// and forwards nothing; after, and the revocation sees the close and owes the fence that makes
+    /// the worker refuse it.
+    pub fn hold_close(&self, grant_id: GrantId) -> CloseHold {
+        let _store = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut closes = self
+            .closes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        closes.next += 1;
+        let id = closes.next;
+        closes.held.insert(id, grant_id);
+        CloseHold {
+            closes: Arc::clone(&self.closes),
+            id,
+        }
     }
 
     /// Writes a proposal and the invitation that carries it, in one transaction.
@@ -3359,17 +3479,17 @@ fn read_row(row: &rusqlite::Row<'_>) -> Row {
     })
 }
 
-/// Whether withdrawing `grant` owes a fence: whether a worker can hold work under it.
+/// Whether withdrawing `grant` always owes a fence: whether a worker can hold work under it.
 ///
 /// Every grant but a voice grant, the one that carries `voice.use`. A voice grant is decided only
 /// inside the control daemon. The device door takes `voice.use` out of the grant it decides every
 /// request under and puts it back only for a method that needs it, and each of those is a voice
 /// method the daemon serves itself; a forwarded mutation carries the rights its decision
-/// permitted, and a forwarded read carries none; and the voice module performs its one effect, a
-/// session read, as the daemon's own request, which carries no rights. So no frame a worker
-/// receives carries a voice right, and a worker holds nothing a voice grant's withdrawal has to
-/// stop. A grant delegated from a voice grant that does not carry `voice.use` is not a voice grant
-/// and owes its fence as any other does.
+/// permitted, and a forwarded read carries none. A voice grant's withdrawal owes a fence only
+/// while a close forwarded under it can still run at a worker ([`GrantDirectory::hold_close`]):
+/// that frame names the voice grant and carries the right to close and no voice right. A grant
+/// delegated from a voice grant that does not carry `voice.use` is not a voice grant and owes its
+/// fence as any other does.
 fn owes_a_fence(grant: &Grant) -> bool {
     !grant.permits(kr_protocol::rights::ActionRight::VoiceUse)
 }

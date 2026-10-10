@@ -430,7 +430,7 @@ impl Controller {
                 mutation.request_id,
                 self.voice_mutation(
                     super::voice_actions::VoiceIngress {
-                        actor_id,
+                        actor_id: actor_id.clone(),
                         actor,
                         route: None,
                     },

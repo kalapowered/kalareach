@@ -75,6 +75,7 @@ mod routes;
 mod standing;
 mod start;
 mod voice_actions;
+mod voice_close;
 mod workers;
 
 pub use barrier::DEBT_PASS_INTERVAL;
@@ -540,6 +541,11 @@ pub struct Controller {
     /// between. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_proxy_is_opened: ReadPause,
+    /// Where this host's own tests stop a close asked for by voice once it is held against its
+    /// grant and before the revision and the authority are read, so that a withdrawal of the grant
+    /// can land in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    after_a_voice_close_is_held: ReadPause,
     /// Where this host's own tests stop a close that has read its worker from the directory, before
     /// it asks for the worker's connection, so that a closure can land in between. Compiled away in
     /// every shipped build.
@@ -593,6 +599,8 @@ pub struct Controller {
     /// The environment's voice service: the coordinator and the seams it reads and proposes
     /// through. Built after the daemon exists, because two of its seams hold a weak reference back.
     voice: std::sync::OnceLock<Arc<crate::voice::VoiceModule>>,
+    /// How long the voice service waits on a session's worker.
+    voice_budgets: std::sync::Mutex<voice_actions::VoiceBudgets>,
     /// This host's own sign-in to the managed account service, which managed voice presents.
     account: Arc<crate::account::HostAccount>,
     /// The environment's privacy record: privacy mode's generation, what each session still owes,
@@ -1159,6 +1167,11 @@ mod a_lease_that_runs_out_at_a_worker;
 /// The voice coordinator's reads of a grant, decided on this host's clock floor.
 #[cfg(test)]
 mod a_voice_grant_on_the_floor;
+
+/// A session closed by voice, and what keeps that close from outliving the authority it was
+/// admitted under.
+#[cfg(test)]
+mod a_voice_close;
 
 /// A delegation this host has already answered, asked for again.
 #[cfg(test)]

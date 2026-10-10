@@ -978,7 +978,7 @@ const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> 
 ///
 /// Every method that needs it is a voice method this daemon serves itself, so the rights a
 /// forwarded mutation carries to a worker, which its decision cut from this grant, never include
-/// it: a worker holds no work under a voice grant, and a voice grant's withdrawal owes no fence.
+/// it: a voice grant's withdrawal owes a fence only while a close forwarded under it can still run.
 fn decided_with_voice(
     paired: &kr_protocol::grant::Grant,
     entry: &MethodEntry,

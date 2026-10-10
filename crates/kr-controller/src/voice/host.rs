@@ -4,13 +4,13 @@
 //! Both hold a weak reference to the daemon, because the daemon owns the voice service and a
 //! counted reference the other way would keep a daemon, and its environment lock, alive.
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use kr_protocol::ids::{ApprovalRequestId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Digest256;
 use kr_voice::seams::{HostReceipt, VoiceFuture};
-use kr_voice::{Proposal, VoiceError};
+use kr_voice::{Admission, Proposal, VoiceError};
 
 use super::context::{SessionFacts, SessionSnapshot};
 use super::submit::HostDispatch;
@@ -130,6 +130,7 @@ impl HostDispatch for ControllerDispatch {
         &'a self,
         method: Method,
         proposal: &'a Proposal,
+        admission: &'a Arc<dyn Admission>,
     ) -> VoiceFuture<'a, HostReceipt> {
         let daemon = self.daemon.clone();
         Box::pin(async move {
@@ -138,7 +139,7 @@ impl HostDispatch for ControllerDispatch {
             // runs under, the grant it was admitted under and the plan the confirmation was bound
             // to are all part of what the effect is checked against.
             daemon
-                .voice_perform(method, proposal)
+                .voice_perform(method, proposal, admission)
                 .await
                 .map_err(host_error)
         })

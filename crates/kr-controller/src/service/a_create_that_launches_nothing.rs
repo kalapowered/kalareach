@@ -2316,11 +2316,12 @@ async fn the_voice_grant_seam_writes_only_under_the_admission_every_service_asks
     );
 }
 
-/// A voice grant's withdrawal owes no fence. Withdrawing one through the seam, as stopping a
-/// call or replacing a standing grant does, writes no debt, publishes none and advances no
-/// revision: no worker holds work under a grant that carries `voice.use`. The control: a grant
-/// delegated from a voice grant that is not one itself is withdrawn with it, and the debt it
-/// owes is published the moment the store commits and retired by one barrier.
+/// A voice grant's withdrawal owes no fence while no close forwarded under it can still run at a
+/// worker. Withdrawing one through the seam, as stopping a call or replacing a standing grant does,
+/// writes no debt, publishes none and advances no revision. The control: a grant delegated from a
+/// voice grant that is not one itself is withdrawn with it, and the debt it owes is published the
+/// moment the store commits and retired by one barrier. A close that is outstanding is the other
+/// case, which `a_stop_while_a_close_is_on_its_way_makes_the_worker_refuse_it` proves.
 ///
 /// On one thread, so the spawned barrier cannot run before the publication is checked.
 #[tokio::test]

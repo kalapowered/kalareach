@@ -303,7 +303,7 @@ impl VoiceModule {
         method: Method,
         authority_revision: AuthorityRevision,
         now_ms: u64,
-        admission: &dyn kr_voice::Admission,
+        admission: &Arc<dyn kr_voice::Admission>,
     ) -> Result<ParamsValue> {
         self.dispatch(
             actor,
@@ -349,7 +349,7 @@ impl VoiceModule {
         method: Method,
         authority_revision: AuthorityRevision,
         now_ms: u64,
-        admission: &dyn kr_voice::Admission,
+        admission: &Arc<dyn kr_voice::Admission>,
     ) -> Result<ParamsValue> {
         let action_id: ActionId = mutation.action_id;
         let device_of = |actor: VoiceActor| {
@@ -380,7 +380,7 @@ impl VoiceModule {
                 value(
                     &self
                         .coordinator
-                        .grant(&params, authority_revision, now_ms, admission)
+                        .grant(&params, authority_revision, now_ms, &**admission)
                         .await
                         .map_err(voice_error)?,
                 )
@@ -395,7 +395,7 @@ impl VoiceModule {
                             &params,
                             authority_revision,
                             now_ms,
-                            admission,
+                            &**admission,
                         )
                         .await
                         .map_err(voice_error)?,
@@ -416,7 +416,7 @@ impl VoiceModule {
                 value(
                     &self
                         .coordinator
-                        .delegate(device_of(actor)?, action_id, &params, now_ms)
+                        .delegate(device_of(actor)?, action_id, &params, now_ms, admission)
                         .await
                         .map_err(voice_error)?,
                 )

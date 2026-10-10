@@ -61,10 +61,11 @@ fn a_requested_capability_is_not_a_geometry_claim() {
     );
 }
 
-/// No frame a worker receives carries a voice right, whichever way work reaches it, which is
-/// why a voice grant's withdrawal owes no fence. The device's pairing grant carries every
-/// right, `voice.use` included, and it holds a live voice grant; its session's worker records
-/// every frame it is sent and refuses each.
+/// No frame a worker receives carries a voice right, whichever way work reaches it. A voice
+/// grant's withdrawal owes a fence only while a close forwarded under it can still run, and
+/// that close carries the right to close and no voice right. The device's pairing grant carries
+/// every right, `voice.use` included, and it holds a live voice grant; its session's worker
+/// records every frame it is sent and refuses each.
 ///
 /// - Every method this door decides for it (`check_grant`, the decision a forwarded mutation's
 ///   rights are cut from) carries `voice.use` only when the method requires it, and each such
@@ -76,7 +77,9 @@ fn a_requested_capability_is_not_a_geometry_claim() {
 ///   written straight to a link is not encoded.
 /// - Every voice effect is performed here or not at all: the one the daemon performs, a
 ///   session read, succeeds and reaches the worker as the daemon's own request, which carries
-///   no rights, and nothing else reaches it.
+///   no rights. A close asked for by voice needs the connection the delegation arrived on, which
+///   this admission has none of, and reaches no worker here; the frame it sends where it does is
+///   the one `a_confirmed_close_closes_the_session_once` reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_frame_a_worker_receives_carries_a_voice_right() {
     use std::sync::Arc;
@@ -368,7 +371,9 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             turn_id: None,
             destination: None,
         };
-        let performed = controller.voice_perform(method, &proposal).await;
+        let performed = controller
+            .voice_perform(method, &proposal, &unbounded())
+            .await;
         if method == Method::SessionRead {
             assert!(
                 performed.as_ref().is_ok_and(|receipt| receipt.performed),
@@ -610,12 +615,17 @@ async fn receipt_of_a_voice_read<Prepared: std::future::Future<Output = ()>>(
         destination: None,
     };
     let receipt = controller
-        .voice_perform(Method::SessionRead, &proposal)
+        .voice_perform(Method::SessionRead, &proposal, &unbounded())
         .await
         .expect("the daemon performs the read");
     assert!(receipt.performed);
     world.serving.abort();
     receipt.summary
+}
+
+/// The admission of a proposal with no window of its own, which never runs out.
+fn unbounded() -> std::sync::Arc<dyn kr_voice::Admission> {
+    std::sync::Arc::new(kr_voice::Unbounded)
 }
 
 /// KR-REQ-15.20: the receipt of a voice read of a session names the session with the name a person
@@ -1577,7 +1587,7 @@ async fn close_for_a_device_of(
                 screen_basis: None,
             },
             accepted,
-            &connection.expiry_observer(),
+            Some(&connection.expiry_observer()),
             answer,
             delivered,
         )
