@@ -23,9 +23,10 @@ use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
     MembershipPresentParams, OrganisationEnrolParams, OrganisationEnrolResult,
-    OrganisationWithdrawParams,
+    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationWithdrawParams,
 };
 use kr_protocol::pairing::ProposedGrant;
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::sharing::RevocationResult;
 use net_support::pairing::{self as calls, Signer};
@@ -458,5 +459,370 @@ async fn an_enrolment_racing_a_withdrawal_cannot_take_the_revision_the_fence_rep
     // Enrolling again once the fence has held takes a later revision in any case.
     let enrolled = fixture.enrol().await;
     assert!(enrolled.enrolment_revision.get() > first_revision.get());
+    fixture.host.stop().await;
+}
+
+/// The owner's own device, on a connection of its own, and the lease the organisation signs for it
+/// once the host is exclusively managed.
+struct OwnerDevice<'a> {
+    fixture: &'a Fixture,
+}
+
+impl OwnerDevice<'_> {
+    async fn connect(&self) -> RawDevice {
+        let device = self
+            .fixture
+            .host
+            .owner_device
+            .as_ref()
+            .expect("the owner device");
+        let record = self
+            .fixture
+            .host
+            .owner
+            .as_ref()
+            .expect("the owner's record");
+        let raw = RawDevice::connect(&self.fixture.host, device, record).await;
+        raw.claim();
+        raw
+    }
+
+    fn lease(&self) -> kr_protocol::account::MembershipLease {
+        let device = self
+            .fixture
+            .host
+            .owner_device
+            .as_ref()
+            .expect("the owner device");
+        self.fixture.organisation.lease(
+            2,
+            &organisation_support::member("owner"),
+            *device.keys().authorisation.public(),
+            self.fixture.now(),
+            &[ActionRight::SessionView],
+        )
+    }
+
+    async fn present(&self, raw: &RawDevice) -> Result<(), kr_protocol::error::ProtocolError> {
+        raw.mutate(
+            Method::MembershipPresent,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(self.fixture.host.environment_id),
+            &MembershipPresentParams {
+                lease: self.lease(),
+                authority: Nullable::null(),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// KR-REQ-17.54: the owner's own device keeps its access when the organisation's leases stop, until
+/// the host is made exclusively organisation-managed. Then its access answers to a lease like a
+/// member's: refused without one, served while the lease the organisation signs for it lasts, and
+/// refused when that ends. Turning it on fences the host, as a restriction does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owners_device_keeps_its_access_until_the_host_is_made_exclusive_and_then_answers_to_a_lease()
+ {
+    let fixture = Fixture::start().await;
+    let owner = OwnerDevice { fixture: &fixture };
+    let raw = owner.connect().await;
+    read_host_info(&raw).await.expect("served on its own grant");
+    let before = fixture.authority_revision();
+
+    let mut client = fixture.host.client().await;
+    let on = fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    assert!(on.exclusive);
+    assert!(
+        on.authority_revision.get() > before.get(),
+        "the host was fenced"
+    );
+    assert!(on.barrier.0.is_some(), "the answer carries the barrier");
+    assert!(fixture.listed().await.exclusive);
+    drop(client);
+
+    // The connection admitted before the fence is served nothing more; a new one is refused for
+    // want of a lease, and served once the organisation's lease for the device is presented.
+    match raw.try_read(Method::HostInfo, &()).await {
+        None => {}
+        Some(answer) => assert!(denied(&net_support::refusal(answer))),
+    }
+    raw.close();
+    let raw = owner.connect().await;
+    assert!(
+        denied(&net_support::refusal(read_host_info(&raw).await)),
+        "the owner's device is refused without a lease"
+    );
+    owner
+        .present(&raw)
+        .await
+        .expect("the owner's lease installs");
+    read_host_info(&raw).await.expect("served under the lease");
+
+    fixture.pass(Duration::from_millis(
+        organisation_support::LEASE_MS + 1_000,
+    ));
+    assert!(
+        denied(&net_support::refusal(read_host_info(&raw).await)),
+        "and refused again once it ends"
+    );
+    raw.close();
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: a change the host would refuse is not put to the owner, and nothing is kept for
+/// it: exclusive management needs an enrolment and a device that can recover the host, and ending
+/// it needs it to be on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exclusive_management_is_refused_without_an_enrolment_and_without_a_device_that_can_recover_the_host()
+ {
+    // No enrolment: there is nothing to manage the host.
+    let fixture = Fixture::start_unenrolled().await;
+    let mut client = fixture.host.client().await;
+    let refused = calls::request(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+    )
+    .await
+    .expect_err("the host is enrolled in nothing");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    let refused = calls::request(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+    )
+    .await
+    .expect_err("the host is not exclusive");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    drop(client);
+    fixture.host.stop().await;
+
+    // The owner's one device does not qualify when its grant ends: nothing that never ends can
+    // confirm for the host once its leases do.
+    let fixture = Fixture::start().await;
+    let helper = Device::create().await;
+    let helper_record = net_support::pair_with(
+        &fixture.host,
+        &helper,
+        &fixture.owner,
+        net_support::proposal(&[ActionRight::HostManage]),
+    )
+    .await;
+    assert!(helper_record.grant.expiry != kr_protocol::grant::GrantExpiry::Never);
+    // Only the helper's device remains; the first owner's is revoked.
+    let owner_id = fixture
+        .host
+        .owner
+        .as_ref()
+        .expect("the owner's record")
+        .device_id;
+    let mut client = fixture.host.client().await;
+    calls::mutate::<_, kr_protocol::sharing::RevocationResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: owner_id,
+        },
+    )
+    .await
+    .expect("the owner's device is revoked");
+    drop(client);
+    let mut client = fixture.host.client().await;
+    let refused = calls::request(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+    )
+    .await
+    .expect_err("no device that never expires can recover the host");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    drop(client);
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: an owner device ends exclusive management, which enlarges nothing the host
+/// refuses and fences nothing. The turning off is recorded with how it was confirmed, the record is
+/// read by `organisation.list`, and a repeat of the action is answered from the record without a
+/// second record. Leaving the last organisation is refused while it is on and allowed after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_device_ends_exclusive_management_and_the_host_records_how_it_was_confirmed() {
+    let fixture = Fixture::start().await;
+    let organisation_id = fixture.organisation.organisation_id;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    assert!(fixture.listed().await.exclusive_events.is_empty());
+
+    // The host's last organisation cannot be left while the host is exclusive: nothing would
+    // answer for it.
+    let mut client = fixture.host.client().await;
+    let refused = fixture
+        .withdraw(
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            organisation_id,
+        )
+        .await
+        .expect_err("the last organisation of an exclusive host");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    let revision = fixture.authority_revision();
+
+    let mut client = fixture.host.client().await;
+    calls::confirm_subject(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+        &Signer::OwnerDevice(&fixture.owner),
+    )
+    .await
+    .expect("the owner device confirms ending it");
+    let request = client
+        .compose(
+            Method::OrganisationExclusiveSet,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(fixture.host.environment_id),
+            &OrganisationExclusiveSetParams { exclusive: false },
+        )
+        .await
+        .expect("the request");
+    let off: OrganisationExclusiveSetResult = client
+        .repeat(&request)
+        .await
+        .expect("the daemon answers")
+        .expect("the owner ends exclusive management")
+        .to_typed()
+        .expect("a result");
+    assert!(!off.exclusive);
+    assert!(
+        off.barrier.0.is_none(),
+        "ending it restricts nothing, so it fences nothing"
+    );
+    assert_eq!(fixture.authority_revision(), revision);
+
+    let listed = fixture.listed().await;
+    assert!(!listed.exclusive);
+    assert_eq!(
+        listed.exclusive_events.len(),
+        1,
+        "the turning off is on record"
+    );
+    let event = &listed.exclusive_events[0];
+    assert_eq!(
+        event.channel,
+        kr_protocol::pairing::ConfirmationChannel::OwnerDevicePresence
+    );
+    assert_eq!(
+        event.organisation_ids.iter().copied().collect::<Vec<_>>(),
+        vec![organisation_id]
+    );
+
+    // A repeat is answered from the record and records nothing more.
+    drop(client);
+    let mut client = fixture.host.client().await;
+    let again: OrganisationExclusiveSetResult = client
+        .repeat(&request)
+        .await
+        .expect("the daemon answers")
+        .expect("answered from the record")
+        .to_typed()
+        .expect("a result");
+    assert_eq!(again, off);
+    assert_eq!(fixture.listed().await.exclusive_events.len(), 1);
+
+    // And the host may leave its last organisation now.
+    drop(client);
+    let mut client = fixture.host.client().await;
+    fixture
+        .withdraw(
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            organisation_id,
+        )
+        .await
+        .expect("the host is not exclusive any more");
+    drop(client);
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: making the host exclusive whose fence the registry cannot raise leaves the fence
+/// owed; a restart finishes it and the repeat of the action is answered from its record, built from
+/// the barrier as it stands, and not again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn making_the_host_exclusive_when_its_fence_fails_stays_owed_and_a_restart_finishes_it() {
+    let fixture = Fixture::start().await;
+    let before = fixture.authority_revision();
+    let mut client = fixture.host.client().await;
+    calls::confirm_subject(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+        &Signer::OwnerDevice(&fixture.owner),
+    )
+    .await
+    .expect("the owner device confirms");
+    let request = client
+        .compose(
+            Method::OrganisationExclusiveSet,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(fixture.host.environment_id),
+            &OrganisationExclusiveSetParams { exclusive: true },
+        )
+        .await
+        .expect("the request");
+
+    let fault = fence_support::refuse_fences(&fixture.host.tree().environment());
+    let failed = client
+        .repeat(&request)
+        .await
+        .expect("the daemon answers")
+        .expect_err("the fence could not be raised");
+    assert_ne!(failed.code, ErrorCode::InvalidArgument, "{failed:?}");
+    assert_eq!(fixture.authority_revision(), before);
+    assert!(
+        fixture.listed().await.exclusive,
+        "the host is exclusive as soon as the change is written"
+    );
+    assert!(
+        !fixture
+            .host
+            .controller()
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+            .is_empty(),
+        "the fence is owed"
+    );
+    drop(client);
+    fence_support::clear_the_fault(&fault);
+    drop(fault);
+
+    let fixture = fixture.restart().await;
+    fixture.until_the_fence_is_retired().await;
+    assert!(fixture.authority_revision().get() > before.get());
+    assert!(
+        fixture.listed().await.exclusive,
+        "the flag survives a restart"
+    );
+    let mut client = fixture.host.client().await;
+    let answered: OrganisationExclusiveSetResult = client
+        .repeat(&request)
+        .await
+        .expect("the daemon answers")
+        .expect("answered from the record")
+        .to_typed()
+        .expect("a result");
+    assert!(answered.exclusive);
+    assert_eq!(answered.authority_revision, fixture.authority_revision());
+    assert!(answered.barrier.0.is_some());
+    drop(client);
     fixture.host.stop().await;
 }

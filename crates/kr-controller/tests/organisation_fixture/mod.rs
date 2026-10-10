@@ -131,6 +131,32 @@ impl Fixture {
         .await
     }
 
+    /// The owner makes the host exclusively organisation-managed, or ends that, on the local
+    /// socket: an owner device signs the confirmation of exactly this change, then the change is
+    /// asked for under `action`.
+    pub async fn set_exclusive(
+        &self,
+        client: &mut kr_ipc::client::LocalClient,
+        action: ActionId,
+        exclusive: bool,
+    ) -> Result<kr_protocol::organisation::OrganisationExclusiveSetResult, ProtocolError> {
+        calls::confirm_subject(
+            self.host.environment_id,
+            client,
+            ConfirmationSubject::SetExclusiveManagement { exclusive },
+            &Signer::OwnerDevice(&self.owner),
+        )
+        .await?;
+        calls::mutate_as(
+            self.host.environment_id,
+            client,
+            action,
+            Method::OrganisationExclusiveSet,
+            &kr_protocol::organisation::OrganisationExclusiveSetParams { exclusive },
+        )
+        .await
+    }
+
     /// The authority revision the host's policy follows now.
     pub fn authority_revision(&self) -> AuthorityRevision {
         self.host.controller().policy().authority_revision()
