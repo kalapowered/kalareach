@@ -386,6 +386,9 @@ impl RemoteConnection {
                 let caller = super::super::owner::Caller::device(self.device.clone())
                     .confirming_the_clock_only(
                         decided.decision.decided.permitted.confirms_the_clock_only,
+                    )
+                    .confirming_recovery_only(
+                        decided.decision.decided.permitted.confirms_recovery_only,
                     );
                 match self
                     .controller
@@ -1441,6 +1444,9 @@ impl RemoteConnection {
                 let caller = super::super::owner::Caller::device(self.device.clone())
                     .confirming_the_clock_only(
                         decided.decision.decided.permitted.confirms_the_clock_only,
+                    )
+                    .confirming_recovery_only(
+                        decided.decision.decided.permitted.confirms_recovery_only,
                     );
                 let admission = self.controller.pairing_admission(
                     self.connection_id(),

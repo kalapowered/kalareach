@@ -34,9 +34,9 @@ use kr_pairing::host::{OwnerApproval, OwnerContext};
 use kr_pairing::platform::PairingClock;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::confirmation::{
-    CLOCK_PURPOSE, ConfirmationDisplay, HostClockEstablishResult, OwnerConfirmationCompleteParams,
-    OwnerConfirmationCompleteResult, OwnerConfirmationPendingResult,
-    OwnerConfirmationRequestResult, PendingConfirmation,
+    CLOCK_PURPOSE, ConfirmationDisplay, ConfirmationSubject, HostClockEstablishResult,
+    OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
+    OwnerConfirmationPendingResult, OwnerConfirmationRequestResult, PendingConfirmation,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, ActorId, BootEpoch, ConfirmationId, DeviceId};
@@ -69,6 +69,11 @@ pub struct Caller {
     /// the owner's confirmation of the clock and no other
     /// ([`crate::grants::Permitted::confirms_the_clock_only`]).
     pub confirms_the_clock_only: bool,
+    /// Whether the request was decided as an owner's device that no lease serves on an
+    /// exclusively organisation-managed host, which serves the owner's confirmations of the clock
+    /// and of ending exclusive management and no other
+    /// ([`crate::grants::Permitted::confirms_recovery_only`]).
+    pub confirms_recovery_only: bool,
 }
 
 impl Caller {
@@ -80,6 +85,7 @@ impl Caller {
             ingress: ActorIngress::LocalIpc,
             device: None,
             confirms_the_clock_only: false,
+            confirms_recovery_only: false,
         }
     }
 
@@ -91,6 +97,7 @@ impl Caller {
             ingress: ActorIngress::PairedDevice,
             device: Some(record),
             confirms_the_clock_only: false,
+            confirms_recovery_only: false,
         }
     }
 
@@ -100,6 +107,44 @@ impl Caller {
     pub const fn confirming_the_clock_only(mut self, only: bool) -> Self {
         self.confirms_the_clock_only = only;
         self
+    }
+
+    /// Marks a request decided as an owner's device that no lease serves on an exclusively
+    /// organisation-managed host, which serves the owner's confirmations of the clock and of
+    /// ending exclusive management and no other.
+    #[must_use]
+    pub const fn confirming_recovery_only(mut self, only: bool) -> Self {
+        self.confirms_recovery_only = only;
+        self
+    }
+
+    /// Whether this caller may be asked for, shown or answer the confirmation `subject` names.
+    ///
+    /// A caller whose request was decided while the clock is unproven serves the confirmation of
+    /// the clock alone; one that no lease serves on an exclusive host serves the clock's and that
+    /// of ending exclusive management.
+    #[must_use]
+    pub fn may_confirm(&self, subject: &ConfirmationSubject) -> bool {
+        match subject {
+            ConfirmationSubject::EstablishClock => true,
+            ConfirmationSubject::SetExclusiveManagement { exclusive: false } => {
+                !self.confirms_the_clock_only
+            }
+            _ => !self.confirms_the_clock_only && !self.confirms_recovery_only,
+        }
+    }
+
+    /// Whether this caller may be shown or answer a challenge that was described as `display`:
+    /// [`Self::may_confirm`] for what the host described.
+    #[must_use]
+    pub fn may_confirm_display(&self, display: &ConfirmationDisplay) -> bool {
+        match display {
+            ConfirmationDisplay::EstablishClock => true,
+            ConfirmationDisplay::ExclusiveManagement {
+                exclusive: false, ..
+            } => !self.confirms_the_clock_only,
+            _ => !self.confirms_the_clock_only && !self.confirms_recovery_only,
+        }
     }
 
     /// Returns the owner context an invitation this caller issues is bound to.
@@ -157,13 +202,6 @@ struct Entry {
     display: ConfirmationDisplay,
     bootstrap: bool,
     answer: Option<Answer>,
-}
-
-impl Entry {
-    /// Whether this is the challenge for the owner's confirmation of the host's clock.
-    const fn is_the_clocks(&self) -> bool {
-        matches!(self.display, ConfirmationDisplay::EstablishClock)
-    }
 }
 
 /// A verified answer, and the signer it was verified against.
@@ -841,7 +879,7 @@ impl OwnerAuthority {
         let mut pending: Vec<&Entry> = state
             .entries
             .values()
-            .filter(|entry| !caller.confirms_the_clock_only || entry.is_the_clocks())
+            .filter(|entry| caller.may_confirm_display(&entry.display))
             .collect();
         pending.sort_by_key(|entry| entry.order);
         Ok(OwnerConfirmationPendingResult {
@@ -907,8 +945,16 @@ impl OwnerAuthority {
                 "the proof answers a challenge this host did not issue",
             ));
         }
-        if caller.confirms_the_clock_only && !entry.is_the_clocks() {
-            return Err(crate::grants::continuity_lost());
+        if !caller.may_confirm_display(&entry.display) {
+            return Err(if caller.confirms_the_clock_only {
+                crate::grants::continuity_lost()
+            } else {
+                ControllerError::PermissionDenied {
+                    detail: "a device that no membership lease serves confirms only the clock \
+                             and the end of exclusive management"
+                        .to_owned(),
+                }
+            });
         }
         let signer = self.signer_for(caller, proof, entry, enrolment, params)?;
         verify_confirmation(&self.clock, &entry.request, proof, &signer, enrolment)

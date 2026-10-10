@@ -248,10 +248,16 @@ impl Controller {
             }
             Method::OwnerConfirmationRequest => {
                 let params: OwnerConfirmationRequestParams = decode(&mutation.params)?;
-                if caller.confirms_the_clock_only
-                    && !matches!(params.subject, ConfirmationSubject::EstablishClock)
-                {
-                    return Err(crate::grants::continuity_lost());
+                if !caller.may_confirm(&params.subject) {
+                    return Err(if caller.confirms_the_clock_only {
+                        crate::grants::continuity_lost()
+                    } else {
+                        ControllerError::PermissionDenied {
+                            detail: "a device that no membership lease serves confirms only the \
+                                     clock and the end of exclusive management"
+                                .to_owned(),
+                        }
+                    });
                 }
                 if matches!(params.subject, ConfirmationSubject::EstablishClock) {
                     let owner = Arc::clone(&self.owner);

@@ -58,6 +58,25 @@ pub struct PolicyIntersection {
     pub lease: Option<HeldBound>,
     /// The bounded offline validity the intersection was taken under, when it applied.
     pub offline: Option<HeldBound>,
+    /// Whether this is a personal owner device that no lease serves on an exclusively
+    /// organisation-managed host, reaching only what recovers the host ([`is_recovery_method`]).
+    pub recovery: bool,
+}
+
+/// The methods an owner's device reaches on an exclusively organisation-managed host when no lease
+/// serves it: reading what the host holds, asking for, answering and spending the owner's
+/// confirmations, and establishing the clock. Presenting a lease is its own exception, since a
+/// device that needs a lease cannot hold one before it presents it.
+#[must_use]
+pub const fn is_recovery_method(method: Method) -> bool {
+    matches!(
+        method,
+        Method::OrganisationList
+            | Method::OwnerConfirmationRequest
+            | Method::OwnerConfirmationPending
+            | Method::OwnerConfirmationComplete
+            | Method::HostClockEstablish
+    )
 }
 
 /// Which time bound on authority a snapshot is of.
@@ -1209,6 +1228,7 @@ impl HostPolicy {
                         organisation_id: Some(requirement.organisation_id),
                         lease: None,
                         offline: None,
+                        recovery: false,
                     });
                 }
                 // Whose lease answers for this grant: the lease of the account and key its
@@ -1241,19 +1261,36 @@ impl HostPolicy {
                     organisation_id: Some(requirement.organisation_id),
                     lease: Some(held),
                     offline: None,
+                    recovery: false,
                 })
             }
             None => {
                 // Personal authority. It continues through an organisation outage, unless this
                 // host is exclusively organisation-managed, in which case there is no personal
                 // path left to continue on.
+                let mut recovery = false;
                 let lease =
                     if self.exclusively_managed && request.method != Method::MembershipPresent {
-                        Some(self.managed_lease(
+                        match self.managed_lease(
                             grant.recipient_device_id,
                             request.continuous_now,
                             now_ms,
-                        )?)
+                        ) {
+                            Ok(held) => Some(held),
+                            // The owner's device that no lease serves still reaches what recovers
+                            // the host, and only that: its leases may have ended with the
+                            // organisation's service, and the host would have nothing left to
+                            // turn exclusive management off with.
+                            Err(_)
+                                if is_recovery_method(request.method)
+                                    && request.ingress == ActorIngress::PairedDevice
+                                    && super::can_recover(grant, request.environment_id) =>
+                            {
+                                recovery = true;
+                                None
+                            }
+                            Err(refusal) => return Err(refusal),
+                        }
                     } else {
                         None
                     };
@@ -1303,6 +1340,7 @@ impl HostPolicy {
                     organisation_id: None,
                     lease,
                     offline,
+                    recovery,
                 })
             }
         }
