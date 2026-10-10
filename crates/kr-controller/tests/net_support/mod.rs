@@ -725,6 +725,11 @@ impl RawDevice {
     }
 
     /// Submits one mutation under the action identity given, and returns what the host answered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host ends the control stream instead of answering; a suite whose mutation
+    /// can withdraw the connection it was sent on asks [`Self::try_mutate`].
     pub async fn mutate<P: serde::Serialize + ?Sized>(
         &self,
         method: Method,
@@ -733,6 +738,26 @@ impl RawDevice {
         params: &P,
     ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
         self.mutate_in(
+            self.action_window_id.clone(),
+            method,
+            action_id,
+            target,
+            params,
+        )
+        .await
+    }
+
+    /// Submits one mutation as [`Self::mutate`] does, and returns `None` when the host ended the
+    /// control stream instead of answering it: a mutation that makes the host withdraw the
+    /// connection it came on may be answered or may lose its answer to the withdrawal.
+    pub async fn try_mutate<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) -> Option<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>> {
+        self.try_mutate_in(
             self.action_window_id.clone(),
             method,
             action_id,
@@ -757,6 +782,20 @@ impl RawDevice {
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
     ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        self.try_mutate_in(action_window_id, method, action_id, target, params)
+            .await
+            .expect("the host answers on an open control stream")
+    }
+
+    /// As [`Self::mutate_in`], and `None` when the host ended the control stream instead.
+    pub async fn try_mutate_in<P: serde::Serialize + ?Sized>(
+        &self,
+        action_window_id: kr_protocol::ids::ActionWindowId,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) -> Option<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>> {
         use kr_client::transport::ControlTransport as _;
         use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue};
 
@@ -776,24 +815,24 @@ impl RawDevice {
             requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
             params: ParamsValue::from_typed(params).expect("the parameters encode"),
         }));
-        self.transport
-            .send(&frame)
-            .await
-            .expect("the frame is sent");
+        if self.transport.send(&frame).await.is_err() {
+            return None;
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             let frame = tokio::time::timeout_at(deadline, self.transport.recv())
                 .await
-                .expect("the host answers in time")
-                .expect("the control stream is open")
-                .expect("the host does not close the stream");
+                .expect("the host answers in time");
+            let Ok(Some(frame)) = frame else {
+                return None;
+            };
             if let ControlFrame::Response(response) = frame
                 && response.request_id == request_id
             {
-                return match response.outcome {
+                return Some(match response.outcome {
                     Outcome::Ok(value) => Ok(value),
                     Outcome::Error(error) => Err(error),
-                };
+                });
             }
         }
     }
