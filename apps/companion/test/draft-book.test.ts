@@ -396,6 +396,26 @@ describe('a prompt sent from a draft (the draft goes only once the host took it)
     expect(book.draft(MAIN).text).toBe('send this')
     expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
   })
+
+  it('leaves no older version of a prompt behind once its text is kept', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send')
+    await book.settled()
+    // The rest of the text is written while the store refuses, and sent from there.
+    store.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    await book.settled()
+    store.refuseSaves(null)
+    book.endSend(token, 'refused')
+    await book.settled()
+
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+    expect(book.draft(MAIN).text).toBe('send this')
+  })
 })
 
 describe('a conflict is a person’s to settle', () => {
