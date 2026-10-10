@@ -50,6 +50,19 @@ pub enum HostEnrolment {
     InitialBootstrap,
     /// An owner exists, so only a real ceremony or a paired owner device will do.
     Enrolled,
+    /// An owner exists, but the host is exclusively organisation-managed and no device that can
+    /// confirm for it is left, so the controlling terminal confirms the one thing that ends that:
+    /// the end of exclusive management. The host decides this state for one challenge, not for
+    /// the host.
+    Recovery,
+}
+
+impl HostEnrolment {
+    /// Whether the interactive controlling terminal can carry the confirmation in this state.
+    #[must_use]
+    pub const fn terminal_confirms(self) -> bool {
+        matches!(self, Self::InitialBootstrap | Self::Recovery)
+    }
 }
 
 /// Issues a challenge for one sensitive action.
@@ -153,10 +166,7 @@ pub fn verify_confirmation(
         // destination, another host or another nonce is not this one.
         return Err(PairingError::OwnerConfirmationRequired);
     }
-    if !proof
-        .channel
-        .is_acceptable(enrolment == HostEnrolment::InitialBootstrap)
-    {
+    if !proof.channel.is_acceptable(enrolment.terminal_confirms()) {
         return Err(PairingError::OwnerConfirmationRequired);
     }
     if clock.wall_clock_ms() >= request.expires_at_ms.get() {

@@ -19042,7 +19042,9 @@ export interface GrantTransferParams1 {
  */
 export interface OwnerConfirmationRequestResult {
   /**
-   * True while this host has no owner yet, so the interactive-terminal bootstrap applies.
+   * True while this host has no owner yet, so the interactive-terminal bootstrap applies, and for
+   * the one challenge that ends exclusive organisation management when no device is left that
+   * can confirm for the host, so the controlling terminal confirms it.
    */
   initial_bootstrap: boolean
   request: OwnerConfirmationRequest3

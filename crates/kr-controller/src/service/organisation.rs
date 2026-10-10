@@ -22,7 +22,7 @@ use kr_protocol::organisation::{
     OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationLeaseView,
     OrganisationListResult, OrganisationMemberView, OrganisationWithdrawParams,
 };
-use kr_protocol::pairing::{KeyPurpose, SensitiveAction, key_id};
+use kr_protocol::pairing::{ConfirmationChannel, KeyPurpose, SensitiveAction, key_id};
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, TimestampMs};
 
 use crate::error::{ControllerError, Result};
@@ -496,7 +496,10 @@ impl Controller {
             destination: None,
             rights: CanonicalSet::new(),
             display: plan.display(),
-            bootstrap: false,
+            // The terminal may confirm ending exclusive management when no device is left that can
+            // confirm for the host, and nothing else: it is decided again wherever the challenge
+            // is answered, spent and committed.
+            bootstrap: !exclusive && self.owner.recovery_open()?,
         })
     }
 
@@ -583,10 +586,24 @@ impl Controller {
                     Ok(((), bytes))
                 },
                 Some(&ending),
-                |_connection| {
+                |connection| {
                     self.check_admission(&registry, &carried)?;
                     self.owner
-                        .covers(&confirmed, digest, "change of exclusive management")
+                        .covers(&confirmed, digest, "change of exclusive management")?;
+                    // The terminal confirms this only while no device can confirm it, read from
+                    // the transaction's own file: one that appeared since is the one to ask.
+                    if confirmed.channel() == ConfirmationChannel::LocalBootstrapTerminal
+                        && crate::grants::an_owner_device_can_recover(connection, environment_id)?
+                    {
+                        return Err(ControllerError::Refused {
+                            code: ErrorCode::OwnerConfirmationRequired,
+                            detail: "an owner device that can confirm for this host exists, so \
+                                     the terminal no longer confirms the end of exclusive \
+                                     management; confirm on that device"
+                                .to_owned(),
+                        });
+                    }
+                    Ok(())
                 },
             )?;
             drop(registry);

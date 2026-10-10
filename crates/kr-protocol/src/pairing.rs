@@ -1857,17 +1857,18 @@ impl ConfirmationChannel {
 
     /// Returns true when a confirmation arriving through this channel may be accepted.
     ///
-    /// `initial_bootstrap` is true only while the host has no owner yet. The controlling-terminal
-    /// channel exists to protect that one moment against accidental agent initiation; afterwards a
-    /// host with no user-presence-capable signer and no separately paired owner refuses the
-    /// confirmation rather than downgrading it.
+    /// `terminal_confirms` is true only while the host has no owner yet, and for the one challenge
+    /// that ends exclusive organisation management when no device is left that can confirm for the
+    /// host. The controlling-terminal channel exists to protect those moments against accidental
+    /// agent initiation; otherwise a host with no user-presence-capable signer and no separately
+    /// paired owner refuses the confirmation rather than downgrading it.
     #[must_use]
-    pub const fn is_acceptable(self, initial_bootstrap: bool) -> bool {
+    pub const fn is_acceptable(self, terminal_confirms: bool) -> bool {
         match self {
             Self::OwnerDevicePresence | Self::PairedOwnerDevice | Self::EnrolledPresenceSigner => {
                 true
             }
-            Self::LocalBootstrapTerminal => initial_bootstrap,
+            Self::LocalBootstrapTerminal => terminal_confirms,
             Self::Session | Self::Plugin | Self::ContactTool => false,
         }
     }

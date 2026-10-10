@@ -278,6 +278,26 @@ impl Controller {
                     })
                     .await;
                 }
+                // Making the host exclusively organisation-managed, or ending that, is described by
+                // this host's policy: the organisations it is enrolled in are what the owner is
+                // shown, and a change this host would refuse is not put to the owner.
+                if let ConfirmationSubject::SetExclusiveManagement { exclusive } = &params.subject {
+                    let controller = Arc::clone(self);
+                    let owner = Arc::clone(&self.owner);
+                    let exclusive = *exclusive;
+                    return blocking(move || {
+                        // The owner authority is the host's own, not the network's: a host with
+                        // no owner device left to confirm ending exclusive management is asked at
+                        // its terminal, and that works off the network, as the clock's does.
+                        owner.require_owner(&caller)?;
+                        if let Some(requested) = owner.requested(&caller, action) {
+                            return requested;
+                        }
+                        let resolved = controller.organisation_exclusive_resolved(exclusive)?;
+                        owner.request(&caller, resolved, action, admission.as_ref())
+                    })
+                    .await;
+                }
                 let pairing = self.pairing_service()?;
                 // A transfer of control is described by the daemon, from the grant and the two
                 // devices it holds, and only the person at this machine asks for it: an owner
@@ -330,19 +350,6 @@ impl Controller {
                     return blocking(move || {
                         pairing.require_owner(&caller)?;
                         let resolved = controller.organisation_enrol_resolved(&enrol)?;
-                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
-                    })
-                    .await;
-                }
-                // Making the host exclusively organisation-managed, or ending that, is described by
-                // this host's policy: the organisations it is enrolled in are what the owner is
-                // shown, and a change this host would refuse is not put to the owner.
-                if let ConfirmationSubject::SetExclusiveManagement { exclusive } = &params.subject {
-                    let controller = Arc::clone(self);
-                    let exclusive = *exclusive;
-                    return blocking(move || {
-                        pairing.require_owner(&caller)?;
-                        let resolved = controller.organisation_exclusive_resolved(exclusive)?;
                         pairing.request_resolved(&caller, resolved, action, admission.as_ref())
                     })
                     .await;

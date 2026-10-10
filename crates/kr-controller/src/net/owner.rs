@@ -49,7 +49,8 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKe
 
 use super::devices::{CommitFn, DeviceDirectory, DeviceRecord};
 use super::invitations::{
-    ActionSubject, InvitationRows, PairingAction, another_subject, claim_effect, consume,
+    ActionSubject, InvitationRows, PairingAction, TerminalStanding, another_subject, claim_effect,
+    consume,
 };
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
@@ -229,10 +230,21 @@ pub struct OwnerAuthority {
     clock: HostPairingClock,
     rows: InvitationRows,
     state: Mutex<Challenges>,
+    /// What the host tells this service of its exclusive organisation management, so the terminal
+    /// can confirm its end when nothing else can. Absent until the host binds it.
+    recovery: Option<Recovery>,
     /// Where this host's own tests stop the establishment of the clock: after it has chosen the
     /// confirmation it spends and before it takes the clock, and inside its commit.
     #[cfg(test)]
     pub(crate) pauses: EstablishPauses,
+}
+
+/// What decides whether the controlling terminal can confirm the end of exclusive management.
+struct Recovery {
+    /// The environment the host serves, which a device's grant has to reach to recover it.
+    environment_id: kr_protocol::ids::EnvironmentId,
+    /// Whether the host is exclusively organisation-managed now.
+    exclusive: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// A point this host's own tests stop a blocking step at: the step says it has arrived and waits
@@ -367,8 +379,76 @@ impl OwnerAuthority {
                 entries: BTreeMap::new(),
                 issued: 0,
             }),
+            recovery: None,
             #[cfg(test)]
             pauses: EstablishPauses::default(),
+        }
+    }
+
+    /// Binds what decides the recovery of an exclusive host: the environment it serves and whether
+    /// the host is exclusively organisation-managed now.
+    #[must_use]
+    pub fn with_recovery(
+        mut self,
+        environment_id: kr_protocol::ids::EnvironmentId,
+        exclusive: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.recovery = Some(Recovery {
+            environment_id,
+            exclusive,
+        });
+        self
+    }
+
+    /// Whether the host is exclusively organisation-managed, has an owner, and has no device left
+    /// that can confirm for it: the state in which the interactive controlling terminal confirms
+    /// the end of exclusive management and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error when the owner or the device records cannot be read.
+    pub fn recovery_open(&self) -> Result<bool> {
+        let Some(recovery) = &self.recovery else {
+            return Ok(false);
+        };
+        Ok(self.enrolment()? == HostEnrolment::Enrolled
+            && (recovery.exclusive)()
+            && !self.an_owner_device_can_recover(recovery.environment_id)?)
+    }
+
+    /// What the terminal can confirm for the challenge `entry` holds, now.
+    ///
+    /// Before the host has an owner it confirms what the first-owner bootstrap does. Afterwards it
+    /// confirms one challenge only: the end of exclusive management, which was asked for in the
+    /// state [`Self::recovery_open`] describes, and only while that state holds.
+    fn standing_of(&self, entry: &Entry) -> Result<HostEnrolment> {
+        Ok(match self.enrolment()? {
+            HostEnrolment::InitialBootstrap => HostEnrolment::InitialBootstrap,
+            _ if entry.bootstrap
+                && matches!(
+                    entry.display,
+                    ConfirmationDisplay::ExclusiveManagement {
+                        exclusive: false,
+                        ..
+                    }
+                )
+                && self.recovery_open()? =>
+            {
+                HostEnrolment::Recovery
+            }
+            _ => HostEnrolment::Enrolled,
+        })
+    }
+
+    /// What the terminal is accepted under for spending a proof, as the consuming transaction
+    /// checks it.
+    fn terminal_standing(&self, enrolment: HostEnrolment) -> TerminalStanding {
+        match (enrolment, &self.recovery) {
+            (HostEnrolment::Recovery, Some(recovery)) => TerminalStanding::Recovery {
+                environment_id: recovery.environment_id,
+                exclusive: (recovery.exclusive)(),
+            },
+            _ => TerminalStanding::Bootstrap,
         }
     }
 
@@ -510,7 +590,18 @@ impl OwnerAuthority {
         admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationRequestResult> {
         self.require_owner(caller)?;
-        let initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap;
+        // Whether the terminal can confirm this one: before the host has an owner, or when it asks
+        // to end exclusive management on a host that no device can confirm for.
+        let initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap
+            || (resolved.bootstrap
+                && matches!(
+                    resolved.display,
+                    ConfirmationDisplay::ExclusiveManagement {
+                        exclusive: false,
+                        ..
+                    }
+                )
+                && self.recovery_open()?);
         let mut state = self.state();
         // Asked under the lock every challenge is issued under, so two copies of one request meet
         // here and the second is given the challenge the first recorded.
@@ -764,8 +855,12 @@ impl OwnerAuthority {
             .entries
             .remove(spendable.request.confirmation_id.get().as_bytes());
         drop(state);
-        self.rows
-            .record_consumed(spendable.proof(), effect, kr_ipc::now_ms())?;
+        self.rows.record_consumed_under(
+            spendable.proof(),
+            effect,
+            kr_ipc::now_ms(),
+            self.terminal_standing(spendable.enrolment),
+        )?;
         Ok(confirmed)
     }
 
@@ -810,9 +905,21 @@ impl OwnerAuthority {
         &self,
         request: OwnerConfirmationRequest,
     ) -> Result<OwnerConfirmationRequestResult> {
+        let mut initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap;
+        if !initial_bootstrap {
+            let mut state = self.state();
+            self.sweep(&mut state);
+            if let Some(entry) = state
+                .entries
+                .get(request.confirmation_id.get().as_bytes())
+                .cloned()
+            {
+                initial_bootstrap = self.standing_of(&entry)?.terminal_confirms();
+            }
+        }
         Ok(OwnerConfirmationRequestResult {
             request,
-            initial_bootstrap: self.enrolment()? == HostEnrolment::InitialBootstrap,
+            initial_bootstrap,
         })
     }
 
@@ -928,7 +1035,6 @@ impl OwnerAuthority {
                 "a session, plugin or contact-tool channel never carries an owner confirmation",
             ));
         }
-        let enrolment = self.enrolment()?;
         let mut state = self.state();
         // Asked under the lock every answer is recorded under, so two copies of one completion meet
         // here and the second is given what the first recorded.
@@ -940,6 +1046,8 @@ impl OwnerAuthority {
         let entry = state.entries.get(&key).ok_or_else(|| {
             confirmation_required("that challenge is not outstanding on this host")
         })?;
+        // What the terminal can confirm is decided for this challenge, now.
+        let enrolment = self.standing_of(entry)?;
         if entry.request != proof.request {
             return Err(confirmation_required(
                 "the proof answers a challenge this host did not issue",
@@ -1018,7 +1126,6 @@ impl OwnerAuthority {
         expectation: &ConfirmationExpectation<'_>,
         shows: &dyn Fn(&ConfirmationDisplay) -> bool,
     ) -> Result<Spendable> {
-        let enrolment = self.enrolment()?;
         self.sweep(state);
         let mut candidates: Vec<&Entry> = state
             .entries
@@ -1045,24 +1152,28 @@ impl OwnerAuthority {
             .iter()
             .map(|device| key_id(&device.authorisation))
             .collect();
-        let (request, answer) = candidates
-            .iter()
-            .find_map(|entry| {
-                let answer = entry.answer.as_ref()?;
-                let standing = match answer.proof.channel {
-                    ConfirmationChannel::LocalBootstrapTerminal => {
-                        enrolment == HostEnrolment::InitialBootstrap
-                    }
-                    _ => owner_keys.contains(&answer.proof.signer_key_id),
-                };
-                standing.then(|| (entry.request.clone(), answer.clone()))
-            })
-            .ok_or_else(|| {
-                confirmation_required(
-                    "the owner confirmation that answered this was given under authority this \
+        let mut chosen = None;
+        for entry in candidates {
+            let Some(answer) = entry.answer.as_ref() else {
+                continue;
+            };
+            // What the terminal can confirm is decided for this challenge, now.
+            let enrolment = self.standing_of(entry)?;
+            let standing = match answer.proof.channel {
+                ConfirmationChannel::LocalBootstrapTerminal => enrolment.terminal_confirms(),
+                _ => owner_keys.contains(&answer.proof.signer_key_id),
+            };
+            if standing {
+                chosen = Some((entry.request.clone(), answer.clone(), enrolment));
+                break;
+            }
+        }
+        let (request, answer, enrolment) = chosen.ok_or_else(|| {
+            confirmation_required(
+                "the owner confirmation that answered this was given under authority this \
                      host no longer holds; confirm again",
-                )
-            })?;
+            )
+        })?;
         Ok(Spendable {
             request,
             proof: answer.proof,
@@ -1191,6 +1302,7 @@ impl OwnerAuthority {
                     &spendable.proof,
                     "establish this host's clock",
                     established,
+                    TerminalStanding::Bootstrap,
                 )?;
                 claim_effect(transaction, &claimed)?;
                 self.still_covers(&state, &spendable, &expectation)?;
@@ -1278,8 +1390,12 @@ impl OwnerAuthority {
             .entries
             .remove(spendable.request.confirmation_id.get().as_bytes());
         drop(state);
-        self.rows
-            .record_consumed(spendable.proof(), effect, kr_ipc::now_ms())
+        self.rows.record_consumed_under(
+            spendable.proof(),
+            effect,
+            kr_ipc::now_ms(),
+            self.terminal_standing(spendable.enrolment),
+        )
     }
 
     /// Returns the signer a proof must be verified against, and refuses a signer this host does
@@ -1294,7 +1410,7 @@ impl OwnerAuthority {
     ) -> Result<AuthorisationKey> {
         match proof.channel {
             ConfirmationChannel::LocalBootstrapTerminal => {
-                if enrolment != HostEnrolment::InitialBootstrap {
+                if !enrolment.terminal_confirms() {
                     return Err(confirmation_required(
                         "this host has an owner, so the terminal bootstrap is over; confirm on an \
                          owner device",

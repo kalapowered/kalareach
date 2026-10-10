@@ -596,12 +596,26 @@ impl Controller {
         // of what they answered, so the tables it writes exist from the first start, and the
         // network's registration binds the endpoint its listener serves to it.
         net::invitations::prepare(&devices)?;
-        let owner = Arc::new(net::owner::OwnerAuthority::new(
-            kr_protocol::ids::DeviceId::new(setup.environment_id.get()),
-            *device_keys.transport.public(),
-            net::pairing::HostPairingClock::new(&setup.boot_identity),
-            net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
-        ));
+        // Whether the host is exclusively organisation-managed is the policy's, which the owner
+        // authority reads when it decides what the terminal can confirm.
+        let exclusive = {
+            let policy = Arc::clone(&policy);
+            Arc::new(move || {
+                policy
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_exclusively_managed()
+            })
+        };
+        let owner = Arc::new(
+            net::owner::OwnerAuthority::new(
+                kr_protocol::ids::DeviceId::new(setup.environment_id.get()),
+                *device_keys.transport.public(),
+                net::pairing::HostPairingClock::new(&setup.boot_identity),
+                net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
+            )
+            .with_recovery(setup.environment_id, exclusive),
+        );
         // The host's own sign-in to the managed account service lives in the same store, in a
         // scope of its own. Everything this host presents an account token for, the voice broker
         // and the storage service, goes through it.

@@ -23020,7 +23020,7 @@
       "description": "The result of `owner.confirmation.request`.",
       "properties": {
         "initial_bootstrap": {
-          "description": "True while this host has no owner yet, so the interactive-terminal bootstrap applies.",
+          "description": "True while this host has no owner yet, so the interactive-terminal bootstrap applies, and for\nthe one challenge that ends exclusive organisation management when no device is left that\ncan confirm for the host, so the controlling terminal confirms it.",
           "type": "boolean"
         },
         "request": {

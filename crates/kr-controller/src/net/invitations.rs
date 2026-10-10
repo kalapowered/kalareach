@@ -774,9 +774,25 @@ impl InvitationRows {
         effect: &str,
         now: TimestampMs,
     ) -> Result<()> {
-        let consumed = self
-            .directory
-            .transaction(|transaction| consume(transaction, &self.lifetimes, proof, effect, now));
+        self.record_consumed_under(proof, effect, now, TerminalStanding::Bootstrap)
+    }
+
+    /// Records that an owner confirmation was consumed by `effect`, as [`Self::record_consumed`]
+    /// does, with the standing the controlling terminal's proof is consumed under.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record_consumed`], and a terminal proof the standing does not cover.
+    pub fn record_consumed_under(
+        &self,
+        proof: &OwnerConfirmationProof,
+        effect: &str,
+        now: TimestampMs,
+        terminal: TerminalStanding,
+    ) -> Result<()> {
+        let consumed = self.directory.transaction(|transaction| {
+            consume(transaction, &self.lifetimes, proof, effect, now, terminal)
+        });
         self.lifetimes.settle();
         consumed
     }
@@ -867,6 +883,7 @@ impl InvitationStore for InvitationRows {
                 issued_under,
                 &effect,
                 terms.issued_at_ms,
+                TerminalStanding::Bootstrap,
             )
         });
         self.lifetimes.settle();
@@ -1043,6 +1060,7 @@ fn commit_pairing(
         &commitment.owner_confirmation,
         &format!("pair.confirm {}", commitment.invitation_id),
         commitment.committed_at_ms,
+        TerminalStanding::Bootstrap,
     )?;
     let record = device_record(commitment).map_err(ControllerError::registry)?;
     insert_record(transaction, &record)?;
@@ -1274,6 +1292,21 @@ pub fn another_subject() -> ControllerError {
     ControllerError::registry("the record of this action names another subject than its payload")
 }
 
+/// What the interactive controlling terminal's proof is consumed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalStanding {
+    /// Only while the host has no owner yet.
+    Bootstrap,
+    /// And also, for the end of exclusive organisation management, while the host has an owner but
+    /// no device that can confirm for it. `exclusive` is whether the host is exclusive now.
+    Recovery {
+        /// The environment the host serves.
+        environment_id: kr_protocol::ids::EnvironmentId,
+        /// Whether the host is exclusively organisation-managed now.
+        exclusive: bool,
+    },
+}
+
 /// Records a confirmation's consumption inside the caller's transaction.
 ///
 /// The row is written whole when `complete` never recorded the answer, so the acceptance record
@@ -1287,8 +1320,9 @@ pub(super) fn consume(
     proof: &OwnerConfirmationProof,
     effect: &str,
     now: TimestampMs,
+    terminal: TerminalStanding,
 ) -> Result<()> {
-    signer_still_authorised(transaction, lifetimes, proof)?;
+    signer_still_authorised(transaction, lifetimes, proof, terminal)?;
     destination_still_held(transaction, proof)?;
     let request = encode(&proof.request)?;
     let action = text_of(&proof.request.action)?;
@@ -1338,6 +1372,7 @@ fn signer_still_authorised(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
     proof: &OwnerConfirmationProof,
+    terminal: TerminalStanding,
 ) -> Result<()> {
     let lapsed = |detail: &str| ControllerError::Refused {
         code: ErrorCode::OwnerConfirmationRequired,
@@ -1351,12 +1386,27 @@ fn signer_still_authorised(
                 })
                 .map_err(ControllerError::registry)?
                 > 0;
-            if owned {
-                return Err(lapsed(
-                    "this host has an owner, so the terminal bootstrap no longer confirms anything",
-                ));
+            if !owned {
+                return Ok(());
             }
-            Ok(())
+            // An owner exists. The terminal still confirms the end of exclusive management, and
+            // only while the host is exclusive and no device that can confirm for it is left,
+            // which is read here, in the transaction that records the spend.
+            match terminal {
+                TerminalStanding::Recovery {
+                    environment_id,
+                    exclusive: true,
+                } if !crate::grants::an_owner_device_can_recover(transaction, environment_id)? => {
+                    Ok(())
+                }
+                TerminalStanding::Recovery { .. } => Err(lapsed(
+                    "a device that can confirm for this host exists, or the host is not exclusively \
+                     organisation-managed, so the terminal no longer confirms its end",
+                )),
+                TerminalStanding::Bootstrap => Err(lapsed(
+                    "this host has an owner, so the terminal bootstrap no longer confirms anything",
+                )),
+            }
         }
         ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
             let mut statement = transaction

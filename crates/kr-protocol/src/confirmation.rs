@@ -285,7 +285,9 @@ pub struct OwnerConfirmationRequestParams {
 pub struct OwnerConfirmationRequestResult {
     /// The challenge to answer. It is single use and expires after a short interval.
     pub request: OwnerConfirmationRequest,
-    /// True while this host has no owner yet, so the interactive-terminal bootstrap applies.
+    /// True while this host has no owner yet, so the interactive-terminal bootstrap applies, and for
+    /// the one challenge that ends exclusive organisation management when no device is left that
+    /// can confirm for the host, so the controlling terminal confirms it.
     pub initial_bootstrap: bool,
 }
 
