@@ -3252,7 +3252,21 @@ impl WorkerService {
         // A named reach describes the revisions after its `since`, so it is trusted only when this
         // worker has fenced every revision up to that one. Otherwise a revision it missed, or one
         // it was refused for its boundary, withdrew authority this notice says nothing about.
-        let reach = notice.reach.applied_by_a_worker_at(held, notice.revision);
+        // What it was refused for its boundary it holds the reach of, and joins to this notice's,
+        // so a notice that begins after those revisions still describes all of them.
+        let joined = {
+            let authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            match &authority.owed {
+                Some(owed) if owed.revision.get() < notice.revision.get() => {
+                    owed.reach.then(owed.revision, &notice.reach)
+                }
+                _ => notice.reach.clone(),
+            }
+        };
+        let reach = joined.applied_by_a_worker_at(held, notice.revision);
         if let Err(error) = self.fence(notice.revision, reach) {
             // The acknowledgement is what the daemon waits on before it calls a revocation
             // complete. Reporting success while the fence did not finish would answer it wrongly;

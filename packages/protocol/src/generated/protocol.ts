@@ -6331,14 +6331,15 @@ export interface AuthorityRevisionNotice {
     | {
         within: {
           /**
-           * The devices the revisions withdrew, or that hold the grants of a subtree too large to
-           * name grant by grant.
+           * The devices the revisions withdrew, and the devices that hold the grants of the
+           * revisions named by device.
            */
           devices: DeviceId[]
           /**
            * The grants the revisions withdrew, with everything delegated from them that anyone
-           * held. None when the revisions withdrew more than [`MAX_REVISION_REACH_NAMES`], which
-           * `devices` then names by the devices that hold them.
+           * held. A revision that withdrew more than [`MAX_REVISION_REACH_NAMES`] names, and the
+           * older revisions of a join that passes it, are named by the devices that hold their
+           * grants instead, in `devices`.
            */
           grants: GrantId[]
           /**

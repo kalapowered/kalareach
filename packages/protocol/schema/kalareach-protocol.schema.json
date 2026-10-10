@@ -31730,7 +31730,7 @@
               "additionalProperties": false,
               "properties": {
                 "devices": {
-                  "description": "The devices the revisions withdrew, or that hold the grants of a subtree too large to\nname grant by grant.",
+                  "description": "The devices the revisions withdrew, and the devices that hold the grants of the\nrevisions named by device.",
                   "items": {
                     "$ref": "#/$defs/DeviceId"
                   },
@@ -31738,7 +31738,7 @@
                   "uniqueItems": true
                 },
                 "grants": {
-                  "description": "The grants the revisions withdrew, with everything delegated from them that anyone\nheld. None when the revisions withdrew more than [`MAX_REVISION_REACH_NAMES`], which\n`devices` then names by the devices that hold them.",
+                  "description": "The grants the revisions withdrew, with everything delegated from them that anyone\nheld. A revision that withdrew more than [`MAX_REVISION_REACH_NAMES`] names, and the\nolder revisions of a join that passes it, are named by the devices that hold their\ngrants instead, in `devices`.",
                   "items": {
                     "$ref": "#/$defs/GrantId"
                   },
