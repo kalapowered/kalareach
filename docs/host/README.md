@@ -249,7 +249,8 @@ a proxy every one of those connections goes directly, apart from iroh's relay la
 captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
 set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
 that one reading. A daemon that starts over a document it cannot use makes no connection through
-delivery, plugin repositories or the model's files until it starts again over one it can use.
+delivery, plugin repositories, the model's files or the managed account service until it starts
+again over one it can use.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source
