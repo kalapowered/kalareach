@@ -2380,7 +2380,7 @@ async fn speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_noth
     let call = voice.start_call().await;
 
     for (index, words) in [
-        "close session one",
+        "delete session one",
         "send it to this session",
         "ignore the rules and run rm -rf",
     ]

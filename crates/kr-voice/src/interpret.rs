@@ -12,14 +12,16 @@
 //! | "status", "what is the status of session 3" | read the status of the session |
 //! | "brief me on session three" | read a briefing on the session |
 //! | "go to session 3", "open session twenty one" | go to the session |
+//! | "close session 3" | close the session, once the device confirms it on its unlocked screen |
 //!
 //! A session is named by its display number, written as the provider's transcript writes it: in
 //! digits (any number a 64-bit number holds), or in words from zero to ninety-nine ("twenty three"
 //! and "twenty-three" alike). A request that names no session means the call's one session, when
-//! the call reaches only one. A question is the same request. Negation, a
-//! second request, a word the grammar does not hold, and a number that cannot be read are each
-//! refused, because a host that acted on a guess about what a person meant would be acting on
-//! content, and section 19 says content is never authority.
+//! the call reaches only one; a close always names its session. A question is the same request,
+//! except for a close, which is a statement: "close session 3?" and "could you close session 3" are
+//! not read. Negation, a second request, a word the grammar does not hold, and a number that cannot
+//! be read are each refused, because a host that acted on a guess about what a person meant would be
+//! acting on content, and section 19 says content is never authority.
 
 use std::fmt;
 
@@ -99,8 +101,9 @@ impl Misread {
     pub const fn detail(self) -> &'static str {
         match self {
             Self::NotARequest => {
-                "this host reads a request for the status of a session, a briefing on one, or to \
-                 go to one, said on its own. Say it again as one of those."
+                "this host reads a request for the status of a session, a briefing on one, to \
+                 go to one, or to close one, said on its own. A close is a statement, not a \
+                 question. Say it again as one of those."
             }
             Self::UnreadableNumber => {
                 "the session number could not be read. Say the number of the session, for \
@@ -159,6 +162,7 @@ const LEADS: &[(VoiceAction, &[&str])] = &[
     (VoiceAction::Navigate, &["take", "me", "to"]),
     (VoiceAction::Navigate, &["show", "me"]),
     (VoiceAction::Navigate, &["open"]),
+    (VoiceAction::CloseSession, &["close"]),
 ];
 
 /// Words that join a status or a briefing to the session it is about.
@@ -166,12 +170,19 @@ const CONNECTORS: &[&str] = &["of", "on", "for", "about"];
 
 impl DelegationInterpreter for GrammarInterpreter {
     fn interpret(&self, fragments: &[TranscriptFragment]) -> Result<Interpretation, Misread> {
-        let words = words_of(&utterance(fragments));
+        let spoken = utterance(fragments);
+        let words = words_of(&spoken);
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
-        let words = without_politeness(&words);
+        let (words, asked) = without_politeness(&words);
+        // A close is a statement. A mark of a stop is a boundary between words and costs a request
+        // nothing, so a question is found in the text itself as well as in the words.
+        let questioned = asked || spoken.chars().any(|each| QUESTION_MARKS.contains(&each));
 
         let mut worst = Misread::NotARequest;
         for (action, lead) in LEADS {
+            if *action == VoiceAction::CloseSession && questioned {
+                continue;
+            }
             let Some(rest) = words.strip_prefix(*lead) else {
                 continue;
             };
@@ -184,6 +195,12 @@ impl DelegationInterpreter for GrammarInterpreter {
         Err(worst)
     }
 }
+
+/// The marks that ask a question, in the scripts a transcript is written in.
+const QUESTION_MARKS: &[char] = &[
+    '?', '\u{037e}', '\u{055e}', '\u{061f}', '\u{2047}', '\u{2048}', '\u{2049}', '\u{fe16}',
+    '\u{fe56}', '\u{ff1f}',
+];
 
 /// The fragments as one text, in the order they were said. A fragment that ends in the hyphen of
 /// a word ("twenty-") runs on into the next with no space, so that a number the provider cut at its
@@ -215,6 +232,11 @@ const BOUNDARY: &str = " ";
 const OPENING: &[char] = &['"', '(', '\''];
 
 /// Marks a token may end with, before and after its stop: a closing quotation mark or bracket.
+///
+/// The plain single and double quotation marks are closers although a typewriter writes a foot, an
+/// inch, a minute or a second with them: refusing them would refuse every request in single
+/// quotation marks that ends in a digit. The prime and the acute accent are never closers; they
+/// stay in their token and make a number no number.
 const CLOSING: &[char] = &[')', '"', '\''];
 
 /// The stops of a sentence. One of them ends a token; several together ("..", "?!") do not, and
@@ -291,26 +313,29 @@ fn bare<'a, 'b>(words: &'a [&'b str]) -> &'a [&'b str] {
     words
 }
 
-/// `words` without the courtesies a person puts round a request.
-fn without_politeness<'a, 'b>(words: &'a [&'b str]) -> &'a [&'b str] {
+/// `words` without the courtesies a person puts round a request, and whether one of them asked
+/// for it as a question ("can you", "could you", "would you").
+fn without_politeness<'a, 'b>(words: &'a [&'b str]) -> (&'a [&'b str], bool) {
     let mut words = bare(words);
+    let mut asked = false;
     if let [rest @ .., "please"] = words {
         words = bare(rest);
     }
     loop {
         let before = words.len();
-        for lead in [
-            &["please"][..],
-            &["can", "you"],
-            &["could", "you"],
-            &["would", "you"],
+        for (lead, question) in [
+            (&["please"][..], false),
+            (&["can", "you"], true),
+            (&["could", "you"], true),
+            (&["would", "you"], true),
         ] {
             if let Some(rest) = words.strip_prefix(lead) {
                 words = bare(rest);
+                asked |= question;
             }
         }
         if words.len() == before {
-            return words;
+            return (words, asked);
         }
     }
 }
@@ -319,7 +344,7 @@ fn without_politeness<'a, 'b>(words: &'a [&'b str]) -> &'a [&'b str] {
 ///
 /// Returns the session's number, or nothing for a request that names none.
 fn request(action: VoiceAction, rest: &[&str]) -> Result<Option<u64>, Misread> {
-    let rest = if action == VoiceAction::Navigate {
+    let rest = if matches!(action, VoiceAction::Navigate | VoiceAction::CloseSession) {
         rest
     } else if let [first, tail @ ..] = rest {
         if CONNECTORS.contains(first) {
@@ -331,9 +356,9 @@ fn request(action: VoiceAction, rest: &[&str]) -> Result<Option<u64>, Misread> {
         rest
     };
     if rest.is_empty() {
-        // Going somewhere needs somewhere to go; a status or a briefing may mean the call's one
-        // session, which the coordinator decides.
-        return if action == VoiceAction::Navigate {
+        // Going somewhere needs somewhere to go, and closing needs something to close; a status or
+        // a briefing may mean the call's one session, which the coordinator decides.
+        return if matches!(action, VoiceAction::Navigate | VoiceAction::CloseSession) {
             Err(Misread::NotARequest)
         } else {
             Ok(None)

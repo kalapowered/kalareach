@@ -2,7 +2,7 @@
 //!
 //! The grammar is closed, so the table is the specification: each line is something a person says,
 //! written as a provider's transcript writes it, and what the host reads of it. A request is one of
-//! the three the grammar holds; anything else is not a request, and a number that cannot be read
+//! the four the grammar holds; anything else is not a request, and a number that cannot be read
 //! is its own answer.
 //!
 //! | Row | What proves it |
@@ -40,7 +40,7 @@ fn read(texts: &[&str]) -> Result<Read, Misread> {
 /// words it refuses.
 #[test]
 fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
-    use VoiceAction::{Brief, Navigate, Status};
+    use VoiceAction::{Brief, CloseSession, Navigate, Status};
 
     let reads: &[(&[&str], Read)] = &[
         // Status, in each lead the grammar holds, with the session named in digits and in words.
@@ -75,6 +75,14 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["open session 6"], (Navigate, Some(6))),
         (&["show me session 6"], (Navigate, Some(6))),
         (&["take me to the session six"], (Navigate, Some(6))),
+        // Closing a session: a statement that names the session.
+        (&["close session 3"], (CloseSession, Some(3))),
+        (&["Close session three."], (CloseSession, Some(3))),
+        (&["close the session twelve"], (CloseSession, Some(12))),
+        (&["Close session twenty-three!"], (CloseSession, Some(23))),
+        (&["please close session 4"], (CloseSession, Some(4))),
+        (&["Close session 4, please."], (CloseSession, Some(4))),
+        (&["close session", "three"], (CloseSession, Some(3))),
         // Numbers: digits, words, and a ten with a unit, with its hyphen written as a hyphen or
         // left out.
         (&["status session 0"], (Status, Some(0))),
@@ -131,6 +139,39 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
             Misread::NotARequest,
         ),
         (&["status session twenty ten"], Misread::NotARequest),
+        // A close is a statement and names its session: a question is not read, whether it is
+        // marked or only asked, wherever the mark stands, and neither is a close that names none
+        // or a stop that cuts it in two.
+        (&["close session three?"], Misread::NotARequest),
+        (&["Close session 3 ?"], Misread::NotARequest),
+        (&["close session three", "?"], Misread::NotARequest),
+        (&["close session 3?!"], Misread::NotARequest),
+        (&["close session 3\u{ff1f}"], Misread::NotARequest),
+        (&["can you close session three"], Misread::NotARequest),
+        (
+            &["Could you close session 3, please?"],
+            Misread::NotARequest,
+        ),
+        (&["would you please close session 3"], Misread::NotARequest),
+        (&["please, could you close session 3"], Misread::NotARequest),
+        (&["close"], Misread::NotARequest),
+        (&["close."], Misread::NotARequest),
+        (&["close. Session three"], Misread::NotARequest),
+        (&["close session three. Session four"], Misread::NotARequest),
+        (&["close session", "?"], Misread::NotARequest),
+        (&["close the session"], Misread::UnreadableNumber),
+        (&["close session"], Misread::UnreadableNumber),
+        (&["close session banana"], Misread::UnreadableNumber),
+        (&["close session 3.5"], Misread::UnreadableNumber),
+        (
+            &["close session three and open session four"],
+            Misread::NotARequest,
+        ),
+        (&["don't close session three"], Misread::NotARequest),
+        (&["do not close session 3"], Misread::NotARequest),
+        (&["close it"], Misread::NotARequest),
+        (&["close this session"], Misread::NotARequest),
+        (&["close session number three"], Misread::UnreadableNumber),
         // Negation and every word the grammar does not hold.
         (
             &["do not give me the status of session three"],
@@ -138,7 +179,6 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         ),
         (&["don't brief me"], Misread::NotARequest),
         (&["never go to session 2"], Misread::NotARequest),
-        (&["close session three"], Misread::NotARequest),
         (&["run the tests in session three"], Misread::NotARequest),
         (&["status of the other session"], Misread::NotARequest),
         // A sign or a point beside a number changes what it says, and is never dropped.
@@ -221,8 +261,9 @@ fn the_grammar_reads_the_requests_it_holds_and_nothing_else() {
         (&["status session 3-"], Misread::UnreadableNumber),
         (&["status session 3+"], Misread::UnreadableNumber),
         (&["status session 3%"], Misread::UnreadableNumber),
-        // A mark after a number that is neither a stop nor a closing quotation or bracket says
-        // something else (a prime, an acute accent, a unit), and the number is not read.
+        // A mark after a number, or between the letters of a word, that is neither a stop nor a
+        // closing quotation or bracket says something else (a prime, an acute accent, a unit), and
+        // the number is not read.
         (&["status of session 3\u{2032}"], Misread::UnreadableNumber),
         (&["status of session 3\u{00b4}"], Misread::UnreadableNumber),
         (
@@ -258,13 +299,13 @@ fn a_mark_in_or_beside_a_number_leaves_no_number() {
     const MARKS: &[&str] = &[
         "(", "\"", "'", "\u{201c}", "\u{2018}", "\u{201d}", "\u{2019}", ".", ",", ";", ":", "!",
         "?", "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}", "\u{2013}", "\u{2014}",
-        "\u{2011}", "\u{2010}", ")", "\u{00b4}", "\u{02bc}", "\u{2032}",
+        "\u{2011}", "\u{2010}", ")", "\u{00b4}", "\u{02bc}", "\u{2032}", "\u{2033}",
     ];
     // Marks that are neither a stop nor a closing quotation or bracket: at the end of what was said
     // they stay in the last word, which is then no number.
     const NOT_CLOSING: &[&str] = &[
         "-", "+", "/", "\\", "*", "_", "~", "#", "%", "\u{2026}", "\u{2013}", "\u{2014}",
-        "\u{2011}", "\u{2010}", "\u{00b4}", "\u{2032}",
+        "\u{2011}", "\u{2010}", "\u{00b4}", "\u{2032}", "\u{2033}", "(",
     ];
     const HYPHENS: &[&str] = &["-", "\u{2010}", "\u{2011}"];
     for (first, second) in [("3", "3"), ("twenty", "three")] {
