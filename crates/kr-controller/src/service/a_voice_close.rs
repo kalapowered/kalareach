@@ -718,6 +718,29 @@ async fn a_read_of_a_worker_that_answers_nothing_is_an_error_in_time() {
     world.serving.abort();
 }
 
+/// KR-REQ-15.20: what a call is told of a session is read within the same time. A worker that
+/// answers nothing is an error to the phone once that has passed, and the read is not held for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_read_of_a_worker_that_answers_nothing_is_an_error_in_time() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    *world.controller.voice_budgets.lock().expect("the budgets") = VoiceBudgets {
+        read: std::time::Duration::from_millis(200),
+        close: VoiceBudgets::STATED.close,
+    };
+    script.mute_reads(true);
+
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        world.controller.voice_session_snapshot(world.session_id),
+    )
+    .await
+    .expect("the read is not held for ever");
+    let error = asked.expect_err("a worker that answers nothing is an error");
+    assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
+    world.serving.abort();
+}
+
 /// Registers a connection as `device_id`'s, as the network door does for a paired device.
 async fn admit(controller: &Controller, device_id: DeviceId) -> kr_protocol::ids::ConnectionId {
     let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
