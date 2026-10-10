@@ -42,6 +42,7 @@ members = [
     "tests/integration/privacy",
     "tests/integration/sync",
     "tests/perf",
+    "tests/support/codex-stand-in",
     "tests/support/service-stand-in",
 ]
 
@@ -90,6 +91,8 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["sin
 hex = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", features = ["zeroize"] }
+# The header types the WebSocket library takes, for the Codex stand-in's browser-style upgrade.
+http = "=1.5.0"
 # The gateway reads a terminal's upgrade request and vets it before the WebSocket library answers
 # it, with the parser that library reads it with.
 httparse = "=1.10.1"
@@ -101,6 +104,10 @@ httparse = "=1.10.1"
 # WebP publishes without a preview. It returns when WebP decoding is bounded in what it allocates.
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png"] }
 interprocess = { version = "=2.4.4", features = ["tokio"] }
+# The Codex stand-in checks every frame against the schemas the pinned release publishes. The
+# defaults resolve references over HTTP and bring a TLS stack; every reference in those schemas is
+# to a definition in the same document.
+jsonschema = { version = "=0.58.6", default-features = false }
 iroh = { version = "=1.2.0", default-features = false, features = ["metrics", "portmapper", "tls-ring"] }
 iroh-base = { version = "=1.2.0", default-features = false, features = ["key", "relay"] }
 # The signed discovery record format, at the release iroh itself is built with. The transport
