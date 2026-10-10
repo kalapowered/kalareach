@@ -145,6 +145,11 @@ interface Flight {
   readonly sent: Draft
   /** The stored draft that holds exactly that, once there is one. */
   record: StoredRef | null
+  /**
+   * An older version the composer held in the store when the write of what was sent failed. It says
+   * less than what was sent, so it goes once the prompt has ended.
+   */
+  earlier: StoredRef | null
 }
 
 /** How a write of a draft ended. */
@@ -441,13 +446,14 @@ export class DraftBook {
     const sent = this.draft(sessionId)
     const key = sent.draftId
     this.#sends += 1
-    const flight: Flight = { composer: key, sent, record: null }
+    const flight: Flight = { composer: key, sent, record: null, earlier: null }
     const token = `send-${String(this.#sends)}`
     this.#flights.set(token, flight)
     this.#enqueue(key, async () => {
       if (this.#status === 'ready' && !holdsNothing(sent)) {
         const written = await this.#write(key, sent)
-        if (written !== 'failed') flight.record = this.#find(key)?.stored ?? null
+        if (written === 'failed') flight.earlier = this.#find(key)?.stored ?? null
+        else flight.record = this.#find(key)?.stored ?? null
       }
       // The composer lets go of the record: the next thing written is a draft of its own, and a
       // composer that still holds what was sent (a phone keeps it until the answer) needs no write.
@@ -465,11 +471,9 @@ export class DraftBook {
     if (flight === undefined) return
     this.#enqueue(flight.composer, async () => {
       this.#flights.delete(token.key)
-      if (outcome === 'taken') {
-        await this.#dropRecord(flight)
-        return
-      }
-      await this.#giveBack(flight)
+      if (outcome === 'taken') await this.#dropRecord(flight)
+      else await this.#giveBack(flight)
+      if (flight.earlier !== null) await this.#dropRecord({ ...flight, record: flight.earlier })
     })
   }
 
@@ -553,8 +557,11 @@ export class DraftBook {
       ...sent,
       draftId: key,
       revision: base.revision + 1,
-      // A break in contact since the press is a fact about the connection, which the text keeps.
-      state: composer?.state === 'detached' ? 'detached' : sent.state,
+      // What happened to the conversation since the press is a fact about it, which the text keeps.
+      state:
+        composer?.state === 'conflicted' || composer?.state === 'orphaned' || composer?.state === 'detached'
+          ? composer.state
+          : sent.state,
       updatedAtMs: Date.now(),
       stored: record
     }
