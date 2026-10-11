@@ -590,6 +590,68 @@ async fn a_bundle_asked_for_without_content_carries_no_content_entry() {
     );
 }
 
+/// KR-REQ-26.13, KR-REQ-26.44: over a document of a level this build does not read, `kr doctor`
+/// warns with both levels and the count, prints the members it ignores whole beside the keys the owner
+/// wrote, and the support bundle carries only their class and length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_doctor_prints_the_members_a_higher_level_document_adds_and_the_bundle_withholds_them() {
+    const NAME: &str = "zq_api_credential_hint";
+    let host = Host::start().await;
+    let document = kr_cli::doctor::configuration::document_path(&host.temp.environment());
+    kr_ipc::paths::write_owner_only_file(
+        &document,
+        format!(
+            r#"{{"version": 3, "level": 2, "preferences": {{"sleep_inhibition": "battery_too"}}, "{NAME}": {{"enabled": true}}}}"#
+        )
+        .as_bytes(),
+    )
+    .expect("the document");
+
+    let printed = host.kr(&["doctor"]);
+    let said = String::from_utf8_lossy(&printed.stdout).into_owned();
+    let row = said
+        .lines()
+        .find(|line| line.contains("configuration.ignored_members"))
+        .unwrap_or_else(|| panic!("no row of the ignored members: {said}"));
+    assert!(
+        row.contains(&format!(
+            "configuration.ignored_members = {NAME} from host_configuration"
+        )),
+        "the key is this build's own word and the name is the owner's, whole: {row}"
+    );
+    let status = said
+        .lines()
+        .find(|line| line.starts_with("configuration ") && line.contains("level 2"))
+        .unwrap_or_else(|| panic!("no line of the levels: {said}"));
+    assert!(
+        status.contains("reads level 1") && status.contains("1 member this build does not know"),
+        "{status}"
+    );
+    assert!(
+        said.lines().any(|line| {
+            line.starts_with("warning") && line.contains("This host's configuration document")
+        }),
+        "and the check warns: {said}"
+    );
+    let applied = said
+        .lines()
+        .find(|line| line.contains("sleep_inhibition = battery_too"))
+        .unwrap_or_else(|| panic!("the setting this build knows is not in force: {said}"));
+    assert!(applied.contains("from host_configuration"), "{applied}");
+
+    // The bundle is read by somebody else.
+    let path = host.temp.root().join("support.tar");
+    let output = host.kr(&["doctor", "--bundle", path.to_str().expect("a path")]);
+    let bundle = Bundle { path, output };
+    for (name, bytes) in bundle.entries() {
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(NAME),
+            "{name} carries the member's name: {text}"
+        );
+    }
+}
+
 /// KR-REQ-07.25: `kr doctor` says where a live session's `PATH`, locale and working directory came
 /// from, in closed words, and so does the content export's record of it. The session is one the
 /// command line creates for nobody to see, so it is started with the host's environment, and its

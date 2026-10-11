@@ -3175,3 +3175,185 @@ fn record_unreachable_worker(
         .expect("the worker is recorded");
     reservation.session_id
 }
+
+/// A document of level 2: a setting this build knows, a ceiling, and a section of a newer release
+/// whose name looks like a credential.
+const AT_A_HIGHER_LEVEL: &[u8] = br#"{
+  "version": 3,
+  "level": 2,
+  "revision": 5,
+  "preferences": { "sleep_inhibition": "battery_too" },
+  "ceilings": { "session_limit": 4 },
+  "zq_api_credential_hint": { "enabled": true }
+}"#;
+
+/// KR-REQ-26.13: a daemon over a document of a level it does not read applies every member it knows,
+/// does not fail closed, reports the members it ignores, and says what to do about them; the
+/// report an owner reads names them, and the form a paired device receives carries only their class
+/// and length. The daemon refuses to edit the document and leaves the file as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_rest() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let environment = host.tree().environment();
+    write_document_bytes(&environment, AT_A_HIGHER_LEVEL);
+    let host = host.restart().await;
+    let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
+
+    let mut local = host.client().await;
+    let result: HostDoctorResult = typed(
+        &local
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
+    );
+    let reported = &result.configuration;
+    assert_eq!(
+        reported.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        reported.status
+    );
+    let setting = reported
+        .values
+        .iter()
+        .find(|value| value.key == "sleep_inhibition")
+        .expect("the sleep setting");
+    assert_eq!(
+        setting.value(),
+        "battery_too",
+        "a member this build knows applies"
+    );
+    let ceiling = reported
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "session_limit")
+        .expect("the session ceiling");
+    assert!(ceiling.value.as_str().contains('4'), "{ceiling:?}");
+
+    let ignored = reported
+        .values
+        .iter()
+        .find(|value| value.key == config_ignored_members())
+        .expect("the row of the members this build ignores");
+    assert_eq!(ignored.value(), "zq_api_credential_hint", "{ignored:?}");
+    let check = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "configuration-document")
+        .expect("the document check");
+    assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
+    let said = check.detail();
+    assert!(
+        said.contains("level 2") && said.contains("reads level 1") && said.contains("1 member"),
+        "the levels and the count: {said}"
+    );
+    assert!(check.remedy().is_some(), "and what to do about it");
+
+    // The form a paired device receives never carries the name.
+    let device_view: HostDoctorResult = typed(
+        &session
+            .read(Method::HostDoctor, &())
+            .await
+            .expect("host.doctor is served to the device"),
+    );
+    let row = device_view
+        .configuration
+        .values
+        .iter()
+        .find(|value| value.key == config_ignored_members())
+        .expect("the row reaches the device");
+    assert!(!row.value().contains("zq_api_credential_hint"), "{row:?}");
+
+    // The daemon does not edit the document, and the file is as it was.
+    let path = kr_worker::config::document_path(&environment);
+    let before = std::fs::read(&path).expect("the document");
+    let refused = host
+        .controller()
+        .apply_configuration(&Change::SleepInhibition(SleepInhibitionSetting::Off))
+        .await
+        .expect_err("an edit of a document above this build's level is refused");
+    let said = format!("{refused}");
+    assert!(
+        said.contains("level 2") && said.contains("nothing was written"),
+        "{said}"
+    );
+    assert_eq!(std::fs::read(&path).expect("the document"), before);
+
+    session.close();
+    host.stop().await;
+}
+
+/// The key of the report's row of ignored members.
+fn config_ignored_members() -> &'static str {
+    kr_protocol::hostinfo::configuration::IGNORED_MEMBERS_KEY
+}
+
+/// KR-REQ-26.13: a daemon over a document of a level it does not read accepts what it applied and
+/// accepts nothing again at the next start, though the file still holds what it ignores: the
+/// registry's copy is the document as this build read it, equal to the file's reading. The file is
+/// never changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_over_a_document_at_a_higher_level_accepts_nothing_again() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let environment = host.tree().environment();
+    write_document_bytes(&environment, AT_A_HIGHER_LEVEL);
+    let path = kr_worker::config::document_path(&environment);
+
+    // The first start over the document accepts it.
+    let stopped = host.shut_down().await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings.clone()).await;
+    let stopped = host.shut_down().await;
+
+    // Count what writes the accepted document from here on, in the file the daemon opens.
+    let database = stopped.tree().environment().registry_database();
+    let connection = rusqlite::Connection::open(&database).expect("the registry file");
+    connection
+        .execute_batch(
+            "CREATE TABLE acceptance_writes (n INTEGER);
+             CREATE TRIGGER count_acceptance AFTER UPDATE OF accepted_document ON environment
+             BEGIN INSERT INTO acceptance_writes VALUES (1); END;",
+        )
+        .expect("a trigger that counts");
+    let record: Option<String> = connection
+        .query_row("SELECT accepted_document FROM environment", [], |row| {
+            row.get(0)
+        })
+        .expect("the accepted document");
+    drop(connection);
+    let file = std::fs::read(&path).expect("the document");
+    let from_the_record = config::from_record(record.as_deref());
+    assert_eq!(
+        from_the_record,
+        kr_protocol::hostinfo::configuration::load(Some(&file)).document,
+        "the registry's copy is what this build read from the file, which is what the start compares"
+    );
+    assert_eq!(
+        from_the_record.expect("accepted").level,
+        1,
+        "and it states the level of what was applied"
+    );
+
+    // The second start finds nothing to accept.
+    let host = stopped.start(settings).await;
+    let connection = rusqlite::Connection::open(&database).expect("the registry file");
+    let writes: i64 = connection
+        .query_row("SELECT COUNT(*) FROM acceptance_writes", [], |row| {
+            row.get(0)
+        })
+        .expect("the count");
+    assert_eq!(writes, 0, "the start accepted a document it had accepted");
+    drop(connection);
+    let effective = host.controller().effective_configuration().await;
+    assert_eq!(effective.status.state, DocumentState::Loaded);
+    assert_eq!(
+        std::fs::read(&path).expect("the document"),
+        file,
+        "the file is the owner's"
+    );
+
+    host.stop().await;
+}

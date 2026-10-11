@@ -690,6 +690,15 @@ pub fn effective(
         resolver.loaded().document.as_ref(),
         &resolver.document().display().to_string(),
     ));
+    // The members of a document of a higher level that this build ignores. The row is how the
+    // report, and the check that reads it, know that this build applies less than the document
+    // says and will not edit it.
+    if let Some(newer) = &resolver.loaded().newer {
+        values.push(configuration::ignored_row(
+            newer,
+            &resolver.document().display().to_string(),
+        ));
+    }
     // What the document asks for, narrowed by what this machine allows, and then replaced by the
     // number admission is actually enforcing. The two are the same on an ordinary host; where they
     // differ - an unusable document, or effects that failed - the report prints the one in force
@@ -993,7 +1002,12 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
             .field("EffectiveConfiguration", "stale_documents", stale)
             .stated(" is a document this build no longer reads and is ignored");
     }
-    let wrong = status.state.is_a_problem() || !effective.stale_documents.is_empty();
+    let ignores_members = effective
+        .values
+        .iter()
+        .any(|value| value.key == configuration::IGNORED_MEMBERS_KEY);
+    let wrong =
+        status.state.is_a_problem() || ignores_members || !effective.stale_documents.is_empty();
     checks.push(DoctorCheck::new(
         "configuration-document",
         "This host's configuration document",
@@ -1012,6 +1026,11 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
              next start of the control daemon; every restriction this host already enforces stays \
              in force. The file is left exactly as it is: nothing here rewrites it. The line above \
              says how to put it right."
+        } else if ignores_members {
+            "Move to a release that reads this document's level; the settings in the members this \
+             release does not know do not apply while it is older, and this release will not edit \
+             the document. To edit it here, remove those members and lower `level` to the level \
+             this release reads."
         } else {
             "That document has no effect. Remove it once you have moved anything you still want \
              into the configuration above."
