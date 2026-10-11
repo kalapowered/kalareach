@@ -1281,7 +1281,13 @@ struct VoiceAllow {
 }
 
 /// What allowing voice came to: the sentences the grant states, and what it could not carry. The
-/// device the grant is for is not in it.
+/// device the grant is for is not in it, and neither is the barrier the host's answer may carry.
+///
+/// Replacing the standing grant ends the calls under it, and when a close sent under one of them can
+/// still reach a worker the host's answer carries the barrier of the fence that owes, naming the
+/// workers that have not acknowledged it. This answer does not pass that on: the screen that
+/// allows voice is shown while the page holds no call, it says what the new grant permits, and the
+/// grant it replaces is withdrawn whether or not that barrier holds.
 #[derive(Debug, Serialize)]
 pub struct VoiceAllowed {
     /// What the grant permits, each action in the sentence that states it.

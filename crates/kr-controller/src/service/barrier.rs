@@ -847,13 +847,14 @@ impl Controller {
     /// Publishes the debt a voice revocation wrote, if it wrote one, raises its barrier on a task
     /// of its own, and returns the wait for it.
     ///
-    /// A voice revocation commits where nothing can wait, outside the lock of the coordinator that
-    /// answers for it. A voice grant's withdrawal owes a fence only while a close forwarded under it
-    /// can still run at a worker, and the fence is the workers holding the revision that refuses
-    /// it. Its reach is the connections acting under the grants withdrawn, and none acts under a
-    /// call's grant: every connection stays admitted, at the revision now in force, so the answer
-    /// to the stop that withdrew the grant, and every other answer on the link it was sent on, is
-    /// delivered. The debt is published the moment the store has committed, so every admission and
+    /// A voice revocation commits where nothing can wait: through a seam that is not asynchronous,
+    /// which a replacement of the standing grant also runs under the coordinator's lock and a stop
+    /// runs with no lock held. A voice grant's withdrawal owes a fence only while a close forwarded
+    /// under it can still run at a worker, and the fence is the workers holding the revision that
+    /// refuses it. Its reach is the connections acting under the grants withdrawn, and none acts
+    /// under a call's grant: every connection stays admitted, at the revision now in force, so the
+    /// answer to the stop that withdrew the grant, and every other answer on the link it was sent
+    /// on, is delivered. The debt is published the moment the store has committed, so every admission and
     /// forward is refused until the barrier retires it.
     ///
     /// The caller waits outside its lock and before it answers, and is given the barrier as it

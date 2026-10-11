@@ -179,6 +179,13 @@ than only the ones that were named: several voice actions share one right, so as
 alone permits navigating, briefing and composing a prompt as well, and the person is shown that
 rather than finding it later.
 
+A spoken action is decided under the grants as this host lets them be used, which is how a typed
+request under them is decided. The rights ceiling in the host's configuration and the policy of an
+organisation's lease narrow the device's grant and the call's, and a grant this host cannot
+attribute a lease to is refused. A voice grant written while a ceiling is in force stays as narrow as
+it was written. A right the configuration removed is named among the actions the device's own access
+does not include, however the device was issued it.
+
 A device changes its own voice grant over its own connection. The person at this machine changes any
 device's on the host's own socket. A device that tries to change another device's is refused: that
 needs host-management authority, and this host does not resolve that right for a device.
@@ -260,14 +267,19 @@ that receipt.
 While a worker can still take a close up, withdrawing the voice grant it was sent under owes a
 fence. The host advances the authority revision, and a worker that has installed it refuses a close
 it had not started. A close can still be taken up from the moment the host sets out to send it until
-the worker accepts it. After any other end, including a refusal, it can be taken up until the
-deadline it was sent with. Once the worker has accepted the close, or that deadline has passed,
-stopping the call owes no fence.
+the worker accepts it. A worker that refuses a close cannot take it up afterwards, but the host
+cannot tell that refusal from a failure of its own, such as a link that broke or an answer it could
+not read, after which the worker might still take the close up. So the host holds any other end to
+the deadline the close was sent with, and stopping the call owes no fence once the worker has
+accepted the close or that deadline has passed.
 
 The fence withdraws no connection. Nothing a connection holds comes from a call's grant, so the stop
 that withdrew the grant is answered on the link it arrived on, and so is every other request on that
-link. The answer is written once the workers that answer hold the new revision. A worker that does
-not answer within the time a revocation allows stays pending, as it does for any revocation.
+link. The answer is written once the workers that answer hold the new revision, and it carries the
+barrier as it then stands, cut to the sessions the call reached. A worker that did not answer within
+the time a revocation allows is named in it as pending, which says that a close sent under the grant
+could still reach that worker. The grant is revoked either way. A stop or a replacement that owed no
+fence carries no barrier.
 
 ## The rate a call runs under
 

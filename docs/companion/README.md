@@ -346,7 +346,10 @@ in the sentence the protocol states it in, and the sessions to choose. Allowing 
 and the default actions to the host as this device's own grant, which native code names, so the
 page never holds the identity the host gave the device. The answer states what the grant permits
 and any action the device's own access does not include, which the person reads before the call
-is shown. The allowance stays until the person changes it.
+is shown. It does not pass on the barrier the host's answer carries when replacing the grant ended
+a call whose close could still reach a worker. The grant it replaces is withdrawn whether or not
+that barrier holds, and the screen is shown while the page holds no call. The allowance stays until
+the person changes it.
 
 An invitation on the pasteboard is read by native code, not by the page. A code invitation that
 names a service other than this computer's raises the system's own alert, modal to the companion's

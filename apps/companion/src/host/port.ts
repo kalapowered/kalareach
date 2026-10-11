@@ -449,7 +449,10 @@ export interface VoiceScope {
 
 /**
  * What allowing voice came to: the sentences the grant states and what it could not carry. The
- * device the grant is for is not in it; native code holds that identity.
+ * device the grant is for is not in it; native code holds that identity. Neither is the barrier the
+ * host's answer carries when replacing the grant ended a call whose close could still reach a
+ * worker: this screen is shown while the page holds no call, and it says what the new grant
+ * permits.
  */
 export interface VoiceAllowed {
   readonly statement: VoiceGrantResult['statement']
