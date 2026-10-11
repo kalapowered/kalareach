@@ -19,7 +19,8 @@ pub const PAD_VARIABLE: &str = "KR_STAND_IN_PAD";
 /// The key the terminal signs in with under the `login` variant.
 pub const KEY_VARIABLE: &str = "KR_STAND_IN_API_KEY";
 
-/// The file a terminal under `answer-when-released` waits for before it answers the approval.
+/// The file a terminal under `answer-when-released` waits for before it answers the approval, and
+/// one under `wait-to-connect` waits for before it connects.
 pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
 
 /// The ways a run can differ from the default.
@@ -62,6 +63,9 @@ pub struct Variants {
     pub idle: bool,
     /// The terminal does not answer the approval until the file `KR_STAND_IN_RELEASE` names exists.
     pub answer_when_released: bool,
+    /// The terminal says it is waiting, and does not connect until the file `KR_STAND_IN_RELEASE`
+    /// names exists.
+    pub wait_to_connect: bool,
 }
 
 impl Variants {
@@ -96,6 +100,7 @@ impl Variants {
                 "retry-plain" => variants.retry_plain = true,
                 "idle" => variants.idle = true,
                 "answer-when-released" => variants.answer_when_released = true,
+                "wait-to-connect" => variants.wait_to_connect = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }
