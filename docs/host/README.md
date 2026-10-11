@@ -2273,9 +2273,9 @@ under the revision it ran for and starts from where the fence before it ended, s
 several revisions in one announcement, or one that refused an announcement and fenced it by itself
 afterwards, names nothing under the revision of the announcement that follows. The daemon records
 every revision it announces to a worker before it sends it. When the worker acknowledges the last
-notice of an announcement, that acknowledgement takes the revisions announced before it into its
-result, in the step that records it, and the result reads their reports with its own, in revision
-order. A revision the worker has not said anything about is asked for, and the result says so until
+notice of an announcement, that acknowledgement takes into its result, in the step that records it,
+the other revisions of that announcement and the revisions announced before it that no result has
+taken in, and the result reads their reports with its own, in revision order. A revision the worker has not said anything about is asked for, and the result says so until
 it answers. A revision the daemon cannot read, because its report went for room or the worker
 answered none of too many announcements, is counted in the result as names that are no longer held
 or revisions that are not read. A worker that missed more revisions than the daemon keeps reports

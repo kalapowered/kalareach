@@ -440,7 +440,7 @@ impl Controller {
                 }
             };
             match outcome {
-                Some(ack) if ack.revision.get() >= revision.get() => {
+                Some((ack, earlier)) if ack.revision.get() >= revision.get() => {
                     // The barrier first, because it is what validates the binding: this
                     // announcement was made over one control path, and another exchange can lose
                     // that path and advance the binding while this one waits. Recording the
@@ -459,6 +459,7 @@ impl Controller {
                         binding,
                         ack.revision,
                         ack.fence,
+                        &earlier,
                     );
                     if accepted && evidenced {
                         {
@@ -612,7 +613,8 @@ impl Controller {
     }
 
     /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
-    /// first, and answers the acknowledgement of the last, which is the one the barrier waits on.
+    /// first, and answers the acknowledgement of the last, which is the one the barrier waits on,
+    /// with the revisions of the notices before it.
     /// It answers nothing when an exchange failed or ran out, `bound` after it began when one is
     /// given.
     ///
@@ -629,7 +631,10 @@ impl Controller {
         revision: AuthorityRevision,
         held: AuthorityRevision,
         bound: Option<std::time::Duration>,
-    ) -> Option<kr_protocol::worker::AuthorityRevisionAck> {
+    ) -> Option<(
+        kr_protocol::worker::AuthorityRevisionAck,
+        Vec<AuthorityRevision>,
+    )> {
         let mut notices = self.revision_notices(
             revision,
             held,
@@ -642,16 +647,19 @@ impl Controller {
             notices.iter().map(|notice| notice.revision),
         );
         let last = notices.pop().expect("an announcement is made");
-        for earlier in notices {
+        let earlier: Vec<AuthorityRevision> =
+            notices.iter().map(|notice| notice.revision).collect();
+        for notice in notices {
             #[cfg(feature = "testing")]
-            self.record_announcement(session_id, &earlier);
-            let ack = Self::exchange(bound, link.client().announce_revision(earlier)).await?;
+            self.record_announcement(session_id, &notice);
+            let ack = Self::exchange(bound, link.client().announce_revision(notice)).await?;
             self.note_earlier_acknowledgement(session_id, binding, ack)
                 .await;
         }
         #[cfg(feature = "testing")]
         self.record_announcement(session_id, &last);
-        Self::exchange(bound, link.client().announce_revision(last)).await
+        let ack = Self::exchange(bound, link.client().announce_revision(last)).await?;
+        Some((ack, earlier))
     }
 
     /// The answer of one exchange with a worker, or nothing when it failed or took longer than

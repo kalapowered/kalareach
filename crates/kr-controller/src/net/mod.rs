@@ -1719,15 +1719,19 @@ impl Controller {
             Ok(Err(_)) | Err(_) => None,
         };
         match answered {
-            Some(ack) if ack.revision.get() >= revision.get() => {
+            Some((ack, earlier)) if ack.revision.get() >= revision.get() => {
                 // What its fence rejected and could not take back travels with the
                 // acknowledgement, because section 9 makes the acknowledgement two statements. A
                 // worker that said nothing about its fence has made one of them, and the barrier
                 // reports it as pending for exactly that reason.
                 let evidenced = ack.fence.is_some();
-                let accepted =
-                    self.leases
-                        .acknowledge_announced(session_id, binding, ack.revision, ack.fence);
+                let accepted = self.leases.acknowledge_announced(
+                    session_id,
+                    binding,
+                    ack.revision,
+                    ack.fence,
+                    &earlier,
+                );
                 if accepted && evidenced {
                     self.registry
                         .lock()

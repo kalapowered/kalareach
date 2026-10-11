@@ -419,13 +419,13 @@ impl WorkerFences {
     /// Takes the revisions announced to this worker before `revision` into the result of
     /// `revision`, which the worker has just acknowledged as the last of an announcement.
     ///
-    /// A result that has been taken in before, or that a later one has overtaken, is left as it is.
+    /// The result reads the earlier revisions of that announcement, `own`, and, when no result has
+    /// taken them in yet, every revision announced before it that no result took in: the ones
+    /// refused or lost in announcements that came to nothing. A result that a later one has
+    /// overtaken takes in only its own announcement, because the later one has taken the rest.
     /// The revisions the worker answered come first and then the newest of the ones it did not;
     /// those that do not fit in what the daemon keeps are counted as unread.
-    fn claim(&mut self, revision: AuthorityRevision) {
-        if revision <= self.claimed_through {
-            return;
-        }
+    fn claim(&mut self, revision: AuthorityRevision, own: &[AuthorityRevision]) {
         let Some(position) = self
             .reports
             .iter()
@@ -433,11 +433,21 @@ impl WorkerFences {
         else {
             return;
         };
-        let mut earlier: Vec<AuthorityRevision> = self.told.range(..revision).copied().collect();
-        self.told = self.told.split_off(&revision);
-        self.told.remove(&revision);
-        self.claimed_through = revision;
-        let mut unread = std::mem::take(&mut self.unread);
+        let mut earlier: BTreeSet<AuthorityRevision> = own
+            .iter()
+            .copied()
+            .filter(|earlier| *earlier < revision)
+            .chain(self.reports[position].carried.iter().copied())
+            .collect();
+        let mut unread = 0;
+        if revision > self.claimed_through {
+            earlier.extend(self.told.range(..revision).copied());
+            self.told = self.told.split_off(&revision);
+            self.told.remove(&revision);
+            self.claimed_through = revision;
+            unread = std::mem::take(&mut self.unread);
+        }
+        let mut earlier: Vec<AuthorityRevision> = earlier.into_iter().collect();
         earlier.sort_by_key(|earlier| {
             (
                 self.reports
@@ -453,7 +463,7 @@ impl WorkerFences {
         earlier.sort_unstable();
         let report = &mut self.reports[position];
         report.carried = earlier;
-        report.unread = unread;
+        report.unread = report.unread.saturating_add(unread);
     }
 
     /// Returns the highest revision this worker has said it installed.
@@ -839,7 +849,8 @@ impl AuthorityBarrier {
 
     /// Records a worker's acknowledgement of the last revision of an announcement, as
     /// [`Self::acknowledge`] does, and in the same step takes the revisions announced to the worker
-    /// before it into this revision's result.
+    /// before it into this revision's result: `earlier` are the other revisions of the same
+    /// announcement.
     ///
     /// Done where the acknowledgement is accepted, under the binding it was made over, because a
     /// binding another announcement replaces afterwards must not take the revisions from it: the
@@ -852,6 +863,7 @@ impl AuthorityBarrier {
         binding: WorkerBinding,
         revision: AuthorityRevision,
         evidence: Option<kr_protocol::action::FenceEvidence>,
+        earlier: &[AuthorityRevision],
     ) -> bool {
         let _order = self.ordered();
         if binding == WorkerBinding::default() || binding != self.leases.binding(session_id) {
@@ -861,7 +873,7 @@ impl AuthorityBarrier {
             let mut fences = self.lock();
             let held = fences.entry(session_id).or_default();
             held.record(revision, evidence);
-            held.claim(revision);
+            held.claim(revision, earlier);
         }
         self.leases.acknowledge(session_id, binding, revision)
     }
@@ -2581,6 +2593,7 @@ mod tests {
             first,
             AuthorityRevision::new(5),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         // Another announcement binds the worker again before the result is read.
         let _second = barrier.bind(session(1));
@@ -2612,6 +2625,7 @@ mod tests {
             binding,
             AuthorityRevision::new(5),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         assert_eq!(
             barrier.unasked_before(session(1), AuthorityRevision::new(5)),
@@ -2658,6 +2672,7 @@ mod tests {
             binding,
             AuthorityRevision::new(5),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         assert!(barrier.acknowledge(session(1), binding, AuthorityRevision::new(4), None));
         assert!(
@@ -2695,6 +2710,7 @@ mod tests {
             binding,
             AuthorityRevision::new(5),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         // Six more reports fill what the daemon keeps, and a seventh lets revision 4's go.
         for revision in 6..=12 {
@@ -2738,6 +2754,7 @@ mod tests {
             binding,
             AuthorityRevision::new(6),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         // Revision 4 was asked for after, and names the action as it stood before.
         assert!(barrier.acknowledge(
@@ -2772,6 +2789,7 @@ mod tests {
             binding,
             AuthorityRevision::new(5),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         // An announcement that read the record before that result was made tells 4 and 5 again.
         barrier.announced(
@@ -2795,6 +2813,7 @@ mod tests {
             binding,
             AuthorityRevision::new(7),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         let report = barrier.report(AuthorityRevision::new(7), [session(1)]);
         assert_eq!(
@@ -2816,6 +2835,7 @@ mod tests {
             binding,
             AuthorityRevision::new(100),
             evidence(Vec::new(), Vec::new()),
+            &[],
         ));
         let report = barrier.report(AuthorityRevision::new(100), [session(1)]);
         let detail = &report.workers[0].detail;
@@ -2827,5 +2847,52 @@ mod tests {
                 .len(),
             MAX_CARRIED_REVISIONS
         );
+    }
+
+    /// A result that a later one has overtaken before its acknowledgement was recorded still reads
+    /// the announcement it was made by.
+    #[test]
+    fn a_result_a_later_one_has_overtaken_still_reads_its_own_announcement() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(
+            session(1),
+            binding,
+            [AuthorityRevision::new(4), AuthorityRevision::new(5)],
+        );
+        barrier.announced(
+            session(1),
+            binding,
+            [AuthorityRevision::new(6), AuthorityRevision::new(7)],
+        );
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            AuthorityRevision::new(6),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            AuthorityRevision::new(7),
+            evidence(Vec::new(), Vec::new()),
+            &[AuthorityRevision::new(6)],
+        ));
+        // The first announcement's answers are recorded after the second's.
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            AuthorityRevision::new(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            AuthorityRevision::new(5),
+            evidence(Vec::new(), Vec::new()),
+            &[AuthorityRevision::new(4)],
+        ));
+        let report = barrier.report(AuthorityRevision::new(5), [session(1)]);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
     }
 }
