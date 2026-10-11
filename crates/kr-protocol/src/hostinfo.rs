@@ -1331,7 +1331,8 @@ impl ComposedBundle {
 ///
 /// ```json
 /// {
-///   "version": 2,
+///   "version": 3,
+///   "level": 1,
 ///   "revision": 3,
 ///   "preferences": { "sleep_inhibition": "mains_only" },
 ///   "profiles": { "review": { "worker_profile": "headless_user" } },
@@ -1407,6 +1408,13 @@ impl ComposedBundle {
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
     use std::collections::BTreeMap;
+
+    mod levels;
+
+    pub use levels::{
+        BASE_LEVEL, LEVEL, LEVELLED, Levelled, NEAR_MISS, Newer, Release, THIS_RELEASE,
+        is_schema_name, is_unused, level_of, names_by_member_of, near_miss,
+    };
 
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -1668,7 +1676,11 @@ pub mod configuration {
     /// that reads version 1 only refuses a document with a section it does not know, so the version
     /// rose with the section, and a switch back to such a release is refused while the document is
     /// at 2.
-    pub const VERSION: u64 = 2;
+    ///
+    /// Version 3 is where levels arrived (`level`). A later section of nullable fields, where an
+    /// absent section means it is not used, costs a level and not a version (see [`LEVEL`]); a
+    /// release before levels reads a document at version 3 as one at a version it does not know.
+    pub const VERSION: u64 = 3;
 
     /// The oldest version this build reads and brings forward.
     ///
@@ -1906,6 +1918,14 @@ pub mod configuration {
     pub struct ConfigurationDocument {
         /// The schema version this document is written against.
         pub version: u64,
+        /// The highest level among the sections this document holds that arrived with a level.
+        ///
+        /// A writer stamps it, so a release that reads up to this level reads the document
+        /// strictly, and a release that reads less ignores the sections it does not know, applies
+        /// the rest, and refuses to edit the document. A document that states none is at the base
+        /// level.
+        #[serde(default = "levels::base_level")]
+        pub level: u64,
         /// The revision this host applied. It rises by one with every validated edit.
         pub revision: u64,
         /// The ordinary preferences that apply when no profile is selected.
@@ -1976,6 +1996,7 @@ pub mod configuration {
         fn default() -> Self {
             Self {
                 version: VERSION,
+                level: BASE_LEVEL,
                 revision: 0,
                 preferences: PreferenceSet::default(),
                 profiles: BTreeMap::new(),
@@ -2680,6 +2701,10 @@ pub mod configuration {
         pub document: Option<ConfigurationDocument>,
         /// What it turned out to be.
         pub status: DocumentStatus,
+        /// What the document held above this build's level that was left out, when it declares a
+        /// level this build does not read. The document is then used without those members and is
+        /// never edited.
+        pub newer: Option<Newer>,
     }
 
     impl Loaded {
@@ -2729,6 +2754,19 @@ pub mod configuration {
     /// stopped applying, and some defaults are wider than anything the owner could have chosen.
     #[must_use]
     pub fn load(bytes: Option<&[u8]>) -> Loaded {
+        load_in(bytes, &THIS_RELEASE)
+    }
+
+    /// Reads the bytes of a configuration document as a release reads them.
+    ///
+    /// A document at or below the release's level is read strictly. One above it has the top-level
+    /// members the release does not read removed and counted before the strict read, so a section
+    /// of a newer release does not make the document unusable and a restriction the owner wrote
+    /// stays in force; the members the release does read stay strict at every depth, and a removed
+    /// member that is a misspelling or a misplaced field of a name the release reads is refused
+    /// rather than ignored.
+    #[must_use]
+    pub fn load_in(bytes: Option<&[u8]>, release: &Release) -> Loaded {
         let Some(bytes) = bytes else {
             return Loaded {
                 document: None,
@@ -2737,6 +2775,7 @@ pub mod configuration {
                     detail: Sentence::new()
                         .stated("no configuration document; every value is the product default"),
                 },
+                newer: None,
             };
         };
         let value: serde_json::Value = match serde_json::from_slice(bytes) {
@@ -2759,6 +2798,7 @@ pub mod configuration {
             .unwrap_or(VERSION);
         if !(OLDEST_VERSION..=VERSION).contains(&declared) {
             return Loaded {
+                newer: None,
                 document: None,
                 status: DocumentStatus {
                     state: DocumentState::UnknownVersion,
@@ -2779,6 +2819,21 @@ pub mod configuration {
                 },
             };
         }
+        let declared_level = match levels::declared_level(&value, declared) {
+            Ok(level) => level,
+            Err(problem) => return invalid(vec![problem]),
+        };
+        let (value, newer) = if declared_level > release.level {
+            match levels::drop_unknown(value, declared_level, release) {
+                Ok((value, newer)) => (value, Some(newer)),
+                Err(problem) => return invalid(vec![problem]),
+            }
+        } else {
+            if let Err(problem) = levels::refuse_listed(&value, release) {
+                return invalid(vec![problem]);
+            }
+            (value, None)
+        };
         let mut document: ConfigurationDocument = match serde_json::from_value(value) {
             Ok(document) => document,
             Err(error) => {
@@ -2789,6 +2844,21 @@ pub mod configuration {
                 ]);
             }
         };
+        // The level of the typed document is the level of the members this release kept, so the
+        // document and the copy of it the registry records state what was applied. A document that
+        // states a lower level than the sections it holds need is refused, as the release that
+        // reads those sections refuses it.
+        let held = level_of(&document, release);
+        if newer.is_none() && declared_level < held {
+            return invalid(vec![
+                Sentence::new()
+                    .stated("the document states level ")
+                    .number(declared_level)
+                    .stated(" and holds a section of level ")
+                    .number(held),
+            ]);
+        }
+        document.level = held;
         // The step from an earlier version: its sections are read as they are, and the ones it
         // lacks are the defaults, so only the version it is read at changes. The file is not
         // touched; the next edit writes it at the version this build writes.
@@ -2800,6 +2870,21 @@ pub mod configuration {
                 .number(VERSION);
             document.version = VERSION;
             detail
+        } else if let Some(newer) = &newer {
+            Sentence::new()
+                .stated("version ")
+                .number(VERSION)
+                .stated(", level ")
+                .number(newer.declared)
+                .stated("; this build reads level ")
+                .number(release.level)
+                .stated("; ")
+                .number(newer.count)
+                .stated(if newer.count == 1 {
+                    " member this build does not know is ignored"
+                } else {
+                    " members this build does not know are ignored"
+                })
         } else {
             Sentence::new().stated("version ").number(VERSION)
         };
@@ -2812,6 +2897,7 @@ pub mod configuration {
                 state: DocumentState::Loaded,
                 detail,
             },
+            newer,
         }
     }
 
@@ -2823,6 +2909,7 @@ pub mod configuration {
     #[must_use]
     pub fn unreadable(detail: Sentence) -> Loaded {
         Loaded {
+            newer: None,
             document: None,
             status: DocumentStatus {
                 state: DocumentState::Unreadable,
@@ -2847,6 +2934,7 @@ pub mod configuration {
             detail = detail.sentence(problem);
         }
         Loaded {
+            newer: None,
             document: None,
             status: DocumentStatus {
                 state: DocumentState::Invalid,
@@ -2861,7 +2949,17 @@ pub mod configuration {
     /// Returns the file contents that record one document.
     #[must_use]
     pub fn contents(document: &ConfigurationDocument) -> String {
-        let mut text = serde_json::to_string_pretty(document)
+        contents_in(document, &THIS_RELEASE)
+    }
+
+    /// Returns the file contents that record one document as a release writes it: the level
+    /// stamped is the highest among the sections the document holds, in the document's own member
+    /// order, and a section that is unused is not written.
+    #[must_use]
+    pub fn contents_in(document: &ConfigurationDocument, release: &Release) -> String {
+        let mut stamped = document.clone();
+        stamped.level = level_of(document, release);
+        let mut text = serde_json::to_string_pretty(&stamped)
             .unwrap_or_else(|_| format!("{{\"version\": {VERSION}}}"));
         text.push('\n');
         text
@@ -3558,6 +3656,32 @@ pub mod configuration {
     /// Returns [`EditRefused::NotOurs`] for a document this build must not rewrite and
     /// [`EditRefused::Invalid`] with every problem the result has.
     pub fn edit(loaded: &Loaded, change: &Change) -> Result<Edited, EditRefused> {
+        edit_in(loaded, change, &THIS_RELEASE)
+    }
+
+    /// Applies one change to a loaded document as a release applies it.
+    ///
+    /// A document above the release's level is refused whether or not any member was left out of
+    /// it: a rewrite from what this release read would drop the members it could not see.
+    ///
+    /// # Errors
+    ///
+    /// As [`edit`].
+    pub fn edit_in(
+        loaded: &Loaded,
+        change: &Change,
+        release: &Release,
+    ) -> Result<Edited, EditRefused> {
+        if let Some(newer) = &loaded.newer {
+            return Err(EditRefused::NotOurs(
+                Sentence::new()
+                    .stated("this document is at level ")
+                    .number(newer.declared)
+                    .stated(" and this build edits documents up to level ")
+                    .number(release.level)
+                    .stated("; nothing was written"),
+            ));
+        }
         let based_on = match (&loaded.document, loaded.status.state) {
             (Some(document), _) => document.revision,
             (None, DocumentState::Absent) => 0,
@@ -3641,9 +3765,10 @@ pub mod configuration {
             }
         }
         document.version = VERSION;
+        document.level = level_of(&document, release);
         document.revision = based_on + 1;
         validate(&document).map_err(EditRefused::Invalid)?;
-        let text = contents(&document);
+        let text = contents_in(&document, release);
         // The bound the reader enforces, checked against the bytes that would be written rather
         // than against the fields. A document that validated and then could not be read back would
         // take every preference in it with it.
@@ -3678,6 +3803,17 @@ pub mod configuration {
     ///
     /// Returns [`EditRefused::NotOurs`] naming both revisions when the document moved.
     pub fn still_current(edited: &Edited, current: &Loaded) -> Result<(), EditRefused> {
+        // An edit is prepared only from a document at or below the editor's level, and the read
+        // keeps only the members it knows, so a file changed since to state a higher level and
+        // hold a member this build cannot see would look unchanged and the write would drop it.
+        if let Some(newer) = &current.newer {
+            return Err(EditRefused::NotOurs(
+                Sentence::new()
+                    .stated("this document is now at level ")
+                    .number(newer.declared)
+                    .stated(", which this build does not edit; nothing was written"),
+            ));
+        }
         if current.status.state == edited.based_on_state
             && current.revision() == edited.based_on
             && current.document == edited.based_on_document
@@ -4635,6 +4771,35 @@ pub mod configuration {
     /// The key of the row [`agents_row`] contributes.
     pub const AGENTS_OWNERSHIP_KEY: &str = "agents.ownership";
 
+    /// The row a document of a level above this build's contributes: the members it holds that
+    /// this build does not know and ignores.
+    ///
+    /// Present exactly when the document is read with members left out or states a level this
+    /// build does not read, which is when the document is not edited here. The names are what the
+    /// owner wrote down, so an export carries their class and length and `kr doctor` shows them to
+    /// the owner, as it shows the keys of the other sections the owner wrote.
+    #[must_use]
+    pub fn ignored_row(newer: &Newer, origin: &str) -> super::EffectiveValue {
+        use super::export::Declared;
+
+        super::EffectiveValue::new(
+            IGNORED_MEMBERS_KEY,
+            "the members of this document that this build does not know and ignores",
+            &if newer.names.is_empty() {
+                Declared::term("none")
+            } else {
+                Declared::names(newer.names.iter().map(String::as_str))
+            },
+            ValueSource::HostConfiguration,
+            Nullable::some(origin.to_owned()),
+            Nullable::null(),
+            ValueEffect::NoEffect,
+        )
+    }
+
+    /// The key of the row [`ignored_row`] contributes.
+    pub const IGNORED_MEMBERS_KEY: &str = "configuration.ignored_members";
+
     // ---------------------------------------------------------------------------------------
     // The environment
     // ---------------------------------------------------------------------------------------
@@ -4942,13 +5107,20 @@ pub mod configuration {
     /// budgets, the documented environment variables, the variables this build reads outside the
     /// precedence, the certificate store variables it does not read, the wire words of the closed
     /// enumerations a report names, and the operating system and processor words of the platform
-    /// this build was compiled for. A string that is none of them is something somebody else wrote,
-    /// and a sentence carries its class and its length instead.
+    /// this build was compiled for, and the names of the properties the configuration document's
+    /// schema declares, at any depth, which are this build's own words. A string that is none of
+    /// them is something somebody else wrote, and a sentence carries its class and its length
+    /// instead.
+    ///
+    /// It decides only whether a string prints as itself or as its class and length, and never
+    /// grants authority, selects a route or parses anything.
     #[must_use]
     pub fn is_known_term(value: &str) -> bool {
-        PREFERENCES.iter().any(|preference| preference.key == value)
+        is_schema_name(value)
+            || PREFERENCES.iter().any(|preference| preference.key == value)
             || SELECTIONS.iter().any(|selection| selection.key == value)
             || value == AGENTS_OWNERSHIP_KEY
+            || value == IGNORED_MEMBERS_KEY
             || SELECTION_WORDS.contains(&value)
             || CEILINGS.contains(&value)
             || BUDGETS.contains(&value)

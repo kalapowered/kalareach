@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -944,6 +944,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -954,6 +955,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -963,6 +965,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -971,6 +974,7 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -978,23 +982,31 @@ impl Registry {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
                 self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
             }
-            Some(9) => self.migrate_9_to_10()?,
+            Some(9) => {
+                self.migrate_9_to_10()?;
+                self.migrate_10_to_11()?;
+            }
+            Some(10) => self.migrate_10_to_11()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1310,6 +1322,26 @@ impl Registry {
     fn migrate_9_to_10(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 10", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 10 to 11: the configuration document the registry keeps a record of is at version 3.
+    ///
+    /// The document gained its `level`, and with it a version: the record written from now on is
+    /// at version 3, and a release before levels cannot read it. A record the release before wrote
+    /// stays as it is, at version 2 or 1, and is read as a document at version 3 (the configuration
+    /// document's own step), so it is still the document the file holds and the next start does
+    /// not take the file for an edit it has not seen. No row changes.
+    ///
+    /// The record is the document as this release applied it: a section of a level this release
+    /// does not read is not in it, and the file keeps the whole of what its owner wrote.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_10_to_11(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 11", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -4355,13 +4387,17 @@ mod tests {
         );
         let document = crate::config::from_record(accepted.document.as_deref())
             .expect("the record is a document this build reads");
-        assert_eq!(document.version, 2, "read at the version this build writes");
+        assert_eq!(
+            document.version,
+            kr_protocol::hostinfo::configuration::VERSION,
+            "read at the version this build writes"
+        );
         assert_eq!(document.revision, 4);
     }
 
-    /// The release before this one, which reads version 9, kept no answer to a redemption or to a
-    /// transfer of control. A registry it left comes forward to this version with no row changed:
-    /// the answers these methods keep are written by a release that writes 10.
+    /// A release that reads version 9 kept no answer to a redemption or to a transfer of control.
+    /// A registry it left comes forward through 10 to this version with no row changed: the
+    /// answers these methods keep are written by a release that writes 10.
     #[test]
     fn a_registry_at_the_version_before_comes_forward_and_changes_no_row() {
         let directory = tempfile::tempdir().expect("a directory");
