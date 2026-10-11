@@ -200,6 +200,10 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                             .unwrap_or_default()
                             .to_owned();
                         println!("TUI: a turn is running");
+                        if variants.stop_reading {
+                            // Nothing more is read from the connection, and nothing is closed.
+                            std::future::pending::<()>().await;
+                        }
                     }
                     _ => {}
                 }
