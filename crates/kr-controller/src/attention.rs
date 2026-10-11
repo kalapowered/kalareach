@@ -75,8 +75,9 @@ use kr_protocol::attention::{
     AttentionQuietHoursParams, AttentionQuietHoursResult, AttentionReadParams, AttentionRecordRef,
     AttentionSource, AttentionSourcePage, AttentionSourcesRequest, AttentionTextRequest,
     MAX_ATTENTION_SOURCE_RECORDS, MAX_ATTENTION_SOURCE_WAIT_MS, MAX_ATTENTION_TEXT_RECORDS,
-    MAX_LOG_VIEW_FILTER_LEN, MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams,
-    ReviewReadParams, ReviewReadResult, ReviewSubject, VisitAcknowledgeParams, VisitChangedParams,
+    MAX_LOG_VIEW_FILTER_LEN, MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_ATTENTION_ITEMS,
+    MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams, ReviewReadParams, ReviewReadResult,
+    ReviewSubject, VisitAcknowledgeParams, VisitChangedParams,
 };
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -2326,6 +2327,12 @@ impl AttentionModule {
         let complete = cursors.reached_by(page);
         let built_at_boot_ms = page.built_at_boot_ms.get();
         let output_floor = page.output_floor.0.map(|floor| floor.get());
+        if events.is_empty()
+            && complete
+            && self.certify_quietly(session_id, link, built_at_boot_ms, output_floor)
+        {
+            return Ok(Taken::Complete);
+        }
         let link = Arc::clone(link);
         let taken = self
             .deciding_on_the_blocking_pool(move |module, reading| -> Answer<Taken> {
@@ -2372,6 +2379,58 @@ impl AttentionModule {
             self.wake.notify_one();
         }
         Ok(taken)
+    }
+
+    /// Takes a complete page that carries no record from the session's link, when nothing the page
+    /// could let the store decide is waiting, and reports whether it did.
+    ///
+    /// An idle session's worker answers its held request with such a page every thirty seconds. The
+    /// page's whole effect is the certificate it gives the session's origin, and a certificate
+    /// matters only to a timer of that origin the store has not yet decided: with none, nothing
+    /// that a tick would decide depends on it, so the page is neither written nor ticked nor does
+    /// it wake the maintenance loop. The store's claim on its file is refreshed by the maintenance
+    /// loop's own writes, at least once a minute.
+    ///
+    /// It answers `false`, and the page takes the full path, when the link is not the session's
+    /// current one, when the origin has a timer or an item nobody has decided about, when the inbox
+    /// is over its bound (a tick shrinks it), and when the store or the engine cannot be read.
+    fn certify_quietly(
+        &self,
+        session_id: SessionId,
+        link: &Arc<Link>,
+        built_at_boot_ms: u64,
+        output_floor: Option<u64>,
+    ) -> bool {
+        let reading = self.reading();
+        // Taken in the order the full path takes them: the store, then the origins.
+        let Ok(store) = self.store() else {
+            return false;
+        };
+        let waiting = !matches!(
+            store.next_deadline_of(&Origin::Session(session_id), reading),
+            Ok(None)
+        );
+        let within_bound = store.engine().is_ok_and(|engine| {
+            u64::try_from(engine.items().count())
+                .is_ok_and(|held| held <= MAX_RETAINED_ATTENTION_ITEMS)
+        });
+        if waiting || !within_bound {
+            return false;
+        }
+        let mut origins = self.origins();
+        if !origins
+            .links
+            .get(&session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, link))
+        {
+            return false;
+        }
+        let certified = origins.certified.entry(session_id).or_insert(0);
+        *certified = (*certified).max(built_at_boot_ms);
+        if let Some(floor) = output_floor {
+            origins.output_floor.insert(session_id, floor);
+        }
+        true
     }
 
     fn certificates(&self) -> Certificates {
@@ -6557,6 +6616,127 @@ pub(crate) mod tests {
         assert_ne!(
             decided[0], polled_on,
             "the page was decided on the thread that read it"
+        );
+    }
+
+    /// The commits another connection makes to the attention store's file, as SQLite counts them:
+    /// the number a connection reads with `PRAGMA data_version` changes when any other connection
+    /// has committed since it last looked.
+    struct Commits {
+        observer: rusqlite::Connection,
+        last: std::cell::Cell<i64>,
+    }
+
+    impl Commits {
+        fn of(temp: &kr_ipc::testing::TempHost) -> Self {
+            let observer = rusqlite::Connection::open(
+                temp.environment().state_dir().join("attention.sqlite3"),
+            )
+            .expect("opens the attention store");
+            observer
+                .busy_timeout(Duration::from_secs(10))
+                .expect("a busy timeout");
+            Self {
+                observer,
+                last: std::cell::Cell::new(-1),
+            }
+        }
+
+        /// Whether another connection committed since the last call.
+        fn since_last(&self) -> bool {
+            let version: i64 = self
+                .observer
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .expect("a data version");
+            let before = self.last.replace(version);
+            before != version
+        }
+    }
+
+    /// KR-PERF-003: a complete page that carries no record, from a session whose origin has no
+    /// timer, is neither written to the store nor does it wake the maintenance loop: an idle
+    /// session's worker answers its held request with one every thirty seconds, and each of them
+    /// used to commit twice and make the loop commit a third time. The control is the same
+    /// session once it has an item nobody has decided about: the page's certificate is what lets
+    /// that be decided, so the page takes the full path and decides it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_page_from_an_idle_session_writes_nothing_and_one_that_decides_something_does()
+    {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+        let commits = Commits::of(&temp);
+        // The wake the setup may have left is not the pages'.
+        let _ = tokio::time::timeout(Duration::ZERO, module.wake.notified()).await;
+        let _ = commits.since_last();
+
+        let empty = AttentionSourcePage {
+            built_at_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms()),
+            ..question_page_without_a_question()
+        };
+        for _ in 0..5 {
+            let taken = module
+                .take_page(session_id, &link, Cursors::default(), &empty)
+                .await
+                .expect("the page is taken");
+            assert!(matches!(taken, Taken::Complete));
+        }
+        assert!(!commits.since_last(), "five empty pages committed nothing");
+        assert!(
+            tokio::time::timeout(Duration::ZERO, module.wake.notified())
+                .await
+                .is_err(),
+            "and woke nobody"
+        );
+        assert!(
+            module
+                .certificates()
+                .at(&Origin::Session(session_id))
+                .is_some(),
+            "the page still certified the session's origin"
+        );
+
+        // The control, for a session nothing has certified: a page that raises an item and
+        // certifies nothing leaves it undecided, and the next empty page's certificate decides it,
+        // so that page is written.
+        let other = SessionId::new(kr_ipc::new_uuid());
+        let (other_link, _other_reader, _other_writer) = linked(&temp, 2, &module, other).await;
+        let mut partial = question_page(other);
+        partial.questions.head = U64::new(2);
+        let taken = module
+            .take_page(other, &other_link, Cursors::default(), &partial)
+            .await
+            .expect("the page is taken");
+        assert!(matches!(taken, Taken::Partial));
+        assert_eq!(decisions(&module)[0].0, None, "nothing decided it yet");
+        let _ = commits.since_last();
+        let taken = module
+            .take_page(
+                other,
+                &other_link,
+                Cursors {
+                    questions: 2,
+                    ..Cursors::default()
+                },
+                &AttentionSourcePage {
+                    questions: AttentionQuestionSlice {
+                        head: U64::new(2),
+                        records: Vec::new(),
+                    },
+                    ..empty
+                },
+            )
+            .await
+            .expect("the page is taken");
+        assert!(matches!(taken, Taken::Complete));
+        assert!(
+            commits.since_last(),
+            "the page that decides something is written"
+        );
+        assert!(
+            decisions(&module)[0].0.is_some(),
+            "and the certificate decided the item"
         );
     }
 
