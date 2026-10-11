@@ -5019,10 +5019,6 @@ impl Session {
     }
 }
 
-/// Returns whichever of two authority deadlines ends first.
-///
-/// A null deadline is authority that does not expire, so it never shortens the other one and never
-/// replaces one that does expire.
 /// When the authority behind bytes of input ends, on both clocks it is decided on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InputAuthority {
@@ -5032,6 +5028,10 @@ pub struct InputAuthority {
     pub utc_ms: Option<u64>,
 }
 
+/// Returns whichever of two authority deadlines ends first.
+///
+/// A null deadline is authority that does not expire, so it never shortens the other one and never
+/// replaces one that does expire.
 const fn tightest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(if left < right { left } else { right }),
