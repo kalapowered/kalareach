@@ -77,15 +77,7 @@ impl Fixture {
         let owner = DeviceKeys::generate().expect("keys");
         let continuous = ManualClock::new();
         let moved = Arc::new(AtomicI64::new(0));
-        let read = Arc::clone(&moved);
-        let clocks = Clocks {
-            continuous: Arc::new(continuous.clone()),
-            wall: WallClock::from_fn(move || {
-                kr_ipc::now_ms()
-                    .get()
-                    .saturating_add_signed(read.load(Ordering::SeqCst))
-            }),
-        };
+        let clocks = clocks_over(&continuous, &moved);
         let host = match document {
             Some(document) => Host::start_with_document_clocks(&owner, document, clocks).await,
             None => Host::start_on_clocks(&owner, clocks).await,
@@ -188,6 +180,21 @@ impl Fixture {
         }
     }
 
+    /// Stops the daemon and starts another on the same tree in another boot of the machine,
+    /// named by `boot`: the continuous clock counts from nothing, and the wall clock is whatever it
+    /// was left at.
+    pub async fn reboot(self, boot: u8) -> Self {
+        let continuous = ManualClock::new();
+        let mut stopped = self.host.shut_down().await;
+        stopped.reboot(boot, clocks_over(&continuous, &self.moved));
+        let settings = stopped.settings().clone();
+        Self {
+            host: stopped.start(settings).await,
+            continuous,
+            ..self
+        }
+    }
+
     /// The daemon's wall clock now, in UTC milliseconds.
     pub fn now(&self) -> u64 {
         kr_ipc::now_ms()
@@ -268,6 +275,20 @@ impl Fixture {
         )
         .await
         .expect("the owner reads the list")
+    }
+}
+
+/// The daemon's clocks: `continuous`, and a wall clock that reads the machine's own moved by
+/// `moved` milliseconds.
+fn clocks_over(continuous: &ManualClock, moved: &Arc<AtomicI64>) -> Clocks {
+    let read = Arc::clone(moved);
+    Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: WallClock::from_fn(move || {
+            kr_ipc::now_ms()
+                .get()
+                .saturating_add_signed(read.load(Ordering::SeqCst))
+        }),
     }
 }
 

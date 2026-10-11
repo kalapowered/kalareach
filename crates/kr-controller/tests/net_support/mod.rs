@@ -35,6 +35,7 @@ use kr_pairing::direct::CandidateIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{
     ActionId, BuildId, DeviceId, DeviceKeyRevision, EnvironmentId, GrantId, SessionEpoch, SessionId,
 };
@@ -155,6 +156,9 @@ pub struct Host {
     secrets: Arc<MemoryStore>,
     /// The clocks the daemon measures time on, which a restart keeps.
     clocks: Clocks,
+    /// The boot a suite chose for the daemon, when it did not leave that to the machine; a restart
+    /// keeps it.
+    boot: Option<BootIdentity>,
 }
 
 /// A wall clock a suite moves by hand: the machine's own, and the time added to it.
@@ -249,6 +253,7 @@ impl Host {
             account_at,
             Arc::new(MemoryStore::new()),
             clocks,
+            None,
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -290,6 +295,7 @@ impl Host {
             AccountAt::Managed,
             Arc::new(MemoryStore::new()),
             clocks,
+            None,
         )
         .await
     }
@@ -316,6 +322,7 @@ impl Host {
             AccountAt::Managed,
             Arc::new(MemoryStore::new()),
             Clocks::system(),
+            None,
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -350,6 +357,7 @@ impl Host {
             account_at,
             secrets,
             clocks,
+            boot,
             ..
         } = self;
         clients.abort();
@@ -375,6 +383,7 @@ impl Host {
             account_at,
             secrets,
             clocks,
+            boot,
         }
     }
 
@@ -387,6 +396,7 @@ impl Host {
         account_at: AccountAt,
         secrets: Arc<MemoryStore>,
         clocks: Clocks,
+        boot: Option<BootIdentity>,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -414,7 +424,9 @@ impl Host {
                             .expect("an identity"))
                         }),
                         secret_store: StoreSelection::File,
-                        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                        boot_identity: boot.clone().unwrap_or_else(|| {
+                            kr_ipc::identity::boot_identity().expect("a boot identity")
+                        }),
                         supervisor: Box::new(RefusingSupervisor),
                         worker_program: PathBuf::from("/nonexistent/kr-worker"),
                         build_id: build(),
@@ -458,6 +470,7 @@ impl Host {
             account_at,
             secrets,
             clocks,
+            boot,
         }
     }
 
@@ -560,6 +573,7 @@ pub struct Stopped {
     account_at: AccountAt,
     secrets: Arc<MemoryStore>,
     clocks: Clocks,
+    boot: Option<BootIdentity>,
 }
 
 impl Stopped {
@@ -581,6 +595,16 @@ impl Stopped {
         self.account_at = AccountAt::Origin(origin.to_owned());
     }
 
+    /// Has the next daemon start in another boot of the machine, on `clocks`, which count from
+    /// nothing in a boot of their own. `boot` names the boot: another value, another boot.
+    pub fn reboot(&mut self, boot: u8, clocks: Clocks) {
+        self.boot = Some(BootIdentity {
+            source: kr_protocol::identity::BootIdentitySource::BootTime,
+            value: kr_protocol::scalars::Bytes::new(vec![boot; 16]),
+        });
+        self.clocks = clocks;
+    }
+
     /// Starts a daemon on the stopped one's environment tree, with its network built from
     /// `settings` and the stopped one's owner.
     pub async fn start(self, settings: NetworkSettings) -> Host {
@@ -591,9 +615,11 @@ impl Stopped {
             account_at,
             secrets,
             clocks,
+            boot,
             ..
         } = self;
-        let mut host = Host::start_on(temp, room, settings, account_at, secrets, clocks).await;
+        let mut host =
+            Host::start_on(temp, room, settings, account_at, secrets, clocks, boot).await;
         host.owner = owner;
         host
     }

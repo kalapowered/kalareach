@@ -22,7 +22,7 @@
 //! | KR-REQ-23.27 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_device_revocation_takes_every_grant_that_device_held` |
 //! | KR-REQ-23.32 | `a_question_is_read_with_view_and_answered_only_with_the_respond_right` |
 //! | KR-REQ-23.53 | `a_composite_method_needs_every_right_its_entry_lists` |
-//! | KR-REQ-24.15 | `expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_authority` |
+//! | KR-REQ-24.15 | `a_grant_at_an_older_revision_still_decides_and_one_at_a_revision_nothing_issued_is_refused` |
 
 use std::sync::Arc;
 
@@ -2343,62 +2343,24 @@ fn a_delegation_cannot_grant_a_right_the_delegating_actor_lacks() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// KR-REQ-24.15: revalidation after wake and reboot
+// KR-REQ-24.15: what a host decides again after a wake and a reboot, and what an old policy cannot
+// bring back. The daemon's part is `organisation_revalidation.rs`; this is the decision's.
 // ---------------------------------------------------------------------------------------------
 
+/// A grant issued under an older revision still decides after somebody else's revocation moved the
+/// host's revision on, and a grant naming a revision this host never issued is refused.
+///
+/// Treating the first as expired would make every revocation a host-wide expiry. The second is what
+/// a restored or invented document would put in front of the host: nothing here could have issued
+/// it.
 #[test]
-fn expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_authority() {
-    let held = grant(
-        1,
-        None,
-        &[ActionRight::SessionView],
-        GrantExpiry::At {
-            expires_at_ms: TimestampMs::new(5_000),
-        },
-    );
-    let stored = record(held.clone());
+fn a_grant_at_an_older_revision_still_decides_and_one_at_a_revision_nothing_issued_is_refused() {
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    policy.advance_authority_revision(AuthorityRevision::new(8));
 
-    decide(
-        &held,
-        &stored,
-        &mut policy,
-        request(Method::SessionRead, 1_000),
-    )
-    .expect("valid before the machine sleeps");
-
-    // The machine sleeps through the deadline. Waking is where expiry is decided again, and the
-    // clock is what decides it: nothing is carried over from before the gap.
-    policy.revalidate(900_000);
-    assert_eq!(policy.revalidated_at_ms(), 900_000);
-    assert_eq!(
-        decide(
-            &held,
-            &stored,
-            &mut policy,
-            request(Method::SessionRead, 900_000)
-        ),
-        Err(Refusal::Expired {
-            expired_at_ms: 5_000
-        })
-    );
-
-    // A policy document restored from a backup names an older revision. It is refused, and the
-    // revision in force does not move.
-    policy.advance_authority_revision(AuthorityRevision::new(7));
-    assert!(!policy.accept_policy(AuthorityRevision::new(3)));
-    assert!(!policy.accept_policy(AuthorityRevision::new(7)));
-    assert_eq!(policy.authority_revision(), AuthorityRevision::new(7));
-    assert_eq!(policy.accepted_floor(), AuthorityRevision::new(7));
-    assert!(policy.accept_policy(AuthorityRevision::new(8)));
-    assert_eq!(policy.authority_revision(), AuthorityRevision::new(8));
-
-    // A grant issued under an older revision still decides. Somebody else's revocation advancing
-    // the host's revision is not a reason to stop honouring an untouched grant, and treating it as
-    // one would make every revocation a host-wide expiry.
     let older = Grant {
         authority_revision: AuthorityRevision::new(2),
-        expiry: GrantExpiry::Never,
         ..held
     };
     decide(
@@ -2409,8 +2371,6 @@ fn expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_au
     )
     .expect("an untouched grant survives somebody else's revocation");
 
-    // A grant claiming a revision this host has never issued is refused: nothing here could have
-    // issued it.
     let invented = Grant {
         authority_revision: AuthorityRevision::new(99),
         ..older
@@ -2697,10 +2657,6 @@ fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
     assert!(restored.enrolment(organisation_id).is_some());
     assert_eq!(restored.accepted_floor(), AuthorityRevision::new(9));
     assert_eq!(restored.utc_floor_ms(), T + 500_000);
-    assert!(
-        !restored.accept_policy(AuthorityRevision::new(5)),
-        "and a restored old policy still cannot revive authority"
-    );
 
     // The lease is deliberately not restored: a fifteen-minute deadline the organisation may have
     // withdrawn is not a thing to bring back.

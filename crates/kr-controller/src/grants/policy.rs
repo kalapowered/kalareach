@@ -14,11 +14,12 @@
 //!   dependency." An owner who chooses a bound gets exactly that bound, measured from the last
 //!   successful feed synchronisation, and the stale status and last sync are visible.
 //! * **Revalidation after wake and reboot (section 24).** "Revalidate expiry after wake/reboot; no
-//!   restored old policy can revive authority." Two halves. Expiry is re-read against the clock
-//!   the moment this host wakes or starts, which [`HostPolicy::revalidate`] does; and a policy
-//!   document restored from a backup cannot put back an authority the host has already moved past,
-//!   which [`HostPolicy::accept_policy`] refuses by keeping the highest revision this host has
-//!   ever accepted.
+//!   restored old policy can revive authority." Two halves. Expiry is decided from the clocks
+//!   at every request, so a host that wakes or starts has nothing cached across the gap to
+//!   revalidate: the continuous clock counts the sleep, and the floor of UTC readings only rises.
+//!   And a policy document restored from a backup cannot put back an authority the host has
+//!   already moved past, which [`HostPolicy::restore`] ensures by keeping the higher of the
+//!   revision the document was stored at and the one the registry holds.
 //!
 //! The third rule is the one an implementation loses by accident: a host that simply loads
 //! whatever its policy file holds will happily load last month's file. The floor is separate from
@@ -689,8 +690,6 @@ pub struct HostPolicy {
     /// synchronisation it is measured from. Shared by every copy of this policy, and published
     /// only once the policy holding a change is written down.
     offline_cell: Arc<BoundCell>,
-    /// When the host last woke or started, in UTC milliseconds.
-    revalidated_at_ms: u64,
     /// The highest UTC reading this host has decided anything from.
     utc_floor: Arc<UtcFloor>,
 }
@@ -738,7 +737,6 @@ impl HostPolicy {
             exclusively_managed: false,
             offline: None,
             offline_cell: offline_cell(None),
-            revalidated_at_ms: 0,
             utc_floor: Arc::new(UtcFloor::default()),
         }
     }
@@ -804,22 +802,6 @@ impl HostPolicy {
         if revision.get() > self.accepted_floor.get() {
             self.accepted_floor = revision;
         }
-    }
-
-    /// Accepts an authority revision this host has been told about.
-    ///
-    /// Section 24: a restored old policy cannot revive authority. A revision at or below the floor
-    /// is refused, whatever document carried it and however well signed that document is, because
-    /// a signature proves who wrote a policy and not that the policy is the current one.
-    ///
-    /// Returns whether it was accepted.
-    pub const fn accept_policy(&mut self, revision: AuthorityRevision) -> bool {
-        if revision.get() <= self.accepted_floor.get() {
-            return false;
-        }
-        self.authority_revision = revision;
-        self.accepted_floor = revision;
-        true
     }
 
     /// Verifies a whole published chain for enrolling this host in its organisation.
@@ -1094,7 +1076,6 @@ impl HostPolicy {
             exclusively_managed: stored.exclusively_managed,
             offline: stored.offline.0,
             offline_cell: offline_cell(stored.offline.0.as_ref()),
-            revalidated_at_ms: 0,
             utc_floor,
         }
     }
@@ -1172,22 +1153,6 @@ impl HostPolicy {
             offline.last_synchronised_at_ms =
                 kr_protocol::scalars::Nullable::some(kr_protocol::scalars::TimestampMs::new(at_ms));
         }
-    }
-
-    /// Revalidates this host's policy after a wake or a reboot.
-    ///
-    /// Nothing is cached across the gap. Expiry is decided from `now_ms` on the next request, and
-    /// this records the moment so a caller can see that the revalidation happened rather than
-    /// assuming it. The authority floor is untouched, which is the point: waking up is not a
-    /// reason to accept an older policy.
-    pub const fn revalidate(&mut self, now_ms: u64) {
-        self.revalidated_at_ms = now_ms;
-    }
-
-    /// When this host last revalidated after a wake or a reboot.
-    #[must_use]
-    pub const fn revalidated_at_ms(&self) -> u64 {
-        self.revalidated_at_ms
     }
 
     /// Intersects one grant with this policy for one request.

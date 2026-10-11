@@ -464,7 +464,8 @@ async fn a_lease_installed_before_a_restart_is_refused_after_it_and_a_newer_one_
     fixture.host.stop().await;
 }
 
-/// KR-REQ-17.53: a chain presented beside a lease is followed before the lease is judged. A lease
+/// KR-REQ-17.53, KR-REQ-24.15: a chain presented beside a lease is followed before the lease is
+/// judged, and an older chain cannot bring back a key revision the host moved past. A lease
 /// signed by a revision the host has not heard of is refused alone and accepted with the chain that
 /// brings the revision in; a chain that is not newer changes nothing and does not refuse the lease
 /// beside it; a newer chain beside a lease already installed is followed; a chain that does not
