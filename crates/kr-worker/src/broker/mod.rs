@@ -318,6 +318,9 @@ pub struct Instance {
     pub application_instance_id: ApplicationInstanceId,
     /// The process, where this host launched one.
     pub process: Option<ManagedProcess>,
+    /// The application server this host started for the process, where it started one: the
+    /// instance ends with the process, and the server is then the one to be ended.
+    pub backend: Option<ProcessStartIdentity>,
     /// The process an adoption found running this instance, where one did.
     ///
     /// It places the questions that process and the ones it starts ask, and does nothing else: it
@@ -1343,7 +1346,39 @@ impl Broker {
                 .process
                 .as_ref()
                 .is_some_and(|held| held.process.matches(process))
+                || instance
+                    .backend
+                    .as_ref()
+                    .is_some_and(|server| server.matches(process))
         })
+    }
+
+    /// Records the application server this host started for one instance, which the instance's
+    /// end names as the backend to stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal for an identifier no instance has.
+    pub fn set_instance_backend(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        server: ProcessStartIdentity,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.backend = Some(server);
+        Ok(())
+    }
+
+    /// Lets go of the tables pinned for one instance, because its launch was given back or its
+    /// backend has ended.
+    pub fn unpin_tables(&self, application_instance_id: ApplicationInstanceId) {
+        self.state()
+            .pinned_tables
+            .retain(|(instance, _), _| *instance != application_instance_id);
     }
 
     /// Records that another attachment is watching one instance.
@@ -1382,10 +1417,13 @@ impl Broker {
                 }
             }
             InstanceEnding::NativeExit => {
-                let backend = instance
-                    .process
-                    .as_ref()
-                    .and_then(|process| process.dedicated.then(|| process.process.clone()));
+                // The server this host started for the program, or a process dedicated to it.
+                let backend = instance.backend.clone().or_else(|| {
+                    instance
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.dedicated.then(|| process.process.clone()))
+                });
                 let ended = state.instances.remove(&application_instance_id);
                 if let Some(agent) = ended.and_then(|instance| instance.process) {
                     // A dedicated backend is stopped from what the registry holds by whoever ends
@@ -3144,6 +3182,48 @@ impl Broker {
         plugin_id: &PluginId,
         installed_protocol_version: &str,
     ) -> Result<GatewayConnectionId> {
+        self.open_native_as(
+            application_instance_id,
+            |launched| launched.authenticates(presented_credential, process),
+            process,
+            plugin_id,
+            installed_protocol_version,
+        )
+    }
+
+    /// Opens a native connection for a terminal the worker's own backend launched and admitted,
+    /// which the kernel names on the connection: the terminal presents no credential, since the
+    /// launcher presented the launch's and then became the terminal in place, so the exchange is
+    /// the backend's own holder of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Broker::open_native_connection`] does.
+    pub(crate) fn open_launched_connection(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        exchange: &crate::broker::process::Credential,
+        process: &ProcessStartIdentity,
+        plugin_id: &PluginId,
+        installed_protocol_version: &str,
+    ) -> Result<GatewayConnectionId> {
+        self.open_native_as(
+            application_instance_id,
+            |launched| launched.authenticates_launch(exchange, process),
+            process,
+            plugin_id,
+            installed_protocol_version,
+        )
+    }
+
+    fn open_native_as(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        authenticated: impl FnOnce(&ManagedProcess) -> bool,
+        process: &ProcessStartIdentity,
+        plugin_id: &PluginId,
+        installed_protocol_version: &str,
+    ) -> Result<GatewayConnectionId> {
         let mut state = self.state();
         let instance = state
             .instances
@@ -3157,7 +3237,7 @@ impl Broker {
         })?;
         // Both halves. A session identifier that leaked is not a launch binding, and a process
         // that matches without the private exchange is not one either.
-        if !launched.authenticates(presented_credential, process) {
+        if !authenticated(launched) {
             return Err(BrokerError::denied(
                 "this connection does not present the launch binding and the private exchange of \
                  a terminal this worker started",
@@ -4243,6 +4323,7 @@ impl BrokerState {
             Instance {
                 application_instance_id,
                 process,
+                backend: None,
                 observed: None,
                 binding_revision: AgentBindingRevision::new(1),
                 source_generation: SourceGeneration::new(1),

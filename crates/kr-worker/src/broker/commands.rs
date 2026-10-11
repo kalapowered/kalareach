@@ -32,6 +32,23 @@
 //! the vector, so what was typed is known from the variable alone, whatever has become of the
 //! backend.
 //!
+//! # A backend that runs a server
+//!
+//! A package whose integration declares a backend (an application whose terminal talks to a server
+//! of its own) has the worker run that server for the invocation and point the terminal at a
+//! gateway the worker serves. The order is the same four steps, with these differences, and only
+//! on a Unix host, for a program that is a native executable and a plain launch of the terminal:
+//!
+//! * the launch record names the address of the gateway's socket, which the launcher writes in
+//!   place of the integration's `{gateway}` element, and the launcher presents its environment;
+//! * once the launcher says it is going, the worker starts the server (in a group of its own, with
+//!   that environment less the launch's two variables), records it as a root of what the session
+//!   owns and waits for the record to be on disk, and binds the socket; and only then commits;
+//! * the program connects to the socket as the process the launch registered, and the gateway
+//!   stands between its WebSocket and the server's standard streams;
+//! * the program ending, the server failing, no connection within a bound, or the session closing
+//!   ends the server, and what the session recorded below it, through one ending.
+//!
 //! # What is served
 //!
 //! One accept loop per backend, one task per accepted connection, at most
@@ -63,6 +80,11 @@ use crate::broker::image::{ExecutableIdentity, FileIdentity, HashedFiles};
 use crate::broker::listener::Registration;
 use crate::broker::process::{Credential, ManagedProcess};
 use crate::broker::profiles::ForegroundMark;
+#[cfg(unix)]
+use crate::broker::server::{Retirement, Server};
+
+#[cfg(unix)]
+mod gateway_run;
 
 /// The most admissions one backend runs at once.
 ///
@@ -249,6 +271,9 @@ struct Backend {
     /// took the name, so the removal runs once, and a second retirement waits for it.
     removed: Mutex<bool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// What a backend that runs an application server for its program holds.
+    #[cfg(unix)]
+    gateway_run: Option<GatewayRun>,
     /// The operating-system user the session runs as.
     os_user: String,
     /// The directory the shell reported for this invocation, for a connector whose installation
@@ -274,6 +299,116 @@ struct Backend {
     show_pause: Arc<Mutex<Option<ConfirmPause>>>,
     #[cfg(all(feature = "testing", windows))]
     started_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+}
+
+/// The longest path a Unix socket can be bound at, in bytes.
+///
+/// The smaller of the two limits Unix systems have (macOS 104, Linux 108), less the byte that ends
+/// the name and a little for the prefix a system may add.
+#[cfg(unix)]
+const SOCKET_PATH_LIMIT: usize = 100;
+
+/// The file name of the socket a program connects to the gateway at, in its backend's directory.
+#[cfg(unix)]
+const GATEWAY_SOCKET: &str = "gw.sock";
+
+/// What a backend that runs an application server for its program holds besides a bridge's
+/// endpoint: where the program is to connect, how the server is started, and the server once it
+/// is.
+#[cfg(unix)]
+struct GatewayRun {
+    /// The socket the program connects to, bound when the launch is committed.
+    socket: PathBuf,
+    /// The address the launcher writes where the integration has `{gateway}`.
+    address: String,
+    /// The arguments the server is started with, as the package declares them.
+    server_arguments: Vec<String>,
+    /// The vector the program is run with: the one the shell was answered, with the address in
+    /// place of `{gateway}`.
+    expanded: Vec<String>,
+    /// The server, from the moment it is started until it is taken out to be ended.
+    server: Mutex<Option<Arc<Server>>>,
+    /// The tables the gateway interprets the program's and the server's frames with, pinned for
+    /// the instance when the launch is admitted.
+    tables: Mutex<Option<crate::broker::connectors::NativeTables>>,
+    /// The socket, from the moment it is bound until the task that accepts on it takes it.
+    listener: Mutex<Option<crate::broker::endpoint::BoundEndpoint>>,
+    /// Set when the program's one connection has been admitted: no other is.
+    claimed: AtomicBool,
+    /// The connection's owner while the program is connected, so a backend that is retired ends it.
+    connection: Mutex<Option<Arc<crate::broker::Duplex>>>,
+    /// The endings in progress, which a closing session waits for.
+    ladders: Mutex<Vec<tokio::task::JoinHandle<Retirement>>>,
+    /// How long the program has to connect once the launch is committed.
+    connection_deadline: std::time::Duration,
+    broker: Arc<Broker>,
+    handle: tokio::runtime::Handle,
+    /// What the host has hashed of executables, so the server's is not read again.
+    hashed: Arc<HashedFiles>,
+}
+
+#[cfg(unix)]
+impl GatewayRun {
+    /// Plans the gateway of one backend in `directory`, for the vector `answered`, whose added
+    /// flags are the `count` elements from `at`.
+    #[allow(clippy::too_many_arguments)]
+    fn plan(
+        directory: &Path,
+        server_arguments: &[String],
+        answered: &[String],
+        at: usize,
+        count: usize,
+        broker: Arc<Broker>,
+        handle: tokio::runtime::Handle,
+        hashed: Arc<HashedFiles>,
+        connection_deadline: std::time::Duration,
+    ) -> Result<Self> {
+        let socket = directory.join(GATEWAY_SOCKET);
+        if socket.as_os_str().len() > SOCKET_PATH_LIMIT {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "the gateway's socket would be at {}, {} bytes, and a socket's path is at most \
+                     {SOCKET_PATH_LIMIT}",
+                    socket.display(),
+                    socket.as_os_str().len()
+                ),
+            });
+        }
+        let address = format!("unix://{}", socket.display());
+        let mut expanded = answered.to_vec();
+        for element in expanded.iter_mut().skip(at).take(count) {
+            if element == kr_plugin_sdk::integration::GATEWAY_PLACEHOLDER {
+                element.clone_from(&address);
+            }
+        }
+        Ok(Self {
+            socket,
+            address,
+            server_arguments: server_arguments.to_vec(),
+            expanded,
+            server: Mutex::new(None),
+            tables: Mutex::new(None),
+            listener: Mutex::new(None),
+            claimed: AtomicBool::new(false),
+            connection: Mutex::new(None),
+            ladders: Mutex::new(Vec::new()),
+            connection_deadline,
+            broker,
+            handle,
+            hashed,
+        })
+    }
+}
+
+/// Whether `path` begins with an interpreter line, which makes the program it runs its interpreter.
+#[cfg(unix)]
+fn starts_with_interpreter_line(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut first = [0_u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut first))
+        .is_ok()
+        && &first == b"#!"
 }
 
 /// What a backend's instance was last announced as, and what may still be announced about it.
@@ -409,6 +544,9 @@ pub struct CommandBackends {
     /// host's own tests.
     #[cfg(feature = "testing")]
     directory_pause: Mutex<Option<DirectoryPause>>,
+    /// How long a program has to connect to its gateway, for this host's own tests.
+    #[cfg(feature = "testing")]
+    connection_deadline: Mutex<Option<std::time::Duration>>,
     /// Where the next close stops before it retires a backend, for this host's own tests.
     #[cfg(feature = "testing")]
     retire_pause: Mutex<Option<DirectoryPause>>,
@@ -505,8 +643,34 @@ impl CommandBackends {
             #[cfg(feature = "testing")]
             directory_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
+            connection_deadline: Mutex::new(None),
+            #[cfg(feature = "testing")]
             retire_pause: Mutex::new(None),
         }
+    }
+
+    /// Sets how long a program has to connect to its gateway once its launch is committed, for
+    /// this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn connect_within(&self, deadline: std::time::Duration) {
+        *self
+            .connection_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+    }
+
+    /// How long a program has to connect to its gateway once its launch is committed.
+    #[cfg(unix)]
+    fn connection_deadline(&self) -> std::time::Duration {
+        #[cfg(feature = "testing")]
+        if let Some(deadline) = *self
+            .connection_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return deadline;
+        }
+        gateway_run::CONNECTION_DEADLINE
     }
 
     /// Delivers the transitions of every channel these backends serve to the session's attached
@@ -759,12 +923,7 @@ impl CommandBackends {
             if let Some(why) = backend.refuses(request.typed) {
                 return Err(format!("{why}, so this invocation runs as typed"));
             }
-            // This host runs no backend. Admitting the launch would run the terminal against a
-            // gateway nothing has opened.
-            return Err(format!(
-                "{} declares a backend, and this host runs none, so this invocation runs as typed",
-                connector.plugin_id()
-            ));
+            self.check_gateway_route(request, connector.plugin_id())?;
         }
 
         let invocation = Invocation {
@@ -926,6 +1085,44 @@ impl CommandBackends {
             })
     }
 
+    /// Says why a launch of a program that has a server cannot be served by a gateway on this
+    /// host, where it cannot.
+    #[cfg(unix)]
+    fn check_gateway_route(
+        &self,
+        request: &EstablishRequest<'_>,
+        plugin: kr_protocol::ids::PluginId,
+    ) -> std::result::Result<(), String> {
+        if starts_with_interpreter_line(Path::new(request.executable)) {
+            return Err(format!(
+                "{} is a script, and the program it runs is its interpreter, so it gets no gateway \
+                 and this invocation runs as typed",
+                request.executable
+            ));
+        }
+        if self.views.is_none() {
+            return Err(format!(
+                "{plugin} declares a backend, and this session keeps no record of its processes \
+                 to hold the server in, so this invocation runs as typed"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Says why a launch of a program that has a server cannot be served by a gateway on this
+    /// host: none is run on this platform.
+    #[cfg(not(unix))]
+    fn check_gateway_route(
+        &self,
+        _request: &EstablishRequest<'_>,
+        plugin: kr_protocol::ids::PluginId,
+    ) -> std::result::Result<(), String> {
+        Err(format!(
+            "{plugin} declares a backend, and this platform runs none, so this invocation runs as \
+             typed"
+        ))
+    }
+
     fn launcher(&self) -> std::result::Result<PathBuf, String> {
         let launcher = self
             .launcher
@@ -1026,11 +1223,33 @@ impl CommandBackends {
         let variables: &[EnvironmentVariable] = connector
             .integration()
             .map_or(&[], |integration| integration.variables.as_slice());
-        let record = serde_json::json!({
+        #[cfg(unix)]
+        let gateway_run = connector
+            .integration()
+            .and_then(|integration| integration.backend.as_ref())
+            .map(|declared| {
+                GatewayRun::plan(
+                    &directory,
+                    &declared.arguments,
+                    &invocation.arguments,
+                    added_at,
+                    invocation.added.len(),
+                    Arc::clone(&self.broker),
+                    self.handle.clone(),
+                    Arc::clone(&self.hashed),
+                    self.connection_deadline(),
+                )
+            })
+            .transpose()?;
+        let mut record = serde_json::json!({
             "endpoint": gateway.address().for_diagnostics(),
             "credential": credential_path.display().to_string(),
             "variables": variables,
         });
+        #[cfg(unix)]
+        if let (Some(run), Some(members)) = (gateway_run.as_ref(), record.as_object_mut()) {
+            members.insert("gateway".to_owned(), serde_json::json!(run.address));
+        }
         kr_ipc::paths::write_owner_only_file(
             &directory.join(LAUNCH_RECORD_FILE),
             record.to_string().as_bytes(),
@@ -1071,6 +1290,8 @@ impl CommandBackends {
             stopped: Arc::new(AtomicBool::new(false)),
             removed: Mutex::new(false),
             tasks: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            gateway_run,
             os_user: self.os_user.clone(),
             host_directory: Arc::new(std::sync::OnceLock::new()),
             views: self
@@ -1191,7 +1412,7 @@ impl Backend {
             application_instance_id: self.application_instance_id,
             plugin_id: kr_protocol::scalars::Nullable::some(self.connector.plugin_id()),
             profile_id: kr_protocol::scalars::Nullable::some(self.profile_id.clone()),
-            mode: IntegrationMode::NativeBridge,
+            mode: self.mode(),
             bypass: kr_protocol::scalars::Nullable::null(),
             started_at: kr_ipc::now_ms(),
             ended_at: kr_protocol::scalars::Nullable::null(),
@@ -1269,6 +1490,26 @@ impl Backend {
             .end(kr_ipc::now_ms())
     }
 
+    /// How this backend integrates its program: through the gateway when it runs a server for it,
+    /// and otherwise through the program's own bridge.
+    fn mode(&self) -> IntegrationMode {
+        #[cfg(unix)]
+        if self.gateway_run.is_some() {
+            return IntegrationMode::Gateway;
+        }
+        IntegrationMode::NativeBridge
+    }
+
+    /// The argument vector the program is run with: the one the shell was answered, and for a
+    /// backend that runs a server, with the gateway's address where the integration has it.
+    fn arguments_run(&self) -> Vec<String> {
+        #[cfg(unix)]
+        if let Some(run) = self.gateway_run.as_ref() {
+            return run.expanded.clone();
+        }
+        self.invocation.arguments.clone()
+    }
+
     fn is_unbound(&self) -> bool {
         matches!(*self.lifecycle.state.borrow(), BackendState::Unbound)
     }
@@ -1294,6 +1535,9 @@ impl Backend {
         {
             task.abort();
         }
+        // The program's connection and the server end with the backend.
+        #[cfg(unix)]
+        self.end_gateway();
         // The path held for the grant is let go of with the backend: the directory can be renamed
         // again once nothing is using it for a launch.
         #[cfg(windows)]
@@ -1316,6 +1560,10 @@ impl Backend {
         {
             let _ = std::fs::remove_file(socket);
         }
+        #[cfg(unix)]
+        if let Some(run) = self.gateway_run.as_ref() {
+            let _ = std::fs::remove_file(&run.socket);
+        }
         // The directory goes with what was in it, so the names a session draws from are used up
         // only by the backends it still holds and not by every backend it ever had.
         let _ = std::fs::remove_dir(&self.directory);
@@ -1337,6 +1585,9 @@ impl Backend {
     /// invocation, or retired when its line ended meanwhile.
     fn roll_back(&self) {
         let _ = std::fs::remove_file(&self.registration);
+        // A server this launch started is ended, and the tables it pinned are let go of.
+        #[cfg(unix)]
+        self.end_gateway();
         let mut retired = false;
         self.lifecycle.state.send_if_modified(|state| {
             if matches!(state, BackendState::Launching) {
@@ -1641,6 +1892,27 @@ async fn admit_launch(
             "the argument vector presented is not the one this backend answered",
         ));
     }
+    // A backend that starts a server starts it with the launcher's environment, so a launcher that
+    // presented none, or more than a backend takes, is refused by name.
+    #[cfg(unix)]
+    if backend.gateway_run.is_some() {
+        match launch.environment.as_ref() {
+            None => {
+                return Err(BrokerError::denied(
+                    "the launcher presented no environment, and this backend starts its server \
+                     with it",
+                ));
+            }
+            Some(environment)
+                if environment.bytes() > crate::broker::attach::MAX_PRESENTED_ENVIRONMENT_BYTES =>
+            {
+                return Err(BrokerError::denied(
+                    "the launcher presented more environment than a backend takes",
+                ));
+            }
+            Some(_) => {}
+        }
+    }
     // Unbound to launching, or refused: one launch per backend.
     let claimed = backend.lifecycle.state.send_if_modified(|state| {
         if matches!(state, BackendState::Unbound) {
@@ -1655,6 +1927,18 @@ async fn admit_launch(
             "this backend is not waiting for a launch",
         ));
     }
+    #[cfg(not(windows))]
+    return continue_launch(
+        backend,
+        broker,
+        environment_id,
+        &process,
+        &identity,
+        stream,
+        launch.environment,
+    )
+    .await;
+    #[cfg(windows)]
     continue_launch(backend, broker, environment_id, &process, &identity, stream).await
 }
 
@@ -1672,6 +1956,7 @@ async fn continue_launch(
     process: &ProcessStartIdentity,
     identity: &ExecutableIdentity,
     mut stream: BridgeStream,
+    environment: Option<crate::broker::attach::PresentedEnvironment>,
 ) -> Result<()> {
     let admitted = admit_claimed(
         backend,
@@ -1703,6 +1988,19 @@ async fn continue_launch(
             "the admitted launch did not say it is going",
         ));
     }
+    // A backend that runs a server starts it now, records it as a root of what the session owns,
+    // and binds the socket the program connects to; it commits only with all three done, and a
+    // launch that fails here is given back with its server ended.
+    #[cfg(unix)]
+    if backend.gateway_run.is_some()
+        && let Err(error) = gateway_run::start(backend, identity, environment).await
+    {
+        drop(guard);
+        backend.roll_back();
+        return Err(error);
+    }
+    #[cfg(not(unix))]
+    drop(environment);
     #[cfg(feature = "testing")]
     {
         let armed = backend
@@ -1718,7 +2016,8 @@ async fn continue_launch(
     // The commit, under the lifecycle lock: the state, the guard and the supervision together, or,
     // for a backend retired meanwhile, none of them, and the guard gives back.
     let mut guard = Some(guard);
-    let committed = backend.lifecycle.commit(Arc::new(registration), || {
+    let registration = Arc::new(registration);
+    let committed = backend.lifecycle.commit(Arc::clone(&registration), || {
         if let Some(guard) = guard.take() {
             guard.commit();
         }
@@ -1727,14 +2026,24 @@ async fn continue_launch(
             Arc::clone(broker),
             process.clone(),
         ));
-        backend
+        let mut tasks = backend
             .tasks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(supervising);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.push(supervising);
+        #[cfg(unix)]
+        if backend.gateway_run.is_some() {
+            tasks.push(tokio::spawn(gateway_run::accept(
+                Arc::clone(backend),
+                Arc::clone(broker),
+                Arc::clone(&registration),
+            )));
+        }
     });
     if !committed {
         drop(guard);
+        #[cfg(unix)]
+        backend.end_gateway();
         return Err(BrokerError::denied("this backend was retired"));
     }
     #[cfg(feature = "testing")]
@@ -1860,9 +2169,9 @@ fn launch_profile(
                 .unwrap_or_else(|| "unknown".to_owned()),
             distribution: "command".to_owned(),
         },
-        arguments: backend.invocation.arguments.clone(),
+        arguments: backend.arguments_run(),
         authentication: AuthenticationState::Unknown,
-        mode: IntegrationMode::NativeBridge,
+        mode: backend.mode(),
         // The program inherits the shell's own job, so it is held by whatever holds the shell.
         ownership: AgentOwnership::Full,
         vendor_mode: Nullable::null(),
@@ -2319,7 +2628,7 @@ async fn admit_claimed<'a>(
         kr_ipc::now_ms(),
     );
     let registered = reservation
-        .register(IntegrationMode::NativeBridge, Some(managed))
+        .register(backend.mode(), Some(managed))
         .map_err(|refused| refused.error)?;
     // The instance is bound to the package this backend was established from, at the frame it was
     // decided at, from the admissions this worker holds. A package that left them since is refused
@@ -2341,6 +2650,20 @@ async fn admit_claimed<'a>(
         },
         kr_ipc::now_ms(),
     )?;
+    // A backend that runs a server has the connector's table compiled for the executable that
+    // runs, pinned for the instance. A table no signed record qualifies for this executable is
+    // a launch that fails here, and the program runs as typed.
+    #[cfg(unix)]
+    if let Some(run) = backend.gateway_run.as_ref() {
+        let tables = broker.pin_compiled(
+            backend.application_instance_id,
+            &backend.connector,
+            &identity.hashed.digest,
+        )?;
+        *run.tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tables);
+    }
     // The directory the invocation was resolved in, for reading only and confined to its own
     // mount. The grant is the instance's, so it goes with the instance: a launch given back takes
     // it along, and so does the program's end. It is granted only when it is the directory the
@@ -2518,6 +2841,9 @@ async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessS
                 backend.application_instance_id,
                 crate::broker::InstanceEnding::NativeExit,
             );
+            // The program is gone: its server is ended too, and the connection with it.
+            #[cfg(unix)]
+            backend.end_gateway();
             backend.retire();
             backend.announce_ended();
             return;

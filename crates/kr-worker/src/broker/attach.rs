@@ -1750,6 +1750,7 @@ impl NativeGateway {
         let _ = identity;
         self.serve(
             connection,
+            self.launch.framing,
             upstream_reader,
             upstream_writer,
             client_reader,
@@ -1758,11 +1759,13 @@ impl NativeGateway {
         )
     }
 
-    /// Starts one admitted connection's owner and the task that supervises it.
+    /// Starts one admitted connection's owner and the task that supervises it, framing the
+    /// upstream's and the client's messages as `framing` says.
     #[allow(clippy::too_many_arguments)]
-    fn serve<UR, UW, CR, CW>(
+    pub(crate) fn serve<UR, UW, CR, CW>(
         &self,
         connection: GatewayConnectionId,
+        framing: Framing,
         upstream_reader: UR,
         upstream_writer: UW,
         client_reader: CR,
@@ -1778,7 +1781,7 @@ impl NativeGateway {
         let (owner, writes) = Duplex::new(
             Arc::clone(&self.broker),
             connection,
-            self.launch.framing,
+            framing,
             upstream_writer,
             client_writer,
             self.launch.site,
@@ -2013,7 +2016,11 @@ impl PresentedEnvironment {
 
 impl std::fmt::Debug for PresentedEnvironment {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "PresentedEnvironment({} variables)", self.0.len())
+        write!(
+            formatter,
+            "PresentedEnvironment({} variables)",
+            self.0.len()
+        )
     }
 }
 
