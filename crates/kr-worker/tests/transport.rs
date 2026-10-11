@@ -4140,14 +4140,11 @@ async fn kr_req_11_32_a_connector_s_frame_limit_is_kept_below_the_host_s_and_cla
     );
 }
 
-/// KR-REQ-11.32 and section 9: a reply that grows past what the connection carries when it goes
-/// back under the terminal's own identifier ends the connection, and none of it is carried.
-///
-/// The upstream's reply is at the connector's limit under the short identifier this host gave the
-/// request. The terminal's identifier is long, so putting it back makes the reply larger than the
-/// connection carries, which is more than the allowance for the identifiers this host gives.
+/// KR-REQ-11.32 and section 9: a reply at the connector's limit is carried back under the longest
+/// identifier a terminal may use, though putting that identifier back makes it larger than the
+/// limit: the allowance for identifiers covers the longest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_32_a_reply_that_grows_past_what_the_connection_carries_ends_it() {
+async fn kr_req_11_32_a_reply_at_the_limit_is_carried_back_under_the_longest_identifier() {
     let broker = broker();
     let served = duplex_watched_framed(
         &broker,
@@ -4155,15 +4152,16 @@ async fn kr_req_11_32_a_reply_that_grows_past_what_the_connection_carries_ends_i
         Framing::within(NativeFraming::JsonLines, 4096),
     )
     .await;
-    let (owner, drained) = (Arc::clone(&served.owner), served.drained);
-    let long = "i".repeat(200);
+    let owner = Arc::clone(&served.owner);
+    // The longest spelling, quotes included, against the shortest identifier this host gives.
+    let long = "i".repeat(kr_worker::broker::MAX_CLIENT_IDENTIFIER_BYTES - 2);
     owner
         .from_client(
             format!(r#"{{"id":"{long}","method":"session/update","params":{{}}}}"#).as_bytes(),
             TimestampMs::new(2),
         )
         .await
-        .expect("the terminal's request, under a long identifier, is carried");
+        .expect("the terminal's request, under the longest identifier, is carried");
 
     // A reply of exactly the connector's limit, under the identifier this host gave the request.
     let bare = r#"{"id":"kr-1","result":{"pad":""}}"#;
@@ -4175,29 +4173,21 @@ async fn kr_req_11_32_a_reply_that_grows_past_what_the_connection_carries_ends_i
     owner
         .from_upstream(reply.as_bytes(), TimestampMs::new(3))
         .await
-        .expect_err("the reply, with the terminal's identifier in it, is more than is carried");
-    assert!(owner.stopping(), "and the connection ends");
+        .expect("the reply, with the terminal's identifier in it, is carried");
+    assert!(!owner.stopping(), "and the connection goes on");
+    let mut client = tokio::io::BufReader::new(served.client);
+    let returned = next_line_from(&mut client).await;
+    assert_eq!(
+        returned.trim_end(),
+        reply.replace(r#""id":"kr-1""#, &format!(r#""id":"{long}""#)),
+        "and it came back under the terminal's own identifier"
+    );
     owner.shutdown();
     drop(owner);
-    tokio::time::timeout(LIVENESS_DEADLINE, drained)
+    tokio::time::timeout(LIVENESS_DEADLINE, served.drained)
         .await
         .expect("the writers finish")
         .expect("they are joined");
-    let mut told = String::new();
-    tokio::time::timeout(
-        LIVENESS_DEADLINE,
-        tokio::io::AsyncReadExt::read_to_string(
-            &mut tokio::io::BufReader::new(served.client),
-            &mut told,
-        ),
-    )
-    .await
-    .expect("the terminal's end reaches its end")
-    .expect("it is readable");
-    assert!(
-        !told.contains("xxxx"),
-        "none of the reply was carried to the terminal"
-    );
 }
 
 /// KR-REQ-11.32 and section 9: a frame above the bound ends the connection and the terminal is
@@ -4876,45 +4866,6 @@ async fn kr_req_11_32_a_request_identifier_that_is_not_an_integer_or_a_short_str
             .await;
         assert_eq!(outcome.is_ok(), carried, "{what}: {outcome:?}");
     }
-    owner.shutdown();
-    driving.abort();
-}
-
-/// KR-REQ-11.32: a reply of exactly the frame bound is carried back under the longest identifier a
-/// terminal may use, though the identifier is longer than the one this host sent it under.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_32_a_reply_at_the_bound_is_carried_back_under_the_longest_identifier() {
-    let broker = broker();
-    let (owner, mut upstream, client, writes) = duplex_over_pipes(&broker, 4 << 20);
-    let driving = tokio::spawn(writes);
-    let mut upstream = tokio::io::BufReader::new(&mut upstream);
-    let mut client = tokio::io::BufReader::new(client);
-
-    let longest = "i".repeat(kr_worker::broker::MAX_CLIENT_IDENTIFIER_BYTES - 2);
-    let sent = format!(r#"{{"id":"{longest}","method":"session/update","params":{{}}}}"#);
-    owner
-        .from_client(sent.as_bytes(), TimestampMs::new(2))
-        .await
-        .expect("the terminal's request is carried");
-    let arrived = next_line_from(&mut upstream).await;
-    assert!(arrived.contains(r#""id":"kr-1""#), "{arrived}");
-
-    let bound = kr_worker::broker::gateway::MAX_NATIVE_FRAME_BYTES;
-    let (head, tail) = (r#"{"id":"kr-1","result":""#, r#""}"#);
-    let reply = format!(
-        "{head}{}{tail}",
-        "x".repeat(bound - head.len() - tail.len())
-    );
-    assert_eq!(reply.len(), bound);
-    owner
-        .from_upstream(reply.as_bytes(), TimestampMs::new(3))
-        .await
-        .expect("the reply is carried");
-    let returned = next_line_from(&mut client).await;
-    assert_eq!(
-        returned.trim_end(),
-        reply.replace(r#""id":"kr-1""#, &format!(r#""id":"{longest}""#)),
-    );
     owner.shutdown();
     driving.abort();
 }
