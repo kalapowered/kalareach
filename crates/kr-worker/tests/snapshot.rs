@@ -3134,7 +3134,7 @@ async fn an_attachment_is_drawn_the_screen_its_grant_allows() {
     let session = Dimensions::new(CANONICAL.0, CANONICAL.1);
     let host = host_with(
         "stty -echo -echonl || exit 1; \
-         printf '\\033]2;a-window-title\\033\\\\\\033]8;;https://example.invalid/a-target\\033\\\\a linked word\\033]8;;\\033\\\\ and plain text\\n'; \
+         printf '\\033]2;a-window-title\\033\\134\\033]8;;https://example.invalid/a-target\\033\\134a linked word\\033]8;;\\033\\134 and plain text\\n'; \
          read -r _",
         session,
         None,
