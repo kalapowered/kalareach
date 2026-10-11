@@ -407,7 +407,8 @@ impl Controller {
         };
         match written {
             Ok(()) => {
-                let completed = self.complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
+                let completed = self
+                    .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
                     .await?;
                 encode(&completed)
             }
