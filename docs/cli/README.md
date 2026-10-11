@@ -43,7 +43,7 @@ worker directly for what a session owns.
 | `kr destination [list/configure/remove]` | — | The places this host sends notifications besides paired devices: a webhook, Slack, Discord, Telegram or email |
 | `kr account [sign-in/sign-out/show]` | — | Sign this host in to the managed account service, in a browser, sign it out, or show where the sign-in stands |
 | `kr host paths` | — | Show where this installation keeps its runtime files and its state |
-| `kr organisation [enrol/list/withdraw/exclusive]` | — | Enrol this host in an organisation's policy, show what it holds for each organisation, leave one, or make the host exclusively organisation-managed or end that |
+| `kr organisation [enrol/list/present/withdraw/exclusive]` | — | Enrol this host in an organisation's policy, show what it holds for each organisation, present the lease signed for the host's own key, leave one, or make the host exclusively organisation-managed or end that |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
@@ -1779,6 +1779,7 @@ host; this is about the owner's side of it.
 ```sh
 kr organisation enrol chain.json     # pin the keys that sign an organisation's policy
 kr organisation list                 # what this host holds for each organisation
+kr organisation present lease.json   # present the lease signed for this host's own key
 kr organisation withdraw <id>        # leave an organisation's policy
 kr organisation exclusive on         # make this host exclusively organisation-managed
 kr organisation exclusive off        # end that
@@ -1806,11 +1807,15 @@ rotation is followed from, the highest key revision accepted and the enrolment r
 requiring the organisation names. It shows the devices bound to member accounts of that
 organisation, and the lease last recorded for each. It also shows whether the host is exclusively
 organisation-managed, and whether it trusts its clock. It shows each time exclusive management was
-turned off. A member's account name is shown as the organisation signed it.
+turned off. It prints the device identifier and key identifier that a lease for the host's own local
+owner is signed for, and names each session whose worker cannot be told what that owner may do. A
+member's account name is shown as the organisation signed it.
+
+`kr organisation present` reads a membership lease from a JSON file and presents it to the host as its local owner's. The organisation signs that lease for the host's own key, which `kr organisation list` prints beside the host's device identifier. `--chain` names a file that holds the organisation's policy-signing chain, for when it has moved since the host last accepted one. On a host that is exclusively organisation-managed, the lease serves the owner until it ends, at the daemon and at each session's worker; without one, the owner reaches only the session's own tooling and what recovers or ends access. On any other host the lease binds nothing yet, and `kr` says so. With `--json` it returns `ok`, `organisation_id`, `account_id`, `key_revision`, `expires_at_ms` and `exclusive`.
 
 To withdraw a host from an organisation, use `kr organisation withdraw <id>`, where `<id>` is the identifier `kr organisation list` shows. This operation, being only a restriction, does not need any confirmation. The host refuses an organisation it is not enrolled in, and its last one while exclusive management is on. The command reports the authority revision the host is fenced at and how far each affected session's worker has got, and it fails with a pending result when a worker has not fenced it yet. With `--json` it returns the revocation result: `authority_revision`, `revoked_grants`, `revoked_grants_total` and the `barrier`.
 
-`kr organisation exclusive on` makes the host exclusively organisation-managed, and `kr organisation exclusive off` ends that. An owner device confirms either, as it confirms an enrolment: `kr` says so, says what that device is asked to confirm, and asks the host again every second until the confirmation arrives or the challenge times out. The host refuses `on` when it is enrolled in no organisation, or when no owner device is left that could confirm for it, and it refuses `off` when exclusive management is not on, in both cases before anyone is asked.
+`kr organisation exclusive on` makes the host exclusively organisation-managed, and `kr organisation exclusive off` ends that. An owner device confirms either, as it confirms an enrolment: `kr` says so, says what that device is asked to confirm, and asks the host again every second until the confirmation arrives or the challenge times out. The host refuses `on` when it is enrolled in no organisation, or when no owner device is left that could confirm for it, and it refuses `off` when exclusive management is not on, in both cases before anyone is asked. It also refuses `on` while a session worker cannot be told what the local owner may do, as a worker that an earlier release started cannot; `kr close` ends that session.
 
 When exclusive management is on and no owner device is left that could confirm for the host, the host tells `kr organisation exclusive off` that the terminal can confirm it. `kr` then asks the person to type `end` at the controlling terminal, which must be interactive and outside every KalaReach session, as for `kr host clock --establish`. The terminal confirms nothing else in that state. With `--json`, `on` and `off` return `ok`, `exclusive`, `authority_revision` and, for `on`, `barrier_workers_total`.
 
@@ -2108,7 +2113,8 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 
 `kr organisation enrol --json` returns `ok`, `organisation_id`, `enrolment_revision`,
 `accepted_head` and `root_key_id`, the identifier of the organisation's first key in hexadecimal.
-`kr organisation list --json` returns `ok`, `exclusive`, `clock_trusted`, `enrolments` and
+`kr organisation list --json` returns `ok`, `exclusive`, `clock_trusted`, `host_device` (with
+`device_id` and `authorisation_key_id`), `workers_without_local_enforcement`, `enrolments` and
 `exclusive_events`. Each enrolment has `organisation_id`, `root_key_id`, `anchor_revision`,
 `anchor_key_id`, `accepted_head`, `enrolment_revision` and `members`; a member has `device_id`,
 `account_id`, `device_key_id`, `bound_at_ms` and, when the host recorded one, `lease` with

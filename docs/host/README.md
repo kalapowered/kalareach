@@ -2817,12 +2817,14 @@ the host is enrolled in. For each it reports the identifier of its first key, th
 and identifier, the highest key revision the host has accepted, the enrolment revision, and the
 devices bound to member accounts with the lease the host last recorded for each. It also reports
 whether exclusive management is on, whether the host trusts its clock, and every time exclusive
-management was turned off.
+management was turned off. It also reports the host's own device identifier and the key a lease for
+its local owner is signed for, and the sessions whose workers cannot be told what that owner may do.
 
 ### Presenting a lease
 
 A member's device presents the lease its organisation signed for it with `membership.present`, at
-the paired door only. The device proves its own key, and the host asks nothing else of it than a
+the paired door. The host's own local owner presents at the host's socket, as the section on the
+host's own local owner describes. The device proves its own key, and the host asks nothing else of it than a
 grant that answers to the organisation: the grant names the revision of this host's enrolment, and
 its environment selector admits this host's environment. On a host that is exclusively
 organisation-managed, a live personal grant answers too, because its owner's access needs a lease
@@ -2887,7 +2889,23 @@ The host refuses to turn it on when it is enrolled in no organisation, and when 
 
 Turning it off writes a record in the same transaction as the policy: when it happened, how the owner's confirmation reached the host, and the organisations the host was enrolled in. `organisation.list` shows these records at both doors, oldest first. The answer to `membership.present` carries the last time it was turned off at the host's terminal, so a member's client can tell the organisation with its next lease request.
 
-Exclusive management does not protect a host against its own operating-system account, which can already delete the host's state.
+Exclusive management holds the host's doors. It does not protect a host against its own operating-system account, which can already read and delete the host's state and the files of its sessions.
+
+### The host's own local owner
+
+On a host that is exclusively organisation-managed, the owner at the host answers to a membership lease like a member. The organisation signs that lease for the host's own device identity and key, which `organisation.list` shows, and the owner presents it at the host's socket with `membership.present`. Any process that runs as the owner can present it, because the host trusts the organisation's signature and not the process.
+
+While no such lease is live, the host serves a local caller three kinds of method. The first is the session's own tooling, the hooks and the terminal guard's probe, which prove themselves with the session's token. The second is what recovers the host: `membership.present`, `organisation.list`, `organisation.exclusive.set`, `owner.confirmation.request`, `owner.confirmation.pending`, `owner.confirmation.complete` and `host.clock.establish`. The third is what only ends or looks at access: `device.revoke`, `grant.revoke`, `organisation.withdraw`, `session.close`, `session.detach`, `input.release`, `pair.cancel`, `action.cancel`, `host.info`, `device.list`, `grant.list` and `session.list`. Every other method is refused with `PERMISSION_DENIED`, a method added later included.
+
+Two sockets serve a local caller, so the hold has to be in two places. The control daemon's socket refuses a held method once the lease has ended, and limits the work it admits to the time the lease has left. Each session's worker listens on a socket of its own, which `kr attach` uses, and it refuses a held read, subscription, mutation and input write by the same rule. The daemon tells each worker what the owner may do: no lease is needed, a lease is needed and none is live, or a lease is live until two moments, one on the host's continuous clock and one in UTC. The worker refuses at the earlier of them, decided on the machine's own clocks and its own time contract, so an ended lease stops the owner at the worker with no word from the daemon. A worker that maps no clock floor cannot decide a UTC end, and serves no lease.
+
+When access ends or narrows, the worker ends what the owner holds. A connection that holds an attachment or a subscription is withdrawn, which releases its input lease. A frame of a stream that the owner may no longer receive is not written. Input that the worker accepted and has not yet given to the terminal is dropped. A result that the worker would write after the end is replaced by the refusal, and the action it records stays recorded.
+
+A worker the daemon starts refuses held methods from the moment its socket is bound until the daemon has told it. The daemon tells it before it makes the worker known, for up to two seconds, tells it again whenever the answer changes until the worker acknowledges, and tells every worker at each start. A worker that holds a lease and meets a newer daemon waits to be told again, because a lease does not outlive the daemon that held it. A worker that needs no lease keeps serving across a restart.
+
+Turning exclusive management on is answered once every worker holds the new answer. The host refuses it while a worker cannot be told, which means a worker an earlier release started, or one the host has not reached. `organisation.list` names those sessions, and `kr close` ends them. On a host that is already exclusive, such a worker serves its local callers without the hold until its session ends.
+
+An owner with no live lease still reaches everything that recovers the host, which the next section describes. The terminal ceremony works on such a host too: a worker answers the terminal guard's probe from outside every session, and does not refuse it for the lease.
 
 ### Recovering an exclusive host
 
