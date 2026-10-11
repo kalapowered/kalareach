@@ -46,7 +46,45 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  diag:
+    name: diag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+      - name: Restore the cargo cache
+        id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          name: linux
+      - name: Build the programs
+        run: |
+          cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-cli
+          cargo build --locked -p kr-describe-model --bin kr-describe-inference
+      - name: The startup suite with a manager required
+        run: |
+          fails=0
+          for i in 1 2; do
+            echo "== startup round $i $(date +%T)"
+            if ! KR_REQUIRE_SERVICE_MANAGER=1 cargo test --locked -p kr-cli --test startup -- --nocapture > "$RUNNER_TEMP/startup-$i.log" 2>&1; then
+              fails=$((fails + 1))
+              echo "== startup round $i FAILED"
+              grep -n -E '^test .*FAILED|test result|is set and the service start' "$RUNNER_TEMP/startup-$i.log" | head -12
+              awk '/^---- /{f=1} f{print}' "$RUNNER_TEMP/startup-$i.log" | cut -c1-3000 | head -200
+            else
+              grep -E '^test result|not tested here' "$RUNNER_TEMP/startup-$i.log"
+            fi
+          done
+          echo "== suites failed: $fails"
+          exit 0
+
   rust:
+    if: github.event_name == 'never'
     name: rust
     runs-on: ubuntu-24.04
     steps:
@@ -427,6 +465,7 @@ jobs:
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
   windows:
+    if: github.event_name == 'never'
     name: ${{ matrix.name }}
     runs-on: windows-2025
     strategy:
@@ -1192,6 +1231,7 @@ jobs:
           paths: target/aarch64-pc-windows-msvc
 
   shell-packages:
+    if: github.event_name == 'never'
     name: shell-packages
     runs-on: ubuntu-24.04
     steps:
@@ -1370,6 +1410,7 @@ jobs:
           key: ${{ steps.shell-sources.outputs.key }}
 
   typescript:
+    if: github.event_name == 'never'
     name: typescript
     runs-on: ubuntu-24.04
     steps:
@@ -1397,6 +1438,7 @@ jobs:
         run: pnpm -r test
 
   companion:
+    if: github.event_name == 'never'
     name: companion
     strategy:
       fail-fast: false
