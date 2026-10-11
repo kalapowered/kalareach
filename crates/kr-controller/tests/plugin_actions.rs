@@ -487,6 +487,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
         .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
             environment_id: acting.hosted.environment_id,
             revision: kr_protocol::ids::AuthorityRevision::new(2),
+            reach: kr_protocol::worker::RevisionReach::Host,
             evidence_from: 0,
         })
         .await

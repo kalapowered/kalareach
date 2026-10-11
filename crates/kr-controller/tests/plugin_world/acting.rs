@@ -982,6 +982,7 @@ impl Acting {
                     .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
                         environment_id: self.hosted.environment_id,
                         revision: kr_protocol::ids::AuthorityRevision::new(2),
+                        reach: kr_protocol::worker::RevisionReach::Host,
                         evidence_from: 0,
                     })
                     .await
