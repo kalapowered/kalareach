@@ -577,6 +577,41 @@ async fn the_owners_device_keeps_its_access_until_the_host_is_made_exclusive_and
     fixture.host.stop().await;
 }
 
+/// KR-REQ-17.54: a local connection kept open across the fence that makes the host exclusive is
+/// refused a held method for its withdrawn authority, and is told to open a new connection. It is
+/// not told that a result was withheld: nothing ran and no lease was live to end, so there is no
+/// result, and "do not repeat the request" would be wrong advice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_connection_the_fence_withdrew_is_told_to_open_a_new_one_and_not_that_a_result_was_withheld()
+ {
+    let fixture = Fixture::start().await;
+    let mut kept = fixture.host.client().await;
+    let mut owner = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut owner, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(owner);
+
+    let refused = kept
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(fixture.host.environment_id),
+            &(),
+        )
+        .await
+        .expect("the daemon answers on the connection the fence left open")
+        .expect_err("a held method is refused to a connection whose authority was withdrawn");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("open a new connection") && !refused.message.contains("withheld"),
+        "the refusal tells the person to open a new connection and does not say a result was \
+         withheld: {refused:?}"
+    );
+    fixture.host.stop().await;
+}
+
 /// KR-REQ-17.54: a change the host would refuse is not put to the owner, and nothing is kept for
 /// it: exclusive management needs an enrolment and a device that can recover the host, and ending
 /// it needs it to be on.
