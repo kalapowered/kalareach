@@ -5558,7 +5558,9 @@ async fn received_until(
             let event: OutputEvent = notification.payload.to_typed().expect("an output event");
             seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
         } else {
-            seen.push_str(&format!("{:?}", notification.payload));
+            // The payload's own fields: a parameters value prints its size and a digest, not what it
+            // holds, and this reads what the recipient was sent.
+            seen.push_str(&format!("{:?}", notification.payload.as_value()));
         }
     }
     assert!(
