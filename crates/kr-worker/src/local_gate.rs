@@ -193,7 +193,11 @@ impl LocalGate {
                 boot_deadline_ms,
                 utc_deadline_ms,
             } => {
-                if self.clock.boot_elapsed_ms() >= boot_deadline_ms {
+                // The machine's continuous clock is read first and the wall clock after it, so a
+                // pause between the two readings shortens the time laid over the first and never
+                // lengthens it.
+                let boot_now = self.clock.boot_elapsed_ms();
+                if boot_now >= boot_deadline_ms {
                     return Err(Refused::Ended);
                 }
                 // The worker decides no copy that carries a UTC deadline when it maps no usable
@@ -202,10 +206,10 @@ impl LocalGate {
                 if self.time.check_utc_deadline(utc_deadline_ms) != UtcDeadline::Ahead {
                     return Err(Refused::Ended);
                 }
-                // The UTC remainder laid over the continuous clock now. Whichever end is earlier
-                // decides how long the work this allows may run.
+                // The UTC remainder laid over the continuous clock as read above. Whichever end is
+                // earlier decides how long the work this allows may run.
                 let remaining = utc_deadline_ms.saturating_sub(self.time.settled_utc_ms());
-                let laid = self.clock.boot_elapsed_ms().saturating_add(remaining);
+                let laid = boot_now.saturating_add(remaining);
                 Ok(Allowed {
                     end_boot_ms: Some(boot_deadline_ms.min(laid)),
                     end_utc_ms: Some(utc_deadline_ms),
@@ -320,12 +324,22 @@ pub enum Verdict {
 pub struct LocalWrites {
     gate: Arc<LocalGate>,
     local: std::sync::atomic::AtomicBool,
-    /// The requests read on this connection that answer to the lease, by identifier, and how many
-    /// of each are waiting for their answer. Clients choose identifiers and this worker does not
-    /// check that they are unique, so a count and not a set: an answer that reuses the identifier
-    /// of a held request is treated as that request's, which refuses more and never less.
-    held: Mutex<std::collections::BTreeMap<RequestId, u32>>,
+    /// The requests read on this connection that are waiting for their answer, by identifier, and
+    /// how many of each kind. Clients choose identifiers and this worker does not check that they
+    /// are unique, so a response cannot say which request it answers: when an identifier is in use
+    /// by a held request, the response is treated as the held one's, which refuses more and never
+    /// less.
+    waiting: Mutex<std::collections::BTreeMap<RequestId, Waiting>>,
     withdraw: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// The requests of one identifier that are waiting for their answer.
+#[derive(Clone, Copy, Debug, Default)]
+struct Waiting {
+    /// How many of them answer to the lease.
+    held: u32,
+    /// How many do not.
+    free: u32,
 }
 
 impl std::fmt::Debug for LocalWrites {
@@ -345,7 +359,7 @@ impl LocalWrites {
         Arc::new(Self {
             gate,
             local: std::sync::atomic::AtomicBool::new(false),
-            held: Mutex::new(std::collections::BTreeMap::new()),
+            waiting: Mutex::new(std::collections::BTreeMap::new()),
             withdraw,
         })
     }
@@ -361,14 +375,30 @@ impl LocalWrites {
         self.local.load(Ordering::Acquire)
     }
 
-    /// Records a request that answers to the lease, so its answer is held to it when written.
-    pub fn hold_request(&self, request_id: RequestId) {
-        *self
-            .held
+    fn waiting(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<RequestId, Waiting>> {
+        self.waiting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(request_id)
-            .or_insert(0) += 1;
+    }
+
+    /// Records a request that is waiting for its answer and does not answer to the lease, as every
+    /// request is until it is known to be a held one that the lease admits. A connection that is
+    /// not a local client records nothing.
+    pub fn free_request(&self, request_id: RequestId) {
+        if self.is_local() {
+            self.waiting().entry(request_id).or_default().free += 1;
+        }
+    }
+
+    /// Records that a request recorded by [`Self::free_request`] answers to the lease, so its
+    /// answer is held to it when written.
+    pub fn hold_request(&self, request_id: RequestId) {
+        if self.is_local() {
+            let mut waiting = self.waiting();
+            let entry = waiting.entry(request_id).or_default();
+            entry.free = entry.free.saturating_sub(1);
+            entry.held += 1;
+        }
     }
 
     /// Decides what to do with `frame`, under the writer.
@@ -386,10 +416,9 @@ impl LocalWrites {
             ControlFrame::Notification(_) => Verdict::Stop,
             ControlFrame::Response(response) => {
                 let held = self
-                    .held
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_key(&response.request_id);
+                    .waiting()
+                    .get(&response.request_id)
+                    .is_some_and(|waiting| waiting.held > 0);
                 if !held {
                     return Verdict::Write;
                 }
@@ -398,8 +427,9 @@ impl LocalWrites {
                     outcome: Outcome::Error(ProtocolError::new(
                         ErrorCode::PermissionDenied,
                         format!(
-                            "{} The result of this request is withheld; the action it asked for \
-                             is recorded and is not to be asked again under a new identifier.",
+                            "{} The result of this request is withheld. If it changed anything, \
+                             the change stands, and the request is not to be repeated under a new \
+                             identifier.",
                             refused.detail()
                         ),
                     )),
@@ -411,20 +441,22 @@ impl LocalWrites {
         }
     }
 
-    /// Notes that a response for a held request has been dealt with, written or replaced.
+    /// Notes that a response has been dealt with, written or replaced. With both kinds of request
+    /// of the identifier waiting, the one that is counted off is a request that does not answer to
+    /// the lease: the held one's mark outlives every answer that might be its own.
     pub fn answered(&self, frame: &ControlFrame) {
         let ControlFrame::Response(response) = frame else {
             return;
         };
-        let mut held = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = held.get_mut(&response.request_id) {
-            if *count <= 1 {
-                held.remove(&response.request_id);
+        let mut waiting = self.waiting();
+        if let Some(entry) = waiting.get_mut(&response.request_id) {
+            if entry.free > 0 {
+                entry.free -= 1;
             } else {
-                *count -= 1;
+                entry.held = entry.held.saturating_sub(1);
+            }
+            if entry.held == 0 && entry.free == 0 {
+                waiting.remove(&response.request_id);
             }
         }
     }
@@ -537,7 +569,8 @@ mod tests {
         assert_eq!(gate.check(), Err(Refused::Closed));
     }
 
-    /// Moves that take access away count as restrictions, and a move to a later end does not.
+    /// A move that takes access away is counted as a restriction, so a request admitted before it
+    /// and dispatched after it is refused, and a move to a later end or to `Open` is not.
     #[test]
     fn a_restriction_is_a_move_that_takes_access_away() {
         let gate = gate();
@@ -546,20 +579,86 @@ mod tests {
             boot_deadline_ms: U64::new(boot),
             utc_deadline_ms: U64::new(utc),
         };
-        assert_eq!(gate.restrictions(), 0);
+        let counted = |before: u64| gate.restrictions() > before;
+        let before = gate.restrictions();
         gate.apply(g, statement(1, until(100, 100)));
-        assert_eq!(gate.restrictions(), 1, "Open to a lease");
+        assert!(counted(before), "Open to a lease");
+        let before = gate.restrictions();
         gate.apply(g, statement(2, until(200, 200)));
-        assert_eq!(gate.restrictions(), 1, "a later end");
+        assert!(!counted(before), "a later end");
         gate.apply(g, statement(3, until(150, 200)));
-        assert_eq!(gate.restrictions(), 2, "an earlier continuous end");
+        assert!(counted(before), "an earlier continuous end");
+        let before = gate.restrictions();
         gate.apply(g, statement(4, until(150, 100)));
-        assert_eq!(gate.restrictions(), 3, "an earlier UTC end");
+        assert!(counted(before), "an earlier UTC end");
+        let before = gate.restrictions();
         gate.apply(g, statement(5, LocalBound::Open));
-        assert_eq!(gate.restrictions(), 3, "Open gives more");
+        assert!(!counted(before), "Open gives more");
         gate.apply(g, statement(6, LocalBound::Closed));
-        assert_eq!(gate.restrictions(), 4, "Closed");
+        assert!(counted(before), "Closed");
+        let before = gate.restrictions();
         gate.apply(g, statement(7, LocalBound::Open));
-        assert_eq!(gate.restrictions(), 4, "Closed to Open");
+        assert!(!counted(before), "Closed to Open");
+    }
+
+    fn response(request_id: u64) -> ControlFrame {
+        ControlFrame::Response(Response {
+            request_id: RequestId::new(request_id),
+            outcome: Outcome::Ok(kr_protocol::envelope::ParamsValue::empty()),
+        })
+    }
+
+    /// Once the lease is over, a frame of a stream is not written, the answer to a held request
+    /// is replaced by its refusal, and the answer to a request that is not held is written.
+    #[test]
+    fn after_the_end_the_writer_stops_streams_and_replaces_the_answer_to_a_held_request() {
+        let gate = Arc::new(gate());
+        gate.apply(generation(1), statement(1, LocalBound::Closed));
+        let writes = LocalWrites::new(Arc::clone(&gate), Arc::new(|| {}));
+        writes.set_local(true);
+        writes.free_request(RequestId::new(7));
+        writes.hold_request(RequestId::new(7));
+        writes.free_request(RequestId::new(8));
+        assert!(matches!(writes.verdict(&response(7)), Verdict::Replace(_)));
+        assert!(matches!(writes.verdict(&response(8)), Verdict::Write));
+        assert!(matches!(
+            writes.verdict(&ControlFrame::Notification(
+                kr_protocol::envelope::Notification {
+                    stream_id: kr_protocol::ids::StreamId::new("test".to_owned())
+                        .expect("a stream identifier"),
+                    sequence: kr_protocol::ids::EventSequence::new(1),
+                    event_type: kr_protocol::ids::EventType::new("session.output")
+                        .expect("an event type"),
+                    payload: kr_protocol::envelope::ParamsValue::empty(),
+                }
+            )),
+            Verdict::Stop
+        ));
+    }
+
+    /// A client may reuse a request identifier, and an answer cannot say which request it answers.
+    /// While a held request waits under an identifier, no answer of that identifier is taken for a
+    /// request that is not held, so a held request's answer is never written for want of its mark.
+    #[test]
+    fn the_answer_of_a_request_that_is_not_held_does_not_clear_a_held_requests_mark() {
+        let gate = Arc::new(gate());
+        gate.apply(generation(1), statement(1, LocalBound::Closed));
+        let writes = LocalWrites::new(Arc::clone(&gate), Arc::new(|| {}));
+        writes.set_local(true);
+        // A held request waits for a launch; a request of the same identifier that is not held is
+        // read and answered meanwhile.
+        writes.free_request(RequestId::new(7));
+        writes.hold_request(RequestId::new(7));
+        writes.free_request(RequestId::new(7));
+        writes.answered(&response(7));
+        assert!(
+            matches!(writes.verdict(&response(7)), Verdict::Replace(_)),
+            "the held request's answer, written after the end, is replaced"
+        );
+        writes.answered(&response(7));
+        assert!(
+            matches!(writes.verdict(&response(7)), Verdict::Write),
+            "and once every request of the identifier is answered nothing is held under it"
+        );
     }
 }

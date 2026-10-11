@@ -2961,14 +2961,26 @@ async fn a_worker_serves_no_held_method_to_a_local_caller_before_its_daemon_has_
     created
         .expect("the call reaches the daemon")
         .expect("the session is created");
-    local
-        .request(
-            Method::SessionRead,
-            &kr_protocol::session::SessionReadParams { session_id },
-        )
-        .await
-        .expect("the worker answers")
-        .expect("a worker the daemon has told serves a host that is not exclusive");
+    // The daemon tells a worker as it makes it known, waiting for that at most a short while, so
+    // a worker that was slow to answer is told by the daemon's next pass instead.
+    let started = tokio::time::Instant::now();
+    loop {
+        let answer = local
+            .request(
+                Method::SessionRead,
+                &kr_protocol::session::SessionReadParams { session_id },
+            )
+            .await
+            .expect("the worker answers");
+        if answer.is_ok() {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "a worker the daemon has told serves a host that is not exclusive: {answer:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     close(&mut client, &host, session_id).await;
     drop(client);

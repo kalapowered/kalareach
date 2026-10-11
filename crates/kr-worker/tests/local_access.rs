@@ -519,6 +519,29 @@ async fn the_worker_applies_the_daemons_statements_in_order_and_a_newer_generati
     world.close();
 }
 
+/// KR-REQ-17.54: a daemon that has been superseded cannot reopen what a newer one closed.
+///
+/// The newer daemon's connection fences the older one's, so a statement of the old generation is
+/// refused whatever it says, and the host stays as the newer daemon left it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_daemon_cannot_reopen_what_a_newer_one_closed() {
+    let world = world("sleep 30", true).await;
+    let mut window = world.window().await;
+    let mut old = world.authority(1).await;
+    tell(&mut old, open(1)).await;
+    world.read(&mut window).await.expect("open serves");
+
+    let mut new = world.authority(2).await;
+    assert_eq!(tell(&mut new, closed(1)).await, 1);
+    refused(world.read(&mut window).await, "not live");
+
+    old.announce_local_access(open(9))
+        .await
+        .expect_err("the superseded daemon's statement is refused");
+    refused(world.read(&mut window).await, "not live");
+    world.close();
+}
+
 /// KR-REQ-17.54: a lease the daemon told does not outlive the daemon that told it.
 ///
 /// A worker that holds a lease when a newer daemon takes over waits to be told again: the old

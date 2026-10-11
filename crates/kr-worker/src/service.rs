@@ -599,12 +599,6 @@ impl WorkerService {
         self.gate.hold_until_told();
     }
 
-    /// The gate that holds this worker's local callers, for a test that reads its restrictions.
-    #[must_use]
-    pub fn local_gate(&self) -> &Arc<crate::local_gate::LocalGate> {
-        &self.gate
-    }
-
     /// Holds the plugin admissions, and the connectors they carry, that this worker read before it
     /// started its shell, so every later snapshot applies to them.
     #[must_use]
@@ -3278,9 +3272,12 @@ impl WorkerService {
                 ),
             );
         }
-        // Held across the check and the application: the generation the statement is of is the one
-        // the connection proved, and a newer one cannot slip in between.
-        let generation = {
+        // Held across the check and the application, and across nothing else: the generation the
+        // statement is of is the one the connection proved, a newer one is installed under this
+        // same lock, and so a statement of a superseded daemon that passed the check cannot be
+        // applied after the newer daemon's. The withdrawal below takes each connection's writer,
+        // so the lock is let go first.
+        let applied = {
             let authority = self
                 .authority
                 .lock()
@@ -3288,20 +3285,18 @@ impl WorkerService {
             if let Err(error) = Self::check_bound(state, &authority) {
                 return failure(RequestId::new(0), &error.to_protocol_error());
             }
-            match state.generation {
-                Some(generation) => generation,
-                None => {
-                    return failure(
-                        RequestId::new(0),
-                        &ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "this connection has not proved a controller generation",
-                        ),
-                    );
-                }
-            }
+            let Some(generation) = state.generation else {
+                return failure(
+                    RequestId::new(0),
+                    &ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this connection has not proved a controller generation",
+                    ),
+                );
+            };
+            self.gate.apply(generation, access)
         };
-        match self.gate.apply(generation, access) {
+        match applied {
             crate::local_gate::Applied::Accepted { tightened } => {
                 if tightened {
                     self.withdraw_local_connections();
@@ -4055,6 +4050,12 @@ impl WorkerService {
         request: &Request,
         caller: &Caller,
     ) -> ControlFrame {
+        // Every request of a local connection is recorded as waiting for its answer, before
+        // anything can answer it: the writer tells a held request's answer from the answer of
+        // another request of the same identifier by what was recorded here.
+        if let Some(local) = state.local.as_ref() {
+            local.free_request(request.request_id);
+        }
         if !state.negotiated {
             return failure(request.request_id, &not_negotiated());
         }
@@ -4152,6 +4153,9 @@ impl WorkerService {
         freshness: Freshness,
         forwarded: bool,
     ) -> ControlFrame {
+        if let Some(local) = state.local.as_ref() {
+            local.free_request(mutation.request_id);
+        }
         if !state.negotiated {
             return failure(mutation.request_id, &not_negotiated());
         }
@@ -8873,18 +8877,40 @@ async fn write_frame_held(
             if !offered && sender.is_mid_frame() {
                 return false;
             }
-            let attempt = if offered {
-                sender.resume_frame()
-            } else {
-                sender.begin_frame(&bytes)
+            // A local connection's frame is offered a piece at a time, and the lease is asked
+            // again before each transport write: one attempt can take several, and the lease can
+            // end between them. The refusal that stops an attempt is acted on at the top of the
+            // loop, where the frame is replaced, taken back, or ends the connection.
+            let attempt = match hold {
+                Some(local) => {
+                    let permitted =
+                        || matches!(local.verdict(frame), crate::local_gate::Verdict::Write);
+                    if offered {
+                        sender.resume_frame_checked(permitted)
+                    } else {
+                        sender.begin_frame_checked(&bytes, permitted)
+                    }
+                }
+                None => if offered {
+                    sender.resume_frame()
+                } else {
+                    sender.begin_frame(&bytes)
+                }
+                .map(|wrote| match wrote {
+                    kr_ipc::framed::Wrote::Complete => kr_ipc::framed::CheckedWrite::Complete,
+                    kr_ipc::framed::Wrote::Blocked => kr_ipc::framed::CheckedWrite::Blocked,
+                }),
             };
             offered = true;
             begun = sender.has_sent_any();
             attempt
         };
         match attempt {
-            Ok(kr_ipc::framed::Wrote::Complete) => return true,
-            Ok(kr_ipc::framed::Wrote::Blocked) => {}
+            Ok(kr_ipc::framed::CheckedWrite::Complete) => return true,
+            Ok(kr_ipc::framed::CheckedWrite::Blocked) => {}
+            // The lease stopped the attempt before a write. What the frame is now is decided at
+            // the top, under the writer.
+            Ok(kr_ipc::framed::CheckedWrite::Refused) => continue,
             Err(_) => return false,
         }
         // The peer has no room. Waiting for it happens here, where the boundary is not held and a
