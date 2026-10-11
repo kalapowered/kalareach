@@ -36,6 +36,9 @@ pub struct OwnedWriter {
     sent: Mutex<Option<OwnedRecord>>,
     /// Whether the thread's last write failed.
     failed: Arc<AtomicBool>,
+    /// Whether every write is to fail, for this host's own tests.
+    #[cfg(feature = "testing")]
+    refused: Arc<AtomicBool>,
 }
 
 impl OwnedWriter {
@@ -48,6 +51,10 @@ impl OwnedWriter {
         let (sender, receiver) = channel::<(OwnedRecord, Option<oneshot::Sender<bool>>)>();
         let failed = Arc::new(AtomicBool::new(false));
         let outcome = Arc::clone(&failed);
+        #[cfg(feature = "testing")]
+        let refused = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "testing")]
+        let refusing = Arc::clone(&refused);
         std::thread::Builder::new()
             .name("kr-owned-record".to_owned())
             .spawn(move || {
@@ -61,6 +68,10 @@ impl OwnedWriter {
                         acknowledge.extend(asked);
                     }
                     let written = (|| -> rusqlite::Result<()> {
+                        #[cfg(feature = "testing")]
+                        if refusing.load(Ordering::Acquire) {
+                            return Err(rusqlite::Error::InvalidQuery);
+                        }
                         if connection.is_none() {
                             let opened = rusqlite::Connection::open(&path)?;
                             opened.busy_timeout(BUSY_TIMEOUT)?;
@@ -84,7 +95,16 @@ impl OwnedWriter {
             sender,
             sent: Mutex::new(None),
             failed,
+            #[cfg(feature = "testing")]
+            refused,
         })
+    }
+
+    /// Makes every write from now on fail, for this host's own tests. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    pub fn refuse_writes(&self) {
+        self.refused.store(true, Ordering::Release);
     }
 
     /// Hands the thread `record`, unless it is the one last handed and that was written.

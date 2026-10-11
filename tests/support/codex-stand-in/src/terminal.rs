@@ -26,6 +26,14 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
         // A terminal that was started and never connects, as one that ran as typed does not.
         std::future::pending::<()>().await;
     }
+    if variants.wait_to_connect
+        && let Ok(release) = std::env::var(RELEASE_VARIABLE)
+    {
+        println!("TUI: waiting to connect");
+        while !std::path::Path::new(&release).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
     // The first attempt carries an `Origin` header under that variant. A terminal that is refused
     // goes away, or under `retry-plain` tries once more without it, as a person starting it again
     // would.
