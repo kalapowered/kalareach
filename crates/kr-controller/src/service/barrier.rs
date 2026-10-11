@@ -892,8 +892,8 @@ impl Controller {
                     kr_protocol::error::ProtocolError::new(
                         error.code(),
                         format!(
-                            "the withdrawal stands, and this host could not raise the fence it \
-                             owes ({error}); every admission and forward is refused until it is"
+                            "the withdrawal stands, and this host could not finish the fence it \
+                             owes ({error})"
                         ),
                     ),
                 )),

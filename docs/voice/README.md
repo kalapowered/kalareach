@@ -181,10 +181,10 @@ rather than finding it later.
 
 A spoken action is decided under the grants as this host lets them be used, which is how a typed
 request under them is decided. The rights ceiling in the host's configuration and the policy of an
-organisation's lease narrow the device's grant and the call's, and a grant this host cannot
-attribute a lease to is refused. A voice grant written while a ceiling is in force stays as narrow as
-it was written. A right the configuration removed is named among the actions the device's own access
-does not include, however the device was issued it.
+organisation's lease narrow the device's grant and the call's, and a grant that requires a lease
+this host holds none for is refused. A voice grant written while a ceiling is in force stays as
+narrow as it was written. A right the configuration removed is named among the actions the device's
+own access does not include, however the device was issued it.
 
 A device changes its own voice grant over its own connection. The person at this machine changes any
 device's on the host's own socket. A device that tries to change another device's is refused: that
@@ -277,9 +277,11 @@ The fence withdraws no connection. Nothing a connection holds comes from a call'
 that withdrew the grant is answered on the link it arrived on, and so is every other request on that
 link. The answer is written once the workers that answer hold the new revision, and it carries the
 barrier as it then stands, cut to the sessions the call reached. A worker that did not answer within
-the time a revocation allows is named in it as pending, which says that a close sent under the grant
-could still reach that worker. The grant is revoked either way. A stop or a replacement that owed no
-fence carries no barrier.
+the time a revocation allows, or that installed the revision and gave no evidence of its fence, is
+named in it as pending, which says that a close sent under the grant could still reach that worker.
+The barrier is cut to what one answer carries, with every total counted before the cut, and a worker
+that is pending is kept whatever is cut. The grant is revoked either way. A stop or a replacement
+that owed no fence carries no barrier.
 
 ## The rate a call runs under
 

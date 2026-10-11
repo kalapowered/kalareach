@@ -5481,13 +5481,13 @@ a call's grant. The withdrawal is answered once that barrier has run. See [Closi
 voice](../voice/README.md#closing-a-session-by-voice).
 
 The fence this daemon takes withdraws the registrations the change reaches, and the connections that
-kept their authority are re-admitted at the revision now in force. A change to this host's policy
-or a revocation of authority that is not one device's, one share's or one call's voice grant
-reaches every registration. The revocation of a share reaches the registrations of the connections
-that decided a request under it or under a grant withdrawn with it. The withdrawal of a call's voice
-grant reaches the connections that decided a request under it, which are none, so it advances the
-revision for the workers and withdraws no registration. Withdrawing one device's registration on its
-own belongs to the network half, which owns those registrations.
+kept their authority are re-admitted at the revision now in force. A change to this host's policy or
+a revocation of authority that is not one device's, one share's or a voice grant's reaches every
+registration. The revocation of a share reaches the registrations of the connections that decided a
+request under it or under a grant withdrawn with it. The withdrawal of a call's voice grant reaches
+the connections that decided a request under it, which are none, so it advances the revision for the
+workers and withdraws no registration. Withdrawing one device's registration on its own belongs to
+the network half, which owns those registrations.
 
 ### The remote authority feed
 

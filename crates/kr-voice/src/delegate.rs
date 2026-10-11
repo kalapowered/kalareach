@@ -1886,8 +1886,9 @@ impl Coordinator {
             return Err(VoiceError::refused(
                 VoiceRefusal::OutsideVoiceGrant,
                 format!(
-                    "this voice grant does not permit {}. Broaden it in settings, where the \
-                     change states which actions it permits.",
+                    "this voice grant does not permit {}. If it was written without it, broaden \
+                     the grant in settings, where the change states which actions it permits; a \
+                     right this host's configuration has taken away is not given back there.",
                     intent.action.as_str()
                 ),
             ));
