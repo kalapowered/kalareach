@@ -4,6 +4,8 @@
 #![allow(dead_code)]
 
 pub mod launched;
+#[cfg(unix)]
+pub mod session;
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
