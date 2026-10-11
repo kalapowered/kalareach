@@ -350,6 +350,16 @@ async fn handle(
         broker.close_connection(connection);
         return;
     };
+    // What an agent starts is started in answer to a frame, so each frame has the session look at
+    // the processes it owns shortly after, and the server's commands are recorded while it runs.
+    if let Some(runtime) = backend.runtime() {
+        let runtime = Arc::downgrade(&runtime);
+        attached.owner.on_frame(move || {
+            if let Some(runtime) = runtime.upgrade() {
+                runtime.note_activity();
+            }
+        });
+    }
     let delivering = backend.views.as_ref().and_then(|(session_id, runtime)| {
         let runtime = runtime.upgrade()?;
         attached.deliver_to_views(*session_id, runtime).ok()

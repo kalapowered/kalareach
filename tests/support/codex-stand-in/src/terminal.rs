@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio_websockets::{ClientBuilder, Message};
 
 use crate::contract::{Contract, Frame, RELEASE, Side};
-use crate::variants::{KEY_VARIABLE, Variants, padded};
+use crate::variants::{KEY_VARIABLE, RELEASE_VARIABLE, Variants, padded};
 
 /// The identifiers the terminal gives its requests, after `initialize`'s.
 const ACCOUNT: i64 = 1;
@@ -22,29 +22,45 @@ const TURN: i64 = 3;
 
 /// Runs the terminal against the server at `socket`, and returns the exit status it ends with.
 pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &str) -> i32 {
-    let stream = match tokio::net::UnixStream::connect(socket).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("Error: remote app server at `unix://{socket}` could not be reached: {error}");
-            return 1;
-        }
-    };
-    let mut builder = ClientBuilder::new()
-        .uri("ws://localhost/rpc")
-        .expect("a URI");
-    if variants.origin {
-        builder = builder
-            .add_header(
-                http::header::ORIGIN,
-                http::HeaderValue::from_static("http://example.test"),
-            )
-            .expect("an Origin header");
+    if variants.idle {
+        // A terminal that was started and never connects, as one that ran as typed does not.
+        std::future::pending::<()>().await;
     }
-    let (mut connection, _) = match builder.connect_on(stream).await {
-        Ok(connected) => connected,
-        Err(error) => {
-            println!("Error: remote app server at `unix://{socket}` did not upgrade: {error}");
-            return 1;
+    // The first attempt carries an `Origin` header under that variant. A terminal that is refused
+    // goes away, or under `retry-plain` tries once more without it, as a person starting it again
+    // would.
+    let mut origin = variants.origin;
+    let mut connection = loop {
+        let stream = match tokio::net::UnixStream::connect(socket).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                println!(
+                    "Error: remote app server at `unix://{socket}` could not be reached: {error}"
+                );
+                return 1;
+            }
+        };
+        let mut builder = ClientBuilder::new()
+            .uri("ws://localhost/rpc")
+            .expect("a URI");
+        if origin {
+            builder = builder
+                .add_header(
+                    http::header::ORIGIN,
+                    http::HeaderValue::from_static("http://example.test"),
+                )
+                .expect("an Origin header");
+        }
+        match builder.connect_on(stream).await {
+            Ok((connection, _)) => break connection,
+            Err(error) => {
+                println!("Error: remote app server at `unix://{socket}` did not upgrade: {error}");
+                if origin && variants.retry_plain {
+                    origin = false;
+                    continue;
+                }
+                return 1;
+            }
         }
     };
     // The requests this terminal has made and had no answer to, by identifier.
@@ -194,6 +210,13 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                 println!("TUI: the server asks for {method}");
                 if variants.leave_unanswered {
                     continue;
+                }
+                if variants.answer_when_released
+                    && let Ok(release) = std::env::var(RELEASE_VARIABLE)
+                {
+                    while !std::path::Path::new(&release).exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
                 }
                 let id_value: Value = serde_json::from_str(&id).expect("an identifier");
                 let decision = if variants.decline {
