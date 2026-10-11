@@ -640,10 +640,10 @@ fn said(error: RecoveryError) -> CommandError {
 /// page never said it saved.
 ///
 /// An existing file is not emptied until it has been made private to this user, so a file whose
-/// mode this user cannot change is left as it was and the save fails. Two limits remain. A process
-/// that opened an earlier, wider file before the save keeps what that open gave it, and only a
-/// new file would take that back, which needs the folder. On Windows a file that already exists
-/// keeps its own access list.
+/// mode this user cannot change, or whose access list on macOS cannot be cleared, is left as it was
+/// and the save fails. Two limits remain. A process that opened an earlier, wider file before the
+/// save keeps what that open gave it, and only a new file would take that back, which needs the
+/// folder. On Windows a file that already exists keeps its own access list.
 fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -661,9 +661,32 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(target_os = "macos")]
+    clear_access_list(path)?;
     file.set_len(0)?;
     file.write_all(body)?;
     file.sync_all()
+}
+
+/// Clears the access list of a file the person chose, so that its mode bits are all that say who
+/// may read it.
+///
+/// On macOS a mode of 0600 does not remove an access list, and a list that names another account
+/// would let it read the kit. An error is returned when the file still carries one, and the kit is
+/// not written. Linux keeps no list beside the mode that the mode does not already cap.
+#[cfg(target_os = "macos")]
+fn clear_access_list(path: &Path) -> std::io::Result<()> {
+    if exacl::getfacl(path, None)?.is_empty() {
+        return Ok(());
+    }
+    exacl::setfacl(&[path], &[], None)?;
+    if exacl::getfacl(path, None)?.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "the file's access list could not be cleared",
+        ))
+    }
 }
 
 /// The time on this machine's clock, in UTC milliseconds.
