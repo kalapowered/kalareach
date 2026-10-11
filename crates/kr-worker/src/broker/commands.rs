@@ -1740,7 +1740,17 @@ impl Backend {
     /// will retire it. Returns true when it is done with and can be forgotten.
     fn end_line(&self) -> bool {
         self.line_over.store(true, Ordering::SeqCst);
-        if self.is_unbound() || self.is_retired() {
+        // Unbound to retired in one step, so that a launch cannot claim the backend between the
+        // look and the retirement, and have its files taken down before its guard gives it back.
+        let idle = self.lifecycle.state.send_if_modified(|state| {
+            if matches!(state, BackendState::Unbound) {
+                *state = BackendState::Retired;
+                true
+            } else {
+                false
+            }
+        });
+        if idle || self.is_retired() {
             self.retire();
             true
         } else {
