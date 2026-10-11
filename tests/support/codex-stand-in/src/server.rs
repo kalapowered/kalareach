@@ -106,7 +106,8 @@ impl Server {
             "method": "remoteControl/status/changed",
             "params": {
                 "status": "disabled",
-                "serverName": "stand-in",
+                // More than a pipe holds, so the write goes only if the other end is read.
+                "serverName": "x".repeat(300_000),
                 "installationId": "00000000-0000-4000-8000-000000000000",
                 "environmentId": null
             }
@@ -115,9 +116,13 @@ impl Server {
         line.push('\n');
         let wrote =
             self.out.write_all(line.as_bytes()).await.is_ok() && self.out.flush().await.is_ok();
+        // Written whole, then renamed into place, so that whoever sees the file reads all of it.
         let mut marker = release.as_os_str().to_owned();
         marker.push(".spoke");
-        let _ = std::fs::write(marker, if wrote { "wrote" } else { "failed" });
+        let mut part = marker.clone();
+        part.push(".part");
+        let _ = std::fs::write(&part, if wrote { "wrote" } else { "failed" });
+        let _ = std::fs::rename(&part, marker);
         if !wrote {
             self.finish().await;
         }
