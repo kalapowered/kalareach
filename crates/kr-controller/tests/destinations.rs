@@ -1252,12 +1252,17 @@ fn authority(name: &str) -> Authority {
 
 /// A server configuration presenting a certificate for `localhost` from `authority`.
 fn server_tls(authority: &Authority) -> Arc<tokio_rustls::rustls::ServerConfig> {
-    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-        .expect("certificate parameters");
+    server_tls_for(authority, "localhost")
+}
+
+/// A server configuration presenting a certificate for `name` from `authority`.
+fn server_tls_for(authority: &Authority, name: &str) -> Arc<tokio_rustls::rustls::ServerConfig> {
+    let mut params =
+        rcgen::CertificateParams::new(vec![name.to_owned()]).expect("certificate parameters");
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "localhost");
+        .push(rcgen::DnType::CommonName, name.to_owned());
     valid_now(&mut params, 30);
     let key = rcgen::KeyPair::generate().expect("a key pair");
     let leaf = params
@@ -1703,17 +1708,30 @@ fn mail_over_starttls_says_only_ehlo_and_starttls_in_the_clear() {
 /// `CONNECT` tunnel to the server. The proxy is asked for the server and its port and for nothing
 /// else, and each way of protecting the connection runs inside the tunnel: TLS from the first byte,
 /// or `EHLO` and `STARTTLS` alone in the clear, so the proxy carries no credential and no message
-/// in the clear.
+/// in the clear. It holds for a proxy reached in the clear and for one reached over TLS of its own.
 #[test]
 fn mail_through_a_proxy_is_the_same_conversation_inside_a_tunnel() {
     let runtime = runtime();
     let trusted = authority("kalareach test authority");
-    for (script, security) in [
-        (MailScript::implicit(), MailSecurity::ImplicitTls),
-        (MailScript::starttls(), MailSecurity::Starttls),
+    for (script, security, over_tls) in [
+        (MailScript::implicit(), MailSecurity::ImplicitTls, false),
+        (MailScript::starttls(), MailSecurity::Starttls, false),
+        (MailScript::implicit(), MailSecurity::ImplicitTls, true),
+        (MailScript::starttls(), MailSecurity::Starttls, true),
     ] {
         let server = MailServer::start(&runtime, script, &trusted);
-        let proxy = runtime.block_on(ConnectProxy::tunnelling());
+        let proxy = runtime.block_on(async {
+            if over_tls {
+                ConnectProxy::tunnelling_over_tls(tokio_rustls::TlsAcceptor::from(server_tls_for(
+                    &trusted,
+                    "127.0.0.1",
+                )))
+                .await
+            } else {
+                ConnectProxy::tunnelling().await
+            }
+        });
+        assert_eq!(proxy.url.starts_with("https://"), over_tls, "{}", proxy.url);
         let outbound = Outbound::Through(proxy.url.parse().expect("a proxy address"));
         let outcome = mail_sender_by(&runtime, &trusted, outbound).send(
             &external(DestinationKind::Email, "person@example.com"),
@@ -1734,6 +1752,76 @@ fn mail_through_a_proxy_is_the_same_conversation_inside_a_tunnel() {
         assert_eq!(seen.secure[1], format!("AUTH PLAIN {}", plain_token()));
         assert!(!seen.data.is_empty(), "the message went through the tunnel");
     }
+}
+
+/// KR-REQ-26.14: a proxy reached over TLS whose TLS then fails is the proxy's failure. It is not
+/// read as the mail server presenting a certificate that did not verify, which would abandon the
+/// attempt as an answer about the account's server: nothing was sent, and the route is what failed.
+#[test]
+fn a_failure_of_the_tls_to_the_proxy_is_not_taken_for_the_mail_servers_certificate() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let runtime = runtime();
+    let trusted = authority("kalareach test authority");
+    let server = MailServer::start(&runtime, MailScript::implicit(), &trusted);
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_for(&trusted, "127.0.0.1"));
+    // A proxy that opens the tunnel, waits for the first bytes of the TLS inside it, and then puts a
+    // record on the connection that the keys of its own TLS never made.
+    let (port, task) = runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let task = tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    continue;
+                };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    match tls.read_u8().await {
+                        Ok(byte) => head.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let _ = tls
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await;
+                let _ = tls.flush().await;
+                let _ = tls.read_u8().await;
+                let (raw, _) = tls.get_mut();
+                let mut corrupt = vec![0x17, 3, 3, 0, 32];
+                corrupt.extend_from_slice(&[0x41; 32]);
+                let _ = raw.write_all(&corrupt).await;
+                let mut sink = [0_u8; 64];
+                while tls.read(&mut sink).await.is_ok_and(|read| read > 0) {}
+            }
+        });
+        (port, task)
+    });
+    let outbound = Outbound::Through(
+        format!("https://127.0.0.1:{port}")
+            .parse()
+            .expect("a proxy address"),
+    );
+    let outcome = mail_sender_by(&runtime, &trusted, outbound).send(
+        &external(DestinationKind::Email, "person@example.com"),
+        &account(&server, MailSecurity::ImplicitTls),
+        &message(DestinationKind::Email),
+    );
+    task.abort();
+    assert!(
+        matches!(
+            outcome,
+            kr_delivery::external::ExternalOutcome::NotDispatched { .. }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        server.seen().handshakes,
+        0,
+        "the mail server was not reached"
+    );
 }
 
 /// KR-REQ-25.23: never downgraded. A server that offers no STARTTLS, one whose certificate this
