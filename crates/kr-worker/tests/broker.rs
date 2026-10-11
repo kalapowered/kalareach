@@ -32,7 +32,6 @@ use kr_protocol::ids::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
-#[cfg(unix)]
 use kr_worker::broker::InstanceEnding;
 use kr_worker::broker::bridge::BridgeProcess;
 use kr_worker::broker::connectors::{DECISION_SCHEMA, InstalledConnector, decoding_trust, fixture};
@@ -87,15 +86,8 @@ fn process_identity(pid: u64, start: u64) -> ProcessStartIdentity {
     ProcessStartIdentity::new(pid, ProcessStartSource::MacosProcBsdInfo, start)
 }
 
-fn managed(instance_id: ApplicationInstanceId, dedicated: bool) -> ManagedProcess {
-    managed_as(instance_id, dedicated, process_identity(41, 900))
-}
-
-fn managed_as(
-    instance_id: ApplicationInstanceId,
-    dedicated: bool,
-    process: ProcessStartIdentity,
-) -> ManagedProcess {
+fn managed(instance_id: ApplicationInstanceId) -> ManagedProcess {
+    let process = process_identity(41, 900);
     ManagedProcess::new(
         instance_id,
         process.clone(),
@@ -106,7 +98,6 @@ fn managed_as(
             process,
         },
         Credential::from_bytes(CREDENTIAL),
-        dedicated,
         TimestampMs::new(1),
     )
 }
@@ -594,7 +585,7 @@ fn broker_recording(
             instance(2),
             IntegrationMode::Gateway,
             Some(LaunchProfileId::new("lp-1").expect("valid")),
-            Some(managed(instance(2), true)),
+            Some(managed(instance(2))),
         )
         .expect("the instance is registered");
     broker
@@ -671,7 +662,7 @@ async fn kr_req_11_22_the_broker_owns_the_process_identity_the_source_and_the_ar
     );
 
     // The process is the broker's, by full identity rather than by identifier.
-    let process = managed(instance(2), true);
+    let process = managed(instance(2));
     assert!(process.authenticates(&CREDENTIAL, &process_identity(41, 900)));
     assert!(!process.authenticates(&CREDENTIAL, &process_identity(41, 901)));
 
@@ -729,7 +720,7 @@ async fn kr_req_11_22_the_broker_owns_the_process_identity_the_source_and_the_ar
 /// process and the runtime's own suite covers what crosses that boundary.
 #[test]
 fn kr_req_11_23_a_handle_names_the_executable_and_both_halves_authenticate() {
-    let process = managed(instance(2), true);
+    let process = managed(instance(2));
     assert_eq!(
         process.handle.executable_digest,
         Digest256::from_bytes([3; 32]),
@@ -885,7 +876,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
                 instance(2),
                 IntegrationMode::Gateway,
                 None,
-                Some(managed(instance(2), true)),
+                Some(managed(instance(2))),
             )
             .expect("the instance is registered");
         broker
@@ -893,7 +884,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
                 instance(3),
                 IntegrationMode::Gateway,
                 None,
-                Some(managed(instance(3), true)),
+                Some(managed(instance(3))),
             )
             .expect("the instance is registered");
         broker
@@ -1167,7 +1158,7 @@ fn kr_req_11_26_a_method_outside_the_trust_stays_recorded_and_is_answered_native
             instance(2),
             IntegrationMode::Gateway,
             None,
-            Some(managed(instance(2), true)),
+            Some(managed(instance(2))),
         )
         .expect("the instance is registered");
     broker
@@ -1305,7 +1296,7 @@ fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interpr
             instance(2),
             IntegrationMode::NativeBridge,
             None,
-            Some(managed(instance(2), false)),
+            Some(managed(instance(2))),
         )
         .expect("the launched instance is registered");
     let derived =
@@ -1499,7 +1490,7 @@ async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart
                 instance(2),
                 IntegrationMode::Gateway,
                 None,
-                Some(managed(instance(2), true)),
+                Some(managed(instance(2))),
             )
             .expect("the instance is registered");
         broker
@@ -1671,7 +1662,7 @@ async fn kr_req_11_26_a_binding_identifier_keeps_its_package() {
                 instance(2),
                 IntegrationMode::Gateway,
                 None,
-                Some(managed(instance(2), true)),
+                Some(managed(instance(2))),
             )
             .expect("the instance is registered");
         bind_as(&broker, bound).expect("bound");
@@ -1859,7 +1850,7 @@ fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResource
             instance(2),
             IntegrationMode::NativeBridge,
             None,
-            Some(managed(instance(2), false)),
+            Some(managed(instance(2))),
         )
         .expect("the launched instance is registered");
     broker
@@ -2531,7 +2522,7 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
         .execute_launch(&first, &ForegroundMark::idle(4), instance(2))
         .expect("the first execution runs");
     reservation
-        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("the instance is registered")
         .commit();
 
@@ -2604,7 +2595,7 @@ fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
         "0.9.1"
     );
     reservation
-        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("the launch registers the instance it reserved")
         .commit();
     assert_eq!(
@@ -2683,7 +2674,7 @@ fn kr_req_12_02_a_failed_launch_gives_back_only_its_own() {
         .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
         .expect("the retry runs");
     let registered = reservation
-        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("the instance is registered");
     assert!(broker.binding_state(instance(2)).is_ok());
     registered.abandon();
@@ -2707,7 +2698,7 @@ fn kr_req_12_02_a_failed_launch_gives_back_only_its_own() {
         .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
         .expect("the retry runs");
     reservation
-        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("and registers")
         .commit();
     assert_eq!(broker.conversation_owner("thread-7"), Some(instance(2)));
@@ -2730,7 +2721,7 @@ fn kr_req_12_02_a_launch_holds_its_identifier_until_its_guard_finishes() {
     let registered = broker
         .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
         .expect("the launch runs")
-        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("the instance is registered");
     let ended = broker.end(instance(2), kr_worker::broker::InstanceEnding::NativeExit);
     assert!(ended.instance_ended);
@@ -2775,7 +2766,7 @@ fn kr_req_12_02_a_reservation_registers_on_its_own_broker() {
         .execute_launch(&second_intent, &ForegroundMark::idle(4), instance(2))
         .expect("the second broker's launch runs");
     let registered_first = on_first
-        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("registered on the first broker");
     assert!(first.binding_state(instance(2)).is_ok());
     assert!(
@@ -2783,7 +2774,7 @@ fn kr_req_12_02_a_reservation_registers_on_its_own_broker() {
         "the first broker's reservation registered nothing on the second"
     );
     on_second
-        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("registered on the second broker")
         .commit();
     registered_first.abandon();
@@ -2807,7 +2798,7 @@ fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
             instance(2),
             IntegrationMode::Gateway,
             None,
-            Some(managed(instance(2), true)),
+            Some(managed(instance(2))),
         )
         .expect("the instance is registered");
 
@@ -3006,7 +2997,7 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
             instance(2),
             IntegrationMode::Gateway,
             None,
-            Some(managed(instance(2), true)),
+            Some(managed(instance(2))),
         )
         .expect("the instance is registered");
     broker
@@ -3014,7 +3005,7 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
             instance(3),
             IntegrationMode::NativeTerminal,
             None,
-            Some(managed(instance(3), true)),
+            Some(managed(instance(3))),
         )
         .expect("the instance is registered");
     broker
@@ -3059,28 +3050,18 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
     assert!(!InstanceEvidenceSource::PackageDeclaration.can_establish_qualified());
 }
 
-/// KR-REQ-07.67: a native exit names the backend to stop by its full process identity; closing an
-/// attachment names nothing and leaves a real child process running.
-// Unix only: a dedicated backend is a managed gateway launch, and Windows has no managed gateway.
-#[cfg(unix)]
+/// KR-REQ-07.67: a native exit ends the instance, and closing an attachment ends nothing: the
+/// instance is still running with an attachment fewer, and one that has no process of its own ends
+/// the same way.
 #[test]
-fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves_it_running() {
-    // A real child, started by this test and stopped by it. `sleep` is on the internal disk and
-    // needs nothing from the workspace.
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .expect("the child starts");
-    let pid = u64::from(child.id());
-    let identity = process_identity(pid, 12_345);
-
+fn kr_req_07_67_a_native_exit_ends_the_instance_and_closing_an_attachment_does_not() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
             instance(2),
             IntegrationMode::Gateway,
             None,
-            Some(managed_as(instance(2), true, identity.clone())),
+            Some(managed(instance(2))),
         )
         .expect("the instance is registered");
     broker.attach(instance(2));
@@ -3088,29 +3069,14 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
 
     let closed = broker.end(instance(2), InstanceEnding::AttachmentClosed);
     assert!(!closed.instance_ended);
-    assert_eq!(closed.backend, None);
     assert_eq!(closed.attachments_remaining, 1);
     broker
         .binding_state(instance(2))
         .expect("the instance is still running");
-    assert!(
-        child.try_wait().expect("the child can be polled").is_none(),
-        "closing an attachment does not end the process in the worker's terminal"
-    );
 
     let exited = broker.end(instance(2), InstanceEnding::NativeExit);
     assert!(exited.instance_ended);
-    assert_eq!(
-        exited.backend,
-        Some(identity),
-        "the outcome names which process to stop, by the identity this host recorded"
-    );
     assert!(broker.binding_state(instance(2)).is_err());
-
-    // The supervisor is what stops it in the product; this test started the child, so this test
-    // stops it.
-    let _ = child.kill();
-    let _ = child.wait();
 
     let bypassed =
         Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
@@ -3119,10 +3085,6 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
         .expect("the instance is registered");
     let ended = bypassed.end(instance(4), InstanceEnding::NativeExit);
     assert!(ended.instance_ended);
-    assert_eq!(
-        ended.backend, None,
-        "a bypassed or shared backend is never claimed or terminated as owned"
-    );
 }
 
 /// KR-REQ-19.05: upstream bytes are data. Nothing a source frame contains changes a grant, and a
@@ -3220,7 +3182,7 @@ async fn kr_req_11_37_a_committed_gap_records_what_happened_inside_it_and_restor
                 instance(2),
                 IntegrationMode::Gateway,
                 None,
-                Some(managed(instance(2), true)),
+                Some(managed(instance(2))),
             )
             .expect("the instance is registered");
         broker

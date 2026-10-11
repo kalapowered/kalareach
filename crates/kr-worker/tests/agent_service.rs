@@ -338,7 +338,6 @@ fn register(host: &Host, dispatch: Option<Arc<dyn UpstreamDispatch>>) {
                     process,
                 },
                 Credential::from_bytes([9; 32]),
-                true,
                 TimestampMs::new(1),
             )),
         )
@@ -2053,7 +2052,6 @@ fn offer_elsewhere(host: &Host) -> kr_protocol::ids::PendingResourceId {
                     process: process.clone(),
                 },
                 Credential::from_bytes([8; 32]),
-                true,
                 TimestampMs::new(1),
             )),
         )
@@ -2342,7 +2340,6 @@ impl ServedChannel {
                         process: launched.clone(),
                     },
                     Credential::from_bytes([9; 32]),
-                    false,
                     TimestampMs::new(1),
                 )),
             )

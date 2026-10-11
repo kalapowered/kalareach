@@ -76,7 +76,6 @@ pub fn register(broker: &Broker, number: u8) {
             process: launched(number),
         },
         Credential::from_bytes([9; 32]),
-        false,
         TimestampMs::new(1),
     );
     broker

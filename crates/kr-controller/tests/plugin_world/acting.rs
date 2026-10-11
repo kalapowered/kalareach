@@ -203,7 +203,6 @@ impl Acting {
                         process: process.clone(),
                     },
                     Credential::from_bytes([9; 32]),
-                    true,
                     TimestampMs::new(1),
                 )),
             )
