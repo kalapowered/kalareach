@@ -26,12 +26,20 @@ pub struct Variants {
     pub ignore_eof: bool,
     /// The server does not end when it is asked to terminate.
     pub ignore_term: bool,
-    /// The server starts its command in the server's own session and process group.
+    /// The server starts its command in the server's own session and process group. The server
+    /// then ends only the command itself when it goes: it cannot end the command's group without
+    /// ending itself, so what the command started stays.
     pub command_shares_group: bool,
     /// The server exits when the approval it asked for is answered, leaving its command running.
     pub die_first: bool,
-    /// The server writes a great deal to its standard error stream and goes on.
+    /// The server writes a great deal to its standard error stream and goes on, in numbered lines.
     pub flood_stderr: bool,
+    /// The server says its working directory and its environment on its error stream when it
+    /// starts, one line each, and then goes on.
+    pub report_environment: bool,
+    /// The server starts a command of its own whenever it is told to end and does not: when its
+    /// input ends under `ignore-eof`, and each time it is asked to terminate under `ignore-term`.
+    pub spawn_late: bool,
     /// The server asks for its approval under the identifier of the terminal's request to start a
     /// turn, before it answers that request.
     pub colliding_ids: bool,
@@ -68,6 +76,8 @@ impl Variants {
                 "command-shares-group" => variants.command_shares_group = true,
                 "die-first" => variants.die_first = true,
                 "flood-stderr" => variants.flood_stderr = true,
+                "report-environment" => variants.report_environment = true,
+                "spawn-late" => variants.spawn_late = true,
                 "colliding-ids" => variants.colliding_ids = true,
                 "leave-unanswered" => variants.leave_unanswered = true,
                 "decline" => variants.decline = true,

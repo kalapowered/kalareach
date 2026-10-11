@@ -23,7 +23,7 @@ use kr_protocol::scalars::Digest256;
 use kr_worker::broker::server::{Ended, MAX_ERROR_BYTES, Owned, Server, ServerSpec};
 use kr_worker::ownership::{OwnedProcesses, OwnershipBoundary};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 /// How long a wait for something to happen is given: the first start of a program that was just
 /// built or copied can take the system most of a minute.
@@ -109,6 +109,8 @@ async fn start(stand_in: &StandIn, variants: &str, command: &str) -> Server {
 struct Record {
     owned: Mutex<OwnedProcesses>,
     forced: Mutex<Vec<ProcessStartIdentity>>,
+    /// Every process the record has named below the server, whenever it was asked.
+    named: Mutex<Vec<ProcessStartIdentity>>,
 }
 
 impl Record {
@@ -124,6 +126,7 @@ impl Record {
         Self {
             owned: Mutex::new(owned),
             forced: Mutex::new(Vec::new()),
+            named: Mutex::new(Vec::new()),
         }
     }
 }
@@ -132,12 +135,26 @@ impl Owned for Record {
     fn below(&self, server: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
         let mut owned = self.owned.lock().expect("the record");
         owned.observe();
-        owned.below_backend(server)
+        let below = owned.below_backend(server);
+        let mut named = self.named.lock().expect("the list");
+        for process in &below {
+            if !named.contains(process) {
+                named.push(process.clone());
+            }
+        }
+        below
     }
 
     fn forced(&self, process: &ProcessStartIdentity) {
         self.owned.lock().expect("the record").note_forced(process);
         self.forced.lock().expect("the list").push(process.clone());
+    }
+
+    fn unsignalled(&self, process: &ProcessStartIdentity, why: &str) {
+        self.owned
+            .lock()
+            .expect("the record")
+            .note_unestablished(format!("process {} was not signalled: {why}", process.pid));
     }
 }
 
@@ -237,6 +254,34 @@ fn gone(process: &ProcessStartIdentity) -> bool {
     process_state(process) == ProcessState::Ended
 }
 
+/// How long a wait for something that is prompt when the code is right is given.
+const PROMPT: Duration = Duration::from_secs(30);
+
+/// Waits until the process is gone, and says whether it went.
+async fn goes(process: &ProcessStartIdentity) -> bool {
+    let started = Instant::now();
+    while !gone(process) {
+        if started.elapsed() >= PROMPT {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// Waits until the server's error stream has said `text`, and says whether it did. What the server
+/// wrote before it ended is read by a task of its own, which is a moment behind.
+async fn says(server: &Server, text: &str) -> bool {
+    let started = Instant::now();
+    while !server.error_tail().contains(text) {
+        if started.elapsed() >= PROMPT {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
 /// A server ends with its input, and its command with it: nothing is forced or left.
 #[tokio::test]
 async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
@@ -267,6 +312,13 @@ async fn kr_req_07_60_a_server_that_ignores_its_input_ends_when_asked_to_termina
     assert_eq!(retirement.ended, Ended::Terminate);
     assert!(retirement.forced.is_empty(), "{:?}", retirement.forced);
     assert!(gone(server.identity()) && gone(&command));
+    // The server ended its command itself, which it does only when it is asked to terminate and
+    // not hung up on: a hang-up kills it at once, and the ladder's sweep ends the command instead.
+    assert!(
+        says(&server, "stand-in: ending its commands").await,
+        "{}",
+        server.error_tail()
+    );
 }
 
 /// A server that ignores both is ended by force, and so is the command it leaves behind, which
@@ -335,25 +387,36 @@ async fn kr_req_07_60_a_server_that_floods_its_error_stream_goes_on_and_only_its
     let server = start(&stand_in, "flood-stderr", PLAIN).await;
     let record = Record::of(&server);
     let _session = to_the_approval(&server).await;
+    // The lines are numbered. The first is gone once more than the bound has been written after
+    // it, and what is left is the end of what was written.
     let started = Instant::now();
     loop {
         let tail = server.error_tail();
-        if tail.len() >= MAX_ERROR_BYTES - 4096 {
+        if !tail.contains("stand-in noise 0 ") && tail.len() >= MAX_ERROR_BYTES - 4096 {
             assert!(tail.len() <= MAX_ERROR_BYTES + 4, "{} bytes", tail.len());
-            assert!(tail.contains("stand-in noise"));
+            let numbers: Vec<u32> = tail
+                .lines()
+                .filter_map(|line| line.strip_prefix("stand-in noise "))
+                .filter_map(|rest| rest.split(' ').next()?.parse().ok())
+                .collect();
+            assert!(
+                numbers.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "what is kept is the end of the stream without a gap: {numbers:?}"
+            );
+            assert!(numbers[0] > 0, "{numbers:?}");
             break;
         }
-        assert!(started.elapsed() < LIVENESS, "the tail never filled");
+        assert!(started.elapsed() < LIVENESS, "the tail never rolled over");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let retirement = server.retire(&record).await;
     assert!(retirement.survivors.is_empty());
 }
 
-/// A program is started only when it is the executable the record names, in a group of its own,
-/// with the presented environment less the two variables of the launch, in the directory asked.
+/// A program is started only when it is the executable the record names, named by an absolute
+/// path, with an environment whose names are names.
 #[tokio::test]
-async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it_and_as_a_session_runs_it() {
+async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it() {
     let stand_in = stand_in();
     let directory = stand_in.directory.path();
     let environment = presented("", PLAIN);
@@ -374,43 +437,88 @@ async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it_and_as_a_s
     .expect_err("an executable the record does not name is not started");
     assert!(refused.contains("signed record"), "{refused}");
 
-    // The environment and the directory are read from a program that prints them.
-    let env = Path::new("/usr/bin/env");
-    let env_digest = Digest256::from_bytes(Sha256::digest(std::fs::read(env).expect("env")).into());
-    let mut with = presented("", PLAIN);
-    with.push((OsString::from("VISIBLE"), OsString::from("to-the-server")));
-    let printer = Server::start(&ServerSpec {
-        executable: env,
-        digest: &env_digest,
-        arguments: &[],
+    let relative = Server::start(&ServerSpec {
+        executable: Path::new("codex"),
+        digest: &stand_in.digest,
+        arguments: &arguments,
         directory,
-        presented: &with,
+        presented: &environment,
     })
     .await
-    .expect("env starts");
-    let (mut output, _input) = printer.take_pipes().expect("the pipes");
-    let mut printed = String::new();
-    tokio::time::timeout(LIVENESS, output.read_to_string(&mut printed))
-        .await
-        .expect("env ends")
-        .expect("it is readable");
+    .expect_err("a relative path names two files and is not started");
+    assert!(relative.contains("absolute"), "{relative}");
+
+    // A name with an equals sign in it would set another variable than the one it spells.
+    let mut forged = presented("", PLAIN);
+    forged.push((
+        OsString::from("KR_CREDENTIAL=forged"),
+        OsString::from("value"),
+    ));
+    let forged = Server::start(&ServerSpec {
+        executable: &stand_in.executable,
+        digest: &stand_in.digest,
+        arguments: &arguments,
+        directory,
+        presented: &forged,
+    })
+    .await
+    .expect_err("an environment with a name that is not one is not started");
+    assert!(forged.contains("environment"), "{forged}");
+}
+
+/// A server is started in a group of its own, in the directory asked, with the presented
+/// environment less the two variables of the launch and nothing of the worker's own.
+#[tokio::test]
+async fn kr_req_07_60_a_server_is_started_as_a_session_runs_it() {
+    let stand_in = stand_in();
+    let mut environment = presented("report-environment", PLAIN);
+    environment.push((OsString::from("VISIBLE"), OsString::from("to-the-server")));
+    let arguments = [
+        "app-server".to_owned(),
+        "--listen".to_owned(),
+        "stdio://".to_owned(),
+    ];
+    let server = Server::start(&ServerSpec {
+        executable: &stand_in.executable,
+        digest: &stand_in.digest,
+        arguments: &arguments,
+        directory: stand_in.directory.path(),
+        presented: &environment,
+    })
+    .await
+    .expect("the server starts");
+    // The stand-in says its directory and each variable it was given, and then that it is done.
     assert!(
-        printed.lines().any(|line| line == "VISIBLE=to-the-server"),
-        "{printed}"
+        says(&server, "stand-in: environment reported").await,
+        "{}",
+        server.error_tail()
+    );
+    let said = server.error_tail();
+    assert!(
+        said.lines()
+            .any(|line| line == "stand-in: variable VISIBLE=to-the-server"),
+        "{said}"
     );
     for withheld in ["KR_REGISTRATION", "KR_CREDENTIAL"] {
         assert!(
-            !printed.contains(withheld),
-            "{withheld} reached the server: {printed}"
+            !said.contains(&format!("variable {withheld}=")),
+            "{withheld} reached the server: {said}"
         );
     }
     assert!(
-        !printed.lines().any(|line| line.starts_with("HOME=")),
-        "the worker's own environment reached the server: {printed}"
+        !said.contains("variable HOME="),
+        "the worker's own environment reached the server: {said}"
+    );
+    let directory = said
+        .lines()
+        .find_map(|line| line.strip_prefix("stand-in: directory "))
+        .expect("the stand-in said its directory");
+    assert_eq!(
+        std::fs::canonicalize(directory).expect("the directory"),
+        std::fs::canonicalize(stand_in.directory.path()).expect("the directory asked"),
     );
 
     // The server leads a group of its own.
-    let server = start(&stand_in, "", PLAIN).await;
     let pid = server.identity().pid.get().to_string();
     let group = std::process::Command::new("/bin/ps")
         .args(["-o", "pgid=", "-p", &pid])
@@ -418,7 +526,121 @@ async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it_and_as_a_s
         .expect("ps runs");
     assert_eq!(String::from_utf8_lossy(&group.stdout).trim(), pid);
     let record = Record::of(&server);
-    let _session = to_the_approval(&server).await;
     let retirement = server.retire(&record).await;
     assert!(retirement.survivors.is_empty());
+}
+
+/// A server that is dropped without being retired is ended: nothing a holder of its pipes does
+/// keeps it.
+#[tokio::test]
+async fn kr_req_07_60_a_server_that_is_dropped_is_ended() {
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof,ignore-term", PLAIN).await;
+    let identity = server.identity().clone();
+    // Another holder of the pipes, which the guard must not wait for.
+    let pipes = server.take_pipes();
+    assert!(!gone(&identity));
+    drop(server);
+    let ended = goes(&identity).await;
+    // Whatever the guard did, nothing is left running by this test.
+    let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
+    drop(pipes);
+    assert!(ended, "the server outlived its guard");
+}
+
+/// A server that starts a command whenever it is told to end, and does not end, leaves commands
+/// that appeared after the first look at the record: each is recorded by a look just before the
+/// server is ended, and ended with it.
+#[tokio::test]
+async fn kr_req_07_60_a_command_started_while_the_server_is_being_ended_is_ended_too() {
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof,ignore-term,spawn-late", PLAIN).await;
+    let record = Record::of(&server);
+    let _session = to_the_approval(&server).await;
+    let _first = command_of(&server, &record).await;
+
+    let retirement = server.retire(&record).await;
+    assert_eq!(retirement.ended, Ended::Force);
+    assert!(retirement.survivors.is_empty(), "{retirement:?}");
+    // The command of the turn, one for the end of the input and one for the terminate: each was
+    // recorded, and each is gone.
+    let started: Vec<u64> = server
+        .error_tail()
+        .lines()
+        .filter_map(|line| line.strip_prefix("stand-in: started command "))
+        .filter_map(|pid| pid.trim().parse().ok())
+        .collect();
+    assert_eq!(started.len(), 3, "{}", server.error_tail());
+    let named = record.named.lock().expect("the list").clone();
+    for pid in started {
+        let recorded = named
+            .iter()
+            .find(|process| process.pid.get() == pid)
+            .unwrap_or_else(|| panic!("command {pid} was never recorded: {named:?}"));
+        assert!(gone(recorded), "command {pid} is still running");
+    }
+}
+
+/// A write that waits on a server that reads nothing is not left waiting when the input is closed.
+#[tokio::test]
+async fn kr_req_07_60_a_write_that_waits_on_the_servers_input_ends_when_the_input_is_closed() {
+    use tokio::io::AsyncWriteExt as _;
+
+    // A server that never reads its input: the pipe fills and a write waits.
+    let sleep = Path::new("/bin/sleep");
+    let digest = Digest256::from_bytes(Sha256::digest(std::fs::read(sleep).expect("sleep")).into());
+    let environment = presented("", PLAIN);
+    let server = Server::start(&ServerSpec {
+        executable: sleep,
+        digest: &digest,
+        arguments: &["300".to_owned()],
+        directory: Path::new("/"),
+        presented: &environment,
+    })
+    .await
+    .expect("sleep starts");
+    let (_output, input) = server.take_pipes().expect("the pipes");
+    let mut writer = input.clone();
+    let mut closer = input;
+    let (parked, waiting) = tokio::sync::oneshot::channel();
+    let writing = tokio::spawn(async move {
+        use std::pin::Pin;
+        use std::task::Poll;
+        use tokio::io::AsyncWrite as _;
+        let block = vec![b'x'; 1 << 20];
+        let mut sent = 0;
+        let mut parked = Some(parked);
+        // Written until the pipe is full, and then it is said that the write waits.
+        std::future::poll_fn(|cx| {
+            loop {
+                match Pin::new(&mut writer).poll_write(cx, &block[sent..]) {
+                    Poll::Ready(Ok(count)) => {
+                        sent += count;
+                        if sent == block.len() {
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {
+                        if let Some(parked) = parked.take() {
+                            let _ = parked.send(());
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            }
+        })
+        .await
+    });
+    tokio::time::timeout(PROMPT, waiting)
+        .await
+        .expect("the write reached a full pipe")
+        .expect("the write said so");
+    // The close is another holder's.
+    closer.shutdown().await.expect("the input closes");
+    let ended = tokio::time::timeout(PROMPT, writing)
+        .await
+        .expect("the waiting write was woken")
+        .expect("the task ends");
+    assert!(ended.is_err(), "the write failed as the input was closed");
 }
