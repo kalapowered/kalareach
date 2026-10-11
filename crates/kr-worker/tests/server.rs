@@ -63,7 +63,9 @@ fn stand_in() -> Arc<StandIn> {
         .tempdir()
         .expect("a directory");
     let executable = directory.path().join("codex");
-    std::fs::copy(&built, &executable).expect("the program is copied");
+    // Placed and started once where nothing is waited for: the first start of a program at a new
+    // path is the one the system checks, and it can take most of a minute.
+    let _ = kr_ipc::testing::place_and_start_once(&built, &executable, &["--version"]);
     let digest = Digest256::from_bytes(
         Sha256::digest(std::fs::read(&executable).expect("the copy is read")).into(),
     );
