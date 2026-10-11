@@ -1061,6 +1061,11 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "what a pipe says of its peer",
+            &["test", "--locked", "-p", "kr-ipc", "--test", "peer_gone"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the local IPC library",
             &["test", "--locked", "-p", "kr-ipc", "--lib"],
         ),

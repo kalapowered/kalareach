@@ -790,6 +790,13 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-ipc --test stop
 
+      # What a connection's writer says of its peer, asked of the pipe itself and not of a runtime:
+      # that the other end has closed, how many bytes it has sent that nobody has read, or that it is
+      # there and quiet. The worker asks before it dispatches an action a client is waiting on.
+      - name: Test what a pipe says of its peer
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-ipc --test peer_gone
+
       # The crate's own tests, among them the environment identity's list and the profile it is
       # kept in, and the two frame-writer tests that used to be skipped here: on this platform a
       # named pipe has no writability of its own the writer can hold while the reader holds the other
