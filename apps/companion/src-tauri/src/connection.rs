@@ -159,6 +159,12 @@ pub struct ConnectionState {
     /// action. A control whose visibility turns on a right is shown from this, and the host checks
     /// the right again when the action arrives.
     pub rights: Option<Vec<kr_protocol::rights::ActionRight>>,
+    /// True while the live connection is to a host this device is paired with, and false for the
+    /// host on this machine and when there is no connection.
+    ///
+    /// A file this application uploads goes to the host on this machine. A host this device is
+    /// paired with takes no file from it, so the page offers no attachment over one.
+    pub paired: bool,
 }
 
 impl ConnectionState {
@@ -170,6 +176,7 @@ impl ConnectionState {
             environment_id: None,
             reason: Some(reason.into()),
             rights: None,
+            paired: false,
         }
     }
 
@@ -181,6 +188,23 @@ impl ConnectionState {
             environment_id: Some(environment_id.to_string()),
             reason: None,
             rights: Some(kr_protocol::rights::ActionRight::ALL.to_vec()),
+            paired: false,
+        }
+    }
+
+    /// The state of a live connection to a host this device is paired with, in `environment_id`,
+    /// with the rights its grant carries.
+    #[must_use]
+    pub fn paired(
+        environment_id: EnvironmentId,
+        rights: Vec<kr_protocol::rights::ActionRight>,
+    ) -> Self {
+        Self {
+            connected: true,
+            environment_id: Some(environment_id.to_string()),
+            reason: None,
+            rights: Some(rights),
+            paired: true,
         }
     }
 
@@ -189,12 +213,9 @@ impl ConnectionState {
     pub fn of(connection: &Connection) -> Self {
         match &connection.standing {
             Standing::Owner => Self::owner(connection.environment_id),
-            Standing::Paired { rights, .. } => Self {
-                connected: true,
-                environment_id: Some(connection.environment_id.to_string()),
-                reason: None,
-                rights: Some(rights.clone()),
-            },
+            Standing::Paired { rights, .. } => {
+                Self::paired(connection.environment_id, rights.clone())
+            }
         }
     }
 }
@@ -366,6 +387,29 @@ mod tests {
 
         let lost = serde_json::to_value(ConnectionState::unreachable("no host")).expect("encodes");
         assert_eq!(lost["rights"], serde_json::Value::Null);
+    }
+
+    /// A connection says whether its host is one this device is paired with, because an
+    /// attachment is offered only for the host on this machine: the path it is given is a path
+    /// there.
+    #[test]
+    fn a_connection_says_whether_its_host_is_one_this_device_is_paired_with() {
+        let environment: EnvironmentId = "3f1a2c40-11aa-4b2c-9d3e-000000000001"
+            .parse()
+            .expect("an environment identity");
+        let here = serde_json::to_value(ConnectionState::owner(environment)).expect("encodes");
+        assert_eq!(here["paired"], serde_json::Value::Bool(false));
+
+        let there = serde_json::to_value(ConnectionState::paired(
+            environment,
+            vec![kr_protocol::rights::ActionRight::AgentPrompt],
+        ))
+        .expect("encodes");
+        assert_eq!(there["paired"], serde_json::Value::Bool(true));
+        assert_eq!(there["rights"], serde_json::json!(["agent.prompt"]));
+
+        let lost = serde_json::to_value(ConnectionState::unreachable("no host")).expect("encodes");
+        assert_eq!(lost["paired"], serde_json::Value::Bool(false));
     }
 
     /// KR-REQ-10.01: what crosses to the WebView is a host event's payload as the native client

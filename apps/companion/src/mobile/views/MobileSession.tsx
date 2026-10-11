@@ -27,8 +27,10 @@ import { flushSync } from 'react-dom'
 
 import { useApp, useSession } from '../../app/state'
 import { useSessionAgent } from '../../app/agent'
-import { useConnectionRights } from '../../app/rights'
-import { composerOffers, subjectOf, withheldTotal } from '../../model/agent'
+import { useHeldConnection } from '../../app/rights'
+import { AttachmentPaths } from '../../components/AttachmentPaths'
+import { AttachmentThumb } from '../../components/AttachmentThumb'
+import { attachOffer, composerOffers, subjectOf, withheldTotal } from '../../model/agent'
 import type { ConversationItem } from '../../model/conversation'
 import { keptEntry } from '../../model/draft-book'
 import { entryLabel, nodeKindLabel } from '../../model/entry-label'
@@ -158,7 +160,7 @@ export function MobileSession({
   /** Whether the host is in contact, or null before the shell's first answer. */
   readonly connected: boolean | null
 }): ReactNode {
-  const { port, say, drafts: book } = useApp()
+  const { port, say, drafts: book, paths } = useApp()
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
   const keptEntryLine = keptEntry(shown)
@@ -229,7 +231,12 @@ export function MobileSession({
       ),
     [held, sessionId, openedAtMs, currentTarget]
   )
-  const rights = useConnectionRights()
+  const { rights, paired } = useHeldConnection()
+  // A file needs the host on this phone's own computer and the rights, and nothing of the agent.
+  const fileOffer = useMemo(
+    () => attachOffer({ connected: connected === true, paired, rights: rights === null ? null : new Set(rights) }),
+    [connected, paired, rights]
+  )
   // What the conversation does not show, said above what it does.
   const historyNotes = useMemo(() => {
     const notes: string[] = []
@@ -350,8 +357,9 @@ export function MobileSession({
           })
           if (removedFiles.current.has(localId)) return
           say(
-            `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it; remove it to send the text on its own.`
+            `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it; give its path to your agent yourself, or remove it to send the text on its own.`
           )
+          void paths.attach(sessionId, { sessionId }, handle)
         })
         .catch((failure: unknown) => {
           settle({ upload: 'failed' })
@@ -359,7 +367,7 @@ export function MobileSession({
           say(`${picked.name} was not uploaded: ${failureMessage(failure)}`, 'danger')
         })
     },
-    [changeFiles, port, say, sessionId]
+    [changeFiles, paths, port, say, sessionId]
   )
 
   // A draft written before the agent was read keeps the first conversation it learns, so that a
@@ -1079,6 +1087,7 @@ export function MobileSession({
                   className="m-attachment"
                   data-upload={attachment.upload}
                 >
+                  <AttachmentThumb attachment={attachment} />
                   {attachment.name}
                   <span className="m-row-detail">
                     {`${describeBytes(attachment.byteLen)} · ${UPLOAD_WORDS[attachment.upload]}`}
@@ -1100,6 +1109,12 @@ export function MobileSession({
               ))}
             </div>
           ) : null}
+          <AttachmentPaths
+            sessionId={sessionId}
+            subject={{ sessionId }}
+            attachments={draft.attachments}
+            target={target}
+          />
 
           {typingToProgram ? null : (
             <label className="visually-hidden" htmlFor={`composer-${sessionId}`}>
@@ -1150,8 +1165,14 @@ export function MobileSession({
                   Keep it for the new conversation
                 </Button>
               ) : null}
+              {fileOffer.offered || connected !== true ? null : (
+                <p className="small muted" data-testid="attach-reason">
+                  {fileOffer.reason}
+                </p>
+              )}
               <AttachmentPicker
                 surface={surface}
+                disabled={!fileOffer.offered}
                 onPicked={(files) => {
                   for (const { picked, file } of files) {
                     const admission = admit(picked)

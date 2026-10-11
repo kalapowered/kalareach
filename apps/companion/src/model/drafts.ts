@@ -8,8 +8,7 @@
  * retarget explicitly. Nothing here ever submits anything.
  *
  * The store behind this is the native client's, which is where durability lives. This module is
- * the part the interface needs: what the state is, what a rebind does to it, and what the person is
- * offered when insertion is refused.
+ * the part the interface needs: what the state is, and what a rebind does to it.
  */
 
 import type { AttachmentHandle } from '@kalareach/protocol'
@@ -228,54 +227,5 @@ export function notSubmittableBecause(draft: Draft): string | null {
       return 'The conversation changed since this was written. Choose whether it goes to the new one.'
     case 'orphaned':
       return 'The session this was written for has gone. Choose another.'
-  }
-}
-
-/** What a refused insertion leaves the person with. */
-export interface InsertionRefusal {
-  /** The protocol code the host answered with. */
-  readonly code: string
-  /** What the person can do instead, in plain words. */
-  readonly fallback: string
-  /** True when the draft and its uploads were kept, which they always are. */
-  readonly retained: true
-}
-
-/**
- * Reads a refused composer insertion.
- *
- * `DRAFT_CONFLICT` is the one the specification names: the native buffer was not empty or its
- * state was unknown, so the draft is retained and the terminal workflow is offered. `LEASE_LOST`
- * is the other way in: insertion needs the current input lease.
- */
-export function readInsertionRefusal(code: string): InsertionRefusal {
-  switch (code) {
-    case 'DRAFT_CONFLICT':
-      return {
-        code,
-        fallback:
-          'The agent composer was not at an empty, qualified boundary. The draft and its uploads are kept: copy the path into the terminal instead.',
-        retained: true
-      }
-    case 'LEASE_LOST':
-      return {
-        code,
-        fallback:
-          'Another view holds terminal input. Take input back, then insert, or copy the path into the terminal.',
-        retained: true
-      }
-    case 'EDITOR_BUSY':
-      return {
-        code,
-        fallback:
-          'The editor is mid-transaction. The draft is kept: try again, or copy the path into the terminal.',
-        retained: true
-      }
-    default:
-      return {
-        code,
-        fallback: 'The draft and its uploads are kept. Copy the path into the terminal instead.',
-        retained: true
-      }
   }
 }

@@ -17,6 +17,7 @@ import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type {
   ActionRight,
   AttachmentSummary,
+  AttachmentHandle,
   CapabilityRecord,
   ClosureRecord,
   DescriptionConfigureParams,
@@ -79,7 +80,13 @@ import type {
 } from './port'
 import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
-import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, decodeParams, STORAGE_OBJECT_DELETE_PARAMS } from './fake-decode'
+import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake-host-drafts'
+import {
+  AGENT_DRAFT_ADD_ATTACHMENT_PARAMS,
+  DRAFT_CREATE_PARAMS,
+  decodeParams,
+  STORAGE_OBJECT_DELETE_PARAMS
+} from './fake-decode'
 import { FakeDraftStore } from './fake-drafts'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
@@ -175,6 +182,24 @@ function settledAs(method: string, state: Receipt['state']): {
 } {
   const actionId = nextActionId()
   return { receipt: receipt(actionId, state, method), value: null, action_id: actionId }
+}
+
+/** The bounded thumbnail the host makes of an image: here a one-pixel PNG, as unpadded base64url. */
+const ONE_PIXEL_PREVIEW: AttachmentHandle['preview'] = {
+  source_format: 'png',
+  source_width: '1',
+  source_height: '1',
+  width: '1',
+  height: '1',
+  thumbnail:
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg'
+}
+
+let transferCounter = 0
+
+function nextTransferId(): string {
+  transferCounter += 1
+  return `99999999-9999-4999-8999-${String(transferCounter).padStart(12, '0')}`
 }
 
 function nextActionId(): string {
@@ -306,6 +331,8 @@ export interface FakeHostControls {
   readonly importedImages: string[]
   /** The files the interface sent to the host, in order. */
   readonly uploaded: string[]
+  /** The drafts the host holds for files, and what the interface bound to them. */
+  readonly hostDrafts: FakeHostDrafts
   /** The action identifiers this host has issued, in order. */
   readonly actions: string[]
   /**
@@ -690,12 +717,16 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let anotherHost = false
   let sessionListRefused = false
   let environmentListRefused = false
+  /** Whether the host is one this device is paired with, not the one on its own computer. */
+  let pairedDevice = false
+  const hostDrafts = scriptedHostDrafts()
   const connectionNow = (): ConnectionState =>
     receivedConnection({
       connected,
       environment_id: connected ? hostEnvironment : null,
       reason: connected ? null : lostBecause,
-      rights: connected ? rights : null
+      rights: connected ? rights : null,
+      paired: connected && pairedDevice
     })
   const connectionListeners = new Set<(state: ConnectionState) => void>()
 
@@ -775,7 +806,6 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       refuse('PERMISSION_DENIED', 'This device may not manage this host.')
     }
   }
-  let pairedDevice = false
   /** The two writes of description setup are the host's own to make: a paired device is refused. */
   const requireLocalSocket = (change: 'a setting' | 'the download') => {
     requireOwner()
@@ -1061,26 +1091,37 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     deviceDraftRetarget: (request) => Promise.resolve(drafts.retarget(request)),
     deviceDraftDiscard: (request) => Promise.resolve(drafts.discard(request)),
 
-    draftCreate: () =>
-      Promise.resolve(settledAs('draft.create', 'applied')),
-    draftUpdate: () =>
-      Promise.resolve(settledAs('draft.update', 'applied')),
+    draftCreate: (params) => {
+      requireConnection()
+      const read = decodeParams<{
+        environment_id: string
+        session_id: string | null
+        application_instance_id: string | null
+      }>(params, DRAFT_CREATE_PARAMS)
+      if (read.environment_id !== hostEnvironment) {
+        refuse('INVALID_ARGUMENT', 'This host owns another environment.')
+      }
+      return Promise.resolve(hostDrafts.create(read.session_id, read.application_instance_id))
+    },
     attachmentUpload: (path) => {
       requireConnection()
       // What `upload.finish` also says of a handle, which the scripted uploads do not vary.
       const unpublished = { session_id: null, preview: null, published_at_ms: '1', expires_at_ms: '2', submitted: false }
       const name = path.split('/').pop() ?? path
       uploaded.push(path)
-      return Promise.resolve({
-        transfer_id: '99999999-9999-4999-8999-999999999999',
+      const handle: AttachmentHandle = {
+        transfer_id: nextTransferId(),
         environment_id: ENVIRONMENT,
         byte_len: '10',
         content_digest: 'a'.repeat(64),
         declared_media_type: 'image/png',
         original_file_name: name,
         presented_as_image: true,
-        ...unpublished
-      })
+        ...unpublished,
+        preview: ONE_PIXEL_PREVIEW
+      }
+      hostDrafts.published(handle)
+      return Promise.resolve(handle)
     },
     attachmentUploadBytes: (file) => {
       requireConnection()
@@ -1091,41 +1132,27 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       // Native code keeps the last component of the name, as metadata.
       const name = file.name.split(/[\\/]/).pop()?.trim() || 'attachment'
       uploaded.push(name)
-      return Promise.resolve({
-        transfer_id: '99999999-9999-4999-8999-999999999998',
+      const handle: AttachmentHandle = {
+        transfer_id: nextTransferId(),
         environment_id: ENVIRONMENT,
         byte_len: String(file.bytes.length),
         content_digest: 'b'.repeat(64),
         declared_media_type: /\.png$/i.test(name) ? 'image/png' : 'application/octet-stream',
         original_file_name: name,
         presented_as_image: /\.png$/i.test(name),
-        ...unpublished
-      })
+        ...unpublished,
+        preview: /\.png$/i.test(name) ? ONE_PIXEL_PREVIEW : null
+      }
+      hostDrafts.published(handle)
+      return Promise.resolve(handle)
     },
     draftAddAttachment: (params) => {
       requireConnection()
       // Native code reads the method's own parameters, the integration's contribution included,
       // before anything reaches a host.
-      const read = decodeParams<{
-        contribution: { insertion_method: string }
-      }>(params, AGENT_DRAFT_ADD_ATTACHMENT_PARAMS)
-      if (read.contribution.insertion_method === 'verified_composer_insertion') {
-        // The specification's own rule: a nonempty or unknown buffer returns DRAFT_CONFLICT, the
-        // draft is retained, and the person is offered the terminal workflow instead.
-        refuse('DRAFT_CONFLICT', 'The agent composer is not at an empty, qualified boundary.')
-      }
-      return Promise.resolve(settledAs('agent.draft.add_attachment', 'applied'))
+      const read = decodeParams<BindParams>(params, AGENT_DRAFT_ADD_ATTACHMENT_PARAMS)
+      return Promise.resolve(hostDrafts.bind(read))
     },
-    attachmentImage: () =>
-      Promise.resolve({
-        // A one-pixel PNG, which is what an attachment handle resolves to here.
-        bytes: [
-          137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8,
-          6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 250, 207, 0, 0,
-          3, 1, 1, 0, 24, 221, 141, 219, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130
-        ],
-        media_type: 'image/png'
-      }),
 
     historyPage: (params) =>
       reading('historyPage', () => {
@@ -1749,6 +1776,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
     reachAsPairedDevice() {
       pairedDevice = true
+      for (const listener of connectionListeners) listener(connectionNow())
     },
     changeDescriptionSetup(change) {
       descriptionSetup = { ...descriptionSetup, ...change }
@@ -1804,6 +1832,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     openedLinks,
     importedImages,
     uploaded,
+    hostDrafts: hostDrafts.controls,
     actions: issuedActions,
     grantPermission(capability) {
       granted.add(capability)

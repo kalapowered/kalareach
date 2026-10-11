@@ -74,7 +74,6 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("device_draft_discard", None),
     // Drafts and attachments.
     ("draft_create", Some(Method::DraftCreate)),
-    ("draft_update", Some(Method::DraftUpdate)),
     (
         "draft_add_attachment",
         Some(Method::AgentDraftAddAttachment),
@@ -82,8 +81,6 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("attachment_upload", Some(Method::UploadBegin)),
     ("attachment_upload_bytes", Some(Method::UploadBegin)),
     ("attachment_upload_status", Some(Method::UploadStatus)),
-    ("attachment_image", Some(Method::DownloadBegin)),
-    ("attachment_image_chunk", Some(Method::DownloadChunk)),
     // History and receipts. A live session's are read from its own worker, and a closed one's from
     // the host's archive.
     ("history_page", Some(Method::HistoryPage)),
@@ -277,13 +274,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         device_draft_retarget,
         device_draft_discard,
         draft_create,
-        draft_update,
         draft_add_attachment,
         attachment_upload,
         attachment_upload_bytes,
         attachment_upload_status,
-        attachment_image,
-        attachment_image_chunk,
         history_page,
         action_read,
         action_cancel,
@@ -425,6 +419,51 @@ fn submitted(
     }
 }
 
+/// What a mutation answered with, when the page reads the method's own result.
+///
+/// A result the host sent is a value of KR-CBOR-1, whose JSON form is diagnostic: an identifier is
+/// a byte string there, and renders as base64url, which is not the form the protocol's JSON gives
+/// an identifier and not the form a later call has to name it in. So the result is read into the
+/// method's own type and written as that type's JSON, as a read's result is.
+fn settled_as<R>(answer: &kr_client::Settled) -> Result<Settled>
+where
+    R: kr_protocol::wire::WireMessage + Serialize,
+{
+    match answer {
+        kr_client::Settled::Result(value) => {
+            let own: R = value.to_typed().map_err(|error| {
+                CommandError::local_failure(format!(
+                    "the host's answer was not the method's own result: {error}"
+                ))
+            })?;
+            Ok(Settled {
+                receipt: None,
+                value: Some(encode(&own)?),
+                action_id: None,
+            })
+        }
+        kr_client::Settled::Receipt(_) => settled(answer),
+    }
+}
+
+/// What the page is told of one submitted mutation whose own result it reads.
+fn submitted_as<R>(
+    answer: std::result::Result<kr_client::Settled, kr_client::ClientError>,
+) -> Result<Settled>
+where
+    R: kr_protocol::wire::WireMessage + Serialize,
+{
+    match answer {
+        Ok(value) => settled_as::<R>(&value),
+        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
+            receipt: None,
+            value: None,
+            action_id: Some(action_id.to_string()),
+        }),
+        Err(error) => Err(CommandError::from(error)),
+    }
+}
+
 /// Declares a command that performs one read and nothing else.
 macro_rules! read_command {
     ($(#[$meta:meta])* $name:ident, $method:expr, () => $result:ty) => {
@@ -462,6 +501,28 @@ macro_rules! mutate_command {
             let target = subject.target(state.environment_id()?)?;
             let session = state.session()?;
             submitted(
+                session
+                    .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
+                    .await,
+            )
+        }
+    };
+}
+
+/// Declares a command that performs one mutation and gives the page the method's own result.
+macro_rules! mutate_result_command {
+    ($(#[$meta:meta])* $name:ident, $method:expr, $params:ty => $result:ty) => {
+        $(#[$meta])*
+        #[tauri::command]
+        pub async fn $name(
+            state: State<'_, AppState>,
+            subject: Subject,
+            params: Value,
+        ) -> Result<Settled> {
+            let typed: $params = decode(params)?;
+            let target = subject.target(state.environment_id()?)?;
+            let session = state.session()?;
+            submitted_as::<$result>(
                 session
                     .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
                     .await,
@@ -832,33 +893,17 @@ mutate_command!(
     /// Launches an installed profile or a named command at a verified empty prompt.
     shell_launch, Method::ShellLaunch, kr_protocol::root::ShellLaunchParams
 );
-mutate_command!(
-    /// Creates a draft on the host.
+mutate_result_command!(
+    /// Creates a draft on the host, which a file is then bound to.
     draft_create, Method::DraftCreate, kr_protocol::transfer::DraftCreateParams
+        => kr_protocol::transfer::DraftCreateResult
 );
-mutate_command!(
-    /// Updates a draft on the host.
-    draft_update, Method::DraftUpdate, kr_protocol::transfer::DraftUpdateParams
-);
-mutate_command!(
-    /// Adds a completed attachment handle to a draft.
+mutate_result_command!(
+    /// Binds a completed attachment handle to a draft, and answers with the draft after it and the
+    /// binding, whose read grant names the path the file can be read at.
     draft_add_attachment, Method::AgentDraftAddAttachment,
     kr_protocol::transfer::AgentDraftAddAttachmentParams
-);
-read_command!(
-    /// Begins reading an image through its validated attachment handle.
-    ///
-    /// This is the only way an image from a session reaches the page. A renderer that followed a
-    /// URL out of agent text would be fetching whatever that text named; a handle names bytes the
-    /// host verified. The registry marks it a read, so it is one: a mutation of a read method is
-    /// refused by the session before it reaches the host.
-    attachment_image, Method::DownloadBegin,
-    kr_protocol::transfer::DownloadBeginParams => kr_protocol::transfer::DownloadBeginResult
-);
-read_command!(
-    /// Reads one chunk of the source the handle named.
-    attachment_image_chunk, Method::DownloadChunk,
-    kr_protocol::transfer::DownloadChunkParams => kr_protocol::transfer::DownloadChunkResult
+        => kr_protocol::transfer::AgentDraftAddAttachmentResult
 );
 mutate_command!(
     /// Cancels a pending action.
@@ -2353,13 +2398,10 @@ mod tests {
             description_download,
             shell_launch,
             draft_create,
-            draft_update,
             draft_add_attachment,
             attachment_upload,
             attachment_upload_bytes,
             attachment_upload_status,
-            attachment_image,
-            attachment_image_chunk,
             history_page,
             action_read,
             action_cancel,

@@ -160,7 +160,6 @@ export function tauriPort(): HostPort {
     deviceDraftRetarget: (request) => read('device_draft_retarget', request),
     deviceDraftDiscard: (request) => read('device_draft_discard', request),
     draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
-    draftUpdate: (params, subject) => mutate<Settled>('draft_update', params, subject),
     // The upload belongs to the same session the subject names; sending the subject without it
     // would reserve the transfer against no session while the action targeted one.
     attachmentUpload: (path, subject) =>
@@ -179,8 +178,6 @@ export function tauriPort(): HostPort {
       }),
     draftAddAttachment: (params, subject) =>
       mutate<Settled>('draft_add_attachment', params, subject),
-    attachmentImage: (params) =>
-      mutate<{ bytes: number[]; media_type: string }>('attachment_image', params, {}),
 
     historyPage: (params) => read('history_page', params),
     // Attention and review belong to the environment, so an acknowledgement names no session.

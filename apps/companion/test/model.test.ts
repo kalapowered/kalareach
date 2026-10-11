@@ -29,7 +29,6 @@ import {
   connectionLost,
   edit,
   notSubmittableBecause,
-  readInsertionRefusal,
   rebind,
   retarget,
   startDraft,
@@ -419,15 +418,6 @@ describe('drafts', () => {
     expect(adoptFirstTarget(kept, { ...first, agentBindingRevision: '5' })).toBe(kept)
     const empty = startDraft('d2', { ...target, applicationInstanceId: null }, 0)
     expect(adoptFirstTarget(empty, first)).toBe(empty)
-  })
-
-  it('retains the draft on every refused insertion and offers the terminal workflow', () => {
-    for (const code of ['DRAFT_CONFLICT', 'LEASE_LOST', 'EDITOR_BUSY', 'SOMETHING_ELSE']) {
-      const refusal = readInsertionRefusal(code)
-      expect(refusal.retained).toBe(true)
-      expect(refusal.fallback).toMatch(/terminal/)
-    }
-    expect(readInsertionRefusal('DRAFT_CONFLICT').fallback).toMatch(/qualified boundary/)
   })
 })
 

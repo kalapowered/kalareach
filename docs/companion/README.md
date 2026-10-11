@@ -113,13 +113,17 @@ Setup offers session descriptions from the host's own answer. Initially, the car
 A draft keeps the conversation it was written for: the agent's instance and the binding revision the
 person wrote to. If the agent moves to another conversation while the draft is on screen, the draft
 is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A draft
-written before the agent was read keeps the first conversation it learns. A file dropped on the
-window, or pasted into the composer, is on the draft from that moment, goes through the transfer
-service, and stays whether the upload succeeds or fails. A dropped file reaches native code as the
-path the platform handed it, so the page never holds its bytes; a pasted file reaches the page
-itself, which hands its bytes to native code, up to 64 MiB, for the same upload; a prompt sent from
-here carries its text inline and cannot carry the file, so a draft that holds one is not sent until
-the person removes it. Nothing that needs a right is offered before the connection has said what it
+written before the agent was read keeps the first conversation it learns.
+
+A file dropped onto the window or pasted into the composer, when files are offered, is on the draft from that moment. The application sends it to the host running on this computer through the transfer service, and it stays on the draft whether the sending succeeds or fails. When a file is dropped, the platform gives its path to native code directly, so the page never holds its bytes. When a file is pasted, it goes to the page, which hands its bytes to native code if the file is at most 64 MiB, and native code sends it by the same upload. When the host has made a small picture of an image, that picture is shown next to the file's name.
+
+Files are offered only while the application is in contact with the host on this computer and holds the rights to upload a file and to send a prompt. A host that this device is paired with takes no file from it, so over one no file is offered. A phone reaches a host only by pairing, so the pickers of the phone layout are disabled, and while a host is connected the reason is displayed next to them.
+
+Once a file is uploaded, the application binds it on the host as a manual terminal workflow and shows the path the host gives, with the time that path stops holding. The path can be selected and copied. It is not quoted for any shell, so the person quotes it for their own shell and gives it to the agent in the terminal. The application inserts nothing into an agent's composer. If the host refuses the path, or does not say whether it gave one, the file stays on the draft, the screen says so in words, and a button asks again.
+
+A prompt sent from a draft carries its text only, so a draft that holds a file is not sent until the person removes the file.
+
+Nothing that needs a right is offered before the connection has said what it
 may do. In a session, when the launch surface was read at an older prompt generation than the view
 has heard since, its buttons start disabled.
 
@@ -268,9 +272,8 @@ that means, and each rule is a fact about a file here rather than a convention:
   listener on `127.0.0.1:8765` takes the answer) or, on a phone, to the platform's browser-backed
   session, checks the answer and keeps the tokens in the device's secure store. The page is told
   where the device stands and never sees an address, a code or a token.
-- **Images come through validated handles.** An image in a session is read by its attachment handle.
-  A remote image is a placeholder with its URL and an import action, and the import is one request,
-  over `https`, with a declared size limit.
+- **A remote image is imported only when asked for.** A remote image is a placeholder with its URL
+  and an import action, and the import is one request, over `https`, with a declared size limit.
 - **Exports are written where a dialog put them.** The page asks for a destination, the platform's
   own save dialog answers, and the backend remembers that answer for exactly one write. A path the
   page names is refused.

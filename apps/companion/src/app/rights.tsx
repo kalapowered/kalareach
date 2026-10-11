@@ -1,5 +1,6 @@
 /**
- * What this connection may do, as native code reports it.
+ * What this connection may do, and whether its host is one this device is paired with, as native
+ * code reports it.
  *
  * A control that turns on a right is offered only once the right is known: until the connection has
  * said what it may do, and whenever it is out of contact, the answer is null and nothing that needs
@@ -17,17 +18,27 @@ import type { ActionRight } from '@kalareach/protocol'
 import { useApp } from './state'
 import { follow } from '../host/port'
 
-/**
- * The rights the shell heard, for the views under it: null while none are known, and undefined
- * outside a shell.
- */
-export const ShellRights = createContext<readonly ActionRight[] | null | undefined>(undefined)
+/** What the live connection may do, and whether its host is paired with this device. */
+export interface HeldConnection {
+  /** The rights it holds, or null while they are not known. */
+  readonly rights: readonly ActionRight[] | null
+  /** True while the host is one this device is paired with, not the one on this computer. */
+  readonly paired: boolean
+}
 
-/** The rights the connection holds now, or null while they are not known. */
-export function useConnectionRights(): readonly ActionRight[] | null {
-  const shared = useContext(ShellRights)
+const NOTHING_KNOWN: HeldConnection = { rights: null, paired: false }
+
+/**
+ * What the shell heard, for the views under it: nothing known while the connection has not
+ * answered, and undefined outside a shell.
+ */
+export const ShellConnection = createContext<HeldConnection | undefined>(undefined)
+
+/** What the connection holds now. */
+export function useHeldConnection(): HeldConnection {
+  const shared = useContext(ShellConnection)
   const { port, rememberRights } = useApp()
-  const [own, setOwn] = useState<readonly ActionRight[] | null>(null)
+  const [own, setOwn] = useState<HeldConnection>(NOTHING_KNOWN)
   useEffect(() => {
     if (shared !== undefined) return
     return follow(
@@ -35,14 +46,21 @@ export function useConnectionRights(): readonly ActionRight[] | null {
       () => port.connectionState(),
       (state) => {
         if (state.connected && state.rights !== null) rememberRights(state.rights)
-        setOwn(state.connected ? state.rights : null)
+        setOwn(
+          state.connected ? { rights: state.rights, paired: state.paired } : NOTHING_KNOWN
+        )
       },
       () => {
-        setOwn(null)
+        setOwn(NOTHING_KNOWN)
       }
     )
   }, [port, shared, rememberRights])
   return shared === undefined ? own : shared
+}
+
+/** The rights the connection holds now, or null while they are not known. */
+export function useConnectionRights(): readonly ActionRight[] | null {
+  return useHeldConnection().rights
 }
 
 /**

@@ -8,7 +8,7 @@
  * sessions and from the banner that reports the recovery.
  */
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -163,5 +163,52 @@ describe('the drafts no composer shows, on a phone (KR-REQ-13.13)', () => {
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
     await screen.findByRole('button', { name: /Session 1/ })
     expect(screen.queryByTestId('kept-drafts-entry')).toBeNull()
+  })
+})
+
+describe('a file picked on a phone (KR-REQ-13.14, 13.17)', () => {
+  /** The phone, on its first session, with the pickers' file input in hand. */
+  async function onTheSession(person: ReturnType<typeof userEvent.setup>) {
+    const host = open(new FakeDraftStore())
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await screen.findByLabelText('Message this session')
+    return host
+  }
+
+  it('is given a path on the host, shown as text to select', async () => {
+    const person = userEvent.setup({ applyAccept: false })
+    const { controls } = await onTheSession(person)
+    const group = await screen.findByRole('group', { name: 'Add an attachment' })
+    const files = group.parentElement?.querySelector<HTMLInputElement>('input[accept="*/*"]')
+    if (!files) throw new Error('no file picker')
+
+    await person.upload(files, new File(['a picked file'], 'notes.txt', { type: 'text/plain' }))
+
+    const path = await screen.findByTestId('attachment-path')
+    expect(path).toHaveTextContent('notes.txt')
+    expect(screen.getByTestId('attachment-path-row')).toHaveTextContent(/not quoted for any shell/)
+    expect(controls.hostDrafts.bound.map((each) => each.insertion_method)).toEqual([
+      'manual_terminal_workflow'
+    ])
+  })
+
+  it('is not taken over a host the phone is paired with, and says why beside the pickers', async () => {
+    const person = userEvent.setup({ applyAccept: false })
+    const { controls } = await onTheSession(person)
+    await act(async () => {
+      controls.reachAsPairedDevice()
+      await Promise.resolve()
+    })
+
+    const reason = await screen.findByTestId('attach-reason')
+    expect(reason).toHaveTextContent(/takes no file/)
+    for (const button of within(screen.getByRole('group', { name: 'Add an attachment' })).getAllByRole(
+      'button'
+    )) {
+      expect(button).toBeDisabled()
+    }
+    expect(controls.uploaded).toEqual([])
+    expect(controls.hostDrafts.made).toEqual([])
   })
 })

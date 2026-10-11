@@ -930,7 +930,11 @@
 
 .m-attachment {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
   gap: var(--gap-2);
   min-block-size: var(--target);
   padding: var(--gap-1) var(--gap-3);

@@ -247,6 +247,14 @@ export const QUESTION_ANSWER_PARAMS = object({
 /** One kept answer, named as native code reads it: by question and by when it was given. */
 export const KEPT_REF_PARAMS = object({ questionId: uuid, draftedAtMs: u64 })
 
+export const DRAFT_CREATE_PARAMS = object({
+  environment_id: uuid,
+  device_id: nullable(uuid),
+  session_id: nullable(uuid),
+  application_instance_id: nullable(uuid),
+  text
+})
+
 export const AGENT_DRAFT_ADD_ATTACHMENT_PARAMS = object({
   draft_id: uuid,
   expected_revision: u64,

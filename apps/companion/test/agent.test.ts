@@ -20,6 +20,7 @@ import type {
 import {
   actionableApprovals,
   agentEntry,
+  attachOffer,
   bindingStateOf,
   COMPOSER_CAPABILITIES,
   composerOffers,
@@ -234,7 +235,6 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
       rights: new Set(['session.view'])
     })
     expect(viewer.submit).toEqual({ offered: false, reason: 'This device was not granted this.' })
-    expect(viewer.attach.offered).toBe(false)
     const untold = composerOffers({
       known: true,
       binding: binding(),
@@ -247,6 +247,30 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
         reason: 'This device does not know yet what it may do here.'
       })
     }
+  })
+})
+
+describe('whether a file is offered (KR-REQ-13.12, 13.14)', () => {
+  const held = { connected: true, paired: false, rights: EVERY_RIGHT }
+
+  it('is offered to a connection to the host on this computer that holds the rights, with no agent capability', () => {
+    expect(attachOffer(held)).toEqual({ offered: true, reason: null })
+  })
+
+  it('is not offered over a host this device is paired with, which takes no file from it', () => {
+    const paired = attachOffer({ ...held, paired: true })
+    expect(paired.offered).toBe(false)
+    expect(paired.reason).toMatch(/takes no file/)
+  })
+
+  it('is not offered without contact, without both rights, or before the rights are known', () => {
+    expect(attachOffer({ ...held, connected: false }).offered).toBe(false)
+    expect(attachOffer({ ...held, rights: new Set(['agent.prompt']) }).offered).toBe(false)
+    expect(attachOffer({ ...held, rights: new Set(['files.upload']) }).offered).toBe(false)
+    expect(attachOffer({ ...held, rights: null })).toEqual({
+      offered: false,
+      reason: 'This device does not know yet what it may do here.'
+    })
   })
 })
 

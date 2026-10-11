@@ -290,7 +290,8 @@ describe('the desktop port and the connection state', () => {
     connected: false,
     environment_id: null,
     reason,
-    rights: null
+    rights: null,
+    paired: false
   })
 
   /** What a listener registered through the port hears when native code publishes `state`. */
@@ -326,7 +327,8 @@ describe('the desktop port and the connection state', () => {
       connected: true,
       environment_id: '3f1a2c40-11aa-4b2c-9d3e-000000000001',
       reason: null,
-      rights: ['session.view', 'agent.prompt']
+      rights: ['session.view', 'agent.prompt'],
+      paired: true
     }
     shell.answers.set('connection_state', live)
     expect(await tauriPort().connectionState()).toEqual(live)

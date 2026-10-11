@@ -5,14 +5,14 @@
  * and settings are never a fourth destination: they open over whatever the person is doing.
  */
 
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import type { ActionRight } from '@kalareach/protocol'
 
 import { AccountPanel, useAccount } from './components/AccountPanel'
 import { Brand, Sheet, Toast } from './components/ui'
 import { isSigningIn, type AccountView } from './model/account'
-import { ShellRights } from './app/rights'
+import { ShellConnection } from './app/rights'
 import { useApp, type Place } from './app/state'
 import { Attention } from './views/Attention'
 import { ChangeSets } from './views/ChangeSets'
@@ -45,6 +45,7 @@ export function App(): ReactNode {
     readonly connected: boolean
     readonly reason: string | null
     readonly rights: readonly ActionRight[] | null
+    readonly paired: boolean
   } | null>(null)
   const account = useAccount(port)
   const [accountOpen, setAccountOpen] = useState(false)
@@ -75,12 +76,18 @@ export function App(): ReactNode {
           setConnection({
             connected: state.connected,
             reason: state.reason,
-            rights: state.connected ? state.rights : null
+            rights: state.connected ? state.rights : null,
+            paired: state.connected && state.paired
           })
         },
         // A failure to answer is itself an answer: the window says it is not connected, and why.
         (failure) => {
-          setConnection({ connected: false, reason: failureMessage(failure), rights: null })
+          setConnection({
+            connected: false,
+            reason: failureMessage(failure),
+            rights: null,
+            paired: false
+          })
         }
       ),
     [port, rememberRights]
@@ -102,6 +109,11 @@ export function App(): ReactNode {
       window.removeEventListener('pointerdown', pointer, true)
     }
   }, [])
+
+  const held = useMemo(
+    () => ({ rights: connection?.rights ?? null, paired: connection?.paired ?? false }),
+    [connection]
+  )
 
   const shell = (
     <div className="app-shell">
@@ -227,7 +239,7 @@ export function App(): ReactNode {
       <Toast message={toast} onDismiss={dismissToast} />
     </div>
   )
-  return <ShellRights.Provider value={connection?.rights ?? null}>{shell}</ShellRights.Provider>
+  return <ShellConnection.Provider value={held}>{shell}</ShellConnection.Provider>
 }
 
 /** The Account item's second line: signing in, or who is signed in. */

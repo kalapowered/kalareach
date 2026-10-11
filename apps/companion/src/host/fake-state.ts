@@ -109,7 +109,6 @@ export interface ScriptedIds {
 /** The capability each composer action is checked against, as the broker names it. */
 const CAPABILITIES = [
   'agent.approval',
-  'agent.attachment',
   'agent.cancel',
   'agent.commands',
   'agent.prompt',

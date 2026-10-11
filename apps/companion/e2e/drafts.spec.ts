@@ -7,6 +7,8 @@
  * application again. Nothing a test does here may send a prompt; the strip counts what was sent.
  */
 
+import { Buffer } from 'node:buffer'
+
 import { expect, test, type Page } from '@playwright/test'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -124,6 +126,47 @@ for (const surface of ['ios', 'android'] as const) {
       for (let index = 0; index < count; index += 1) {
         await controls.nth(index).click({ trial: true, timeout: 2_000 })
       }
+    })
+
+    test('shows the path of a picked file whole inside the screen at the largest size', async ({
+      page
+    }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      const opened = page.waitForEvent('filechooser')
+      await page.getByRole('button', { name: 'Files', exact: true }).click()
+      const chooser = await opened
+      await chooser.setFiles({
+        name: 'a-file-with-a-name-long-enough-that-its-path-has-to-wrap-on-a-narrow-screen.png',
+        mimeType: 'image/png',
+        buffer: Buffer.from('a picked file')
+      })
+      const path = page.getByTestId('attachment-path')
+      await expect(path).toBeVisible()
+      await expect(path).toContainText('a-file-with-a-name-long-enough')
+      await expect(page.getByTestId('attachment-thumb')).toBeVisible()
+
+      const across = await page.evaluate(() => ({
+        page: document.documentElement.scrollWidth,
+        screen: window.innerWidth
+      }))
+      expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
+      const outside = await page.evaluate(() => {
+        const edge = window.innerWidth
+        return [
+          ...document.querySelectorAll(
+            '[data-testid="attachment-paths"] *, [data-testid="draft-attachments"], [data-testid="draft-attachments"] *'
+          )
+        ]
+          .filter((element) => element.getBoundingClientRect().right > edge + 0.5)
+          .map((element) => element.textContent?.slice(0, 40) ?? element.tagName)
+      })
+      expect(outside, 'lines of the chip and the path that run past the screen').toEqual([])
+      // The chip's own controls are within reach: Remove can be pressed.
+      await page
+        .getByRole('button', { name: /^Remove .* from this draft$/ })
+        .click({ trial: true, timeout: 2_000 })
     })
 
     test('is moved to a session the person chooses, and is in that session’s composer after a restart', async ({

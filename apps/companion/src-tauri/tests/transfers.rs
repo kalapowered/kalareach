@@ -21,13 +21,15 @@ use kr_ipc::testing::TempHost;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, StreamKind};
-use kr_protocol::ids::{EnvironmentId, TransferId};
+use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId, TransferId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Digest256, Nullable};
 use kr_protocol::transfer::{
-    AttachmentHandle, DownloadBeginParams, DownloadBeginResult, DownloadSource, UploadChunkParams,
-    UploadState, UploadStatusParams, UploadStatusResult,
+    AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
+    AttachmentHandle, DownloadBeginParams, DownloadBeginResult, DownloadSource, DraftCreateParams,
+    DraftCreateResult, InsertionMethod, UploadChunkParams, UploadState, UploadStatusParams,
+    UploadStatusResult,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -47,32 +49,94 @@ impl WorkerSupervisor for RefusingSupervisor {
     }
 }
 
-/// The daemon of one test, with the tasks that serve its two endpoints.
-struct Daemon {
-    tree: TempHost,
-    /// Held so the daemon lives exactly as long as its test.
-    _controller: Arc<Controller>,
-    clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
-    chunks: tokio::task::JoinHandle<()>,
-    /// The tree whose address the chunk listener borrows when a relay stands at this
-    /// environment's own, kept so its directory outlives the listener.
-    _elsewhere: Option<TempHost>,
+/// What a daemon of this suite is started with: an environment on the internal disk, its secrets in
+/// a file inside it, and no worker.
+fn setup(tree: &TempHost) -> ControllerSetup {
+    let environment = tree.environment();
+    let environment_id = tree.environment_id();
+    let secrets = environment.secrets_dir();
+    ControllerSetup {
+        paths: environment,
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store for the test environment");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(RefusingSupervisor),
+        worker_program: PathBuf::from("/nonexistent/kr-worker"),
+        build_id: companion_tauri::connection::build_id().expect("a build identity"),
+        release: "0".to_owned(),
+        shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    }
 }
 
-impl Drop for Daemon {
+/// The tasks that serve a daemon's two endpoints, ended with it.
+struct Serving {
+    clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    chunks: tokio::task::JoinHandle<()>,
+}
+
+impl Serving {
+    /// Ends both tasks and waits until they have let go of their endpoints.
+    async fn end(&mut self) {
+        self.clients.abort();
+        self.chunks.abort();
+        let _ = (&mut self.clients).await;
+        let _ = (&mut self.chunks).await;
+    }
+}
+
+impl Drop for Serving {
     fn drop(&mut self) {
         self.clients.abort();
         self.chunks.abort();
     }
 }
 
+/// The daemon of one test, with the tasks that serve its two endpoints.
+struct Daemon {
+    tree: TempHost,
+    /// Held so the daemon lives exactly as long as its test.
+    controller: Arc<Controller>,
+    serving: Serving,
+    /// The tree whose address the chunk listener borrows when a relay stands at this
+    /// environment's own, kept so its directory outlives the listener.
+    _elsewhere: Option<TempHost>,
+}
+
 impl Daemon {
     /// Starts a daemon that serves both endpoints at the environment's own addresses.
     async fn start() -> Self {
-        let tree = TempHost::create();
+        Self::start_on(TempHost::create()).await
+    }
+
+    /// Starts a daemon on an environment that may already hold a transfer journal.
+    async fn start_on(tree: TempHost) -> Self {
         let chunk_listener = kr_controller::transfer::bind_chunk_endpoint(&tree.environment())
             .expect("binds the attachment-chunk endpoint");
         Self::serving(tree, chunk_listener, None).await
+    }
+
+    /// Ends this daemon the way its process ending would end it, and returns the environment.
+    ///
+    /// Both endpoints are released before this returns, so a daemon started on the same
+    /// environment afterwards finds them free.
+    async fn stop(self) -> TempHost {
+        let Self {
+            tree,
+            controller,
+            mut serving,
+            ..
+        } = self;
+        serving.end().await;
+        drop(controller);
+        tree
     }
 
     /// Starts a daemon whose attachment-chunk listener is at an address nothing else uses, and
@@ -97,30 +161,10 @@ impl Daemon {
         elsewhere: Option<TempHost>,
     ) -> Self {
         let environment = tree.environment();
-        let environment_id = tree.environment_id();
-        let secrets = environment.secrets_dir();
-        let controller = Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                let store =
-                    open_store_in(&secrets).expect("a secret store for the test environment");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
-            }),
-            secret_store: StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(RefusingSupervisor),
-            worker_program: PathBuf::from("/nonexistent/kr-worker"),
-            build_id: companion_tauri::connection::build_id().expect("a build identity"),
-            release: "0".to_owned(),
-            shell_packages: None,
-            terminal: Box::new(kr_controller::supervision::NoTerminal),
-        })
-        .await
-        .expect("the daemon starts");
+        // Waits for a daemon this one replaces to let go of the environment.
+        let controller = kr_controller::testing::taken_over(|| Controller::start(setup(&tree)))
+            .await
+            .expect("the daemon starts");
         let listener = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
             .expect("binds the control endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -130,9 +174,8 @@ impl Daemon {
         ));
         Self {
             tree,
-            _controller: controller,
-            clients,
-            chunks,
+            controller,
+            serving: Serving { clients, chunks },
             _elsewhere: elsewhere,
         }
     }
@@ -371,6 +414,203 @@ async fn a_handed_file_goes_through_the_same_upload_as_a_dropped_one() {
     assert_eq!(handle.original_file_name, "café.png");
     assert_eq!(handle.declared_media_type, "image/png");
     assert_eq!(read_back(&daemon, &session, &handle).await, bytes);
+}
+
+/// A target naming a session at its first epoch, as a page names one it read in a list.
+fn target_of(daemon: &Daemon, session_id: SessionId) -> ActionTarget {
+    ActionTarget {
+        environment_id: daemon.environment_id(),
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    }
+}
+
+/// Asks the host for a draft for `session_id`, the way the page asks for the one a file is bound to.
+async fn try_host_draft(
+    daemon: &Daemon,
+    session: &Session,
+    session_id: SessionId,
+) -> Result<kr_protocol::transfer::DraftRecord, kr_client::ClientError> {
+    let created = session
+        .mutate(
+            Method::DraftCreate,
+            target_of(daemon, session_id),
+            None,
+            &serde_json::json!({}),
+            &DraftCreateParams {
+                environment_id: daemon.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session_id),
+                application_instance_id: Nullable::null(),
+                text: String::new(),
+            },
+            kr_protocol::scalars::DurationMs::new(30_000),
+        )
+        .await?;
+    let kr_client::Settled::Result(value) = created else {
+        panic!("a draft is made with a result, not a receipt");
+    };
+    let made: DraftCreateResult = value.to_typed().expect("a draft the page can read");
+    Ok(made.draft)
+}
+
+/// A host draft for `session_id`, which the host makes.
+async fn host_draft(
+    daemon: &Daemon,
+    session: &Session,
+    session_id: SessionId,
+) -> kr_protocol::transfer::DraftRecord {
+    try_host_draft(daemon, session, session_id)
+        .await
+        .expect("the host makes the draft")
+}
+
+/// Binds `handle` to `draft` as a manual terminal workflow, as the page does.
+async fn bind_manually(
+    daemon: &Daemon,
+    session: &Session,
+    session_id: SessionId,
+    draft: &kr_protocol::transfer::DraftRecord,
+    handle: &AttachmentHandle,
+) -> Result<AgentDraftAddAttachmentResult, kr_client::ClientError> {
+    let bound = session
+        .mutate(
+            Method::AgentDraftAddAttachment,
+            target_of(daemon, session_id),
+            None,
+            &serde_json::json!({}),
+            &AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                expected_revision: draft.revision,
+                transfer_id: handle.transfer_id,
+                contribution: AttachmentContribution {
+                    operation_id: "attach".to_owned(),
+                    accepted_media_types: vec![handle.declared_media_type.clone()],
+                    max_byte_len: handle.byte_len,
+                    max_count: kr_protocol::scalars::U64::new(64),
+                    insertion_method: InsertionMethod::ManualTerminalWorkflow,
+                    external_destination: Nullable::null(),
+                    model_media_capability: false,
+                },
+            },
+            kr_protocol::scalars::DurationMs::new(30_000),
+        )
+        .await?;
+    let kr_client::Settled::Result(value) = bound else {
+        panic!("a binding is answered with a result, not a receipt");
+    };
+    Ok(value.to_typed().expect("a binding the page can read"))
+}
+
+/// KR-REQ-13.14: a file sent for a session and bound to a host draft as a manual terminal workflow
+/// comes back with the path the person is shown, and the file at that path is the file that was
+/// sent, byte for byte, with an expiry still to come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_file_comes_back_with_the_path_it_can_be_read_at() {
+    let daemon = Daemon::start().await;
+    let session = daemon.session().await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let (path, bytes) = dropped_file(directory.path(), "capture.bin", 4096);
+    let handle = companion_tauri::transfers::upload_to(
+        &session,
+        &daemon.tree.environment(),
+        target_of(&daemon, session_id),
+        Some(session_id),
+        path,
+    )
+    .await
+    .expect("the file reaches a handle");
+
+    let draft = host_draft(&daemon, &session, session_id).await;
+    let bound = bind_manually(&daemon, &session, session_id, &draft, &handle)
+        .await
+        .expect("the host binds the file");
+
+    let grant = bound
+        .attachment
+        .read_grant
+        .0
+        .expect("the binding carries the grant the path is shown from");
+    assert_eq!(
+        grant.insertion_method,
+        InsertionMethod::ManualTerminalWorkflow
+    );
+    assert!(grant.expires_at_ms.get() > kr_ipc::now_ms().get());
+    assert_eq!(
+        std::fs::read(&grant.host_path).expect("the file is at the path the person is shown"),
+        bytes
+    );
+    assert_eq!(bound.draft.revision.get(), draft.revision.get() + 1);
+}
+
+/// KR-REQ-24.09: once the closure of a session is recorded and the host has started again, the
+/// draft the window holds for the session's files has been moved on by the closure, so a binding at
+/// the revision the window saw is refused as a conflict, and a draft made anew for the session is
+/// refused as the session's closure; the window is given no path, and the file keeps the identity
+/// it had: the host still reports it published, and the handle is the one the person holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_for_a_closed_session_is_refused_a_path_and_keeps_its_identity() {
+    let first = Daemon::start().await;
+    let session = first.session().await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let (path, bytes) = dropped_file(directory.path(), "capture.bin", 4096);
+    let handle = companion_tauri::transfers::upload_to(
+        &session,
+        &first.tree.environment(),
+        target_of(&first, session_id),
+        Some(session_id),
+        path,
+    )
+    .await
+    .expect("the file reaches a handle");
+    let draft = host_draft(&first, &session, session_id).await;
+    drop(session);
+
+    // The host ends with the session's closure recorded and not yet acted on.
+    let environment_id = first.environment_id();
+    let tree = first.stop().await;
+    kr_controller::registry::Registry::open(tree.environment().registry_database(), environment_id)
+        .expect("opens the host's registry")
+        .record_closure(&kr_protocol::session::ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::WorkerCrash,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_ipc::now_ms(),
+        })
+        .expect("records the closure");
+
+    let second = Daemon::start_on(tree).await;
+    let session = second.session().await;
+    let stale = bind_manually(&second, &session, session_id, &draft, &handle)
+        .await
+        .expect_err("the closure moved the draft on, so the revision the window saw is stale");
+    assert_eq!(
+        stale.code(),
+        kr_protocol::error::ErrorCode::DraftConflict,
+        "{stale:?}"
+    );
+    let fresh = try_host_draft(&second, &session, session_id)
+        .await
+        .expect_err("a closed session is given no new draft, and so no path");
+    assert_eq!(
+        fresh.code(),
+        kr_protocol::error::ErrorCode::SessionClosed,
+        "the host refused it as the session's closure: {fresh:?}"
+    );
+
+    // The file is what it was: published, the same handle, the same bytes.
+    verified(&session, &handle, &bytes).await;
+    assert_eq!(read_back(&second, &session, &handle).await, bytes);
 }
 
 /// What one relayed connection carried from the client to the host.

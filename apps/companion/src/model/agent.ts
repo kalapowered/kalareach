@@ -158,7 +158,6 @@ export const COMPOSER_CAPABILITIES = {
   queue: 'agent.prompt.queue',
   steer: 'agent.steer',
   interrupt: 'agent.cancel',
-  attach: 'agent.attachment',
   answer: 'agent.approval'
 } as const
 
@@ -168,7 +167,6 @@ const COMPOSER_RIGHTS: Readonly<Record<keyof typeof COMPOSER_CAPABILITIES, reado
   queue: ['agent.prompt'],
   steer: ['agent.prompt'],
   interrupt: ['agent.cancel'],
-  attach: ['files.upload', 'agent.prompt'],
   answer: ['agent.approval.respond']
 }
 
@@ -248,10 +246,44 @@ export function composerOffers({
     queue: offer('queue'),
     steer: offer('steer'),
     interrupt: offer('interrupt'),
-    attach: offer('attach'),
     answer: offer('answer')
   }
 }
+
+/** What decides whether a file is offered. */
+export interface AttachFacts {
+  /** Whether there is a live connection. */
+  readonly connected: boolean
+  /** Whether the host is one this device is paired with, not the one on this computer. */
+  readonly paired: boolean
+  /** The rights the connection holds, or null while they are not known. */
+  readonly rights: ReadonlySet<string> | null
+}
+
+/**
+ * Whether a file may be sent for a draft, and why not when it may not.
+ *
+ * A file goes to the host on this computer and is given a path there, which the person types into
+ * the agent's terminal themselves. So it needs a connection to that host and the two rights an
+ * upload and a prompt need, and nothing of the agent: no agent says it takes attachments, and none
+ * is asked to. A host this device is paired with takes no file from it.
+ */
+export function attachOffer({ connected, paired, rights }: AttachFacts): Offer {
+  if (!connected) return { offered: false, reason: 'Not in contact with this host.' }
+  if (paired) {
+    return { offered: false, reason: 'A host this device is paired with takes no file from it.' }
+  }
+  if (rights === null) {
+    return { offered: false, reason: 'This device does not know yet what it may do here.' }
+  }
+  if (ATTACH_RIGHTS.some((right) => !rights.has(right))) {
+    return { offered: false, reason: 'This device was not granted this.' }
+  }
+  return OFFERED
+}
+
+/** The rights a file needs: an upload to the host, and the prompt it is for. */
+const ATTACH_RIGHTS: readonly string[] = ['files.upload', 'agent.prompt']
 
 /**
  * The requests a person can answer now: approvals whose interpretation a granted decoder verified

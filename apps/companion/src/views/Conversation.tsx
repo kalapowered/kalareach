@@ -34,7 +34,9 @@ import { promptTextProblem } from '@kalareach/protocol'
 import { Badge, Banner, Button, Card, CommitButton, IconButton } from '../components/ui'
 import { useApp, useSession } from '../app/state'
 import { useSessionAgent } from '../app/agent'
-import { useConnectionRights } from '../app/rights'
+import { useHeldConnection } from '../app/rights'
+import { AttachmentPaths } from '../components/AttachmentPaths'
+import { AttachmentThumb } from '../components/AttachmentThumb'
 import {
   failureCode,
   failureMessage,
@@ -47,6 +49,7 @@ import {
 import { renderMarkdown } from '../markdown/render'
 import {
   actionableApprovals,
+  attachOffer,
   bindingStateOf,
   composerOffers,
   subjectOf,
@@ -147,8 +150,8 @@ export function Conversation({
   readonly shellMode?: 'managed' | 'native_compat' | null
   readonly onLaunched: () => void
 }): ReactNode {
-  const { port, say, drafts: book } = useApp()
-  const rights = useConnectionRights()
+  const { port, say, drafts: book, paths } = useApp()
+  const { rights, paired } = useHeldConnection()
   const { state, update } = useSession(sessionId)
   // The draft belongs to the window, not to this view: it is kept on this device as it is typed,
   // and it is the same draft whichever view of the session is open, and after the tab is closed.
@@ -259,6 +262,11 @@ export function Conversation({
         rights: rights === null ? null : new Set(rights)
       }),
     [agent.instances, agent.binding, agent.capabilities, rights]
+  )
+  // A file needs the host on this computer and the rights, and nothing of the agent.
+  const fileOffer = useMemo(
+    () => attachOffer({ connected, paired, rights: rights === null ? null : new Set(rights) }),
+    [connected, paired, rights]
   )
   const waitingOnPerson =
     agent.instances === null ? null : actionableApprovals(agent.resources).length > 0
@@ -423,16 +431,17 @@ export function Conversation({
    * its bytes. A pasted file reaches the page itself, so the page hands its bytes over, and they go
    * through the same upload. Section 12 keeps the upload, the insertion into the agent's composer
    * and the submission apart, and only upstream evidence makes an attachment accepted by an agent.
-   * Inserting a handle names the contribution the agent's integration declared for it, which this
-   * view is not given, so the view inserts nothing: it keeps the handle with the draft and says
-   * what the person can do. A file is sent only where the agent says it takes attachments now.
+   * This view declares no way to insert a handle into an agent's composer, so it inserts nothing:
+   * it keeps the handle with the draft, asks the host for the path the file can be read at, and
+   * shows it for the person to give to their agent themselves. A file is sent only to the host on
+   * this computer, by a connection that holds the rights for it.
    */
   const attach = useCallback(
     (files: readonly Incoming[]) => {
       for (const incoming of files) {
         const name = incoming.kind === 'dropped' ? incoming.file.name : incoming.file.name || 'attachment'
-        if (!offers.attach.offered) {
-          setInsertion(`${name} was not sent: ${offers.attach.reason ?? 'this agent takes no attachments here.'}`)
+        if (!fileOffer.offered) {
+          setInsertion(`${name} was not sent: ${fileOffer.reason ?? 'files are not taken here.'}`)
           continue
         }
         let upload: () => Promise<AttachmentHandle>
@@ -511,8 +520,9 @@ export function Conversation({
             })
             if (!kept) return
             setInsertion(
-              `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it: type its path in the terminal to give it to the agent, or remove it to send the text on its own.`
+              `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it: give its path to your agent in the terminal yourself, or remove it to send the text on its own.`
             )
+            void paths.attach(sessionId, subject, handle)
           })
           .catch((error: unknown) => {
             if (!settle({ upload: 'failed' })) return
@@ -520,7 +530,7 @@ export function Conversation({
           })
       }
     },
-    [port, subject, changeDraft, offers.attach]
+    [port, subject, sessionId, changeDraft, fileOffer, paths]
   )
 
   const dropped = useCallback(
@@ -834,6 +844,8 @@ export function Conversation({
       )}
 
       <Composer
+        sessionId={sessionId}
+        subject={subject}
         draft={presented}
         opening={!draftsOpen}
         connected={connected}
@@ -1442,6 +1454,8 @@ function commandLine(argv: readonly string[]): string {
 
 /** The composer. */
 function Composer({
+  sessionId,
+  subject,
   draft,
   opening,
   connected,
@@ -1454,6 +1468,8 @@ function Composer({
   onRemoveAttachment,
   onAction
 }: {
+  readonly sessionId: string
+  readonly subject: SessionSubject
   readonly draft: Draft
   /** True while the drafts kept on this device are being read: nothing typed yet could be kept. */
   readonly opening: boolean
@@ -1507,6 +1523,7 @@ function Composer({
               key={attachment.localId}
               data-upload={attachment.upload}
             >
+              <AttachmentThumb attachment={attachment} />
               {attachment.name}
               {attachment.acceptedUpstream ? (
                 <Badge tone="success">Accepted</Badge>
@@ -1531,6 +1548,7 @@ function Composer({
           ))}
         </div>
       ) : null}
+      <AttachmentPaths sessionId={sessionId} subject={subject} attachments={draft.attachments} />
 
       {draft.state === 'conflicted' && onRetarget !== null ? (
         <div className="composer-note">

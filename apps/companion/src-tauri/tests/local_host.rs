@@ -52,6 +52,8 @@ struct Host {
     _placed: Option<kr_controller::describe::hooks::Placed>,
     _controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    /// Serves the attachment-chunk endpoint, which a file's chunks travel on.
+    chunks: tokio::task::JoinHandle<()>,
     app: tauri::App<MockRuntime>,
     window: tauri::WebviewWindow<MockRuntime>,
     /// Where the application keeps the answers a host did not confirm.
@@ -61,6 +63,7 @@ struct Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.clients.abort();
+        self.chunks.abort();
     }
 }
 
@@ -124,6 +127,12 @@ impl Host {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the control endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+        let chunk_listener = kr_controller::transfer::bind_chunk_endpoint(&environment)
+            .expect("binds the attachment-chunk endpoint");
+        let chunks = tokio::spawn(kr_controller::transfer::serve_chunks(
+            Arc::downgrade(&controller),
+            chunk_listener,
+        ));
 
         let app = tauri::test::mock_builder()
             .manage(companion_tauri::AppState::new())
@@ -141,6 +150,8 @@ impl Host {
                 companion_tauri::commands::catalogue_list,
                 companion_tauri::commands::history_page,
                 companion_tauri::commands::session_create,
+                companion_tauri::commands::draft_create,
+                companion_tauri::commands::draft_add_attachment,
                 companion_tauri::commands::description_setup,
                 companion_tauri::commands::description_configure,
                 companion_tauri::commands::description_download,
@@ -166,6 +177,7 @@ impl Host {
             _placed: placed,
             _controller: controller,
             clients,
+            chunks,
             app,
             window,
             kept,
@@ -592,6 +604,123 @@ async fn a_stock_shells_creation_reaches_the_host_as_the_page_writes_it() {
         .await
         .expect_err("a shell mode the protocol does not name");
     assert!(!refused_by_the_host(&unnamed), "{unnamed}");
+}
+
+/// KR-REQ-13.14: a file the page hands over is given a path on the host through the commands the
+/// page calls, with the identifiers the page reads and writes. The page reads the draft's
+/// identifier from the answer of `draft_create` and names it in `draft_add_attachment`, so the
+/// answer carries it in the protocol's own JSON form (an identifier as hyphenated text, a counter
+/// as a decimal string), and the file at the path the binding names is the file that was handed
+/// over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handed_file_is_given_a_path_through_the_commands_the_page_calls() {
+    let host = Host::start().await;
+    let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string();
+    let subject = json!({ "sessionId": session_id, "sessionEpoch": "1" });
+    let bytes = b"a file the page handed over".to_vec();
+
+    // The file reaches the host through the companion's own upload, on its own connection and the
+    // environment's attachment-chunk endpoint; what follows are the commands the page calls.
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = directory.path().join("notes.txt");
+    std::fs::write(&path, &bytes).expect("the file is written");
+    let session = host
+        .app
+        .state::<companion_tauri::AppState>()
+        .session()
+        .expect("the application's connection");
+    let target = kr_protocol::envelope::ActionTarget {
+        environment_id: host.tree.environment_id(),
+        session_id: kr_protocol::scalars::Nullable::some(
+            session_id.parse().expect("a session identifier"),
+        ),
+        session_epoch: kr_protocol::scalars::Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: kr_protocol::scalars::Nullable::null(),
+        agent_binding_revision: kr_protocol::scalars::Nullable::null(),
+    };
+    let handle = companion_tauri::transfers::upload_to(
+        &session,
+        &host.tree.environment(),
+        target,
+        Some(session_id.parse().expect("a session identifier")),
+        path,
+    )
+    .await
+    .expect("the file is uploaded");
+
+    let made = host
+        .call(
+            "draft_create",
+            json!({
+                "params": {
+                    "environment_id": host.environment_id(),
+                    "device_id": null,
+                    "session_id": session_id,
+                    "application_instance_id": null,
+                    "text": ""
+                },
+                "subject": subject
+            }),
+        )
+        .await
+        .expect("the host makes the draft");
+    let draft_id = made["value"]["draft"]["draft_id"]
+        .as_str()
+        .expect("the draft's identifier");
+    // The page names this text in the next call, so it has to be an identifier as the protocol
+    // writes one.
+    draft_id
+        .parse::<kr_protocol::ids::DraftId>()
+        .unwrap_or_else(|error| panic!("{draft_id:?} is not a draft identifier: {error}"));
+    let revision = made["value"]["draft"]["revision"]
+        .as_str()
+        .expect("the draft's revision, as a decimal string");
+
+    let bound = host
+        .call(
+            "draft_add_attachment",
+            json!({
+                "params": {
+                    "draft_id": draft_id,
+                    "expected_revision": revision,
+                    "transfer_id": handle.transfer_id.to_string(),
+                    "contribution": {
+                        "operation_id": "attach",
+                        "accepted_media_types": [handle.declared_media_type],
+                        "max_byte_len": handle.byte_len.get().to_string(),
+                        "max_count": "8",
+                        "insertion_method": "manual_terminal_workflow",
+                        "external_destination": null,
+                        "model_media_capability": false
+                    }
+                },
+                "subject": subject
+            }),
+        )
+        .await
+        .expect("the host binds the file");
+    // The draft after the binding is the one that was made, one revision on: the page reads both.
+    assert_eq!(bound["value"]["draft"]["draft_id"], json!(draft_id));
+    assert_eq!(bound["value"]["draft"]["revision"], "2");
+    let grant = &bound["value"]["attachment"]["read_grant"];
+    assert_eq!(
+        grant["transfer_id"],
+        json!(handle.transfer_id.to_string()),
+        "the grant names the file that was bound"
+    );
+    assert_eq!(grant["insertion_method"], "manual_terminal_workflow");
+    assert!(
+        grant["expires_at_ms"]
+            .as_str()
+            .and_then(|at| at.parse::<u64>().ok())
+            .is_some_and(|at| at > kr_ipc::now_ms().get()),
+        "the grant has time to run: {grant}"
+    );
+    let path = grant["host_path"].as_str().expect("the path to read it at");
+    assert_eq!(
+        std::fs::read(path).expect("the file is at the path the person is shown"),
+        bytes
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

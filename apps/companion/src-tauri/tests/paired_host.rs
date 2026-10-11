@@ -254,6 +254,10 @@ async fn a_paired_host_answers_the_commands_the_page_calls() {
         json!(["session.view"]),
         "the application claims what the grant carries and nothing else"
     );
+    assert_eq!(
+        used["paired"], true,
+        "the page is told the host is one this device is paired with, so that it offers no file"
+    );
     let listed = companion
         .call("session_list", every_session())
         .expect("the host lists its sessions");

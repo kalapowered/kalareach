@@ -269,6 +269,7 @@ impl AppState {
                     .expect("the state lock is not poisoned")
                     .clone(),
                 rights: None,
+                paired: false,
             },
         }
     }

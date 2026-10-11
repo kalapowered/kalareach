@@ -134,6 +134,13 @@ export interface ConnectionState {
    * decided from.
    */
   readonly rights: readonly ActionRight[] | null
+  /**
+   * True while the live connection is to a host this device is paired with, and false for the host
+   * on this computer and when there is no connection. A file this application sends goes to the host
+   * on this computer; a host this device is paired with takes no file from it, so no file is offered
+   * over one.
+   */
+  readonly paired: boolean
 }
 
 /**
@@ -860,7 +867,6 @@ export interface HostPort {
   deviceDraftDiscard(request: DraftDiscardRequest): Promise<{ readonly removed: boolean }>
 
   draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
-  draftUpdate(params: unknown, subject: SessionSubject): Promise<Settled>
   /**
    * Sends one dropped file to the host and answers with the verified handle.
    *
@@ -877,8 +883,6 @@ export interface HostPort {
    */
   attachmentUploadBytes(file: HandedFile, subject: SessionSubject): Promise<AttachmentHandle>
   draftAddAttachment(params: unknown, subject: SessionSubject): Promise<Settled>
-  /** Reads the bytes behind one validated attachment handle. */
-  attachmentImage(params: unknown): Promise<{ bytes: number[]; media_type: string }>
 
   /**
    * One page of a session's retained output, from the cursor and within the byte bound the

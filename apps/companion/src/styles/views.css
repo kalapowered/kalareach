@@ -727,7 +727,11 @@
 
 .attachment-chip {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
   gap: 7px;
   padding: 5px 8px;
   background: var(--subtle);
@@ -1547,4 +1551,52 @@
       opacity: 0;
     }
   }
+}
+
+/* ---- Attached files' paths ------------------------------------------------------------------- */
+
+/*
+ * The path a file can be read at on the host, which a person gives to their agent themselves. It is
+ * text to select and copy, so it breaks anywhere rather than run past the screen, and sizes in rem
+ * so a larger text size reflows it.
+ */
+.attachment-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 10px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.attachment-path {
+  min-inline-size: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--raised);
+}
+
+.attachment-path p {
+  overflow-wrap: anywhere;
+}
+
+.attachment-path-text {
+  display: block;
+  margin: 6px 0;
+  user-select: text;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* The picture of an attached image: small, inside its chip, and never wider than the chip. */
+.attachment-thumb {
+  display: inline-block;
+  inline-size: 40px;
+  block-size: 40px;
+  max-inline-size: 100%;
+  margin-inline-end: 8px;
+  vertical-align: middle;
+  object-fit: cover;
+  border-radius: 4px;
 }
