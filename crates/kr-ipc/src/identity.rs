@@ -155,10 +155,9 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// two apart, and the next pass that reads any children misses the same ones, by the same again or
 /// by a skip of the kernel's list as another child is collected.
 ///
-/// On macOS the list comes from the kernel's process table, which a reading walks twice (once for
-/// the size), so what it costs follows the host's processes. A list is a hint on every platform: a
-/// caller reads each process with [`process_lineage`] and keeps it only when that reading names
-/// `pid` as its parent.
+/// On macOS the list comes from the kernel's process table, so what it costs follows the host's
+/// processes. A list is a hint on every platform: a caller reads each process with
+/// [`process_lineage`] and keeps it only when that reading names `pid` as its parent.
 ///
 /// # Errors
 ///
@@ -2060,8 +2059,9 @@ mod platform {
 mod macos_listing {
     #![expect(
         unsafe_code,
-        reason = "the kernel's list of a group's or a terminal's processes has no safe interface, \
-                  and its failure is told from an empty list by the thread's error number"
+        reason = "the kernel's list of a group's, a terminal's or a parent's processes has no safe \
+                  interface, and its failure is told from an empty list by the thread's error \
+                  number"
     )]
 
     /// `PROC_PGRP_ONLY` of `<sys/proc_info.h>`: the processes of one group.
