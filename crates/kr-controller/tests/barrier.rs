@@ -4243,3 +4243,292 @@ async fn the_startup_exchange_binds_a_worker_to_its_own_reservation() {
     );
     creating.abort();
 }
+
+/// A managed voice service that answers without a network call, for a call that runs for ten
+/// minutes.
+#[derive(Debug)]
+struct OfflineProvider;
+
+impl kr_client::services::voice::ManagedVoiceService for OfflineProvider {
+    fn metadata(
+        &self,
+    ) -> kr_client::services::ServiceFuture<'_, Option<kr_client::services::voice::VoiceMetadata>>
+    {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn call_is_open<'a>(
+        &'a self,
+        _call_id: &'a str,
+    ) -> kr_client::services::ServiceFuture<'a, bool> {
+        Box::pin(async move { Ok(true) })
+    }
+
+    fn provider(&self) -> String {
+        "the offline provider".to_owned()
+    }
+
+    fn start<'a>(
+        &'a self,
+        _request: &'a kr_client::services::voice::VoiceSessionRequest,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::voice::VoiceStart> {
+        use kr_client::services::voice::{
+            VoiceHold, VoiceRateQuote, VoiceSession, VoiceStart, VoiceStartLatency,
+        };
+
+        Box::pin(async move {
+            Ok(VoiceStart::Started(Box::new(VoiceSession {
+                call_id: "call-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
+                provider_session_id: "sess_1".to_owned(),
+                answer_sdp: "v=0\r\n".to_owned(),
+                model: "gpt-live-1".to_owned(),
+                closes_at: "2026-09-20T01:00:00Z".to_owned(),
+                reservation_ends_at: "2026-09-20T01:00:15Z".to_owned(),
+                control_path: "/api/voice/sessions/call-1/control".to_owned(),
+                heartbeat_seconds: 20,
+                sideband_ready: true,
+                hold: VoiceHold {
+                    reservation_id: "hold-1".to_owned(),
+                    reserved: "600".to_owned(),
+                    ceiling: "500".to_owned(),
+                    deadline: "2026-09-20T01:00:15Z".to_owned(),
+                },
+                reasoning_hold: None,
+                rate: VoiceRateQuote {
+                    version: "2026-09".to_owned(),
+                    minor_units_per_second: "1".to_owned(),
+                    minimum_seconds: 15,
+                    currency: "USD".to_owned(),
+                },
+                latency: VoiceStartLatency {
+                    creation_to_answer_ms: 10,
+                    sideband_ready_ms: 5,
+                },
+                replayed: false,
+                disclosure: Vec::new(),
+            })))
+        })
+    }
+
+    fn close<'a>(
+        &'a self,
+        call_id: &'a str,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::voice::VoiceClosure> {
+        let call_id = call_id.to_owned();
+        Box::pin(async move {
+            Ok(kr_client::services::voice::VoiceClosure {
+                call_id,
+                state: "finalised".to_owned(),
+                usage_seconds: 0,
+                usage_provisional: true,
+            })
+        })
+    }
+}
+
+/// An admission that stands, for a delegation that arrived on a connection of this name.
+#[derive(Debug)]
+struct Standing(ConnectionId);
+
+impl kr_voice::Admission for Standing {
+    fn still_admitted(&self) -> Result<(), kr_protocol::error::ProtocolError> {
+        Ok(())
+    }
+
+    fn connection(&self) -> Option<ConnectionId> {
+        Some(self.0)
+    }
+}
+
+/// KR-REQ-15.13 and 09.16: the close the host sends for a spoken request is a close the session's
+/// own worker takes up.
+///
+/// The worker is the real one, on a real socket with a real journal, and it checks what the
+/// double the other suites use does not: that the close names the voice grant in the frame and in
+/// the mutation alike, that it carries the right to close and nothing else, and that it arrives
+/// with a deadline the worker can hold it to. A device says "close session N", signs the challenge
+/// the host answers with, and submits the delegation again; the host's answer is the worker's, and
+/// the session has left the live state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_spoken_close_the_device_confirmed_is_taken_up_by_the_sessions_real_worker() {
+    use kr_controller::service::net::devices::DeviceRecord;
+    use kr_crypto::keys::AuthorisationKeyPair;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{DeviceId, GrantId};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::voice::{
+        VoiceAction, VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationId,
+        VoiceDelegationOutcome, VoiceGrantParams, VoicePrepareParams, VoiceStartOutcome,
+        VoiceStartParams,
+    };
+
+    let hosted = hosted_worker().await;
+    let controller = Arc::clone(&hosted.controller);
+    let session_id = hosted.session_id;
+    let number = hosted.runtime.session().summary().display_number.get();
+
+    // A paired device that may see the session and close it, written into the daemon's own stores.
+    let key = AuthorisationKeyPair::generate().expect("a device identity key");
+    let device_id = DeviceId::new(kr_ipc::new_uuid());
+    let grant = Grant {
+        grant_id: GrantId::new(kr_ipc::new_uuid()),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: controller.sharing().host_device_id(),
+        recipient_device_id: device_id,
+        authority_revision: controller.policy().authority_revision(),
+        environment_selector: EnvironmentSelector::These {
+            environment_ids: [hosted.environment_id].into_iter().collect(),
+        },
+        session_selector: SessionSelector::These {
+            session_ids: [session_id].into_iter().collect(),
+        },
+        actions: [ActionRight::SessionView, ActionRight::SessionClose]
+            .into_iter()
+            .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(1)),
+            include_live_screen: true,
+            named_questions: kr_protocol::scalars::CanonicalSet::from_iter([]),
+            named_approvals: kr_protocol::scalars::CanonicalSet::from_iter([]),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    };
+    controller
+        .devices()
+        .commit(&DeviceRecord {
+            device_id,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([0x61; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: *key.public(),
+            stored_envelope: None,
+            notification_preview: None,
+            device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant,
+            paired_at_ms: TimestampMs::new(1),
+            revoked_at_ms: None,
+            committed_invitation_id: None,
+            expired_at_ms: None,
+        })
+        .expect("the device is paired");
+
+    // Its call, with a voice grant that may close.
+    controller
+        .voice()
+        .attach_provider(Some(Arc::new(OfflineProvider)));
+    let coordinator = controller.voice().coordinator();
+    let revision = controller.policy().authority_revision();
+    let now = kr_ipc::now_ms().get();
+    coordinator
+        .grant(
+            &VoiceGrantParams {
+                device_id,
+                session_ids: [session_id].into_iter().collect(),
+                actions: Nullable::some(
+                    [VoiceAction::CloseSession, VoiceAction::Status]
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+            revision,
+            now,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    let prepared = coordinator
+        .prepare(
+            device_id,
+            &VoicePrepareParams {
+                session_ids: [session_id].into_iter().collect(),
+                selected: kr_protocol::scalars::CanonicalSet::from_iter([]),
+            },
+        )
+        .await
+        .expect("a preparation")
+        .prepared;
+    let started = coordinator
+        .start(
+            device_id,
+            &VoiceStartParams {
+                session_ids: [session_id].into_iter().collect(),
+                offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+                duration_seconds: 600,
+                reasoning_budget_minor: Nullable::null(),
+                prepared,
+                expected_rate_version: Nullable::some("2026-09".to_owned()),
+            },
+            revision,
+            now,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a call");
+    let VoiceStartOutcome::Started { session: call } = started.outcome else {
+        panic!("the call runs");
+    };
+
+    // The person says it; the host answers with the challenge; the device signs it and submits
+    // the same delegation again.
+    let params = VoiceDelegateParams {
+        voice_session_id: call.voice_session_id,
+        delegation_id: VoiceDelegationId::new("item_close").expect("a delegation"),
+        offset_ms: kr_protocol::scalars::U64::new(0),
+        fragments: vec![kr_protocol::voice::TranscriptFragment {
+            start_ms: kr_protocol::scalars::U64::new(0),
+            end_ms: kr_protocol::scalars::U64::new(0),
+            text: kr_protocol::voice::FragmentText::new(format!("close session {number}"))
+                .expect("a fragment"),
+        }],
+        confirmation: Nullable::null(),
+    };
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let admission: Arc<dyn kr_voice::Admission> =
+        Arc::new(Standing(ConnectionId::new(kr_ipc::new_uuid())));
+    let asked: VoiceDelegateResult = coordinator
+        .delegate(
+            device_id,
+            action_id,
+            &params,
+            kr_ipc::now_ms().get(),
+            &admission,
+        )
+        .await
+        .expect("the delegation is answered");
+    let VoiceDelegationOutcome::ConfirmationRequired { request, .. } = asked.outcome else {
+        panic!(
+            "a close asks for the device's confirmation first: {:?}",
+            asked.outcome
+        );
+    };
+    let mut signed = params.clone();
+    signed.confirmation =
+        Nullable::some(kr_voice::sign_confirmation(&key, &request).expect("the device signs"));
+    let closed: VoiceDelegateResult = coordinator
+        .delegate(
+            device_id,
+            action_id,
+            &signed,
+            kr_ipc::now_ms().get(),
+            &admission,
+        )
+        .await
+        .expect("the delegation is answered");
+
+    let VoiceDelegationOutcome::Performed { summary, .. } = closed.outcome else {
+        panic!("the real worker takes the close up: {:?}", closed.outcome);
+    };
+    assert!(
+        summary.contains(&format!("session {number}")),
+        "the receipt names the session: {summary}"
+    );
+    assert_ne!(
+        hosted.runtime.session().summary().state,
+        kr_protocol::session::SessionState::Live,
+        "and the worker's session has left the live state"
+    );
+}
