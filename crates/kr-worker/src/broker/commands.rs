@@ -1694,7 +1694,7 @@ impl Backend {
         // The program's connection and the server end with the backend, unless the session is
         // closing and a retirement that raced its close finds the server the closure's.
         #[cfg(unix)]
-        self.end_after_connection();
+        self.end_unless_closing();
         self.remove_files();
     }
 
@@ -3063,7 +3063,7 @@ async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessS
             // session is closing, whose closure ends the servers once the acceptance of its close
             // has been delivered.
             #[cfg(unix)]
-            backend.end_after_connection();
+            backend.end_unless_closing();
             backend.retire();
             backend.announce_ended();
             return;
