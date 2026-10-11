@@ -30,6 +30,7 @@ import { useSessionAgent } from '../../app/agent'
 import { useConnectionRights } from '../../app/rights'
 import { composerOffers, subjectOf, withheldTotal } from '../../model/agent'
 import type { ConversationItem } from '../../model/conversation'
+import { keptEntry } from '../../model/draft-book'
 import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { failureCode, failureMessage } from '../../host/port'
@@ -158,7 +159,9 @@ export function MobileSession({
   readonly connected: boolean | null
 }): ReactNode {
   const { port, say, drafts: book } = useApp()
-  const { drafts: composers, kept: keptDrafts, status: draftsStatus, problem: draftsProblem } = useBook()
+  const shown = useBook()
+  const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
+  const keptEntryLine = keptEntry(shown)
   const [pane, setPane] = useState<Pane>('semantic')
   // The session's agent, read from its own worker while this screen is open, into the session's
   // own store: nothing of another session is ever shown under this one.
@@ -803,7 +806,7 @@ export function MobileSession({
             detail={lifecycle.banner.detail}
             action={
               <>
-                {keptDrafts.length === 0 || onOpenKept === undefined ? null : (
+                {keptEntryLine === null || onOpenKept === undefined ? null : (
                   <Button onClick={onOpenKept}>Kept drafts</Button>
                 )}
                 <Button onClick={lifecycle.acknowledge}>Dismiss</Button>

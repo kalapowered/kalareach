@@ -327,6 +327,10 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     await person.click(screen.getByRole('button', { name: 'Sessions' }))
     await person.click(await screen.findByRole('button', { name: 'One kept draft' }))
     expect(await screen.findByTestId('unstored-prompt-text')).toHaveTextContent('send this')
+    // The composer holds the next thing, so the prompt is not put over it; the person is told.
+    await person.click(screen.getByTestId('unstored-prompt-use'))
+    expect(await screen.findByText(/The composer holds something/)).toBeInTheDocument()
+    expect(screen.getByTestId('unstored-prompt')).toBeInTheDocument()
     await person.click(screen.getByTestId('unstored-prompt-forget'))
     await waitFor(() => {
       expect(screen.queryByTestId('unstored-prompt')).toBeNull()

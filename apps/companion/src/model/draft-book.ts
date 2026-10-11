@@ -90,7 +90,7 @@ export interface KeptDraft {
   readonly inComposer: boolean
 }
 
-/** The text of a prompt the host did not take and the store will not keep, for its size. */
+/** The text of a prompt the host did not take, or could not say it took, that the store will not keep for its size. */
 export interface UnstoredPrompt {
   readonly id: string
   readonly sessionId: string
@@ -200,6 +200,13 @@ function markOf(draft: Draft): StoredMark {
   return draft.state === 'conflicted' || draft.state === 'orphaned' ? draft.state : 'open'
 }
 
+/** Whether the person changed the text or the files of a composer between two looks at it. */
+function writtenSince(before: Draft, after: Draft): boolean {
+  const content = (draft: Draft) =>
+    JSON.stringify([draft.text, draft.attachments.map((file) => [file.localId, file.upload])])
+  return before.revision !== after.revision || content(before) !== content(after)
+}
+
 /** Whether two drafts hold the same files. */
 function sameFiles(a: Draft, b: Draft): boolean {
   const ids = (draft: Draft) => storable(draft).map((handle) => handle.transfer_id)
@@ -296,6 +303,8 @@ export class DraftBook {
   readonly #sentRecords = new Set<string>()
   /** The highest edit number a composer ever showed, so that no number is shown twice. */
   readonly #floor = new Map<string, number>()
+  /** The records of listed drafts that an act is working on, out of reach of every read until it ends. */
+  readonly #acting = new Set<string>()
   /** How many times a record was removed or moved, so a read that overtaken by one can be told. */
   #moves = 0
   #settling = false
@@ -583,9 +592,11 @@ export class DraftBook {
   /** Removes the older version a prompt grew from, now that its text stands elsewhere. */
   async #dropEarlier(flight: Flight): Promise<void> {
     const earlier = flight.earlier
-    flight.earlier = null
     if (earlier === null) return
+    // The record stays on the flight, and so out of reach of every read, until it is gone or the
+    // cleanups hold it; a read that merged in between would show a ghost of it.
     if (!(await this.#dropRecord(earlier, flight.id))) this.#cleanups.push({ ref: earlier, key: flight.id })
+    flight.earlier = null
   }
 
   /**
@@ -609,11 +620,14 @@ export class DraftBook {
     const same = composer !== undefined && composer.text === sent.text && sameFiles(composer, sent)
     if (composer === undefined || (composer.stored === null && (holdsNothing(composer) || same))) {
       if (record !== null) {
+        this.#clearFailure(flight.id)
         this.#adopt(key, sent, composer, record)
         return true
       }
       // Nothing stores it. The composer shows it, and what the store held of this draft before is
       // the record the next write goes over, so that it says all of the text once the store takes it.
+      // The failure is the composer's from here: its next good write clears it.
+      this.#handOverFailure(flight.id, key)
       this.#adopt(key, sent, composer, flight.earlier)
       flight.earlier = null
       return true
@@ -621,6 +635,7 @@ export class DraftBook {
     if (same) {
       // The screen put the text back and it was stored under the composer's own record. The record
       // set apart for the prompt says the same thing, and goes.
+      this.#clearFailure(flight.id)
       if (record !== null && composer.stored?.id !== record.id) await this.#dropSent({ ...flight, record })
       return record !== null || composer.stored !== null
     }
@@ -632,7 +647,7 @@ export class DraftBook {
       if (this.#failed.get(flight.id)?.code === 'QUOTA_EXCEEDED') {
         // The store will never take it, for its size. Nothing stands for it, so the older version it
         // grew from stays; the text is held here, listed with the kept drafts, for a person to copy.
-        this.#failed.delete(flight.id)
+        this.#clearFailure(flight.id)
         this.#hold_unstored(flight)
         return true
       }
@@ -647,11 +662,25 @@ export class DraftBook {
     )
     // Its text is decided: the older version goes and the record is no longer set apart, so that
     // the list shows it.
-    this.#failed.delete(flight.id)
+    this.#clearFailure(flight.id)
     await this.#dropEarlier(flight)
     this.#flights.delete(flight.id)
     await this.reload()
     return true
+  }
+
+  /** A failure kept under a prompt's name is over: the text is stored, or another owns it now. */
+  #clearFailure(name: string): void {
+    if (this.#failed.delete(name)) this.#recompute()
+  }
+
+  /** The composer takes over a failure the prompt's name held: its next good write clears it. */
+  #handOverFailure(name: string, key: string): void {
+    const held = this.#failed.get(name)
+    if (held === undefined) return
+    this.#failed.delete(name)
+    this.#failed.set(key, held)
+    this.#recompute()
   }
 
   /** Holds the text of a prompt the store will not keep, and says so. */
@@ -660,6 +689,28 @@ export class DraftBook {
     this.#unstored = [...this.#unstored, flight]
     this.#say('The prompt that was sent is too long to keep as a draft. Its text is listed in Kept drafts so that you can copy it.')
     this.#changed()
+  }
+
+  /**
+   * Puts the text of an unstored prompt in its session's composer, when the composer holds nothing.
+   *
+   * The composer is where a person can shorten it and send it again, and where it can be copied
+   * from. It stays in this window only, with the warning that it is not kept, until it is short
+   * enough for the store.
+   */
+  useUnstored(id: string): boolean {
+    const flight = this.#unstored.find((each) => each.id === id)
+    if (flight === undefined) return false
+    const key = flight.composer
+    const composer = this.#find(key)
+    if (composer !== undefined && !holdsNothing(composer)) {
+      this.#say('The composer holds something. Send it or clear it first, then put this prompt there.')
+      return false
+    }
+    this.#adopt(key, flight.sent, composer, null)
+    this.#unstored = this.#unstored.filter((each) => each.id !== id)
+    this.#changed()
+    return true
   }
 
   /** Lets go of the text of a prompt a person has copied or no longer wants. */
@@ -718,21 +769,21 @@ export class DraftBook {
       for (const cleanup of [...this.#cleanups]) {
         if (await this.#dropRecord(cleanup.ref, cleanup.key)) {
           this.#cleanups = this.#cleanups.filter((each) => each !== cleanup)
-          this.#failed.delete(cleanup.key)
+          this.#clearFailure(cleanup.key)
         }
       }
       for (const flight of [...this.#unsettled]) {
         const stored = await this.#storeSent(flight)
         if (stored === null) {
           if (this.#failed.get(flight.id)?.code === 'QUOTA_EXCEEDED') {
-            this.#failed.delete(flight.id)
+            this.#clearFailure(flight.id)
             this.#unsettled = this.#unsettled.filter((each) => each !== flight)
             this.#hold_unstored(flight)
             await this.reload()
           }
           continue
         }
-        this.#failed.delete(flight.id)
+        this.#clearFailure(flight.id)
         this.#sentRecords.add(stored.id)
         await this.#dropEarlier(flight)
         this.#unsettled = this.#unsettled.filter((each) => each !== flight)
@@ -772,6 +823,7 @@ export class DraftBook {
    * it replaces, so what the store holds is then kept beside and not written over.
    */
   #adopt(key: string, sent: Draft, composer: Draft | undefined, record: StoredRef | null): void {
+    if (composer) this.#retire(composer)
     const back: Draft = {
       ...sent,
       draftId: key,
@@ -806,18 +858,22 @@ export class DraftBook {
       const composer = keyed === undefined ? undefined : this.#find(keyed)
       const target = composer?.stored ?? (await this.#shownOf(id, shown))
       if (target === undefined || target === null) return
+      if (composer === undefined) this.#acting.add(target.id)
       try {
         await this.#port.deviceDraftDiscard({ id: target.id, expectedRevision: target.revision })
         this.#moves += 1
       } catch (failure) {
+        this.#acting.delete(target.id)
         await this.#sawTheirs(composer?.draftId, failure)
         throw failure
       }
+      this.#acting.delete(target.id)
       if (composer) {
         const now = this.#find(composer.draftId)
-        if (now !== undefined && now.revision !== composer.revision) {
+        if (now !== undefined && writtenSince(composer, now)) {
           // The person wrote in the composer while the store was answering: what they wrote is not
           // what was discarded, so it stays, as a draft of its own.
+          this.#say('The composer keeps what you wrote while this was being done.')
           this.#letGo(composer.draftId)
         } else {
           this.#retire(now ?? composer)
@@ -854,6 +910,7 @@ export class DraftBook {
       }
       const target = composer ? this.#find(composer.draftId)?.stored : await this.#shownOf(id, shown)
       if (target === undefined || target === null) return
+      if (composer === undefined) this.#acting.add(target.id)
       try {
         await this.#port.deviceDraftRetarget({
           id: target.id,
@@ -864,14 +921,17 @@ export class DraftBook {
         })
         this.#moves += 1
       } catch (failure) {
+        this.#acting.delete(target.id)
         await this.#sawTheirs(composer?.draftId, failure)
         throw failure
       }
+      this.#acting.delete(target.id)
       if (composer) {
         const now = this.#find(composer.draftId)
-        if (now !== undefined && now.revision !== composer.revision) {
+        if (now !== undefined && writtenSince(composer, now)) {
           // Written in while the store was answering: the moved draft is what was pressed on, and
           // what was written since stays in the composer, as a draft of its own.
+          this.#say('The composer keeps what you wrote while this was being done.')
           this.#letGo(composer.draftId)
         } else {
           this.#retire(now ?? composer)
@@ -901,7 +961,7 @@ export class DraftBook {
       const composer = this.#find(key)
       // The composer as it is when this begins: anything written in it from here on is the person's
       // newest, and is not put over, whether it is written while the store answers this or the next.
-      const edited = composer?.revision
+      const edited = composer
       if (composer && !holdsNothing(composer) && (await this.#write(key)) === 'failed') {
         // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
         throw this.#unsaved(key)
@@ -909,6 +969,7 @@ export class DraftBook {
       const target = await this.#shownOf(id, shown)
       if (target === undefined) return
       let moved: StoredDraft
+      this.#acting.add(target.id)
       try {
         moved = await this.#port.deviceDraftRetarget({
           id: target.id,
@@ -918,12 +979,14 @@ export class DraftBook {
           agentBindingRevision: null
         })
       } catch (failure) {
+        this.#acting.delete(target.id)
         await this.#sawTheirs(undefined, failure)
         throw failure
       }
+      this.#acting.delete(target.id)
       this.#moves += 1
       const now = this.#find(key)
-      if (now?.revision !== edited) {
+      if ((now === undefined) !== (edited === undefined) || (now && edited && writtenSince(edited, now))) {
         // The composer changed while the store was answering. What is in it is the person's newest,
         // so the draft stays listed and is not put over it.
         this.#say('You wrote in the composer meanwhile, so the kept draft was not put there. It is still listed.')
@@ -1251,7 +1314,8 @@ export class DraftBook {
         ...(flight.record === null ? [] : [flight.record.id]),
         ...(flight.earlier === null ? [] : [flight.earlier.id])
       ]),
-      ...this.#cleanups.map((cleanup) => cleanup.ref.id)
+      ...this.#cleanups.map((cleanup) => cleanup.ref.id),
+      ...this.#acting
     ]
   }
 
