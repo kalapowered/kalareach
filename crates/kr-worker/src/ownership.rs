@@ -257,7 +257,8 @@ pub const LEFT_FOR_A_DAEMON: &str = "left_for_a_daemon";
 /// keeps every one it has seen so that a closure can name what it ended, and the closure's receipt
 /// travels in a frame of at most a megabyte, so the record has a bound. When it is full, the
 /// processes that ended of their own accord are dropped from it first, because a closure has
-/// nothing to say about them; one that is still full refuses to record another and says so.
+/// nothing to say about them; one that is still full refuses to record another and says so. A
+/// server the session starts is always recorded.
 pub const MAX_RECORDED_PROCESSES: usize = 1024;
 
 #[derive(Debug)]
@@ -468,7 +469,17 @@ impl OwnedProcesses {
         self.backends.insert(key(&root), root.clone());
         self.under_backends
             .insert(key(&root), (root.clone(), key(&root)));
-        self.take([root]);
+        // A server is recorded whatever the record holds: it is the root of a tree that is read
+        // from it, so a server left out would be a tree nothing reads, and a record that said it
+        // was written would not name the process a later daemon has to stop. A session has few,
+        // and one that has ended is dropped like any other when the record is full.
+        self.live.insert(key(&root), root.clone());
+        self.seen.entry(key(&root)).or_insert(Recorded {
+            identity: root,
+            forced: false,
+            left: std::sync::atomic::AtomicBool::new(false),
+        });
+        self.forget_ended();
     }
 
     /// Returns whether `identity` is a backend root.
@@ -505,11 +516,20 @@ impl OwnedProcesses {
     /// recorded processes it was not given, and applies a positive answer the same way.
     fn take(&mut self, found: impl IntoIterator<Item = ProcessStartIdentity>) {
         let mut read = std::collections::BTreeSet::new();
+        let mut trimmed = false;
         for identity in found {
             let this = key(&identity);
             read.insert(this);
-            if !self.seen.contains_key(&this) && !self.make_room_for(&identity) {
-                continue;
+            if !self.seen.contains_key(&this) {
+                if self.seen.len() >= self.cap && !trimmed {
+                    // Once for the whole batch: it reads every process the record holds.
+                    self.forget_ended();
+                    trimmed = true;
+                }
+                if self.seen.len() >= self.cap {
+                    self.refuse_for_room(&identity);
+                    continue;
+                }
             }
             self.seen.entry(this).or_insert(Recorded {
                 identity: identity.clone(),
@@ -541,6 +561,11 @@ impl OwnedProcesses {
         for identity in moved {
             self.note_left(&identity);
         }
+        self.read_live();
+    }
+
+    /// Forgets the processes the kernel says have ended from the ones that are running.
+    fn read_live(&mut self) {
         self.live.retain(|_, identity| {
             !matches!(
                 kr_ipc::identity::process_state(identity),
@@ -604,16 +629,14 @@ impl OwnedProcesses {
         in_one
     }
 
-    /// Makes room in the record for `identity`, and says whether there is room.
+    /// Drops from the record what a closure has nothing to report about: a process that ended
+    /// without being forced, and a server that ended with nothing below it running. The session's
+    /// root is kept, and so is anything forced and a server that left something running.
     ///
-    /// A full record drops the processes that ended without being forced, which a closure has
-    /// nothing to report about, and the session's root and its servers, which it always keeps. If
-    /// that is not enough, the process is not recorded, and the closure is told once that the
-    /// record was full.
-    fn make_room_for(&mut self, identity: &ProcessStartIdentity) -> bool {
-        if self.seen.len() < self.cap {
-            return true;
-        }
+    /// What is not running is what [`Self::read_live`] has just dropped from `live`, so each
+    /// process is read once.
+    fn forget_ended(&mut self) {
+        self.read_live();
         let root = key(&self.root);
         let ended: Vec<(u64, u64)> = self
             .seen
@@ -621,21 +644,29 @@ impl OwnedProcesses {
             .filter(|(kept, recorded)| {
                 **kept != root
                     && !recorded.forced
-                    && !self.backends.contains_key(*kept)
-                    && matches!(
-                        kr_ipc::identity::process_state(&recorded.identity),
-                        kr_ipc::identity::ProcessState::Ended
-                    )
+                    && !self.live.contains_key(*kept)
+                    && !self.runs_below(kept)
             })
             .map(|(kept, _)| *kept)
             .collect();
         for gone in ended {
             self.seen.remove(&gone);
+            self.backends.remove(&gone);
             self.under_backends.remove(&gone);
         }
-        if self.seen.len() < self.cap {
-            return true;
-        }
+    }
+
+    /// Returns whether a process is running below the server `root`, which a server that has gone
+    /// stays in the record for: the ending of it finds what it left behind through it.
+    fn runs_below(&self, root: &(u64, u64)) -> bool {
+        self.backends.contains_key(root)
+            && self.under_backends.iter().any(|(below, (_, under))| {
+                under == root && below != root && self.live.contains_key(below)
+            })
+    }
+
+    /// Says once that the record was full, and which process it had no room for.
+    fn refuse_for_room(&mut self, identity: &ProcessStartIdentity) {
         if !self.refused_for_room {
             self.refused_for_room = true;
             self.note_unestablished(format!(
@@ -644,7 +675,6 @@ impl OwnedProcesses {
                 self.cap, identity.pid
             ));
         }
-        false
     }
 
     /// Returns the boundary this session's ownership rests on.
@@ -1949,23 +1979,30 @@ mod tests {
                 kr_ipc::identity::process_start_identity(child.id()).expect("its identity")
             })
             .collect();
+        let known = |owned: &OwnedProcesses, identity: &ProcessStartIdentity| {
+            owned.surviving().contains(identity)
+                || owned
+                    .terminated()
+                    .iter()
+                    .any(|ended| &ended.identity == identity)
+        };
         // The root takes one place, which it keeps; two running processes take the rest.
         owned.take([identities[0].clone(), identities[1].clone()]);
-        assert_eq!(owned.seen.len(), 3);
+        assert!(known(&owned, &identities[0]) && known(&owned, &identities[1]));
         // The first ends of its own accord, and a third finds its place free.
         let _ = children[0].kill();
         let _ = children[0].wait();
         owned.take([identities[2].clone()]);
-        assert!(owned.seen.contains_key(&key(&identities[2])));
+        assert!(owned.surviving().contains(&identities[2]));
         assert!(
-            !owned.seen.contains_key(&key(&identities[0])),
-            "what ended was dropped"
+            !known(&owned, &identities[0]),
+            "what ended was dropped, so a closure does not report it"
         );
         assert!(owned.unestablished().is_empty(), "nothing was refused yet");
         // A fourth finds the root and two running processes, and is refused, once, with the reason.
         owned.take([identities[3].clone()]);
         owned.take([identities[3].clone()]);
-        assert!(!owned.seen.contains_key(&key(&identities[3])));
+        assert!(!known(&owned, &identities[3]));
         let notes = owned.unestablished();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("not recorded"), "{notes:?}");
@@ -1973,7 +2010,58 @@ mod tests {
         let _ = children[1].kill();
         let _ = children[1].wait();
         owned.take([identities[3].clone()]);
-        assert!(owned.seen.contains_key(&key(&identities[3])));
+        assert!(owned.surviving().contains(&identities[3]));
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// KR-REQ-07.60: a server is recorded whatever the record holds, so the record a session
+    /// writes after starting one always names it; and a server that has ended is dropped when the
+    /// record is full, unless something it started is still running.
+    #[test]
+    fn a_server_is_recorded_when_the_record_is_full_and_dropped_once_it_has_ended() {
+        use std::process::Command;
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_005),
+        );
+        owned.cap = 3;
+        let mut children: Vec<std::process::Child> = (0..4)
+            .map(|_| {
+                Command::new("sleep")
+                    .arg("120")
+                    .spawn()
+                    .expect("starts a process")
+            })
+            .collect();
+        let identities: Vec<ProcessStartIdentity> = children
+            .iter()
+            .map(|child| {
+                kr_ipc::identity::process_start_identity(child.id()).expect("its identity")
+            })
+            .collect();
+        // The record is full: the root and two running processes.
+        owned.take([identities[0].clone(), identities[1].clone()]);
+        owned.add_backend(identities[2].clone());
+        let record = owned.record();
+        assert_eq!(record.backends, vec![identities[2].clone()]);
+        assert!(record.processes.contains(&identities[2]));
+        // The server ends with nothing below it, and so does another process: places are free.
+        let _ = children[2].kill();
+        let _ = children[2].wait();
+        let _ = children[1].kill();
+        let _ = children[1].wait();
+        owned.take([identities[3].clone()]);
+        assert!(owned.surviving().contains(&identities[3]));
+        assert!(
+            !owned.is_backend(&identities[2]),
+            "a server that ended with nothing below it is forgotten"
+        );
         for child in &mut children {
             let _ = child.kill();
             let _ = child.wait();
