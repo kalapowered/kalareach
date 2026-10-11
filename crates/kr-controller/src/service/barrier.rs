@@ -889,7 +889,13 @@ impl Controller {
             match barrier.await {
                 Ok(Some(Ok(barrier))) => Ok(barrier),
                 Ok(Some(Err(error))) => Err(kr_voice::VoiceError::Host(
-                    kr_protocol::error::ProtocolError::new(error.code(), error.to_string()),
+                    kr_protocol::error::ProtocolError::new(
+                        error.code(),
+                        format!(
+                            "the withdrawal stands, and this host could not raise the fence it \
+                             owes ({error}); every admission and forward is refused until it is"
+                        ),
+                    ),
                 )),
                 Ok(None) | Err(_) => Err(kr_voice::VoiceError::Host(
                     kr_protocol::error::ProtocolError::new(

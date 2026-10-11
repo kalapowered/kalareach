@@ -913,6 +913,83 @@ async fn a_stop_with_a_close_on_its_way_is_answered_with_the_barrier_pending() {
     call.world.serving.abort();
 }
 
+/// KR-REQ-15.13 and 09.12: a worker that stays silent while the barrier waits for it leaves the stop
+/// answered with that worker pending, and not as though it had fenced. The scripted worker holds
+/// the announcement and acknowledges it only once the stop has been answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_whose_worker_stays_silent_is_answered_with_that_worker_pending() {
+    let call = Call::start().await;
+    let hold = call
+        .controller
+        .sharing()
+        .grants()
+        .hold_close(call.voice_grant_id());
+    let before = revision(&call.controller).await;
+    let (_told, install) = call.script.hold_the_next_announcement();
+
+    let answered: VoiceStopResult = call
+        .submit_voice(Method::VoiceStop, &call.stop_submitted())
+        .await
+        .expect("the stop is answered")
+        .to_typed()
+        .expect("a stop result");
+
+    assert!(
+        call.script
+            .installed_revision()
+            .is_none_or(|held| held.get() <= before),
+        "the worker acknowledged nothing while the stop waited"
+    );
+    let barrier = answered
+        .barrier
+        .0
+        .expect("the stop owed a fence, so it reports it");
+    assert_eq!(barrier.pending(), vec![call.world.session_id]);
+    drop(install);
+    drop(hold);
+    call.world.serving.abort();
+}
+
+/// KR-REQ-15.13 and 09.12: a stop whose fence this host could not raise at all is an error, not a
+/// success, and the grant it withdrew stays withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_whose_fence_cannot_be_raised_is_an_error_and_the_grant_stays_withdrawn() {
+    let call = Call::start().await;
+    let hold = call
+        .controller
+        .sharing()
+        .grants()
+        .hold_close(call.voice_grant_id());
+    let grant_id = call.voice_grant_id();
+    // The registry takes no new authority revision, as on a full disk.
+    rusqlite::Connection::open(call.world._temp.environment().registry_database())
+        .expect("opens the registry")
+        .execute_batch(
+            "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision ON environment
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+
+    let refused = call
+        .submit_voice(Method::VoiceStop, &call.stop_submitted())
+        .await
+        .expect_err("a fence that cannot be raised is not a stop that succeeded");
+
+    assert_ne!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(
+        call.controller
+            .sharing()
+            .grants()
+            .record(grant_id)
+            .expect("the store reads")
+            .is_none_or(|record| record.revoked_at_ms.is_some()),
+        "the grant the stop withdrew stays withdrawn"
+    );
+    assert_eq!(call.controller.voice().coordinator().live_sessions(), 0);
+    drop(hold);
+    call.world.serving.abort();
+}
+
 /// KR-REQ-15.14 and 09.12: replacing the standing grant ends the calls under it, and owes the fence
 /// a close on its way to a worker needs; the answer carries the barrier as it stands, cut to the
 /// sessions of the calls it ended.
