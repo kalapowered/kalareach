@@ -18,6 +18,7 @@ use kr_protocol::confirmation::{ConfirmationSubject, OrganisationEnrolPlan};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::OrganisationRequirement;
+use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::{AccountId, ActionId, AuthorityRevision, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
@@ -59,6 +60,20 @@ impl Fixture {
 
     /// Starts a daemon with an owner device, enrolled in nothing.
     pub async fn start_unenrolled() -> Self {
+        Self::start_unenrolled_under(None).await
+    }
+
+    /// Starts a daemon that reads `document` as its configuration, with an owner device and
+    /// enrolled in the organisation.
+    pub async fn start_under(document: &ConfigurationDocument) -> Self {
+        let mut fixture = Self::start_unenrolled_under(Some(document)).await;
+        fixture.enrol().await;
+        fixture
+    }
+
+    /// Starts a daemon with an owner device, enrolled in nothing, that reads `document` as its
+    /// configuration when it is given one.
+    pub async fn start_unenrolled_under(document: Option<&ConfigurationDocument>) -> Self {
         let owner = DeviceKeys::generate().expect("keys");
         let continuous = ManualClock::new();
         let moved = Arc::new(AtomicI64::new(0));
@@ -71,7 +86,10 @@ impl Fixture {
                     .saturating_add_signed(read.load(Ordering::SeqCst))
             }),
         };
-        let host = Host::start_on_clocks(&owner, clocks).await;
+        let host = match document {
+            Some(document) => Host::start_with_document_clocks(&owner, document, clocks).await,
+            None => Host::start_on_clocks(&owner, clocks).await,
+        };
         let now = kr_ipc::now_ms().get();
         let mut organisation = Organisation::new(0x21, now - 2 * DAY_MS);
         organisation.rotate(now - DAY_MS);

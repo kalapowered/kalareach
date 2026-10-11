@@ -922,9 +922,21 @@ async fn recover_by_a_confirmed_ending(fixture: &Fixture) {
     assert!(!listed.exclusive);
     assert_eq!(listed.exclusive_events.len(), 1);
 
-    // And the owner's device is served on its own grant again.
+    // And the owner's device is served on its own grant again, and reads the event at its own door.
     let raw = owner.connect().await;
     read_host_info(&raw).await.expect("served on its own grant");
+    let listed: OrganisationListResult = raw
+        .read(Method::OrganisationList, &OrganisationListParams::default())
+        .await
+        .expect("the owner device reads the list")
+        .to_typed()
+        .expect("a list");
+    assert!(!listed.exclusive);
+    assert_eq!(
+        listed.exclusive_events.len(),
+        1,
+        "the paired door shows the record of the ending"
+    );
     raw.close();
 }
 
@@ -1412,5 +1424,417 @@ async fn a_paired_device_does_not_reach_withdrawal_or_exclusive_management() {
         "nothing was withdrawn"
     );
     assert!(!fixture.listed().await.exclusive);
+    fixture.host.stop().await;
+}
+
+/// What the host lists as outstanding for the device on `raw`.
+async fn pending_on(raw: &RawDevice) -> OwnerConfirmationPendingResult {
+    raw.read(
+        Method::OwnerConfirmationPending,
+        &OwnerConfirmationPendingParams {},
+    )
+    .await
+    .expect("the list of challenges is read")
+    .to_typed()
+    .expect("a list")
+}
+
+/// KR-REQ-17.54: on a lapsed exclusive host the owner's device is shown, and may answer, only the
+/// challenges that recover the host. A challenge for a member's invitation, asked for at the host,
+/// is neither listed for it nor accepted from it; once a lease serves the device it is both, and
+/// the answer is spent at the host to issue the invitation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapsed_owner_device_is_neither_shown_nor_allowed_to_answer_a_members_invitation_and_a_leased_one_is()
+ {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    let proposed = ProposedGrant {
+        organisation: Nullable::some(OrganisationRequirement {
+            organisation_id: fixture.organisation.organisation_id,
+            policy_revision: fixture.revision,
+        }),
+        ..net_support::proposal(&[ActionRight::SessionView])
+    };
+    let challenge = calls::request(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::IssueInvitation {
+            mode: kr_protocol::invitation::InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: proposed.clone(),
+        },
+    )
+    .await
+    .expect("the owner at the host asks for the member's invitation to be confirmed");
+
+    let owner = OwnerDevice::of(&fixture).await;
+    let raw = owner.connect().await;
+    let environment = ActionTarget::environment(fixture.host.environment_id);
+    let (proof, _) = calls::sign(&challenge.request, &Signer::OwnerDevice(&fixture.owner));
+    let complete = || OwnerConfirmationCompleteParams {
+        proof: proof.clone(),
+        bootstrap_signer: Nullable::null(),
+    };
+    assert!(
+        !pending_on(&raw)
+            .await
+            .pending
+            .iter()
+            .any(|shown| shown.request == challenge.request),
+        "no lease serves the device, so it is not shown the invitation's challenge"
+    );
+    let refused = net_support::refusal(
+        raw.mutate(
+            Method::OwnerConfirmationComplete,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment.clone(),
+            &complete(),
+        )
+        .await,
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    // Served by a lease, the same device is shown the challenge, answers it, and the owner at the
+    // host issues the invitation on that answer.
+    owner.present(&raw).await.expect("the owner's lease");
+    assert!(
+        pending_on(&raw)
+            .await
+            .pending
+            .iter()
+            .any(|shown| shown.request == challenge.request),
+        "a leased device is shown the challenge"
+    );
+    raw.mutate(
+        Method::OwnerConfirmationComplete,
+        ActionId::new(kr_ipc::new_uuid()),
+        environment,
+        &complete(),
+    )
+    .await
+    .expect("a leased owner device answers a member's invitation");
+    raw.close();
+    calls::mutate::<_, kr_protocol::invitation::PairInviteResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::PairInvite,
+        &kr_protocol::invitation::PairInviteParams {
+            mode: kr_protocol::invitation::InviteMode::Direct,
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: proposed,
+        },
+    )
+    .await
+    .expect("the host issues the invitation on the device's answer");
+    drop(client);
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: what recovers an exclusive host is a device whose host management the
+/// configuration leaves it. A rights ceiling that removes `host.manage` leaves no device that can
+/// recover the host, so making the host exclusive is refused; one that keeps it allows that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rights_ceiling_that_removes_host_management_leaves_no_device_that_can_recover_the_host()
+{
+    let ceiling_naming = |rights: &[ActionRight]| {
+        let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+        document.ceilings.grant_rights = Nullable::some(
+            rights
+                .iter()
+                .map(|right| right.as_str().to_owned())
+                .collect(),
+        );
+        document
+    };
+
+    let fixture = Fixture::start_under(&ceiling_naming(&[ActionRight::SessionView])).await;
+    let mut client = fixture.host.client().await;
+    let refused = fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect_err("the configuration removes host management from the owner's device");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(!fixture.listed().await.exclusive);
+    drop(client);
+    fixture.host.stop().await;
+
+    let fixture = Fixture::start_under(&ceiling_naming(&[
+        ActionRight::SessionView,
+        ActionRight::HostManage,
+    ]))
+    .await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("a ceiling that keeps host management leaves a device that can recover the host");
+    assert!(fixture.listed().await.exclusive);
+    drop(client);
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: a change of exclusive management is written whole or not at all. When the store
+/// refuses the record of the ending, the policy that went into the same transaction is not kept;
+/// when it refuses the policy, no record is kept; each attempt spent its confirmation, and a stop
+/// of the host after either leaves the host exclusive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_write_ends_exclusive_management_in_neither_the_policy_nor_the_record_and_spends_the_confirmation()
+ {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+
+    let end = |client: &mut kr_ipc::client::LocalClient| {
+        calls::mutate::<_, OrganisationExclusiveSetResult>(
+            fixture.host.environment_id,
+            client,
+            Method::OrganisationExclusiveSet,
+            &OrganisationExclusiveSetParams { exclusive: false },
+        )
+    };
+    let confirm_ending = async |client: &mut kr_ipc::client::LocalClient| {
+        calls::confirm_subject(
+            fixture.host.environment_id,
+            client,
+            ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+            &Signer::OwnerDevice(&fixture.owner),
+        )
+        .await
+        .expect("the owner device confirms ending it");
+    };
+    let refusing = |trigger: &str| {
+        let blocker = rusqlite::Connection::open(fixture.host.registry_database())
+            .expect("the registry opens");
+        blocker
+            .execute_batch(trigger)
+            .expect("the fault is in place");
+        blocker
+    };
+
+    // The record of the ending is refused.
+    confirm_ending(&mut client).await;
+    let blocker = refusing(
+        "CREATE TRIGGER refuse_record BEFORE INSERT ON exclusive_management_events
+         BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+    );
+    end(&mut client)
+        .await
+        .expect_err("the store refuses the record");
+    blocker
+        .execute_batch("DROP TRIGGER refuse_record;")
+        .expect("the fault is cleared");
+    drop(blocker);
+    let listed = fixture.listed().await;
+    assert!(listed.exclusive, "the policy went with the record");
+    assert!(listed.exclusive_events.is_empty());
+    let refused = end(&mut client)
+        .await
+        .expect_err("the failed attempt spent the confirmation");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+
+    // The policy is refused.
+    confirm_ending(&mut client).await;
+    let blocker = refusing(
+        "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+         WHEN NEW.key = 'policy'
+         BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+    );
+    end(&mut client)
+        .await
+        .expect_err("the store refuses the policy");
+    blocker
+        .execute_batch("DROP TRIGGER refuse_policy;")
+        .expect("the fault is cleared");
+    drop(blocker);
+    let listed = fixture.listed().await;
+    assert!(listed.exclusive);
+    assert!(
+        listed.exclusive_events.is_empty(),
+        "no record without the policy"
+    );
+    drop(client);
+
+    // A stop of the host after the spent confirmation turns nothing off.
+    let fixture = fixture.restart().await;
+    let listed = fixture.listed().await;
+    assert!(
+        listed.exclusive,
+        "the host is still exclusive after a restart"
+    );
+    assert!(listed.exclusive_events.is_empty());
+    let mut client = fixture.host.client().await;
+    let refused = calls::mutate::<_, OrganisationExclusiveSetResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::OrganisationExclusiveSet,
+        &OrganisationExclusiveSetParams { exclusive: false },
+    )
+    .await
+    .expect_err("the confirmation was spent");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+
+    // Confirmed again, it ends, with its record.
+    calls::confirm_subject(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: false },
+        &Signer::OwnerDevice(&fixture.owner),
+    )
+    .await
+    .expect("the owner device confirms again");
+    let off: OrganisationExclusiveSetResult = calls::mutate(
+        fixture.host.environment_id,
+        &mut client,
+        Method::OrganisationExclusiveSet,
+        &OrganisationExclusiveSetParams { exclusive: false },
+    )
+    .await
+    .expect("and the host ends it");
+    assert!(!off.exclusive);
+    let listed = fixture.listed().await;
+    assert!(!listed.exclusive);
+    assert_eq!(listed.exclusive_events.len(), 1);
+    drop(client);
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: making the host exclusive never commits after the last device that could recover
+/// it was revoked. The revocation lands while the change waits for the store; the change is
+/// refused and the host stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn making_the_host_exclusive_never_commits_after_the_last_device_that_could_recover_it_was_revoked()
+ {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    calls::confirm_subject(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+        &Signer::OwnerDevice(&fixture.owner),
+    )
+    .await
+    .expect("the owner device confirms making the host exclusive");
+    let (arrived, go) = fixture
+        .host
+        .controller()
+        .sharing()
+        .grants()
+        .pause_before_effect();
+    let environment = fixture.host.environment_id;
+    let enabling = tokio::spawn(async move {
+        let answer = calls::mutate::<_, OrganisationExclusiveSetResult>(
+            environment,
+            &mut client,
+            Method::OrganisationExclusiveSet,
+            &OrganisationExclusiveSetParams { exclusive: true },
+        )
+        .await;
+        (client, answer)
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the wait ends")
+        .expect("the change reaches the store");
+
+    // The revocation is written where the store reads it, as the host's own revocation does, while
+    // the change waits. The pairing path would wait on the registry the change holds.
+    rusqlite::Connection::open(fixture.host.registry_database())
+        .expect("the registry opens")
+        .execute(
+            "UPDATE network_devices SET revoked_at_ms = ?1 WHERE revoked_at_ms IS NULL",
+            [i64::try_from(kr_ipc::now_ms().get()).expect("a time")],
+        )
+        .expect("the last owner device is revoked");
+    go.send(()).expect("the change waits");
+    let (client, answer) = enabling.await.expect("the change ends");
+    drop(client);
+    let refused = answer.expect_err("no device is left that could recover the host");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(!fixture.listed().await.exclusive);
+    fixture.host.stop().await;
+}
+
+/// KR-REQ-17.54: exclusive management refuses no revocation. The fence that making the host
+/// exclusive owes can stop a revocation admitted while it is owed; once it is retired the same
+/// revocation, asked again at the host's socket, succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_stopped_by_the_fence_of_making_the_host_exclusive_succeeds_once_it_is_retired()
+ {
+    let fixture = Fixture::start().await;
+    let helper = Device::create().await;
+    let helper_record = net_support::pair_with(
+        &fixture.host,
+        &helper,
+        &fixture.owner,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let mut client = fixture.host.client().await;
+    calls::confirm_subject(
+        fixture.host.environment_id,
+        &mut client,
+        ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+        &Signer::OwnerDevice(&fixture.owner),
+    )
+    .await
+    .expect("the owner device confirms");
+    let fault = fence_support::refuse_fences(&fixture.host.tree().environment());
+    calls::mutate::<_, OrganisationExclusiveSetResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::OrganisationExclusiveSet,
+        &OrganisationExclusiveSetParams { exclusive: true },
+    )
+    .await
+    .expect_err("the fence could not be raised");
+    drop(client);
+
+    // The fence is owed: the revocation is not admitted, and nothing about exclusive management
+    // is what stopped it.
+    let revoke = kr_protocol::sharing::DeviceRevokeParams {
+        device_id: helper_record.device_id,
+    };
+    let mut client = fixture.host.client().await;
+    calls::mutate::<_, RevocationResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &revoke,
+    )
+    .await
+    .expect_err("the fence the change owes stops the revocation");
+    drop(client);
+    fence_support::clear_the_fault(&fault);
+    drop(fault);
+
+    let fixture = fixture.restart().await;
+    fixture.until_the_fence_is_retired().await;
+    let mut client = fixture.host.client().await;
+    calls::mutate::<_, RevocationResult>(
+        fixture.host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &revoke,
+    )
+    .await
+    .expect("asked again at the host's socket, the revocation succeeds");
+    assert!(fixture.listed().await.exclusive);
+    drop(client);
     fixture.host.stop().await;
 }
