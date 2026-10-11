@@ -17,6 +17,12 @@
 //! with a line break inside would be read as two frames, so it ends the connection, as does a binary
 //! message and a message above the connection's frame bound.
 //!
+//! **A close that cannot be sent at once is sent when it can.** When the gateway ends a connection
+//! the terminal is sent a close, so that it reads an end and not a reset. A terminal that has not
+//! read the answers to its pings leaves them in the socket, and the close has no room behind
+//! them. Dropping the connection hands the close to a task of its own, which waits for the room for
+//! [`CLOSE_DEADLINE`] and then lets the socket go.
+//!
 //! **A flush is the library's own send.** The adapter implements reading and writing directly over
 //! the WebSocket stream, so a flush returns when the library has written what it queued and not
 //! before. The gateway's write deadline keeps its meaning: a terminal that has stopped reading
@@ -55,6 +61,15 @@ pub const CONTROL_WINDOW: Duration = Duration::from_secs(60);
 
 /// How long a terminal has to send its upgrade request and have it answered.
 pub const UPGRADE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a close that the socket had no room for waits for room, once the gateway has let go of
+/// the connection. A terminal that reads nothing for this long is gone.
+pub const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A connection the gateway can carry a terminal's upgrade over, and hand to a task of its own.
+pub trait Carrier: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Carrier for S {}
 
 /// A connection's start: the bytes already read off it, then the rest of it.
 #[derive(Debug)]
@@ -118,7 +133,7 @@ pub type Terminal<S> = TextLines<Replayed<S>>;
 /// connection is closed.
 pub async fn accept<S>(stream: S, framing: Framing) -> Result<Terminal<S>>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Carrier,
 {
     tokio::time::timeout(UPGRADE_DEADLINE, upgrade(stream, framing))
         .await
@@ -129,7 +144,7 @@ where
 
 async fn upgrade<S>(mut stream: S, framing: Framing) -> Result<Terminal<S>>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Carrier,
 {
     let head = match read_head(&mut stream).await {
         Ok(head) => head,
@@ -244,8 +259,9 @@ fn vet(head: &[u8]) -> Result<()> {
 /// When it is dropped, the gateway has ended the connection: the terminal is sent a close with the
 /// reason the gateway had, if it had one, so that it reads an end and not a reset.
 #[derive(Debug)]
-pub struct TextLines<S: AsyncRead + AsyncWrite + Unpin> {
-    socket: WebSocketStream<S>,
+pub struct TextLines<S: Carrier> {
+    /// Held until the connection is dropped, which hands it to the close.
+    socket: Option<WebSocketStream<S>>,
     /// Why the gateway ended the connection, when it did so for a message it refused.
     closing: Option<CloseCode>,
     /// When the window the ping and pong messages are counted in began, and how many have been
@@ -264,10 +280,10 @@ pub struct TextLines<S: AsyncRead + AsyncWrite + Unpin> {
     writing: Vec<u8>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> TextLines<S> {
+impl<S: Carrier> TextLines<S> {
     fn new(socket: WebSocketStream<S>, framing: Framing) -> Self {
         Self {
-            socket,
+            socket: Some(socket),
             closing: None,
             control_window: None,
             peer_closed: false,
@@ -293,8 +309,17 @@ fn failed(error: tokio_websockets::Error) -> io::Error {
 
 impl<S> TextLines<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Carrier,
 {
+    /// The socket, which is there until the connection is dropped.
+    fn socket(&mut self) -> Pin<&mut WebSocketStream<S>> {
+        Pin::new(
+            self.socket
+                .as_mut()
+                .expect("the socket is held until the connection is dropped"),
+        )
+    }
+
     /// Hands the socket every whole line written so far, each as one text message.
     ///
     /// A line is taken off only when the socket is ready for it, so a socket that is not taking
@@ -306,10 +331,10 @@ where
                     "a frame is larger than the connection carries",
                 )));
             }
-            ready!(Pin::new(&mut self.socket).poll_ready(cx)).map_err(failed)?;
+            ready!(self.socket().poll_ready(cx)).map_err(failed)?;
             let line: Vec<u8> = self.writing.drain(..=end).take(end).collect();
             let text = String::from_utf8(line).map_err(|_| refused("a frame is not text"))?;
-            Pin::new(&mut self.socket)
+            self.socket()
                 .start_send(Message::text(text))
                 .map_err(failed)?;
         }
@@ -334,7 +359,7 @@ where
 
 impl<S> AsyncRead for TextLines<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Carrier,
 {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -350,7 +375,7 @@ where
                 return Poll::Ready(Ok(()));
             }
             let this = &mut *self;
-            let message = match ready!(Pin::new(&mut this.socket).poll_next(cx)) {
+            let message = match ready!(this.socket().poll_next(cx)) {
                 None => return Poll::Ready(Ok(())),
                 // A terminal that closed and then went away before the answer reached it has left,
                 // and that is how a person quitting looks.
@@ -413,7 +438,7 @@ where
 
 impl<S> AsyncWrite for TextLines<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Carrier,
 {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -441,28 +466,45 @@ where
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         ready!(this.send_lines(cx))?;
-        Pin::new(&mut this.socket).poll_flush(cx).map_err(failed)
+        this.socket().poll_flush(cx).map_err(failed)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         ready!(this.send_lines(cx))?;
-        Pin::new(&mut this.socket).poll_close(cx).map_err(failed)
+        this.socket().poll_close(cx).map_err(failed)
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Drop for TextLines<S> {
-    /// Sends the terminal a close, if there is room for it in the socket at once.
+impl<S: Carrier> Drop for TextLines<S> {
+    /// Sends the terminal a close, now if there is room for it in the socket and when there is
+    /// otherwise.
     ///
-    /// Nothing waits here: the gateway has ended the connection and has no task left to wait in.
-    /// A close the connection has already sent is not sent again, and one the socket has no room
-    /// for is not sent at all. Anything the library queued before this, a reply to the terminal's
-    /// own close among it, is sent now if the socket takes it.
+    /// A close the connection has already sent is not sent again. Anything the library queued
+    /// before this, a reply to the terminal's own close among it, goes out ahead of the close. What
+    /// the socket will not take at once is left to a task that waits for the room for
+    /// [`CLOSE_DEADLINE`]: the gateway has ended the connection and has no task of its own left to
+    /// wait in. Where there is no runtime to run the task, what the socket takes now is all that is
+    /// sent.
     fn drop(&mut self) {
+        let Some(mut socket) = self.socket.take() else {
+            return;
+        };
         let code = self.closing.unwrap_or(CloseCode::NORMAL_CLOSURE);
+        let _ = Pin::new(&mut socket).start_send(Message::close(Some(code), ""));
         let mut context = Context::from_waker(std::task::Waker::noop());
-        let _ = Pin::new(&mut self.socket).start_send(Message::close(Some(code), ""));
-        let _ = Pin::new(&mut self.socket).poll_flush(&mut context);
+        if Pin::new(&mut socket).poll_flush(&mut context).is_ready() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(
+                    CLOSE_DEADLINE,
+                    std::future::poll_fn(|cx| Pin::new(&mut socket).poll_flush(cx)),
+                )
+                .await;
+            });
+        }
     }
 }
 
@@ -483,11 +525,10 @@ mod tests {
         }
     }
 
-    /// KR-REQ-11.32: the pings of a terminal are bounded by their rate and not by their number, so
-    /// a keepalive that goes on for as long as a session does is not cut off, and a flood is.
-    #[tokio::test(start_paused = true)]
-    async fn kr_req_11_32_a_slow_keepalive_is_not_cut_off_and_a_flood_is() {
-        let (mut terminal, gateway) = tokio::io::duplex(1 << 16);
+    /// Upgrades a terminal's connection over an in-memory pipe that holds `room` bytes in each
+    /// direction, and returns the terminal's end and the gateway's lines.
+    async fn upgraded(room: usize) -> (tokio::io::DuplexStream, Terminal<tokio::io::DuplexStream>) {
+        let (mut terminal, gateway) = tokio::io::duplex(room);
         let upgrading = tokio::spawn(accept(gateway, Framing::new(NativeFraming::JsonLines)));
         terminal
             .write_all(
@@ -504,10 +545,18 @@ mod tests {
             assert_ne!(read, 0, "the connection ended before the upgrade");
             response.extend_from_slice(&chunk[..read]);
         }
-        let mut lines = upgrading
+        let lines = upgrading
             .await
             .expect("the upgrade ends")
             .expect("the terminal is accepted");
+        (terminal, lines)
+    }
+
+    /// KR-REQ-11.32: the pings of a terminal are bounded by their rate and not by their number, so
+    /// a keepalive that goes on for as long as a session does is not cut off, and a flood is.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_11_32_a_slow_keepalive_is_not_cut_off_and_a_flood_is() {
+        let (mut terminal, mut lines) = upgraded(1 << 16).await;
         let mut reading = tokio::spawn(async move {
             let mut buffer = [0_u8; 16];
             lines.read(&mut buffer).await
@@ -537,5 +586,41 @@ mod tests {
         settle().await;
         let ended = (&mut reading).await.expect("the reader is joined");
         assert!(ended.is_err(), "the flood ended the connection: {ended:?}");
+    }
+
+    /// KR-REQ-11.32: a connection the gateway ends is closed to the terminal even when the pipe
+    /// to it is full of the answers to the terminal's own pings, which a terminal that has not
+    /// read them leaves there. The close waits for room and is sent when the terminal reads.
+    #[tokio::test]
+    async fn kr_req_11_32_a_close_the_socket_had_no_room_for_is_sent_when_the_terminal_reads() {
+        // The pipe holds the answers to 32 pings, so the answers to the flood outgrow it.
+        let (mut terminal, mut lines) = upgraded(64).await;
+        let reading = tokio::spawn(async move {
+            let mut buffer = [0_u8; 16];
+            lines.read(&mut buffer).await
+        });
+        for _ in 0..=MAX_CONTROL_MESSAGES_PER_WINDOW {
+            terminal.write_all(&PING).await.expect("a ping");
+        }
+        let ended = reading.await.expect("the reader is joined");
+        assert!(ended.is_err(), "the flood ended the connection: {ended:?}");
+
+        // The terminal reads only now: the answers, then the close and the end of the connection.
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), terminal.read_to_end(&mut received))
+            .await
+            .expect("the connection ends")
+            .expect("it is readable");
+        let policy_violation = [0x88, 0x02, 0x03, 0xF0];
+        assert!(
+            received.ends_with(&policy_violation),
+            "the terminal was not sent the close that ended its connection"
+        );
+        assert!(
+            received[..received.len() - policy_violation.len()]
+                .chunks(2)
+                .all(|answer| answer == [0x8A, 0x00]),
+            "only the answers to its pings came before the close"
+        );
     }
 }
