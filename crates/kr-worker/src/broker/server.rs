@@ -240,6 +240,19 @@ impl Server {
     /// not be read or is not the one the record names, the process could not be started, could not
     /// be read once started, or does not run the code that was hashed.
     pub async fn start(spec: &ServerSpec<'_>) -> Result<Self, String> {
+        Self::start_with(spec, Arc::new(HashedFiles::default())).await
+    }
+
+    /// Starts the server `spec` names, reading the executable through `cache`, which holds what
+    /// was read of it already while it is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Server::start`] does.
+    pub(crate) async fn start_with(
+        spec: &ServerSpec<'_>,
+        cache: Arc<HashedFiles>,
+    ) -> Result<Self, String> {
         if !spec.executable.is_absolute() {
             return Err(format!(
                 "{} is not an absolute path, so no server was started",
@@ -261,7 +274,7 @@ impl Server {
         let hashed = {
             let stop = Arc::clone(&stop);
             tokio::task::spawn_blocking(move || {
-                crate::broker::image::read_identity(&path, &HashedFiles::default(), &stop)
+                crate::broker::image::read_identity(&path, &cache, &stop)
             })
             .await
             .map_err(|error| format!("the executable could not be read: {error}"))??
