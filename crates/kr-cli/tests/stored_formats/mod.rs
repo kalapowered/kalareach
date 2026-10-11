@@ -825,10 +825,14 @@ pub enum KnownIs {
     Protocol(Value, &'static str),
     /// A type of the source, by file; its fields' types are checked as a declared one's are.
     Source(&'static str),
-    /// Words the code matches stored text against by hand, and the source file where the code
-    /// that writes and reads them is, when the words are not taken from the code itself: the digest
-    /// holds how many times each word occurs in that file as a quoted literal, so a word changed
-    /// where the code writes it, or read where the code reads it, moves the digest.
+    /// Words the code matches stored text against, with the source file where most of the code
+    /// that writes and reads them is, when the words are not taken from the code itself, and the
+    /// enums the words stand for.
+    ///
+    /// The digest holds how many times each listed word occurs in that file as a quoted literal,
+    /// so a listed word changed in that file moves it, and the definition of each enum, so a
+    /// variant added to one does. It does not see a writer outside that file, a word written in an
+    /// SQL statement (single quotes), or a word added to a set that names no enum.
     Words(
         Vec<String>,
         Option<&'static str>,
