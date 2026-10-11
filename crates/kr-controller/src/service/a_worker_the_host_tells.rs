@@ -14,7 +14,8 @@ use kr_ipc::framed::split;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::frame::StreamKind;
-use kr_protocol::ids::{CapabilityId, ConnectionId, SessionId};
+use kr_protocol::ids::{BuildId, CapabilityId, ConnectionId, SessionId};
+use kr_protocol::method::Method;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::worker::{AuthorityRevisionAck, LocalAccessAck};
 
@@ -152,13 +153,28 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// What the worker of `session_id` has acknowledged, as the daemon records it.
-fn acknowledged(silent: &Silent, session_id: SessionId) -> u64 {
+/// The registry's row for the fake worker of `silent`, as a worker that reported itself has one.
+fn row_of(silent: &Silent) -> crate::registry::WorkerRecord {
+    let descriptor = &silent.worker.descriptor;
+    crate::registry::WorkerRecord {
+        session_id: silent.session_id,
+        display_number: descriptor.display_number,
+        public_key: descriptor.worker_public_key,
+        process_identity: descriptor.process_start_identity.clone(),
+        endpoint: descriptor.endpoint.clone(),
+        profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        state: kr_protocol::session::SessionState::Live,
+        acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+    }
+}
+
+/// The sessions the host counts as unable to be told what the local owner may do.
+async fn lacking(silent: &Silent) -> Vec<SessionId> {
+    let registry = silent.controller.registry.lock().await;
     silent
         .controller
-        .local_access
-        .worker(session_id)
-        .acknowledged
+        .workers_without_local_enforcement_in(&registry)
+        .expect("the registry answers")
 }
 
 /// KR-REQ-17.54: a barrier tells a worker what the local owner may do before it announces the
@@ -236,6 +252,15 @@ async fn a_worker_that_states_no_capability_is_sent_no_statement_and_counts_as_o
     .await;
     let controller = &silent.controller;
     world::acknowledged(controller, silent.session_id);
+    controller
+        .registry
+        .lock()
+        .await
+        .adopt_worker(
+            &row_of(&silent),
+            Some(&kr_protocol::identity::DesktopBinding::none()),
+        )
+        .expect("the registry records the worker");
 
     controller.tell_workers().await;
     let debt = controller
@@ -245,9 +270,9 @@ async fn a_worker_that_states_no_capability_is_sent_no_statement_and_counts_as_o
     controller.barrier(own).await.expect("a barrier");
 
     assert_eq!(
-        controller.local_access.worker(silent.session_id).states,
-        Some(false),
-        "the worker's hello said it cannot be told"
+        lacking(&silent).await,
+        vec![silent.session_id],
+        "the worker's hello said it cannot be told, and the host counts it as one that cannot be"
     );
     assert!(
         !heard(&recorded)
@@ -267,53 +292,28 @@ async fn a_statement_a_worker_did_not_acknowledge_is_sent_again_by_the_publisher
         fails_the_first_statement: true,
     })
     .await;
-    let session_id = silent.session_id;
-    until("the worker acknowledges a statement", || {
-        acknowledged(&silent, session_id) >= 1
+    // The first statement ends its link without an answer; the publisher sends the same statement
+    // again on a link of its own, with nobody asking it to.
+    until("the worker is sent the statement a second time", || {
+        heard_on(&recorded)
+            .iter()
+            .filter(|(_, frame)| matches!(frame, ControlFrame::LocalAccess(_)))
+            .map(|(link, _)| *link)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            >= 2
     })
     .await;
-    let statements = heard(&recorded)
-        .iter()
-        .filter(|frame| matches!(frame, ControlFrame::LocalAccess(_)))
-        .count();
-    assert!(
-        statements >= 2,
-        "the first statement failed and the worker was sent it again: {statements}"
-    );
     silent.serving.abort();
-}
-
-/// The registry's row for the fake worker of `silent`, as a worker that reported itself has one.
-fn row_of(silent: &Silent) -> crate::registry::WorkerRecord {
-    let descriptor = &silent.worker.descriptor;
-    crate::registry::WorkerRecord {
-        session_id: silent.session_id,
-        display_number: descriptor.display_number,
-        public_key: descriptor.worker_public_key,
-        process_identity: descriptor.process_start_identity.clone(),
-        endpoint: descriptor.endpoint.clone(),
-        profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-        state: kr_protocol::session::SessionState::Live,
-        acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
-    }
-}
-
-/// The sessions the host counts as unable to be told what the local owner may do.
-async fn lacking(silent: &Silent) -> Vec<SessionId> {
-    let registry = silent.controller.registry.lock().await;
-    silent
-        .controller
-        .workers_without_local_enforcement_in(&registry)
-        .expect("the registry answers")
 }
 
 /// KR-REQ-17.54: the host counts as unable to be told every recorded worker it has not reached or
 /// that states no capability, and every claimed launch that this run of the daemon did not make,
 /// because its worker may be alive and serving its local caller without the hold. A worker it has
-/// told, and a launch it made itself (which starts closed), are not counted. Making the host
-/// exclusively organisation-managed is refused while the count is not empty.
+/// told is not counted. Making the host exclusively organisation-managed is refused while the
+/// count is not empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told_or_launched() {
+async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told() {
     let (silent, _recorded) = with(Behaviour {
         states: true,
         fails_the_first_statement: false,
@@ -331,19 +331,13 @@ async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told_or
         .expect("the registry records the worker");
 
     // A recorded worker that has not been reached counts as one that cannot be told.
-    controller.local_access.touch(silent.session_id);
     assert_eq!(lacking(&silent).await, vec![silent.session_id]);
 
-    // Once it states the capability, it does not.
+    // Once it has been reached and states the capability, it does not.
     controller.tell_workers().await;
-    until("the worker is told", || {
-        controller.local_access.worker(silent.session_id).states == Some(true)
-    })
-    .await;
     assert!(lacking(&silent).await.is_empty());
 
-    // A claimed launch this run of the daemon did not make may have a worker alive; one it made
-    // starts closed and is not counted.
+    // A claimed launch this run of the daemon did not make may have a worker alive.
     let claim = super::a_create_that_launches_nothing::seed_claim_as(
         controller,
         &silent.actor.actor_id,
@@ -356,8 +350,6 @@ async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told_or
     )
     .await;
     assert_eq!(lacking(&silent).await, vec![claim.session_id]);
-    controller.local_access.launching(claim.reservation_id);
-    assert!(lacking(&silent).await.is_empty());
     silent.serving.abort();
 }
 
@@ -403,10 +395,10 @@ async fn a_recovered_claim_is_recorded_before_it_is_told_and_published_on_what_i
         controller.directory.lock().await.get(session_id).is_none(),
         "and nothing can find it yet"
     );
-    assert_eq!(
-        world.service().local_gate().check(),
-        Err(kr_worker::local_gate::Refused::NotTold),
-        "the worker has been told nothing, and serves its local owner nothing that is held"
+    refused_for_the_lease(
+        &read_as_the_owner(&world).await,
+        "not yet told",
+        "the worker has been told nothing, and serves its local owner nothing that is held",
     );
 
     // A restriction commits after the statement was drawn and before it is sent.
@@ -426,9 +418,48 @@ async fn a_recovered_claim_is_recorded_before_it_is_told_and_published_on_what_i
         controller.directory.lock().await.get(session_id).is_some(),
         "the worker is published"
     );
-    assert_eq!(
-        world.service().local_gate().check(),
-        Err(kr_worker::local_gate::Refused::Closed),
-        "and it holds the restriction that committed meanwhile, not the answer drawn before it"
+    refused_for_the_lease(
+        &read_as_the_owner(&world).await,
+        "not live",
+        "and it holds the restriction that committed meanwhile, not the answer drawn before it",
     );
+}
+
+/// A read of the worker's session by the host's local owner, on the worker's own socket as
+/// `kr attach` makes it.
+async fn read_as_the_owner(
+    world: &super::a_link_that_is_not_given_back::Served,
+) -> Result<(), kr_protocol::error::ProtocolError> {
+    let mut client = kr_ipc::client::LocalClient::connect(
+        &world.worker.endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        BuildId::new("kr-test/0").expect("a build identifier"),
+    )
+    .await
+    .expect("connects to the worker");
+    client
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams {
+                session_id: world.session_id,
+            },
+        )
+        .await
+        .expect("the worker answers")
+        .map(|_| ())
+}
+
+/// Asserts that a read was refused for the local owner's lease, in the words that name `why`.
+fn refused_for_the_lease(
+    answer: &Result<(), kr_protocol::error::ProtocolError>,
+    why: &str,
+    what: &str,
+) {
+    let error = answer.as_ref().expect_err(what);
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{what}: {error:?}"
+    );
+    assert!(error.message.contains(why), "{what}: {error:?}");
 }

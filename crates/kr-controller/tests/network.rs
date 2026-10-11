@@ -2535,6 +2535,10 @@ async fn an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at
         .expect("the daemon answers")
         .expect_err("a held method is refused at the door");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        !refused.message.contains("recorded"),
+        "nothing was done, and the refusal does not say that something was: {refused:?}"
+    );
     let _: kr_protocol::hostinfo::HostInfoResult =
         pairing_calls::read(&mut local, Method::HostInfo, &())
             .await
@@ -2611,16 +2615,26 @@ async fn ending_exclusive_management_serves_the_local_owner_without_a_lease_and_
     world.make_exclusive().await;
     refused_for_the_owners_lease(&worker_read(&mut window, world.session_id).await);
 
+    // Ending exclusive management is answered at once, and the workers are told as the host's
+    // next pass reaches them, so they are waited for.
     world.make_open().await;
-    worker_read(&mut window, world.session_id)
-        .await
-        .expect("the connection that was refused is served with no lease");
+    eventually(
+        "the connection that was refused is served with no lease",
+        async || worker_read(&mut window, world.session_id).await.is_ok(),
+    )
+    .await;
     let mut local = world.local().await;
     let created = create(&mut local, &world.host).await;
     let mut other = world.worker_of(created.session.display_number).await;
-    worker_read(&mut other, created.session.session_id)
-        .await
-        .expect("a session made at the open host's door is served");
+    eventually(
+        "a session made at the open host's door is served",
+        async || {
+            worker_read(&mut other, created.session.session_id)
+                .await
+                .is_ok()
+        },
+    )
+    .await;
 
     world.make_exclusive().await;
     refused_for_the_owners_lease(&worker_read(&mut window, world.session_id).await);
