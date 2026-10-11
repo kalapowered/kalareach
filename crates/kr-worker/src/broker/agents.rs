@@ -38,12 +38,16 @@ impl AgentBindings for Broker {
             state
                 .instances
                 .values()
-                .filter_map(|instance| {
+                .flat_map(|instance| {
+                    // The program and the server this host started for it both place a helper
+                    // under the instance.
                     instance
                         .process
                         .as_ref()
                         .map(|launched| launched.process.clone())
                         .or_else(|| instance.observed.clone())
+                        .into_iter()
+                        .chain(instance.backend.clone())
                         .map(|process| (instance.application_instance_id, process))
                 })
                 .collect()

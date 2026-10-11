@@ -1328,6 +1328,44 @@ impl Session {
             })
     }
 
+    /// Reads what runs below a server the worker started for the session, and returns the
+    /// processes recorded below it that have not been read as ended, the ones read earlier
+    /// included. The record is handed to the thread that keeps it up to date.
+    pub fn read_below_server(
+        &mut self,
+        server: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
+        let Some(owned) = self.owned.as_mut() else {
+            return Vec::new();
+        };
+        owned.observe();
+        let below = owned.below_backend(server);
+        self.submit_owned();
+        below
+    }
+
+    /// Notes that a process the session owns was ended by force.
+    pub fn note_process_forced(&mut self, process: &kr_protocol::identity::ProcessStartIdentity) {
+        if let Some(owned) = self.owned.as_mut() {
+            owned.note_forced(process);
+        }
+    }
+
+    /// Notes that a process the session owns could not be signalled, and why: something this host
+    /// could not do, which the closure carries into its receipt.
+    pub fn note_process_unsignalled(
+        &self,
+        process: &kr_protocol::identity::ProcessStartIdentity,
+        why: &str,
+    ) {
+        if let Some(owned) = self.owned.as_ref() {
+            owned.note_unestablished(format!(
+                "process {} was not signalled: {why}",
+                process.pid.get()
+            ));
+        }
+    }
+
     /// Starts the thread that writes the record, if there is none and the journal is a file. A
     /// thread that cannot be started is noted as something this host could not establish, and
     /// is tried again at the next observation.
