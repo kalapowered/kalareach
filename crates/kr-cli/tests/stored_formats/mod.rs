@@ -30,8 +30,10 @@
 //! still.
 //!
 //! What it cannot see, and the documentation says so: a hand edit of the lock itself (the same
-//! check against the lock on main sees that), and a type that a store keeps and the table does not
-//! declare.
+//! check against the lock on main sees that), a type that a store keeps and the table does not
+//! declare, and the checks the code runs on what a section holds (`validate`, a hand-written
+//! deserialiser), which no schema shows. A change to what a section accepts needs the version
+//! raised even when its digest does not move.
 
 #![allow(dead_code)]
 

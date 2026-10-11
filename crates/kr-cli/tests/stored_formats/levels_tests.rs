@@ -230,6 +230,9 @@ fn the_level_and_the_distance_never_go_down_even_with_no_sections() {
     assert!(messages(&refused).contains("misspelling"), "{refused:?}");
 }
 
+/// A change to a document schema that a rule must refuse.
+type Mutation = fn(&mut Value);
+
 /// What a section may be: an object that cannot be null and is closed, whose fields are nullable
 /// with a null default, whose own default is none or all null, and that refers to nothing the
 /// document's definitions do not hold. Each refusal holds at a raised version too.
@@ -242,7 +245,7 @@ fn the_shape_of_a_section_is_held_to_the_rule_at_every_version() {
         designs(&document(), &two)
     );
 
-    let mutations: [(&str, fn(&mut Value)); 7] = [
+    let mutations: [(&str, Mutation); 7] = [
         ("cannot be null", |schema| {
             schema["properties"]["telemetry"] = nullable(json!({ "$ref": "#/$defs/Telemetry" }));
         }),
@@ -363,6 +366,59 @@ fn the_name_of_a_section_is_held_to_what_a_release_in_the_field_applies() {
         schema["properties"][name] = schema["properties"]["telemetry"].clone();
         let found = designs(&schema, &release(2, levelled));
         assert!(messages(&found).contains(near), "{name}: {found:?}");
+    }
+}
+
+/// Two sections that arrive in one write are held to each other's names as well as to the base's: a
+/// release that knows the first and not the second takes the second for a misspelling of the first.
+#[test]
+fn two_sections_arriving_together_are_held_to_each_others_names() {
+    const BOTH: &[Levelled] = &[
+        Levelled {
+            member: "relays",
+            level: 2,
+        },
+        Levelled {
+            member: "relay",
+            level: 3,
+        },
+    ];
+    let mut schema = document();
+    schema["properties"]["relay"] = schema["properties"]["relays"].clone();
+    let found = designs(&schema, &release(3, BOTH));
+    assert!(
+        messages(&found).contains("the section relay is within 2 edits of the name relays"),
+        "{found:?}"
+    );
+}
+
+/// The folding and the metric are the ones every release in the field applies, so they are pinned
+/// beside the distance: a change to either changes which names such a release takes for a
+/// misspelling, and so needs a version raise like the distance does.
+#[test]
+fn the_folding_and_the_metric_of_the_near_miss_rule_are_pinned() {
+    use kr_protocol::hostinfo::configuration::near_miss;
+
+    assert_eq!(NEAR_MISS, 2);
+    for (a, b) in [
+        ("ceilings", "ceilings"),
+        ("ceilngs", "ceilings"),
+        ("CEILINGS", "ceilings"),
+        ("default-profile", "default_profile"),
+        ("defaultprofile", "default_profile"),
+        ("ceilnigs", "ceilings"),
+        ("ceiling", "ceilings"),
+        ("sessionlimit", "session_limit"),
+    ] {
+        assert!(near_miss(a, b), "{a} and {b} are taken for each other");
+    }
+    for (a, b) in [
+        ("telemetry", "ceilings"),
+        ("authority", "agents"),
+        ("sync", "startup"),
+        ("ceil", "ceilings"),
+    ] {
+        assert!(!near_miss(a, b), "{a} and {b} are not");
     }
 }
 
