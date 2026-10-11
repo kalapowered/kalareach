@@ -1963,7 +1963,7 @@ enum FirstFrame {
 /// Nothing in it is authority. The command backend compares the process with what the kernel
 /// names, the credential with the one it generated, and the executable and arguments with the
 /// invocation it was established for.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchHello {
     /// The credential the launcher read from the backend's owner-only file, as hexadecimal.
@@ -1983,8 +1983,19 @@ pub struct LaunchHello {
     pub environment: Option<PresentedEnvironment>,
 }
 
-/// The most bytes of environment, names and values, that a launch presents.
-pub const MAX_PRESENTED_ENVIRONMENT_BYTES: usize = 256 * 1024;
+impl std::fmt::Debug for LaunchHello {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The credential is the launch's secret and is never shown.
+        formatter
+            .debug_struct("LaunchHello")
+            .field("pid", &self.pid)
+            .field("start", &self.start)
+            .field("executable", &self.executable)
+            .field("arguments", &self.arguments)
+            .field("environment", &self.environment)
+            .finish_non_exhaustive()
+    }
+}
 
 /// The environment a launcher presented.
 ///
