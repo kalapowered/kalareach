@@ -128,8 +128,10 @@ Only the current release's `kr` updates the host. An update, in order:
    stop;
 5. takes the install lock, waiting up to thirty seconds for a control daemon that is starting;
    reads the store's environments again, so an environment whose daemon started after the first
-   look is found; and looks at every environment no prepared daemon serves, where a daemon that
-   holds one holds the update, with nothing stopped and each prepared daemon resumed. Only then
+   look is found; looks at every environment no prepared daemon serves, where a daemon that
+   holds one holds the update, with nothing stopped and each prepared daemon resumed; and reads
+   what the store's commands registered, where a registration that cannot be read refuses the
+   switch the same way. Only then
    does it tell each prepared daemon to stop, one after the other. The first that answers that it
    does not stop, because its attempt is over, holds the update: the daemons not yet told resume,
    and those already told are waited for to have gone, up to thirty seconds from the last telling,
