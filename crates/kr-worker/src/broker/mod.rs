@@ -1434,13 +1434,10 @@ impl Broker {
                 }
             }
             InstanceEnding::NativeExit => {
-                // The server this host started for the program, or a process dedicated to it.
-                let backend = instance.backend.clone().or_else(|| {
-                    instance
-                        .process
-                        .as_ref()
-                        .and_then(|process| process.dedicated.then(|| process.process.clone()))
-                });
+                let backend = instance
+                    .process
+                    .as_ref()
+                    .and_then(|process| process.dedicated.then(|| process.process.clone()));
                 let ended = state.instances.remove(&application_instance_id);
                 if let Some(agent) = ended.and_then(|instance| instance.process) {
                     // A dedicated backend is stopped from what the registry holds by whoever ends
