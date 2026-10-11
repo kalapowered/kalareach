@@ -10216,8 +10216,9 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
 /// declares holds in a field is declared for the same store or listed as known for it, however deep;
 /// every method whose answer the registry keeps is paired with the type of that answer, which the
 /// registry declares or lists as known; and a known type is the one it was when it was listed. A
-/// type added to a stored item, or a method that keeps an answer, without a line in the table fails
-/// here until it has one.
+/// type added to a stored item, or a listed method that keeps an answer, without a line in the table
+/// fails here until it has one; a method that claims an answer without being listed fails the first
+/// test that runs it.
 #[test]
 fn no_type_a_store_keeps_is_undeclared() {
     let table = stored_formats::table::table();
@@ -10240,6 +10241,7 @@ fn no_type_a_store_keeps_is_undeclared() {
     // The answers the registry keeps.
     let retained: Vec<_> = kr_controller::service::RETAINED_AUTHORITY_ANSWERS
         .iter()
+        .chain(kr_controller::service::RETAINED_DEVICE_ANSWERS.iter())
         .chain(kr_controller::service::RETAINED_MACHINE_ANSWERS.iter())
         .copied()
         .collect();
