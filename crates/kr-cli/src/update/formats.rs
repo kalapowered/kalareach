@@ -8,7 +8,9 @@
 //!
 //! It runs once every daemon has stopped and every environment's lock is held, before anything is
 //! brought forward, and changes nothing but what a daemon that ended by a signal left in a log,
-//! which is taken into its file first.
+//! which is taken into its file first. What a command registered is read before that too, under the
+//! install lock and before any daemon is told to stop ([`look_ahead`]), so a registration that
+//! cannot be read refuses the switch with every daemon still serving.
 
 use std::path::{Path, PathBuf};
 
@@ -269,7 +271,8 @@ pub fn look_ahead(install: &kr_ipc::install::Store) -> Vec<Refusal> {
 }
 
 /// The refusal for records in `roots/` that cannot be read, named by what they record. The error
-/// names the file; the remedy is to remove it or make it owner-only.
+/// names the file, and the refusal says what to do: a record is written again by the command or the
+/// daemon that works there next, so removing the one that cannot be read loses nothing.
 fn unreadable_records(
     what: &str,
     install: &kr_ipc::install::Store,
@@ -279,7 +282,11 @@ fn unreadable_records(
         store: what.to_owned(),
         environment: None,
         place: install.roots(),
-        why: Why::Unreadable(super::said(error)),
+        why: Why::Unreadable(shown!(
+            "{}; remove the record it names, which the command or daemon that works there next \
+             writes again",
+            super::said(error)
+        )),
     }
 }
 
@@ -331,13 +338,18 @@ fn registered(
                 continue;
             }
         }
-        // A root that cannot be listed holds nothing that can be looked at: named, and left whole.
-        if let Err(error) = std::fs::read_dir(&roots.state_root) {
-            unreached.push(not_reached(shown!(
-                "it could not be listed: {}",
-                Shown::io(&error)
-            )));
-            continue;
+        // The records of a root are opened by name, so what decides whether they can be looked at is
+        // whether the root can be searched, not whether it can be listed. A root that cannot be
+        // searched holds nothing that can be looked at: named, and left whole. Asking for a name no
+        // store uses answers "not there" for a root that can be searched.
+        if let Err(error) = std::fs::symlink_metadata(roots.state_root.join(".looked-at")) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                unreached.push(not_reached(shown!(
+                    "it could not be searched: {}",
+                    Shown::io(&error)
+                )));
+                continue;
+            }
         }
         let Ok(host) = kr_ipc::paths::HostPaths::new(&roots.runtime_root, &roots.state_root) else {
             unreached.push(not_reached(Shown::said("its roots cannot be resolved")));

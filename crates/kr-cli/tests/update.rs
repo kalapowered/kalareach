@@ -9780,14 +9780,39 @@ async fn a_registration_that_cannot_be_read_refuses_the_switch_until_it_is_remov
         "nothing was switched"
     );
 
-    // Owner-only, and naming no roots.
+    // Owner-only, and naming no roots, a runtime root alone, or a root that is not an absolute path.
     std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o600)).expect("owner-only");
-    std::fs::write(&damaged, b"no roots here").expect("a registration that names none");
-    let (output, said) = host.roll_back_to(&one);
-    assert_eq!(output.status.code(), Some(1), "{said}");
+    for contents in [
+        b"no roots here".as_slice(),
+        b"/run\0".as_slice(),
+        b"\0/state".as_slice(),
+        b"run\0/state".as_slice(),
+        b"/run\0state".as_slice(),
+    ] {
+        std::fs::write(&damaged, contents).expect("a registration that names no usable roots");
+        let (output, said) = host.roll_back_to(&one);
+        assert_eq!(output.status.code(), Some(1), "{contents:?}: {said}");
+        assert_eq!(
+            host.store.current().expect("reads"),
+            Some(two.name().clone()),
+            "{contents:?}: nothing was switched"
+        );
+    }
 
-    // The control: removed, the same rollback goes ahead.
+    // A record of a configuration document that names no document, or one that is not absolute.
     std::fs::remove_file(&damaged).expect("removed");
+    let document = host.store.roots().join("fedcba9876543210.document");
+    let environment = host.tree.environment_id().to_string();
+    for path in ["", "relative/config.json"] {
+        std::fs::write(&document, format!("{environment}\0{path}")).expect("a document record");
+        std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only");
+        let (output, said) = host.roll_back_to(&one);
+        assert_eq!(output.status.code(), Some(1), "document {path:?}: {said}");
+    }
+    std::fs::remove_file(&document).expect("removed");
+
+    // The control: all removed, the same rollback goes ahead.
     let (output, said) = host.roll_back_to(&one);
     assert!(
         output.status.success(),
@@ -9797,6 +9822,55 @@ async fn a_registration_that_cannot_be_read_refuses_the_switch_until_it_is_remov
     assert_eq!(
         host.store.current().expect("reads"),
         Some(one.name().clone())
+    );
+}
+
+/// KR-REQ-26.10: a registration that cannot be read refuses the update before the daemon is
+/// stopped. The daemon the host was serving with is still the process that serves it afterwards, on
+/// the release it ran, and removing the record lets the same update go ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_that_cannot_be_read_refuses_the_update_before_a_daemon_is_stopped() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (mut host, one, two, archive) = host_to_update().await;
+    let damaged = host.store.roots().join("0123456789abcdef.registered");
+    std::fs::write(&damaged, b"/run\0").expect("a registration with no state root");
+    std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o600)).expect("owner-only");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said.to_string().contains("0123456789abcdef.registered"),
+        "the refusal names the record: {said}"
+    );
+    assert!(
+        host.daemons[0]
+            .try_wait()
+            .expect("asks the daemon")
+            .is_none(),
+        "the daemon was not stopped: it is still the process it was"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "and it still serves the release it ran"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+
+    // The control: removed, the same update goes ahead and the daemon is the new release's.
+    std::fs::remove_file(&damaged).expect("removed");
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "the control: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
     );
 }
 

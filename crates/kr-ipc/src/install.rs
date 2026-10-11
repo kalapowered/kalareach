@@ -1197,9 +1197,24 @@ impl Store {
                 }
                 continue;
             };
+            let (runtime_root, state_root) = (
+                bytes_path(&contents[..split]),
+                bytes_path(&contents[split + 1..]),
+            );
+            if strict {
+                for (name, root) in [("runtime root", &runtime_root), ("state root", &state_root)] {
+                    if let Some(why) = unusable_path(root) {
+                        return Err(InstallError::io(
+                            "read",
+                            &path,
+                            std::io::Error::other(format!("its {name} {why}")),
+                        ));
+                    }
+                }
+            }
             recorded.push(RecordedRoots {
-                runtime_root: bytes_path(&contents[..split]),
-                state_root: bytes_path(&contents[split + 1..]),
+                runtime_root,
+                state_root,
                 record: path,
             });
         }
@@ -1225,9 +1240,17 @@ impl Store {
             let Ok(environment) = String::from_utf8_lossy(&contents[..split]).parse() else {
                 return Err(malformed("it names no environment"));
             };
+            let document = bytes_path(&contents[split + 1..]);
+            if let Some(why) = unusable_path(&document) {
+                return Err(malformed(if why == "is empty" {
+                    "it names no document path"
+                } else {
+                    "its document path is not an absolute path"
+                }));
+            }
             recorded.push(RecordedDocument {
                 environment,
-                path: bytes_path(&contents[split + 1..]),
+                path: document,
                 record: path,
             });
         }
@@ -1324,6 +1347,19 @@ fn bytes_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt as _;
 
     PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+/// Why a path a record holds cannot be looked at, or `None` when it can: a record names where a
+/// command worked, and an empty or relative path names nowhere an update can look.
+#[cfg(unix)]
+fn unusable_path(path: &Path) -> Option<&'static str> {
+    if path.as_os_str().is_empty() {
+        Some("is empty")
+    } else if !path.is_absolute() {
+        Some("is not an absolute path")
+    } else {
+        None
+    }
 }
 
 /// The extension of the record of the roots a control daemon served.
