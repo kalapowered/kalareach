@@ -419,8 +419,8 @@ fn the_typed_document_and_the_copy_the_registry_records_state_what_was_applied()
 }
 
 /// KR-REQ-26.13: the predicate that leaves an unused section out of the written document, which
-/// every section of a level carries on its field, says a section is unused when it is null or
-/// every one of its fields is.
+/// every section of a level carries on its field, says a section is unused when every one of its
+/// fields is null.
 #[test]
 fn a_section_is_unused_when_every_field_of_it_is_null() {
     use crate::hostinfo::configuration::{StorageSelection, is_unused};
