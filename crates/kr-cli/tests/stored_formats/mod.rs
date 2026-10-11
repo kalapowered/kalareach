@@ -14,8 +14,8 @@
 //! The check fails when the version the code writes, or the digest of what the code keeps, is not
 //! the lock's, and says which: a digest that moved while the version stood still is a change nobody
 //! gave a version to. The lock is written by [`write`], which refuses that same change, a lowered
-//! version, and a store moved to another place, so the lock cannot be brought up to the code
-//! without the version having been raised first.
+//! version, a store moved to another place, and a store's levels left out of what it records, so
+//! the lock cannot be brought up to the code without the version having been raised first.
 //!
 //! The lock also names every other thing the host keeps under the state root with the reason it
 //! has no version, so that a reference run can tell a file nothing names from one something does.
@@ -1001,7 +1001,8 @@ pub fn design_findings(levels: &ObservedLevels) -> Vec<String> {
     found
 }
 
-/// The shape a section must have: an object that is not nullable, closed at every depth, whose
+/// The shape a section must have: an object that is not nullable and declares its fields itself
+/// (a map is allowed as a field inside it, never as the section), closed at every depth, whose
 /// every immediate field is nullable with a null default, whose own default is none or all null,
 /// and that refers to nothing outside the document's definitions.
 fn shape_findings(name: &str, property: &Property) -> Vec<String> {
@@ -1282,7 +1283,8 @@ fn level_findings(name: &str, now: &Observed, locked: &Locked) -> Vec<String> {
 /// A digest that moved while its version stood still, a version that went down, and a store moved
 /// to another place are refused: the lock is not brought up to the code past a version that was
 /// not raised. A section that arrives with a level is held to its design whatever the lock holds,
-/// and to its level against the lock's.
+/// and to its level against the lock's. A store whose lock records levels keeps them, at any
+/// version: a change that states none does not remove them.
 ///
 /// # Errors
 ///
