@@ -12,6 +12,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | the backend and its registration exist before the program runs; a refused, timed-out, uncommitted or orphaned invocation runs as typed |
+//! | KR-REQ-12.02 | a launch's profile records the executable, the arguments the program ran and the mode; a launch that goes no further than its admission gives back what it took and its retry is admitted; a second launcher for a backend a launch holds runs as typed and leaves the first |
 //! | KR-REQ-05.09 | a launch is admitted by the kernel's account of its process, its parent and its start, and the backend's credential; the program's bridges only when it executes what was hashed |
 //! | KR-REQ-11.34 | the launched program's hooks are admitted against the registration the launch published |
 //! | KR-REQ-11.13 | a launched instance is bound, at its admission, to the connector its command resolved; a launch rolled back takes its binding with it, and an instance's end takes its own |
@@ -1007,10 +1008,11 @@ fn assert_typed(report: &BTreeMap<String, String>, what: &str) {
     );
 }
 
-/// KR-REQ-12.07, KR-REQ-05.09: the root shell's own child, started after the establish, with the
-/// backend's credential and the answered invocation, is admitted, and its registration exists
-/// when the program first runs and names the program. When the program ends, so do the instance,
-/// the endpoint, the credential, the registration and the launch record.
+/// KR-REQ-12.07, KR-REQ-05.09, KR-REQ-12.02: the root shell's own child, started after the
+/// establish, with the backend's credential and the answered invocation, is admitted, and its
+/// registration exists when the program first runs and names the program. Its profile records the
+/// executable, the arguments the program ran and the mode. When the program ends, so do the
+/// instance, the endpoint, the credential, the registration and the launch record.
 #[test]
 fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
     let shell = Shell::new();
@@ -1044,10 +1046,25 @@ fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
             .mode,
         kr_protocol::broker::IntegrationMode::NativeBridge
     );
-    assert!(
-        shell.broker.profile_of(instance).is_some(),
-        "its profile was recorded when it presented itself"
+    let profile = shell
+        .broker
+        .profile_of(instance)
+        .expect("its profile was recorded when it presented itself");
+    assert_eq!(
+        profile.binary.resolved_path,
+        shell.executable.to_str().expect("a text path"),
+        "the profile records the executable the invocation resolved to"
     );
+    assert_eq!(
+        profile.arguments,
+        Shell::answered(),
+        "and the arguments the program ran"
+    );
+    assert_eq!(
+        profile.mode,
+        kr_protocol::broker::IntegrationMode::NativeBridge
+    );
+    assert_eq!(profile.ownership, kr_protocol::broker::AgentOwnership::Full);
     // KR-REQ-11.13: bound at its admission to the connector its command resolved.
     let bound: Vec<_> = shell
         .broker
@@ -1322,9 +1339,9 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_variable() {
     drop(listener);
 }
 
-/// KR-REQ-12.07: a launcher that goes away after its admission and before it says it is going
-/// leaves nothing: the registration is taken back and the instance given back, and a retry of the
-/// same invocation is admitted.
+/// KR-REQ-12.07, KR-REQ-12.02: a launcher that goes away after its admission and before it says it
+/// is going leaves nothing: the registration is taken back and the instance given back, and a retry
+/// of the same invocation is admitted.
 #[test]
 fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
     let shell = Shell::new();
@@ -1357,9 +1374,9 @@ fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
     let _ = finish(child);
 }
 
-/// KR-REQ-12.07: a launch whose admission cannot be delivered, because its launcher went away
-/// between the registration being published and the admission being written, gives its instance
-/// and its binding back before it takes the registration down, so nobody who finds the
+/// KR-REQ-12.07, KR-REQ-12.02: a launch whose admission cannot be delivered, because its launcher
+/// went away between the registration being published and the admission being written, gives its
+/// instance and its binding back before it takes the registration down, so nobody who finds the
 /// registration gone finds the launch still holding the instance. The two steps of taking such a
 /// launch back are held apart, and what is true between them is looked at.
 #[test]
@@ -1424,6 +1441,41 @@ fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_regist
         "a retry is admitted"
     );
     let _ = finish(child);
+}
+
+/// KR-REQ-12.02: a second launcher that presents itself to a backend a launch already holds is
+/// refused and its program runs as typed, and the first launch is left as it was: its program
+/// still runs, its instance is still bound and its registration is still published.
+#[test]
+fn kr_req_12_02_a_second_launch_for_a_backend_a_launch_holds_runs_as_typed_and_leaves_the_first() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let registration = Shell::registration(&answer);
+    let mut first = shell.launch(&answer, "first", &[("LINGER", "120")]);
+    let held = shell.report("first");
+    assert_eq!(held["registered"], "yes", "the first launch is admitted");
+    let instance = instance_of(&held);
+    let pid: i32 = held["pid"].parse().expect("the first program's identifier");
+
+    let second = shell.launch(&answer, "second", &[]);
+    assert_typed(
+        &shell.report("second"),
+        "a launcher for a backend a launch holds",
+    );
+    let (status, said) = finish(second);
+    assert!(status.success(), "{said}");
+
+    assert!(running(pid), "the first program runs on");
+    assert!(
+        shell.broker.binding_state(instance).is_ok(),
+        "its instance is still bound"
+    );
+    assert!(registration.exists(), "and its registration is published");
+    let _ = first.kill();
+    let _ = first.wait();
+    eventually("the instance ends with its program", || {
+        shell.broker.binding_state(instance).is_err()
+    });
 }
 
 /// KR-REQ-12.07: a launcher stopped before it looked, whose line then ended, still runs the

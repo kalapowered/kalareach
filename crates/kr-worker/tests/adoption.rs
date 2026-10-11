@@ -520,7 +520,6 @@ fn kr_req_12_07_a_program_the_integration_launched_is_not_adopted() {
                     process: started.process.clone(),
                 },
                 Credential::from_bytes([9; 32]),
-                false,
                 TimestampMs::new(1),
             )),
         )
