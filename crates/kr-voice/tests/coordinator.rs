@@ -43,8 +43,8 @@ use kr_protocol::voice::{
     VoiceStopParams,
 };
 use kr_voice::seams::{
-    ActionSubmitter, Admission, ContextItem, ContextRequest, ContextSource, GatheredContext,
-    HostReceipt, SelectedItem, VoiceAuthority, VoiceFuture, WithheldRun,
+    ActionSubmitter, Admission, ContextItem, ContextRequest, ContextSource, Fence, GatheredContext,
+    HostReceipt, Replaced, Revoked, SelectedItem, VoiceAuthority, VoiceFuture, WithheldRun,
 };
 use kr_voice::{
     Coordinator, DelegationInterpreter, GrammarInterpreter, Interpretation, Misread, Proposal,
@@ -109,6 +109,15 @@ struct Authority {
     refusing: Mutex<Option<(Seam, kr_protocol::error::ProtocolError)>>,
     /// The delegation identifiers this host has spent, and the action each was spent under.
     spent: Mutex<std::collections::BTreeMap<(DeviceId, String), ActionId>>,
+    /// The fence the next withdrawal owes, once a test has set one.
+    fence: Mutex<Option<Arc<OwedFence>>>,
+}
+
+/// A fence a test holds: it says when it is first waited on, and ends when the test lets go of it.
+#[derive(Debug, Default)]
+struct OwedFence {
+    waited_on: tokio::sync::Notify,
+    released: tokio::sync::Notify,
 }
 
 /// The three reads of a grant the coordinator makes.
@@ -146,7 +155,24 @@ impl Authority {
             now: std::sync::atomic::AtomicU64::new(0),
             refusing: Mutex::new(None),
             spent: Mutex::new(std::collections::BTreeMap::new()),
+            fence: Mutex::new(None),
         }
+    }
+
+    /// Makes the next withdrawal owe a fence, and returns the hand that watches and ends it.
+    fn owes_a_fence(&self) -> Arc<OwedFence> {
+        let held = Arc::new(OwedFence::default());
+        *self.fence.lock().expect("the fence") = Some(Arc::clone(&held));
+        held
+    }
+
+    /// The fence a withdrawal owes, when a test has set one.
+    fn fence_for_a_withdrawal(&self) -> Option<Fence> {
+        let held = self.fence.lock().expect("the fence").take()?;
+        Some(Box::pin(async move {
+            held.waited_on.notify_one();
+            held.released.notified().await;
+        }))
     }
 
     /// The moments grants were revoked at, in order.
@@ -383,7 +409,7 @@ impl VoiceAuthority for Authority {
         plan: &VoiceGrantPlan,
         now_ms: u64,
         admission: &dyn kr_voice::Admission,
-    ) -> kr_voice::Result<Grant> {
+    ) -> kr_voice::Result<Replaced> {
         // The replacement written whole or not at all, as the host's store writes it: held here, in
         // the window a second change would read the same grant in, and then written under one hold
         // of the store. A test can make the write fail, and then the grant it replaces stands.
@@ -427,7 +453,10 @@ impl VoiceAuthority for Authority {
                 store.revoked_at_ms.push(now_ms);
             }
         }
-        Ok(grant)
+        Ok(Replaced {
+            grant,
+            fence: self.fence_for_a_withdrawal(),
+        })
     }
 
     fn revoke(
@@ -435,7 +464,7 @@ impl VoiceAuthority for Authority {
         grant_id: GrantId,
         now_ms: u64,
         _admission: &dyn kr_voice::Admission,
-    ) -> kr_voice::Result<u64> {
+    ) -> kr_voice::Result<Revoked> {
         // Held here, after the grant to replace has been read and before it is withdrawn: that is
         // the window a second change would read the same grant in.
         self.hold_lookup_if_armed();
@@ -460,7 +489,10 @@ impl VoiceAuthority for Authority {
                 store.revoked_at_ms.push(now_ms);
             }
         }
-        Ok(now_ms)
+        Ok(Revoked {
+            at_ms: now_ms,
+            fence: self.fence_for_a_withdrawal(),
+        })
     }
 
     fn device_identity_key(
@@ -2184,6 +2216,80 @@ async fn a_call_the_service_ended_is_over_before_its_deadline() {
         "the call's grant was revoked when the host found the call over"
     );
     assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+}
+
+/// KR-REQ-15.14 and 09.12: a stop is answered once the fence its withdrawal owes has been waited
+/// for, and the broker is told the call is over without waiting for it. The grant is gone either
+/// way; what the answer waits for is the workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_waits_for_the_fence_its_withdrawal_owes() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    let owed = fixture.authority.owes_a_fence();
+    let coordinator = Arc::new(fixture.coordinator);
+
+    let mut stopping = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 12_000)
+                .await
+        }
+    });
+    // Either the stop reaches the wait for its fence, or it ends without one.
+    tokio::select! {
+        () = owed.waited_on.notified() => {}
+        ended = &mut stopping => panic!("the stop ended without waiting for its fence: {ended:?}"),
+    }
+    assert_eq!(
+        fixture.broker.closed(),
+        vec!["call-managed".to_owned()],
+        "the broker was told before the fence was waited on"
+    );
+
+    owed.released.notify_one();
+    let stopped = stopping.await.expect("the stop ends").expect("it stops");
+    assert!(stopped.broker_notified);
+    assert_eq!(coordinator.live_sessions(), 0);
+}
+
+/// KR-REQ-15.14 and 09.12: replacing the standing grant answers once the fence the withdrawal of
+/// the old one owes has been waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_the_standing_grant_waits_for_the_fence_its_withdrawal_owes() {
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+    let owed = fixture.authority.owes_a_fence();
+    let coordinator = Arc::new(fixture.coordinator);
+
+    let mut replacing = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .grant(
+                    &grant_params(None),
+                    AuthorityRevision::new(1),
+                    13_000,
+                    &kr_voice::Unbounded,
+                )
+                .await
+        }
+    });
+    tokio::select! {
+        () = owed.waited_on.notified() => {}
+        ended = &mut replacing => panic!("the replacement ended without waiting for its fence: {ended:?}"),
+    }
+
+    owed.released.notify_one();
+    replacing
+        .await
+        .expect("the replacement ends")
+        .expect("it is made");
+    assert_eq!(
+        coordinator.live_sessions(),
+        0,
+        "and the call under it ended"
+    );
 }
 
 /// KR-REQ-15.02: a voice session is not a shell session. Stopping one names the terminal sessions

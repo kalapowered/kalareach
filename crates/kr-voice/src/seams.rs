@@ -157,6 +157,51 @@ pub trait ContextSource: Send + Sync + fmt::Debug {
 /* Deciding                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/// What a withdrawal of authority leaves to wait for.
+///
+/// A grant a worker could still be acting under is not gone until that worker holds the revision
+/// that refuses it. The host raises that fence as the withdrawal commits; this is the wait for it,
+/// to be awaited outside any lock and before the withdrawal is answered. Dropping it does not
+/// cancel the fence: a caller that stops waiting stops waiting to answer, and the host raises the
+/// fence all the same.
+pub type Fence = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A grant withdrawn.
+pub struct Revoked {
+    /// When, in UTC milliseconds, by the host's own reading.
+    pub at_ms: u64,
+    /// The wait for the workers, when the withdrawal owes one.
+    pub fence: Option<Fence>,
+}
+
+impl fmt::Debug for Revoked {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Revoked")
+            .field("at_ms", &self.at_ms)
+            .field("fence", &self.fence.is_some())
+            .finish()
+    }
+}
+
+/// A grant written in place of one that was withdrawn.
+pub struct Replaced {
+    /// The new grant.
+    pub grant: Grant,
+    /// The wait for the workers, when the withdrawal of the old one owes one.
+    pub fence: Option<Fence>,
+}
+
+impl fmt::Debug for Replaced {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Replaced")
+            .field("grant", &self.grant)
+            .field("fence", &self.fence.is_some())
+            .finish()
+    }
+}
+
 /// Where the coordinator reads and writes grants.
 ///
 /// The store is the host's one authority store. This crate reads through its public interface and
@@ -224,7 +269,8 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     ///
     /// The host's authority store does this in one transaction, so a failure of the new grant
     /// leaves the old one standing and the calls running under it as they were. `admission` is
-    /// asked inside that transaction, as it is for a write or a revocation alone.
+    /// asked inside that transaction, as it is for a write or a revocation alone. The answer
+    /// carries the [`Fence`] the withdrawal owes, for the caller to wait for once it holds no lock.
     ///
     /// # Errors
     ///
@@ -236,16 +282,18 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
         plan: &crate::grant::VoiceGrantPlan,
         now_ms: u64,
         admission: &dyn Admission,
-    ) -> Result<Grant>;
+    ) -> Result<Replaced>;
 
     /// Revokes a grant and everything delegated from it, and reports when.
     ///
-    /// `admission` is asked inside the store's own transaction, for the same reason.
+    /// `admission` is asked inside the store's own transaction, for the same reason. The answer
+    /// carries the [`Fence`] the withdrawal owes, for the caller to wait for before it tells
+    /// anybody the grant is gone.
     ///
     /// # Errors
     ///
     /// Returns an error when the revocation cannot be written, or the admission has run out.
-    fn revoke(&self, grant_id: GrantId, now_ms: u64, admission: &dyn Admission) -> Result<u64>;
+    fn revoke(&self, grant_id: GrantId, now_ms: u64, admission: &dyn Admission) -> Result<Revoked>;
 
     /// The device identity key that signs this device's authority-bearing requests.
     ///

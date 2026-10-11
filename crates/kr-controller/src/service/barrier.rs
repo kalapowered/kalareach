@@ -60,8 +60,9 @@ pub(crate) enum Reach {
     /// revision the barrier advances to, so one device's revocation is not everybody's reconnect.
     Device(kr_protocol::ids::DeviceId),
     /// The connections acting under these grants, which a share's revocation withdrew with its
-    /// descendants. A connection that acts under any other grant, and the owner's own, are
-    /// admitted again at the revision the barrier advances to.
+    /// descendants, or a call's voice grant, which no connection acts under: the barrier then
+    /// withdraws none and only moves the revision. A connection that acts under any other grant,
+    /// and the owner's own, are admitted again at the revision the barrier advances to.
     Grants {
         /// Every grant the revocation reached.
         grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
@@ -843,21 +844,44 @@ impl Controller {
         }
     }
 
-    /// Publishes the debt a voice revocation wrote, if it wrote one, and leaves its barrier to the
-    /// debt pass, which this wakes.
+    /// Publishes the debt a voice revocation wrote, if it wrote one, raises its barrier on a task
+    /// of its own, and returns the wait for it.
     ///
-    /// A voice revocation runs where nothing can wait. A voice grant's withdrawal owes a fence only
-    /// while a close forwarded under it can still run at a worker, and then the barrier reaches the
-    /// connections of that one device and no other: a paired device's connection is not the call's.
-    /// A cascade that also withdrew a grant that is not a voice grant publishes it host-wide, as any
-    /// other restriction is. Either way the debt is published the moment the store has committed,
-    /// so every admission and forward is refused until the barrier retires it.
-    pub(crate) fn fence_voice_revocation(&self, revocation: &crate::grants::GrantRevocation) {
-        let Some(debt) = revocation.debt else {
-            return;
+    /// A voice revocation commits where nothing can wait, under the coordinator's lock. A voice
+    /// grant's withdrawal owes a fence only while a close forwarded under it can still run at a
+    /// worker, and the fence is the workers holding the revision that refuses it. Its reach is the
+    /// connections acting under the grants withdrawn, and none acts under a call's grant: every
+    /// connection stays admitted, at the revision now in force, so the answer to the stop that
+    /// withdrew the grant, and every other answer on the link it was sent on, is delivered. The
+    /// debt is published the moment the store has committed, so every admission and forward is
+    /// refused until the barrier retires it.
+    ///
+    /// The caller waits outside its lock and before it answers. The barrier runs on its own task,
+    /// so a caller that stops waiting leaves it running; where there is no runtime to run it on,
+    /// the debt is left to the debt pass.
+    pub(crate) fn fence_voice_revocation(
+        self: &Arc<Self>,
+        revocation: &crate::grants::GrantRevocation,
+    ) -> Option<kr_voice::Fence> {
+        let debt = revocation.debt?;
+        let reach = Reach::Grants {
+            grants: revocation
+                .revoked
+                .iter()
+                .chain(revocation.reached.iter())
+                .copied()
+                .collect(),
+            with_input: revocation.reached_with_input.clone(),
         };
-        let reach = revocation.closes_of.map_or(Reach::Host, Reach::Device);
-        drop(self.publish_debts(&[(debt, reach)]));
+        let own = self.publish_debts(&[(debt, reach)]);
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let daemon = Arc::clone(self);
+        let barrier = runtime.spawn(async move {
+            let _ = daemon.barrier(own).await;
+        });
+        Some(Box::pin(async move {
+            let _ = barrier.await;
+        }))
     }
 
     pub(super) fn debts(&self) -> std::sync::MutexGuard<'_, Debts> {

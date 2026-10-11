@@ -284,8 +284,9 @@ struct HeldCloses {
 /// as long as it can still start at that worker.
 ///
 /// While one is held, withdrawing the voice grant it was forwarded under owes a fence, because
-/// the worker may not yet have refused it. It lets go when the worker has answered, or when the
-/// deadline the close was forwarded with has passed, whichever its holder reaches first.
+/// the worker may not yet have refused it. It lets go when the worker has accepted the close. After
+/// any other end, a worker's refusal included, no worker is known not to be able to take the close
+/// up, so it is held until the deadline the close was forwarded with has passed.
 #[derive(Debug)]
 #[must_use = "a close is held until this is dropped"]
 pub struct CloseHold {
@@ -338,10 +339,6 @@ pub struct GrantRevocation {
     /// while a close forwarded under it can still run at a worker): one row for the whole change,
     /// retired only by a barrier that follows it.
     pub debt: Option<DebtId>,
-    /// The one device whose voice grants this revocation withdrew with a close outstanding, when
-    /// that is all the debt is for: the barrier that retires it reaches that device's connections
-    /// and no others. Nothing for a debt that is owed for any other grant as well.
-    pub closes_of: Option<DeviceId>,
 }
 
 /// The identity of one restrictive change's fence debt.
@@ -1046,7 +1043,6 @@ impl GrantDirectory {
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
                 debt: None,
-                closes_of: None,
             };
             merged.devices.insert(device_id);
             // Every subtree is read before any of them is written, so the check below is the last
@@ -1104,25 +1100,20 @@ impl GrantDirectory {
     /// [`GrantRevocation::revoked`] names only what **this** call revoked. A repeat finds the
     /// subtree already revoked and names nothing, which is what lets a caller tell a revocation
     /// that did something from one that found the work done: advancing the authority revision for
-    /// a repeat would make a retry look like a new withdrawal of authority.
+    /// a repeat would make a retry look like a new withdrawal of authority. `held` is the voice
+    /// grants with a close outstanding, read while the caller holds the store's lock
+    /// ([`Self::held_closes`]).
     fn revoke_within(
         connection: &Connection,
         grant_id: GrantId,
         now_ms: u64,
         covers: &str,
+        held: &BTreeSet<GrantId>,
     ) -> Result<GrantRevocation> {
         let subtree = Self::subtree_to_revoke(connection, grant_id)?;
         let now_ms = next_moment(connection, now_ms)?;
-        // A proposal that was never redeemed and a grant control is transferred away from are not
-        // voice grants, so no close is outstanding under either.
         Self::revoke_subtree(
-            connection,
-            grant_id,
-            &subtree,
-            now_ms,
-            &mut None,
-            covers,
-            &BTreeSet::new(),
+            connection, grant_id, &subtree, now_ms, &mut None, covers, held,
         )
     }
 
@@ -1162,8 +1153,6 @@ impl GrantDirectory {
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
         let owed = moments_a_fence_is_owed(connection)?;
-        let mut owed_for_others = false;
-        let mut owed_for_closes = BTreeSet::new();
         let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
         for record in subtree {
             if record.is_active()
@@ -1225,24 +1214,12 @@ impl GrantDirectory {
             // nothing away from anybody, so there is nothing to fence, and recording it would make
             // an ordinary cancellation fence the host later. Nor does a voice grant's withdrawal,
             // unless a close forwarded under it can still run at a worker.
-            let owes = owes_a_fence(&record.grant);
-            let closing = !owes && held.contains(&record.grant.grant_id);
-            if record.is_active() && (owes || closing) {
-                if owes {
-                    owed_for_others = true;
-                } else {
-                    owed_for_closes.insert(record.grant.recipient_device_id);
-                }
-                if debt.is_none() {
-                    *debt = Some(owe_within(connection, covers, now_ms)?);
-                }
+            let owes = owes_a_fence(&record.grant) || held.contains(&record.grant.grant_id);
+            if record.is_active() && debt.is_none() && owes {
+                *debt = Some(owe_within(connection, covers, now_ms)?);
             }
             revoked.push(record.grant.grant_id);
         }
-        let closes_of = match (owed_for_others, owed_for_closes.len()) {
-            (false, 1) => owed_for_closes.first().copied(),
-            _ => None,
-        };
         Ok(GrantRevocation {
             grant_id,
             revoked,
@@ -1252,7 +1229,6 @@ impl GrantDirectory {
             sessions,
             covers_every_session,
             debt: *debt,
-            closes_of,
         })
     }
 
@@ -1659,6 +1635,7 @@ impl GrantDirectory {
                 source_grant_id,
                 now_ms,
                 &format!("the transfer of control away from grant {source_grant_id}"),
+                &self.held_closes(),
             )?;
             if let Some(hold) = claim {
                 record_withdrawal(connection, hold, &revocation.revoked)?;

@@ -92,6 +92,9 @@ pub(super) struct Scripted {
     /// Where it holds the next close it is forwarded, once a test has set one, before it takes the
     /// close up.
     holding_a_close: std::sync::Mutex<Option<End>>,
+    /// Where it holds the next announcement of an authority revision it is sent, once a test has
+    /// set one, before it installs the revision.
+    holding_an_announcement: std::sync::Mutex<Option<End>>,
     /// The authority revision it has installed, as a worker holds the one it last acknowledged.
     installed: std::sync::Mutex<Option<kr_protocol::ids::AuthorityRevision>>,
     /// What it holds for the prompts it was forwarded, by the actor and the action: the digest of
@@ -142,6 +145,7 @@ impl Scripted {
             accepts_prompts: AtomicBool::new(false),
             holding_a_prompt: std::sync::Mutex::new(None),
             holding_a_close: std::sync::Mutex::new(None),
+            holding_an_announcement: std::sync::Mutex::new(None),
             installed: std::sync::Mutex::new(None),
             prompt_receipts: std::sync::Mutex::new(BTreeMap::new()),
             receipts_unreadable: AtomicBool::new(false),
@@ -169,6 +173,21 @@ impl Scripted {
         let (go, going) = oneshot::channel();
         *self
             .holding_a_close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(End { arrived, go: going });
+        (arrival, go)
+    }
+
+    /// Has this worker hold the next announcement of an authority revision it is sent, before it
+    /// installs the revision or acknowledges it. The first half says that the announcement has
+    /// arrived, and the worker installs the revision once the second is sent or dropped.
+    pub(super) fn hold_the_next_announcement(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (go, going) = oneshot::channel();
+        *self
+            .holding_an_announcement
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(End { arrived, go: going });
         (arrival, go)
@@ -841,6 +860,15 @@ fn serve_scripted(
                         // It installs a revision it is told of, with nothing to fence, as a
                         // device's link to it asks it to.
                         (None, ControlFrame::AuthorityRevision(notice)) => {
+                            let holding = script
+                                .holding_an_announcement
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take();
+                            if let Some(holding) = holding {
+                                let _ = holding.arrived.send(());
+                                let _ = holding.go.await;
+                            }
                             {
                                 let mut installed = script
                                     .installed

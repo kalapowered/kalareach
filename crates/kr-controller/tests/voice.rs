@@ -14,6 +14,7 @@
 //! | KR-REQ-09.16 | `a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt` |
 //! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds`, `speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_nothing`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
 //! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation`, `a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_its_identifier` |
+//! | KR-REQ-15.13, 09.12 | `a_stop_with_a_close_on_its_way_is_answered_on_the_link_that_sent_it` |
 //! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store` |
 //! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
 //! | KR-REQ-15.19 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
@@ -1582,6 +1583,107 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
     .expect("a stop result");
     assert_eq!(stopped.revoked_grant_id, call.grant_id);
     assert_eq!(broker.closed(), vec!["call-1".to_owned()]);
+    host.stop().await;
+}
+
+/// KR-REQ-15.13 and 09.12: a device that stops its call while a close is on its way to a worker is
+/// answered on the link it sent the stop on, and that link goes on serving it.
+///
+/// The close is held against the call's grant, as the host holds one from the moment it is about
+/// to be forwarded, so the stop owes a fence. The fence makes workers refuse the close; it takes no
+/// connection away, because no connection holds authority from the call's grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_with_a_close_on_its_way_is_answered_on_the_link_that_sent_it() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    )
+    .await;
+    let environment_id = host.environment_id;
+    host.controller().voice().attach_provider(Some(
+        Arc::new(OfflineProvider::default()) as Arc<dyn ManagedVoiceService>
+    ));
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let device_id = host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| {
+            let owner = host.owner.as_ref().map(|owner| owner.device_id);
+            record.is_paired() && owner != Some(record.device_id)
+        })
+        .expect("the paired device")
+        .device_id;
+    let _granted = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceGrant,
+        &VoiceGrantParams {
+            device_id,
+            session_ids: [session_id].into_iter().collect(),
+            actions: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the voice grant is written");
+    let prepare = VoicePrepareParams {
+        session_ids: [session_id].into_iter().collect(),
+        selected: CanonicalSet::from_iter([]),
+    };
+    let prepared: VoicePrepareResult = session
+        .read(Method::VoicePrepare, &prepare)
+        .await
+        .expect("the host answers what a call would be");
+    let started: kr_protocol::voice::VoiceStartResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStart,
+        &VoiceStartParams {
+            session_ids: [session_id].into_iter().collect(),
+            offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: Nullable::null(),
+            prepared: prepared.prepared,
+            expected_rate_version: Nullable::some("2026-09".to_owned()),
+        },
+    )
+    .await
+    .expect("the call is created")
+    .to_typed()
+    .expect("a start result");
+    let VoiceStartOutcome::Started { session: call } = started.outcome else {
+        panic!("the call runs: {:?}", started.outcome);
+    };
+    let hold = host
+        .controller()
+        .sharing()
+        .grants()
+        .hold_close(call.grant_id);
+
+    let stopped: kr_protocol::voice::VoiceStopResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await
+    .expect("the stop is answered on the link that sent it")
+    .to_typed()
+    .expect("a stop result");
+    assert_eq!(stopped.revoked_grant_id, call.grant_id);
+
+    let _still: VoicePrepareResult = session
+        .read(Method::VoicePrepare, &prepare)
+        .await
+        .expect("and the link goes on serving the device");
+    drop(hold);
     host.stop().await;
 }
 

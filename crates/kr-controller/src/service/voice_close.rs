@@ -112,7 +112,7 @@ impl Controller {
             (revision, self.voice_authority_now(proposal, session_id)?)
         };
 
-        let mutation = close_of(proposal, session_id);
+        let mutation = close_of(proposal, session_id, self.voice_budgets().close);
         let envelope = ActorEnvelope {
             actor_id: kr_transport::listener::device_principal(&proposal.device_id),
             ingress: ActorIngress::PairedDevice,
@@ -206,11 +206,13 @@ impl Controller {
 
 /// The close a voice proposal is, as the worker is sent it.
 ///
-/// Everything in it is fixed by the proposal, so the same proposal is always the same mutation:
-/// the worker's journal answers an exact retry from the action it already took.
+/// Everything in it is fixed by the proposal and by the close budget this daemon states once, so
+/// the same proposal is always the same mutation: the worker's journal answers an exact retry from
+/// the action it already took.
 fn close_of(
     proposal: &kr_voice::Proposal,
     session_id: kr_protocol::ids::SessionId,
+    budget: std::time::Duration,
 ) -> MutationRequest {
     MutationRequest {
         // The link gives the frame its own request identity; the durable one is the action's.
@@ -229,7 +231,9 @@ fn close_of(
         expected: ParamsValue::empty(),
         action_window_id: ActionWindowId::new("voice:delegation")
             .expect("a fixed window is an opaque identifier"),
-        requested_ttl_ms: DurationMs::new(30_000),
+        // The longest a close may travel for, which is what the worker is asked to accept it for;
+        // the deadline it is sent with is never later.
+        requested_ttl_ms: DurationMs::new(u64::try_from(budget.as_millis()).unwrap_or(u64::MAX)),
         params: ParamsValue::from_typed(&SessionCloseParams { session_id })
             .expect("a session identifier encodes"),
     }
@@ -237,8 +241,9 @@ fn close_of(
 
 /// Keeps a close held against its grant until the deadline it was forwarded with has passed.
 ///
-/// A worker that did not answer may still take the close up until that deadline, so a withdrawal of
-/// the voice grant before then still owes the fence.
+/// A close that did not end in the worker accepting it, a worker's refusal included, is not known
+/// to be one that no worker can still take up before that deadline, so a withdrawal of the voice
+/// grant before then still owes the fence.
 fn lets_go_at(
     hold: CloseHold,
     deadline: kr_transport::clock::ContinuousInstant,

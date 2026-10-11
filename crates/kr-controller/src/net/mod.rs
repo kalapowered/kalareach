@@ -1935,6 +1935,36 @@ impl Controller {
         decided
     }
 
+    /// A grant as this host's configuration lets it be used: its rights narrowed to the ceiling in
+    /// force, and nothing else changed.
+    ///
+    /// This is the narrowing [`crate::config::ceilings::decide_with_ceiling`] makes before it
+    /// decides a request, for a reader that has no request to decide: the voice service reads the
+    /// device's grant to see what a spoken action may use, and a right this host has taken away
+    /// from every grant is not one it may use. A host with no ceiling returns the grant as it is.
+    pub(crate) fn under_the_rights_ceiling(
+        &self,
+        grant: kr_protocol::grant::Grant,
+    ) -> kr_protocol::grant::Grant {
+        let ceiling = self
+            .rights_ceiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(ceiling) = ceiling else {
+            return grant;
+        };
+        kr_protocol::grant::Grant {
+            actions: grant
+                .actions
+                .iter()
+                .copied()
+                .filter(|right| ceiling.contains(right))
+                .collect(),
+            ..grant
+        }
+    }
+
     /// Writes down the time the offline bound has spent, as the network's record task does at
     /// every mark.
     ///

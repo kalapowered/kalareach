@@ -20,7 +20,7 @@ use kr_protocol::voice::{
     VoiceDelegationOutcome, VoiceRefusal, VoiceStopParams,
 };
 
-use super::a_delegation_that_is_asked_again::{ask, call_over, delegation_named};
+use super::a_delegation_that_is_asked_again::{ask, call_over, call_over_for, delegation_named};
 use super::a_floor_owed_its_record::until;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, scripted};
 use super::a_voice_grant_on_the_floor::paired_signing_as;
@@ -43,6 +43,11 @@ struct Call {
 
 impl Call {
     async fn start() -> Self {
+        Self::start_for(600).await
+    }
+
+    /// The same, for a call that runs for `duration_seconds`.
+    async fn start_for(duration_seconds: u32) -> Self {
         let script = Scripted::new();
         let world = scripted(&script).await;
         let controller = Arc::clone(&world.controller);
@@ -54,11 +59,12 @@ impl Call {
             &[ActionRight::SessionView, ActionRight::SessionClose],
             None,
         );
-        let voice_session_id = call_over(
+        let voice_session_id = call_over_for(
             &controller,
             device.device_id,
             world.session_id,
             &[VoiceAction::CloseSession, VoiceAction::Status],
+            duration_seconds,
         )
         .await;
         let number = controller
@@ -138,6 +144,66 @@ impl Call {
             .into_iter()
             .filter(|forwarded| forwarded.mutation.method == Method::SessionClose.into())
             .collect()
+    }
+
+    /// The grant the call runs under.
+    fn voice_grant_id(&self) -> kr_protocol::ids::GrantId {
+        self.controller
+            .sharing()
+            .grants()
+            .records_for_device(self.device.device_id)
+            .expect("the store reads")
+            .into_iter()
+            .map(|record| record.grant)
+            .find(|grant| grant.permits(ActionRight::VoiceUse) && grant.parent_grant_id.0.is_some())
+            .expect("the call's own voice grant")
+            .grant_id
+    }
+
+    /// The close of the call's session, as the coordinator proposes it to the host.
+    fn proposal(&self) -> kr_voice::Proposal {
+        let delegation_id =
+            kr_protocol::voice::VoiceDelegationId::new("item_close").expect("an id");
+        let action = VoiceAction::CloseSession;
+        kr_voice::Proposal {
+            voice_session_id: self.voice_session_id,
+            device_id: self.device.device_id,
+            voice_grant_id: self.voice_grant_id(),
+            environment_id: self.world.environment_id,
+            action,
+            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            session_id: Some(self.world.session_id),
+            delegation_id: delegation_id.clone(),
+            plan: kr_protocol::voice::VoiceActionPlan {
+                voice_session_id: self.voice_session_id,
+                action,
+                session_id: Nullable::some(self.world.session_id),
+                delegation_id: Nullable::some(delegation_id),
+                payload_digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+            },
+            approval: None,
+            turn_id: None,
+            destination: None,
+        }
+    }
+
+    /// Stops the call on a task of its own, so a test can watch it wait.
+    fn stopping(&self) -> tokio::task::JoinHandle<()> {
+        let controller = Arc::clone(&self.controller);
+        let device_id = self.device.device_id;
+        let voice_session_id = self.voice_session_id;
+        tokio::spawn(async move {
+            controller
+                .voice()
+                .coordinator()
+                .stop(
+                    device_id,
+                    &VoiceStopParams { voice_session_id },
+                    kr_ipc::now_ms().get(),
+                )
+                .await
+                .expect("the call is stopped");
+        })
     }
 
     async fn stop(&self) {
@@ -267,11 +333,18 @@ async fn a_confirmed_close_closes_the_session_once() {
         forwarded.actor.ingress,
         kr_protocol::actor::ActorIngress::PairedDevice
     );
-    let voice_grant = call.controller.voice().coordinator().live_sessions();
-    assert_eq!(voice_grant, 1, "the call is still running");
-    assert!(
-        forwarded.actor.grant_id.as_ref().is_some(),
-        "the close travels under the voice grant"
+    let live = call.controller.voice().coordinator().live_sessions();
+    assert_eq!(live, 1, "the call is still running");
+    let voice_grant_id = call.voice_grant_id();
+    assert_eq!(
+        forwarded.actor.grant_id.as_ref(),
+        Some(&voice_grant_id),
+        "the close travels under the call's voice grant"
+    );
+    assert_eq!(
+        forwarded.mutation.grant_id.as_ref(),
+        Some(&voice_grant_id),
+        "and the mutation names the same grant"
     );
     assert_eq!(
         forwarded.grant_rights.iter().copied().collect::<Vec<_>>(),
@@ -401,18 +474,15 @@ async fn a_worker_that_does_not_answer_a_close_leaves_it_uncertain() {
 }
 
 /// KR-REQ-15.13 and 09.12: stopping the call while a close is on its way to the worker owes a fence,
-/// which reaches the device that holds the call and no other connection, and which a worker that
-/// has installed it answers by refusing the close it had not yet taken up. The session is not
-/// closed.
+/// which a worker that has installed it answers by refusing the close it had not yet taken up. The
+/// session is not closed, and the close stays held against its grant until the deadline it
+/// travelled with: a refusal that did not come from the worker is not proof that no worker can
+/// still take it up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_while_a_close_is_on_its_way_makes_the_worker_refuse_it() {
     let call = Call::start().await;
     let signed = call.confirmed(&call.saying("item_close")).await;
     let before = revision(&call.controller).await;
-    let (here, other) = (
-        admit(&call.controller, call.device.device_id).await,
-        admit(&call.controller, DeviceId::new(kr_ipc::new_uuid())).await,
-    );
     let (arrived, go) = call.controller.before_a_proxy_is_opened.arm();
 
     let controller = Arc::clone(&call.controller);
@@ -426,23 +496,12 @@ async fn a_stop_while_a_close_is_on_its_way_makes_the_worker_refuse_it() {
     arrived.await.expect("the close reaches the link");
     call.stop().await;
 
-    until("the barrier for the stop", async || {
-        owed(&call.controller).is_empty() && revision(&call.controller).await > before
-    })
-    .await;
     assert_eq!(
         revision(&call.controller).await,
         before + 1,
-        "one barrier retires the debt the stop owed"
+        "one barrier retired the debt the stop owed before the stop was answered"
     );
-    assert!(
-        call.controller.admitted_revision(here).is_err(),
-        "the device's connection was withdrawn"
-    );
-    assert!(
-        call.controller.admitted_revision(other).is_ok(),
-        "another device's connection stays admitted"
-    );
+    assert!(owed(&call.controller).is_empty());
 
     go.send(()).expect("the close goes on");
     let refused = asking
@@ -452,8 +511,6 @@ async fn a_stop_while_a_close_is_on_its_way_makes_the_worker_refuse_it() {
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert_eq!(call.closes().len(), 1, "the close reached the worker");
     assert_eq!(call.script.closes_taken(), 0, "and the worker took none up");
-    // A close that failed is held against its grant until the deadline it travelled with: a
-    // failure is not proof that no worker can still take it up.
     assert_eq!(call.controller.sharing().grants().closes_held(), 1);
     call.world.serving.abort();
 }
@@ -548,49 +605,297 @@ async fn a_close_the_call_cannot_make_closes_nothing() {
         VoiceSessionId::new(call.world.session_id.get()),
         &format!("close session {}", call.number),
     );
-    let error = ask(
-        &call.controller,
-        &call.device.principal(),
-        call.device.device_id,
-        &mistaken,
-    )
-    .await;
-    assert!(
-        error.is_err()
-            || matches!(
-                error
-                    .expect("answered")
-                    .to_typed::<VoiceDelegateResult>()
-                    .expect("a delegation result")
-                    .outcome,
-                VoiceDelegationOutcome::Refused { .. }
-            ),
+    assert_eq!(
+        refusal_of(&call.submit(&mistaken).await),
+        VoiceRefusal::UnknownVoiceSession,
         "a terminal session's identifier names no voice session"
     );
 
     // The call is stopped while the device holds a challenge.
     let signed = call.confirmed(&call.saying("item_close")).await;
     call.stop().await;
-    let after_the_stop = ask(
-        &call.controller,
-        &call.device.principal(),
-        call.device.device_id,
-        &signed,
-    )
-    .await;
-    assert!(
-        after_the_stop.is_err()
-            || matches!(
-                after_the_stop
-                    .expect("answered")
-                    .to_typed::<VoiceDelegateResult>()
-                    .expect("a delegation result")
-                    .outcome,
-                VoiceDelegationOutcome::Refused { .. }
-            ),
+    assert_eq!(
+        refusal_of(&call.submit(&signed).await),
+        VoiceRefusal::UnknownVoiceSession,
         "a stopped call closes nothing"
     );
     assert!(call.closes().is_empty(), "nothing reached the worker");
+    call.world.serving.abort();
+}
+
+/// The ceiling this host's configuration puts on the rights a grant may carry, naming the right to
+/// use voice and to see a session and not the right to close one.
+///
+/// The scripted worker gives no evidence of its fence, so the change is written and in force and its
+/// barrier is reported as not held, which `apply_configuration` answers as an error. What a test
+/// needs is the ceiling in force, and that is what it asks.
+async fn without_the_right_to_close(controller: &Arc<Controller>) {
+    let _ = controller
+        .apply_configuration(&kr_protocol::hostinfo::configuration::Change::GrantRights(
+            Some(vec![
+                ActionRight::VoiceUse.as_str().to_owned(),
+                ActionRight::SessionView.as_str().to_owned(),
+            ]),
+        ))
+        .await;
+    assert!(
+        controller
+            .rights_ceiling
+            .lock()
+            .expect("the ceiling")
+            .as_ref()
+            .is_some_and(|ceiling| !ceiling.contains(&ActionRight::SessionClose)),
+        "the ceiling is in force"
+    );
+}
+
+/// KR-REQ-15.13 and 26.16: a right this host's configuration has taken away from every grant is
+/// not one a spoken close can use. The device's grant and the call's grant both carry the right to
+/// close, and the close is refused before the device is asked to confirm it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_the_configuration_has_taken_the_right_for_is_not_asked_for() {
+    let call = Call::start().await;
+    without_the_right_to_close(&call.controller).await;
+
+    let asked = call.submit(&call.saying("item_close")).await;
+
+    assert_eq!(refusal_of(&asked), VoiceRefusal::OutsideDeviceGrant);
+    assert!(call.closes().is_empty(), "nothing reached the worker");
+    call.world.serving.abort();
+}
+
+/// KR-REQ-15.13 and 26.16: a ceiling that comes in after the device has signed, and before the
+/// close is forwarded, stops the close. The authority is read again at the last moment, under the
+/// ceiling then in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceiling_that_comes_in_after_the_close_is_held_forwards_nothing() {
+    let call = Call::start().await;
+    let signed = call.confirmed(&call.saying("item_close")).await;
+    let (arrived, go) = call.controller.after_a_voice_close_is_held.arm();
+
+    let controller = Arc::clone(&call.controller);
+    let principal = call.device.principal();
+    let device_id = call.device.device_id;
+    let asking = tokio::spawn({
+        let signed = signed.clone();
+        async move { ask(&controller, &principal, device_id, &signed).await }
+    });
+    arrived.await.expect("the close is held");
+    without_the_right_to_close(&call.controller).await;
+
+    go.send(()).expect("the close goes on");
+    let refused = asking
+        .await
+        .expect("the attempt ends")
+        .expect_err("the host no longer lets the device close");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(call.closes().is_empty(), "nothing reached the worker");
+    call.world.serving.abort();
+}
+
+/// KR-REQ-15.13 and 09.12: a stop is answered once the workers hold the revision that makes them
+/// refuse a close the stop caught on its way, and not before. A worker that has not been told is
+/// one a close could still reach, and a stop that had been answered would be a statement that it
+/// could not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_is_answered_only_once_the_worker_holds_the_revision() {
+    let call = Call::start().await;
+    let signed = call.confirmed(&call.saying("item_close")).await;
+    let before = revision(&call.controller).await;
+    let (at_the_link, go) = call.controller.before_a_proxy_is_opened.arm();
+    let controller = Arc::clone(&call.controller);
+    let principal = call.device.principal();
+    let device_id = call.device.device_id;
+    let asking = tokio::spawn({
+        let signed = signed.clone();
+        async move { ask(&controller, &principal, device_id, &signed).await }
+    });
+    at_the_link
+        .await
+        .expect("the close is about to open its link");
+    let (told, install) = call.script.hold_the_next_announcement();
+
+    let stopping = call.stopping();
+    told.await.expect("the worker is told the revision");
+    assert!(
+        !stopping.is_finished(),
+        "the stop waits for the worker to hold the revision"
+    );
+    assert!(
+        call.script
+            .installed_revision()
+            .is_none_or(|held| held.get() <= before),
+        "and the worker does not hold it yet"
+    );
+
+    install.send(()).expect("the worker installs the revision");
+    stopping.await.expect("the stop ends");
+    assert_eq!(
+        call.script.installed_revision().map(|held| held.get()),
+        Some(before + 1),
+        "the worker holds the revision the stop's answer stands on"
+    );
+    assert!(owed(&call.controller).is_empty(), "and nothing is owed");
+
+    go.send(()).expect("the close goes on");
+    let _ = asking.await.expect("the attempt ends");
+    call.world.serving.abort();
+}
+
+/// KR-REQ-15.13 and 09.12: withdrawing a call's grant while a close is on its way raises a barrier
+/// that withdraws no connection. The connection of the device that holds the call stays admitted,
+/// so the answer to the stop and to every request on that link is delivered, and so does every
+/// other device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_while_a_close_is_on_its_way_withdraws_no_connection() {
+    let call = Call::start().await;
+    let before = revision(&call.controller).await;
+    let (here, other) = (
+        admit(&call.controller, call.device.device_id).await,
+        admit(&call.controller, DeviceId::new(kr_ipc::new_uuid())).await,
+    );
+    let hold = call
+        .controller
+        .sharing()
+        .grants()
+        .hold_close(call.voice_grant_id());
+
+    call.stop().await;
+
+    assert_eq!(
+        revision(&call.controller).await,
+        before + 1,
+        "one barrier retired the debt the stop owed"
+    );
+    assert!(owed(&call.controller).is_empty());
+    assert_eq!(
+        call.controller
+            .admitted_revision(here)
+            .ok()
+            .map(|r| r.get()),
+        Some(before + 1),
+        "the device's connection stays, admitted at the revision now in force"
+    );
+    assert_eq!(
+        call.controller
+            .admitted_revision(other)
+            .ok()
+            .map(|r| r.get()),
+        Some(before + 1),
+        "and so does every other device's"
+    );
+    drop(hold);
+    call.world.serving.abort();
+}
+
+/// KR-REQ-15.13 and 09.12: the owner's revocation of a call's grant while a close is on its way
+/// reaches the workers and the connections acting under that grant, which are none, and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_of_a_call_s_grant_while_a_close_is_on_its_way_withdraws_no_connection() {
+    let call = Call::start().await;
+    let before = revision(&call.controller).await;
+    let (here, other) = (
+        admit(&call.controller, call.device.device_id).await,
+        admit(&call.controller, DeviceId::new(kr_ipc::new_uuid())).await,
+    );
+    let hold = call
+        .controller
+        .sharing()
+        .grants()
+        .hold_close(call.voice_grant_id());
+
+    call.controller
+        .revoke_grant(call.voice_grant_id(), super::Audience::Host, None, None)
+        .await
+        .expect("the owner revokes the call's grant");
+
+    assert_eq!(revision(&call.controller).await, before + 1);
+    assert!(owed(&call.controller).is_empty());
+    for connection in [here, other] {
+        assert_eq!(
+            call.controller
+                .admitted_revision(connection)
+                .ok()
+                .map(|r| r.get()),
+            Some(before + 1),
+            "no connection acts under a call's grant"
+        );
+    }
+    drop(hold);
+    call.world.serving.abort();
+}
+
+/// An admission that stands, with the time it has left.
+#[derive(Debug)]
+struct StandingFor(Option<std::time::Duration>);
+
+impl kr_voice::Admission for StandingFor {
+    fn still_admitted(&self) -> Result<(), kr_protocol::error::ProtocolError> {
+        Ok(())
+    }
+
+    fn time_left(&self) -> Option<std::time::Duration> {
+        self.0
+    }
+
+    fn connection(&self) -> Option<kr_protocol::ids::ConnectionId> {
+        Some(kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()))
+    }
+}
+
+/// How far past the boot clock's reading when the close was performed the worker was told it may
+/// take the close up, in milliseconds, for a close performed under an admission with `left` to
+/// run.
+async fn the_time_a_worker_is_given(call: &Call, left: Option<std::time::Duration>) -> u64 {
+    let admission: Arc<dyn kr_voice::Admission> = Arc::new(StandingFor(left));
+    call.controller
+        .voice_perform(Method::SessionClose, &call.proposal(), &admission)
+        .await
+        .expect("the close is performed");
+    let after = call.controller.shared_clock.boot_elapsed_ms();
+    let closes = call.closes();
+    assert_eq!(closes.len(), 1, "the worker was forwarded one close");
+    let deadline = closes[0].accepted_deadline_boot_ms.get();
+    assert!(deadline > 0, "and a deadline");
+    deadline.saturating_sub(after)
+}
+
+/// KR-REQ-09.16: the deadline a close travels with is the earliest of the close budget, the time
+/// the delegation has left and the end of the voice grant, so a worker slow to take it up cannot
+/// take it up late. Each bound is the one that decides in one case, and the others are far past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_travels_with_the_earliest_of_its_budget_its_admission_and_its_grant() {
+    let ms = |seconds: u64| seconds * 1_000;
+
+    // The budget: the admission and the grant leave far more.
+    let call = Call::start().await;
+    *call.controller.voice_budgets.lock().expect("the budgets") = VoiceBudgets {
+        read: VoiceBudgets::STATED.read,
+        close: std::time::Duration::from_secs(7),
+    };
+    let given = the_time_a_worker_is_given(&call, Some(std::time::Duration::from_secs(300))).await;
+    assert!(given <= ms(7), "the budget decides: {given} ms");
+    call.world.serving.abort();
+
+    // The time the delegation has left.
+    let call = Call::start().await;
+    let given = the_time_a_worker_is_given(&call, Some(std::time::Duration::from_secs(3))).await;
+    assert!(given <= ms(3), "the admission decides: {given} ms");
+    call.world.serving.abort();
+
+    // The end of the voice grant: a call of twenty seconds, against a budget of forty-five.
+    let call = Call::start_for(20).await;
+    let given = the_time_a_worker_is_given(&call, None).await;
+    assert!(given <= ms(20), "the grant decides: {given} ms");
+    call.world.serving.abort();
+
+    // And with none of them short of the budget, the worker is given the budget.
+    let call = Call::start().await;
+    let given = the_time_a_worker_is_given(&call, None).await;
+    assert!(
+        given > ms(20) && given <= ms(45),
+        "the stated budget decides: {given} ms"
+    );
     call.world.serving.abort();
 }
 
@@ -617,38 +922,7 @@ impl kr_voice::Admission for NoLongerStanding {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_is_not_forwarded_under_an_admission_that_no_longer_stands() {
     let call = Call::start().await;
-    let voice_grant = call
-        .controller
-        .sharing()
-        .grants()
-        .records_for_device(call.device.device_id)
-        .expect("the store reads")
-        .into_iter()
-        .map(|record| record.grant)
-        .find(|grant| grant.permits(ActionRight::VoiceUse) && grant.parent_grant_id.0.is_some())
-        .expect("the call's own voice grant");
-    let delegation_id = kr_protocol::voice::VoiceDelegationId::new("item_close").expect("an id");
-    let action = VoiceAction::CloseSession;
-    let proposal = kr_voice::Proposal {
-        voice_session_id: call.voice_session_id,
-        device_id: call.device.device_id,
-        voice_grant_id: voice_grant.grant_id,
-        environment_id: call.world.environment_id,
-        action,
-        action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-        session_id: Some(call.world.session_id),
-        delegation_id: delegation_id.clone(),
-        plan: kr_protocol::voice::VoiceActionPlan {
-            voice_session_id: call.voice_session_id,
-            action,
-            session_id: Nullable::some(call.world.session_id),
-            delegation_id: Nullable::some(delegation_id),
-            payload_digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
-        },
-        approval: None,
-        turn_id: None,
-        destination: None,
-    };
+    let proposal = call.proposal();
     let admission: Arc<dyn kr_voice::Admission> = Arc::new(NoLongerStanding(
         kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
     ));

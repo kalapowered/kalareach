@@ -2215,7 +2215,7 @@ async fn a_voice_grant_replaced_through_the_seam_publishes_the_fence_it_owes_onc
         .expect("the replacement is written");
     assert!(held(written.grant_id).revoked_at_ms.is_some());
     assert!(held(delegated.grant_id).revoked_at_ms.is_some());
-    assert!(held(replacement.grant_id).revoked_at_ms.is_none());
+    assert!(held(replacement.grant.grant_id).revoked_at_ms.is_none());
     // The fence the delegated grant's withdrawal owes is published once the change has committed,
     // which wakes the debt pass: its barrier advances the revision, and that is what is waited for,
     // by condition, because the pass may already have taken the debt up.
@@ -2419,7 +2419,7 @@ async fn a_voice_grants_withdrawal_through_the_seam_fences_nothing() {
             || Ok(()),
         )
         .expect("a delegated grant");
-    authority
+    let withdrawn = authority
         .revoke(
             voice.grant_id,
             6,
@@ -2435,10 +2435,10 @@ async fn a_voice_grants_withdrawal_through_the_seam_fences_nothing() {
     controller
         .check_fence()
         .expect_err("every admission is refused until its barrier");
-    controller
-        .raise_owed_barrier()
-        .await
-        .expect("the barrier is raised");
+    withdrawn
+        .fence
+        .expect("the withdrawal hands back the wait for its barrier")
+        .await;
     assert_eq!(revision().await, before + 1, "one barrier retires it");
     assert!(
         controller

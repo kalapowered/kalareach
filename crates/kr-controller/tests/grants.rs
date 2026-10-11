@@ -392,54 +392,76 @@ fn a_voice_grants_withdrawal_owes_no_fence() {
 }
 
 /// A voice grant's withdrawal owes a fence while a close forwarded under it can still run at a
-/// worker, on every revocation path, and the debt is for that device alone. Once the hold on the
+/// worker, whether the grant is revoked, replaced or revoked with its device. Once the hold on the
 /// close is let go, the same withdrawal owes none. A close held under another voice grant is no
 /// reason to fence this one.
 #[test]
 fn a_voice_grants_withdrawal_owes_a_fence_while_a_close_is_held_under_it() {
-    let directory = GrantDirectory::in_memory().expect("a grant store");
     let voice_rights = [ActionRight::VoiceUse, ActionRight::SessionView];
-    let standing = grant(1, None, &voice_rights, GrantExpiry::Never);
-    directory
-        .issue(&record(standing.clone()), || Ok(()))
-        .expect("written");
-    let call = grant(
-        2,
-        Some(standing.grant_id),
-        &voice_rights,
-        GrantExpiry::Never,
-    );
-    directory
-        .issue(&record(call.clone()), || Ok(()))
-        .expect("written");
+    for path in ["revoke", "replace", "revoke_device"] {
+        let directory = GrantDirectory::in_memory().expect("a grant store");
+        let standing = grant(1, None, &voice_rights, GrantExpiry::Never);
+        directory
+            .issue(&record(standing.clone()), || Ok(()))
+            .expect("written");
+        let call = grant(
+            2,
+            Some(standing.grant_id),
+            &voice_rights,
+            GrantExpiry::Never,
+        );
+        directory
+            .issue(&record(call.clone()), || Ok(()))
+            .expect("written");
+
+        // A close held under the call, withdrawn through the standing grant it descends from.
+        let held = directory.hold_close(call.grant_id);
+        let withdrawn = match path {
+            "revoke" => directory
+                .revoke(standing.grant_id, 4_000, || Ok(()))
+                .expect("revoked"),
+            "replace" => directory
+                .replace(
+                    Some(standing.grant_id),
+                    4_000,
+                    &record(grant(9, None, &voice_rights, GrantExpiry::Never)),
+                    || Ok(()),
+                )
+                .expect("replaced")
+                .expect("the old grant was withdrawn"),
+            _ => directory
+                .revoke_device(call.recipient_device_id, 4_000, || Ok(()), None)
+                .expect("revoked"),
+        };
+        assert!(withdrawn.debt.is_some(), "a close can still run: {path}");
+        assert_eq!(
+            directory.fence_owed().expect("readable"),
+            vec![withdrawn.debt.expect("a debt")],
+            "{path}"
+        );
+        drop(held);
+    }
+
+    // A close held under one call is no reason to fence another's withdrawal, and once it is let
+    // go nothing is owed for its own.
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let call = grant(2, None, &voice_rights, GrantExpiry::Never);
     let elsewhere = grant(3, None, &voice_rights, GrantExpiry::Never);
-    directory
-        .issue(&record(elsewhere.clone()), || Ok(()))
-        .expect("written");
-
-    // A close held under the call, withdrawn through the standing grant it descends from.
+    for each in [&call, &elsewhere] {
+        directory
+            .issue(&record(each.clone()), || Ok(()))
+            .expect("written");
+    }
     let held = directory.hold_close(call.grant_id);
-    let withdrawn = directory
-        .revoke(standing.grant_id, 4_000, || Ok(()))
-        .expect("revoked");
-    assert!(withdrawn.debt.is_some(), "a close can still run");
-    assert_eq!(
-        withdrawn.closes_of,
-        Some(call.recipient_device_id),
-        "and the fence is for the device that holds the call"
-    );
-    assert_eq!(
-        directory.fence_owed().expect("readable"),
-        vec![withdrawn.debt.expect("a debt")]
-    );
-    drop(held);
-
-    // A close held under another call, or let go: nothing is owed.
-    let _other = directory.hold_close(call.grant_id);
     let unrelated = directory
         .revoke(elsewhere.grant_id, 4_100, || Ok(()))
         .expect("revoked");
     assert_eq!(unrelated.debt, None, "that close is not under this grant");
+    drop(held);
+    let let_go = directory
+        .revoke(call.grant_id, 4_200, || Ok(()))
+        .expect("revoked");
+    assert_eq!(let_go.debt, None, "and a close let go owes nothing");
 }
 
 /// A grant replaced in place is withdrawn and its replacement written in one transaction. The

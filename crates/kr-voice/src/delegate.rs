@@ -125,7 +125,8 @@ enum PlanFor {
     Description,
 }
 use crate::seams::{
-    ActionSubmitter, Admission, ContextRequest, ContextSource, Unbounded, VoiceAuthority,
+    ActionSubmitter, Admission, ContextRequest, ContextSource, Replaced, Revoked, Unbounded,
+    VoiceAuthority,
 };
 use crate::session::{NewVoiceSession, VoiceSessionRecord, VoiceSessions};
 
@@ -590,7 +591,10 @@ impl Coordinator {
                     self.authority
                         .replace(replaced.grant_id, &planned.plan, now_ms, admission)
                 }
-                None => self.authority.issue(&planned.plan, admission),
+                None => self
+                    .authority
+                    .issue(&planned.plan, admission)
+                    .map(|grant| Replaced { grant, fence: None }),
             };
             // The calls under the grant that was replaced are stopped only once it was: a
             // replacement that failed left them their authority and their grant.
@@ -623,6 +627,12 @@ impl Coordinator {
             }
         }
         let written = written?;
+        // The old grant is gone when the workers hold the revision that refuses what was sent under
+        // it, and the person is not told the replacement is made before that.
+        if let Some(fence) = written.fence {
+            fence.await;
+        }
+        let written = written.grant;
 
         Ok(VoiceGrantResult {
             grant_id: written.grant_id,
@@ -1265,7 +1275,7 @@ impl Coordinator {
         now_ms: u64,
     ) -> Result<VoiceStopResult> {
         let (record, _closing) = self.take_session(params.voice_session_id, device_id)?;
-        let revoked_at_ms = self.revoke_taken(&record, now_ms).await?;
+        let Revoked { at_ms, fence } = self.revoke_taken(&record, now_ms).await?;
 
         let mut broker_notified = false;
         // Through the provider that created it, not through whatever this coordinator brokers
@@ -1276,11 +1286,17 @@ impl Coordinator {
             // money is settled on its own schedule and `session.closed` is what finalises it.
             broker_notified = provider.close(call_id).await.is_ok();
         }
+        // Answered once the workers hold the revision that refuses whatever was sent under the
+        // grant, when anything could have been: a stop that said the call was over while a close
+        // could still reach a worker would say more than the host knows.
+        if let Some(fence) = fence {
+            fence.await;
+        }
 
         Ok(VoiceStopResult {
             voice_session_id: params.voice_session_id,
             revoked_grant_id: record.grant_id,
-            revoked_at_ms: TimestampMs::new(revoked_at_ms),
+            revoked_at_ms: TimestampMs::new(at_ms),
             broker_notified,
             sessions_left_running: record.session_ids,
         })
@@ -1315,7 +1331,7 @@ impl Coordinator {
     /// the only thing that still knows which call it held. When the revocation fails the call is
     /// finalised before the failure is returned, or nothing would be able to finalise it
     /// afterwards.
-    async fn revoke_taken(&self, record: &VoiceSessionRecord, now_ms: u64) -> Result<u64> {
+    async fn revoke_taken(&self, record: &VoiceSessionRecord, now_ms: u64) -> Result<Revoked> {
         match self
             .authority
             .revoke(record.grant_id, now_ms, &crate::seams::Unbounded)

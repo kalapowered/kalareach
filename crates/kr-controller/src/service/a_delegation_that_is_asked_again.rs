@@ -280,6 +280,17 @@ pub(super) async fn call_over(
     session_id: SessionId,
     actions: &[VoiceAction],
 ) -> VoiceSessionId {
+    call_over_for(controller, device_id, session_id, actions, 600).await
+}
+
+/// The same, for a call that runs for `duration_seconds`, which is how long its grant stands.
+pub(super) async fn call_over_for(
+    controller: &Arc<Controller>,
+    device_id: kr_protocol::ids::DeviceId,
+    session_id: SessionId,
+    actions: &[VoiceAction],
+    duration_seconds: u32,
+) -> VoiceSessionId {
     controller.voice().attach_provider(Some(
         Arc::new(OfflineProvider) as Arc<dyn ManagedVoiceService>
     ));
@@ -316,7 +327,7 @@ pub(super) async fn call_over(
             &VoiceStartParams {
                 session_ids: [session_id].into_iter().collect(),
                 offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
-                duration_seconds: 600,
+                duration_seconds,
                 reasoning_budget_minor: Nullable::null(),
                 prepared,
                 expected_rate_version: Nullable::some("2026-09".to_owned()),

@@ -10,7 +10,7 @@ use kr_protocol::grant::Grant;
 use kr_protocol::ids::{DeviceId, GrantId, SessionId};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::AuthorisationKey;
-use kr_voice::seams::VoiceAuthority;
+use kr_voice::seams::{Replaced, Revoked, VoiceAuthority};
 use kr_voice::{VoiceError, VoiceGrantPlan};
 
 use crate::grants::{GrantRecord, GrantRevocation};
@@ -52,16 +52,18 @@ impl GrantAuthority {
     /// down. The same decision every other reader of a grant's time takes, and the daemon's own,
     /// so a daemon that has gone has nothing to decide with and answers with a refusal.
     fn lifetimes(&self) -> kr_voice::Result<Arc<GrantLifetimes>> {
-        self.daemon
-            .upgrade()
-            .map(|daemon| Arc::clone(daemon.lifetimes()))
-            .ok_or_else(|| {
-                VoiceError::Host(kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::ResourceUnavailable,
-                    "this host is stopping, so it cannot say whether a grant still stands"
-                        .to_owned(),
-                ))
-            })
+        Ok(Arc::clone(self.daemon()?.lifetimes()))
+    }
+
+    /// The daemon this seam answers for, or the refusal of a host that is stopping: one that has
+    /// gone has nothing to decide with.
+    fn daemon(&self) -> kr_voice::Result<Arc<crate::service::Controller>> {
+        self.daemon.upgrade().ok_or_else(|| {
+            VoiceError::Host(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                "this host is stopping, so it cannot say whether a grant still stands".to_owned(),
+            ))
+        })
     }
 
     /// The moment before which a spent delegation identifier may be forgotten at `now_ms`, or none
@@ -222,7 +224,13 @@ impl VoiceAuthority for GrantAuthority {
             .filter(|grant| !grant.permits(ActionRight::VoiceUse))
             .filter(|grant| session_id.is_none_or(|id| grant.session_selector.admits(id)))
             .max_by_key(|grant| grant.actions.len());
-        standing.answer(widest)
+        // As this host's configuration lets it be used: a right the rights ceiling takes away
+        // from every grant is not one a spoken action may use, whichever grant it was written in.
+        // The coordinator reads the device's authority here before it asks for a confirmation, and
+        // the host reads it again immediately before a close is forwarded, so both are under the
+        // ceiling in force when they read.
+        let daemon = self.daemon()?;
+        standing.answer(widest.map(|grant| daemon.under_the_rights_ceiling(grant)))
     }
 
     fn grant(&self, grant_id: GrantId) -> kr_voice::Result<Option<Grant>> {
@@ -282,7 +290,7 @@ impl VoiceAuthority for GrantAuthority {
         plan: &VoiceGrantPlan,
         now_ms: u64,
         admission: &dyn kr_voice::Admission,
-    ) -> kr_voice::Result<Grant> {
+    ) -> kr_voice::Result<Replaced> {
         let record = voice_record(plan);
         let grant = record.grant.clone();
         // The withdrawal and the new grant are one transaction of the store, with the admission
@@ -295,12 +303,12 @@ impl VoiceAuthority for GrantAuthority {
             .grants()
             .replace(Some(replaced), now_ms, &record, at_the_write(admission))
             .map_err(store)?;
-        if let Some(revocation) = revocation
-            && let Some(daemon) = self.daemon.upgrade()
-        {
-            daemon.fence_voice_revocation(&revocation);
-        }
-        Ok(grant)
+        let fence = revocation.and_then(|revocation| {
+            self.daemon
+                .upgrade()
+                .and_then(|daemon| daemon.fence_voice_revocation(&revocation))
+        });
+        Ok(Replaced { grant, fence })
     }
 
     fn revoke(
@@ -308,7 +316,7 @@ impl VoiceAuthority for GrantAuthority {
         grant_id: GrantId,
         now_ms: u64,
         admission: &dyn kr_voice::Admission,
-    ) -> kr_voice::Result<u64> {
+    ) -> kr_voice::Result<Revoked> {
         // The store's own cascade: revoking a parent revokes its descendants, which is what makes
         // withdrawing a standing voice grant end the calls running under it.
         // The admission check inside the transaction is the caller's authority to revoke, which
@@ -327,11 +335,15 @@ impl VoiceAuthority for GrantAuthority {
         // no barrier. The store writes a debt when a close is outstanding under the grant, or when
         // the cascade also withdrew a grant delegated from a voice grant that is not one itself,
         // and that debt is published here, the moment the transaction that is its restriction has
-        // committed, and fenced.
-        if let Some(daemon) = self.daemon.upgrade() {
-            daemon.fence_voice_revocation(&revocation);
-        }
-        Ok(now_ms)
+        // committed, and the wait for its fence goes back to the caller.
+        let fence = self
+            .daemon
+            .upgrade()
+            .and_then(|daemon| daemon.fence_voice_revocation(&revocation));
+        Ok(Revoked {
+            at_ms: now_ms,
+            fence,
+        })
     }
 
     fn device_identity_key(
