@@ -19,7 +19,7 @@
 //! keeps and not in them: an answer names the environment it was given to, and a store with one
 //! directory per environment cannot be settled against a host it was not given to. A second window
 //! of the application is a second process over the same directory, and what changes the kept
-//! answers (answering, sending, dismissing) takes a lock every window holds ([`QuestionDesk::turn`]).
+//! answers (answering, sending, dismissing) takes a lock every window holds (`QuestionDesk::turn`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
