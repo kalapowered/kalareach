@@ -372,10 +372,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 12,
+        "version": 13,
         "migrates_from": 1
       },
-      "digest": "35436108be55a8bfc63a8d559a573265a60284f45cc64daf094a5eb171d05414",
+      "digest": "6ee232c25130b7a5f1119271bd234ff5f667328c179e92145836eded7aa4f0ce",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",

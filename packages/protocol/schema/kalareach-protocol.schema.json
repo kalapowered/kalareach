@@ -37871,6 +37871,17 @@
       "additionalProperties": false,
       "description": "The result of `voice.grant`.",
       "properties": {
+        "barrier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevocationBarrier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The per-worker status of the fence this replacement owed, cut to the sessions of the calls\nit ended, and null when it owed none.\n\nA replacement withdraws the grant it replaces and the calls running under it. Withdrawing\na call's grant while a close sent under it can still reach a worker owes a fence, and the\nwithdrawal is complete only when the barrier holds: until then this names the workers that\nhave not acknowledged the new revision, not success."
+        },
         "device_id": {
           "$ref": "#/$defs/DeviceId",
           "description": "The device it was issued to."
@@ -37896,7 +37907,8 @@
         "grant_id",
         "device_id",
         "statement",
-        "not_held_by_device"
+        "not_held_by_device",
+        "barrier"
       ],
       "type": "object"
     },
@@ -38610,6 +38622,17 @@
       "additionalProperties": false,
       "description": "The result of `voice.stop`.",
       "properties": {
+        "barrier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevocationBarrier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The per-worker status of the fence this stop owed, cut to the sessions the call reached,\nand null when it owed none.\n\nWithdrawing the call's grant while a close sent under it can still reach a worker owes a\nfence, and the withdrawal is complete only when the barrier holds: until then this names\nthe workers that have not acknowledged the new revision, not success. The grant is revoked\neither way."
+        },
         "broker_notified": {
           "description": "Whether the broker was told to finalise the call.\n\nFalse is not a failure of the stop. The grant is gone either way; what the broker does with\nthe money is settled on its own schedule, and a host that waited for it would be holding a\nrevocation open for a reason that has nothing to do with authority.",
           "type": "boolean"
@@ -38640,7 +38663,8 @@
         "revoked_grant_id",
         "revoked_at_ms",
         "broker_notified",
-        "sessions_left_running"
+        "sessions_left_running",
+        "barrier"
       ],
       "type": "object"
     },

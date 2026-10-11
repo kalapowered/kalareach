@@ -1603,7 +1603,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             revoked_grant_id: VOICE_GRANT,
             revoked_at_ms: String(VOICE_NOW_MS),
             broker_notified: true,
-            sessions_left_running: [SESSION_MAIN]
+            sessions_left_running: [SESSION_MAIN],
+            barrier: null
           }
         },
         host_failure: null

@@ -29485,6 +29485,16 @@ export interface VoiceGrantParams {
  */
 export interface VoiceGrantResult {
   /**
+   * The per-worker status of the fence this replacement owed, cut to the sessions of the calls
+   * it ended, and null when it owed none.
+   *
+   * A replacement withdraws the grant it replaces and the calls running under it. Withdrawing
+   * a call's grant while a close sent under it can still reach a worker owes a fence, and the
+   * withdrawal is complete only when the barrier holds: until then this names the workers that
+   * have not acknowledged the new revision, not success.
+   */
+  barrier: RevocationBarrier1 | null
+  /**
    * One paired device.
    */
   device_id: string
@@ -30021,6 +30031,16 @@ export interface VoiceStopParams {
  * The result of `voice.stop`.
  */
 export interface VoiceStopResult {
+  /**
+   * The per-worker status of the fence this stop owed, cut to the sessions the call reached,
+   * and null when it owed none.
+   *
+   * Withdrawing the call's grant while a close sent under it can still reach a worker owes a
+   * fence, and the withdrawal is complete only when the barrier holds: until then this names
+   * the workers that have not acknowledged the new revision, not success. The grant is revoked
+   * either way.
+   */
+  barrier: RevocationBarrier1 | null
   /**
    * Whether the broker was told to finalise the call.
    *

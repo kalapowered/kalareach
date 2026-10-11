@@ -512,6 +512,7 @@ impl GrantDirectory {
         migrate_receipts(&connection)?;
         migrate_revocation_answers(&connection)?;
         migrate_delegation_answers(&connection)?;
+        migrate_voice_barrier_answers(&connection)?;
         migrate_grants(&connection)?;
         migrate_policy(&connection)?;
         migrate_fence_debt(&connection)?;
@@ -3069,6 +3070,117 @@ struct EarlierDelegationResult {
     outcome: kr_protocol::voice::VoiceDelegationOutcome,
 }
 
+/// Brings the answers stored for earlier voice stops and voice grant changes to the shape this
+/// build reads, once.
+///
+/// An earlier build kept the answer to a stop and to a replacement of a voice grant without the
+/// barrier of the fence the withdrawal owed. This build keeps it, null when the withdrawal owed
+/// none. A stored answer in the earlier shape is written in this build's shape with no barrier,
+/// which is what it said: the earlier build reported none, and a repeat of the action is answered
+/// as it was kept.
+///
+/// One immediate transaction, so two processes opening one store change a row once, and a row
+/// already in this build's shape does not decode as the earlier one and is not touched, so a second
+/// open writes nothing.
+///
+/// Remove this upgrade, with [`EarlierVoiceStopResult`] and [`EarlierVoiceGrantResult`], once no
+/// supported upgrade starts from a build that stored these answers without a barrier.
+fn migrate_voice_barrier_answers(connection: &Connection) -> Result<()> {
+    use kr_protocol::voice::{VoiceGrantResult, VoiceStopResult};
+
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    // Each answer names a field no other kept answer does; what holds the name is decided by the
+    // decodes below, which accept only the earlier shapes.
+    let candidates: Vec<(String, Vec<u8>)> = transaction
+        .prepare(
+            "SELECT actor_id, action_id FROM authority_receipts
+              WHERE result IS NOT NULL
+                AND (instr(result, CAST('sessions_left_running' AS BLOB)) > 0
+                  OR instr(result, CAST('not_held_by_device' AS BLOB)) > 0)",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(ControllerError::registry)?;
+    let mut brought = 0_usize;
+    for (actor_id, action_id) in candidates {
+        let stored: Vec<u8> = transaction
+            .query_row(
+                "SELECT result FROM authority_receipts WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let limits = kr_cbor::Limits::DEFAULT;
+        let current = if let Ok(earlier) =
+            kr_cbor::from_canonical_slice::<EarlierVoiceStopResult>(&stored, &limits)
+        {
+            kr_cbor::to_canonical_vec(&VoiceStopResult {
+                voice_session_id: earlier.voice_session_id,
+                revoked_grant_id: earlier.revoked_grant_id,
+                revoked_at_ms: earlier.revoked_at_ms,
+                broker_notified: earlier.broker_notified,
+                sessions_left_running: earlier.sessions_left_running,
+                barrier: Nullable::null(),
+            })
+        } else if let Ok(earlier) =
+            kr_cbor::from_canonical_slice::<EarlierVoiceGrantResult>(&stored, &limits)
+        {
+            kr_cbor::to_canonical_vec(&VoiceGrantResult {
+                grant_id: earlier.grant_id,
+                device_id: earlier.device_id,
+                statement: earlier.statement,
+                not_held_by_device: earlier.not_held_by_device,
+                barrier: Nullable::null(),
+            })
+        } else {
+            continue;
+        }
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        transaction
+            .execute(
+                "UPDATE authority_receipts SET result = ?3 WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id, current],
+            )
+            .map_err(ControllerError::registry)?;
+        brought += 1;
+    }
+    if brought > 0 {
+        eprintln!(
+            "kr-controller: {brought} stored voice answer{} brought to the shape this build reads",
+            if brought == 1 { "" } else { "s" },
+        );
+    }
+    transaction.commit().map_err(ControllerError::registry)
+}
+
+/// A voice stop's answer as earlier builds stored it: no barrier. It lives inside the upgrade and
+/// nowhere else.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierVoiceStopResult {
+    voice_session_id: kr_protocol::ids::VoiceSessionId,
+    revoked_grant_id: GrantId,
+    revoked_at_ms: TimestampMs,
+    broker_notified: bool,
+    sessions_left_running: kr_protocol::scalars::CanonicalSet<SessionId>,
+}
+
+/// A voice grant change's answer as earlier builds stored it: no barrier. It lives inside the
+/// upgrade and nowhere else.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierVoiceGrantResult {
+    grant_id: GrantId,
+    device_id: DeviceId,
+    statement: kr_protocol::voice::VoiceGrantStatement,
+    not_held_by_device: kr_protocol::scalars::CanonicalSet<kr_protocol::voice::VoiceAction>,
+}
+
 /// A revocation's answer as earlier builds stored it: every list whole and no totals. It lives
 /// inside the upgrade and nowhere else.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3822,6 +3934,104 @@ mod tests {
         let written = raw_receipt(&path, 2);
         drop(GrantDirectory::open(&path).expect("the store opens again"));
         assert_eq!(raw_receipt(&path, 2), written, "nothing is upgraded twice");
+    }
+
+    /// KR-REQ-09.12: the answers stored for a voice stop and for a replacement of a voice grant by
+    /// an earlier build, which reported no barrier, come forward once when the store opens, each
+    /// with a barrier of none and every other field as it was. A row that is no such answer and one
+    /// already in this build's shape are as they were, and a second open writes nothing.
+    #[test]
+    fn a_voice_stop_and_grant_answer_an_earlier_build_stored_come_forward_once_when_the_store_opens()
+     {
+        use kr_protocol::ids::VoiceSessionId;
+        use kr_protocol::voice::{
+            VoiceAction, VoiceGrantResult, VoiceGrantStatement, VoiceStopResult,
+        };
+
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        drop(GrantDirectory::open(&path).expect("the store is created"));
+
+        let actions: kr_protocol::scalars::CanonicalSet<VoiceAction> =
+            [VoiceAction::Status].into_iter().collect();
+        let sessions: kr_protocol::scalars::CanonicalSet<SessionId> =
+            [SessionId::new(Uuid::from_bytes([0x71; 16]))]
+                .into_iter()
+                .collect();
+        let earlier_stop = EarlierVoiceStopResult {
+            voice_session_id: VoiceSessionId::new(Uuid::from_bytes([0x72; 16])),
+            revoked_grant_id: GrantId::new(Uuid::from_bytes([0x73; 16])),
+            revoked_at_ms: TimestampMs::new(1_700_000_000_000),
+            broker_notified: true,
+            sessions_left_running: sessions.clone(),
+        };
+        let earlier_grant = EarlierVoiceGrantResult {
+            grant_id: GrantId::new(Uuid::from_bytes([0x74; 16])),
+            device_id: DeviceId::new(Uuid::from_bytes([0x75; 16])),
+            statement: VoiceGrantStatement::of(&actions),
+            not_held_by_device: [VoiceAction::Brief].into_iter().collect(),
+        };
+        let stop = kr_cbor::to_canonical_vec(&earlier_stop).expect("the earlier shape encodes");
+        let grant = kr_cbor::to_canonical_vec(&earlier_grant).expect("the earlier shape encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<VoiceStopResult>(&stop, &kr_cbor::Limits::DEFAULT)
+                .is_err()
+                && kr_cbor::from_canonical_slice::<VoiceGrantResult>(
+                    &grant,
+                    &kr_cbor::Limits::DEFAULT
+                )
+                .is_err(),
+            "this build's readers refuse what the earlier build stored"
+        );
+        write_raw_receipt(&path, 1, &stop);
+        write_raw_receipt(&path, 2, &grant);
+        // Not an answer, though it holds the name of a field; and an answer already in this shape.
+        let other = kr_cbor::to_canonical_vec(&std::collections::BTreeMap::from([(
+            "sessions_left_running_note",
+            "not an answer",
+        )]))
+        .expect("a map encodes");
+        write_raw_receipt(&path, 3, &other);
+        let current = kr_cbor::to_canonical_vec(&VoiceStopResult {
+            voice_session_id: earlier_stop.voice_session_id,
+            revoked_grant_id: earlier_stop.revoked_grant_id,
+            revoked_at_ms: earlier_stop.revoked_at_ms,
+            broker_notified: false,
+            sessions_left_running: sessions.clone(),
+            barrier: Nullable::some(kr_protocol::action::RevocationBarrier::new(
+                AuthorityRevision::new(9),
+                Vec::new(),
+            )),
+        })
+        .expect("encodes");
+        write_raw_receipt(&path, 4, &current);
+
+        drop(GrantDirectory::open(&path).expect("the store opens and brings the rows forward"));
+
+        let read = |action: u8| raw_receipt(&path, action).0;
+        let stopped: VoiceStopResult =
+            kr_cbor::from_canonical_slice(&read(1), &kr_cbor::Limits::DEFAULT)
+                .expect("a stop answer this build reads");
+        assert_eq!(stopped.voice_session_id, earlier_stop.voice_session_id);
+        assert_eq!(stopped.revoked_grant_id, earlier_stop.revoked_grant_id);
+        assert_eq!(stopped.revoked_at_ms, earlier_stop.revoked_at_ms);
+        assert!(stopped.broker_notified);
+        assert_eq!(stopped.sessions_left_running, sessions);
+        assert_eq!(stopped.barrier, Nullable::null());
+        let granted: VoiceGrantResult =
+            kr_cbor::from_canonical_slice(&read(2), &kr_cbor::Limits::DEFAULT)
+                .expect("a grant answer this build reads");
+        assert_eq!(granted.grant_id, earlier_grant.grant_id);
+        assert_eq!(granted.device_id, earlier_grant.device_id);
+        assert_eq!(granted.statement, earlier_grant.statement);
+        assert_eq!(granted.not_held_by_device, earlier_grant.not_held_by_device);
+        assert_eq!(granted.barrier, Nullable::null());
+        assert_eq!(read(3), other, "a row that is no answer is as it was");
+        assert_eq!(read(4), current, "an answer in this shape is as it was");
+
+        let written = (read(1), read(2));
+        drop(GrantDirectory::open(&path).expect("the store opens again"));
+        assert_eq!((read(1), read(2)), written, "nothing is upgraded twice");
     }
 
     /// A revocation's answer in the shape an earlier build stored: every list whole.

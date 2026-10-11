@@ -608,11 +608,6 @@ pub struct VoiceGrantParams {
     pub actions: Nullable<CanonicalSet<VoiceAction>>,
 }
 
-/// What a result an earlier build kept says of the barrier it did not report: none.
-fn no_barrier() -> Nullable<RevocationBarrier> {
-    Nullable::null()
-}
-
 /// The result of `voice.grant`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -635,9 +630,7 @@ pub struct VoiceGrantResult {
     /// A replacement withdraws the grant it replaces and the calls running under it. Withdrawing
     /// a call's grant while a close sent under it can still reach a worker owes a fence, and the
     /// withdrawal is complete only when the barrier holds: until then this names the workers that
-    /// have not acknowledged the new revision, not success. A result an earlier build kept has
-    /// none.
-    #[serde(default = "no_barrier")]
+    /// have not acknowledged the new revision, not success.
     pub barrier: Nullable<RevocationBarrier>,
 }
 
@@ -943,8 +936,7 @@ pub struct VoiceStopResult {
     /// Withdrawing the call's grant while a close sent under it can still reach a worker owes a
     /// fence, and the withdrawal is complete only when the barrier holds: until then this names
     /// the workers that have not acknowledged the new revision, not success. The grant is revoked
-    /// either way. A result an earlier build kept has none.
-    #[serde(default = "no_barrier")]
+    /// either way.
     pub barrier: Nullable<RevocationBarrier>,
 }
 
