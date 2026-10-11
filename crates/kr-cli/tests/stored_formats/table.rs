@@ -165,6 +165,11 @@ pub fn known() -> Vec<Known> {
             "SessionRenameResult",
             "8647db2b73068c496d6d6fc3a923e0bf3b2838d05c6926b0052c937115003c2b",
         ),
+        known_protocol::<push::DevicePushRegisterResult>(
+            "registry",
+            "DevicePushRegisterResult",
+            "e9aaf057c87c511242039f5fde45cea281a56cb916155865a10b0886c91b16e8",
+        ),
         known_protocol::<delivery::DeliveryDestinationConfigureResult>(
             "registry",
             "DeliveryDestinationConfigureResult",
@@ -532,8 +537,8 @@ pub fn kept_without_a_holder() -> Vec<&'static str> {
 }
 
 /// The type of the answer the registry keeps for each method that has it kept, by the type's name:
-/// the method's answer, as `kr_controller::service::RETAINED_AUTHORITY_ANSWERS` and
-/// `RETAINED_MACHINE_ANSWERS` name the methods.
+/// the method's answer, as `kr_controller::service::RETAINED_AUTHORITY_ANSWERS`,
+/// `RETAINED_DEVICE_ANSWERS` and `RETAINED_MACHINE_ANSWERS` name the methods.
 #[must_use]
 pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
     use kr_protocol::method::Method;
@@ -560,6 +565,7 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
             Method::DeliveryDestinationSecretSet,
             "DeliveryDestinationSecretSetResult",
         ),
+        (Method::DevicePushRegister, "DevicePushRegisterResult"),
         (Method::PrivacySet, "PrivacyReport"),
         (Method::AccountSignIn, "AccountSignInStarted"),
         (Method::AccountSignOut, "AccountSignedOut"),
