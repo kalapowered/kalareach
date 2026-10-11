@@ -65,7 +65,9 @@ pub struct AccountStatusParams {}
 pub struct AccountReport {
     /// The account service this host keeps its account for, which is also where its token is
     /// presented when its voice broker is that service or it selects that service for storage.
-    /// Null when the host could not set up how to reach it, and `unavailable` says why.
+    /// Null when the host could not set up how to reach it, and `unavailable` says why. A host
+    /// that keeps the account and sends the service nothing, because its configuration document
+    /// cannot be used, still names it, with `unavailable` set.
     pub service: Nullable<String>,
     /// Why this host does not sign in or present its account: its configuration selects no storage
     /// service and names no voice broker, selects none and names a broker that is another service

@@ -545,13 +545,15 @@ impl Controller {
             // held, which is the order a revocation takes, and the clock is read last, so the last
             // thing between this create and its launch is a reading with nothing left to wait for.
             //
-            // The document in force is read in the same section: one accepted as unusable while
-            // this create prepared its launch refuses it here, as an action whose authority was
-            // withdrawn is. A document accepted after this section has no create left to refuse;
-            // it was made before it.
+            // The document in force is read in the same section, and before the admission, so
+            // that the clock is still read last: one accepted as unusable while this create
+            // prepared its launch refuses it here, as an action whose authority was withdrawn is.
+            // A document accepted after this section has no create left to refuse; it was made
+            // before it.
+            let unusable = self.refusal_for_unusable_document();
             if let Err(refusal) = self
                 .check_admission(&registry, &carried)
-                .and_then(|()| self.refusal_for_unusable_document().map_or(Ok(()), Err))
+                .and_then(|()| unusable.map_or(Ok(()), Err))
             {
                 // Nothing was started, so the reservation is resolved as a confirmed failure and
                 // stops occupying the environment. The caller is told which of the two it was.
