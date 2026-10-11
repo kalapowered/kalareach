@@ -146,9 +146,9 @@ written before the member existed reads and hashes as it did.
 An application whose terminal can communicate with a server (in Codex, a `--remote` terminal that
 talks to the App Server) adds a `backend` member that informs a host capable of running such a
 server how to start the server (namely, with the same executable that a shell would resolve for the
-command and the arguments declared here) and run the terminal against a gateway of its own. This
-host does not run such a server, so it merely checks the declaration and runs each invocation as
-typed, and `kr doctor` says why.
+command and the arguments declared here) and run the terminal against a gateway of its own. A host
+on macOS or Linux does so for a plain launch of the terminal, as described below; any other host
+checks the declaration and runs each invocation as typed, and `kr doctor` says why.
 
 ```json
 "command_integration": {
@@ -189,6 +189,38 @@ typed, and `kr doctor` says why.
 
 The `backend` member and the table's `messages` member are optional and left out when unset, so a
 manifest or a table written before them reads and hashes exactly as it did.
+
+#### How a host runs a backend
+
+On macOS and Linux, for a plain launch of the terminal, the host runs the server if the first
+executable the shell found is a native executable (not a script), a signed qualification record
+names it, and its version is one the connector's table is qualified for; otherwise, and on all other
+platforms, the invocation runs as typed, and `kr doctor` says why.
+
+When the launcher says it is going, the host starts the server in its own process group, in the
+directory the invocation runs in, and with the environment presented by the launcher except for the
+registration and the credential of the launch. The host records the server among the session's
+processes so that a control daemon can stop it if the host stops. The host creates a private socket
+in the backend's directory. When all three of those have completed, the host commits the launch. The
+launcher then writes the socket's address where the declaration has `{gateway}` and begins running
+as the terminal.
+
+The host will only accept one connection on the socket, from the process the launch registered. It
+then reads the upgrade request, which must arrive within 5 seconds and be no more than 16 KiB. The
+upgrade request must be a plain `GET` request using HTTP/1.1 protocol. A request with a header that
+a browser adds is refused, and a refused request does not use the connection. Text messages are
+used, one JSON message to a WebSocket message, and the host passes each one, a line at a time,
+between the terminal and the server's standard streams.
+
+The server is ended when the terminal ends, when the connection to the terminal ends, when 30
+seconds have elapsed since the launch was committed with no connection having been made, or when the
+session is closed. To end the server, the host closes its input and gives it a moment to end the
+commands it started, then asks it to terminate, then ends it. It then ends every process the session
+recorded below the server, by the process's identity. This is necessary because a command of the
+server's leaves the server's process group and outlives a server that dies. On Linux a command the
+server leaves behind stays in the process table, ended, until the worker exits. When the session is
+closed, this happens after the acceptance of the close has been delivered, because the command that
+asked for the close may be one the server started.
 
 ### The forwarder's placeholder
 
@@ -531,6 +563,16 @@ component fault disables rich meaning without stalling or discarding valid nativ
   response may share their identifier member, as is the case with JSON-RPC. A table that does not
   need the member leaves it out, and a package whose table declares it states
   `"sdk_range": ">=0.1.5, <0.2.0"`.
+- **Limits:** the host carries messages of at most 1 MiB, whatever the package says: if
+  `max_message_bytes` is below this, that value is used, and if it is above, this value is used. A
+  message over the limit ends the connection with the reason. A message the size of the limit is
+  carried both ways: a queue that holds nothing takes one message of the limit, and swapping the
+  host's identifier for the terminal's own can lengthen a message by at most 258 bytes. A terminal's
+  request identifier is limited to 256 bytes for a string and 20 digits for an integer, and any
+  other spelling is refused. A terminal may have 256 requests outstanding at a time, and if the
+  server has not answered one after 120 seconds, it is refused to the terminal. If a terminal stops
+  reading for 5 seconds, its connection is ended. A terminal may send at most 256 pings and pongs in
+  a minute, which a keepalive stays far below, and a flood ends the connection.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
