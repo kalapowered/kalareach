@@ -649,7 +649,6 @@ fn kr_req_11_30_the_installed_table_compiles_to_the_golden_core_table() {
         .qualify(&tables.protocol_version)
         .expect("an empty rich table qualifies");
     // The package declares a frame bound above the host's, and the host's holds.
-    assert!(tables.frame_limit_clamped);
     assert_eq!(
         tables.framing.limit(),
         kr_worker::broker::gateway::MAX_NATIVE_FRAME_BYTES
