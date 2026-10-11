@@ -1344,6 +1344,53 @@ fn a_version_six_journal_gains_the_record_of_its_processes_seeded_with_its_root_
     }
 }
 
+/// Makes a current journal into the one a worker of the build before wrote: the version before.
+fn as_version_seven(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("opens the journal");
+    connection
+        .execute_batch("UPDATE schema_version SET version = 7;")
+        .expect("steps it back");
+}
+
+#[test]
+fn a_version_seven_journal_keeps_its_record_of_processes_and_names_no_server() {
+    // The record a build wrote before servers were named reads as it did, with none.
+    let path = journal_path("version-seven");
+    let session_id = fixture_session();
+    let identity = |pid: u64| {
+        kr_protocol::identity::ProcessStartIdentity::new(
+            pid,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            pid * 3,
+        )
+    };
+    let record = kr_worker::ownership::OwnedRecord {
+        boot: kr_ipc::identity::boot_identity().ok(),
+        root: identity(10),
+        processes: vec![identity(10), identity(11)],
+        cgroup: None,
+        boundary: "the terminal's process group".to_owned(),
+        limits: Vec::new(),
+        backends: Vec::new(),
+    };
+    {
+        let mut journal = Journal::open(&path).expect("opens");
+        journal.record_owned(session_id, &record).expect("records");
+    }
+    as_version_seven(&path);
+    let journal = Journal::open(&path).expect("steps it forward");
+    assert_eq!(
+        journal.schema_version().expect("a version"),
+        migration::CURRENT
+    );
+    assert_eq!(
+        journal.read_owned(session_id).expect("reads the record"),
+        Some(record)
+    );
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
 #[test]
 fn what_a_worker_records_of_its_processes_is_read_back_whole() {
     let path = journal_path("owned-round-trip");
@@ -1363,11 +1410,12 @@ fn what_a_worker_records_of_its_processes_is_read_back_whole() {
         cgroup: Some("/user.slice/kr-worker-x.service".to_owned()),
         boundary: "the terminal's process group".to_owned(),
         limits: vec!["a limit".to_owned()],
-        backends: Vec::new(),
+        backends: vec![identity(11)],
     };
     journal.record_owned(session_id, &record).expect("records");
     let newer = kr_worker::ownership::OwnedRecord {
         processes: vec![identity(10)],
+        backends: Vec::new(),
         ..record.clone()
     };
     journal.record_owned(session_id, &newer).expect("replaces");
