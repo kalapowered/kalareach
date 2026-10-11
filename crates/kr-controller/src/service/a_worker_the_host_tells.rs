@@ -240,3 +240,81 @@ async fn a_statement_a_worker_did_not_acknowledge_is_sent_again_by_the_publisher
     );
     silent.serving.abort();
 }
+
+/// The registry's row for the fake worker of `silent`, as a worker that reported itself has one.
+fn row_of(silent: &Silent) -> crate::registry::WorkerRecord {
+    let descriptor = &silent.worker.descriptor;
+    crate::registry::WorkerRecord {
+        session_id: silent.session_id,
+        display_number: descriptor.display_number,
+        public_key: descriptor.worker_public_key,
+        process_identity: descriptor.process_start_identity.clone(),
+        endpoint: descriptor.endpoint.clone(),
+        profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        state: kr_protocol::session::SessionState::Live,
+        acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+    }
+}
+
+/// The sessions the host counts as unable to be told what the local owner may do.
+async fn lacking(silent: &Silent) -> Vec<SessionId> {
+    let registry = silent.controller.registry.lock().await;
+    silent
+        .controller
+        .workers_without_local_enforcement_in(&registry)
+        .expect("the registry answers")
+}
+
+/// KR-REQ-17.54: the host counts as unable to be told every recorded worker it has not reached or
+/// that states no capability, and every claimed launch that this run of the daemon did not make,
+/// because its worker may be alive and serving its local caller without the hold. A worker it has
+/// told, and a launch it made itself (which starts closed), are not counted. Making the host
+/// exclusively organisation-managed is refused while the count is not empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told_or_launched() {
+    let (silent, _recorded) = with(Behaviour {
+        states: true,
+        fails_the_first_statement: false,
+    })
+    .await;
+    let controller = &silent.controller;
+    controller
+        .registry
+        .lock()
+        .await
+        .adopt_worker(
+            &row_of(&silent),
+            Some(&kr_protocol::identity::DesktopBinding::none()),
+        )
+        .expect("the registry records the worker");
+
+    // A recorded worker that has not been reached counts as one that cannot be told.
+    controller.local_access.touch(silent.session_id);
+    assert_eq!(lacking(&silent).await, vec![silent.session_id]);
+
+    // Once it states the capability, it does not.
+    controller.tell_workers().await;
+    until("the worker is told", || {
+        controller.local_access.worker(silent.session_id).states == Some(true)
+    })
+    .await;
+    assert!(lacking(&silent).await.is_empty());
+
+    // A claimed launch this run of the daemon did not make may have a worker alive; one it made
+    // starts closed and is not counted.
+    let claim = super::a_create_that_launches_nothing::seed_claim_as(
+        controller,
+        &silent.actor.actor_id,
+        kr_protocol::identity::WorkerProfile::HeadlessUser,
+        |_| {
+            *kr_crypto::keys::AuthorisationKeyPair::generate()
+                .expect("a key")
+                .public()
+        },
+    )
+    .await;
+    assert_eq!(lacking(&silent).await, vec![claim.session_id]);
+    controller.local_access.launching(claim.reservation_id);
+    assert!(lacking(&silent).await.is_empty());
+    silent.serving.abort();
+}
