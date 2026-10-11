@@ -9031,7 +9031,7 @@ async fn a_command_that_tries_while_a_real_rollback_holds_the_locks_waits_and_is
     assert_eq!(
         code,
         Some(1),
-        "the release rolled back to reads the document at version 1, not 2: {said}"
+        "the release rolled back to reads the document at version 1 only: {said}"
     );
     assert!(!document.exists(), "the document was never written");
 }
@@ -9480,7 +9480,7 @@ async fn kr_new_with_no_daemon_over_an_unusable_document_names_the_way_out() {
 /* -------------------------------------------------------------------------------------------- */
 
 /// A release that reads the configuration document at version 1 only: a rollback to it is refused
-/// for a document at version 2.
+/// for a document at a later version.
 fn reading_the_document_at_1(name: &str) -> Assembled {
     Assembled::at_this_level(name, 1).reading(reading_a_store_at("configuration", 1, 1))
 }
@@ -9551,7 +9551,11 @@ async fn a_command_that_writes_in_a_root_no_daemon_recorded_is_found_by_the_chec
     assert_eq!(output.status.code(), Some(1), "{said}");
     let message = said["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains(&document.display().to_string()) && message.contains("records version 2"),
+        message.contains(&document.display().to_string())
+            && message.contains(&format!(
+                "records version {}",
+                kr_protocol::hostinfo::configuration::VERSION
+            )),
         "the refusal names the document: {said}"
     );
     assert_eq!(
@@ -10917,17 +10921,18 @@ fn broken_by_command_written_records(
 /// - a daemon in an environment the update could not reach is accepted for the configuration
 ///   document.
 ///
-/// The next raise of the configuration document, past 2, needs:
-/// - the document's `VERSION` at 3, with `OLDEST_VERSION` kept at 1 while a release that writes
+/// A raise of the configuration document past the version every listed release reads needs:
+/// - the document's `VERSION` raised, with `OLDEST_VERSION` kept at 1 while a release that writes
 ///   version 1 is a source of an update and the version-1 reading kept; the table of what releases
 ///   without the lock write stays, because it bounds what the reader may require;
 /// - the registry's version raised with its forward step, since the registry keeps the document it
-///   accepted, and `stored-formats.lock` written, the document at 3 in the release's `stores` list
-///   (with equality a list at 2 refuses the release's own commands);
+///   accepted, and `stored-formats.lock` written, the document at the new version in the release's
+///   `stores` list (with equality a list at the version before refuses the release's own commands);
 /// - the schema the protocol generates and the guides' examples, and the test of a document the
-///   build does not recognise, which names version 3 as that document's unknown version;
-/// - a test that a rollback is refused naming a version 3 document, as
-///   `a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read` does for 2,
+///   build does not recognise, which names the version after the current one as that document's
+///   unknown version;
+/// - a test that a rollback is refused naming a document at the current version, as
+///   `a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read` does,
 ///   and the sentence in `docs/host/updates.md` that gives the floor;
 /// - a base that holds the writers' lock and the registration.
 ///
