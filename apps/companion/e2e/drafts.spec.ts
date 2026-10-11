@@ -175,9 +175,13 @@ for (const surface of ['ios', 'android'] as const) {
         return [...path, ...chip]
       })
       expect(outside, 'lines of the chip and the path that run past the screen or their chip').toEqual([])
-      // The notice after the upload covers the screen at this size and goes by itself; the chip's
-      // own control can be pressed once it has.
-      await expect(page.locator('.toast')).toHaveCount(0, { timeout: 10_000 })
+      // The notice after the upload covers the screen at this size, and the pointer that picked the
+      // file rests on it, which holds it there; it is dismissed from its own control, and the
+      // chip's control can be pressed once it has gone.
+      const notice = page.locator('.toast')
+      await notice.getByRole('button', { name: 'Dismiss' }).focus()
+      await page.keyboard.press('Enter')
+      await expect(notice).toHaveCount(0)
       await page
         .getByRole('button', { name: /^Remove .* from this draft$/ })
         .click({ trial: true, timeout: 2_000 })
