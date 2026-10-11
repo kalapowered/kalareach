@@ -1616,6 +1616,19 @@ impl WorkerService {
             // must stop it. One produced afterwards is a refusal, and the caller is owed that
             // refusal rather than a socket that closed.
             let protected = !withdrawn.is_set();
+            // The request this iteration answers, when it is one that was recorded as waiting
+            // (a request or a mutation, and a prepared action's second pass). Only the end of
+            // such a request counts it off; a response to a frame that carries no recorded
+            // request, a refusal of a frame only the daemon sends, takes nothing off any.
+            let recorded = match &next {
+                Next::Frame(ControlFrame::Request(request)) => Some(request.request_id),
+                Next::Frame(ControlFrame::Mutation(mutation)) => Some(mutation.request_id),
+                Next::Prepared(ready) | Next::Held(ready) => {
+                    Some(ready.pending.mutation.request_id)
+                }
+                Next::Frame(_) => None,
+            };
+            state.answering_held = false;
             let reply = match next {
                 Next::Frame(message) => self.handle(&mut state, &peer, message).await,
                 Next::Prepared(ready) => {
@@ -1650,7 +1663,11 @@ impl WorkerService {
                             held = Some(ready);
                             continue;
                         }
-                        PeerState::Quiet => Some(self.dispatch_prepared(&mut state, *ready)),
+                        PeerState::Quiet => {
+                            state.answering_held =
+                                ready.pending.caller.gate_restrictions.is_some();
+                            Some(self.dispatch_prepared(&mut state, *ready))
+                        }
                     }
                 }
                 // The action held for what its client had sent, which has been acted on. The
@@ -1667,9 +1684,11 @@ impl WorkerService {
                         self.abandon_prepared(*ready);
                         continue;
                     }
+                    state.answering_held = ready.pending.caller.gate_restrictions.is_some();
                     Some(self.dispatch_prepared(&mut state, *ready))
                 }
             };
+            let answered_held = state.answering_held;
             // An accepted action to be prepared is prepared on a task of its own, for the reason a
             // launch and an upstream operation are answered on one: this socket carries the same
             // client's next keystroke, its interrupt and its keepalive, and none of them waits
@@ -1763,15 +1782,20 @@ impl WorkerService {
                 let answering_writable = writable.clone();
                 let answering_withdrawn = Arc::clone(&withdrawn);
                 tokio::spawn(async move {
+                    let (request_id, held) = (pending.request_id, pending.held);
                     let answer = service.finish_launch(pending).await;
-                    write_frame(
+                    let sent = write_frame(
                         &answering_writable,
                         &sender,
                         &answer,
                         &answering_withdrawn,
                         true,
                     )
-                    .await
+                    .await;
+                    if let Some(local) = answering_writable.local.as_ref() {
+                        local.answered(request_id, held);
+                    }
+                    sent
                 });
             }
             // An admitted operation the upstream has not answered is answered on its own task for
@@ -1783,15 +1807,20 @@ impl WorkerService {
                 let answering_writable = writable.clone();
                 let answering_withdrawn = Arc::clone(&withdrawn);
                 tokio::spawn(async move {
+                    let (request_id, held) = (pending.request_id, pending.held);
                     let answer = service.finish_upstream(pending).await;
-                    write_frame(
+                    let sent = write_frame(
                         &answering_writable,
                         &sender,
                         &answer,
                         &answering_withdrawn,
                         true,
                     )
-                    .await
+                    .await;
+                    if let Some(local) = answering_writable.local.as_ref() {
+                        local.answered(request_id, held);
+                    }
+                    sent
                 });
             }
             if let Some(reply) = reply {
@@ -1811,6 +1840,14 @@ impl WorkerService {
                 )
                 .await
                 .unwrap_or_default();
+                // Whatever came of it, a final answer to a recorded request has been dealt with:
+                // written, replaced by its refusal, or dropped with the connection. An interim
+                // keepalive is not an answer.
+                if let (Some(request_id), Some(local)) = (recorded, writable.local.as_ref())
+                    && !matches!(reply, ControlFrame::Event(_))
+                {
+                    local.answered(request_id, answered_held);
+                }
                 if let Some((action_id, gate)) = closing {
                     if written && state.client_kind == LocalClientKind::Controller {
                         // The requester is not the peer that was just written to: the daemon still
@@ -3232,23 +3269,6 @@ impl WorkerService {
         }
     }
 
-    /// Installs the authority revision the controller now holds, and fences what it removes.
-    ///
-    /// A revision is not a number to store. Section 9 makes a revocation complete only once every
-    /// worker that could still act under the removed authority has stopped being able to, so
-    /// installing one rejects every intent this worker has admitted and not yet dispatched. An
-    /// intent past its dispatch marker cannot be taken back from here, and is not claimed to be.
-    ///
-    /// The whole sequence runs inside the dispatch barrier, so a mutation cannot be admitted under
-    /// the old revision after this has begun and before it finishes. That is also what makes the
-    /// fence's two answers two answers: it reads an action either before its dispatch marker, and
-    /// rejects it, or after, and names it, never between the acceptance and the marker.
-    ///
-    /// The boundary is taken without waiting. A fence that queued for it would hold this
-    /// connection, and on a host with few threads it would hold one the dispatch it is waiting for
-    /// may need. Section 9 says what to do instead: a revocation a worker has not acknowledged is
-    /// `pending`, and the daemon announces again. So a dispatch in flight is answered with a
-    /// refusal that says to come back, which is exactly what `pending` means.
     /// Takes the control daemon's statement of what this session's local owner may do.
     ///
     /// Only the daemon's authority connection speaks for it, as only it announces an authority
@@ -3338,6 +3358,23 @@ impl WorkerService {
         }
     }
 
+    /// Installs the authority revision the controller now holds, and fences what it removes.
+    ///
+    /// A revision is not a number to store. Section 9 makes a revocation complete only once every
+    /// worker that could still act under the removed authority has stopped being able to, so
+    /// installing one rejects every intent this worker has admitted and not yet dispatched. An
+    /// intent past its dispatch marker cannot be taken back from here, and is not claimed to be.
+    ///
+    /// The whole sequence runs inside the dispatch barrier, so a mutation cannot be admitted under
+    /// the old revision after this has begun and before it finishes. That is also what makes the
+    /// fence's two answers two answers: it reads an action either before its dispatch marker, and
+    /// rejects it, or after, and names it, never between the acceptance and the marker.
+    ///
+    /// The boundary is taken without waiting. A fence that queued for it would hold this
+    /// connection, and on a host with few threads it would hold one the dispatch it is waiting for
+    /// may need. Section 9 says what to do instead: a revocation a worker has not acknowledged is
+    /// `pending`, and the daemon announces again. So a dispatch in flight is answered with a
+    /// refusal that says to come back, which is exactly what `pending` means.
     fn acknowledge_revision(
         &self,
         state: &ConnectionState,
@@ -4072,6 +4109,7 @@ impl WorkerService {
         };
         let bounded = Self::bound_by_lease(caller, allowed, restrictions);
         let caller = bounded.as_ref().unwrap_or(caller);
+        state.answering_held = allowed.is_some();
         if allowed.is_some()
             && let Some(local) = state.local.as_ref()
         {
@@ -4175,6 +4213,7 @@ impl WorkerService {
         };
         let bounded = Self::bound_by_lease(caller, allowed, restrictions);
         let caller = bounded.as_ref().unwrap_or(caller);
+        state.answering_held = allowed.is_some();
         if allowed.is_some()
             && let Some(local) = state.local.as_ref()
         {
@@ -4211,6 +4250,7 @@ impl WorkerService {
                     request_id: mutation.request_id,
                     action_id: mutation.action_id,
                     actor_id: caller.actor_id.clone(),
+                    held: caller.gate_restrictions.is_some(),
                     transaction,
                     receiver,
                 });
@@ -4232,6 +4272,7 @@ impl WorkerService {
                     request_id: mutation.request_id,
                     action_id,
                     actor_id,
+                    held: caller.gate_restrictions.is_some(),
                     handoff,
                 });
                 // Nothing is written now. The connection's loop finds the pending operation, hands
@@ -8277,6 +8318,10 @@ pub struct ConnectionState {
     pub input_sequence: u64,
     /// A close that has been admitted and whose acceptance has not yet been written.
     pub close_gate: Option<(kr_protocol::ids::ActionId, crate::runtime::CloseGate)>,
+    /// Whether the request this connection is answering now is one the local owner's lease
+    /// admitted as a held method. Set by the request that was handled, read once its answer has
+    /// been dealt with.
+    answering_held: bool,
     /// A launch this connection asked for, whose answer the reader has not given yet.
     ///
     /// The connection's own loop takes it and hands it to a task of its own, so the read loop goes
@@ -8363,6 +8408,7 @@ impl ConnectionState {
             subscribed: None,
             input_sequence: 0,
             close_gate: None,
+            answering_held: false,
             pending_launch: None,
             pending_page: None,
             pending_facts: None,
@@ -8768,13 +8814,7 @@ async fn write_frame_unless(
     protected: bool,
     abandoned: Option<&mut tokio::sync::oneshot::Receiver<()>>,
 ) -> bool {
-    let sent = write_frame_held(writable, writer, frame, withdrawn, protected, abandoned).await;
-    // Whatever came of it, the answer to a held request has been dealt with: written, replaced by
-    // its refusal, or dropped with the connection.
-    if let Some(local) = writable.local.as_ref() {
-        local.answered(frame);
-    }
-    sent
+    write_frame_held(writable, writer, frame, withdrawn, protected, abandoned).await
 }
 
 /// [`write_frame_unless`], holding a local connection's frames to the local owner's lease.
@@ -8835,6 +8875,11 @@ async fn write_frame_held(
                 .lock()
                 .expect("the connection writer is not poisoned");
             if protected && withdrawn.is_set() {
+                // A frame that was offered and has not begun is taken back, so the connection is
+                // not left part way through a frame for the refusal its caller is owed.
+                if offered && !begun {
+                    sender.withdraw_unstarted();
+                }
                 return false;
             }
             // Asked under the writer, which is also where a replacement is signalled, so the
@@ -9430,6 +9475,8 @@ pub struct PendingLaunch {
     action_id: kr_protocol::ids::ActionId,
     /// The principal that asked.
     actor_id: ActorId,
+    /// Whether the local owner's lease admitted it as a held method.
+    held: bool,
     /// The transaction.
     transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
     /// Where the reader's word arrives.
@@ -9448,6 +9495,8 @@ pub struct PendingUpstream {
     action_id: kr_protocol::ids::ActionId,
     /// The principal that asked.
     actor_id: ActorId,
+    /// Whether the local owner's lease admitted it as a held method.
+    held: bool,
     /// The admitted operation and what recording it means.
     handoff: Box<UpstreamHandoff>,
 }

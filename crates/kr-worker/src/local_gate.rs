@@ -441,22 +441,21 @@ impl LocalWrites {
         }
     }
 
-    /// Notes that a response has been dealt with, written or replaced. With both kinds of request
-    /// of the identifier waiting, the one that is counted off is a request that does not answer to
-    /// the lease: the held one's mark outlives every answer that might be its own.
-    pub fn answered(&self, frame: &ControlFrame) {
-        let ControlFrame::Response(response) = frame else {
-            return;
-        };
+    /// Notes that the final answer to a request recorded here has been dealt with, written or
+    /// replaced, and says which kind of request it was. The count that goes down is that kind's:
+    /// the request itself knows whether the lease admitted it as a held method, so a request of
+    /// another kind under the same identifier is never counted off for it. A response to a frame
+    /// that carries no recorded request counts nothing off.
+    pub fn answered(&self, request_id: RequestId, held: bool) {
         let mut waiting = self.waiting();
-        if let Some(entry) = waiting.get_mut(&response.request_id) {
-            if entry.free > 0 {
-                entry.free -= 1;
-            } else {
+        if let Some(entry) = waiting.get_mut(&request_id) {
+            if held {
                 entry.held = entry.held.saturating_sub(1);
+            } else {
+                entry.free = entry.free.saturating_sub(1);
             }
             if entry.held == 0 && entry.free == 0 {
-                waiting.remove(&response.request_id);
+                waiting.remove(&request_id);
             }
         }
     }
@@ -637,28 +636,42 @@ mod tests {
     }
 
     /// A client may reuse a request identifier, and an answer cannot say which request it answers.
-    /// While a held request waits under an identifier, no answer of that identifier is taken for a
-    /// request that is not held, so a held request's answer is never written for want of its mark.
+    /// While a held request waits under an identifier, no answer of that identifier is taken for
+    /// a request that is not held, and a request of the other kind that ends first counts off its
+    /// own kind only, so a held request's answer is never written for want of its mark and no
+    /// mark outlives the requests it was made for.
     #[test]
-    fn the_answer_of_a_request_that_is_not_held_does_not_clear_a_held_requests_mark() {
+    fn a_request_counts_off_its_own_kind_and_a_held_requests_mark_outlives_the_others() {
         let gate = Arc::new(gate());
         gate.apply(generation(1), statement(1, LocalBound::Closed));
         let writes = LocalWrites::new(Arc::clone(&gate), Arc::new(|| {}));
         writes.set_local(true);
-        // A held request waits for a launch; a request of the same identifier that is not held is
-        // read and answered meanwhile.
+        // A held request waits for a launch; a request of the same identifier that is not held
+        // is read and answered meanwhile.
         writes.free_request(RequestId::new(7));
         writes.hold_request(RequestId::new(7));
         writes.free_request(RequestId::new(7));
-        writes.answered(&response(7));
+        writes.answered(RequestId::new(7), false);
         assert!(
             matches!(writes.verdict(&response(7)), Verdict::Replace(_)),
             "the held request's answer, written after the end, is replaced"
         );
-        writes.answered(&response(7));
+        writes.answered(RequestId::new(7), true);
         assert!(
             matches!(writes.verdict(&response(7)), Verdict::Write),
             "and once every request of the identifier is answered nothing is held under it"
         );
+
+        // The held request ends first: the one that is not held is left, and is not taken for it.
+        writes.free_request(RequestId::new(9));
+        writes.hold_request(RequestId::new(9));
+        writes.free_request(RequestId::new(9));
+        writes.answered(RequestId::new(9), true);
+        assert!(
+            matches!(writes.verdict(&response(9)), Verdict::Write),
+            "what is left under the identifier is a request that is not held"
+        );
+        writes.answered(RequestId::new(9), false);
+        assert!(matches!(writes.verdict(&response(9)), Verdict::Write));
     }
 }

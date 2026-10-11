@@ -672,9 +672,11 @@ async fn a_statement_that_takes_access_away_withdraws_what_a_local_connection_ho
     world.close();
 }
 
-/// KR-REQ-17.54: a lease that runs out while a stream is open ends the stream with no word from
-/// the daemon: the first frame the worker may not write is not written, and the connection's
-/// holdings are withdrawn, so the input lease it held is released.
+/// KR-REQ-17.54: a lease that runs out while a stream is open ends what the connection holds with
+/// no word from the daemon: the first frame the worker may not write is not written and the
+/// connection's holdings are withdrawn, so the input lease it held is released. What the test
+/// shows is the release; that no frame follows the end is the writer's rule, shown beside the
+/// request-identifier cases in the gate's own tests.
 ///
 /// The shell prints a line every second, so the stream has a next frame to refuse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
