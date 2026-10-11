@@ -110,6 +110,9 @@ impl Server {
     /// The command itself goes first and its group after it. A command that has not yet made its
     /// session has no group to end, and ending it first is what leaves nothing for it to start.
     async fn finish(&mut self) -> ! {
+        // Said first, where a test that wants to know the server ended its commands itself, and
+        // was not killed before it could, reads it.
+        eprintln!("stand-in: ending its commands");
         for started in &mut self.commands {
             let leader = started.child.id().and_then(|pid| i32::try_from(pid).ok());
             let _ = started.child.start_kill();
@@ -354,13 +357,30 @@ async fn terminated(terminate: &mut Signal) {
 pub async fn run(variants: Variants) -> ! {
     let mut terminate = signal(SignalKind::terminate()).expect("a handler for terminate");
     let contract = Contract::pinned();
+    if variants.report_environment {
+        eprintln!(
+            "stand-in: directory {}",
+            std::env::current_dir().unwrap_or_default().display()
+        );
+        for (name, value) in std::env::vars_os() {
+            eprintln!(
+                "stand-in: variable {}={}",
+                name.to_string_lossy(),
+                value.to_string_lossy()
+            );
+        }
+        eprintln!("stand-in: environment reported");
+    }
     if variants.flood_stderr {
         tokio::task::spawn_blocking(|| {
-            let line = format!("{}\n", "stand-in noise ".repeat(64));
+            // Numbered, so that what is kept of it can be told from what came first.
             let mut written = 0_usize;
+            let mut number = 0_u32;
             while written < 16 << 20 {
+                let line = format!("stand-in noise {number} {}\n", "x".repeat(900));
                 eprint!("{line}");
                 written += line.len();
+                number += 1;
             }
         });
     }
@@ -382,6 +402,9 @@ pub async fn run(variants: Variants) -> ! {
                 if !ignore_term {
                     server.finish().await;
                 }
+                if server.variants.spawn_late {
+                    server.start_command();
+                }
             }
             line = lines.next_line() => match line {
                 Ok(Some(line)) if line.trim().is_empty() => {}
@@ -395,10 +418,16 @@ pub async fn run(variants: Variants) -> ! {
                 Ok(None) | Err(_) => {
                     if server.variants.ignore_eof {
                         // The input has ended and the server goes on, still answering a terminate.
+                        if server.variants.spawn_late {
+                            server.start_command();
+                        }
                         loop {
                             terminated(&mut terminate).await;
                             if !ignore_term {
                                 server.finish().await;
+                            }
+                            if server.variants.spawn_late {
+                                server.start_command();
                             }
                         }
                     }
