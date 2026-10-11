@@ -63,11 +63,11 @@ impl Default for LocalPace {
     }
 }
 
-/// The methods whose answer the registry keeps under the actor's action, in its receipts, and
-/// that the local route answers again to a repeat. The stored-formats table pairs each with the
-/// type of the answer it keeps, so an answer kept here whose type the table does not name fails the
-/// lock's checks. A method only a paired device's route claims is in
-/// [`RETAINED_DEVICE_ANSWERS`].
+/// The methods whose answer the registry keeps under the actor's action, in its receipts, and that
+/// the local route looks up before it admits a call, so that a repeat is answered from the record.
+/// The stored-formats table pairs each with the type of the answer it keeps, so an answer kept here
+/// whose type the table does not name fails the lock's checks. A kept answer that lookup does not
+/// cover is in [`RETAINED_DEVICE_ANSWERS`].
 pub const RETAINED_AUTHORITY_ANSWERS: [Method; 19] = [
     Method::GrantCreate,
     Method::GrantRedeem,
@@ -90,9 +90,10 @@ pub const RETAINED_AUTHORITY_ANSWERS: [Method; 19] = [
     Method::HostUpdateHandover,
 ];
 
-/// The methods only a paired device's route claims, whose answer the registry keeps in the same
-/// receipts and answers again to a repeat on that route. The stored-formats table pairs each with
-/// the type of the answer it keeps, as it does the methods above.
+/// The methods whose answer the registry keeps in the same receipts and that the local route's
+/// lookup does not cover: a paired device's route claims them and answers a repeat. The
+/// stored-formats table pairs each with the type of the answer it keeps, as it does the methods
+/// above.
 pub const RETAINED_DEVICE_ANSWERS: [Method; 1] = [Method::DevicePushRegister];
 
 /// The methods whose answer the machine group's record keeps, in the same store, and answers again to

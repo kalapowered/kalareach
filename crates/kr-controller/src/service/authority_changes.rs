@@ -93,8 +93,10 @@ impl Controller {
     ///
     /// Every method that claims here is one of [`super::RETAINED_AUTHORITY_ANSWERS`] or
     /// [`super::RETAINED_DEVICE_ANSWERS`], which the stored-formats table pairs with the type of the
-    /// answer the claim keeps: a method that claims without being listed fails the first test that
-    /// runs it, so no answer the registry keeps is left out of the table.
+    /// answer the claim keeps: in a build with debug assertions, a method that claims here without
+    /// being listed fails the first test that runs it. The other paths that claim in the same
+    /// receipts (`claimed_action`, a device's session rename, the voice and machine group flows)
+    /// do not pass through this check.
     fn claim_authority_change(
         &self,
         actor_id: &ActorId,
