@@ -53,7 +53,7 @@ pub use kr_shell_integration::host::command::lookup_name;
 use crate::broker::PackageIdentity;
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
 use crate::broker::framing::Framing;
-use crate::broker::gateway::{MAX_NATIVE_FRAME_BYTES, native_class};
+use crate::broker::gateway::native_class;
 
 /// The command an integration resolves, the flags it adds to an invocation of it and the variables
 /// it sets for that invocation, as the verified manifest declares them.
@@ -142,8 +142,6 @@ pub struct NativeTables {
     /// How a connection over these tables frames, with the bound the package declares held to
     /// what the host carries.
     pub framing: Framing,
-    /// True when the package declares a bound above what the host carries, and the host's holds.
-    pub frame_limit_clamped: bool,
 }
 
 /// A connector read from its installed package, and checked.
@@ -514,7 +512,6 @@ impl InstalledConnector {
                 NativeFraming::JsonLines,
                 usize::try_from(declared).unwrap_or(usize::MAX),
             ),
-            frame_limit_clamped: declared > MAX_NATIVE_FRAME_BYTES as u64,
         })
     }
 
