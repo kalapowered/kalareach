@@ -342,12 +342,14 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
 }
 
 /// KR-REQ-26.13, KR-REQ-26.14: a daemon that starts over a configuration document it cannot use
-/// reaches the managed account service no more than it reaches the other routes. The sign-in an
-/// earlier daemon kept, which a direct route would sign out at the service, is signed out nowhere
-/// and the service hears nothing; once the document is put right and the daemon has started again,
-/// the same sign-in reaches the service.
+/// reaches the managed account service no more than it reaches the other routes, and keeps the
+/// account local. The sign-in an earlier daemon kept still shows, signing in again is refused
+/// naming the document, and signing out removes the grant and sends nothing: its revocation waits,
+/// and goes to the service when a daemon next starts over a document it can use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_daemon_started_over_a_document_it_cannot_use_reaches_no_account_service() {
+async fn a_daemon_started_over_a_document_it_cannot_use_keeps_the_account_local() {
+    use kr_protocol::host_account::{AccountState, SignInUnavailable};
+
     let (service_origin, _, service) = unreached();
     let host = kr_ipc::testing::TempHost::create();
     let environment = host.environment();
@@ -374,38 +376,54 @@ async fn a_daemon_started_over_a_document_it_cannot_use_reaches_no_account_servi
     write_bytes(&environment, br#"{"version": 99}"#, 0o600);
     let controller =
         start_with_account_at(&service_origin, &environment, host.environment_id()).await;
-    let refused = tokio::time::timeout(WATCHDOG, controller.host_account().sign_out())
-        .await
-        .expect("the sign-out ends: it reached no service")
-        .expect_err("a host over an unusable document signs out nowhere");
+    let account = controller.host_account();
+    let report = account.report();
     assert!(
-        matches!(refused, kr_controller::ControllerError::NotConfigured(_)),
-        "{refused:?}"
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the grant the host keeps still shows: {report:?}"
+    );
+    assert_eq!(
+        report.unavailable.as_ref().copied(),
+        Some(SignInUnavailable::NotUsable)
+    );
+    let refused = account
+        .sign_in()
+        .await
+        .expect_err("a sign-in is refused over a document the host cannot use");
+    assert!(
+        matches!(&refused, kr_controller::ControllerError::NotConfigured(text)
+            if text.contains("config.json")),
+        "the refusal names the document: {refused:?}"
+    );
+    let done = tokio::time::timeout(WATCHDOG, account.sign_out())
+        .await
+        .expect("the sign-out ends")
+        .expect("the grant is removed here");
+    assert!(done.was_signed_in, "the grant the host kept is removed");
+    assert!(
+        !done.service_told,
+        "and its revocation waits: the service is not told"
+    );
+    assert!(
+        matches!(account.report().state, AccountState::SignedOut),
+        "the account is gone from this host"
     );
     heard_nothing(&service);
     drop(controller);
 
-    // The control: over the document put right, the same sign-in reaches the service.
+    // The control: over the document put right, the next daemon sends the revocation that waited.
     write_document(&environment, &usable);
     let restarted =
         start_with_account_at(&service_origin, &environment, host.environment_id()).await;
-    let account = restarted.host_account().clone();
-    let signing_out = tokio::spawn(async move { account.sign_out().await });
-    let began = std::time::Instant::now();
-    loop {
-        match service.accept() {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    began.elapsed() < WATCHDOG,
-                    "the sign-out never reached the service"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(error) => panic!("the listener: {error}"),
-        }
-    }
-    signing_out.abort();
+    service
+        .set_nonblocking(true)
+        .expect("a listener to wait on");
+    let service = tokio::net::TcpListener::from_std(service).expect("a listener");
+    tokio::time::timeout(WATCHDOG, service.accept())
+        .await
+        .expect("the revocation that waited reaches the service")
+        .expect("a connection");
+    drop(restarted);
 }
 
 /// Fetches `address` through `transport` and reads the whole answer: the stream the transport always
@@ -514,24 +532,14 @@ async fn start_with_account_at(
 }
 
 /// Starts a daemon in-process on `environment`, launching no worker. A daemon dropped a moment ago
-/// holds the environment until its tasks have ended, so a start that meets it is made again until
-/// the watchdog ends.
+/// holds the environment until its tasks have ended, so the start is made again while it does.
 async fn start_controller(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: kr_protocol::ids::EnvironmentId,
 ) -> std::sync::Arc<kr_controller::service::Controller> {
-    let began = std::time::Instant::now();
-    loop {
-        match start_controller_once(environment, environment_id).await {
-            Ok(controller) => return controller,
-            Err(kr_controller::ControllerError::AlreadyRunning { .. })
-                if began.elapsed() < WATCHDOG =>
-            {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("the daemon starts: {error:?}"),
-        }
-    }
+    kr_controller::testing::taken_over(|| start_controller_once(environment, environment_id))
+        .await
+        .expect("the daemon starts")
 }
 
 async fn start_controller_once(

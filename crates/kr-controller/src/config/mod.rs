@@ -327,7 +327,8 @@ impl InForce {
 /// While one is in force the host takes the narrowest value of each preference and selection: its
 /// descriptions are off, it creates no new session (the owner's choice between the two worker
 /// profiles is in the document, and neither is inside the other), and its proxy-bound transports
-/// are closed from the next start. What the host accepted from the document before stays in force.
+/// are closed from the next start. The restrictions the host accepted from the document before stay
+/// in force.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unusable {
     /// How the document turned out.
@@ -1285,17 +1286,18 @@ pub fn network_check(
     let unusable_now = loaded.fails_closed();
     if started.unusable.is_some() {
         detail = detail.stated(
-            "; this host started over a configuration document it could not use, so nothing it \
-             sends goes through a proxy until it starts again over one it can use",
+            "; this host started over a configuration document it could not use, so it sends \
+             nothing through a proxy and nothing around one until it starts again over one it \
+             can use",
         );
     }
     if moved {
         detail = detail.stated(if unusable_now {
             "; the configuration document cannot be used now, so the next start closes the \
-             network, the voice broker, storage and every route through a proxy"
+             network, the voice broker, storage and every route a proxy governs"
         } else if started.unusable.is_some() {
-            "; the configuration document can be used now, so what it selects and the routes \
-             through a proxy open at the next start"
+            "; the configuration document can be used now, so what it selects and every route a \
+             proxy governs open at the next start"
         } else {
             "; the configuration document now selects a different network, voice broker or storage \
              service from the one this host started with, which applies at the next start"

@@ -78,23 +78,49 @@ impl Controller {
         if storage.is_some() {
             scopes.push(kr_client::services::account::BACKUP_WRITE_SCOPE);
         }
-        let refused = match (broker, storage) {
-            (_, Some(_)) => None,
-            (None, None) => Some(SignInUnavailable::NoManagedService),
-            (Some(broker), None) if broker == origin => None,
-            (Some(_), None) => Some(SignInUnavailable::BrokerIsAnotherService),
+        let route = Self::outbound_of(started);
+        let closed = match &route {
+            Ok(crate::config::Outbound::Closed(refusal)) => Some(refusal.clone()),
+            _ => None,
+        };
+        // A host over a document it cannot use selects nothing, so it would read as naming no
+        // service; it is the document that stands in the way, and the refusals say so.
+        let refused = if closed.is_some() {
+            Some(SignInUnavailable::NotUsable)
+        } else {
+            match (broker, storage) {
+                (_, Some(_)) => None,
+                (None, None) => Some(SignInUnavailable::NoManagedService),
+                (Some(broker), None) if broker == origin => None,
+                (Some(_), None) => Some(SignInUnavailable::BrokerIsAnotherService),
+            }
         };
         let service = GatewayOrigin::new(&origin)
             .map_err(|error| unusable(&format_args!("the account service: {error}")))
             .and_then(|gateway| {
-                let proxy = Self::outbound_of(started)
-                    .and_then(|route| route.proxy().map(|proxy| proxy.cloned()))
-                    .map_err(|error| unusable(&error))?;
-                let transport = Arc::new(crate::managed_transport::ManagedTransport::new(
-                    gateway,
-                    proxy,
-                    kr_client::services::HttpDeadlines::default(),
-                ));
+                // Over a closed route the account the host keeps is still read and ended here, and
+                // nothing is sent: what is owed to the service waits for the route.
+                let transport: Arc<dyn kr_client::services::AccountHttp> = match route {
+                    Ok(crate::config::Outbound::Closed(refusal)) => {
+                        eprintln!("kr-controller: no request to the account service: {refusal}");
+                        Arc::new(crate::managed_transport::ClosedTransport)
+                    }
+                    Ok(crate::config::Outbound::Through(proxy)) => {
+                        Arc::new(crate::managed_transport::ManagedTransport::new(
+                            gateway,
+                            Some(proxy),
+                            kr_client::services::HttpDeadlines::default(),
+                        ))
+                    }
+                    Ok(crate::config::Outbound::Direct) => {
+                        Arc::new(crate::managed_transport::ManagedTransport::new(
+                            gateway,
+                            None,
+                            kr_client::services::HttpDeadlines::default(),
+                        ))
+                    }
+                    Err(error) => return Err(unusable(&error)),
+                };
                 Ok(crate::account::Service {
                     scopes,
                     account: Arc::new(kr_client::services::ManagedAccountService::at_origin(
@@ -103,6 +129,7 @@ impl Controller {
                         kr_client::services::account::Client::Desktop,
                     )),
                     origin: origin.clone(),
+                    closed,
                 })
             });
         Ok(crate::account::HostAccount::new(

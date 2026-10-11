@@ -196,7 +196,8 @@ fn lines(report: &AccountReport) -> Vec<Line> {
         )),
         (_, Some(SignInUnavailable::NotUsable)) => lines.push(stdout_line!(
             "This host cannot reach the managed account service the way its configuration says: \
-             the daemon's log says why."
+             when its configuration document cannot be used, `kr doctor` says how to put it \
+             right; otherwise the daemon's log says why."
         )),
         (_, Some(SignInUnavailable::NoManagedService)) | (None, None) => lines.push(stdout_line!(
             "This host names no managed service: set voice.broker_origin or storage.origin in its \
