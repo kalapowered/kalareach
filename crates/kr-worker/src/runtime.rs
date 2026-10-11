@@ -1518,6 +1518,14 @@ impl SessionRuntime {
         self.sink.flush(&self.domain);
     }
 
+    /// Notes that something happened that may have started a process the session owns, so the
+    /// supervision looks at the boundary shortly after this rather than on a clock.
+    pub fn note_activity(&self) {
+        // The mark is flags and a wake-up and takes no lock, so it is made from wherever this is
+        // called, whatever the caller holds.
+        self.sink.activity.note();
+    }
+
     /// Admits a close and returns the acceptance, before anything is signalled.
     ///
     /// The returned gate starts the termination sequence. The caller releases it **after** the
