@@ -1399,17 +1399,18 @@ fn signer_still_authorised(
                     environment_id,
                     exclusive: true,
                     ceiling,
-                } if !crate::grants::an_owner_device_can_recover(
-                    transaction,
-                    environment_id,
-                    ceiling.as_ref(),
-                )? =>
+                } if proof.request.action == SensitiveAction::ChangeHostAuthority
+                    && !crate::grants::an_owner_device_can_recover(
+                        transaction,
+                        environment_id,
+                        ceiling.as_ref(),
+                    )? =>
                 {
                     Ok(())
                 }
                 TerminalStanding::Recovery { .. } => Err(lapsed(
-                    "a device that can confirm for this host exists, or the host is not exclusively \
-                     organisation-managed, so the terminal no longer confirms its end",
+                    "the terminal confirms only the end of exclusive organisation management, and \
+                     only while the host is exclusive and no device that can confirm for it is left",
                 )),
                 TerminalStanding::Bootstrap => Err(lapsed(
                     "this host has an owner, so the terminal bootstrap no longer confirms anything",
