@@ -115,6 +115,7 @@ impl Credential {
     /// Returns true when `other` is this credential, compared in constant time.
     ///
     /// For two holders inside the broker: the value is not read out to be compared.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) fn is_same_as(&self, other: &Self) -> bool {
         kr_crypto::constant_time_eq(self.secret.expose(), other.secret.expose())
@@ -311,6 +312,7 @@ impl ManagedProcess {
     /// Returns true when `exchange` is this launch's private exchange and `process` is the process
     /// the launch started: the two halves of [`ManagedProcess::authenticates`], for a holder of the
     /// launch's credential that is inside the broker.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) fn authenticates_launch(
         &self,
