@@ -193,7 +193,8 @@ impl Drop for ClaimHold {
     }
 }
 
-/// How many grants one delegation tree may hold that are not revoked, proposals included.
+/// How many grants one delegation tree may hold that are not revoked or are revoked with their
+/// fence still owed, proposals included.
 ///
 /// A revocation reaches at most one tree, and what it reaches is told to each worker by name in
 /// one notice, which holds at most this many names ([`kr_protocol::worker::MAX_REVISION_REACH_NAMES`],
@@ -745,6 +746,7 @@ impl GrantDirectory {
                 self.passed_at_effect(parent, expiry, at, parent_anchor, &ran_out)
             })?;
             still_admitted()?;
+            let now_ms = next_moment(connection, now_ms)?;
             let revocation = match (replaced, subtree) {
                 (Some(grant_id), Some(subtree)) => Some(Self::revoke_subtree(
                     connection,
@@ -874,6 +876,7 @@ impl GrantDirectory {
             // holds, so a check made before it is a check with a read still to come.
             let subtree = Self::subtree_to_revoke(connection, grant_id)?;
             still_admitted()?;
+            let now_ms = next_moment(connection, now_ms)?;
             let revocation = Self::revoke_subtree(
                 connection,
                 grant_id,
@@ -954,6 +957,7 @@ impl GrantDirectory {
             still_admitted()?;
             // One change, one debt, however many subtrees it withdraws.
             let covers = format!("the revocation of device {device_id}'s grants");
+            let now_ms = next_moment(connection, now_ms)?;
             let mut debt = None;
             for (grant_id, subtree) in &subtrees {
                 let one = Self::revoke_subtree(
@@ -987,6 +991,7 @@ impl GrantDirectory {
         covers: &str,
     ) -> Result<GrantRevocation> {
         let subtree = Self::subtree_to_revoke(connection, grant_id)?;
+        let now_ms = next_moment(connection, now_ms)?;
         Self::revoke_subtree(connection, grant_id, &subtree, now_ms, &mut None, covers)
     }
 
@@ -1024,14 +1029,6 @@ impl GrantDirectory {
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
         let owed = moments_a_fence_is_owed(connection)?;
-        // A change is told apart from the fences still owed by the moment it revokes at, which is
-        // after every moment a fence on disk was recorded at: a clock stepped back, or a second
-        // change in the same millisecond, would otherwise let an unrelated debt stand for a
-        // grant whose own fence is done.
-        let now_ms = owed
-            .iter()
-            .next_back()
-            .map_or(now_ms, |latest| now_ms.max(latest.saturating_add(1)));
         let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
         for record in subtree {
             if record.is_active()
@@ -1487,7 +1484,10 @@ impl GrantDirectory {
     ///
     /// Returns a storage error when the row cannot be written.
     pub fn owe_fence(&self, covers: &str, now_ms: u64) -> Result<DebtId> {
-        self.in_transaction(|connection| owe_within(connection, covers, now_ms))
+        self.in_transaction(|connection| {
+            let moment = next_moment(connection, now_ms)?;
+            owe_within(connection, covers, moment)
+        })
     }
 
     /// Returns every fence debt on disk, oldest first.
@@ -2253,7 +2253,8 @@ fn check_parent(
     Ok(())
 }
 
-/// How many grants of the delegation tree `member` belongs to are not revoked, proposals included.
+/// How many grants of the delegation tree `member` belongs to are not revoked, or are revoked with
+/// their fence still owed, proposals included: the grants a revocation of the tree can reach.
 ///
 /// The tree is everything below the grant that has no parent in this store, found from `member` up
 /// and counted from there down, in the store, without reading a grant.
@@ -2272,7 +2273,9 @@ fn live_in_tree(connection: &Connection, member: GrantId) -> Result<usize> {
                  SELECT g.grant_id FROM grants g JOIN down ON g.parent_grant_id = down.id
              )
              SELECT COUNT(*) FROM grants
-              WHERE revoked_at_ms IS NULL AND grant_id IN (SELECT id FROM down)",
+              WHERE grant_id IN (SELECT id FROM down)
+                AND (revoked_at_ms IS NULL
+                     OR revoked_at_ms IN (SELECT recorded_at_ms FROM fence_debt))",
             params![member.get().as_bytes().as_slice()],
             |row| row.get(0),
         )
@@ -2285,8 +2288,8 @@ fn tree_is_full() -> ControllerError {
     ControllerError::Refused {
         code: kr_protocol::error::ErrorCode::QuotaExceeded,
         detail: format!(
-            "this share already has {MAX_GRANTS_PER_TREE} grants delegated from it, which is the \
-             most one share can hold; withdraw some of them first"
+            "a share holds at most {MAX_GRANTS_PER_TREE} grants, counting itself and everything \
+             delegated from it; withdraw some of them first"
         ),
     }
 }
@@ -3020,6 +3023,33 @@ fn read_row(row: &rusqlite::Row<'_>) -> Row {
 /// and owes its fence as any other does.
 fn owes_a_fence(grant: &Grant) -> bool {
     !grant.permits(kr_protocol::rights::ActionRight::VoiceUse)
+}
+
+/// The moment a change is made at: `now_ms`, or the one after every moment a grant was revoked at
+/// and a fence debt was recorded at, whichever is later.
+///
+/// A grant is matched to the fence that is still owed for it by the moment it was revoked at, which
+/// is the moment its change recorded its debt at. Moments no two changes share keep that match
+/// exact: a second change in the same millisecond, a clock stepped back, or a debt written after
+/// another change's was completed cannot stand for a grant whose own fence is done.
+fn next_moment(connection: &Connection, now_ms: u64) -> Result<u64> {
+    let latest: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(moment) FROM (
+                 SELECT MAX(revoked_at_ms) AS moment FROM grants
+                 UNION ALL
+                 SELECT MAX(recorded_at_ms) FROM fence_debt
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    let latest = latest.map_or(0, |moment| u64::try_from(moment).unwrap_or_default());
+    Ok(if latest >= now_ms {
+        latest.saturating_add(1)
+    } else {
+        now_ms
+    })
 }
 
 /// The moments the fence debts still on disk were recorded at, in milliseconds.

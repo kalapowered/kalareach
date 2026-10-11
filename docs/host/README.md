@@ -4906,12 +4906,13 @@ session is queried for the preview text, so that what a device is shown of a ses
 what the grant it delegates from reaches. The grant written authorises nothing until the device it
 names redeems it, and it ends with its parent.
 
-A share holds at most 4,096 grants that are not revoked, counting the share itself, everything
-delegated from it however far down, and invitations not yet redeemed. `grant.create` refuses the
-grant after the last with a `QUOTA_EXCEEDED` error that states the limit, and `grant.redeem` refuses
-an invitation into a share that holds more, which only a share from before the limit can.
-Withdrawing a grant gives its room back. The limit lets one revocation tell each worker, grant by
-grant and in one notice, exactly whose input to end.
+A share holds at most 4,096 grants that are not revoked or are revoked with their fence still owed,
+counting the share itself, everything delegated from it however far down, and invitations not yet
+redeemed. `grant.create` refuses the grant after the last with a `QUOTA_EXCEEDED` error that states
+the limit, and `grant.redeem` refuses an invitation into a share that holds more, which only a share
+from before the limit can. Withdrawing a grant gives its room back once the fence it owed is done.
+The limit lets one revocation tell each worker, grant by grant and in one notice, exactly whose
+input to end.
 
 A device revokes with `grant.revoke` whatever descends from a grant it holds, however far down. The
 revocation is decided under that grant, and a share revoked while the request waits is caught where
