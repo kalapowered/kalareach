@@ -1694,6 +1694,7 @@ impl Controller {
             let notice = self.revision_notice(
                 revision,
                 held,
+                session_id,
                 0,
                 &link.client().acknowledgement().capabilities,
             );

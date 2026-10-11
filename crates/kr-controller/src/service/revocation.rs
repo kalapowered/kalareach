@@ -132,7 +132,10 @@ impl Controller {
             .map(|debt| {
                 (
                     debt,
-                    Reach::Grants(revocation.reached.iter().copied().collect()),
+                    Reach::Grants {
+                        grants: revocation.reached.iter().copied().collect(),
+                        sessions: revocation.reached_in.clone(),
+                    },
                 )
             })
             .collect()

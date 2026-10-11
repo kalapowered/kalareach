@@ -1200,10 +1200,12 @@ fn a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_red
 }
 
 /// KR-REQ-10.45: what a revocation reaches is every grant of its subtree that can still hold input
-/// at a worker, each with the device it was issued to, and no more. A grant revoked earlier, whose
-/// fence is done, one that ran out and a proposal nobody redeemed are not in it, so a subtree's old
-/// rows do not widen a fence; a grant a concurrent revocation withdrew a moment before is, for as
-/// long as that revocation's debt is on disk.
+/// at a worker, each with the device it was issued to, in the sessions they cover, and no more. A
+/// grant revoked earlier whose fence is done and a proposal nobody redeemed are not in it, so a
+/// subtree's old rows do not widen a fence, whatever other fence is owed meanwhile; a grant a
+/// concurrent revocation withdrew a moment before is, for as long as that revocation's debt is on
+/// disk; and one that has run out by this host's clock is, since the worker takes its lease at its
+/// own deadline on its own clock.
 #[test]
 fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_device() {
     let now = kr_ipc::now_ms().get();
@@ -1214,8 +1216,8 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
     let runs_out = GrantExpiry::At {
         expires_at_ms: TimestampMs::new(now + DAY_MS),
     };
-    // The subtree below the root: two live children held by two devices, one that runs out after a
-    // day, one revoked in each test, and a proposal.
+    // The subtree below the root: two live children held by two devices, one revoked in each test,
+    // one that runs out after a day, and a proposal.
     let build = |directory: &GrantDirectory| {
         let root = grant(1, None, VIEW, GrantExpiry::Never);
         directory.issue(&record(root), || Ok(())).expect("root");
@@ -1242,16 +1244,20 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
             .collect::<std::collections::BTreeMap<_, _>>()
     };
 
-    // Grant 4 is revoked and its fence completed: nothing is owed for it. A day and more later
-    // grant 5 has run out, and the worker takes its lease at its deadline.
+    // Grant 4 is revoked and its fence completed, while a fence that is another change's stays
+    // owed: nothing is owed for grant 4, and the other debt does not bring it back.
     let directory = GrantDirectory::in_memory().expect("a grant store");
     build(&directory);
+    directory
+        .owe_fence("another change", now - 5_000)
+        .expect("another change owes a fence");
     let early = directory
         .revoke(grant_id(4), now - 3_000, || Ok(()))
         .expect("the child is revoked");
     directory
         .fence_completed(&early.debt.into_iter().collect::<Vec<_>>())
         .expect("its fence is done");
+    // Two days on, grant 5 has run out by this clock; the worker's is not this one.
     let revocation = directory
         .revoke(grant_id(1), now + 2 * DAY_MS, || Ok(()))
         .expect("the root is revoked");
@@ -1261,11 +1267,17 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
             (grant_id(1), device_id(0xf1)),
             (grant_id(2), device_id(0x21)),
             (grant_id(3), device_id(0x22)),
+            (grant_id(5), device_id(0x24)),
         ]
         .into_iter()
         .collect(),
-        "the live ones, each with the device it was issued to: not the one revoked and fenced, the \
-         one that ran out or the proposal"
+        "the live ones, each with the device it was issued to, and one that has run out: not the \
+         one revoked and fenced, or the proposal"
+    );
+    assert_eq!(
+        revocation.reached_in,
+        kr_controller::grants::SessionScope::These([session_id(0xa0)].into_iter().collect()),
+        "in the session the grants cover"
     );
 
     // The same with grant 4 revoked a moment before and its fence still owed.
@@ -1289,6 +1301,19 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
         .into_iter()
         .collect(),
         "a grant revoked a moment before, whose fence is owed, is reached; the proposal is not"
+    );
+
+    // A revocation of a grant that has run out is a revocation that reaches it: the debt it writes
+    // is for a grant in the list, so a fence is never owed for nothing.
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    build(&directory);
+    let revocation = directory
+        .revoke(grant_id(5), now + 2 * DAY_MS, || Ok(()))
+        .expect("the grant that ran out is revoked");
+    assert!(revocation.debt.is_some());
+    assert_eq!(
+        reached(&revocation),
+        [(grant_id(5), device_id(0x24))].into_iter().collect()
     );
 
     // Revoking the device that holds the root takes its grants and everything delegated from them,
