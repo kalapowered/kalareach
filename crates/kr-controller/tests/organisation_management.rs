@@ -1592,13 +1592,14 @@ async fn a_refused_write_ends_exclusive_management_in_neither_the_policy_nor_the
         .await
         .expect("the owner makes the host exclusive");
 
-    let end = |client: &mut kr_ipc::client::LocalClient| {
+    let end = async |client: &mut kr_ipc::client::LocalClient| {
         calls::mutate::<_, OrganisationExclusiveSetResult>(
             fixture.host.environment_id,
             client,
             Method::OrganisationExclusiveSet,
             &OrganisationExclusiveSetParams { exclusive: false },
         )
+        .await
     };
     let confirm_ending = async |client: &mut kr_ipc::client::LocalClient| {
         calls::confirm_subject(
