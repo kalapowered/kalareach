@@ -4856,7 +4856,12 @@ async fn a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_wi
                 .revoked_at_ms
         })
         .collect();
-    assert_eq!(moments[0], moments[1], "both withdrawals carry one moment");
+    // The clock is behind the floor, so both withdrawals are made at moments the floor holds up;
+    // each change has a moment of its own, and the earlier withdrawal is the one before.
+    assert!(
+        moments[0].is_some() && moments[0] < moments[1],
+        "both are withdrawn, the earlier first: {moments:?}"
+    );
     assert!(!first.revoked_grants.contains(&earlier.grant_id));
     drop(client);
     host.forget_answer(action_id);
