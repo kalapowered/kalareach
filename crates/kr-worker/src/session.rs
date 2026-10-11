@@ -1287,6 +1287,16 @@ impl Session {
         }
     }
 
+    /// Makes every write of the record of the session's processes fail from now on, for this
+    /// host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn refuse_owned_writes(&mut self) {
+        self.start_owned_writer();
+        if let Some(writer) = self.owned_writer.as_ref() {
+            writer.refuse_writes();
+        }
+    }
+
     /// Starts the thread that writes the record, if there is none and the journal is a file. A
     /// thread that cannot be started is noted as something this host could not establish, and
     /// is tried again at the next observation.
