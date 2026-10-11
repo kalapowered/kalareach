@@ -242,6 +242,23 @@ pub fn configured_rights(ceilings: &ConfigurationCeilings) -> Option<CanonicalSe
     })
 }
 
+/// `grant` as every decision sees it under `ceiling`: carrying only the rights the ceiling names.
+///
+/// This is the one place a ceiling narrows a grant. A question about what a device can do under the
+/// ceiling in force asks it of this grant, so it cannot answer otherwise than a request would.
+#[must_use]
+pub fn narrowed_by(grant: &Grant, ceiling: &CanonicalSet<ActionRight>) -> Grant {
+    Grant {
+        actions: grant
+            .actions
+            .iter()
+            .copied()
+            .filter(|right| ceiling.contains(right))
+            .collect(),
+        ..grant.clone()
+    }
+}
+
 /// Decides one request against a grant, this host's policy and the rights ceiling in force.
 ///
 /// The grant and the policy are intersected by [`crate::grants::decide`], which is the one
@@ -284,15 +301,7 @@ pub fn decide_with_ceiling(
     // taken against the unnarrowed grant would already have permitted it: emptying the answer
     // afterwards would leave a caller holding a permission that was granted and then quietly
     // hollowed out.
-    let narrowed = Grant {
-        actions: grant
-            .actions
-            .iter()
-            .copied()
-            .filter(|right| ceiling.contains(right))
-            .collect(),
-        ..grant.clone()
-    };
+    let narrowed = narrowed_by(grant, ceiling);
     // The decision first, so every rule it applies refuses in its own order and the ceiling only
     // decides what the rules left to it.
     let decided = decide(&narrowed, record, policy, request.clone());

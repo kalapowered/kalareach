@@ -245,7 +245,15 @@ struct Recovery {
     environment_id: kr_protocol::ids::EnvironmentId,
     /// Whether the host is exclusively organisation-managed now.
     exclusive: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The rights ceiling this host's configuration has in force, which narrows what a device's
+    /// grant can do.
+    ceiling: RightsCeiling,
 }
+
+/// The rights ceiling a host's configuration has in force, shared with the daemon that replaces it.
+pub type RightsCeiling = std::sync::Arc<
+    Mutex<Option<kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>>>,
+>;
 
 /// A point this host's own tests stop a blocking step at: the step says it has arrived and waits
 /// there until the test lets it go. Armed once, it fires once.
@@ -385,17 +393,23 @@ impl OwnerAuthority {
         }
     }
 
-    /// Binds what decides the recovery of an exclusive host: the environment it serves and whether
-    /// the host is exclusively organisation-managed now.
+    /// Binds what decides the recovery of an exclusive host: the environment it serves, whether
+    /// the host is exclusively organisation-managed now, and the rights ceiling its configuration
+    /// has in force.
+    ///
+    /// `exclusive` reads the policy under its lock, so [`Self::recovery_open`] and everything that
+    /// asks it must never run with the policy lock held.
     #[must_use]
     pub fn with_recovery(
         mut self,
         environment_id: kr_protocol::ids::EnvironmentId,
         exclusive: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+        ceiling: RightsCeiling,
     ) -> Self {
         self.recovery = Some(Recovery {
             environment_id,
             exclusive,
+            ceiling,
         });
         self
     }
@@ -414,6 +428,19 @@ impl OwnerAuthority {
         Ok(self.enrolment()? == HostEnrolment::Enrolled
             && (recovery.exclusive)()
             && !self.an_owner_device_can_recover(recovery.environment_id)?)
+    }
+
+    /// The rights ceiling in force now, when this authority is bound to a host's configuration.
+    fn ceiling_in_force(
+        &self,
+    ) -> Option<kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>> {
+        self.recovery.as_ref().and_then(|recovery| {
+            recovery
+                .ceiling
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
     }
 
     /// What the terminal can confirm for the challenge `entry` holds, now.
@@ -447,6 +474,7 @@ impl OwnerAuthority {
             (HostEnrolment::Recovery, Some(recovery)) => TerminalStanding::Recovery {
                 environment_id: recovery.environment_id,
                 exclusive: (recovery.exclusive)(),
+                ceiling: self.ceiling_in_force(),
             },
             _ => TerminalStanding::Bootstrap,
         }
@@ -466,7 +494,7 @@ impl OwnerAuthority {
 
     /// Whether a paired device can confirm for this host when its organisation's lease serves
     /// nothing: one whose grant carries host management, never expires, requires no organisation
-    /// and reaches `environment_id`.
+    /// and reaches `environment_id`, under the rights ceiling this host has in force.
     ///
     /// # Errors
     ///
@@ -475,8 +503,16 @@ impl OwnerAuthority {
         &self,
         environment_id: kr_protocol::ids::EnvironmentId,
     ) -> Result<bool> {
+        let ceiling = self.ceiling_in_force();
         Ok(self.devices().devices()?.iter().any(|device| {
-            device.is_paired() && crate::grants::can_recover(&device.grant, environment_id)
+            device.is_paired()
+                && crate::grants::can_recover(
+                    &ceiling.as_ref().map_or_else(
+                        || device.grant.clone(),
+                        |ceiling| crate::config::ceilings::narrowed_by(&device.grant, ceiling),
+                    ),
+                    environment_id,
+                )
         }))
     }
 

@@ -614,7 +614,11 @@ impl Controller {
                 net::pairing::HostPairingClock::new(&setup.boot_identity),
                 net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
             )
-            .with_recovery(setup.environment_id, exclusive),
+            .with_recovery(
+                setup.environment_id,
+                exclusive,
+                Arc::clone(&rights_ceiling),
+            ),
         );
         // The host's own sign-in to the managed account service lives in the same store, in a
         // scope of its own. Everything this host presents an account token for, the voice broker

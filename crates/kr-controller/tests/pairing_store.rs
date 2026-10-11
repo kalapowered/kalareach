@@ -1265,6 +1265,7 @@ fn the_terminal_answer_is_spent_for_the_end_of_exclusive_management_only_where_n
     let under = |exclusive| TerminalStanding::Recovery {
         environment_id,
         exclusive,
+        ceiling: None,
     };
 
     // The owner's device is live and never expires, so it can confirm, and the terminal cannot.

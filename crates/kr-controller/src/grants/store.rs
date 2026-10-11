@@ -218,6 +218,10 @@ pub struct ExclusiveEnding {
 /// that no lease serves: one whose grant carries host management, never expires, requires no
 /// organisation and reaches this host's environment.
 ///
+/// The grant is the one a request is decided on, narrowed by the rights `ceiling` this host's
+/// configuration names, so a device whose host management the configuration removed is not one that
+/// can recover the host, here or at the door.
+///
 /// The rows are read through `connection`, so a caller inside a transaction on this file reads the
 /// devices from the snapshot it writes under.
 ///
@@ -227,6 +231,7 @@ pub struct ExclusiveEnding {
 pub fn an_owner_device_can_recover(
     connection: &Connection,
     environment_id: kr_protocol::ids::EnvironmentId,
+    ceiling: Option<&kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>>,
 ) -> Result<bool> {
     let mut statement = connection
         .prepare(
@@ -240,14 +245,26 @@ pub fn an_owner_device_can_recover(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(ControllerError::registry)?;
     Ok(grants.iter().any(|stored| {
-        kr_cbor::from_canonical_slice::<Grant>(stored, &kr_cbor::Limits::DEFAULT)
-            .is_ok_and(|grant| can_recover(&grant, environment_id))
+        kr_cbor::from_canonical_slice::<Grant>(stored, &kr_cbor::Limits::DEFAULT).is_ok_and(
+            |grant| {
+                can_recover(
+                    &ceiling.map_or_else(
+                        || grant.clone(),
+                        |ceiling| crate::config::ceilings::narrowed_by(&grant, ceiling),
+                    ),
+                    environment_id,
+                )
+            },
+        )
     }))
 }
 
-/// Whether `grant` is one an exclusively organisation-managed host can be recovered with when no
-/// lease serves: the host's own management, with no end, answering to no organisation, reaching
-/// this environment.
+/// Whether `grant`, as a decision sees it, is one an exclusively organisation-managed host can be
+/// recovered with when no lease serves: the host's own management, with no end, answering to no
+/// organisation, reaching this environment.
+///
+/// A decision sees the grant narrowed by the rights ceiling in force, which a caller outside a
+/// decision applies first ([`crate::config::ceilings::narrowed_by`]).
 #[must_use]
 pub fn can_recover(grant: &Grant, environment_id: kr_protocol::ids::EnvironmentId) -> bool {
     grant.permits(kr_protocol::rights::ActionRight::HostManage)

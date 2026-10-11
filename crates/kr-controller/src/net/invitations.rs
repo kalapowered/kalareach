@@ -1293,7 +1293,7 @@ pub fn another_subject() -> ControllerError {
 }
 
 /// What the interactive controlling terminal's proof is consumed under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalStanding {
     /// Only while the host has no owner yet.
     Bootstrap,
@@ -1304,6 +1304,8 @@ pub enum TerminalStanding {
         environment_id: kr_protocol::ids::EnvironmentId,
         /// Whether the host is exclusively organisation-managed now.
         exclusive: bool,
+        /// The rights ceiling in force, which narrows what a device's grant can do.
+        ceiling: Option<kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>>,
     },
 }
 
@@ -1396,7 +1398,13 @@ fn signer_still_authorised(
                 TerminalStanding::Recovery {
                     environment_id,
                     exclusive: true,
-                } if !crate::grants::an_owner_device_can_recover(transaction, environment_id)? => {
+                    ceiling,
+                } if !crate::grants::an_owner_device_can_recover(
+                    transaction,
+                    environment_id,
+                    ceiling.as_ref(),
+                )? =>
+                {
                     Ok(())
                 }
                 TerminalStanding::Recovery { .. } => Err(lapsed(

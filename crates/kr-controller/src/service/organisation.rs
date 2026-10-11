@@ -457,6 +457,15 @@ impl Controller {
         }
     }
 
+    /// The rights ceiling this host's configuration has in force, which narrows every paired
+    /// device's grant.
+    fn rights_ceiling_in_force(&self) -> Option<CanonicalSet<kr_protocol::rights::ActionRight>> {
+        self.rights_ceiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// The plan whose digest the owner confirms for making the host exclusively
     /// organisation-managed, or ending that: the new value and the organisations the host is
     /// enrolled in now, so a confirmation for one state of the host is not carried to another.
@@ -593,7 +602,11 @@ impl Controller {
                     // The terminal confirms this only while no device can confirm it, read from
                     // the transaction's own file: one that appeared since is the one to ask.
                     if confirmed.channel() == ConfirmationChannel::LocalBootstrapTerminal
-                        && crate::grants::an_owner_device_can_recover(connection, environment_id)?
+                        && crate::grants::an_owner_device_can_recover(
+                            connection,
+                            environment_id,
+                            self.rights_ceiling_in_force().as_ref(),
+                        )?
                     {
                         return Err(ControllerError::Refused {
                             code: ErrorCode::OwnerConfirmationRequired,
@@ -639,6 +652,7 @@ impl Controller {
                     require_a_device_that_can_recover(crate::grants::an_owner_device_can_recover(
                         connection,
                         environment_id,
+                        self.rights_ceiling_in_force().as_ref(),
                     )?)
                 },
             );
