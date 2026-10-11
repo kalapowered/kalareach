@@ -56,8 +56,8 @@ fn entry(
 #[must_use]
 pub fn known() -> Vec<Known> {
     use kr_protocol::{
-        account, attention, automation, delivery, describe, error, identity, pairing, privacy,
-        push, sharing, skill, update,
+        account, attention, automation, delivery, describe, error, host_account, identity, pairing,
+        privacy, push, sharing, skill, update,
     };
 
     let source = |store, name, file, pinned| Known {
@@ -67,11 +67,16 @@ pub fn known() -> Vec<Known> {
         pinned,
     };
 
-    let words = |store, name, words: Vec<String>, anchor, pinned| Known {
+    // Words the code matches stored text against, and the enums that name them where there are
+    // some: the digest holds each enum's definition, so a variant added to one moves it.
+    let words_of = |store, name, words: Vec<String>, anchor, enums, pinned| Known {
         store,
         name,
-        is: KnownIs::Words(words, anchor),
+        is: KnownIs::Words(words, anchor, enums),
         pinned,
+    };
+    let words = |store, name, words: Vec<String>, anchor, pinned| {
+        words_of(store, name, words, anchor, &[], pinned)
     };
     let literal = |words: &[&str]| {
         words
@@ -178,6 +183,16 @@ pub fn known() -> Vec<Known> {
             "HostUpdateHandoverResult",
             "b216ad57793ff4fb71dd5829f786381e2498baac9c3b9193b20dae2100949e0e",
         ),
+        known_protocol::<host_account::AccountSignInStarted>(
+            "registry",
+            "AccountSignInStarted",
+            "4c582a489bd5ec4347e20b6f0015386ef7ffc4912739e649b28d88b2cc4bc382",
+        ),
+        known_protocol::<host_account::AccountSignedOut>(
+            "registry",
+            "AccountSignedOut",
+            "1c02b8aa44a0f9f364e09cf7cfcb8c9dad9ac89a63d9294a4bd7a4c019f97442",
+        ),
         known_protocol::<privacy::PrivacyReport>(
             "registry",
             "PrivacyReport",
@@ -223,12 +238,13 @@ pub fn known() -> Vec<Known> {
             "PushUrgency",
             "e299a0789eb8e4f4c26d886628cc8d967bfdb5bee1f82f3ef89e3c95d6a36bd0",
         ),
-        words(
+        words_of(
             "delivery",
             "push suppression reasons",
             literal(&["burst", "sustained"]),
             Some("crates/kr-delivery/src/journal.rs"),
-            "0e643099a89e0e8682d6499e4804d7f24b3c95823c410f44d08ac6000a0e9c8b",
+            &[("crates/kr-protocol/src/push.rs", "PushSuppressionReason")],
+            "a8bd4c6fd3dd8adbfd67f642f2122ec7c209d1e9bc4a7dff39b40cb492236ec1",
         ),
         words(
             "delivery",
@@ -271,7 +287,7 @@ pub fn known() -> Vec<Known> {
             "dc39b51d2095b584734fb1a33503909b1bace98db1606d43d273163b64b52305",
         ),
         // The attention store: the words it matches stored text against.
-        words(
+        words_of(
             "attention",
             "process start sources",
             literal(&[
@@ -281,14 +297,16 @@ pub fn known() -> Vec<Known> {
                 "windows_process_start_seconds",
             ]),
             Some("crates/kr-attention/src/store.rs"),
-            "68800b25fce7a9c5b5c6f0f1198dd0b201f86abae7544708556500140236cfcd",
+            &[("crates/kr-protocol/src/identity.rs", "ProcessStartSource")],
+            "efd94e47ea16145263aeb3fb022c89efda99adbf99f17495bc06cb3dab7e0138",
         ),
-        words(
+        words_of(
             "attention",
             "review subject kinds",
             literal(&["turn", "change_set"]),
             Some("crates/kr-attention/src/store.rs"),
-            "33d39425d0745a1163cf6991835686b321b0e41667fe9585e2caf25f7ed6eeb6",
+            &[("crates/kr-protocol/src/attention.rs", "ReviewSubject")],
+            "caadb9f56cfaf54422e1e9b605c0a25be659299f99c01eb892864eb51e477297",
         ),
         words(
             "attention",
@@ -297,12 +315,16 @@ pub fn known() -> Vec<Known> {
             Some("crates/kr-attention/src/store.rs"),
             "aaa2de43a1c54f7fb5d9ab9da825dfcaf92ba293500b7b9da06448a5e6d2177d",
         ),
-        words(
+        words_of(
             "attention",
             "automation subject kinds",
             literal(&["workflow", "chain"]),
             Some("crates/kr-attention/src/store.rs"),
-            "097faff90054685829b78895c15ef1312c563096dfe9e5758b9aa862c281ec3a",
+            &[(
+                "crates/kr-protocol/src/attention.rs",
+                "AttentionAutomationSubject",
+            )],
+            "50677eeec032dc58f7ab6e46310dac288493220e0e449c4e3b7f128a9d45a624",
         ),
         words(
             "attention",
@@ -373,7 +395,7 @@ pub fn known() -> Vec<Known> {
         ),
         // The registry's columns of words, and the consumed reasons it stores by their protocol
         // names.
-        words(
+        words_of(
             "registry",
             "process start sources",
             literal(&[
@@ -383,40 +405,48 @@ pub fn known() -> Vec<Known> {
                 "windows_process_start_seconds",
             ]),
             Some("crates/kr-controller/src/registry.rs"),
-            "1c750df45ee66474ba06ec09d82f6ca4a32c707b6ab982a416bece8b7c269612",
+            &[("crates/kr-protocol/src/identity.rs", "ProcessStartSource")],
+            "8d0462fea698cd5062e47b8c5d9d0257dd829ac52bca210fad6dbb814ee278b6",
         ),
-        words(
+        words_of(
             "registry",
             "invitation states",
             literal(&["open", "locked", "committed", "consumed"]),
             Some("crates/kr-controller/src/net/invitations.rs"),
-            "6573daf2c77d49cda9010577555ddec0339061ca4d3d6510647a85802bd7755a",
+            &[("crates/kr-pairing/src/platform.rs", "InvitationState")],
+            "30c62bdf8453f6dd1a294b8d52ae7a5e149d0ba6d979fb221f339747b8244326",
         ),
-        words(
+        words_of(
             "registry",
             "host owner kinds",
             literal(&["migrated", "first_owner"]),
             Some("crates/kr-controller/src/net/invitations.rs"),
-            "b17bedb24eeb4e5cbbc2f8478172cc20354a04d8684c87f7c525e75f752363de",
+            &[("crates/kr-controller/src/net/invitations.rs", "HostOwner")],
+            "12da03792d3c200ec87495bc1ff96a236c5b43a55aeab9f011e38dc7983fd563",
         ),
         known_protocol::<pairing::PairingConsumedReason>(
             "registry",
             "PairingConsumedReason",
             "8e47614af034efad7f29d0c65b13daad3f150bbe2d59cda4034dfe69dbfad33c",
         ),
-        words(
+        words_of(
             "catalogue",
             "repository kinds",
             literal(&["official", "vendor", "community", "local", "mirror"]),
             Some("crates/kr-plugin-catalogue/src/db.rs"),
-            "89e6b075dbf4abc5af6e7207d669efa9866caaa3794c043accbf3c2784b819b3",
+            &[(
+                "crates/kr-plugin-catalogue/src/repository.rs",
+                "RepositoryKind",
+            )],
+            "79096143ddb5237b2adb39514d7c187c29edb14840a5af10d20ed199a733c75a",
         ),
-        words(
+        words_of(
             "transfers",
             "snapshot states",
             literal(&["reserving", "open", "failed", "expired", "released"]),
             Some("crates/kr-transfer/src/store.rs"),
-            "a10daafcc946e723fa6ec5ff7591462273af4a7035b62186a8487b5900c2bbdc",
+            &[("crates/kr-transfer/src/store.rs", "SnapshotState")],
+            "49e5f3b705b933016657462dba3bf9a0971954b08a67e97fd03f28385b0517af",
         ),
         // The delivery journal's queued external message: the document and the words in it.
         source(
@@ -447,7 +477,7 @@ pub fn known() -> Vec<Known> {
             Some("crates/kr-delivery/src/producer.rs"),
             "dba448ea8bdc6ebb7ccc73c996b729e90ad85bcc030142dc32a784a254caa040",
         ),
-        words(
+        words_of(
             "delivery",
             "withheld reasons",
             literal(&[
@@ -456,7 +486,8 @@ pub fn known() -> Vec<Known> {
                 "no_production_time",
             ]),
             Some("crates/kr-delivery/src/external.rs"),
-            "62680564c22d0fd60e41adcc09777ce8252aaf834095fe5491c63e20a54368ca",
+            &[("crates/kr-delivery/src/external.rs", "Withheld")],
+            "1320677d9b402b374f5bff99e3252ee3dac5d7033c0b4400661b59d7fc002be4",
         ),
         // The environment's presence record.
         known_protocol::<identity::EnvironmentPresence>(
@@ -518,6 +549,8 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
             "DeliveryDestinationSecretSetResult",
         ),
         (Method::PrivacySet, "PrivacyReport"),
+        (Method::AccountSignIn, "AccountSignInStarted"),
+        (Method::AccountSignOut, "AccountSignedOut"),
         (Method::SessionRename, "SessionRenameResult"),
         (Method::DescriptionConfigure, "DescriptionSetup"),
         (Method::DescriptionDownload, "DescriptionSetup"),

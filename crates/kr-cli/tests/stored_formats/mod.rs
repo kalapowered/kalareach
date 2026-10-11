@@ -438,7 +438,47 @@ pub fn normalise_sql(sql: &str) -> String {
 
 /// A type definition as the source writes it, with its attributes, and without comments or spacing.
 fn definition(file: &str, name: &str) -> Result<String, String> {
-    let path = repository().join(file);
+    definition_at(&repository(), file, name)
+}
+
+/// What is hashed for a set of words the code matches stored text against: the words, how many
+/// times each occurs as a quoted literal in the file where the code that writes and reads them is
+/// (so a word changed there moves it), and the enums the words stand for, as they are defined (so
+/// a word added to one does).
+///
+/// # Errors
+///
+/// Returns what stops a file being read or an enum being found.
+pub fn words_basis(
+    root: &Path,
+    words: &[String],
+    anchor: Option<&str>,
+    enums: &[(&str, &str)],
+) -> Result<Value, String> {
+    let mut basis = match anchor {
+        None => json!(words),
+        Some(file) => {
+            let text = std::fs::read_to_string(root.join(file))
+                .map_err(|error| format!("{file}: {error}"))?;
+            let occurrences: Vec<usize> = words
+                .iter()
+                .map(|word| text.matches(&format!("\"{word}\"")).count())
+                .collect();
+            json!({ "words": words, "file": file, "occurrences": occurrences })
+        }
+    };
+    if !enums.is_empty() {
+        let mut defined = Vec::new();
+        for (file, item) in enums {
+            defined.push(definition_at(root, file, item)?);
+        }
+        basis = json!({ "words": basis, "enums": defined });
+    }
+    Ok(basis)
+}
+
+fn definition_at(root: &Path, file: &str, name: &str) -> Result<String, String> {
+    let path = root.join(file);
     let text = std::fs::read_to_string(&path).map_err(|error| format!("{file}: {error}"))?;
     let bare = strip_comments(&text);
     for keyword in ["struct", "enum"] {
@@ -789,7 +829,11 @@ pub enum KnownIs {
     /// that writes and reads them is, when the words are not taken from the code itself: the digest
     /// holds how many times each word occurs in that file as a quoted literal, so a word changed
     /// where the code writes it, or read where the code reads it, moves the digest.
-    Words(Vec<String>, Option<&'static str>),
+    Words(
+        Vec<String>,
+        Option<&'static str>,
+        &'static [(&'static str, &'static str)],
+    ),
     /// A type of a dependency, by the crate's name: it is what the crate's locked version is.
     Crate(&'static str),
 }
@@ -804,15 +848,8 @@ impl Known {
         let basis = match &self.is {
             KnownIs::Protocol(schema, _) => normalise_schema(schema),
             KnownIs::Source(file) => json!(definition(file, self.name)?),
-            KnownIs::Words(words, None) => json!(words),
-            KnownIs::Words(words, Some(file)) => {
-                let text = std::fs::read_to_string(repository().join(file))
-                    .map_err(|error| format!("{file}: {error}"))?;
-                let occurrences: Vec<usize> = words
-                    .iter()
-                    .map(|word| text.matches(&format!("\"{word}\"")).count())
-                    .collect();
-                json!({ "words": words, "file": file, "occurrences": occurrences })
+            KnownIs::Words(words, anchor, enums) => {
+                words_basis(&repository(), words, *anchor, enums)?
             }
             KnownIs::Crate(name) => json!({ "crate": name, "locked": locked_version(name)? }),
         };
