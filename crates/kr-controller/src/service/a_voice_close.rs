@@ -26,7 +26,7 @@ use super::a_delegation_that_is_asked_again::{
 };
 use super::a_floor_owed_its_record::until;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, scripted};
-use super::a_voice_grant_on_the_floor::paired_signing_as;
+use super::a_voice_grant_on_the_floor::{paired_needing_a_lease, paired_signing_as};
 use super::one_barrier_for_every_restriction::{owed, revision};
 use super::voice_actions::VoiceBudgets;
 use crate::service::Controller;
@@ -832,6 +832,43 @@ async fn a_close_the_host_policy_leaves_no_lease_for_is_neither_asked_for_nor_fo
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert!(call.closes().is_empty(), "nothing reached the worker");
     call.world.serving.abort();
+}
+
+/// KR-REQ-15.13 and 26.16: a device whose grant requires membership of an organisation this host
+/// holds no lease for is not given a voice grant, so no call of its can reach a spoken close. The
+/// voice service reads the device's grant as this host lets it be used, which refuses it as a typed
+/// request under it would be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_grant_needs_a_lease_the_host_holds_none_for_is_given_no_voice_grant() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let device = paired_needing_a_lease(
+        &world.controller,
+        63,
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    );
+    let asked = voice_mutation_of(
+        Method::VoiceGrant,
+        world.environment_id,
+        &VoiceGrantParams {
+            device_id: device.device_id,
+            session_ids: [world.session_id].into_iter().collect(),
+            actions: Nullable::some([VoiceAction::CloseSession].into_iter().collect()),
+        },
+    );
+
+    let refused = ask_voice(
+        &world.controller,
+        &device.principal(),
+        device.device_id,
+        Method::VoiceGrant,
+        &asked,
+    )
+    .await
+    .expect_err("this host can use no lease for the device");
+
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    world.serving.abort();
 }
 
 /// KR-REQ-15.13 and 09.12: a stop is answered once the workers hold the revision that makes them

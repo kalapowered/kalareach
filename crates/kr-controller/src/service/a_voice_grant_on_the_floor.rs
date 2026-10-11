@@ -88,6 +88,44 @@ pub(super) fn paired_signing_as(
     rights: &[ActionRight],
     expires_at_ms: Option<u64>,
 ) -> DeviceRecord {
+    paired_on(
+        controller,
+        byte,
+        authorisation,
+        rights,
+        expires_at_ms,
+        Nullable::null(),
+    )
+}
+
+/// As [`paired_holding`], for a device whose grant requires membership of an organisation this host
+/// is not enrolled in, so that no lease answers for it.
+pub(super) fn paired_needing_a_lease(
+    controller: &Controller,
+    byte: u8,
+    rights: &[ActionRight],
+) -> DeviceRecord {
+    paired_on(
+        controller,
+        byte,
+        kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]),
+        rights,
+        None,
+        Nullable::some(kr_protocol::grant::OrganisationRequirement {
+            organisation_id: kr_protocol::ids::OrganisationId::new(kr_ipc::new_uuid()),
+            policy_revision: controller.policy().authority_revision(),
+        }),
+    )
+}
+
+fn paired_on(
+    controller: &Controller,
+    byte: u8,
+    authorisation: kr_protocol::scalars::AuthorisationKey,
+    rights: &[ActionRight],
+    expires_at_ms: Option<u64>,
+    organisation: Nullable<kr_protocol::grant::OrganisationRequirement>,
+) -> DeviceRecord {
     let revision = controller.policy().authority_revision();
     let device_id = DeviceId::new(kr_ipc::new_uuid());
     let device = DeviceRecord {
@@ -99,7 +137,10 @@ pub(super) fn paired_signing_as(
         notification_preview: None,
         device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
         platform: kr_protocol::pairing::DevicePlatform::Ios,
-        grant: grant(device_id, rights, expires_at_ms, revision),
+        grant: Grant {
+            organisation,
+            ..grant(device_id, rights, expires_at_ms, revision)
+        },
         paired_at_ms: TimestampMs::new(1),
         revoked_at_ms: None,
         committed_invitation_id: None,
