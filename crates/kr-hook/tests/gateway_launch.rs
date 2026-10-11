@@ -96,10 +96,20 @@ impl Gateway {
         Self::with(true, "")
     }
 
+    /// A session whose broker keeps its ledger in a file under the host's root, which a test can
+    /// search for what must not be kept.
+    fn with_ledger_on_disk() -> Self {
+        Self::build(true, "", true)
+    }
+
     /// A session whose signed record names the stand-in's digest, or, with `qualified` false,
-    /// names no executable at all, and whose backends live in the directory `runtime_name` names under
-    /// the host's root (the root itself when it is empty).
+    /// names no executable at all, and whose backends live in the directory `runtime_name` names
+    /// under the host's root (the root itself when it is empty).
     fn with(qualified: bool, runtime_name: &str) -> Self {
+        Self::build(qualified, runtime_name, false)
+    }
+
+    fn build(qualified: bool, runtime_name: &str, ledger_on_disk: bool) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -126,8 +136,10 @@ impl Gateway {
                 version: fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
             }];
         }
+        let ledger = ledger_on_disk.then(|| placed.host.root().join("broker-ledger.sqlite"));
         let broker = Arc::new(
-            Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
+            Broker::open(ledger.as_deref(), session(), JournalHealth::shared())
+                .expect("the broker opens"),
         );
         let sources = Arc::new(ConnectorSources::new());
         let admissions = kr_worker::broker::catalogue::Admissions::new();
@@ -771,6 +783,78 @@ fn kr_req_12_07_a_runtime_directory_with_a_space_is_served_as_any_other() {
     );
     let mut launched = shell.launch(&answer, "spaced", &[("KR_STAND_IN", "stay")]);
     launched.prints("TUI: turn/completed");
+}
+
+/// KR-REQ-11.33: the key a terminal signs in with is forwarded to the server, so that signing in
+/// works, and is kept nowhere: not in the broker's resources, and not in a byte of what the
+/// session wrote to disk, its ledger included.
+#[test]
+fn kr_req_11_33_a_credential_a_terminal_signs_in_with_is_kept_nowhere() {
+    const KEY: &str = "sk-SECRET-LOGIN-KEY-5c1d9e";
+    let shell = Gateway::with_ledger_on_disk();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(
+        &answer,
+        "login",
+        &[
+            ("KR_STAND_IN", "stay,login"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            ("KR_STAND_IN_API_KEY", KEY),
+        ],
+    );
+    // The server answered the sign-in, so the request reached it, and the session went on.
+    launched.prints("TUI: the sign-in was refused; the stand-in goes on");
+    launched.prints("TUI: turn/completed");
+    let snapshot = format!(
+        "{:?} {:?}",
+        shell.broker.resource_snapshot(),
+        shell.broker.pending_resources()
+    );
+    assert!(
+        !snapshot.contains(KEY),
+        "the broker's resources hold the key"
+    );
+    let _ = launched.child.kill();
+    let _ = launched.ends();
+    let mut searched = 0_usize;
+    let mut directories = vec![shell.placed.host.root().to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                directories.push(path);
+            } else if kind.is_file() {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                searched += 1;
+                assert!(
+                    !bytes
+                        .windows(KEY.len())
+                        .any(|window| window == KEY.as_bytes()),
+                    "{} holds the key",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(searched > 0, "something was searched");
+    assert!(
+        shell
+            .placed
+            .host
+            .root()
+            .join("broker-ledger.sqlite")
+            .is_file(),
+        "and the ledger was among it"
+    );
 }
 
 /// KR-REQ-07.60: a program that was started and never connects, as one that ran as typed does not,
