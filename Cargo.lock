@@ -1249,6 +1249,7 @@ dependencies = [
  "block2",
  "companion-platform",
  "companion-tauri",
+ "exacl",
  "iroh",
  "kr-cbor",
  "kr-client",

@@ -514,7 +514,8 @@ async fn turning_recovery_on_puts_the_bundle_at_the_service_and_hands_over_a_kit
 }
 
 /// The kit holds the recovery seed. A file the person chose that already exists, whatever its mode
-/// and however long its earlier content, ends as the kit alone and readable by them alone.
+/// or access list and however long its earlier content, ends as the kit alone and readable by them
+/// alone.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kit_saved_over_an_existing_file_leaves_that_file_private_and_whole() {
@@ -530,12 +531,33 @@ async fn a_kit_saved_over_an_existing_file_leaves_that_file_private_and_whole() 
     std::fs::write(&path, "earlier words ".repeat(2000)).expect("an earlier file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("a wide mode");
 
+    // On macOS a mode does not say who may read a file: an access list can name another account,
+    // and the file the person chose may carry one.
+    #[cfg(target_os = "macos")]
+    exacl::setfacl(
+        &[&path],
+        &[exacl::AclEntry::allow_group(
+            "everyone",
+            exacl::Perm::READ,
+            None,
+        )],
+        None,
+    )
+    .expect("an access list on the earlier file");
+
     page.kit(out.path());
 
     let text = std::fs::read_to_string(&path).expect("the kit file");
     assert!(
         !text.contains("earlier words"),
         "none of the earlier content is left in the file"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        exacl::getfacl(&path, None)
+            .expect("the access list")
+            .is_empty(),
+        "no other account is named as able to read the kit"
     );
     let mode = std::fs::metadata(&path)
         .expect("the file")

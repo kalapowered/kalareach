@@ -67,6 +67,9 @@ ureq.workspace = true
 kr-loopback.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# A file the person chose for the recovery kit may carry an access list that its mode bits do not
+# show, and the kit is not written into it until the list is cleared.
+exacl.workspace = true
 # The platform user-verification ceremony section 10 asks for on an unlocked owner device.
 block2.workspace = true
 objc2.workspace = true
