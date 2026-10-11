@@ -274,6 +274,11 @@ struct Backend {
     /// What a backend that runs an application server for its program holds.
     #[cfg(unix)]
     gateway_run: Option<GatewayRun>,
+    /// Set when the session is closing: the program's connection may end then, because the
+    /// instance is gone, and its server is left for the closure to end once the acceptance of the
+    /// close has been delivered.
+    #[cfg(unix)]
+    closing: AtomicBool,
     /// The operating-system user the session runs as.
     os_user: String,
     /// The directory the shell reported for this invocation, for a connector whose installation
@@ -1110,6 +1115,10 @@ impl CommandBackends {
             // given back by that launch's guard, for which an ended instance is nothing to undo;
             // and only then its files go, so that whoever finds the registration gone finds
             // nothing of the launch held.
+            // Marked first: the instance goes next, and what that does to the program's connection
+            // is not a reason to end its server before the acceptance of the close is delivered.
+            #[cfg(unix)]
+            backend.closing.store(true, Ordering::SeqCst);
             backend.fence();
             ended.extend(backend.end_at_close(&self.broker));
             #[cfg(feature = "testing")]
@@ -1149,13 +1158,14 @@ impl CommandBackends {
     }
 
     /// Ends the servers the backends of a closing session run, and what the session recorded below
-    /// them, and returns the processes still running when they were ended.
+    /// them. What survived is in the session's record of its processes, which the closure's
+    /// receipt reads.
     ///
     /// The session's closure calls this after the acceptance of the close has been delivered, and
     /// beside its own request to stop the processes it owns, so that a server ends gently, with
     /// the end of its input, before anything is forced.
     #[cfg(unix)]
-    pub async fn end_servers(&self) -> Vec<ProcessStartIdentity> {
+    pub async fn end_servers(&self) {
         let closing = std::mem::take(
             &mut *self
                 .closing
@@ -1165,11 +1175,9 @@ impl CommandBackends {
         for backend in &closing {
             backend.end_gateway();
         }
-        let mut survivors = Vec::new();
         for backend in &closing {
-            survivors.extend(backend.endings().await);
+            backend.endings().await;
         }
-        survivors
     }
 
     /// Returns the session's root, once the first establish has made it.
@@ -1443,6 +1451,8 @@ impl CommandBackends {
             tasks: Mutex::new(Vec::new()),
             #[cfg(unix)]
             gateway_run,
+            #[cfg(unix)]
+            closing: AtomicBool::new(false),
             os_user: self.os_user.clone(),
             host_directory: Arc::new(std::sync::OnceLock::new()),
             views: self
