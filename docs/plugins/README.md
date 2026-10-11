@@ -215,9 +215,10 @@ between the terminal and the server's standard streams.
 The server is ended when the terminal ends, when the connection to the terminal ends, when 30
 seconds have elapsed since the launch was committed with no connection having been made, or when the
 session is closed. To end the server, the host closes its input and gives it a moment to end the
-commands it started, then asks it to terminate, then ends it. It then ends every process the session
-recorded below the server, by the process's identity. This is necessary because a command of the
-server's leaves the server's process group and outlives a server that dies. On Linux a command the
+commands it started, then asks it to terminate. It asks every process the session recorded below the
+server to terminate too, by the process's identity, and ends by force whatever is still running five
+seconds after the ending began. This is necessary because a command of the server's leaves the
+server's process group and outlives a server that dies. On Linux a command the
 server leaves behind stays in the process table, ended, until the worker exits. When the session is
 closed, this happens after the acceptance of the close has been delivered, because the command that
 asked for the close may be one the server started.
