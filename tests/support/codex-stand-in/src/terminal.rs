@@ -180,7 +180,8 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                     _ => {}
                 }
             }
-            Frame::Failure { method, .. } if method == "account/login/start" => {
+            Frame::Failure { id, method } if method == "account/login/start" => {
+                sent.remove(&id);
                 println!("TUI: the sign-in was refused; the stand-in goes on");
                 send!(json!({ "id": THREAD, "method": "thread/start", "params": {} }));
             }
