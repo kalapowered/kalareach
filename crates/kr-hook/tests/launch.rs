@@ -1368,7 +1368,7 @@ fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_regist
     let answer = shell.establish();
     let registration = Shell::registration(&answer);
     let (published, deliver) = shell.backends.pause_before_admitting();
-    let (giving_back, finish_giving_back) = shell.backends.pause_before_giving_back();
+    let (unpublishing, finish_unpublishing) = shell.backends.pause_before_unpublishing();
     let mut launcher = shell.launcher(&shell.executable, &Shell::answered(), None);
     shell.prepare(&mut launcher, Some(&answer), "undelivered", &[]);
     let mut launcher = launcher.spawn().expect("the launcher starts");
@@ -1379,6 +1379,12 @@ fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_regist
         .expect("the registration is published")
         .expect("and the backend waits to write the admission");
     assert!(registration.exists());
+    let instance = Shell::registered_instance(&answer);
+    assert_eq!(
+        shell.broker.live_bindings().len(),
+        1,
+        "the launch holds a binding while its admission is not written"
+    );
     // The launcher goes away before it is admitted, so the admission has nobody to reach.
     let _ = launcher.kill();
     let _ = launcher.wait();
@@ -1387,23 +1393,29 @@ fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_regist
     // Between the two steps of taking the launch back: the first is done and the second is not.
     shell
         .runtime
-        .block_on(async { tokio::time::timeout(LIVENESS, giving_back).await })
+        .block_on(async { tokio::time::timeout(LIVENESS, unpublishing).await })
         .expect("the admission fails")
         .expect("and the backend stops while it takes the launch back");
     assert!(
-        shell.broker.live_bindings().is_empty(),
-        "the binding is given back before the registration is taken down"
+        shell.broker.live_bindings().is_empty() && shell.broker.binding_state(instance).is_err(),
+        "the instance and its binding are given back before the registration is taken down"
     );
     assert!(
         registration.exists(),
         "and the registration is taken down after, never before"
     );
-    finish_giving_back.send(()).expect("the backend waits");
+    finish_unpublishing.send(()).expect("the backend waits");
 
-    eventually("the registration goes", || !registration.exists());
-    assert!(
-        shell.broker.live_bindings().is_empty(),
-        "and the binding with it"
+    // The backend is free for a retry once it is unbound, which is after the registration goes.
+    eventually(
+        "the registration goes and the backend is free again",
+        || {
+            !registration.exists()
+                && matches!(
+                    shell.backends.state_of(instance),
+                    Some(BackendState::Unbound)
+                )
+        },
     );
     let child = shell.launch(&answer, "again", &[]);
     assert_eq!(

@@ -3199,6 +3199,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns what [`Broker::open_native_connection`] does.
+    #[cfg(unix)]
     pub(crate) fn open_launched_connection(
         &self,
         application_instance_id: ApplicationInstanceId,
