@@ -70,6 +70,21 @@ async fn what_ended_while_the_host_slept_is_over_at_the_first_request_after() {
             "the grant ended in the sleep"
         ),
     }
+    // A new connection finds the same: it is refused at the door or at its first request.
+    match net_support::RawDevice::try_connect(&fixture.host, &helper, &helper_record).await {
+        Err(_) => {}
+        Ok(fresh) => {
+            fresh.claim();
+            match fresh.try_read(Method::HostInfo, &()).await {
+                None => {}
+                Some(answer) => assert!(
+                    denied(&net_support::refusal(answer.map(|_| ()))),
+                    "a new connection of a device whose grant ended is not served"
+                ),
+            }
+            fresh.close();
+        }
+    }
     let owner = net_support::RawDevice::connect(
         &fixture.host,
         fixture
