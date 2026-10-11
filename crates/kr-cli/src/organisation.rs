@@ -29,7 +29,7 @@ use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Request, closed};
 use crate::plugin::confirmed_on_an_owner_device;
-use crate::shown::{key_identifier, utc_moment};
+use crate::shown::{key_hex, key_identifier, utc_moment};
 use crate::stdout_line;
 
 /// Runs one `kr organisation` command and prints its result.
@@ -103,11 +103,6 @@ async fn present(
             presented.key_revision,
             utc_moment(presented.expires_at_ms.get())
         ));
-        if !presented.exclusive {
-            output::line(&stdout_line!(
-                "This host is not exclusively organisation-managed, so the lease binds nothing yet."
-            ));
-        }
     }
     Ok(())
 }
@@ -423,8 +418,10 @@ async fn list(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Re
         }
     }
     output::line(&stdout_line!(
-        "A lease for this host's own local owner is signed for device {} and key {}.",
+        "A lease for this host's own local owner is signed for device {} and authorisation key {} \
+         (key identifier {}).",
         listed.host_device.device_id,
+        key_hex(listed.host_device.authorisation_key.as_bytes()),
         key_identifier(&kr_protocol::pairing::key_id(
             kr_protocol::pairing::KeyPurpose::Authorisation,
             listed.host_device.authorisation_key.as_bytes(),
@@ -522,6 +519,10 @@ fn document(listed: &OrganisationListResult) -> Document {
             "host_device",
             Document::new()
                 .with("device_id", closed(&listed.host_device.device_id))
+                .with(
+                    "authorisation_key",
+                    output::said(&key_hex(listed.host_device.authorisation_key.as_bytes())),
+                )
                 .with(
                     "authorisation_key_id",
                     output::said(&key_identifier(&kr_protocol::pairing::key_id(

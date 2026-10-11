@@ -121,6 +121,9 @@ pub enum LeaseRefused {
     NotEnrolled,
     /// The presenting device holds no live grant on this host that requires that organisation.
     NoOrganisationGrant,
+    /// The host's own local owner presented a lease while the host is not exclusively
+    /// organisation-managed, so it answers to none.
+    HostNotExclusive,
     /// The lease names a revision this host has not authenticated from its anchor.
     UnauthenticatedRevision,
     /// The signature is not the named revision's over the lease's signing input.
@@ -165,6 +168,7 @@ impl LeaseRefused {
         match self {
             Self::NotEnrolled => "not_enrolled",
             Self::NoOrganisationGrant => "no_organisation_grant",
+            Self::HostNotExclusive => "host_not_exclusive",
             Self::UnauthenticatedRevision => "unauthenticated_revision",
             Self::BadSignature => "bad_signature",
             Self::DeviceMismatch => "device_mismatch",
@@ -190,6 +194,10 @@ impl LeaseRefused {
             Self::NotEnrolled => "this host is not enrolled in that organisation",
             Self::NoOrganisationGrant => {
                 "this device holds no grant on this host that requires that organisation"
+            }
+            Self::HostNotExclusive => {
+                "this host is not exclusively organisation-managed, so its local owner answers to \
+                 no lease"
             }
             Self::UnauthenticatedRevision => {
                 "the lease names a policy-signing revision this host has not authenticated"

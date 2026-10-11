@@ -249,6 +249,13 @@ pub fn key_identifier(identifier: &kr_protocol::scalars::KeyId) -> KeyIdentifier
     )
 }
 
+/// Returns a public key itself as hexadecimal digits, as an organisation's service needs it to
+/// sign a lease for the device that holds the key.
+#[must_use]
+pub fn key_hex(key: &[u8]) -> KeyIdentifier {
+    KeyIdentifier(key.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 impl fmt::Display for KeyIdentifier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)

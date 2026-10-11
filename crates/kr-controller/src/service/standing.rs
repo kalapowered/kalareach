@@ -128,6 +128,11 @@ impl Controller {
         if held.enrolment(organisation_id).is_none() {
             return Ok(Err(LeaseRefused::NotEnrolled));
         }
+        // The host's own local owner answers to a lease only on a host that is exclusively
+        // organisation-managed, and is told so rather than that it lacks a grant.
+        if device_id == self.local_owner_device() && !held.is_exclusively_managed() {
+            return Ok(Err(LeaseRefused::HostNotExclusive));
+        }
         match self.organisation_standing(&held, device_id, organisation_id)? {
             Standing::Holds => {}
             Standing::Lacks => return Ok(Err(LeaseRefused::NoOrganisationGrant)),
@@ -197,10 +202,17 @@ impl Controller {
                 matches!(before, crate::grants::policy::LocalOwnerBound::Until { continuous, utc_ms }
                     if installed.continuous_deadline < continuous || installed.expires_at_ms < utc_ms)
             };
-        let restriction = if dropped_a_lease || host_owner_tightened {
+        let restriction = if dropped_a_lease {
             Some((
                 super::barrier::Reach::Host,
                 "a policy-signing chain that dropped membership leases".to_owned(),
+            ))
+        } else if host_owner_tightened {
+            Some((
+                super::barrier::Reach::Host,
+                "a membership lease for the host's own local owner that ends sooner than the one \
+                 before it"
+                    .to_owned(),
             ))
         } else if narrowed && device_id != self.local_owner_device() {
             Some((
