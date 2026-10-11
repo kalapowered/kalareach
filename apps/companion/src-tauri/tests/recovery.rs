@@ -437,6 +437,37 @@ async fn the_sync_service_is_the_managed_service_until_another_is_chosen() {
     );
 }
 
+/// The setting is one origin in one file. Choices made together, as a person can by closing and
+/// opening the account sheet during a slow save and choosing again, leave the file and this run
+/// saying the same thing, so that a restart does not change the service in use.
+#[test]
+fn choices_made_together_leave_the_file_and_the_run_agreeing() {
+    use companion_tauri::sync_service::SyncService;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    for round in 0..40 {
+        let service = Arc::new(SyncService::open(directory.path()));
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let service = Arc::clone(&service);
+                std::thread::spawn(move || {
+                    service
+                        .set(&format!("https://sync-{round}-{n}.example"))
+                        .expect("a choice is kept");
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a choice finished");
+        }
+        assert_eq!(
+            SyncService::open(directory.path()).origin(),
+            service.origin(),
+            "round {round}: a restart reads another service than the one in use"
+        );
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Turning recovery on                                                         */
 /* -------------------------------------------------------------------------- */
