@@ -3176,15 +3176,16 @@ fn record_unreachable_worker(
     reservation.session_id
 }
 
-/// A document of level 2: a setting this build knows, a ceiling, and a section of a newer release
-/// whose name looks like a credential.
+/// A document of level 2: a setting this build knows, a ceiling, and two sections of a newer
+/// release, one whose name looks like a credential.
 const AT_A_HIGHER_LEVEL: &[u8] = br#"{
   "version": 3,
   "level": 2,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
   "ceilings": { "session_limit": 4 },
-  "zq_api_credential_hint": { "enabled": true }
+  "zq_api_credential_hint": { "enabled": true },
+  "zq_other_hint": {}
 }"#;
 
 /// KR-REQ-26.13: a daemon over a document of a level it does not read applies every member it knows,
@@ -3237,7 +3238,11 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
         .iter()
         .find(|value| value.key == config_ignored_members())
         .expect("the row of the members this build ignores");
-    assert_eq!(ignored.value(), "zq_api_credential_hint", "{ignored:?}");
+    assert_eq!(
+        ignored.value(),
+        "zq_api_credential_hint, zq_other_hint",
+        "{ignored:?}"
+    );
     let check = result
         .checks
         .iter()
@@ -3246,7 +3251,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
     let said = check.detail();
     assert!(
-        said.contains("level 2") && said.contains("reads level 1") && said.contains("1 member"),
+        said.contains("level 2") && said.contains("reads level 1") && said.contains("2 members"),
         "the levels and the count: {said}"
     );
     assert!(check.remedy().is_some(), "and what to do about it");
@@ -3264,7 +3269,14 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
         .iter()
         .find(|value| value.key == config_ignored_members())
         .expect("the row reaches the device");
-    assert!(!row.value().contains("zq_api_credential_hint"), "{row:?}");
+    assert_eq!(
+        row.value(),
+        format!(
+            "[name withheld, {} bytes]",
+            "zq_api_credential_hint, zq_other_hint".len()
+        ),
+        "the two names are one value, withheld once: {row:?}"
+    );
 
     // The daemon does not edit the document, and the file is as it was.
     let path = kr_worker::config::document_path(&environment);
