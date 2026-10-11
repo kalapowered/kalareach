@@ -66,9 +66,6 @@ const MAX_ANSWER_BYTES: usize = 4096;
 #[cfg(unix)]
 const CONNECT_RETRY: Duration = Duration::from_millis(10);
 
-/// The variables that name a backend, taken out of a program that runs without one.
-const LAUNCH_VARIABLES: [&str; 2] = [REGISTRATION_VARIABLE, "KR_CREDENTIAL"];
-
 /// The flag that opens a file without waiting for it, whatever the file is.
 #[cfg(unix)]
 const NONBLOCK: i32 = rustix::fs::OFlags::NONBLOCK.bits().cast_signed();
@@ -296,7 +293,7 @@ fn environment(command: &mut std::process::Command, route: Route<'_>) {
             }
         }
         Route::AsTyped => {
-            for variable in LAUNCH_VARIABLES {
+            for variable in kr_protocol::root::LAUNCH_VARIABLES {
                 command.env_remove(variable);
             }
         }
