@@ -16,8 +16,9 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::SigningTranscript;
 use kr_ipc::client::LocalClient;
 use kr_protocol::account::{
-    POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN, PolicyAuthority, PolicyAuthorityHead,
-    PolicyAuthorityHeadPayload, PolicyAuthorityLink, PolicyAuthorityLinkPayload,
+    MembershipLeasePayload, POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN, PolicyAuthority,
+    PolicyAuthorityHead, PolicyAuthorityHeadPayload, PolicyAuthorityLink,
+    PolicyAuthorityLinkPayload,
 };
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::{BuildId, OrganisationId, PolicyKeyRevision};
@@ -235,10 +236,100 @@ async fn a_host_enrolled_in_nothing_says_so() {
     );
     assert!(printed.contains("enrolled in no organisation"), "{printed}");
     assert!(printed.contains("Exclusive management is off"), "{printed}");
+    assert!(
+        printed.contains("signed for device"),
+        "the list says what a lease for the host's own local owner is signed for: {printed}"
+    );
     let listed = host.kr_json(&["organisation", "list", "--json"]);
     assert_eq!(listed["enrolments"], serde_json::json!([]), "{listed}");
     assert_eq!(listed["exclusive"], false, "{listed}");
     assert_eq!(listed["clock_trusted"], true, "{listed}");
+    assert!(listed["host_device"]["device_id"].is_string(), "{listed}");
+    assert!(
+        listed["host_device"]["authorisation_key_id"].is_string(),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["workers_without_local_enforcement"],
+        serde_json::json!([]),
+        "{listed}"
+    );
+}
+
+/// KR-REQ-17.54: a file that is not a membership lease, or is larger than one, is the person's
+/// mistake and is said before the host is asked; a lease the host has no enrolment for reaches the
+/// host at its own socket and is refused there, with nothing installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn presenting_a_lease_is_refused_before_the_host_is_asked_or_by_the_host_that_holds_no_enrolment()
+ {
+    let host = Host::start().await;
+    let directory = host.temp.root().join("exports");
+    std::fs::create_dir_all(&directory).expect("a directory");
+
+    let not_a_lease = directory.join("not-a-lease.json");
+    std::fs::write(&not_a_lease, b"{\"hello\": 1}").expect("writes");
+    let output = host.kr(&[
+        "organisation",
+        "present",
+        not_a_lease.to_str().expect("a path"),
+    ]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("not a membership lease"), "{said}");
+
+    let too_large = directory.join("too-large.json");
+    std::fs::File::create(&too_large)
+        .expect("creates")
+        .set_len(2 * 1024 * 1024)
+        .expect("a sparse file");
+    let output = host.kr(&[
+        "organisation",
+        "present",
+        too_large.to_str().expect("a path"),
+    ]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("larger than any lease"), "{said}");
+
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let payload = MembershipLeasePayload {
+        organisation_id: OrganisationId::new(Uuid::from_bytes([0x21; 16])),
+        account_id: kr_protocol::ids::AccountId::new("account:ada").expect("an account"),
+        device_key: *key.public(),
+        role: kr_protocol::account::TeamRole::Controller,
+        maximum_grants: kr_protocol::scalars::CanonicalSet::new(),
+        issued_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+        expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 60_000),
+        key_revision: PolicyKeyRevision::new(1),
+    };
+    let signature = kr_crypto::sign::sign(
+        &key,
+        &SigningTranscript::from_canonical_bytes(
+            kr_protocol::account::MEMBERSHIP_LEASE_DOMAIN,
+            payload.signing_input().expect("encodes"),
+        )
+        .expect("a transcript"),
+    )
+    .expect("a signature");
+    let lease = directory.join("lease.json");
+    std::fs::write(
+        &lease,
+        serde_json::to_vec(&kr_protocol::account::MembershipLease { payload, signature })
+            .expect("encodes"),
+    )
+    .expect("writes");
+    let output = host.kr(&["organisation", "present", lease.to_str().expect("a path")]);
+    assert!(
+        !output.status.success(),
+        "a host enrolled in nothing takes no lease: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("PERMISSION_DENIED") || said.contains("enrol"),
+        "the host's own refusal, not a want of the method at its socket: {said}\n{}",
+        host.log()
+    );
 }
 
 /// KR-REQ-17.53: a file that is not an organisation's chain is a mistake of the person's, said
