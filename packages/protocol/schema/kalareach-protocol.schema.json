@@ -37792,7 +37792,7 @@
         },
         "omitted_actions": {
           "$ref": "#/$defs/U64",
-          "description": "How many affected actions this result cannot name.\n\nNought in every ordinary case, because the names are kept in the worker's journal and\ndelivered a page at a time. Anything else is names that went before they reached this\ndaemon: ones the worker no longer held when it was asked, and ones this daemon let go for\nroom."
+          "description": "How many affected actions this result cannot name.\n\nNought in every ordinary case, because the names are kept in the worker's journal and\ndelivered a page at a time. Anything else is names this result no longer holds: ones the\nworker no longer held when it was asked, and ones this daemon let go for room after it had\nthem."
         },
         "possibly_executed": {
           "description": "The actions whose dispatch transition had already won the serial race, in identity order\n(action, then actor), cut to what one answer carries. `possibly_executed_total` says how\nmany there were.\n\nEach one's receipt state says how much is known about what it did; the list is\nnot only the uncertain ones.",

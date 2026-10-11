@@ -440,7 +440,7 @@ impl Controller {
                 }
             };
             match outcome {
-                Some((ack, earlier)) if ack.revision.get() >= revision.get() => {
+                Some(ack) if ack.revision.get() >= revision.get() => {
                     // The barrier first, because it is what validates the binding: this
                     // announcement was made over one control path, and another exchange can lose
                     // that path and advance the binding while this one waits. Recording the
@@ -459,7 +459,6 @@ impl Controller {
                         binding,
                         ack.revision,
                         ack.fence,
-                        &earlier,
                     );
                     if accepted && evidenced {
                         {
@@ -612,8 +611,7 @@ impl Controller {
     }
 
     /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
-    /// first, and answers the acknowledgement of the last, which is the one the barrier waits on,
-    /// with the revisions of the notices before it.
+    /// first, and answers the acknowledgement of the last, which is the one the barrier waits on.
     /// It answers nothing when an exchange failed or ran out, `bound` after it began when one is
     /// given.
     ///
@@ -630,32 +628,26 @@ impl Controller {
         revision: AuthorityRevision,
         held: AuthorityRevision,
         bound: Option<std::time::Duration>,
-    ) -> Option<(
-        kr_protocol::worker::AuthorityRevisionAck,
-        Vec<AuthorityRevision>,
-    )> {
+    ) -> Option<kr_protocol::worker::AuthorityRevisionAck> {
         let mut notices = self.revision_notices(
             revision,
             held,
             0,
             &link.client().acknowledgement().capabilities,
         );
-        self.leases
-            .announced(session_id, notices.iter().map(|notice| notice.revision));
+        let told: Vec<AuthorityRevision> = notices.iter().map(|notice| notice.revision).collect();
+        self.leases.announced(session_id, &told);
         let last = notices.pop().expect("an announcement is made");
-        let earlier: Vec<AuthorityRevision> =
-            notices.iter().map(|notice| notice.revision).collect();
-        for (at, notice) in notices.into_iter().enumerate() {
+        for notice in notices {
             #[cfg(feature = "testing")]
             self.record_announcement(session_id, &notice);
             let ack = Self::exchange(bound, link.client().announce_revision(notice)).await?;
-            self.note_earlier_acknowledgement(session_id, binding, ack, &earlier[..at])
+            self.note_earlier_acknowledgement(session_id, binding, ack)
                 .await;
         }
         #[cfg(feature = "testing")]
         self.record_announcement(session_id, &last);
-        let ack = Self::exchange(bound, link.client().announce_revision(last)).await?;
-        Some((ack, earlier))
+        Self::exchange(bound, link.client().announce_revision(last)).await
     }
 
     /// The answer of one exchange with a worker, or nothing when it failed or took longer than
@@ -949,20 +941,19 @@ impl Controller {
 
     /// Takes the acknowledgement of a revision older than the one a barrier waits on, which a worker
     /// that missed it gave while it was told the revisions in order: it is news about that
-    /// revision, with the notices before it in the same announcement, `earlier`, and nothing else,
-    /// as an acknowledgement of an older revision is.
+    /// revision and nothing else, as an acknowledgement of an older revision is. What the result of
+    /// the revision reads of the notices before it was recorded with the announcement.
     pub(crate) async fn note_earlier_acknowledgement(
         &self,
         session_id: SessionId,
         binding: WorkerBinding,
         ack: kr_protocol::worker::AuthorityRevisionAck,
-        earlier: &[AuthorityRevision],
     ) {
         let evidenced = ack.fence.is_some();
         let revision = ack.revision;
         if self
             .leases
-            .acknowledge_in_announcement(session_id, binding, revision, ack.fence, earlier)
+            .acknowledge(session_id, binding, revision, ack.fence)
             && evidenced
         {
             let _ = self
