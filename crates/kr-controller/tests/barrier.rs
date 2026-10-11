@@ -3904,6 +3904,74 @@ async fn the_announcement_a_request_makes_asks_for_what_a_refused_revision_was_f
     names_the_actions(&next, &hosted, &device, rejected, dispatched);
 }
 
+/// KR-REQ-09.13: a result that could not ask the worker what its fence named for a revision it
+/// refused says so, and the next announcement asks again and names them.
+///
+/// The first revocation is refused whole and fenced by the worker's own maintenance. The second is
+/// acknowledged, and the worker's boundary is held from there, so every ask the daemon makes for the
+/// first revision's names is refused. The result holds, because the worker acknowledged, and says
+/// the worker has not yet been asked; it names no action as though the first revision had named
+/// none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_result_that_could_not_ask_about_a_refused_revision_says_so_and_the_next_one_names_it() {
+    let hosted = hosted_worker_apart().await;
+    let settled = announced_until(
+        &hosted.controller,
+        hosted
+            .controller
+            .revoke_authority()
+            .await
+            .expect("the revocation is recorded"),
+        |barrier| barrier.holds(),
+    )
+    .await;
+    let held = settled.authority_revision.get();
+    let device = actor("device:phone");
+    let rejected = 3;
+    seed_undispatched_intents(&hosted, &device, rejected);
+    let dispatched = a_dispatched_action(&hosted).await;
+
+    let boundary = HeldBoundary::take(&hosted).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    assert_eq!(refused.pending(), vec![hosted.session_id], "{refused:?}");
+    boundary.release().await;
+    hosted.service.fence_what_is_owed_for_tests();
+
+    let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
+    let boundary = HeldBoundary::take(&hosted).await;
+    stopped
+        .go
+        .send(())
+        .expect("the announcement is waiting at the stop");
+    let barrier = tokio::time::timeout(Duration::from_secs(120), stopped.announcing)
+        .await
+        .expect("the announcement returns although the worker refuses every ask")
+        .expect("the announcing task finishes")
+        .expect("the revocation is announced");
+    assert_eq!(barrier.authority_revision.get(), held + 2);
+    assert!(barrier.holds(), "{barrier:?}");
+    let reported = worker_report(&barrier, hosted.session_id);
+    assert!(reported.rejected_actions.is_empty(), "{reported:?}");
+    assert!(
+        reported.detail.contains("not yet been asked"),
+        "the result says what it could not ask: {:?}",
+        reported.detail
+    );
+
+    boundary.release().await;
+    let later = announced_until(&hosted.controller, barrier, |barrier| {
+        barrier.holds() && worker_report(barrier, hosted.session_id).detail.is_empty()
+    })
+    .await;
+    names_the_actions(&later, &hosted, &device, rejected, dispatched);
+}
+
 /// Writes one mutation to this daemon and returns what it answered.
 async fn submit(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
     client
