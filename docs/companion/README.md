@@ -404,9 +404,11 @@ never came back, and a checkpoint that never moves back.
   person settles it. Settling asks the service to fence the write's identity, and reads the bundle
   back where the fence does not say what became of the write. A restart keeps the write unsettled.
 - Saving the kit writes the seed, the locator and the service to a file at a destination the save
-  dialog returned. The file is flushed to disk and, on Unix, has the owner-only mode (0600). On
-  Windows a new file has the permissions of the folder the person chose, and a file that already
-  existed keeps its own. The page is sent none of its contents.
+  dialog returned. The file is flushed to disk and, on Unix, has the owner-only mode (0600); on
+  macOS its access list is removed first, and the save fails and leaves the file's contents as they
+  were when the list cannot be removed. On Windows a new file has the permissions of the folder the
+  person chose, and a file that already existed keeps its own. The page is sent none of its
+  contents.
 - `Recovery::enable_writer` is how a backup writer is made recovery-enabled. It commits the bundle
   with the writer named in it, and returns the evidence that the writer is enabled only after that
   commit has landed.
