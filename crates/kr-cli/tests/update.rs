@@ -10273,6 +10273,55 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
     assert!(found[0].contains("names that type nowhere"), "{found:?}");
 }
 
+/// KR-REQ-26.10: a word the code matches stored text against is found when a word is added, not only
+/// when a listed one is changed. The digest of a set holds how often each listed word occurs where
+/// the code writes it, which a word added beside them does not move, and the definition of the enum
+/// the words stand for, which a variant added to it does.
+#[test]
+fn a_word_added_to_the_enum_behind_a_set_of_words_moves_its_digest() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let write = |path: &str, text: &str| {
+        std::fs::write(directory.path().join(path), text).expect("a source");
+    };
+    let words = vec!["one".to_owned(), "two".to_owned()];
+    let basis = |enums: &[(&str, &str)]| {
+        stored_formats::words_basis(directory.path(), &words, Some("store.rs"), enums)
+            .expect("the basis")
+    };
+    let enums = [("kinds.rs", "Kinds")];
+    write(
+        "store.rs",
+        "fn out(k: Kinds) -> &str { match k { A => \"one\", B => \"two\" } }\n",
+    );
+    write("kinds.rs", "pub enum Kinds {\n    A,\n    B,\n}\n");
+    let (before, without_enums) = (basis(&enums), basis(&[]));
+
+    // A variant, and the arm that writes its word, are added.
+    write(
+        "store.rs",
+        "fn out(k: Kinds) -> &str { match k { A => \"one\", B => \"two\", C => \"three\" } }\n",
+    );
+    write("kinds.rs", "pub enum Kinds {\n    A,\n    B,\n    C,\n}\n");
+    assert_ne!(
+        basis(&enums),
+        before,
+        "the enum's new variant moves the digest"
+    );
+    assert_eq!(
+        basis(&[]),
+        without_enums,
+        "and the occurrences of the listed words alone do not: the case the enum is for"
+    );
+
+    // A listed word changed where the code writes it moves the digest too.
+    write("kinds.rs", "pub enum Kinds {\n    A,\n    B,\n}\n");
+    write(
+        "store.rs",
+        "fn out(k: Kinds) -> &str { match k { A => \"one\", B => \"zwei\" } }\n",
+    );
+    assert_ne!(basis(&enums), before);
+}
+
 /// KR-REQ-26.10: a type a stored item holds is followed to the file that defines it, and what cannot
 /// be followed is reported, never skipped. Two types of one name in two files are two types, a `use`
 /// that renames or groups or globs is followed, and an alias, a name nothing brings in, a type
