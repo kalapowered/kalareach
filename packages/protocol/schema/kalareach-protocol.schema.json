@@ -188,7 +188,7 @@
       "description": "What `account.sign_out` answers: whether there was an account to sign out, and whether the\nservice has been told to end it.",
       "properties": {
         "service_told": {
-          "description": "Whether the service has acknowledged every revocation this host holds: the one just sent\nand any that were waiting. When it has not, the grant is gone from this host all the same,\nand the daemon sends what is left again when it next starts.",
+          "description": "Whether the service has acknowledged every revocation this host holds: the one just sent\nand any that were waiting. When it has not, the grant is gone from this host all the same,\nand the daemon sends what is left again at a later start that can reach the service.",
           "type": "boolean"
         },
         "was_signed_in": {
