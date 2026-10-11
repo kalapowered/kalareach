@@ -2536,8 +2536,9 @@ async fn an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at
         .expect_err("a held method is refused at the door");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(
-        !refused.message.contains("recorded"),
-        "nothing was done, and the refusal does not say that something was: {refused:?}"
+        refused.message.contains("not live") && !refused.message.contains("withheld"),
+        "nothing was done, and the refusal says the lease is not live and not that a result was \
+         withheld: {refused:?}"
     );
     let _: kr_protocol::hostinfo::HostInfoResult =
         pairing_calls::read(&mut local, Method::HostInfo, &())
