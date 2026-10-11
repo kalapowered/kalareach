@@ -1164,9 +1164,9 @@ impl Controller {
     /// not known and nothing goes around it.
     ///
     /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
-    /// delivery, the managed voice broker, the plugin catalogue and the managed storage service
-    /// never go through two different routes, and an edit applies to all of them at the next
-    /// start.
+    /// delivery, the managed voice broker and account service, backups to the managed storage
+    /// service, the model's files and the plugin catalogue never go through two different
+    /// routes, and an edit applies to all of them at the next start.
     ///
     /// # Errors
     ///
