@@ -1283,9 +1283,10 @@ impl Registry {
     /// The registry holds, for each environment, the document it last accepted, as text. A document
     /// gained its `storage` section, and with it a version: the record written from now on is at
     /// version 2, and a release that reads version 1 of the document cannot read it. A record the
-    /// release before wrote stays as it is, at version 1, and is read as a document at version 2
-    /// (the configuration document's own step), so it is still the document the file holds and the
-    /// next start does not take the file for an edit it has not seen. No row changes.
+    /// release before wrote stays as it is, at version 1, and is read as a document at the version
+    /// this build writes (the configuration document's own step), so it is still the document the
+    /// file holds and the next start does not take the file for an edit it has not seen. No row
+    /// changes.
     ///
     /// This migration goes in the first release after every install has opened the registry at
     /// this version: nothing before it is installed anywhere it has to be read from again.
