@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kr_protocol::envelope::{ControlEvent, ControlFrame, Outcome, Response};
+use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ControllerGeneration, RequestId};
 use kr_protocol::worker::{LocalAccess, LocalBound};
@@ -381,10 +381,9 @@ impl LocalWrites {
             return Verdict::Write;
         };
         match frame {
-            // Neither carries session content: the host's own keep-alive and window renewal.
-            ControlFrame::Event(ControlEvent::Keepalive | ControlEvent::ActionWindowRenewed(_)) => {
-                Verdict::Write
-            }
+            // A frame of a stream carries session content: it is not written, and the connection
+            // ends what it holds.
+            ControlFrame::Notification(_) => Verdict::Stop,
             ControlFrame::Response(response) => {
                 let held = self
                     .held
@@ -406,7 +405,9 @@ impl LocalWrites {
                     )),
                 })))
             }
-            _ => Verdict::Stop,
+            // The opening exchange, the host's own keep-alive and window renewal, and any other
+            // frame that carries no session content.
+            _ => Verdict::Write,
         }
     }
 
@@ -439,6 +440,7 @@ impl LocalWrites {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_ipc::clock::SharedClock as _;
     use kr_protocol::scalars::U64;
 
     fn gate() -> LocalGate {

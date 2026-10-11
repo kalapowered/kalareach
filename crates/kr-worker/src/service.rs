@@ -10000,6 +10000,7 @@ mod tests {
         let writable = Writing {
             turn: Arc::new(tokio::sync::Mutex::new(())),
             readiness: writer.writable(),
+            local: None,
         };
         (temp, writable, Arc::new(Mutex::new(writer)), reader)
     }
