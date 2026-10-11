@@ -77,6 +77,8 @@ pub mod probe;
 pub mod process;
 pub mod profiles;
 pub mod semantic;
+#[cfg(unix)]
+pub mod server;
 mod splice;
 pub mod tokens;
 pub mod volatile;
