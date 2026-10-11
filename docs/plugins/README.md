@@ -565,15 +565,15 @@ component fault disables rich meaning without stalling or discarding valid nativ
   `"sdk_range": ">=0.1.5, <0.2.0"`.
 - **Limits:** the host carries messages of at most 1 MiB, whatever the package says: if
   `max_message_bytes` is below this, that value is used, and if it is above, this value is used. A
-  message over the limit ends the connection, with the close code for a message that is too big. A
-  message the size of the limit is carried both ways: a queue that holds nothing takes one message
-  of the limit, and swapping the host's identifier for the terminal's own can lengthen a message by
-  at most 258 bytes. A terminal's request identifier is a string of at most 256 bytes, quotes and
-  escapes counted, or an integer that fits in 64 bits, and any other spelling is refused. A terminal
-  may have 256 requests outstanding at a time, and if the server has not answered one after 120
-  seconds, it is refused to the terminal. A message that cannot be written to the terminal within 5
-  seconds ends its connection. A terminal may send at most 256 pings and pongs in a minute, which a
-  keepalive stays far below, and a flood ends the connection.
+  message over the limit ends the connection. A message the size of the limit is carried both ways:
+  a queue that holds nothing takes one message of the limit, and swapping the host's identifier for
+  the terminal's own can lengthen a message by at most 258 bytes. A terminal's request identifier is
+  a string of at most 256 bytes, quotes and escapes counted, or an integer that fits in 64 bits, and
+  any other spelling is refused, a string that begins with `kr-` among them, since that names the
+  requests the host sends. A terminal may have 256 requests outstanding at a time, and if the server
+  has not answered one after 120 seconds, it is refused to the terminal. A message that cannot be
+  written to the terminal within 5 seconds ends its connection. A terminal may send at most 256
+  pings and pongs in a minute, which a keepalive stays far below, and a flood ends the connection.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
