@@ -62,7 +62,9 @@ pub struct Levelled {
 /// - a struct with derived `Serialize`, `Deserialize` and `JsonSchema`, and no `flatten`,
 ///   `serialize_with`, `deserialize_with`, `with` or schema override, that is
 ///   `#[serde(deny_unknown_fields, default)]` and has only `Nullable` fields, so that absent and
-///   all null are the same and mean the section is not used;
+///   all null are the same and mean the section is not used, and every type it holds, at any
+///   depth, derives `Deserialize` and `JsonSchema` with `deny_unknown_fields` and none of those
+///   attributes (a map is the one open form, and only as a field);
 /// - on the document, `#[serde(default, skip_serializing_if = "is_unused")]`, and never an
 ///   `Option`, so that an unused section is not written and a release that reads less reads the
 ///   document strictly;
