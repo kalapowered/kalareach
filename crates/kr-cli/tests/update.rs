@@ -10301,7 +10301,17 @@ fn a_held_type_is_followed_to_the_file_that_defines_it_and_what_cannot_be_follow
     );
     write(
         "crates/kr-a/src/lib.rs",
-        "pub mod holder;\npub mod one;\npub mod strings;\npub mod two;\npub use one::Notice as Renamed;\n",
+        "pub mod holder;\npub mod holder2;\npub mod holder3;\npub mod one;\npub mod strings;\npub mod two;\npub use one::Notice as Renamed;\n",
+    );
+    // A `String` an inline module exports through a glob the walk cannot follow is not the
+    // standard library's, and two globs that bring in different types of one name are an error.
+    write(
+        "crates/kr-a/src/holder2.rs",
+        "use self::exports::*;\nmod exports {\n    pub struct String {}\n}\npub struct Hidden {\n    a: String,\n}\n",
+    );
+    write(
+        "crates/kr-a/src/holder3.rs",
+        "use crate::one::*;\nuse crate::two::*;\npub struct Both {\n    a: Notice,\n}\n",
     );
     write(
         "crates/kr-a/src/one.rs",
@@ -10446,6 +10456,18 @@ pub struct Made {
             name: "String".to_owned()
         }]
     );
+    for (file, item, said) in [
+        ("holder2.rs", "Hidden", "cannot be followed"),
+        ("holder3.rs", "Both", "more than one glob"),
+    ] {
+        let problems = workspace
+            .held_by(&format!("crates/kr-a/src/{file}"), item)
+            .expect_err(item);
+        assert!(
+            problems.iter().any(|problem| problem.contains(said)),
+            "{item}: {problems:?}"
+        );
+    }
     let variants = workspace
         .held_by("crates/kr-a/src/holder.rs", "Variants")
         .expect("the fields of a variant are followed");
