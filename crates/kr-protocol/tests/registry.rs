@@ -791,13 +791,17 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     }
 
     // A member's device presents the lease its organisation signed for it, and nobody presents
-    // for anyone else: the method is the device's own, over the paired door alone, behind its own
-    // key and no right of the grant, since a device whose grant needs a lease cannot hold a right
-    // before it has one. It asks for no owner confirmation, because it only ever narrows or
-    // renews what the organisation signed.
+    // for anyone else: the method is the device's own, over the paired door and the host's own
+    // socket (where the host's local owner presents the lease signed for the host's own key),
+    // behind its own key and no right of the grant, since a device whose grant needs a lease
+    // cannot hold a right before it has one. It asks for no owner confirmation, because it only
+    // ever narrows or renews what the organisation signed.
     let presenting = lookup("membership.present").expect("membership.present is in the registry");
     assert_eq!(presenting.effect, EffectClass::Write);
-    assert_eq!(presenting.ingress, &[ActorIngress::PairedDevice]);
+    assert_eq!(
+        presenting.ingress,
+        &[ActorIngress::LocalIpc, ActorIngress::PairedDevice]
+    );
     assert_eq!(
         presenting.required_rights,
         &[RequiredRight::basis(RequiredAuthority::ResourceOwner)],
