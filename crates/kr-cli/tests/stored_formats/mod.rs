@@ -33,7 +33,10 @@
 //! check against the lock on main sees that), a type that a store keeps and that no type the table
 //! declares holds, and a list of words the code matches by hand that the table does not declare.
 //! What a declared source item holds is found by [`undeclared_in`], and a type the table has not
-//! declared yet is listed as [`Known`] with a digest of what it is.
+//! declared yet is listed as [`Known`] with a digest of what it is. It cannot see the checks the
+//! code runs on what a section holds (`validate`, a hand-written deserialiser) either, which no
+//! schema shows: a change to what a section accepts needs the version raised even when its digest
+//! does not move.
 
 #![allow(dead_code)]
 
