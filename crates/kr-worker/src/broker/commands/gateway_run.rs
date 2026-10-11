@@ -86,17 +86,17 @@ impl Backend {
     /// tables pinned for the instance. It is idempotent: a second call finds nothing to end.
     ///
     /// The ending runs in a task of its own, kept in the backend's list of endings, which retiring
-    /// the backend does not abort and which the session's closing waits for.
+    /// the backend does not abort.
     pub(super) fn end_gateway(&self) {
         let Some(run) = self.gateway_run.as_ref() else {
             return;
         };
-        if let Some(owner) = run
+        let connection = run
             .connection
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(owner) = connection {
             owner.shutdown();
         }
         let server = run
@@ -151,7 +151,7 @@ pub(super) async fn start(
     let attempt = async {
         let presented = environment.pairs();
         drop(environment);
-        let server = Server::start_with(
+        let (server, unshown) = Server::spawn(
             &ServerSpec {
                 executable: std::path::Path::new(&backend.invocation.executable),
                 digest: &identity.hashed.digest,
@@ -163,6 +163,10 @@ pub(super) async fn start(
         )
         .await
         .map_err(|detail| BrokerError::UpstreamUnavailable { detail })?;
+        // From here the ending finds the server, whatever stops this attempt: nothing that can be
+        // cancelled sits between the process being started and its being put where it is ended
+        // from, and it is recorded before it is shown to run what was hashed, which takes as long
+        // as the executable is large.
         let server = Arc::new(server);
         *run.server.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&server));
         run.broker
@@ -178,6 +182,10 @@ pub(super) async fn start(
             session.record_backend(server.identity().clone())
         }
         .map_err(|detail| BrokerError::PreconditionFailed { detail })?;
+        server
+            .show(unshown)
+            .await
+            .map_err(|detail| BrokerError::UpstreamUnavailable { detail })?;
         match written.await {
             Ok(true) => {}
             _ => {
@@ -249,22 +257,37 @@ pub(super) async fn accept(
         match event {
             Event::Retired => return,
             Event::NoConnection => {
-                // Nothing connected: the program ran as typed. There is nothing for the server to
-                // serve, and the instance names a program that has no gateway.
-                let _ = broker.end(
-                    backend.application_instance_id,
-                    crate::broker::InstanceEnding::NativeExit,
-                );
-                backend.end_gateway();
-                backend.announce_ended();
+                end_unconnected(&backend, &broker);
                 return;
             }
             Event::Accepted(Ok(accepted)) => {
-                handle(&backend, &broker, &registration, accepted).await;
+                // The admission is held to the same bound: a program that is part way through
+                // being admitted when the bound passes has not connected, and a check of its image
+                // or its upgrade that does not finish is not a connection either.
+                tokio::select! {
+                    biased;
+                    () = &mut retired => return,
+                    () = &mut deadline, if !run.claimed.load(Ordering::Acquire) => {
+                        end_unconnected(&backend, &broker);
+                        return;
+                    }
+                    () = handle(&backend, &broker, &registration, accepted) => {}
+                }
             }
             Event::Accepted(Err(_)) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     }
+}
+
+/// Ends what a program that never connected leaves: it ran as typed, so there is nothing for the
+/// server to serve, and the instance names a program that has no gateway.
+fn end_unconnected(backend: &Arc<Backend>, broker: &Arc<Broker>) {
+    let _ = broker.end(
+        backend.application_instance_id,
+        crate::broker::InstanceEnding::NativeExit,
+    );
+    backend.end_gateway();
+    backend.announce_ended();
 }
 
 /// Admits one connection if it is the program's, and serves it.
@@ -314,6 +337,8 @@ async fn handle(
     let Ok(lines) = crate::broker::websocket::accept(stream, tables.framing).await else {
         return;
     };
+    // From the claim to the end of this function nothing is awaited, so the deadline cannot cut an
+    // admission between its being claimed and its being served.
     if run.claimed.swap(true, Ordering::AcqRel) {
         return;
     }

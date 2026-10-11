@@ -78,7 +78,6 @@ pub trait Owned: Send + Sync {
 }
 
 /// What the server is started from.
-#[derive(Debug)]
 pub struct ServerSpec<'a> {
     /// The executable, as the launch presented it.
     pub executable: &'a Path,
@@ -90,6 +89,23 @@ pub struct ServerSpec<'a> {
     pub directory: &'a Path,
     /// The environment the launcher presented.
     pub presented: &'a [(OsString, OsString)],
+}
+
+impl std::fmt::Debug for ServerSpec<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The environment is the person's, and is never shown: only how many variables it holds.
+        formatter
+            .debug_struct("ServerSpec")
+            .field("executable", &self.executable)
+            .field("digest", &self.digest)
+            .field("arguments", &self.arguments)
+            .field("directory", &self.directory)
+            .field(
+                "presented",
+                &format_args!("{} variables", self.presented.len()),
+            )
+            .finish()
+    }
 }
 
 /// How the server came to an end.
@@ -220,6 +236,13 @@ impl Tail {
     }
 }
 
+/// What a started server is shown against: the executable that was hashed.
+#[derive(Debug)]
+pub(crate) struct Unshown {
+    hashed: crate::broker::image::HashedFile,
+    stop: Arc<AtomicBool>,
+}
+
 /// An application server a session started.
 #[derive(Debug)]
 pub struct Server {
@@ -240,19 +263,28 @@ impl Server {
     /// not be read or is not the one the record names, the process could not be started, could not
     /// be read once started, or does not run the code that was hashed.
     pub async fn start(spec: &ServerSpec<'_>) -> Result<Self, String> {
-        Self::start_with(spec, Arc::new(HashedFiles::default())).await
+        let (server, unshown) = Self::spawn(spec, Arc::new(HashedFiles::default())).await?;
+        server.show(unshown).await?;
+        Ok(server)
     }
 
     /// Starts the server `spec` names, reading the executable through `cache`, which holds what
-    /// was read of it already while it is unchanged.
+    /// was read of it already while it is unchanged, and returns it before it is shown to run the
+    /// executable that was hashed.
+    ///
+    /// The process exists when this returns, and nothing that can be cancelled is awaited after it
+    /// is started, so a caller that puts the server where its ending finds it, and has it recorded,
+    /// before it awaits [`Server::show`] leaves no moment in which the server runs and nothing
+    /// would end it and what it starts.
     ///
     /// # Errors
     ///
-    /// Returns what [`Server::start`] does.
-    pub(crate) async fn start_with(
+    /// Returns why nothing was started: the executable could not be read or is not the one the
+    /// record names, or the process could not be started or read once started.
+    pub(crate) async fn spawn(
         spec: &ServerSpec<'_>,
         cache: Arc<HashedFiles>,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, Unshown), String> {
         if !spec.executable.is_absolute() {
             return Err(format!(
                 "{} is not an absolute path, so no server was started",
@@ -340,26 +372,34 @@ impl Server {
             errors,
             retired: AtomicBool::new(false),
         };
+        Ok((server, Unshown { hashed, stop }))
+    }
+
+    /// Shows that the server runs the executable that was hashed.
+    ///
+    /// # Errors
+    ///
+    /// Returns why it was not shown to: the image could not be read, or is not the one that was
+    /// hashed. The server is still running, and is the caller's to end.
+    pub(crate) async fn show(&self, unshown: Unshown) -> Result<(), String> {
+        let identity = self.identity.clone();
         // Off the runtime's threads: where the image is hashed again, it is the whole file.
         let shown = tokio::task::spawn_blocking(move || {
             crate::broker::image::verify_image(
                 &identity,
                 &ExecutableIdentity {
-                    hashed,
+                    hashed: unshown.hashed,
                     version: None,
                 },
                 &VerifiedFiles::default(),
-                &stop,
+                &unshown.stop,
             )
         })
         .await
         .map_err(|error| format!("the server's image could not be read: {error}"))?;
-        match shown {
-            Ok(()) => Ok(server),
-            Err(why) => Err(format!(
-                "the server started does not run the code that was hashed, so it was ended: {why}"
-            )),
-        }
+        shown.map_err(|why| {
+            format!("the server started does not run the code that was hashed: {why}")
+        })
     }
 
     /// The process the kernel started, by its identifier and start.
@@ -408,10 +448,12 @@ impl Server {
 
     /// Asks the server to end with `stop`, by its identity; where the system will not signal by
     /// identity, through the child this holds, which has not been collected and so still names
-    /// the server.
+    /// the server. Returns whether a signal was delivered: not when the server was already gone,
+    /// which delivers nothing and so forces nothing.
     async fn ask(&self, stop: Stop, owned: &dyn Owned) -> bool {
         match stop_process(&self.identity, stop) {
-            Stopped::Signalled | Stopped::Gone | Stopped::Unsupported => true,
+            Stopped::Signalled => true,
+            Stopped::Gone | Stopped::Unsupported => false,
             Stopped::Refused(why) | Stopped::Unsafe(why) => {
                 let mut held = self.child.lock().await;
                 let signalled = held.as_mut().is_some_and(|child| match stop {
