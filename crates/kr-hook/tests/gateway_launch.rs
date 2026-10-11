@@ -559,7 +559,9 @@ fn kr_req_12_07_a_launch_lost_to_a_retirement_ends_its_server() {
     let servers = shell.servers();
     assert_eq!(servers.len(), 1, "the server was started before the commit");
     let _ = shell.backends.close();
-    release.send(()).expect("the launch waits");
+    // The retirement ends the admission wherever it is, the pause with it, so there may be nobody
+    // left to let go; the launch is abandoned either way.
+    let _ = release.send(());
     assert_eq!(launched.ends().code(), Some(2), "the program ran as typed");
     eventually("the server ended", || {
         kr_ipc::identity::process_state(&servers[0]) == kr_ipc::identity::ProcessState::Ended
