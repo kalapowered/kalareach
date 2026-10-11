@@ -1242,11 +1242,11 @@ impl Store {
             };
             let document = bytes_path(&contents[split + 1..]);
             if let Some(why) = unusable_path(&document) {
-                return Err(malformed(match why {
-                    "is empty" => "it names no document path",
-                    "is not an absolute path" => "its document path is not an absolute path",
-                    _ => "its document path holds a byte no path holds",
-                }));
+                return Err(InstallError::io(
+                    "read",
+                    &path,
+                    std::io::Error::other(format!("its document path {why}")),
+                ));
             }
             recorded.push(RecordedDocument {
                 environment,
