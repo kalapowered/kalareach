@@ -11,14 +11,23 @@ use kr_protocol::gateway::NativeFraming;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::MAX_NATIVE_FRAME_BYTES;
 
+/// The most bytes a request identifier of a terminal's may be spelled in, quotes included, when it
+/// is a string.
+///
+/// The terminal's identifiers are held until the upstream answers, and a reply carries back the
+/// spelling the terminal used, so the spelling is what is bounded.
+pub const MAX_CLIENT_IDENTIFIER_BYTES: usize = 256;
+
 /// How many bytes a body may grow by on its way through this host.
 ///
 /// A request the terminal sends is forwarded under an identifier this host gives it, and the
 /// reply comes back under the terminal's own. The longest identifier this host gives is a quoted
-/// `kr-` and twenty digits, 25 bytes, in place of one that may be a single character. A body is
-/// read at the limit its connector states and may be written that many bytes longer, so a frame at
-/// the limit is not carried in one direction and refused in the other.
-pub const IDENTIFIER_ALLOWANCE: usize = 32;
+/// `kr-` and twenty digits, 25 bytes, in place of one that may be a single character; the longest
+/// the terminal gives is a string of [`MAX_CLIENT_IDENTIFIER_BYTES`] and its quotes, in place of
+/// one this host gave that may be six bytes. A body is read at the limit its connector states and
+/// may be written that many bytes longer, so a frame at the limit is not carried in one direction
+/// and refused in the other.
+pub const IDENTIFIER_ALLOWANCE: usize = MAX_CLIENT_IDENTIFIER_BYTES + 2;
 
 /// Reads and writes one connector's frames, as its qualified table describes them.
 #[derive(Clone, Copy, Debug)]
