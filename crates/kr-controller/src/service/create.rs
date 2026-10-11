@@ -547,9 +547,10 @@ impl Controller {
             //
             // The document in force is read in the same section, and before the admission, so
             // that the clock is still read last: one accepted as unusable while this create
-            // prepared its launch refuses it here, as an action whose authority was withdrawn is.
-            // A document accepted after this section has no create left to refuse; it was made
-            // before it.
+            // prepared its launch refuses it here. An acceptance takes the registry lock before it
+            // returns (`fence_owed`), so one that overlaps this section ends after it, and the
+            // create came first; a document accepted after this section has no create left to
+            // refuse.
             let unusable = self.refusal_for_unusable_document();
             if let Err(refusal) = self
                 .check_admission(&registry, &carried)

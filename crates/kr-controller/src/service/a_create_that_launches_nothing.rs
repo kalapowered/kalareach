@@ -1292,7 +1292,9 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_its_package_went_a
 /// The refusal for a document the host cannot use is for an action with no outcome yet: a retry of
 /// one that has one is answered from it, as section 9 says, whatever the host's conditions are now.
 /// This is the guard of the order in `session_create`, which a request that reaches the daemon as
-/// a retry does not show: the daemon answers a repeated token before `session_create` is asked.
+/// a retry does not show: the daemon answers a repeated token before `session_create` is asked. A
+/// token refused for the document is refused again for it, before a reservation that would answer
+/// the repeat as a failed create.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke() {
     let (temp, controller, asked) = daemon().await;
@@ -1363,7 +1365,7 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke
     assert_eq!(again.code(), ErrorCode::HostNotConfigured, "{again}");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
-        "and nothing was started for either"
+        "and nothing was started for any of the three"
     );
 }
 

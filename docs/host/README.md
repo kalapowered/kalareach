@@ -357,7 +357,7 @@ the host's answer.
 management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret
 store and asks the service to end it. It is refused while a call is open, for the reason a sign-in
 is. A service that cannot be told leaves the grant gone from this host and the revocation queued;
-the daemon sends it again when it next starts, and the command says so. A host with no account
+the daemon sends it again at a later start that can reach the service, and the command says so. A host with no account
 answers that there was none. Recovery at start and before the first token is tried again by the next
 request when the store fails it, and no token goes out until it has succeeded.
 
