@@ -273,6 +273,48 @@ fn a_document_this_build_does_not_know_is_left_exactly_as_it_was() {
     );
 }
 
+/// KR-REQ-26.13: a document of a level this build does not read is not rewritten either, though the
+/// build reads it: an edit would drop the members it cannot see.
+#[test]
+fn a_document_at_a_higher_level_is_refused_an_edit_and_left_exactly_as_it_was() {
+    let installation = Installation::create();
+    let environment = installation.environment();
+    let path = kr_cli::doctor::configuration::document_path(&environment);
+    let higher = r#"{"version": 3, "level": 2, "ceilings": {"session_limit": 4}, "zq_telemetry": {"enabled": true}}"#;
+    kr_ipc::paths::write_owner_only_file(&path, higher.as_bytes()).expect("writes it");
+
+    // The control: this build reads the document, so it is the edit that is refused and not the
+    // reading, which would also refuse it.
+    let loaded = kr_cli::doctor::configuration::load(&environment);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(
+        loaded.newer.is_some(),
+        "it is above the level this build reads"
+    );
+
+    let output = installation.run(&["host", "power", "--set", "battery_too"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a refused edit is a usage failure, not a host failure"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("level 2") && message.contains("nothing was written"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("still there"),
+        higher,
+        "byte for byte as the owner left it"
+    );
+}
+
 /// Every path under `root`, with each file's content, so a test can say that nothing was added,
 /// removed or changed there.
 fn every_path_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {

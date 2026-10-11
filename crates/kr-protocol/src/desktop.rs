@@ -1062,12 +1062,16 @@ mod tests {
                 chosen
             );
         }
+        let from_the_future = format!(
+            r#"{{"version": {}, "preferences": {{"sleep_inhibition": "battery_too"}}}}"#,
+            configuration::VERSION + 1
+        );
         for damaged in [
             b"".as_slice(),
             b"not a document".as_slice(),
             br#"{"preferences": {"sleep_inhibition": "always"}}"#.as_slice(),
             br#"{"preferences": {"sleep_inhibition": true}}"#.as_slice(),
-            br#"{"version": 3, "preferences": {"sleep_inhibition": "battery_too"}}"#.as_slice(),
+            from_the_future.as_bytes(),
         ] {
             let loaded = configuration::load(Some(damaged));
             assert_eq!(
