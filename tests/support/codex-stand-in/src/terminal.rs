@@ -18,7 +18,7 @@ use crate::variants::{KEY_VARIABLE, RELEASE_VARIABLE, Variants, padded};
 const ACCOUNT: i64 = 1;
 const SIGN_IN: i64 = 4;
 const THREAD: i64 = 2;
-const TURN: i64 = 3;
+pub(crate) const TURN: i64 = 3;
 
 /// Runs the terminal against the server at `socket`, and returns the exit status it ends with.
 pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &str) -> i32 {
@@ -247,6 +247,15 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                     // A person quitting closes the connection as it leaves.
                     let _ = connection.send(Message::close(None, "")).await;
                     return 0;
+                }
+                if completed
+                    && variants.request_when_released
+                    && let Ok(release) = std::env::var(RELEASE_VARIABLE)
+                {
+                    while !std::path::Path::new(&release).exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    send!(json!({ "id": ACCOUNT, "method": "account/read", "params": {} }));
                 }
             }
         }
