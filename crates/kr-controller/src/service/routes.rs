@@ -271,7 +271,7 @@ impl Controller {
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
             Method::DeliveryDestinationList => self.delivery_destination_list(&request.params),
-            Method::OrganisationList => self.organisation_list(),
+            Method::OrganisationList => self.organisation_list().await,
             Method::PrivacyStatus => self.privacy_status().await,
             Method::AccountStatus => self.account_status(&request.params),
             Method::DescriptionSetup => self.description_setup(),

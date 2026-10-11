@@ -476,6 +476,29 @@ impl LocalClient {
         .await
     }
 
+    /// Tells a worker what the host's local owner may do and waits for it to acknowledge.
+    ///
+    /// The acknowledgement carries the sequence the worker now holds: the statement's own, or the
+    /// higher one it already held.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worker's refusal, or a transport failure.
+    pub async fn announce_local_access(
+        &mut self,
+        access: kr_protocol::worker::LocalAccess,
+    ) -> Result<kr_protocol::worker::LocalAccessAck> {
+        self.acknowledged(
+            &ControlFrame::LocalAccess(access),
+            "the worker refused the statement of what the local owner may do",
+            |frame| match frame {
+                ControlFrame::LocalAccessAck(ack) => Some(ack),
+                _ => None,
+            },
+        )
+        .await
+    }
+
     /// Tells a worker the environment's privacy generation and waits for its answer: the
     /// generation its session holds now, and where its own cleanup stands.
     ///

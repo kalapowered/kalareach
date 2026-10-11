@@ -17,7 +17,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::OrganisationId;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
-    MembershipPresentParams, MembershipPresentResult, OrganisationChangeMarker,
+    HostDeviceView, MembershipPresentParams, MembershipPresentResult, OrganisationChangeMarker,
     OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
     OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationLeaseView,
     OrganisationListResult, OrganisationMemberView, OrganisationWithdrawParams,
@@ -146,6 +146,20 @@ fn check_exclusive_change(
         require_a_device_that_can_recover(recoverable)?;
     }
     Ok(())
+}
+
+/// Refuses making the host exclusive while a worker that may be alive cannot be told what the
+/// local owner may do: it would serve its local caller without the hold.
+fn require_every_worker_can_be_told(lacking: &[kr_protocol::ids::SessionId]) -> Result<()> {
+    if lacking.is_empty() {
+        return Ok(());
+    }
+    Err(ControllerError::InvalidArgument(format!(
+        "{} session worker(s) cannot be told what this host's local owner may do (a session an \
+         earlier release started, or one this host has not reached), so they would serve a local \
+         caller without the owner's membership lease; end them with `kr close` first",
+        lacking.len()
+    )))
 }
 
 /// Refuses making the host exclusive when no owner device could confirm for it once its leases
@@ -637,6 +651,9 @@ impl Controller {
             // revision advanced and every connection fenced for nothing.
             let recoverable = self.owner.an_owner_device_can_recover(environment_id)?;
             check_exclusive_change(&self.policy(), &plan, recoverable)?;
+            require_every_worker_can_be_told(
+                &self.workers_without_local_enforcement_in(&registry)?,
+            )?;
             let debt = self.owe_debt(
                 "making this host exclusively organisation-managed",
                 Reach::Host,
@@ -656,6 +673,9 @@ impl Controller {
                     // The devices are read from the transaction's own file, so an enablement
                     // never commits after the last device that can recover the host has been
                     // revoked.
+                    require_every_worker_can_be_told(
+                        &self.workers_without_local_enforcement_in(&registry)?,
+                    )?;
                     require_a_device_that_can_recover(crate::grants::an_owner_device_can_recover(
                         connection,
                         environment_id,
@@ -813,7 +833,15 @@ impl Controller {
     /// `organisation.list`: what this host holds for each organisation it is enrolled in, whether
     /// it is exclusively organisation-managed, whether it trusts its clock, and the times
     /// exclusive management was turned off.
-    pub(crate) fn organisation_list(&self) -> Result<ParamsValue> {
+    pub(crate) async fn organisation_list(&self) -> Result<ParamsValue> {
+        let without_local_enforcement = {
+            let registry = self.registry.lock().await;
+            self.workers_without_local_enforcement_in(&registry)?
+        };
+        let host_device = HostDeviceView {
+            device_id: self.local_owner_device(),
+            authorisation_key: self.host_authorisation_key,
+        };
         let policy = self.policy();
         let clock_trusted = self
             .lifetimes
@@ -859,6 +887,8 @@ impl Controller {
             exclusive: policy.is_exclusively_managed(),
             clock_trusted,
             exclusive_events: self.sharing.grants().exclusive_management_events()?,
+            host_device,
+            workers_without_local_enforcement: without_local_enforcement,
         })
     }
 }

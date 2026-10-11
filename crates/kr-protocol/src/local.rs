@@ -236,6 +236,24 @@ pub fn reads_history_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
         .any(|capability| capability.as_str() == FORWARDED_HISTORY_SCOPE)
 }
 
+/// The capability a worker states when it holds a local caller to what the control daemon tells it
+/// the host's local owner may do ([`crate::worker::LocalAccess`]), and a control daemon reads
+/// before it sends one.
+///
+/// A worker of an earlier build ends the connection that carries a frame it cannot read, so a
+/// daemon sends the statement only to a worker that states this. An exclusive host refuses to be
+/// made so while a worker it knows of does not.
+pub const LOCAL_ACCESS: &str = "local.access/1";
+
+/// Returns true when a worker's statement says it holds a local caller to the host's statement of
+/// what its local owner may do ([`LOCAL_ACCESS`]).
+#[must_use]
+pub fn holds_local_access(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == LOCAL_ACCESS)
+}
+
 /// The capability a worker states when it holds a forwarded `question.read` to the history scope
 /// the read carries, and a control daemon reads before it sends a question read with a scope.
 ///

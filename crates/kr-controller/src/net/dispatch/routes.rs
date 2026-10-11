@@ -219,6 +219,8 @@ impl RemoteConnection {
             | ControlFrame::GenerationAccepted(_)
             | ControlFrame::AuthorityRevision(_)
             | ControlFrame::AuthorityRevisionAck(_)
+            | ControlFrame::LocalAccess(_)
+            | ControlFrame::LocalAccessAck(_)
             | ControlFrame::PluginAdmissions(_)
             | ControlFrame::PluginAdmissionsAck(_)
             | ControlFrame::PluginRuntimeWanted(_)

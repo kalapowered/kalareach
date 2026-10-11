@@ -192,6 +192,8 @@ pub struct WorkerService {
     windows: ActionWindowIssuer,
     controller_public_key: AuthorisationKey,
     authority: Mutex<Authority>,
+    /// What this session's local owner may do, as the control daemon last told this worker.
+    gate: Arc<crate::local_gate::LocalGate>,
     /// The serial boundary every mutation and every authority change passes through.
     ///
     /// Checking authority and then acting on it are two operations, and between them a replacement
@@ -494,6 +496,10 @@ impl WorkerService {
         // same clock for the second to be a continuation of the first.
         let shared_clock = runtime.shared_clock();
         let time = Arc::clone(runtime.session().time());
+        let gate = Arc::new(crate::local_gate::LocalGate::open(
+            Arc::clone(&shared_clock),
+            Arc::clone(&time),
+        ));
         let journal_changes = runtime
             .session()
             .journal()
@@ -518,6 +524,7 @@ impl WorkerService {
             shared_clock,
             time,
             controller_public_key: binding.controller_public_key,
+            gate,
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
                 bound_connection: None,
@@ -569,6 +576,21 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             announcement_watch: Mutex::new(None),
         })
+    }
+
+    /// Makes this worker refuse a local caller what the host holds to its owner's lease until the
+    /// control daemon that launched it has said what the local owner may do.
+    ///
+    /// Called for a worker whose launch specification says its daemon tells workers. A worker no
+    /// daemon tells (a test, a tool) serves its local caller as it always did.
+    pub fn hold_local_access_until_told(&self) {
+        self.gate.hold_until_told();
+    }
+
+    /// The gate that holds this worker's local callers, for a test that reads its restrictions.
+    #[must_use]
+    pub fn local_gate(&self) -> &Arc<crate::local_gate::LocalGate> {
+        &self.gate
     }
 
     /// Holds the plugin admissions, and the connectors they carry, that this worker read before it
@@ -1420,13 +1442,26 @@ impl WorkerService {
         // accounting for what that attempt sent. Waiting for the peer happens outside it, on the
         // readiness handle beside it, which is what lets a withdrawal take the same lock and know
         // that no write can begin after it.
+        let local_writes = {
+            let service = Arc::downgrade(&self);
+            crate::local_gate::LocalWrites::new(
+                Arc::clone(&self.gate),
+                Arc::new(move || {
+                    if let Some(service) = service.upgrade() {
+                        service.withdraw(connection_id);
+                    }
+                }),
+            )
+        };
         let writable = Writing {
             turn: Arc::new(tokio::sync::Mutex::new(())),
             readiness: writer.writable(),
+            local: Some(Arc::clone(&local_writes)),
         };
         let writer = Arc::new(Mutex::new(writer));
         let mut state =
             ConnectionState::new(connection_id, &peer, Arc::new(Mutex::new(Vec::new())));
+        state.local = Some(local_writes);
         // The caller's record is validated and the connection registered in one step. The
         // listener checked the peer when it accepted the connection; this is the final check, and
         // it happens where the registration is written, so nothing can be admitted in between.
@@ -2261,6 +2296,7 @@ impl WorkerService {
             ControlFrame::AuthorityRevision(notice) => {
                 Some(self.acknowledge_revision(state, &notice))
             }
+            ControlFrame::LocalAccess(access) => Some(self.accept_local_access(state, access)),
             ControlFrame::PrivacyGeneration(notice) => {
                 Some(self.take_privacy(state, &notice).await)
             }
@@ -2449,6 +2485,9 @@ impl WorkerService {
         }
         state.negotiated = true;
         state.client_kind = hello.client;
+        if let Some(local) = state.local.as_ref() {
+            local.set_local(hello.client != LocalClientKind::Controller);
+        }
         state.origin = hello.origin;
         // The peer's offered limits bound what this worker sends it, and never raise this host's
         // own: a client that offers more than this host will accept does not get more.
@@ -2534,6 +2573,7 @@ impl WorkerService {
                     kr_protocol::local::FORWARDED_RESULT_SCOPE,
                     kr_protocol::local::FORWARDED_SCREEN_BASIS,
                     kr_protocol::local::AUTHORITY_REVISION_REACH,
+                    kr_protocol::local::LOCAL_ACCESS,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
@@ -3067,6 +3107,8 @@ impl WorkerService {
                     fenced.extend(authority.descriptions_connection.take());
                 }
                 authority.accepted_generation = Some(token.generation);
+                // A bound that carries a lease does not outlive the daemon that held the lease.
+                let lease_taken = self.gate.generation_accepted(token.generation);
                 match state.controller_role {
                     // Installing this connection fences whatever held the authority before it,
                     // including an earlier connection of the same generation.
@@ -3124,6 +3166,9 @@ impl WorkerService {
                 for previous in &fenced {
                     self.withdraw(*previous);
                 }
+                if lease_taken {
+                    self.withdraw_local_connections();
+                }
                 state.controller = true;
                 state.generation = Some(token.generation);
                 ControlFrame::GenerationAccepted(kr_protocol::worker::GenerationAccepted {
@@ -3158,6 +3203,94 @@ impl WorkerService {
     /// may need. Section 9 says what to do instead: a revocation a worker has not acknowledged is
     /// `pending`, and the daemon announces again. So a dispatch in flight is answered with a
     /// refusal that says to come back, which is exactly what `pending` means.
+    /// Takes the control daemon's statement of what this session's local owner may do.
+    ///
+    /// Only the daemon's authority connection speaks for it, as only it announces an authority
+    /// revision, and the generation proof comes first. A statement that takes access away, a move
+    /// to `Closed` or to an earlier end, withdraws the local connections that hold something, so
+    /// a held input lease is released and input already queued is discarded.
+    fn accept_local_access(
+        &self,
+        state: &ConnectionState,
+        access: kr_protocol::worker::LocalAccess,
+    ) -> ControlFrame {
+        if state.client_kind != LocalClientKind::Controller
+            || state.controller_role != ControllerConnectionRole::Authority
+        {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "only the control daemon's authority connection says what the local owner \
+                     may do",
+                ),
+            );
+        }
+        // Held across the check and the application: the generation the statement is of is the one
+        // the connection proved, and a newer one cannot slip in between.
+        let generation = {
+            let authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            if let Err(error) = Self::check_bound(state, &authority) {
+                return failure(RequestId::new(0), &error.to_protocol_error());
+            }
+            match state.generation {
+                Some(generation) => generation,
+                None => {
+                    return failure(
+                        RequestId::new(0),
+                        &ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this connection has not proved a controller generation",
+                        ),
+                    );
+                }
+            }
+        };
+        match self.gate.apply(generation, access) {
+            crate::local_gate::Applied::Accepted { tightened } => {
+                if tightened {
+                    self.withdraw_local_connections();
+                }
+                ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
+                    sequence: access.sequence,
+                })
+            }
+            crate::local_gate::Applied::Stale { held } => {
+                ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
+                    sequence: U64::new(held),
+                })
+            }
+            crate::local_gate::Applied::Conflict => failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    "a statement of what the local owner may do repeats a sequence with another \
+                     content",
+                ),
+            ),
+        }
+    }
+
+    /// Withdraws every local connection that holds an attachment or a subscription.
+    ///
+    /// The authority lock is not held: a withdrawal takes each connection's writer.
+    fn withdraw_local_connections(&self) {
+        let holding: Vec<ConnectionId> = self
+            .admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .iter()
+            .filter(|(_, registration)| registration.local_and_holding())
+            .map(|(connection_id, _)| *connection_id)
+            .collect();
+        for connection_id in holding {
+            self.withdraw(connection_id);
+        }
+    }
+
     fn acknowledge_revision(
         &self,
         state: &ConnectionState,
@@ -3792,6 +3925,78 @@ impl WorkerService {
         Ok(())
     }
 
+    /// Whether a local caller may use `method` now, on a host that holds its local owner to a
+    /// membership lease, and until when.
+    ///
+    /// A connection the control daemon opened is the daemon's own and is never held here: it is
+    /// decided at the daemon's door. A method the host does not hold to the lease is served
+    /// whatever the lease says. Otherwise the gate decides, from the state the daemon last told.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of a held method.
+    fn check_local_hold(
+        &self,
+        state: &ConnectionState,
+        method: Method,
+    ) -> std::result::Result<Option<crate::local_gate::Allowed>, WorkerError> {
+        if state.client_kind == LocalClientKind::Controller
+            || kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free
+        {
+            return Ok(None);
+        }
+        self.gate
+            .check()
+            .map(Some)
+            .map_err(|refused| WorkerError::PermissionDenied {
+                detail: refused.detail().to_owned(),
+            })
+    }
+
+    /// The caller of a held method, bounded by the lease it answers to, and the gate's
+    /// restriction count at this moment, which the dispatch boundary asks again.
+    fn bound_by_lease(
+        caller: &Caller,
+        allowed: Option<crate::local_gate::Allowed>,
+        restrictions: u64,
+    ) -> Option<Caller> {
+        let allowed = allowed?;
+        let mut bounded = caller.clone();
+        bounded.gate_restrictions = Some(restrictions);
+        if let Some(end) = allowed.end_boot_ms {
+            bounded.authority_deadline_boot_ms = Some(
+                bounded
+                    .authority_deadline_boot_ms
+                    .map_or(end, |existing| existing.min(end)),
+            );
+        }
+        bounded.authority_utc_deadline_ms = allowed.end_utc_ms;
+        Some(bounded)
+    }
+
+    /// Asks again, inside the dispatch boundary, whether a local caller's held method may be
+    /// dispatched: the gate must allow it now, and must not have been restricted since the request
+    /// was admitted. A notice to `Closed` that arrived while the request waited for the boundary
+    /// cannot be overtaken by it.
+    fn check_local_dispatch(
+        &self,
+        state: &ConnectionState,
+        method: Method,
+        caller: &Caller,
+    ) -> Result<()> {
+        self.check_local_hold(state, method)?;
+        if let Some(admitted) = caller.gate_restrictions
+            && self.gate.restrictions() != admitted
+        {
+            return Err(WorkerError::PermissionDenied {
+                detail: "the host restricted what its local owner may do while this request \
+                         waited, so it was not dispatched"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn request(
         &self,
         state: &mut ConnectionState,
@@ -3803,6 +4008,21 @@ impl WorkerService {
         }
         if let Err(error) = self.check_authority(state) {
             return failure(request.request_id, &error.to_protocol_error());
+        }
+        let restrictions = self.gate.restrictions();
+        let allowed = match request.method.method() {
+            Some(method) => match self.check_local_hold(state, method) {
+                Ok(allowed) => allowed,
+                Err(error) => return failure(request.request_id, &error.to_protocol_error()),
+            },
+            None => None,
+        };
+        let bounded = Self::bound_by_lease(caller, allowed, restrictions);
+        let caller = bounded.as_ref().unwrap_or(caller);
+        if allowed.is_some()
+            && let Some(local) = state.local.as_ref()
+        {
+            local.hold_request(request.request_id);
         }
         // A read the daemon admitted under an authority revision this worker has installed past is
         // a read whose authority has been withdrawn. It matters most for raw input, which is a
@@ -3892,6 +4112,18 @@ impl WorkerService {
         let Some(entry) = Self::entry(method, mutation.method_version, caller.ingress) else {
             return failure(mutation.request_id, &unlisted());
         };
+        let restrictions = self.gate.restrictions();
+        let allowed = match self.check_local_hold(state, method) {
+            Ok(allowed) => allowed,
+            Err(error) => return failure(mutation.request_id, &error.to_protocol_error()),
+        };
+        let bounded = Self::bound_by_lease(caller, allowed, restrictions);
+        let caller = bounded.as_ref().unwrap_or(caller);
+        if allowed.is_some()
+            && let Some(local) = state.local.as_ref()
+        {
+            local.hold_request(mutation.request_id);
+        }
         let dispatched = self.receipted(state, mutation, method, entry, caller, freshness);
         self.answered(state, mutation, caller, forwarded, dispatched)
     }
@@ -4069,6 +4301,14 @@ impl WorkerService {
         self.wait_inside_boundary();
         self.revalidate_time();
         if let Err(error) = self.check_authority(state) {
+            return Err(self.reject_accepted(
+                caller,
+                mutation,
+                kr_protocol::receipt::RejectionReason::Revoked,
+                error,
+            ));
+        }
+        if let Err(error) = self.check_local_dispatch(state, method, caller) {
             return Err(self.reject_accepted(
                 caller,
                 mutation,
@@ -4548,6 +4788,7 @@ impl WorkerService {
         // to be caught: a revocation is complete for a worker when the worker has stopped being
         // able to act under what it removed.
         self.check_validated_revision(caller)?;
+        self.check_local_dispatch(state, method, caller)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
@@ -4593,7 +4834,8 @@ impl WorkerService {
         let now = self.clock.now();
         let deadline = match freshness {
             Freshness::Window(received_at) => {
-                self.check_window(state, mutation, received_at)?.deadline
+                self.check_window(state, mutation, received_at, caller)?
+                    .deadline
             }
             // The daemon derived this deadline at first admission and the worker anchored what was
             // left of it on its own clock the moment the frame arrived, before it waited for
@@ -5271,17 +5513,32 @@ impl WorkerService {
     /// continuous clock. An expired or unknown window admits nothing: section 9 makes replacing a
     /// window a different request, never an automatic retry of this one.
     ///
-    /// The third bound is `None` here, and that is a statement rather than an omission. A caller
-    /// on this endpoint acts under the authenticated operating-system identity, whose authority
-    /// over its own session does not expire; a caller acting under a grant reaches this worker
-    /// through the control daemon, which applies that grant's deadline at first admission and
-    /// forwards what is left of the result.
+    /// The third bound is `None` for a local caller, and that is a statement rather than an
+    /// omission. A caller on this endpoint acts under the authenticated operating-system identity,
+    /// whose authority over its own session does not expire; a caller acting under a grant reaches
+    /// this worker through the control daemon, which applies that grant's deadline at first
+    /// admission and forwards what is left of the result. The one local caller whose authority
+    /// does end is the owner of a host that is exclusively organisation-managed, for a method the
+    /// host holds to its membership lease: its third bound is that lease's end.
     fn check_window(
         &self,
         state: &ConnectionState,
         mutation: &MutationRequest,
         received_at: ContinuousInstant,
+        caller: &Caller,
     ) -> Result<AcceptedDeadline> {
+        // A local caller of a held method on a host that holds its owner to a membership lease
+        // has that lease's end as the third bound; any other local caller has none.
+        let authority = match caller.authority_deadline_boot_ms {
+            None => None,
+            Some(end) => Some(
+                vouched_deadline(&*self.clock, &*self.shared_clock, end).ok_or_else(|| {
+                    WorkerError::WindowExpired {
+                        detail: "the membership lease this request answers to has ended".to_owned(),
+                    }
+                })?,
+            ),
+        };
         crate::action::window::first_admission(
             &self.windows,
             &mutation.action_window_id,
@@ -5289,7 +5546,7 @@ impl WorkerService {
             self.boot_epoch,
             received_at,
             mutation.requested_ttl_ms,
-            None,
+            authority,
         )
     }
 
@@ -6982,6 +7239,7 @@ impl WorkerService {
             // grant behind it runs out, and what the boundary decides is what actually reaches the
             // application.
             self.check_validated_revision(caller)?;
+            self.check_local_dispatch(state, Method::InputWrite, caller)?;
             self.check_authority_deadline(caller, &mut session, params.attachment_id)?;
             Self::check_session(&session, params.session_id)?;
             Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
@@ -7505,6 +7763,14 @@ pub struct Caller {
     /// written to the application afterwards, because the queue it waits in is not the check that
     /// admitted it. Absent for a caller whose authority does not expire.
     pub authority_deadline_boot_ms: Option<u64>,
+    /// When the membership lease a local caller of a held method answers to runs out in UTC, kept
+    /// beside its continuous end so that input waiting for the terminal is checked against it
+    /// again when it is about to be written. Absent for every other caller.
+    pub authority_utc_deadline_ms: Option<u64>,
+    /// How many times the host had restricted what its local owner may do when this caller's held
+    /// request was admitted, so that the dispatch boundary can refuse one that waited across a
+    /// restriction. Absent for every other caller.
+    pub gate_restrictions: Option<u64>,
     /// The rights the grant this caller's *mutation* was checked against carries.
     ///
     /// Section 8's intersection of requested attachment capabilities with the actor's rights is
@@ -7538,6 +7804,8 @@ impl Caller {
             device_id: Nullable::null(),
             validated_revision: None,
             authority_deadline_boot_ms: None,
+            authority_utc_deadline_ms: None,
+            gate_restrictions: None,
             grant_rights: CanonicalSet::new(),
             history: None,
             screen_basis: None,
@@ -7557,6 +7825,8 @@ impl Caller {
             device_id: actor.device_id,
             validated_revision: actor.grant_revision.as_ref().copied(),
             authority_deadline_boot_ms: None,
+            authority_utc_deadline_ms: None,
+            gate_restrictions: None,
             grant_rights: grant_rights.clone(),
             history: None,
             screen_basis: None,
@@ -7905,6 +8175,9 @@ pub struct ConnectionState {
     pub controller: bool,
     /// Which kind of client opened this connection, as it declared in its hello.
     pub client_kind: LocalClientKind,
+    /// What holds this connection's frames to the local owner's lease, once it has declared itself
+    /// a local client. Absent for a connection built without a service (a test).
+    pub(crate) local: Option<Arc<crate::local_gate::LocalWrites>>,
     /// Where this connection's requests originally entered, when it is a process bridge's helper
     /// and said so in its hello. Kept for the life of the connection: a connection says hello once.
     ///
@@ -8017,6 +8290,7 @@ impl ConnectionState {
             negotiated: false,
             controller: false,
             client_kind: LocalClientKind::Cli,
+            local: None,
             origin: None,
             peer_limits: kr_protocol::hello::ReceiveLimits::default(),
             generation: None,
@@ -8322,6 +8596,27 @@ struct Registration {
     writable: Writing,
 }
 
+impl Registration {
+    /// Whether this is a local connection that holds something a restriction of the local owner's
+    /// access has to take back: an attachment, or a delivery.
+    fn local_and_holding(&self) -> bool {
+        self.writable
+            .local
+            .as_ref()
+            .is_some_and(|local| local.is_local())
+            && (!self
+                .attachments
+                .lock()
+                .expect("the attachment list is not poisoned")
+                .is_empty()
+                || self
+                    .delivery
+                    .lock()
+                    .expect("the delivery slot is not poisoned")
+                    .is_some())
+    }
+}
+
 /// A registration's withdrawal, as something every part of a connection can watch at once.
 ///
 /// A stored notification permit is answered by exactly one waiter, and a connection has more than
@@ -8410,11 +8705,38 @@ async fn write_frame_unless(
     frame: &ControlFrame,
     withdrawn: &Withdrawal,
     protected: bool,
+    abandoned: Option<&mut tokio::sync::oneshot::Receiver<()>>,
+) -> bool {
+    let sent = write_frame_held(writable, writer, frame, withdrawn, protected, abandoned).await;
+    // Whatever came of it, the answer to a held request has been dealt with: written, replaced by
+    // its refusal, or dropped with the connection.
+    if let Some(local) = writable.local.as_ref() {
+        local.answered(frame);
+    }
+    sent
+}
+
+/// [`write_frame_unless`], holding a local connection's frames to the local owner's lease.
+///
+/// The lease is asked under the writer at every attempt to write, a resumed one after the peer
+/// had no room included, so a frame that waited for room is not written under a lease that ended
+/// meanwhile. A response to a held request that has not begun is replaced by its refusal; a frame
+/// of a stream is not written, and the connection is withdrawn; a frame already partly written
+/// cannot be replaced, so the connection ends with it.
+async fn write_frame_held(
+    writable: &Writing,
+    writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+    frame: &ControlFrame,
+    withdrawn: &Withdrawal,
+    protected: bool,
     mut abandoned: Option<&mut tokio::sync::oneshot::Receiver<()>>,
 ) -> bool {
-    let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(StreamKind::Control, frame) else {
+    let Ok(mut bytes) = kr_ipc::framed::FrameWriter::encode(StreamKind::Control, frame) else {
         return false;
     };
+    // Cleared when the frame has been replaced by a refusal, which is then written whatever the
+    // lease says by then.
+    let mut hold = writable.local.as_ref();
     // One frame at a time on this connection. A frame the peer had no room for is retained by the
     // writer until it is finished, so a second writer starting one in between would interleave two
     // frames on a stream that carries them whole. This is where a writer waits for its turn, and a
@@ -8461,6 +8783,32 @@ async fn write_frame_unless(
                     sender.withdraw_unstarted();
                 }
                 return false;
+            }
+            if let Some(local) = hold {
+                match local.verdict(frame) {
+                    crate::local_gate::Verdict::Write => {}
+                    crate::local_gate::Verdict::Replace(refusal) if !begun => {
+                        if offered {
+                            sender.withdraw_unstarted();
+                            offered = false;
+                        }
+                        let Ok(replacement) = kr_ipc::framed::FrameWriter::encode(
+                            StreamKind::Control,
+                            refusal.as_ref(),
+                        ) else {
+                            return false;
+                        };
+                        bytes = replacement;
+                        hold = None;
+                    }
+                    crate::local_gate::Verdict::Replace(_) | crate::local_gate::Verdict::Stop => {
+                        if offered && !begun {
+                            sender.withdraw_unstarted();
+                        }
+                        local.withdraw_soon();
+                        return false;
+                    }
+                }
             }
             // A frame that was cut in half left its beginning with the peer. Writing anything else
             // now would push the rest of it out first, so this connection is finished instead:
@@ -8644,6 +8992,9 @@ fn request_id_of(frame: &ControlFrame) -> RequestId {
 struct Writing {
     turn: Arc<tokio::sync::Mutex<()>>,
     readiness: kr_ipc::framed::Writable,
+    /// What holds this connection's frames to the local owner's lease, when it is a local
+    /// connection. Read under the writer at every attempt to write.
+    local: Option<Arc<crate::local_gate::LocalWrites>>,
 }
 
 /// Where one delivery writes its frames, and what stops it.

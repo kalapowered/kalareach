@@ -518,6 +518,10 @@ pub enum ControlFrame {
     AuthorityRevision(crate::worker::AuthorityRevisionNotice),
     /// The worker's acknowledgement of an authority revision.
     AuthorityRevisionAck(crate::worker::AuthorityRevisionAck),
+    /// What the host's local owner may do at this session, from the control daemon.
+    LocalAccess(crate::worker::LocalAccess),
+    /// The worker's acknowledgement of that statement.
+    LocalAccessAck(crate::worker::LocalAccessAck),
     /// One part of a snapshot of plugin admissions: after a launch specification on the
     /// rendezvous connection, and on the control daemon's authority connection to a worker.
     PluginAdmissions(Box<crate::admission::PluginAdmissions>),

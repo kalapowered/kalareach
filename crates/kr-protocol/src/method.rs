@@ -577,12 +577,15 @@ methods! {
           owner confirmation.";
 
     MembershipPresent = "membership.present", HostAndEnvironment,
-    effect: Write, ingress: [PairedDevice], rights: [basis(ResourceOwner)], selectors: [Device],
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [basis(ResourceOwner)],
+    selectors: [Device],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: keyed("the lease's signing-input digest"),
     doc: "Present the membership lease the organisation signed for this device, with the \
           organisation's chain when it has moved, so the host answers for the device while the \
-          lease lasts. The device acts on its own standing and proves its own key.";
+          lease lasts. The device acts on its own standing and proves its own key. At the host's \
+          own socket the lease is the one signed for the host's own key, which the host's local \
+          owner answers to while the host is exclusively organisation-managed.";
 
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
@@ -1723,6 +1726,68 @@ methods! {
     doc: "Read definitions, runs, node receipts and remaining causal budget.";
 }
 
+/// How a host that is exclusively organisation-managed treats a local caller's use of a method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalHold {
+    /// Served whatever the local owner's membership lease says: the session's own tooling, what
+    /// recovers the host, and what only ends access.
+    Free,
+    /// Served while the local owner's membership lease is live, and refused after it.
+    Held,
+}
+
+/// The methods a local caller reaches on an exclusively organisation-managed host whatever its
+/// membership lease says, apart from the session's own tooling ([`local_hold`]).
+///
+/// What recovers the host: presenting a lease, reading what the host holds, asking for, answering
+/// and spending the owner's confirmations, and establishing the clock. What only restricts or ends
+/// access: revoking a device or a grant, leaving an organisation, closing a session, detaching,
+/// releasing input, and cancelling what is pending. And the reads those take their arguments from.
+/// Every other method is held.
+pub const LOCAL_RECOVERY: &[Method] = &[
+    Method::MembershipPresent,
+    Method::OrganisationList,
+    Method::OrganisationExclusiveSet,
+    Method::OwnerConfirmationRequest,
+    Method::OwnerConfirmationPending,
+    Method::OwnerConfirmationComplete,
+    Method::HostClockEstablish,
+    Method::DeviceRevoke,
+    Method::GrantRevoke,
+    Method::OrganisationWithdraw,
+    Method::SessionClose,
+    Method::SessionDetach,
+    Method::InputRelease,
+    Method::PairCancel,
+    Method::ActionCancel,
+    Method::HostInfo,
+    Method::DeviceList,
+    Method::GrantList,
+    Method::SessionList,
+];
+
+/// Whether a local caller's use of `method` is held to the local owner's membership lease on an
+/// exclusively organisation-managed host.
+///
+/// A pure function of the method, read from the authority table and not listed by hand: a method
+/// whose entry always requires the local caller token is the session's own tooling (its hooks and
+/// the terminal guard's probe) and is free, and so is a member of [`LOCAL_RECOVERY`]. Everything
+/// else, including a method added later, is held. The token basis must be present in the entry;
+/// an entry that requires nothing is not made free by a test that all of nothing holds.
+#[must_use]
+pub fn local_hold(method: Method) -> LocalHold {
+    if LOCAL_RECOVERY.contains(&method)
+        || method.entry().required_rights.iter().any(|required| {
+            required.authority == RequiredAuthority::LocalCallerToken
+                && required.when == RightCondition::Always
+        })
+    {
+        LocalHold::Free
+    } else {
+        LocalHold::Held
+    }
+}
+
 impl Method {
     /// Returns this method's authority entry.
     #[must_use]
@@ -1778,6 +1843,57 @@ mod tests {
             .iter()
             .find(|entry| entry.name == name)
             .unwrap_or_else(|| panic!("{name} is not in the registry"))
+    }
+
+    /// A local caller's use of a method is held to the owner's lease, except the nine methods of a
+    /// session's own tooling (two of which also require ownership of the resource they name), what
+    /// recovers the host, and what only ends access. Stated as outcomes and not as the predicate.
+    #[test]
+    fn a_local_caller_is_held_to_the_owners_lease_except_for_tooling_recovery_and_ends_of_access() {
+        let tooling = [
+            Method::QuestionCreate,
+            Method::QuestionReadOwn,
+            Method::QuestionCancelOwn,
+            Method::AlertCreate,
+            Method::RootEditorEnter,
+            Method::RootEditorLeave,
+            Method::RootEditorFence,
+            Method::RootEofDetach,
+            Method::RootCommandAccepted,
+        ];
+        for method in &tooling {
+            assert_eq!(local_hold(*method), LocalHold::Free, "{method}");
+        }
+        let free: Vec<Method> = Method::ALL
+            .iter()
+            .copied()
+            .filter(|method| local_hold(*method) == LocalHold::Free)
+            .collect();
+        assert_eq!(
+            free.len(),
+            tooling.len() + LOCAL_RECOVERY.len(),
+            "nothing is free but the tooling and the recovery list: {free:?}"
+        );
+        for method in LOCAL_RECOVERY {
+            assert!(
+                method.entry().permits_ingress(ActorIngress::LocalIpc),
+                "{method} is a recovery method a local caller can reach"
+            );
+        }
+        for held in [
+            Method::SessionRead,
+            Method::SessionCreate,
+            Method::InputWrite,
+            Method::EventsSubscribe,
+            Method::ProjectRead,
+            Method::WorkspaceRead,
+            Method::PairInvite,
+            Method::WorkflowRun,
+            Method::PluginActionInvoke,
+            Method::OrganisationEnrol,
+        ] {
+            assert_eq!(local_hold(held), LocalHold::Held, "{held}");
+        }
     }
 
     fn unconditional(name: &str) -> Vec<ActionRight> {

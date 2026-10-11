@@ -447,6 +447,9 @@ impl Controller {
     pub(crate) fn advance_authority_epoch(&self) {
         self.authority_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // What the host's local owner may do is computed from the same policy, so the workers are
+        // told again whenever it may have moved.
+        self.local_access.wake();
     }
 
     /// Writes down a clock floor still owed its record, and the time the offline bound has spent

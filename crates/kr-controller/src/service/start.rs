@@ -591,6 +591,7 @@ impl Controller {
             .map_err(ControllerError::registry)?;
         let secret_store: Arc<dyn kr_crypto::store::SecretStore> = Arc::from(opened_store.store);
         let device_keys = net::host_device_keys(&*secret_store, setup.environment_id)?;
+        let host_authorisation_key = *device_keys.authorisation.public();
         // The owner authority is the host's, not the network's: the clock is established through
         // it on a host that never joins one. It keeps the challenges owners answer and the records
         // of what they answered, so the tables it writes exist from the first start, and the
@@ -848,6 +849,8 @@ impl Controller {
             owner,
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
+            local_access: super::local_access::LocalAccessState::default(),
+            host_authorisation_key,
             utc_floor,
             feed: std::sync::Mutex::new(feed),
             changesets,
@@ -937,6 +940,12 @@ impl Controller {
             Directory::rebuild(&controller.paths, &registry, &controller.reconnect()).await?
         };
         *controller.directory.lock().await = directory;
+        // Every worker this daemon has just reconnected to is told what the host's local owner may
+        // do before anything is served: a bound that carried a lease did not survive the daemon
+        // that held it, and the new generation says what it is. A worker that cannot be told yet
+        // is told again by the publisher, which runs from here on.
+        controller.tell_workers().await;
+        controller.start_local_access_publisher();
         // Every reservation whose claim was consumed and every recorded worker is a member of the
         // plugin admissions' set before anything is served, each pending until it reports.
         controller.seed_admission_members().await?;

@@ -342,6 +342,15 @@ pub struct WorkerLaunchSpec {
     /// Empty for a session started with its creator's environment. The worker reads them to say
     /// where each variable came from; the values are already among the create request's.
     pub environment_additions: Vec<String>,
+    /// Whether the control daemon that launched this worker tells it what its local owner may do
+    /// ([`LocalAccess`]).
+    ///
+    /// True: the worker serves no local caller a method the host holds to its owner's lease until
+    /// the daemon has said so. Absent when false, so a specification from a daemon that does not
+    /// tell workers is byte for byte what a worker built before this field reads, and such a
+    /// worker serves its local caller as it always did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub holds_local_access: bool,
 }
 
 /// Whose environment a session's variables are, which decides how the worker labels where they
@@ -615,6 +624,50 @@ pub struct AuthorityRevisionAck {
     pub fence: Option<crate::action::FenceEvidence>,
 }
 
+/// What a host's local owner may do at a session, as the control daemon last told its worker.
+///
+/// On a host that is exclusively organisation-managed the local owner answers to a membership
+/// lease like a member (section 17), and the worker, which serves a local caller directly, holds
+/// the methods the host holds to that lease until the lease's end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocalBound {
+    /// No lease is needed: the host is not exclusively organisation-managed.
+    Open,
+    /// The host is exclusively organisation-managed and no lease of its own key is live.
+    Closed,
+    /// The host is exclusively organisation-managed and one lease of its own key is live. The two
+    /// ends are that lease's, together: the worker refuses at the earlier of them.
+    Until {
+        /// The lease's end on the machine's continuous clock, in milliseconds since this boot.
+        boot_deadline_ms: U64,
+        /// The lease's end in UTC milliseconds, decided through the worker's time contract.
+        utc_deadline_ms: U64,
+    },
+}
+
+/// The control daemon's statement of [`LocalBound`], on its authority connection to a worker.
+///
+/// Sent only to a worker that states [`crate::local::LOCAL_ACCESS`]: a worker of an earlier build
+/// ends a connection that carries a frame it cannot read. The sequence rises within one controller
+/// generation, and a frame of a newer generation replaces the state whatever its sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalAccess {
+    /// Which statement this is, within the generation that sent it.
+    pub sequence: U64,
+    /// What the local owner may do.
+    pub bound: LocalBound,
+}
+
+/// A worker's acknowledgement of [`LocalAccess`]: the sequence of the statement it now holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalAccessAck {
+    /// The sequence the worker holds, which is the frame's own or the higher one it already held.
+    pub sequence: U64,
+}
+
 /// How a worker's execution context is bound, as recorded in the registry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -793,6 +846,7 @@ mod tests {
             privacy,
             environment_origin: EnvironmentOrigin::CreatorSnapshot,
             environment_additions: Vec::new(),
+            holds_local_access: false,
         }
     }
 

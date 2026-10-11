@@ -185,6 +185,12 @@ impl Controller {
         described: Option<SessionSummary>,
     ) -> Result<()> {
         let session_id = worker.descriptor.session_id;
+        // Told what the host's local owner may do before anything can find it. The worker has a
+        // registry row by now, so every barrier from here on counts it; opening the link tells it
+        // and tells it again until what it acknowledged is what is in force, so a worker is not
+        // visible on a bound a restriction that committed meanwhile has already replaced. A
+        // restriction that commits after this reaches it through the barrier.
+        drop(self.open_worker(&worker).await?);
         #[cfg(test)]
         self.before_a_worker_is_made_known.wait().await;
         // Whether it was written is looked at once the closure has been: a write that fails after
@@ -511,6 +517,11 @@ impl Controller {
                     .generation_token(generation, &boot, nonce)
                     .map_err(kr_ipc::IpcError::from)
             })
+            .await?;
+        // The first thing the worker is told on a link of the generation it has just accepted:
+        // what the host's local owner may do. Nothing else is held up for it, but a bound that
+        // carries a lease did not survive the generation, and the worker is told its successor.
+        self.tell_link(worker.descriptor.session_id, &mut client)
             .await?;
         Ok(client)
     }

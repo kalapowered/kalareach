@@ -61,6 +61,7 @@ mod host;
 mod inhibition;
 mod insertion;
 mod local;
+mod local_access;
 mod machine_group;
 mod organisation;
 pub mod plugin_runtime;
@@ -615,6 +616,11 @@ pub struct Controller {
     /// hand bytes over, so a change that lands while a batch waits for the writer or for the peer
     /// stops it there: the batch is decided again, or, once bytes are moving, the connection ends.
     authority_epoch: std::sync::atomic::AtomicU64,
+    /// What this daemon has told its session workers the host's local owner may do, and what each
+    /// has acknowledged.
+    local_access: local_access::LocalAccessState,
+    /// The authorisation key a lease for the host's own local owner names.
+    host_authorisation_key: kr_protocol::scalars::AuthorisationKey,
     /// The policy's clock floor itself, which the policy shares with every holder of it.
     ///
     /// The write boundary decides at every attempt to hand bytes over whether a relayed batch's

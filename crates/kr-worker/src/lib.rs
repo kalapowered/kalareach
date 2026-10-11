@@ -54,6 +54,7 @@ pub mod history_filter;
 pub mod input;
 pub mod journal;
 pub mod lifecycle;
+pub mod local_gate;
 pub mod output;
 pub mod owned_writer;
 pub mod ownership;

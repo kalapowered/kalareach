@@ -162,6 +162,25 @@ pub struct OrganisationListResult {
     pub clock_trusted: bool,
     /// Every time exclusive management was turned off, oldest first.
     pub exclusive_events: Vec<ExclusiveManagementEvent>,
+    /// The device identity and authorisation key the host presents leases as for its own local
+    /// owner, which an organisation signs a lease for while the host is exclusively
+    /// organisation-managed.
+    pub host_device: HostDeviceView,
+    /// The sessions whose workers cannot be told what the host's local owner may do: a worker an
+    /// earlier build started, or one this host has not reached. While one runs, the host does not
+    /// become exclusively organisation-managed, and one that runs on an exclusive host serves its
+    /// local caller without the hold. Ending the session (`kr close`) ends the exception.
+    pub workers_without_local_enforcement: Vec<crate::ids::SessionId>,
+}
+
+/// The identity the host presents a lease as for its own local owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostDeviceView {
+    /// The host's own device identifier.
+    pub device_id: DeviceId,
+    /// The authorisation key a lease for the host's local owner names.
+    pub authorisation_key: crate::scalars::AuthorisationKey,
 }
 
 /// The parameters of `membership.present`.

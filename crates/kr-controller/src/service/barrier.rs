@@ -411,27 +411,40 @@ impl Controller {
             let outcome = {
                 match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client(&worker)).await {
                     Ok(Ok(mut link)) => {
-                        // Bounded, because a worker that will not answer must not stop the
-                        // revocation from reporting `pending` for it, and must not stop the
-                        // announcement reaching the workers after it. Section 9 makes waiting the
-                        // opposite of completion.
-                        let answered = self
-                            .tell_revisions(
-                                session_id,
-                                binding,
-                                &mut link,
-                                revision,
-                                recorded
-                                    .get(&session_id)
-                                    .copied()
-                                    .unwrap_or_else(|| AuthorityRevision::new(0)),
-                                Some(WORKER_EXCHANGE),
-                            )
-                            .await;
-                        // An exchange that failed or ran out leaves a client whose stream position
-                        // nothing knows, so the link is closed rather than returned, and the path
-                        // it was on is given up with it as it goes out of scope.
-                        answered.inspect(|_| link.give_back())
+                        // What the host's local owner may do goes first, so the worker
+                        // acknowledges the revision only after it holds the bound in force. A
+                        // worker that cannot be told is pending, as one that cannot be reached.
+                        let told = tokio::time::timeout(
+                            WORKER_EXCHANGE,
+                            self.tell_link(session_id, link.client()),
+                        )
+                        .await;
+                        if !matches!(told, Ok(Ok(_))) {
+                            drop(link);
+                            None
+                        } else {
+                            // Bounded, because a worker that will not answer must not stop the
+                            // revocation from reporting `pending` for it, and must not stop the
+                            // announcement reaching the workers after it. Section 9 makes waiting
+                            // the opposite of completion.
+                            let answered = self
+                                .tell_revisions(
+                                    session_id,
+                                    binding,
+                                    &mut link,
+                                    revision,
+                                    recorded
+                                        .get(&session_id)
+                                        .copied()
+                                        .unwrap_or_else(|| AuthorityRevision::new(0)),
+                                    Some(WORKER_EXCHANGE),
+                                )
+                                .await;
+                            // An exchange that failed or ran out leaves a client whose stream
+                            // position nothing knows, so the link is closed rather than returned,
+                            // and the path it was on is given up with it as it goes out of scope.
+                            answered.inspect(|_| link.give_back())
+                        }
                     }
                     // The wait for the link ran out: another operation holds it, and what that
                     // operation does with it is its own to answer for, so nothing is given up

@@ -66,6 +66,22 @@ pub struct PolicyIntersection {
     pub recovery: bool,
 }
 
+/// What the host's local owner may do, as the host's policy decides it ([`HostPolicy::local_owner_bound`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalOwnerBound {
+    /// The host is not exclusively organisation-managed: no lease is needed.
+    Open,
+    /// The host is, and no lease of its own key is live.
+    Closed,
+    /// The host is, and one lease of its own key is live, with its two ends.
+    Until {
+        /// The lease's end on the daemon's continuous clock.
+        continuous: ContinuousInstant,
+        /// The lease's end in UTC milliseconds.
+        utc_ms: u64,
+    },
+}
+
 /// The methods an owner's device reaches on an exclusively organisation-managed host when no lease
 /// serves it: reading what the host holds, asking for, answering and spending the owner's
 /// confirmations, and establishing the clock. Presenting a lease is its own exception, since a
@@ -1310,6 +1326,47 @@ impl HostPolicy {
                     recovery,
                 })
             }
+        }
+    }
+
+    /// What this host's local owner may do now: the host itself acting for its OS owner, whose
+    /// device identity is `host_device`.
+    ///
+    /// On a host that is not exclusively organisation-managed nothing is needed. On one that is,
+    /// the local owner answers to a membership lease like a member: **one** live lease of the host
+    /// key, with its two ends together, the one that ends last on the continuous clock (the later
+    /// UTC end decides a tie). Two leases' ends are never combined. With none live the owner has
+    /// nothing to answer with.
+    #[must_use]
+    pub fn local_owner_bound(
+        &self,
+        host_device: DeviceId,
+        now: ContinuousInstant,
+        now_ms: u64,
+    ) -> LocalOwnerBound {
+        if !self.exclusively_managed {
+            return LocalOwnerBound::Open;
+        }
+        let mut latest: Option<(ContinuousInstant, u64)> = None;
+        for enrolment in self.enrolments.values() {
+            let Ok((_, held)) = enrolment.lease_for_device(host_device, now, now_ms) else {
+                continue;
+            };
+            let (Some(continuous), Some(utc_ms)) = (
+                held.snapshot().continuous_deadline,
+                held.snapshot().utc_deadline_ms,
+            ) else {
+                continue;
+            };
+            if latest.is_none_or(|(held_continuous, held_utc)| {
+                continuous > held_continuous || (continuous == held_continuous && utc_ms > held_utc)
+            }) {
+                latest = Some((continuous, utc_ms));
+            }
+        }
+        match latest {
+            Some((continuous, utc_ms)) => LocalOwnerBound::Until { continuous, utc_ms },
+            None => LocalOwnerBound::Closed,
         }
     }
 

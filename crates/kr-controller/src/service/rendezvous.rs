@@ -332,6 +332,7 @@ impl Controller {
         let launched_under = tokio::task::spawn_blocking(move || privacy.now())
             .await
             .map_err(|error| ControllerError::supervision(error.to_string()))?;
+        self.local_access.launching(reservation.reservation_id);
         let mut specification = WorkerLaunchSpec {
             session_id: reservation.session_id,
             session_epoch: SessionEpoch::V1,
@@ -346,6 +347,9 @@ impl Controller {
             privacy: launched_under.to_launch(),
             environment_origin: environment.origin,
             environment_additions: environment.additions,
+            // This daemon tells its workers what the host's local owner may do, so a worker it
+            // launches serves no local caller what the host holds to that lease until it has.
+            holds_local_access: true,
         };
         // The specification is one control frame. Beside a create request that leaves too little
         // room, the largest integrations are left out as well. The session starts without them,

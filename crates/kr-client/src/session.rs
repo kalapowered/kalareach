@@ -1079,6 +1079,8 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::GenerationAccepted(_)
         | ControlFrame::AuthorityRevision(_)
         | ControlFrame::AuthorityRevisionAck(_)
+        | ControlFrame::LocalAccess(_)
+        | ControlFrame::LocalAccessAck(_)
         // A daemon's plugin admissions and a worker's report on them are that pair's own.
         | ControlFrame::PluginAdmissions(_)
         | ControlFrame::PluginAdmissionsAck(_)
