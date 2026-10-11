@@ -1276,20 +1276,16 @@ impl RemoteConnection {
                 }
             }
             // A device handing the host the credential its installation was issued: the daemon's
-            // own effect, on the destination of the device this connection authenticated as. It is
-            // retained and answered like a key registration, because the gateway is asked before
-            // anything is kept and the answer can be lost on the way back.
+            // own effect, on the destination of the device this connection authenticated as. Its
+            // answer is retained like a key registration's, because the gateway is asked before
+            // anything is kept and the answer can be lost on the way back: a repeat of it is
+            // answered before the call is admitted, on a later connection and after its window
+            // has closed, so what reaches this arm is a first request.
             Method::DevicePushRegister => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());
                 }
                 let actor_id = self.device.principal();
-                if let Some(answer) = self
-                    .controller
-                    .retained_authority_change(&actor_id, mutation)
-                {
-                    return answer;
-                }
                 if self.controller.clock.now() >= accepted.deadline {
                     return failure(
                         mutation.request_id,

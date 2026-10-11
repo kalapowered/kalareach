@@ -64,11 +64,14 @@ impl Default for LocalPace {
 }
 
 /// The methods whose answer the registry keeps under the actor's action, in its receipts, and that
-/// the local route looks up before it admits a call, so that a repeat is answered from the record.
-/// The stored-formats table pairs each with the type of the answer it keeps, so an answer kept here
-/// whose type the table does not name fails the lock's checks. A kept answer that lookup does not
-/// cover is in [`RETAINED_DEVICE_ANSWERS`].
-pub const RETAINED_AUTHORITY_ANSWERS: [Method; 19] = [
+/// both routes look up before they admit a call (`Controller::retained`, which the local route and
+/// a paired device's route each make first), so that a repeat is answered from the record, on a
+/// later connection and after the window it was sent in has closed. The stored-formats table pairs
+/// each with the type of the answer it keeps, so an answer kept here whose type the table does not
+/// name fails the lock's checks. A method only a paired device sends, such as
+/// `device.push.register`, is refused to a local caller before it can claim, so the lookup finds no
+/// record for it there.
+pub const RETAINED_AUTHORITY_ANSWERS: [Method; 20] = [
     Method::GrantCreate,
     Method::GrantRedeem,
     Method::GrantRevoke,
@@ -78,6 +81,7 @@ pub const RETAINED_AUTHORITY_ANSWERS: [Method; 19] = [
     Method::DeliveryDestinationConfigure,
     Method::DeliveryDestinationRemove,
     Method::DeliveryDestinationSecretSet,
+    Method::DevicePushRegister,
     Method::PrivacySet,
     Method::AccountSignIn,
     Method::AccountSignOut,
@@ -89,12 +93,6 @@ pub const RETAINED_AUTHORITY_ANSWERS: [Method; 19] = [
     Method::EnvironmentRefresh,
     Method::HostUpdateHandover,
 ];
-
-/// The methods whose answer the registry keeps in the same receipts and that the local route's
-/// lookup does not cover: a paired device's route claims them and answers a repeat. The
-/// stored-formats table pairs each with the type of the answer it keeps, as it does the methods
-/// above.
-pub const RETAINED_DEVICE_ANSWERS: [Method; 1] = [Method::DevicePushRegister];
 
 /// The methods whose answer the machine group's record keeps, in the same store, and answers again to
 /// a repeat.

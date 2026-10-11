@@ -91,10 +91,10 @@ impl Controller {
     /// one attempt that may perform the change. Anything else is answered by
     /// [`Self::recorded_authority_change`], and nothing is performed.
     ///
-    /// Every method that claims here is one of [`super::RETAINED_AUTHORITY_ANSWERS`] or
-    /// [`super::RETAINED_DEVICE_ANSWERS`], which the stored-formats table pairs with the type of the
-    /// answer the claim keeps: in a build with debug assertions, a method that claims here without
-    /// being listed fails the first test that runs it. The other paths that claim in the same
+    /// Every method that claims here is one of [`super::RETAINED_AUTHORITY_ANSWERS`], which the
+    /// stored-formats table pairs with the type of the answer the claim keeps: in a build with
+    /// debug assertions, a method that claims here without being listed fails the first test that
+    /// runs it. The other paths that claim in the same
     /// receipts (`claimed_action`, a device's session rename, the voice and machine group flows)
     /// do not pass through this check.
     fn claim_authority_change(
@@ -104,10 +104,10 @@ impl Controller {
         now_ms: u64,
     ) -> Result<crate::grants::ActionClaim> {
         debug_assert!(
-            mutation.method.method().is_some_and(|method| {
-                super::RETAINED_AUTHORITY_ANSWERS.contains(&method)
-                    || super::RETAINED_DEVICE_ANSWERS.contains(&method)
-            }),
+            mutation
+                .method
+                .method()
+                .is_some_and(|method| super::RETAINED_AUTHORITY_ANSWERS.contains(&method)),
             "{} keeps an answer in the registry's receipts and is in no list of the methods that do",
             mutation.method.as_str()
         );

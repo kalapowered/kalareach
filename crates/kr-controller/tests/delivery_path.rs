@@ -1600,6 +1600,74 @@ async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_i
     assert_eq!(environment.gateway.state().bearers_refused, 0);
 }
 
+/// KR-REQ-09.07, KR-REQ-16.08: a device whose registration answer was lost on the way back repeats
+/// the request on a new connection, as it sent it, and is given what the first registration
+/// produced. The daemon registers nothing again and asks the gateway nothing again. The same action
+/// identity in the new connection's own window is another request, and is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registration_whose_answer_was_lost_is_answered_again_over_a_new_connection() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x71));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    let params = DevicePushRegisterParams {
+        credential,
+        previews_enabled: true,
+    };
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(environment.environment_id());
+
+    let first = phone
+        .connection
+        .mutate(Method::DevicePushRegister, action, target.clone(), &params)
+        .await
+        .expect("the daemon registers a credential its gateway confirms");
+    let window = phone.connection.action_window_id();
+    // The answer is taken to be lost with the connection it travelled on.
+    phone.connection.close();
+    let probes = environment
+        .gateway
+        .answers_on("/api/push/deliver/status")
+        .len();
+    assert_eq!(
+        probes, 1,
+        "the gateway was asked once, for the first request"
+    );
+
+    let later = RawDevice::connect(&environment.host, &phone.device, &phone.record).await;
+    let repeated = later
+        .mutate_in(
+            window,
+            Method::DevicePushRegister,
+            action,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect("an exact repeat is answered from its record");
+    assert_eq!(
+        repeated, first,
+        "the answer is the one the first request produced"
+    );
+    assert_eq!(
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len(),
+        probes,
+        "the gateway was not asked again"
+    );
+
+    let reused = later
+        .mutate(Method::DevicePushRegister, action, target, &params)
+        .await
+        .expect_err("an action identity reused in another window");
+    assert_eq!(reused.code, kr_protocol::error::ErrorCode::IdConflict);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Approvals a worker's application raises
 // ---------------------------------------------------------------------------------------------

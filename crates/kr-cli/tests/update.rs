@@ -10241,7 +10241,6 @@ fn no_type_a_store_keeps_is_undeclared() {
     // The answers the registry keeps.
     let retained: Vec<_> = kr_controller::service::RETAINED_AUTHORITY_ANSWERS
         .iter()
-        .chain(kr_controller::service::RETAINED_DEVICE_ANSWERS.iter())
         .chain(kr_controller::service::RETAINED_MACHINE_ANSWERS.iter())
         .copied()
         .collect();

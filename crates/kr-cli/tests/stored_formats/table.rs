@@ -537,8 +537,8 @@ pub fn kept_without_a_holder() -> Vec<&'static str> {
 }
 
 /// The type of the answer the registry keeps for each method that has it kept, by the type's name:
-/// the method's answer, as `kr_controller::service::RETAINED_AUTHORITY_ANSWERS`,
-/// `RETAINED_DEVICE_ANSWERS` and `RETAINED_MACHINE_ANSWERS` name the methods.
+/// the method's answer, as `kr_controller::service::RETAINED_AUTHORITY_ANSWERS` and
+/// `RETAINED_MACHINE_ANSWERS` name the methods.
 #[must_use]
 pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
     use kr_protocol::method::Method;
