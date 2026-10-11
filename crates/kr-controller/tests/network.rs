@@ -2304,6 +2304,290 @@ async fn a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_o
     world.finish().await;
 }
 
+/// A host enrolled in an organisation and, once `make_exclusive` has run, exclusively
+/// organisation-managed, with a running session whose worker the test reaches directly, as
+/// `kr attach` does.
+///
+/// The organisation is a stand-in that signs with real keys. The clocks are the machine's own: the
+/// worker reads the machine's clock, so a lease that ends is a lease of a few real seconds, and the
+/// tests wait on a condition and never on a measured delay.
+struct Exclusive {
+    host: Host,
+    daemon: RunningDaemon,
+    owner: DeviceKeys,
+    organisation: organisation_support::Organisation,
+    session_id: SessionId,
+    display: kr_protocol::session::DisplayNumber,
+}
+
+/// How long a lease the tests present lasts. The host ends a lease five seconds early on its
+/// continuous clock, so this leaves it about fifteen seconds of use.
+const SHORT_LEASE_MS: u64 = 20_000;
+
+impl Exclusive {
+    async fn start() -> Self {
+        let host = Host::create();
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let daemon = host.start(loopback(), &owner).await;
+        let day_ms = 24 * 60 * organisation_support::MINUTE_MS;
+        let now = kr_ipc::now_ms().get();
+        let organisation =
+            organisation_support::Organisation::new(0x21, now.saturating_sub(2 * day_ms));
+        let params = OrganisationEnrolParams {
+            authority: organisation.authority(now - 1_000),
+        };
+        let mut local = host.client().await;
+        pairing_calls::confirm_subject(
+            host.environment_id,
+            &mut local,
+            ConfirmationSubject::EnrolOrganisation(Box::new(params.clone())),
+            &pairing_calls::Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("the owner confirms the chain");
+        let _: OrganisationEnrolResult = pairing_calls::mutate_as(
+            host.environment_id,
+            &mut local,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::OrganisationEnrol,
+            &params,
+        )
+        .await
+        .expect("the host enrols");
+        let created = create(&mut local, &host).await;
+        Self {
+            host,
+            daemon,
+            owner,
+            organisation,
+            session_id: created.session.session_id,
+            display: created.session.display_number,
+        }
+    }
+
+    /// The owner makes the host exclusively organisation-managed, on an owner device's
+    /// confirmation, and is answered once the barrier has run.
+    async fn make_exclusive(&self) {
+        let mut local = self.host.client().await;
+        pairing_calls::confirm_subject(
+            self.host.environment_id,
+            &mut local,
+            ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+            &pairing_calls::Signer::OwnerDevice(&self.owner),
+        )
+        .await
+        .expect("the owner device confirms");
+        let _: kr_protocol::organisation::OrganisationExclusiveSetResult =
+            pairing_calls::mutate_as(
+                self.host.environment_id,
+                &mut local,
+                ActionId::new(kr_ipc::new_uuid()),
+                Method::OrganisationExclusiveSet,
+                &kr_protocol::organisation::OrganisationExclusiveSetParams { exclusive: true },
+            )
+            .await
+            .expect("the host becomes exclusively organisation-managed");
+    }
+
+    /// A new connection to the worker of `display`, as `kr attach` makes one.
+    async fn worker_of(&self, display: kr_protocol::session::DisplayNumber) -> LocalClient {
+        LocalClient::connect(
+            &self
+                .host
+                .paths()
+                .worker_endpoint(display)
+                .expect("the worker's endpoint"),
+            LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("connects to the worker")
+    }
+
+    /// The owner's local connection to the daemon.
+    async fn local(&self) -> LocalClient {
+        self.host.client().await
+    }
+
+    /// Presents a lease that lasts `lifetime_ms`, signed for the host's own local owner.
+    async fn present(&self, lifetime_ms: u64) {
+        let mut local = self.local().await;
+        let listed: kr_protocol::organisation::OrganisationListResult = pairing_calls::read(
+            &mut local,
+            Method::OrganisationList,
+            &kr_protocol::organisation::OrganisationListParams::default(),
+        )
+        .await
+        .expect("the host lists what it holds");
+        let account = organisation_support::member("owner");
+        let lease = self.organisation.sign(
+            1,
+            self.organisation.payload(
+                1,
+                &account,
+                listed.host_device.authorisation_key,
+                kr_ipc::now_ms().get(),
+                lifetime_ms,
+                &[ActionRight::SessionView],
+            ),
+        );
+        let _: MembershipPresentResult = pairing_calls::mutate_as(
+            self.host.environment_id,
+            &mut local,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::MembershipPresent,
+            &MembershipPresentParams {
+                lease,
+                authority: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the host takes the lease for its local owner");
+    }
+
+    async fn finish(self) {
+        let mut local = self.host.client().await;
+        close_session(&mut local, &self.host, self.session_id).await;
+        self.daemon.stop().await;
+    }
+}
+
+/// What a worker answers to a read of its session.
+async fn worker_read(
+    worker: &mut LocalClient,
+    session_id: SessionId,
+) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
+    worker
+        .request(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("the worker answers")
+}
+
+/// Asserts that a worker refused a read because of the local owner's lease.
+fn refused_for_the_owners_lease(
+    answer: &std::result::Result<ParamsValue, kr_protocol::error::ProtocolError>,
+) {
+    let error = answer.as_ref().expect_err("the read is refused");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(
+        error.message.contains("exclusively organisation-managed")
+            || error.message.contains("not yet told this session"),
+        "the refusal names the lease: {error:?}"
+    );
+}
+
+/// Waits until `check` holds, which must happen before the deadline.
+async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !check().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "it did not happen: {what}"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-17.54: on a host that is exclusively organisation-managed, the local owner answers to a
+/// membership lease like a member, at the session's worker as at the daemon's door.
+///
+/// A real host, a real worker, a real shell. Making the host exclusive is answered once the worker
+/// holds the bound, so the first read at the worker afterwards, on a connection made before it, is
+/// refused with no wait. What recovers the host and what only ends access is served throughout.
+/// A lease presented at the local socket serves both doors; its end, decided by the worker's own
+/// clock, refuses the next read on the connection that stayed up; a new lease serves it again.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at_the_daemon() {
+    let world = Exclusive::start().await;
+    let mut before = world.worker_of(world.display).await;
+    worker_read(&mut before, world.session_id)
+        .await
+        .expect("a host that is not exclusive serves its local owner as it always did");
+
+    world.make_exclusive().await;
+
+    // The enablement was answered, so the worker holds the bound: no waiting.
+    refused_for_the_owners_lease(&worker_read(&mut before, world.session_id).await);
+    let mut after = world.worker_of(world.display).await;
+    refused_for_the_owners_lease(&worker_read(&mut after, world.session_id).await);
+
+    // The daemon's door holds a held method and serves what recovers the host.
+    let mut local = world.local().await;
+    let refused = local
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(world.host.environment_id),
+            &create_params(world.host.environment_id, world.host.tree().root()),
+        )
+        .await
+        .expect("the daemon answers")
+        .expect_err("a held method is refused at the door");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    let _: kr_protocol::hostinfo::HostInfoResult =
+        pairing_calls::read(&mut local, Method::HostInfo, &())
+            .await
+            .expect("what only reads the host's own identity is served");
+    let listed: kr_protocol::organisation::OrganisationListResult = pairing_calls::read(
+        &mut local,
+        Method::OrganisationList,
+        &kr_protocol::organisation::OrganisationListParams::default(),
+    )
+    .await
+    .expect("the recovery set is served");
+    assert!(listed.exclusive);
+    assert!(
+        listed.workers_without_local_enforcement.is_empty(),
+        "every worker of this host holds the bound: {:?}",
+        listed.workers_without_local_enforcement
+    );
+    // The session's own tooling is not held: the terminal guard's probe, from outside every
+    // session, is told so by the worker and not refused for the lease.
+    let tooling = after
+        .request(
+            Method::QuestionReadOwn,
+            &kr_protocol::question::QuestionReadOwnParams {
+                session_id: world.session_id,
+                question_id: kr_protocol::ids::QuestionId::new(kr_ipc::new_uuid()),
+                caller_token: kr_protocol::question::CallerToken::new(vec![
+                    0;
+                    kr_protocol::question::CALLER_TOKEN_BYTES
+                ]),
+                wait_ms: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the worker answers")
+        .expect_err("a process outside every session has no question");
+    assert_eq!(tooling.code, ErrorCode::NotInKrSession, "{tooling:?}");
+
+    // A lease presented at the local socket serves both doors, and its end refuses the worker.
+    world.present(SHORT_LEASE_MS).await;
+    eventually("the worker serves the local owner", async || {
+        worker_read(&mut before, world.session_id).await.is_ok()
+    })
+    .await;
+    eventually(
+        "the lease ends at the worker, on the same connection",
+        async || {
+            worker_read(&mut before, world.session_id)
+                .await
+                .is_err_and(|error| error.message.contains("lease has ended"))
+        },
+    )
+    .await;
+    world.present(SHORT_LEASE_MS).await;
+    eventually("a new lease serves the same connection again", async || {
+        worker_read(&mut before, world.session_id).await.is_ok()
+    })
+    .await;
+
+    drop(local);
+    world.finish().await;
+}
+
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
