@@ -1,4 +1,4 @@
-//! Running a package's launch probe, and what a launch does with the mode it reads.
+//! Running a package's launch probe.
 //!
 //! A package can declare how to read the mode its application will run in: the application's own
 //! diagnostic, run before a launch with the options of the launch that decide which configuration
@@ -10,7 +10,7 @@
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
-//! | KR-REQ-07.64 | The mode is read from what the program prints, and a nonzero exit status does not change that; the program runs in the launch's directory with no input; one that prints too much or never finishes records no mode and is ended with everything it started; one that cannot start says so; a launch records the mode its package's probe read in its profile, and a probe the installation did not grant is not run; in a Windows service session a launch whose mode is refused there, or unknown because its probe did not finish in time for a package that refuses a mode there, is a named failure and starts nothing, and a probe that finished with no mode in it is not stopped |
+//! | KR-REQ-07.64 | The mode is read from what the program prints, and a nonzero exit status does not change that; the program runs in the launch's directory with no input; one that prints too much or never finishes records no mode and is ended with everything it started; one that cannot start says so |
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,13 +24,6 @@ use common::LIVENESS_DEADLINE;
 
 /// How long a probe is given in the tests that do not test the deadline.
 const GENEROUS: Duration = Duration::from_secs(60);
-
-/// How long a launch waits for its probe in the cases that decide by the mode the stand-in prints.
-///
-/// The stand-in is a program the machine may be slow to start, so these cases wait for it as long
-/// as the others here do, and a probe that is late is not one they would take for a probe that
-/// printed nothing.
-const WAITING: Duration = GENEROUS;
 
 /// One platform's stand-in for the application: the program and the arguments that run `script`.
 struct Standin {
@@ -93,12 +86,6 @@ impl Standin {
             .collect(),
             refused: vec!["elevated".to_owned()],
         }
-    }
-
-    /// The same program, for a package that refuses no mode in a service session.
-    fn refusing_nothing(mut self) -> Self {
-        self.refused.clear();
-        self
     }
 
     /// The probe a package declares for it: its own arguments, and the mode at `/mode`.
@@ -300,258 +287,4 @@ fn kr_req_07_64_a_program_that_cannot_start_records_no_mode_and_says_so() {
         "{probed:?}"
     );
     assert!(!probed.late, "it never ran, so it was not late");
-}
-
-// ---------------------------------------------------------------------------------------------
-// A launch and the mode its package's probe reads.
-
-mod launch {
-    use std::sync::Arc;
-
-    use kr_protocol::broker::{
-        AgentOwnership, AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile,
-    };
-    use kr_protocol::gateway::NativeFraming;
-    use kr_protocol::ids::{
-        ApplicationInstanceId, EnvironmentId, LaunchProfileId, PluginId, SessionId,
-    };
-    use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
-    use kr_worker::broker::{Broker, BrokerError, Framing, NativeGateway, NativeLaunch};
-    use kr_worker::persistence::JournalHealth;
-
-    use super::Standin;
-
-    fn profile(program: &std::path::Path, arguments: &[String]) -> LaunchProfile {
-        LaunchProfile {
-            profile_id: LaunchProfileId::new("lp-1").expect("valid"),
-            environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
-            binary: BinaryIdentity {
-                resolved_path: program.to_string_lossy().into_owned(),
-                digest: Digest256::from_bytes([3; 32]),
-                version: "1".to_owned(),
-                distribution: "build".to_owned(),
-            },
-            arguments: arguments.to_vec(),
-            authentication: AuthenticationState::Authenticated,
-            mode: IntegrationMode::Gateway,
-            ownership: AgentOwnership::Full,
-            vendor_mode: Nullable::null(),
-            resolved_at: TimestampMs::new(1),
-        }
-    }
-
-    /// What a launch of one stand-in came to.
-    pub struct Attempt {
-        /// The profile the launch recorded, or what it refused.
-        pub outcome: Result<LaunchProfile, BrokerError>,
-        /// Whether the launch started the agent's process.
-        pub started: bool,
-    }
-
-    /// What a launch of `standin` as the agent, with its package's probe given `probe_deadline`
-    /// where there is one, records and refuses. The launch is in whichever kind of session this
-    /// machine is in, unless `service_session` says it is in a service session or not.
-    pub fn launch(
-        standin: &Standin,
-        probe_deadline: Option<std::time::Duration>,
-        service_session: Option<bool>,
-    ) -> Attempt {
-        let directory = tempfile::tempdir().expect("a directory");
-        let private = directory.path().join("private");
-        kr_ipc::paths::create_private_directory(&private).expect("a private directory");
-        let broker = Arc::new(
-            Broker::open(
-                None,
-                SessionId::new(Uuid::from_bytes([1; 16])),
-                JournalHealth::shared(),
-            )
-            .expect("the broker opens"),
-        );
-        let mut gateway = NativeGateway::bind(
-            Arc::clone(&broker),
-            &private,
-            NativeLaunch {
-                profile_id: LaunchProfileId::new("lp-1").expect("valid"),
-                expected_process: None,
-                native_terminal: None,
-                application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([1; 16])),
-                plugin_id: PluginId::new("kalareach/codex").expect("valid"),
-                installed_protocol_version: "1".to_owned(),
-                framing: Framing::new(NativeFraming::JsonLines),
-                site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
-                os_user: "agent-user".to_owned(),
-                working_directory: directory.path().to_path_buf(),
-            },
-        )
-        .expect("the endpoint binds");
-        #[cfg(windows)]
-        let session = Arc::new(kr_worker::windows::job::SessionJob::create().expect("a job"));
-        #[cfg(windows)]
-        {
-            gateway = gateway.in_session(Arc::clone(&session));
-        }
-        if let Some(in_service_session) = service_session {
-            gateway = gateway.with_service_session(in_service_session);
-        }
-        if let Some(deadline) = probe_deadline {
-            gateway = gateway
-                .with_launch_probe(standin.probe(&[]))
-                .with_probe_deadline(deadline);
-        }
-        let intent = broker
-            .prepare_launch(
-                profile(&standin.program, &standin.arguments),
-                kr_worker::broker::ForegroundMark::idle(4),
-                None,
-            )
-            .expect("the launch is prepared");
-        let launched = gateway.launch(
-            &intent,
-            &kr_worker::broker::ForegroundMark::idle(4),
-            IntegrationMode::Gateway,
-            TimestampMs::new(1),
-        );
-        let started = gateway.last_started().is_some();
-        let outcome = match launched {
-            Ok(mut launched) => {
-                // The agent is a program that has printed what the probe reads and will go on to
-                // end by itself; what matters here is the profile its launch recorded.
-                let _ = launched.child.kill();
-                let _ = launched.child.wait();
-                #[cfg(windows)]
-                let _ = session.terminate(1);
-                let recorded = broker
-                    .profile_of(ApplicationInstanceId::new(Uuid::from_bytes([1; 16])))
-                    .expect("the launch's profile is recorded");
-                assert_eq!(recorded, launched.profile, "what is recorded is what ran");
-                Ok(launched.profile)
-            }
-            Err(error) => Err(error),
-        };
-        Attempt { outcome, started }
-    }
-}
-
-/// KR-REQ-07.64: a launch whose package declares a probe records the mode the probe read in its
-/// profile, and one whose installation did not grant the probe runs none and records none.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_07_64_a_launch_records_the_mode_its_probe_read_and_a_probe_not_granted_is_not_run()
-{
-    let standin = Standin::running(
-        r#"printf '{"mode":"disabled"}'"#,
-        r#"[Console]::Out.Write('{"mode":"disabled"}')"#,
-    );
-    let probing = launch::launch(&standin, Some(WAITING), None)
-        .outcome
-        .expect("the launch goes ahead");
-    assert_eq!(probing.vendor_mode.0.as_deref(), Some("disabled"));
-    let without = launch::launch(&standin, None, None)
-        .outcome
-        .expect("the launch goes ahead");
-    assert_eq!(
-        without.vendor_mode.0, None,
-        "a probe nobody gave the gateway is not run"
-    );
-}
-
-/// Whether this worker runs in a Windows service session, as the launch itself reads it.
-fn in_service_session() -> bool {
-    #[cfg(windows)]
-    {
-        kr_ipc::starter::current_session().is_ok_and(|session| session == 0)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-/// KR-REQ-07.64: a mode the package refuses in a service session is a named launch failure where
-/// this worker runs in one and starts nothing, and a launch otherwise: the same program and the
-/// same probe, with the session this test runs in deciding which.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_07_64_a_refused_mode_is_a_named_failure_in_a_service_session_and_a_launch_elsewhere()
- {
-    let standin = Standin::running(
-        r#"printf '{"mode":"elevated"}'"#,
-        r#"[Console]::Out.Write('{"mode":"elevated"}')"#,
-    );
-    let attempt = launch::launch(&standin, Some(WAITING), None);
-    if in_service_session() {
-        let error = attempt
-            .outcome
-            .expect_err("a refused mode is a named failure here");
-        assert!(
-            matches!(&error, kr_worker::broker::BrokerError::PreconditionFailed { detail }
-                if detail.contains("elevated") && detail.contains("service session")),
-            "{error:?}"
-        );
-        assert!(!attempt.started, "nothing was started");
-    } else {
-        let profile = attempt
-            .outcome
-            .expect("the mode is not refused in this session");
-        assert_eq!(profile.vendor_mode.0.as_deref(), Some("elevated"));
-    }
-}
-
-/// KR-REQ-07.64: a launch whose probe does not finish records no mode, and its mode is unknown. In
-/// a service session, for a package that refuses some mode there, it may be that mode, so the
-/// launch is a named failure and starts nothing, whatever the application had printed before it
-/// stopped finishing; elsewhere, or for a package that refuses none, the launch goes ahead, and
-/// the application's own sandbox is left as it is: nothing is disabled and nothing is let out of
-/// the job. A probe that finished and printed nothing a mode can be read from is an answer, and
-/// the launch goes ahead in a service session too. A stand-in that does not finish waits for ever,
-/// so these cases decide by that and not by how soon the deadline passes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_07_64_a_launch_whose_probe_does_not_finish_is_a_named_failure_in_a_service_session()
-{
-    let silent = || Standin::running("exec sleep 600", "Start-Sleep -Seconds 600");
-    let deadline = Some(Duration::from_secs(1));
-
-    let attempt = launch::launch(&silent(), deadline, Some(true));
-    let error = attempt
-        .outcome
-        .expect_err("a mode that is unknown may be a refused one in a service session");
-    assert!(
-        matches!(&error, kr_worker::broker::BrokerError::PreconditionFailed { detail }
-            if detail.contains("service session")),
-        "{error:?}"
-    );
-    assert!(!attempt.started, "nothing was started");
-
-    // An answer that was printed but not finished is not used.
-    let printed_and_stalled = Standin::running(
-        r#"printf '{"mode":"disabled"}'; exec sleep 600"#,
-        r#"[Console]::Out.Write('{"mode":"disabled"}'); Start-Sleep -Seconds 600"#,
-    );
-    let attempt = launch::launch(&printed_and_stalled, deadline, Some(true));
-    let error = attempt
-        .outcome
-        .expect_err("an answer that was not finished is no answer");
-    assert!(
-        matches!(&error, kr_worker::broker::BrokerError::PreconditionFailed { detail }
-            if detail.contains("did not finish")),
-        "{error:?}"
-    );
-    assert!(!attempt.started, "nothing was started");
-
-    // Elsewhere the same probe records no mode and the launch goes ahead.
-    let profile = launch::launch(&silent(), deadline, Some(false))
-        .outcome
-        .expect("a probe that does not finish does not stop the launch outside a service session");
-    assert_eq!(profile.vendor_mode.0, None);
-
-    // A package that refuses no mode has nothing an unknown mode could be, in any session.
-    let profile = launch::launch(&silent().refusing_nothing(), deadline, Some(true))
-        .outcome
-        .expect("a package that refuses no mode is not stopped by a probe that does not finish");
-    assert_eq!(profile.vendor_mode.0, None);
-
-    // A probe that finished is an answer, whether or not a mode can be read from it.
-    let unreadable = Standin::running("printf 'not json'", "[Console]::Out.Write('not json')");
-    let profile = launch::launch(&unreadable, Some(WAITING), Some(true))
-        .outcome
-        .expect("an application that answered with no mode does not stop the launch");
-    assert_eq!(profile.vendor_mode.0, None);
 }

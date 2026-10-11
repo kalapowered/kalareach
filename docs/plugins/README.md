@@ -273,24 +273,20 @@ installation's own `kr-hook`, under the launch's registration and credential.
 ### The launch probe
 
 A package can tell the host how to read the mode its application will run in. The `launch_probe`
-member of the manifest names the application's own diagnostic command, which the host runs before a
-launch the worker starts and whenever it reads its diagnostics (`host.doctor`, which `kr doctor`
-makes). This host starts no agent through the worker's launch, so on it only that read runs the
-probe; `kr plugin integration enable` and `disable` make it too, and a paired device may.
+member of the manifest names the application's own diagnostic command, which the host runs whenever
+it reads its diagnostics (`host.doctor`, which `kr doctor` makes). Only that read runs the probe;
+`kr plugin integration enable` and `disable` make it too, and a paired device may.
 
 - `arguments` are what the host passes to the application's executable: one to eight, each one line
   of 1 to 256 bytes, so the application is never started bare.
 - `carried_options` are up to eight option names of at most 32 bytes, each taking one value, that
-  change which configuration the diagnostic reads. The host copies each one found in the launch's
-  own arguments, with its value, in front of `arguments`. A short name (`-c`) is read as `-c v`,
-  `-cv` and `-c=v`, and a long one (`--config`) as `--config v` and `--config=v`. Options after a
-  bare `--` are not carried.
+  change which configuration the diagnostic reads. The diagnostics hold no launch, so they carry
+  none.
 - `mode` is an RFC 6901 JSON Pointer of at most 256 bytes into the JSON the diagnostic prints on
   standard output. It has to reach a string of at most 128 printable bytes, and anything else
   records no mode.
 - `refused_in_service_session` lists up to eight modes, each one line of at most 64 bytes, that the
-  application cannot run with in a Windows service session. A launch there whose mode is listed
-  fails by name before anything starts, and so does one whose probe does not finish in time.
+  application cannot run with in a Windows service session.
 
 The probe runs only while the installation holds `launch.probe`. The owner confirms the capability
 on every release, because it runs the application's own executable with arguments the package chose.

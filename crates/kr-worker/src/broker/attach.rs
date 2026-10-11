@@ -20,8 +20,7 @@
 //! 5. **Register.** The connection's own dispatch becomes the one the broker hands admissions to,
 //!    and the connection is subscribed to the resolutions of the instance it speaks for.
 //! 6. **Serve and tear down.** The owner reads both ends until one closes; then the connection is
-//!    closed, its subscription withdrawn, and — only for the native exit section 7 names — the
-//!    dedicated backend is stopped through the normal grace period.
+//!    closed and its subscription withdrawn.
 //!
 //! A failure at any step leaves nothing behind: an admitted connection whose owner could not start
 //! is closed again, so a refused bridge does not leave a gateway connection nobody drives.
@@ -29,8 +28,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[cfg(windows)]
-use kr_protocol::broker::AgentOwnership;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, GatewayConnectionId, PluginId};
 
@@ -39,7 +36,6 @@ use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
 use crate::broker::listener::{BridgeHello, ListenerAddress, Registration, reject_browser_origin};
-use crate::broker::process::{Credential, ManagedProcess};
 use crate::broker::{Broker, ResourceTransition};
 
 /// How long a connecting bridge has to say who it is.
@@ -57,14 +53,6 @@ pub const CREDENTIAL_FILE: &str = "credential";
 /// How long a connection's own writes are given to finish once both ends have stopped reading.
 pub const TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often the native terminal this host started is read while it is still running.
-///
-/// A socket reaching end of file and the process behind it exiting are two events in either order,
-/// and neither is a bound on the other: a terminal can close its connection and go on running for
-/// an hour, and a terminal whose connection stays open can exit at once. So the process is watched
-/// for as long as it runs rather than for a window after something else happened.
-pub const TERMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// What one launched agent's bridge must satisfy, and what its connection is read with.
 #[derive(Clone, Debug)]
 pub struct NativeLaunch {
@@ -72,18 +60,9 @@ pub struct NativeLaunch {
     pub profile_id: kr_protocol::ids::LaunchProfileId,
     /// The bridge process this host expects on the connection.
     ///
-    /// It is absent until this host has started one. [`NativeGateway::launch`] fills it in from
-    /// the process it actually spawned, which is the only thing that can: the registration names
-    /// the process, so the process has to exist before the registration does.
+    /// It is absent until the gateway is bound for a process the invocation presented: the
+    /// registration names the process, so the process has to exist before the registration does.
     pub expected_process: Option<ProcessStartIdentity>,
-    /// The native terminal this host started, where it started one.
-    ///
-    /// Section 7 draws its line between two processes: the terminal the person is typing in, and
-    /// the backend that serves it. The terminal ending is the intentional native exit that ends
-    /// the instance and stops that backend; the connection closing is not, and an attachment
-    /// closing is not. Where this host started no terminal of its own — a bypassed or shared
-    /// backend — it is absent, and no closure is read as an exit.
-    pub native_terminal: Option<ProcessStartIdentity>,
     /// The instance the connection speaks for.
     pub application_instance_id: ApplicationInstanceId,
     /// The connector package whose pinned tables read this connection's frames.
@@ -96,12 +75,6 @@ pub struct NativeLaunch {
     pub site: kr_protocol::ids::EnvironmentId,
     /// The operating-system user the agent runs as.
     pub os_user: String,
-    /// The directory a launched backend starts in.
-    ///
-    /// It is the directory the application works in and never the launch's own private directory,
-    /// which holds the registration and the credential: an application that writes into its
-    /// working directory must not write there.
-    pub working_directory: std::path::PathBuf,
 }
 
 /// What a connecting bridge writes before anything else.
@@ -134,106 +107,11 @@ struct Hello {
 
 /// What one connection's ending meant, as the closure itself established it.
 ///
-/// It says what the socket closing was, and nothing about what the terminal does afterwards: that
-/// belongs to [`TerminalWatch`], which is still running when this is returned.
+/// It says what the socket closing was, and nothing about what the terminal does afterwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ended {
     /// Why the connection ended.
     pub closure: Closure,
-}
-
-/// The supervision of the native terminal this host started.
-///
-/// Section 7 makes the terminal's own exit the intentional native exit that ends the instance and
-/// stops its dedicated backend. The connection is not that event and cannot stand in for it: the
-/// socket can close while the terminal runs on, and the terminal can exit long after any window a
-/// teardown could reasonably wait. So this watches the process itself, from the moment the
-/// connection is served until the process ends, and it is what stops the backend.
-#[derive(Debug)]
-pub struct TerminalWatch {
-    stopping: Arc<tokio::sync::Notify>,
-    stopped: Arc<std::sync::atomic::AtomicBool>,
-    watching: tokio::task::JoinHandle<Option<crate::broker::process::BackendStop>>,
-}
-
-impl TerminalWatch {
-    /// Waits for the terminal to exit and returns what stopping its dedicated backend did.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::UpstreamUnavailable`] when the supervising task could not be joined,
-    /// which leaves what became of the terminal unestablished.
-    pub async fn exited(self) -> Result<Option<crate::broker::process::BackendStop>> {
-        self.watching
-            .await
-            .map_err(|error| BrokerError::UpstreamUnavailable {
-                detail: format!("the terminal's supervision could not be joined: {error}"),
-            })
-    }
-
-    /// Ends the supervision without waiting for the terminal.
-    ///
-    /// Nothing is stopped and nothing is ended: this is the host giving up the watch, which is
-    /// what a session shutting down does. The request is recorded rather than signalled, so one
-    /// made before the watch first waits, or between two of its readings, still ends it.
-    pub fn stop(&self) {
-        self.stopped
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.stopping.notify_waiters();
-    }
-}
-
-/// Watches one terminal for as long as it runs, and stops what its exit stops.
-async fn supervise_terminal(
-    broker: Arc<Broker>,
-    application_instance_id: ApplicationInstanceId,
-    terminal: ProcessStartIdentity,
-    stopping: Arc<tokio::sync::Notify>,
-    stopped: Arc<std::sync::atomic::AtomicBool>,
-) -> Option<crate::broker::process::BackendStop> {
-    loop {
-        // The request to stop is read first and read from state, so one made while this task was
-        // not waiting is not a request that disappeared.
-        if stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
-        if matches!(
-            kr_ipc::identity::process_state(&terminal),
-            kr_ipc::identity::ProcessState::Ended
-        ) {
-            return stop_what_ended(&broker, application_instance_id).await;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(TERMINAL_POLL) => {}
-            () = stopping.notified() => return None,
-        }
-    }
-}
-
-/// Returns true when the terminal this host started has ended, read once.
-fn terminal_has_ended(terminal: Option<&ProcessStartIdentity>) -> bool {
-    terminal.is_some_and(|terminal| {
-        matches!(
-            kr_ipc::identity::process_state(terminal),
-            kr_ipc::identity::ProcessState::Ended
-        )
-    })
-}
-
-/// Ends the instance an intentional native exit ends, and stops the backend it stops.
-async fn stop_what_ended(
-    broker: &Broker,
-    application_instance_id: ApplicationInstanceId,
-) -> Option<crate::broker::process::BackendStop> {
-    let outcome = broker.end(
-        application_instance_id,
-        crate::broker::InstanceEnding::NativeExit,
-    );
-    let backend = outcome.backend?;
-    let stopped =
-        crate::broker::process::stop_backend(&backend, crate::broker::process::BACKEND_GRACE).await;
-    broker.release_stopped(&backend);
-    Some(stopped)
 }
 
 fn map_content_class(
@@ -497,12 +375,6 @@ pub struct Attached {
     pub owner: Arc<Duplex>,
     /// Where this connection's authorised observer reads resolutions.
     pub observations: Option<Observations>,
-    /// The supervision of the native terminal, where this host started one.
-    ///
-    /// It is already running and it outlives this connection. Closing the attachment does not end
-    /// it, because the terminal exiting is a different event from the socket closing and section 7
-    /// acts on the first.
-    pub terminal: Option<TerminalWatch>,
     /// The task driving the owner's own writes and reads.
     served: tokio::task::JoinHandle<Ended>,
     /// The broker that minted this attachment and holds its state.
@@ -574,20 +446,13 @@ pub struct NativeGateway {
     endpoint: BoundEndpoint,
     observatory: Observatory,
     launch: NativeLaunch,
-    /// The registration this endpoint admits against, once a launch has published it.
+    /// The registration this endpoint admits against.
     ///
-    /// Set once: by [`NativeGateway::launch`], or by the command backend when the invocation that
-    /// presented itself is admitted. Admissions read it concurrently, so it is never replaced.
+    /// Set once, when the gateway is bound for the process the invocation presented. Admissions
+    /// read it concurrently, so it is never replaced.
     registration: std::sync::OnceLock<Registration>,
     /// The native bridge the launched application was installed with, where it has one.
     bridge: Option<crate::broker::bridge::InstalledBridge>,
-    /// How the application's own package reads the mode it will run in, where the package
-    /// declares a probe and the installation holds the capability that runs it.
-    launch_probe: Option<kr_plugin_sdk::launch_probe::LaunchProbe>,
-    runtime_directory: std::path::PathBuf,
-    /// The session's job, which a launch is held by and which ends it when it closes.
-    #[cfg(windows)]
-    session_job: Option<Arc<crate::windows::job::SessionJob>>,
     /// How long this gateway gives a connection's writers once its reading has ended.
     ///
     /// It is [`TEARDOWN_DEADLINE`] for every gateway this product binds. It is a field rather than
@@ -595,305 +460,6 @@ pub struct NativeGateway {
     /// deadline a single write gets, and so tell a writer this supervision ended from a writer
     /// that ran out of its own time: with both at one value, either could be what happened.
     teardown: std::time::Duration,
-    /// How long this gateway gives its launch probe to print its answer and end.
-    ///
-    /// It is [`crate::broker::probe::DEADLINE`] for every gateway this product binds. It is a
-    /// field rather than the constant at the one place that waits on it so that a test can give a
-    /// probe the time a loaded machine takes to start a program, and decide by what the probe
-    /// printed rather than by how soon it printed. The bound a closure puts on the launches in
-    /// flight comes from [`crate::broker::probe::DEADLINE`] and not from this field, so a gateway
-    /// whose probe was given longer is not one a closure waits that long for.
-    probe_deadline: std::time::Duration,
-    /// Whether this worker runs in a Windows service session, read once when the gateway is bound.
-    ///
-    /// It is [`in_service_session`] for every gateway this product binds. It is a field rather than
-    /// a call at the places that read it so that a test can put one gateway in each kind of
-    /// session on any platform, and decide what a launch does there, instead of deciding it only
-    /// on the machines that happen to be in one.
-    in_service_session: bool,
-    /// The last process a launch of this gateway started, for this host's own tests.
-    ///
-    /// A launch that fails after its process started returns no process, and this is how a test
-    /// learns which one it has to find stopped.
-    #[cfg(feature = "testing")]
-    last_started: Option<ProcessStartIdentity>,
-    /// Where the next launch stops on its way to handing its agent over, for this host's own tests.
-    #[cfg(all(feature = "testing", windows))]
-    launch_pause: std::sync::Mutex<Option<ArmedPause>>,
-    /// Where a failed launch stops before it undoes anything, for this host's own tests.
-    #[cfg(feature = "testing")]
-    cleanup_pause: std::sync::Mutex<
-        Option<(
-            std::sync::mpsc::SyncSender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
-}
-
-/// The process a launch starts, as this platform hands it back: with the ends of its standard
-/// input and output this host keeps, and what ends it and waits for it.
-#[cfg(unix)]
-pub type AgentChild = std::process::Child;
-
-/// The process a launch starts, as this platform hands it back: with the ends of its standard
-/// input and output this host keeps, and what ends it and waits for it.
-#[cfg(windows)]
-pub type AgentChild = crate::windows::launch::Child;
-
-/// A place a launch can be held on its way to handing its agent over, for this host's own tests.
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LaunchStage {
-    /// The session has admitted the launch; nothing else has been done.
-    Admitted,
-    /// The launch is about to read the application's own configuration, before it reserves
-    /// anything.
-    Probing,
-    /// The agent's job is made, and recorded on the session where the profile is reduced; its
-    /// process is not created.
-    JobRecorded,
-    /// The agent's process exists and the launch has not yet asked whether the session is closing.
-    ProcessCreated,
-    /// The launch has found the session open with its process created, and has not yet handed the
-    /// agent over.
-    Checked,
-}
-
-/// A pause a test armed: where it stops the launch, how it says the launch arrived and what lets
-/// the launch go on.
-#[cfg(all(feature = "testing", windows))]
-type ArmedPause = (
-    LaunchStage,
-    std::sync::mpsc::SyncSender<()>,
-    std::sync::mpsc::Receiver<()>,
-);
-
-/// Stops a process a launch started, and waits for it, because the launch failed after it.
-///
-/// The process has not been told where to connect, so it has done nothing anyone depends on, and
-/// it is ended at once rather than given a grace period. It is waited for so that it is gone, not
-/// merely signalled, when the launch returns. On Windows its job is ended with it, which ends
-/// anything it started in the meantime, and the job is let go of: nothing will ask about an agent
-/// that never ran.
-fn stop_started(mut child: AgentChild, started: &ProcessStartIdentity) {
-    #[cfg(windows)]
-    {
-        if let Some(job) = crate::windows::job::agent_job(started) {
-            // Best effort: the child is ended below whatever this answers.
-            let _ = job.terminate(1);
-        }
-        crate::windows::job::release_agent(started);
-    }
-    #[cfg(not(windows))]
-    let _ = started;
-    // A process that has already exited cannot be killed, and that is the outcome wanted.
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Starts the agent a launch names and reads back what the kernel started.
-///
-/// Elsewhere the broker walks the parents, and the agent is started as it is.
-#[cfg(unix)]
-fn start_agent(
-    program: &str,
-    arguments: &[String],
-    directory: &std::path::Path,
-    registration: &std::path::Path,
-) -> Result<(AgentChild, ProcessStartIdentity)> {
-    let could_not_start =
-        |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
-    let mut child = std::process::Command::new(program)
-        .args(arguments)
-        .current_dir(directory)
-        // One variable: the registration names the credential file beside it.
-        .env("KR_REGISTRATION", registration)
-        // The worker owns the standard streams of the backend it starts. The person's own
-        // terminal is the session's PTY and is a different path; what this pair carries is
-        // whatever the launched process says to the host that started it.
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(could_not_start)?;
-    match kr_ipc::identity::started_process_identity(child.id()) {
-        Ok(started) => Ok((child, started)),
-        Err(error) => {
-            // A process this host cannot name is one it could never supervise or stop by its
-            // identity later, so it is stopped now, while the handle still names it.
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(BrokerError::ledger(format!(
-                "the started process cannot be read, so it was stopped: {error}"
-            )))
-        }
-    }
-}
-
-/// Starts the agent a launch names and reads back what the kernel started.
-///
-/// On Windows the agent is started in the session's job and in a job of its own, both joined
-/// before it runs, and its job is kept for the broker: a Windows process keeps naming a parent
-/// after that parent exits, so the broker places a caller under an agent by what the agent's job
-/// holds rather than by a walk up the parents. It is given its standard input and output as pipes
-/// and nothing else this worker holds.
-///
-/// An agent whose launch profile records reduced ownership is started in a job of its own alone:
-/// one that ends what it holds when the last handle to it closes, which is held by the session's
-/// record of its reduced agents, so the session's closure lists what it holds and ends it. Nothing
-/// else changes about the launch, and the vendor's own sandbox is left exactly as the vendor made
-/// it.
-///
-/// The launch is in flight on the session, admitted by [`NativeGateway::launch`] and held by the
-/// caller, for as long as this runs and after it: the session's closure waits for it.
-#[cfg(windows)]
-fn start_agent(
-    program: &str,
-    arguments: &[String],
-    directory: &std::path::Path,
-    registration: &std::path::Path,
-    session: &Arc<crate::windows::job::SessionJob>,
-    ownership: AgentOwnership,
-    pause: impl Fn(LaunchStage),
-) -> Result<(AgentChild, ProcessStartIdentity)> {
-    let could_not_start =
-        |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
-    let session_is_closing = || BrokerError::PreconditionFailed {
-        detail: format!("this session is closing, so {program} was not started"),
-    };
-    let reduced = ownership == AgentOwnership::Reduced;
-    let job = Arc::new(
-        if reduced {
-            crate::windows::job::AgentJob::create_owning()
-        } else {
-            crate::windows::job::AgentJob::create()
-        }
-        .map_err(could_not_start)?,
-    );
-    if reduced {
-        // Before the process exists: the closure reads the session's record, and an agent it did
-        // not know of would be one it could not end.
-        session.adopt_reduced(Arc::clone(&job));
-    }
-    let forget = || {
-        if reduced {
-            session.release_reduced(&job);
-        }
-    };
-    pause(LaunchStage::JobRecorded);
-    let mut child = match crate::windows::launch::start(&crate::windows::launch::Spec {
-        program: std::path::Path::new(program),
-        arguments,
-        directory,
-        // One variable: the registration names the credential file beside it.
-        environment: &[("KR_REGISTRATION", registration.as_os_str())],
-        session: (!reduced).then_some(session.as_ref()),
-        agent: &job,
-        pipe_input: true,
-        pipe_output: true,
-    }) {
-        Ok(child) => child,
-        Err(error) => {
-            forget();
-            return Err(could_not_start(error));
-        }
-    };
-    pause(LaunchStage::ProcessCreated);
-    // A process created in a job that was ended is not ended with it. The session's closure marks
-    // the session before it ends the jobs, so a closure that began before this process existed is
-    // seen here, and a closure that begins now ends the process with its job.
-    if session.is_closed() {
-        let _ = job.terminate(1);
-        let _ = child.kill();
-        let _ = child.wait();
-        forget();
-        return Err(session_is_closing());
-    }
-    let started = match kr_ipc::identity::started_process_identity(child.id()) {
-        Ok(started) => started,
-        Err(error) => {
-            // A process this host cannot name is one it could never supervise or stop by its
-            // identity later, so it is stopped now, while the handle still names it.
-            let _ = job.terminate(1);
-            let _ = child.kill();
-            let _ = child.wait();
-            forget();
-            return Err(BrokerError::ledger(format!(
-                "the started process cannot be read, so it was stopped: {error}"
-            )));
-        }
-    };
-    pause(LaunchStage::Checked);
-    crate::windows::job::keep_agent(started.clone(), job, child.stdin.clone());
-    Ok((child, started))
-}
-
-/// Refuses a launch whose jobs a vendor's own sandbox cannot run under, by name, before anything
-/// starts.
-///
-/// Section 7 allows two outcomes where a vendor sandbox is incompatible with the jobs it would
-/// run under: a named launch failure, or an explicitly selected reduced-ownership profile. The
-/// vendor's sandbox is never switched off and breakaway is never granted to make it start. What
-/// the sandbox cannot run under is a chain that restricts desktops: it makes one of its own.
-#[cfg(windows)]
-fn refuse_what_a_vendor_sandbox_cannot_run_under(
-    session: &crate::windows::job::SessionJob,
-    ownership: AgentOwnership,
-) -> Result<()> {
-    use crate::windows::job::SandboxBlock;
-
-    // An agent in a job of its own is not under the session's, so only the worker's own job can
-    // stop it.
-    let held_by = (ownership == AgentOwnership::Full).then_some(session);
-    let block = crate::windows::job::sandbox_block(held_by).map_err(|error| {
-        BrokerError::PreconditionFailed {
-            detail: format!(
-                "the limits of the jobs this agent would start in could not be read, so nothing \
-                 was started: {error}"
-            ),
-        }
-    })?;
-    let detail = match block {
-        None => return Ok(()),
-        Some(SandboxBlock::SessionJob) => {
-            "the session's job restricts access to desktops, which a vendor's own sandbox needs \
-             to make one of its own, so nothing was started and the sandbox was left as it is; \
-             a launch whose profile records reduced ownership starts this agent in a job of its \
-             own, which its closure then reads as incomplete coverage"
-        }
-        Some(SandboxBlock::WorkersOwnJob) => {
-            "the job this worker is itself in restricts access to desktops, which a vendor's own \
-             sandbox needs to make one of its own, and every process this worker starts is under \
-             that job whatever job the agent is put in, so nothing was started and the sandbox \
-             was left as it is"
-        }
-    };
-    Err(BrokerError::PreconditionFailed {
-        detail: detail.to_owned(),
-    })
-}
-
-/// Returns whether this worker runs in a Windows service session: login session 0, which no
-/// person signs in to and a desktop is not shown in. There is no such session elsewhere.
-fn in_service_session() -> bool {
-    #[cfg(windows)]
-    {
-        kr_ipc::starter::current_session().is_ok_and(|session| session == 0)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-/// One agent this host started, and what it started.
-#[derive(Debug)]
-pub struct Launched {
-    /// The process itself, so its owner can wait for it or end it.
-    pub child: AgentChild,
-    /// What the kernel says it is.
-    pub process: ProcessStartIdentity,
-    /// The profile it was started from.
-    pub profile: kr_protocol::broker::LaunchProfile,
 }
 
 impl NativeGateway {
@@ -906,29 +472,6 @@ impl NativeGateway {
     #[must_use]
     pub const fn with_teardown_deadline(mut self, teardown: std::time::Duration) -> Self {
         self.teardown = teardown;
-        self
-    }
-
-    /// Sets how long this gateway gives its launch probe to print its answer and end.
-    ///
-    /// It exists so that this host's own tests can give a probe a program the machine is slow to
-    /// start, and read the mode that program prints, instead of racing the deadline a launch gives.
-    /// It is compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    #[must_use]
-    pub const fn with_probe_deadline(mut self, deadline: std::time::Duration) -> Self {
-        self.probe_deadline = deadline;
-        self
-    }
-
-    /// Sets whether this gateway launches as a worker in a Windows service session does.
-    ///
-    /// It exists so that this host's own tests can launch in each kind of session on every platform,
-    /// whichever one the machine they run on is in. It is compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    #[must_use]
-    pub const fn with_service_session(mut self, in_service_session: bool) -> Self {
-        self.in_service_session = in_service_session;
         self
     }
 
@@ -962,88 +505,13 @@ impl NativeGateway {
         }
         Ok(Self {
             teardown: TEARDOWN_DEADLINE,
-            probe_deadline: crate::broker::probe::DEADLINE,
-            in_service_session: in_service_session(),
             broker,
             endpoint,
             observatory,
             launch,
             registration,
             bridge: None,
-            launch_probe: None,
-            runtime_directory: runtime_directory.to_path_buf(),
-            #[cfg(windows)]
-            session_job: None,
-            #[cfg(feature = "testing")]
-            last_started: None,
-            #[cfg(all(feature = "testing", windows))]
-            launch_pause: std::sync::Mutex::new(None),
-            #[cfg(feature = "testing")]
-            cleanup_pause: std::sync::Mutex::new(None),
         })
-    }
-
-    /// Stops the next launch that fails after its process started, before it undoes anything, for
-    /// this host's own tests.
-    ///
-    /// Returns the end that says the launch has arrived there and the end that lets it go on. The
-    /// pause fires once. It is compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    pub fn pause_before_cleanup(
-        &mut self,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<()>,
-    ) {
-        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
-        let (release, go) = std::sync::mpsc::sync_channel(1);
-        *self
-            .cleanup_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
-        (watch, release)
-    }
-
-    /// Stops the next launch where it reaches `stage`, for this host's own tests.
-    ///
-    /// Returns the end that says the launch has arrived there and the end that lets it go on. The
-    /// pause fires once. It is compiled away in every shipped build.
-    #[cfg(all(feature = "testing", windows))]
-    pub fn pause_launch_at(
-        &self,
-        stage: LaunchStage,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<()>,
-    ) {
-        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
-        let (release, go) = std::sync::mpsc::sync_channel(1);
-        *self
-            .launch_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stage, arrived, go));
-        (watch, release)
-    }
-
-    /// Returns the last process a launch of this gateway started, for this host's own tests.
-    ///
-    /// It is compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    #[must_use]
-    pub const fn last_started(&self) -> Option<&ProcessStartIdentity> {
-        self.last_started.as_ref()
-    }
-
-    /// Names the session's job, which the agent this gateway launches is held by.
-    ///
-    /// A launch on Windows is held by the session's job and by a job of its own, joined before it
-    /// runs, so that closing the session ends it and everything it started. A gateway with none
-    /// launches nothing.
-    #[cfg(windows)]
-    #[must_use]
-    pub fn in_session(mut self, job: Arc<crate::windows::job::SessionJob>) -> Self {
-        self.session_job = Some(job);
-        self
     }
 
     /// Declares the native bridge the launched application was installed with.
@@ -1069,375 +537,6 @@ impl NativeGateway {
         }
         self.bridge = Some(installed);
         Ok(self)
-    }
-
-    /// Declares how the application's own package reads the mode it will run in.
-    ///
-    /// The probe is given only while the installation holds `launch.probe`, which a connector
-    /// assembled from the installation's current grants answers
-    /// ([`crate::broker::connectors::InstalledConnector::launch_probe`]). A launch that has one
-    /// runs it before anything starts, records the mode it read in the launch's profile, and is
-    /// refused by name where this worker is in a Windows service session and either the package
-    /// says the application cannot run with that mode there, or the probe did not finish in time
-    /// for a package that says so of any mode, since the mode is then unknown.
-    #[must_use]
-    pub fn with_launch_probe(mut self, probe: kr_plugin_sdk::launch_probe::LaunchProbe) -> Self {
-        self.launch_probe = Some(probe);
-        self
-    }
-
-    /// Starts the agent this launch names and publishes what its forwarder needs to reach here.
-    ///
-    /// This is the whole of the production order, and the order is the point.
-    ///
-    /// 1. Everything that can refuse without starting anything is asked first: whether this
-    ///    platform can publish the launch credential as a file, whether the runtime directory is
-    ///    the owner's alone, whether a credential can be drawn, and whether the intent still holds
-    ///    against the foreground it was prepared against, because section 12 refuses a launch an
-    ///    application took the foreground in front of.
-    /// 2. The executable is started, with the registration's path in its environment and nothing
-    ///    secret in its argument vector. The registration names the credential file beside it.
-    /// 3. The kernel is asked what it started, and that identity is what the registration names.
-    ///    Nothing the process says about itself is used.
-    /// 4. The private exchange is written to an owner-only file and handed to the broker as the
-    ///    launch's own record.
-    /// 5. The registration file is written last, and published whole by a rename, so a forwarder
-    ///    that reads it reads all of it or nothing, and the credential it names already exists.
-    ///
-    /// A launch that fails after step 2 leaves nothing running and nothing reserved: the process
-    /// it started is ended and waited for, the files it wrote are removed, and the broker gives
-    /// back the instance and the conversation the launch took, so a retry is not refused for a
-    /// launch that never happened. What it gives back is its own: a gateway launches one instance,
-    /// and a launch for an instance that is already live is refused before anything is executed.
-    ///
-    /// On Windows the launch is in flight on its session from the moment the session admits it,
-    /// before the application's own configuration is probed, until it has committed or undone
-    /// everything it made, and the session's closure waits for it. A session that is closing
-    /// admits none.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::InvalidArgument`] when the instance is already live,
-    /// [`BrokerError::UnsupportedCapability`] on a platform that cannot publish the launch
-    /// credential as a file, [`BrokerError::Launch`] when the intent is stale,
-    /// [`BrokerError::PreconditionFailed`] on Windows when there is no session job to hold the
-    /// launch, the session is closing, a vendor's own sandbox cannot run under the jobs the launch
-    /// would start in, the application's package refuses the mode it is configured for, or its
-    /// probe did not finish in time where the package refuses a mode in this session, and
-    /// [`BrokerError::LedgerUnavailable`] when the directory is not private, or the process cannot
-    /// be started or its files written.
-    pub fn launch(
-        &mut self,
-        intent: &crate::broker::profiles::LaunchIntent,
-        foreground: &crate::broker::profiles::ForegroundMark,
-        mode: kr_protocol::broker::IntegrationMode,
-        now: kr_protocol::scalars::TimestampMs,
-    ) -> Result<Launched> {
-        let application_instance_id = self.launch.application_instance_id;
-        let registration_path = self.runtime_directory.join(REGISTRATION_FILE);
-        let credential_path = self.runtime_directory.join(CREDENTIAL_FILE);
-        // One launch for one instance. A second one would replace the registration a running
-        // process was told about, and a second one that failed would give back the instance the
-        // first is still running as. Only a launch that never took the instance may take it now.
-        if self.registration.get().is_some()
-            || self.broker.binding_state(application_instance_id).is_ok()
-        {
-            return Err(BrokerError::invalid(format!(
-                "{application_instance_id} is already live on this gateway, and a second launch \
-                 would replace the process running as it"
-            )));
-        }
-        // Refused before anything is started. A launch that cannot be finished must cost nothing,
-        // and on a platform without verifiable owner-only files the credential could never be
-        // published, so no process is started only to be stopped again.
-        if !ManagedProcess::publishes_credential_file() {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: "this platform cannot prove a file is closed to other accounts, so the \
-                         launch credential cannot be published and nothing was started"
-                    .to_owned(),
-            });
-        }
-        // The full profile is held by the session's job, which ends everything in it when it
-        // closes. A launch with none to be held by is refused before anything starts.
-        #[cfg(windows)]
-        let session = self
-            .session_job
-            .clone()
-            .ok_or_else(|| BrokerError::PreconditionFailed {
-                detail: "this launch has no session job to be held by, so nothing was started"
-                    .to_owned(),
-            })?;
-        // In flight from here until this returns, whether the launch commits or undoes what it
-        // made: the session's closure waits for it, so it reads the session only once nothing
-        // this launch made is left running outside what it reads. A session that is closing
-        // admits none.
-        #[cfg(windows)]
-        let _in_flight = session
-            .admit_launch()
-            .ok_or_else(|| BrokerError::PreconditionFailed {
-                detail: format!(
-                    "this session is closing, so {} was not started",
-                    intent.profile.binary.resolved_path
-                ),
-            })?;
-        #[cfg(windows)]
-        self.pause_if_armed(LaunchStage::Admitted);
-        #[cfg(windows)]
-        refuse_what_a_vendor_sandbox_cannot_run_under(&session, intent.profile.ownership)?;
-        // What the application's own package reads of the mode it will run in, before anything
-        // starts: the profile records it, and a mode the package says cannot run in this session
-        // (or a mode its probe did not finish reading, which may be one) is a named failure now
-        // rather than a launch that hangs.
-        let probed = self.read_vendor_mode(intent)?;
-        let intent = &probed;
-        crate::broker::process::check_private_directory(&self.runtime_directory)?;
-        let credential = Credential::generate()?;
-        // The launch's hold on its instance. Every failure from here gives back what it took, by
-        // dropping it, and nothing else can take or give back the instance while it is held.
-        let broker = Arc::clone(&self.broker);
-        let reservation = broker.execute_launch(intent, foreground, application_instance_id)?;
-        let program = reservation.profile().binary.resolved_path.clone();
-        #[cfg(unix)]
-        let (child, started) = start_agent(
-            &program,
-            &reservation.profile().arguments,
-            &self.launch.working_directory,
-            &registration_path,
-        )?;
-        #[cfg(windows)]
-        let (child, started) = start_agent(
-            &program,
-            &reservation.profile().arguments,
-            &self.launch.working_directory,
-            &registration_path,
-            &session,
-            reservation.profile().ownership,
-            |stage| self.pause_if_armed(stage),
-        )?;
-        #[cfg(feature = "testing")]
-        {
-            self.last_started = Some(started.clone());
-        }
-        let process = ManagedProcess::new(
-            application_instance_id,
-            started.clone(),
-            crate::broker::process::TransportHandle {
-                transport: crate::broker::process::BrokerTransport::PrivateSocket,
-                application_instance_id,
-                executable_digest: reservation.profile().binary.digest,
-                process: started.clone(),
-            },
-            credential,
-            // Dedicated: this host started it for this instance, so section 7 stops it when the
-            // terminal intentionally exits.
-            true,
-            now,
-        );
-        // The credential file is created new, so one already there makes this fail and is left
-        // alone. Once this has written it, the file is this launch's own, and a later failure
-        // removes it again: the name is free for a retry, and no secret is left behind for a
-        // process that was stopped.
-        if let Err(error) = process.write_registration(&credential_path) {
-            return Err(self.fail_after_start(child, &started, reservation, None, error));
-        }
-        let registered = match reservation.register(mode, Some(process)) {
-            Ok(registered) => registered,
-            Err(refused) => {
-                let crate::broker::profiles::RegistrationRefused { error, reservation } = *refused;
-                return Err(self.fail_after_start(
-                    child,
-                    &started,
-                    reservation,
-                    Some(&credential_path),
-                    error,
-                ));
-            }
-        };
-        let profile_id = registered.profile().profile_id.clone();
-        match self.publish(&profile_id, &started, &credential_path, &registration_path) {
-            Ok(registration) => {
-                let profile = registered.commit();
-                self.launch.expected_process = Some(started.clone());
-                let _ = self.registration.set(registration);
-                Ok(Launched {
-                    child,
-                    process: started,
-                    profile,
-                })
-            }
-            Err(error) => Err(self.fail_after_start(
-                child,
-                &started,
-                registered,
-                Some(&credential_path),
-                error,
-            )),
-        }
-    }
-
-    /// The pause a test armed for `stage`, where it armed one.
-    #[cfg(windows)]
-    fn pause_if_armed(&self, stage: LaunchStage) {
-        #[cfg(feature = "testing")]
-        {
-            let armed = {
-                let mut armed = self
-                    .launch_pause
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if armed.as_ref().is_some_and(|(at, ..)| *at == stage) {
-                    armed.take()
-                } else {
-                    None
-                }
-            };
-            if let Some((_, arrived, go)) = armed {
-                let _ = arrived.send(());
-                let _ = go.recv();
-            }
-        }
-        #[cfg(not(feature = "testing"))]
-        let _ = stage;
-    }
-
-    /// Runs the application's launch probe, where the package declares one and the installation
-    /// holds the capability that runs it, and returns the intent with the mode it read recorded in
-    /// its profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::PreconditionFailed`] in a Windows service session when the mode read
-    /// is one the package refuses there, and when the probe did not finish in time for a package
-    /// that refuses any: the mode is then unknown, and it may be one of them.
-    fn read_vendor_mode(
-        &self,
-        intent: &crate::broker::profiles::LaunchIntent,
-    ) -> Result<crate::broker::profiles::LaunchIntent> {
-        #[cfg(windows)]
-        self.pause_if_armed(LaunchStage::Probing);
-        let mut intent = intent.clone();
-        let Some(probe) = self.launch_probe.as_ref() else {
-            return Ok(intent);
-        };
-        let probed = crate::broker::probe::run_within(
-            std::path::Path::new(&intent.profile.binary.resolved_path),
-            probe,
-            &intent.profile.arguments,
-            &self.launch.working_directory,
-            self.probe_deadline,
-            crate::broker::probe::MAX_OUTPUT_BYTES,
-        );
-        if let Some(mode) = probed.mode.as_deref()
-            && probe.refuses_in_service_session(mode)
-            && self.in_service_session
-        {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "the application's own configuration selects the mode {mode:?}, which its \
-                     package says it cannot run in a Windows service session, and this worker \
-                     runs in one, so nothing was started"
-                ),
-            });
-        }
-        // A probe that did not finish leaves the mode unknown, and where the package refuses some
-        // mode in a service session the unknown one may be that mode. This differs from a probe
-        // that finished and printed nothing a mode can be read from: that is an application that
-        // answered, and what the host cannot read it does not guess at, so such a launch goes
-        // ahead and records no mode. A probe that did not finish may only be slow, and a launch
-        // that goes ahead on that would let a refused mode through unseen.
-        if probed.late && !probe.refused_in_service_session.is_empty() && self.in_service_session {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "the mode the application runs in is unknown, and its package says some modes \
-                     cannot run in a Windows service session, and this worker runs in one, so \
-                     nothing was started: {}",
-                    probed
-                        .unread
-                        .as_deref()
-                        .unwrap_or("its probe did not finish")
-                ),
-            });
-        }
-        intent.profile.vendor_mode = kr_protocol::scalars::Nullable(probed.mode);
-        Ok(intent)
-    }
-
-    /// Undoes a launch that failed after its process started, in the order that keeps its hold.
-    ///
-    /// The process is stopped and waited for first, and the credential it was given is removed;
-    /// only then is the launch's hold on its instance dropped, which gives back the instance and
-    /// its conversation. Giving them back first would let another launch take the conversation
-    /// while the process that holds it is still running.
-    fn fail_after_start<Held>(
-        &mut self,
-        child: AgentChild,
-        started: &ProcessStartIdentity,
-        held: Held,
-        credential_path: Option<&std::path::Path>,
-        error: BrokerError,
-    ) -> BrokerError {
-        #[cfg(feature = "testing")]
-        if let Some((arrived, go)) = self
-            .cleanup_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            let _ = arrived.send(());
-            let _ = go.recv();
-        }
-        // The agent's job is read before it is let go of. An agent that did not stay is not one the
-        // session ran, but its record stays on the session for as long as its process might run.
-        #[cfg(windows)]
-        let agent = crate::windows::job::agent_job(started);
-        stop_started(child, started);
-        #[cfg(windows)]
-        if let (Some(session), Some(agent)) = (self.session_job.as_ref(), agent) {
-            session.release_reduced(&agent);
-        }
-        if let Some(credential_path) = credential_path {
-            // Best effort: a file that cannot be removed now is refused as a stale name by the
-            // next launch's create, which is the safe way round.
-            let _ = std::fs::remove_file(credential_path);
-        }
-        drop(held);
-        error
-    }
-
-    /// Publishes the registration that names a started process.
-    ///
-    /// Whole or not at all: a forwarder that looks while it is being written finds nothing rather
-    /// than an empty or partial record.
-    fn publish(
-        &self,
-        profile_id: &kr_protocol::ids::LaunchProfileId,
-        started: &ProcessStartIdentity,
-        credential_path: &std::path::Path,
-        registration_path: &std::path::Path,
-    ) -> Result<Registration> {
-        let registration = Registration::new(
-            self.endpoint.address().clone(),
-            profile_id.clone(),
-            self.launch.application_instance_id,
-            started.clone(),
-            credential_path.to_path_buf(),
-        );
-        // The framing travels with it, because the forwarder writes one frame before this host
-        // has told it anything else and it has to write that frame the way this connector reads.
-        let published = format!(
-            "{}framing={}\n",
-            registration.to_file(),
-            self.launch.framing.name()
-        );
-        kr_ipc::paths::write_owner_only_file(registration_path, published.as_bytes()).map_err(
-            |error| {
-                BrokerError::ledger(format!(
-                    "could not write the registration file {}: {error}",
-                    registration_path.display()
-                ))
-            },
-        )?;
-        Ok(registration)
     }
 
     /// Returns the address a launched process is told to connect to.
@@ -1811,29 +910,10 @@ impl NativeGateway {
             return Err(error);
         }
         let observations = self.observatory.subscribe(connection);
-        // The terminal is watched from here, and the watch is not this connection's to end.
-        // Section 7 acts on the terminal exiting, which is neither caused by nor bounded by the
-        // socket closing, so the supervision starts now and runs until the process ends.
-        let terminal = self.launch.native_terminal.clone().map(|terminal| {
-            let stopping = Arc::new(tokio::sync::Notify::new());
-            let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            TerminalWatch {
-                stopping: Arc::clone(&stopping),
-                stopped: Arc::clone(&stopped),
-                watching: tokio::spawn(supervise_terminal(
-                    Arc::clone(&self.broker),
-                    self.launch.application_instance_id,
-                    terminal,
-                    stopping,
-                    stopped,
-                )),
-            }
-        });
         let served = {
             let owner = Arc::clone(&owner);
             let broker = Arc::clone(&self.broker);
             let observatory = self.observatory.clone();
-            let watched = self.launch.native_terminal.clone();
             let application_instance_id = self.launch.application_instance_id;
             let teardown = self.teardown;
             tokio::spawn(async move {
@@ -1866,13 +946,8 @@ impl NativeGateway {
                 broker.unbind_dispatch(application_instance_id, &carrying);
                 broker.close_connection(connection);
                 observatory.withdraw(connection);
-                // What the closure was, read once, from the process rather than from the socket.
-                // Nothing is stopped here: the terminal's own supervision owns that, and it is
-                // still running whichever of these this closure turns out to be.
                 let closure = if asked_to_stop {
                     Closure::Shutdown
-                } else if terminal_has_ended(watched.as_ref()) {
-                    Closure::NativeExit
                 } else {
                     Closure::Detached
                 };
@@ -1883,7 +958,6 @@ impl NativeGateway {
             connection,
             owner,
             observations: Some(observations),
-            terminal,
             served,
             broker: Arc::clone(&self.broker),
         })

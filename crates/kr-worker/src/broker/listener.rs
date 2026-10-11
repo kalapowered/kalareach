@@ -523,7 +523,6 @@ mod tests {
                 process: identity,
             },
             Credential::from_bytes([9; CREDENTIAL_BYTES]),
-            true,
             TimestampMs::new(1),
         )
     }
