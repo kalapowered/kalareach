@@ -1757,8 +1757,10 @@ present only when they apply: `service` is the account service the host keeps it
 `unavailable` (`no_managed_service`, `broker_is_another_service` or `not_usable`) says why it does not sign
 in or present an account. A host that selects no storage service and whose broker is not the account
 service refuses `sign-in` with `HOST_NOT_CONFIGURED`, shows a grant it still keeps, and signs it
-out; a host that cannot reach the account service at all refuses both. One with a voice call open
-refuses both with `RESOURCE_UNAVAILABLE`.
+out; so does a host that started over a configuration document it cannot use, and the revocation
+then waits for the next start over one it can use. A host that cannot reach the account service at
+all for another reason refuses both. One with a voice call open refuses both with
+`RESOURCE_UNAVAILABLE`.
 
 ## `kr host paths`
 

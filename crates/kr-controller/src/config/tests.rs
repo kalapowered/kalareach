@@ -1273,7 +1273,7 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
     assert!(
         check
             .detail()
-            .contains("nothing it sends goes through a proxy until it starts again"),
+            .contains("started over a configuration document it could not use"),
         "{check:?}"
     );
     let check = network_check(&closed, &read(&document), Running::default());

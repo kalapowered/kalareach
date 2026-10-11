@@ -498,6 +498,7 @@ async fn keep_sign_in(
             origin: origin.to_owned(),
             scopes: Vec::new(),
             account: Arc::new(NeverAsked),
+            closed: None,
         }),
         None,
     );
