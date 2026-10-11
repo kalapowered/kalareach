@@ -82,11 +82,11 @@ impl Backend {
             .and_then(|(_, runtime)| runtime.upgrade())
     }
 
-    /// Ends the connection, the server and what the session recorded below it, and lets go of the
-    /// tables pinned for the instance. It is idempotent: a second call finds nothing to end.
+    /// Ends the connection, the server and what the session recorded below it. It is idempotent: a
+    /// second call finds nothing to end.
     ///
     /// The ending runs in a task of its own, kept in the backend's list of endings, which retiring
-    /// the backend does not abort.
+    /// the backend does not abort and [`Backend::endings`] waits for.
     pub(super) fn end_gateway(&self) {
         let Some(run) = self.gateway_run.as_ref() else {
             return;
@@ -123,7 +123,27 @@ impl Backend {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(ending);
         }
-        run.broker.unpin_tables(self.application_instance_id);
+    }
+
+    /// Waits for the endings in progress, and returns the processes still running when they were
+    /// over.
+    pub(super) async fn endings(&self) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
+        let Some(run) = self.gateway_run.as_ref() else {
+            return Vec::new();
+        };
+        let endings: Vec<_> = run
+            .ladders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        let mut survivors = Vec::new();
+        for ending in endings {
+            if let Ok(retirement) = ending.await {
+                survivors.extend(retirement.survivors);
+            }
+        }
+        survivors
     }
 }
 
