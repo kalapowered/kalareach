@@ -1326,6 +1326,12 @@ impl SessionRuntime {
         }
     }
 
+    /// Notes that something happened that may have started a process the session owns, so the
+    /// supervision looks at the boundary shortly after this rather than on a clock.
+    pub fn note_activity(&self) {
+        self.activity.note();
+    }
+
     /// Admits a close and returns the acceptance, before anything is signalled.
     ///
     /// The returned gate starts the termination sequence. The caller releases it **after** the
