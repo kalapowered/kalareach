@@ -362,15 +362,7 @@ impl GrantedRecipients {
         // The configured ceiling narrows the grant before the policy is applied to it, as it does
         // for a device's request.
         let narrowed = match &ceiling {
-            Some(ceiling) => Grant {
-                actions: grant
-                    .actions
-                    .iter()
-                    .copied()
-                    .filter(|right| ceiling.contains(right))
-                    .collect(),
-                ..grant.clone()
-            },
+            Some(ceiling) => crate::config::ceilings::narrowed_by(grant, ceiling),
             None => grant.clone(),
         };
         // Content leaving this host for a recipient elsewhere is remote use of the grant, so it is

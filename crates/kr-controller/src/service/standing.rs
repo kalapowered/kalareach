@@ -551,16 +551,7 @@ impl Controller {
         // right this host's configuration removed is not one the workflow may use, whatever the
         // grant was issued with.
         let narrowed = ceiling.map(|ceiling| crate::grants::GrantRecord {
-            grant: kr_protocol::grant::Grant {
-                actions: record
-                    .grant
-                    .actions
-                    .iter()
-                    .copied()
-                    .filter(|right| ceiling.contains(right))
-                    .collect(),
-                ..record.grant.clone()
-            },
+            grant: crate::config::ceilings::narrowed_by(&record.grant, &ceiling),
             ..record.clone()
         });
         let record = narrowed.as_ref().unwrap_or(record);

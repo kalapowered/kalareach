@@ -573,6 +573,11 @@ impl Controller {
             .action_digest()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let environment_id = self.paths.environment_id();
+        // Read and released before anything else is held. A configuration acceptance takes the
+        // ceiling and then the grants store; a read inside the store's transaction would take them
+        // the other way round. A ceiling that moves after this read is a stale one for this
+        // change only: the doors read the ceiling in force.
+        let ceiling = self.rights_ceiling_in_force();
         if !plan.exclusive {
             let registry = self.registry.lock().await;
             self.check_admission(&registry, &carried)?;
@@ -600,12 +605,14 @@ impl Controller {
                     self.owner
                         .covers(&confirmed, digest, "change of exclusive management")?;
                     // The terminal confirms this only while no device can confirm it, read from
-                    // the transaction's own file: one that appeared since is the one to ask.
+                    // the transaction's own file: one that appeared since is the one to ask. The
+                    // ceiling was read before the transaction: it is taken before the store
+                    // everywhere else, and a configuration acceptance holds it while it writes.
                     if confirmed.channel() == ConfirmationChannel::LocalBootstrapTerminal
                         && crate::grants::an_owner_device_can_recover(
                             connection,
                             environment_id,
-                            self.rights_ceiling_in_force().as_ref(),
+                            ceiling.as_ref(),
                         )?
                     {
                         return Err(ControllerError::Refused {
@@ -652,7 +659,7 @@ impl Controller {
                     require_a_device_that_can_recover(crate::grants::an_owner_device_can_recover(
                         connection,
                         environment_id,
-                        self.rights_ceiling_in_force().as_ref(),
+                        ceiling.as_ref(),
                     )?)
                 },
             );
