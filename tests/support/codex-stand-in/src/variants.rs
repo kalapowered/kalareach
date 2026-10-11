@@ -28,7 +28,7 @@ pub struct Variants {
     pub ignore_term: bool,
     /// The server starts its command in the server's own session and process group.
     pub command_shares_group: bool,
-    /// The server exits as soon as it has started its command, leaving the command running.
+    /// The server exits when the approval it asked for is answered, leaving its command running.
     pub die_first: bool,
     /// The server writes a great deal to its standard error stream and goes on.
     pub flood_stderr: bool,
