@@ -377,7 +377,8 @@ impl Unusable {
     }
 }
 
-/// How this daemon's outbound connections leave the host, as it read the document when it started.
+/// How this daemon's connections to services leave the host (HTTPS, and mail submission), as it read
+/// the document when it started.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outbound {
     /// Directly: the document named no proxy.

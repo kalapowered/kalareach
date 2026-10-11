@@ -103,6 +103,10 @@ to the second are final for that credential. A bare status, a missing route, a s
 `data` or with an error beside it, and any answer that is not the gateway's say nothing either way,
 and the device is told it may try again.
 
+A device whose registration answer was lost repeats it with the same action, on any later
+connection, and is told what it was told: the host answers from its record and does not ask the
+gateway again.
+
 Both questions come out of the gateway's allowances for this host, so the host rations them. One
 device may have a credential confirmed three times in a burst and then six times an hour. The status
 question comes out of the sweep's share of the status allowance. The nonce comes out of the sixty
@@ -514,11 +518,12 @@ anything between agreeing to TLS and starting it. The server's certificate is ve
 operating system's own verifier, the one the managed HTTPS transport uses, and nothing turns that
 off. The host signs in with AUTH PLAIN, or AUTH LOGIN where the server offers only that.
 
-A submission leaves the host by the route every other connection takes. With a proxy in the host's
-configuration it asks the proxy for a `CONNECT` tunnel to the server and port, and the conversation
-above, TLS included, runs inside the tunnel. A proxy that cannot be reached or does not open the
-tunnel leaves the message unsent, and so does a daemon that started over a configuration document it
-could not use: the destination is told so and nothing is connected to.
+The request for submission departs the host using the same route as for the other service
+connections. Here, this involves asking the proxy configured in the host’s configuration to open a
+`CONNECT` tunnel to the server and port and, if successful, carrying on the conversation above
+(including the TLS negotiation) over that tunnel. If the proxy is not available or does not open the
+tunnel, or if the daemon is started with a configuration document it cannot use, the message is not
+sent. The result of the attempt is reported; here, that it was not possible to connect at all.
 
 The addresses and the subject are checked before they are written, and none may carry a line break,
 so nothing a destination or an event supplies can add a header or a mail command. The body is

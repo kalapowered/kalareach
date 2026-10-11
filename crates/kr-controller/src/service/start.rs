@@ -1158,7 +1158,7 @@ impl Controller {
         });
     }
 
-    /// How this host's outbound connections leave it: through the configuration document's
+    /// How this host's connections to services leave it: through the configuration document's
     /// `network.proxy_url` as this daemon read it when it started, directly when it named none,
     /// and not at all when the document could not be used, because the proxy it may have named is
     /// not known and nothing goes around it.

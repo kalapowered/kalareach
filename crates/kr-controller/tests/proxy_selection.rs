@@ -1,5 +1,5 @@
-//! The host's outbound connections go through the proxy its configuration document selects, and no
-//! other.
+//! The host's connections to services go through the proxy its configuration document selects, and
+//! no other.
 //!
 //! The daemon reads the selection once, when it starts, and every client takes that one reading:
 //! the rendezvous it reserves locators at and opens its room at, and delivery, which carries

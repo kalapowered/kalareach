@@ -2372,16 +2372,17 @@ pub mod configuration {
         /// The public Mainline DHT for discovery. It publishes to a public network and carries no
         /// KalaReach service guarantee, which is why it is never on unless chosen.
         pub mainline_dht: Nullable<bool>,
-        /// The HTTP proxy this host's outbound connections go through, as an absolute `http` or
+        /// The HTTP proxy this host's connections to services go through, as an absolute `http` or
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
         /// and Pkarr servers, the rendezvous, delivery and webhooks, mail submission (a `CONNECT`
         /// tunnel to the mail server), the managed voice broker and account service, uploads of
         /// backups to the managed storage service, the model's files, and plugin repositories.
-        /// Nothing goes around it, so an address it cannot reach fails, and a daemon that started
-        /// over a document it could not use sends nothing through these routes until it starts
-        /// again over one it can. Name lookups do not use it. It is this machine's own choice: no
-        /// invitation or host bundle carries it. It names no user and no password, because a
-        /// proxy that needs credentials is not supported.
+        /// Nothing on that list goes around it, so an address it cannot reach fails, and a daemon
+        /// that started over a document it could not use sends nothing through these routes until
+        /// it starts again over one it can. The host's own name lookups, the endpoint's direct
+        /// paths and the Git operations an owner asks for do not use it. It is this machine's own
+        /// choice: no invitation or host bundle carries it. It names no user and no password,
+        /// because a proxy that needs credentials is not supported.
         pub proxy_url: Nullable<String>,
     }
 
@@ -2446,7 +2447,7 @@ pub mod configuration {
             self.mainline_dht.0.unwrap_or(false)
         }
 
-        /// The HTTP proxy this host's outbound connections go through, when one is selected.
+        /// The HTTP proxy this host's connections to services go through, when one is selected.
         #[must_use]
         pub fn proxy_url(&self) -> Option<&str> {
             self.proxy_url.as_ref().map(String::as_str)
@@ -4133,10 +4134,10 @@ pub mod configuration {
         about: "whether this host uses the public Mainline DHT for discovery",
     };
 
-    /// The HTTP proxy this host's outbound connections go through.
+    /// The HTTP proxy this host's connections to services go through.
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
-        about: "the HTTP proxy this host's outbound connections go through: the network \
+        about: "the HTTP proxy this host's connections to services go through: the network \
                 endpoint's relays and Pkarr servers, the rendezvous, delivery and mail, the \
                 managed voice broker and account service, backups, the model's files and plugin \
                 repositories",

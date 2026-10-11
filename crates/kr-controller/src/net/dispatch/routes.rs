@@ -1278,9 +1278,10 @@ impl RemoteConnection {
             // A device handing the host the credential its installation was issued: the daemon's
             // own effect, on the destination of the device this connection authenticated as. Its
             // answer is retained like a key registration's, because the gateway is asked before
-            // anything is kept and the answer can be lost on the way back: a repeat of it is
-            // answered before the call is admitted, on a later connection and after its window
-            // has closed, so what reaches this arm is a first request.
+            // anything is kept and the answer can be lost on the way back: a repeat of a finished
+            // registration is answered before the call is admitted, on a later connection and
+            // after its window has closed. What reaches this arm is a first request or a copy of
+            // one still running, which the claim in `push_register_action` answers.
             Method::DevicePushRegister => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());
