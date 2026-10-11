@@ -64,9 +64,6 @@ ureq.workspace = true
 kr-loopback.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# A file the person chose for the recovery kit may carry an access list that its mode bits do not
-# show, and the kit is not written into it until the list is cleared.
-exacl.workspace = true
 # The platform user-verification ceremony section 10 asks for on an unlocked owner device.
 block2.workspace = true
 objc2.workspace = true
@@ -86,6 +83,10 @@ custom-protocol = ["tauri/custom-protocol"]
 # Seams the application's own tests act through, compiled in for them and in no shipped build: the
 # clock that counts a share's bound can be moved on, to pass a bound no test can wait out.
 testing = ["kr-client/testing"]
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Gives a file an access list and reads it back, which the recovery kit's save has to clear.
+exacl.workspace = true
 
 [dev-dependencies]
 # This crate's own tests, with the seams above compiled in.
@@ -125,9 +126,10 @@ tauri = { workspace = true, features = ["test"] }
 tao.workspace = true
 
 # The workspace forbids unsafe code, which the macOS user-verification ceremony cannot honour: it
-# is a call into Apple's LocalAuthentication runtime and there is no safe wrapper for it. This
-# crate denies it instead and allows it in exactly one function, in `verify`. Nothing else here may
-# relax the rule.
+# is a call into Apple's LocalAuthentication runtime and there is no safe wrapper for it, and
+# clearing a file's access list on macOS is a call through a descriptor with none either. This
+# crate denies it instead and allows it in exactly two places, one function in `verify` and the
+# module `access_list`. Nothing else here may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
