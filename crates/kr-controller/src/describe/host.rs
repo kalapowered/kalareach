@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use kr_describe::context::{ContextBinding, ContextSignal, ProjectText, SemanticEvent};
@@ -309,6 +309,11 @@ struct Shared {
     /// How many purges were posted and not yet done.
     purges_owed: AtomicU64,
     running: AtomicBool,
+    /// Held while `running` is cleared and while the reader of conditions tests it, so the reader
+    /// cannot test the flag, miss the clearing and sleep a whole period.
+    stopping: Mutex<()>,
+    /// Woken when `running` is cleared.
+    stopped: Condvar,
     /// The newest reading of the host's own conditions, and when it was taken.
     reading: Mutex<Option<Taken>>,
     files: Files,
@@ -316,6 +321,15 @@ struct Shared {
     /// publishes the snapshot that judges it.
     #[cfg(any(test, feature = "testing"))]
     before_snapshot: crate::attention::Pause,
+}
+
+impl Shared {
+    /// Clears `running` and wakes the reader of conditions out of its wait.
+    fn stop_running(&self) {
+        let _held = self.stopping.lock().unwrap_or_else(PoisonError::into_inner);
+        self.running.store(false, Ordering::Release);
+        self.stopped.notify_all();
+    }
 }
 
 /// Where the model's files are kept and what the fetch of them needs of the host.
@@ -428,6 +442,8 @@ impl DescribeHost {
             snapshot: RwLock::new(Snapshot::default()),
             purges_owed: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            stopping: Mutex::new(()),
+            stopped: Condvar::new(),
             reading: Mutex::new(None),
             files: Files {
                 models,
@@ -486,7 +502,7 @@ impl DescribeHost {
                 .map_err(|error| {
                     // The reader of conditions started first and must not outlive a host that did
                     // not start.
-                    shared.running.store(false, Ordering::Release);
+                    shared.stop_running();
                     ControllerError::registry(format!(
                         "the description host's thread could not start: {error}"
                     ))
@@ -765,7 +781,7 @@ impl DescribeHost {
 
     /// Stops the host's thread and ends the description process.
     pub(crate) fn stop(&self) {
-        self.shared.running.store(false, Ordering::Release);
+        self.shared.stop_running();
         let _ = self
             .shared
             .inbox
@@ -797,7 +813,7 @@ struct Exit(Arc<Shared>);
 
 impl Drop for Exit {
     fn drop(&mut self) {
-        self.0.running.store(false, Ordering::Release);
+        self.0.stop_running();
         self.0.purges_owed.store(0, Ordering::Release);
         self.0
             .slots
@@ -1563,10 +1579,18 @@ fn read_conditions_until_stopped(
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Taken { at_ms, conditions });
         shared.waker.wake();
-        let until = std::time::Instant::now() + every;
-        while shared.running.load(Ordering::Acquire) && std::time::Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(250).min(every));
-        }
+        // One wait for the whole period, ended early only by the host stopping: the flag is tested
+        // and cleared under the same lock, so a stop is never missed between the test and the wait.
+        let held = shared
+            .stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(
+            shared
+                .stopped
+                .wait_timeout_while(held, every, |()| shared.running.load(Ordering::Acquire))
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 }
 
@@ -1643,6 +1667,8 @@ pub(crate) mod tests {
             snapshot: RwLock::new(Snapshot::default()),
             purges_owed: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            stopping: Mutex::new(()),
+            stopped: Condvar::new(),
             reading: Mutex::new(None),
             files: Files {
                 profile,
@@ -2421,7 +2447,7 @@ pub(crate) mod tests {
         struct Stop<'a>(&'a Shared, std::sync::mpsc::Sender<()>);
         impl Drop for Stop<'_> {
             fn drop(&mut self) {
-                self.0.running.store(false, Ordering::Release);
+                self.0.stop_running();
                 let _ = self.1.send(());
             }
         }
@@ -2481,7 +2507,7 @@ pub(crate) mod tests {
             &host.clock,
             &|| {
                 host.clock.skew_ms.fetch_add(61_000, Ordering::AcqRel);
-                host.shared.running.store(false, Ordering::Release);
+                host.shared.stop_running();
                 roomy
             },
             Duration::from_millis(1),
