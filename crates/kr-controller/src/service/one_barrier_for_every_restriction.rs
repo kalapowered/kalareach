@@ -638,6 +638,61 @@ async fn a_worker_that_missed_a_revision_is_told_each_in_order_by_name() {
     drop(controller);
 }
 
+/// KR-REQ-10.45: a worker that missed more revisions than the daemon keeps reports for is told one
+/// revision of the whole host's, and not the notices a result could not read: it takes the lease of
+/// every caller under a grant, which is safe, and its fence files its names under the revision the
+/// result is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_that_missed_more_revisions_than_a_result_reads_is_told_the_host() {
+    use kr_protocol::worker::RevisionReach;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+    let bound = u32::try_from(kr_protocol::worker::MAX_REVISION_REACH_NAMES).expect("fits");
+    let input_grants = |first: u32, count: u32| {
+        let grants: std::collections::BTreeSet<_> = (first..first + count)
+            .map(|number| {
+                let mut bytes = [0_u8; 16];
+                bytes[..4].copy_from_slice(&number.to_be_bytes());
+                kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+            })
+            .collect();
+        Reach::Grants {
+            with_input: grants.clone(),
+            grants,
+        }
+    };
+    let groups = crate::authority::MAX_HELD_FENCE_REPORTS;
+    let mut newest = None;
+    for number in 0..=groups {
+        let first = u32::try_from(number).expect("fits") * 10_000;
+        newest = Some(barrier_for(&controller, input_grants(first, bound / 2 + 1)).await);
+    }
+    let newest = newest.expect("revisions were advanced");
+    let behind = kr_protocol::ids::AuthorityRevision::new(newest.get() - (groups as u64 + 1));
+
+    // Each revision is a group of its own, and one more than a result reads is told as the host's.
+    let notices = controller.revision_notices(newest, behind, 0, &stating());
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].revision, newest);
+    assert_eq!(notices[0].reach, RevisionReach::Host);
+
+    // One fewer is told by name, each in a notice of its own.
+    let notices = controller.revision_notices(
+        newest,
+        kr_protocol::ids::AuthorityRevision::new(behind.get() + 1),
+        0,
+        &stating(),
+    );
+    assert_eq!(notices.len(), groups);
+    assert!(
+        notices
+            .iter()
+            .all(|notice| matches!(notice.reach, RevisionReach::Within { .. }))
+    );
+    drop(controller);
+}
+
 /// A grant of the kind a device holds below another, for the store, that carries `actions`.
 fn a_typists_grant(
     id: kr_protocol::ids::GrantId,

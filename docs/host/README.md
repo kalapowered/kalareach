@@ -2268,10 +2268,20 @@ between the two leaves the conservative answer rather than none.
 
 The daemon keeps its reports the same way, one per revocation rather than one per worker. An older
 revocation's result names what that revocation's fence named, and a newer one's lists are a
-different question's answer. The result of the revision an announcement was for also names what the
-worker's fences for the other revisions of that announcement named, and for any revision announced
-to it earlier that no later acknowledgement has taken in. It also asks again for the pages an older revocation still owes: the
-revision in force comes first, and the unfinished ones after it, out of one page budget per
+different question's answer. The exception is one announcement. A worker's fence files its names
+under the revision it ran for and starts from where the fence before it ended, so a worker told
+several revisions in one announcement, or one that refused an announcement and fenced it by itself
+afterwards, names nothing under the revision of the announcement that follows. The daemon records
+every revision it announces to a worker before it sends it. When the worker acknowledges the last
+notice of an announcement, that acknowledgement takes the revisions announced before it into its
+result, in the step that records it, and the result reads their reports with its own, in revision
+order. A revision the worker has not said anything about is asked for, and the result says so until
+it answers. A revision the daemon cannot read, because its report went for room or the worker
+answered none of too many announcements, is counted in the result as names that are no longer held
+or revisions that are not read. A worker that missed more revisions than the daemon keeps reports
+for is told one revision of the whole host's. The daemon also asks again for the pages an older
+revocation still owes: the revision in force comes first, then the revisions the result carries
+that were not answered, and the unfinished older ones after them, out of one page budget per
 announcement.
 
 A rejection and its name are one transaction. A rejection committed without its name would be an

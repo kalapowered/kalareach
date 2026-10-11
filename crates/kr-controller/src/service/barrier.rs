@@ -454,9 +454,12 @@ impl Controller {
                     // worker that said nothing about its fence would make `revision_pending` and
                     // the barrier disagree, and the barrier is the one section 9 defines.
                     let evidenced = ack.fence.is_some();
-                    let accepted =
-                        self.leases
-                            .acknowledge(session_id, binding, ack.revision, ack.fence);
+                    let accepted = self.leases.acknowledge_announced(
+                        session_id,
+                        binding,
+                        ack.revision,
+                        ack.fence,
+                    );
                     if accepted && evidenced {
                         {
                             let mut registry = self.registry.lock().await;
@@ -491,13 +494,6 @@ impl Controller {
                 continue;
             }
             self.reconcile(*session_id).await?;
-        }
-        // What a worker's fences for the revisions announced to it before this one named is part of
-        // this revision's result, and a worker that has not been asked about one is asked here,
-        // with the first page of every worker's evidence, before any of the pages that follow.
-        for (session_id, binding) in &acknowledged {
-            self.claim_earlier_fences(*session_id, *binding, revision)
-                .await;
         }
         for (session_id, binding) in acknowledged {
             self.collect_owed_evidence(session_id, binding, revision)
@@ -579,6 +575,18 @@ impl Controller {
         let mut budget = self.evidence_budget();
         self.collect_fence_evidence(session_id, binding, revision, &mut budget, false)
             .await;
+        // The revisions announced to the worker with this one or before it, that its result reads
+        // and the worker has said nothing about, because the announcement was refused or lost. Its
+        // fence may have run for them since, and what it named is part of this revision's result:
+        // each is asked for its first page, and the pages that follow come with the older
+        // revocations' below.
+        for earlier in self.leases.unasked_before(session_id, revision) {
+            if budget.pages == 0 {
+                return;
+            }
+            self.collect_fence_evidence(session_id, binding, earlier, &mut budget, true)
+                .await;
+        }
         for older in self.leases.evidence_outstanding(session_id, revision) {
             if budget.pages == 0 {
                 return;
@@ -588,7 +596,7 @@ impl Controller {
         }
     }
 
-    /// What one announcement may spend collecting a worker's fence evidence in one step.
+    /// What one announcement may spend collecting a worker's fence evidence.
     fn evidence_budget(&self) -> EvidenceBudget {
         #[cfg(feature = "testing")]
         let pages = MAX_EVIDENCE_PAGES.min(
@@ -603,33 +611,6 @@ impl Controller {
         }
     }
 
-    /// Makes what a worker's fences named for the revisions announced to it before `revision` part
-    /// of the result of `revision`, once the worker has acknowledged it.
-    ///
-    /// A worker's fence files its names under the revision it ran for and starts from where the
-    /// fence before it ended, so a worker told several revisions in one announcement, or one that
-    /// refused an announcement and fenced it afterwards by itself, names nothing under the revision
-    /// of the announcement that follows. A revision the worker answered is carried as it is. One it
-    /// has said nothing about is asked for its first page, which the worker answers from its journal
-    /// whether or not its fence ran for it; the pages that follow come with the rest of the
-    /// evidence the worker owes ([`Self::collect_owed_evidence`]). A revision that could not be
-    /// asked about stays announced, and the result says so.
-    pub(super) async fn claim_earlier_fences(
-        &self,
-        session_id: SessionId,
-        binding: WorkerBinding,
-        revision: AuthorityRevision,
-    ) {
-        let mut budget = self.evidence_budget();
-        for (earlier, answered) in self.leases.unclaimed_before(session_id, revision) {
-            if !answered {
-                self.collect_fence_evidence(session_id, binding, earlier, &mut budget, true)
-                    .await;
-            }
-        }
-        self.leases.claim(session_id, binding, revision);
-    }
-
     /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
     /// first, and answers the acknowledgement of the last, which is the one the barrier waits on.
     /// It answers nothing when an exchange failed or ran out, `bound` after it began when one is
@@ -638,9 +619,8 @@ impl Controller {
     /// Each is a revision of its own, acknowledged as one ([`Self::note_earlier_acknowledgement`]).
     /// All are recorded as announced before any is sent, because the worker's fence may run for any
     /// of them whatever becomes of the answer, and what it names is owed to the result of the
-    /// revision the announcement was for ([`AuthorityBarrier::claim`]).
-    ///
-    /// [`AuthorityBarrier::claim`]: crate::authority::AuthorityBarrier::claim
+    /// revision the worker next acknowledges as the last of an announcement
+    /// ([`crate::authority::AuthorityBarrier::acknowledge_announced`]).
     pub(crate) async fn tell_revisions(
         &self,
         session_id: SessionId,
@@ -1051,6 +1031,11 @@ impl Controller {
             previous = *at;
         }
         groups.push((revision, within(since, group)));
+        // More notices than reports kept would have the reports of the first let go before the
+        // result of the last reads them, and a worker that far behind is fenced as the whole host's.
+        if groups.len() > crate::authority::MAX_HELD_FENCE_REPORTS {
+            return host();
+        }
         groups
     }
 

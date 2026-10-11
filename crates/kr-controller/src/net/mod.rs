@@ -1727,7 +1727,7 @@ impl Controller {
                 let evidenced = ack.fence.is_some();
                 let accepted =
                     self.leases
-                        .acknowledge(session_id, binding, ack.revision, ack.fence);
+                        .acknowledge_announced(session_id, binding, ack.revision, ack.fence);
                 if accepted && evidenced {
                     self.registry
                         .lock()
@@ -1737,8 +1737,6 @@ impl Controller {
                     // one. The rest of what this worker owes, for this revocation and for any
                     // older one whose pages never finished arriving, is collected here as it is
                     // after the announcement every worker gets.
-                    self.claim_earlier_fences(session_id, binding, revision)
-                        .await;
                     self.collect_owed_evidence(session_id, binding, revision)
                         .await;
                 }

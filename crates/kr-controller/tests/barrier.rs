@@ -3910,8 +3910,8 @@ async fn the_announcement_a_request_makes_asks_for_what_a_refused_revision_was_f
 /// The first revocation is refused whole and fenced by the worker's own maintenance. The second is
 /// acknowledged, and the worker's boundary is held from there, so every ask the daemon makes for the
 /// first revision's names is refused. The result holds, because the worker acknowledged, and says
-/// the worker has not yet been asked; it names no action as though the first revision had named
-/// none.
+/// the worker has not said what its fence named for the revision; it names no action as though the
+/// first revision had named none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_result_that_could_not_ask_about_a_refused_revision_says_so_and_the_next_one_names_it() {
     let hosted = hosted_worker_apart().await;
@@ -3959,7 +3959,7 @@ async fn a_result_that_could_not_ask_about_a_refused_revision_says_so_and_the_ne
     let reported = worker_report(&barrier, hosted.session_id);
     assert!(reported.rejected_actions.is_empty(), "{reported:?}");
     assert!(
-        reported.detail.contains("not yet been asked"),
+        reported.detail.contains("has not said"),
         "the result says what it could not ask: {:?}",
         reported.detail
     );
