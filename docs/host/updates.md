@@ -356,7 +356,7 @@ The configuration document is looked for where a daemon that made way said it re
 Rolling back is only safe if the stores on disk are in a format that the target release can read (see "Stored formats"). After stopping all control daemons and locking all environments, but before anything is brought forward, `kr host rollback` opens each store the target release’s manifest specifies, at the path that manifest gives. If a store is at a version that is not in the range of versions the target release reads for it, `kr host rollback` does not switch to the target release or bring any store forward, starts again each daemon it stopped, and exits with exit code 1, naming the stores that cannot be read, the environments they are in, the versions they are at and the range of versions that the target release reads for them:
 
 ```text
-kr: the switch to 0.1.0+aaaaaaaaaaaa was not made, and no store was brought forward, because it cannot read the stores as they are: registry of environment 7c9e… at …/registry.sqlite records schema version 7, and 0.1.0+aaaaaaaaaaaa reads versions 1 to 6
+kr: the switch to 0.1.0+aaaaaaaaaaaa was not made, and no store was brought forward, because the stores cannot be checked, or are not ones it reads, as they are: registry of environment 7c9e… at …/registry.sqlite records schema version 7, and 0.1.0+aaaaaaaaaaaa reads versions 1 to 6
 ```
 
 `kr host update` performs this same check before it switches to a new release. In performing this check, `kr host update` and `kr host rollback` follow these rules:
