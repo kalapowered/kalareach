@@ -183,12 +183,26 @@ impl Controller {
             return Ok(Ok(installed));
         }
         let narrowed = matches!(installed.change, LeaseChange::Installed { narrowed: true });
-        let restriction = if dropped_a_lease {
+        // The host's own local owner is no device: a lease for it that ends earlier shortens what
+        // every session worker may serve its local callers, which only the host-wide barrier
+        // carries to them (it announces the bound before the revision). A narrower set of rights
+        // means nothing to the local owner and owes nothing here.
+        let host_owner_tightened = device_id == self.local_owner_device()
+            && matches!(installed.change, LeaseChange::Installed { .. })
+            && {
+                // What the policy gave the local owner before this lease, against this lease's two
+                // ends: the new lease is not in its cell until the policy is put in force.
+                let before =
+                    held.local_owner_bound(device_id, self.clock.now(), self.settled_utc_now());
+                matches!(before, crate::grants::policy::LocalOwnerBound::Until { continuous, utc_ms }
+                    if installed.continuous_deadline < continuous || installed.expires_at_ms < utc_ms)
+            };
+        let restriction = if dropped_a_lease || host_owner_tightened {
             Some((
                 super::barrier::Reach::Host,
                 "a policy-signing chain that dropped membership leases".to_owned(),
             ))
-        } else if narrowed {
+        } else if narrowed && device_id != self.local_owner_device() {
             Some((
                 super::barrier::Reach::Device(device_id),
                 format!("a membership lease that narrows device {device_id}'s access"),

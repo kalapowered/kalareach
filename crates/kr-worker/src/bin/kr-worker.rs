@@ -372,6 +372,13 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             // the forwarder too, so a session's flags are the same text on both sides.
             registered_forwarder: kr_ipc::install::registered_forwarder(),
         });
+    // A worker whose daemon tells it what the host's local owner may do serves no local caller what
+    // the host holds to that lease until the daemon has said, from the first moment its endpoint is
+    // bound: a host that is exclusively organisation-managed must not find a window in which its
+    // worker serves on an assumption.
+    if specification.holds_local_access {
+        service.hold_local_access_until_told();
+    }
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));
 
     // Section 7 paragraph 4: a managed create succeeds only after full post-profile qualification.

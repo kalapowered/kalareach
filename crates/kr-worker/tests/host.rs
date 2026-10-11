@@ -2857,6 +2857,124 @@ impl WorkerSupervisor for WorkerWithVariable {
     }
 }
 
+/// KR-REQ-17.54: a worker its daemon launched serves no local caller what the host holds to its
+/// owner's lease before the daemon has said what the local owner may do, from the first moment its
+/// endpoint is bound.
+///
+/// The worker is held between its shell and its ready report by a seam compiled in for tests, with
+/// its endpoint already bound, so the window is reached by construction: a local client on that
+/// endpoint is refused a read that is held, and is not refused what is the session's own tooling.
+/// Once the daemon has recorded the worker and told it, the same client is served.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_serves_no_held_method_to_a_local_caller_before_its_daemon_has_told_it() {
+    let host = Host::create();
+    let release = host.temp.root().join("kr-ready-go");
+    let environment = host.paths();
+    let supervisor = host.temp.supervisor(Box::new(WorkerWithVariable {
+        name: "KR_TEST_HOLD_READY",
+        value: release.display().to_string(),
+        inner: Box::new(DetachedSupervisor::new()),
+    }));
+    let daemon = start_daemon(&environment, supervisor, host.worker.clone(), None)
+        .await
+        .expect("the daemon starts");
+    let mut client = host.client().await;
+    let params = create_params(host.environment_id, host.temp.root());
+    let create = tokio::spawn(async move {
+        let outcome = client
+            .mutate(
+                Method::SessionCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(params.environment_id),
+                &params,
+            )
+            .await;
+        (client, outcome)
+    });
+    let (session_id, display) = until("the reservation to be claimed", || {
+        let registry =
+            Registry::open(host.paths().registry_database(), host.environment_id).ok()?;
+        let claimed = registry
+            .reservations_in(kr_controller::registry::LaunchPhase::Claimed)
+            .ok()?;
+        claimed
+            .first()
+            .map(|reservation| (reservation.session_id, reservation.display_number))
+    })
+    .await;
+
+    // The worker serves its endpoint while it waits to report: a local client reaches it.
+    let endpoint = host
+        .paths()
+        .worker_endpoint(display)
+        .expect("the worker's endpoint");
+    let mut local = {
+        let started = tokio::time::Instant::now();
+        loop {
+            match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+                Ok(connected) => break connected,
+                Err(error) => {
+                    assert!(
+                        started.elapsed() < LIVENESS_DEADLINE,
+                        "the worker's endpoint was not reachable: {error}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    };
+    let refused = local
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await
+        .expect("the worker answers")
+        .expect_err("a held read is refused before the daemon has told the worker");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("not yet told this session"),
+        "{refused:?}"
+    );
+    let tooling = local
+        .request(
+            Method::QuestionReadOwn,
+            &kr_protocol::question::QuestionReadOwnParams {
+                session_id,
+                question_id: kr_protocol::ids::QuestionId::new(kr_ipc::new_uuid()),
+                caller_token: kr_protocol::question::CallerToken::new(vec![
+                    0;
+                    kr_protocol::question::CALLER_TOKEN_BYTES
+                ]),
+                wait_ms: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the worker answers")
+        .expect_err("a process outside every session has no question");
+    assert_eq!(tooling.code, ErrorCode::NotInKrSession, "{tooling:?}");
+
+    // The worker reports, the daemon records it and tells it, and the same client is served.
+    std::fs::write(&release, b"go").expect("releases the worker");
+    let (mut client, created) = create.await.expect("the create ends");
+    created
+        .expect("the call reaches the daemon")
+        .expect("the session is created");
+    local
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await
+        .expect("the worker answers")
+        .expect("a worker the daemon has told serves a host that is not exclusive");
+
+    close(&mut client, &host, session_id).await;
+    drop(client);
+    daemon.stop().await;
+}
+
 /// KR-REQ-07.66, KR-REQ-24.25: a worker that dies after its claim and before it reports itself has
 /// started a shell, and what that shell started is stopped before the session identity is released.
 ///

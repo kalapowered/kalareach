@@ -7243,14 +7243,18 @@ impl WorkerService {
             self.check_authority_deadline(caller, &mut session, params.attachment_id)?;
             Self::check_session(&session, params.session_id)?;
             Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
-            let accepted = session.write_input(
+            let accepted = session.write_input_until(
                 params.attachment_id,
                 params.epoch.get(),
                 params.sequence.get(),
                 params.bytes.as_slice(),
-                // The deadline travels with the bytes. This check is the host's, taken now; the
-                // writer's is its own, taken when the terminal actually takes them.
-                caller.authority_deadline_boot_ms,
+                // The deadline travels with the bytes, on both clocks it is decided on. This check
+                // is the host's, taken now; the writer's is its own, taken when the terminal
+                // actually takes them.
+                crate::session::InputAuthority {
+                    boot_ms: caller.authority_deadline_boot_ms,
+                    utc_ms: caller.authority_utc_deadline_ms,
+                },
                 std::time::Instant::now(),
             )?;
             // Handed to the writer while the session is still held, so two writers cannot

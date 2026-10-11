@@ -574,6 +574,9 @@ impl SessionRuntime {
     ) -> Result<Self> {
         let reader = session.output_reader()?;
         let mut writer = session.input_writer()?;
+        // The session's time contract, which the writer reads UTC through when a batch carries a
+        // UTC end.
+        let writer_time = Arc::clone(session.time());
         // What the host owes the application is bounded by what has been *written*, not by what is
         // waiting in the session, because the session hands its queue over on every flush.
         let input_waiter = session.input_waiter();
@@ -747,29 +750,33 @@ impl SessionRuntime {
                         break;
                     }
                 }
-                let (epoch, bytes, transition, authority_deadline) = match &batch {
-                    InputBatch::Lease {
-                        epoch,
-                        bytes,
-                        paste,
-                        authority_deadline_boot_ms,
-                    } => (
-                        Some(*epoch),
-                        bytes.as_slice(),
-                        paste.clone(),
-                        *authority_deadline_boot_ms,
-                    ),
-                    InputBatch::Reply { bytes, .. } => (
-                        None,
-                        bytes.as_slice(),
-                        PasteTransition::default(),
-                        // The host's own answer to a question the application asked belongs to the
-                        // application, not to any caller's grant, so no grant's expiry withholds
-                        // it. Its own deadline is the response lane's, looked at below.
-                        None,
-                    ),
-                    InputBatch::LeaseChanged => continue,
-                };
+                let (epoch, bytes, transition, authority_deadline, authority_utc_deadline) =
+                    match &batch {
+                        InputBatch::Lease {
+                            epoch,
+                            bytes,
+                            paste,
+                            authority_deadline_boot_ms,
+                            authority_utc_deadline_ms,
+                        } => (
+                            Some(*epoch),
+                            bytes.as_slice(),
+                            paste.clone(),
+                            *authority_deadline_boot_ms,
+                            *authority_utc_deadline_ms,
+                        ),
+                        InputBatch::Reply { bytes, .. } => (
+                            None,
+                            bytes.as_slice(),
+                            PasteTransition::default(),
+                            // The host's own answer to a question the application asked belongs to the
+                            // application, not to any caller's grant, so no grant's expiry withholds
+                            // it. Its own deadline is the response lane's, looked at below.
+                            None,
+                            None,
+                        ),
+                        InputBatch::LeaseChanged => continue,
+                    };
                 // Stale keystrokes are dropped here rather than written. A takeover that only
                 // stopped *new* input would still let the previous holder's last keystrokes land in
                 // the new holder's command line. The host's own answer to a query the application
@@ -801,6 +808,10 @@ impl SessionRuntime {
                 // never leave behind, because the next actor's input would complete it.
                 let expired = |clock: &dyn kr_ipc::clock::SharedClock| {
                     authority_deadline.is_some_and(|deadline| clock.boot_elapsed_ms() >= deadline)
+                        || authority_utc_deadline.is_some_and(|deadline| {
+                            writer_time.check_utc_deadline(deadline)
+                                != crate::action::time::UtcDeadline::Ahead
+                        })
                 };
                 if expired(writer_clock.as_ref()) {
                     // Only a lease batch carries an authority deadline, and the lease itself has

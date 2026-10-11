@@ -1839,6 +1839,7 @@ mod tests {
                 bytes: b"held".to_vec(),
                 paste: crate::session::PasteTransition::default(),
                 authority_deadline_boot_ms: None,
+                authority_utc_deadline_ms: None,
             },
         );
         assert_eq!(

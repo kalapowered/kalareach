@@ -497,6 +497,9 @@ pub struct Session {
     /// bytes are in the prefix is what it carries, so a prefix that outlived the grant behind it
     /// is fenced with everything else that grant sent.
     held_input_deadline: Option<u64>,
+    /// The same, in UTC milliseconds: the end of the membership lease a local owner's bytes were
+    /// accepted under, which a wall clock set forward passes while the continuous clock does not.
+    held_input_utc_deadline: Option<u64>,
     /// The lease epoch the writer compares every queued batch against.
     ///
     /// The session publishes it the moment the lease changes, which is what lets the count of what
@@ -747,6 +750,7 @@ impl Session {
             input_gate: Arc::new(std::sync::Mutex::new(())),
             terminal_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             held_input_deadline: None,
+            held_input_utc_deadline: None,
             input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delivered_paste_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1429,6 +1433,7 @@ impl Session {
     /// bytes it belonged to have been discarded, and the deadline is a fact about those bytes.
     fn close_framing_for_takeover(&mut self) -> crate::input::TakeoverFraming {
         self.held_input_deadline = None;
+        self.held_input_utc_deadline = None;
         self.framer.close_for_takeover()
     }
 
@@ -2599,6 +2604,36 @@ impl Session {
         authority_deadline_boot_ms: Option<u64>,
         now: Instant,
     ) -> Result<InputAccepted> {
+        self.write_input_until(
+            attachment_id,
+            epoch,
+            sequence,
+            bytes,
+            InputAuthority {
+                boot_ms: authority_deadline_boot_ms,
+                utc_ms: None,
+            },
+            now,
+        )
+    }
+
+    /// As [`Self::write_input`], for bytes whose authority ends at both of two moments: on the
+    /// machine's continuous clock and in UTC. The writer checks each before every piece it offers
+    /// the terminal, so a batch that waits for the application is not written after either.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_input`].
+    pub fn write_input_until(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        sequence: u64,
+        bytes: &[u8],
+        authority: InputAuthority,
+        now: Instant,
+    ) -> Result<InputAccepted> {
+        let authority_deadline_boot_ms = authority.boot_ms;
         if !self.state.accepts_input() {
             return Err(WorkerError::SessionClosed);
         }
@@ -2656,6 +2691,7 @@ impl Session {
         // earlier write's deadline never gets extended by a later write, and a later write's
         // never gets extended by an earlier one.
         let admitted = tightest(self.held_input_deadline, authority_deadline_boot_ms);
+        let admitted_utc = tightest(self.held_input_utc_deadline, authority.utc_ms);
         if !outcome.forward.is_empty() {
             // The framer's own state after the push is what these bytes leave the application in,
             // because `forward` carries every delimiter the push completed and no part of one it
@@ -2669,6 +2705,7 @@ impl Session {
                 bytes: outcome.forward.clone(),
                 paste,
                 authority_deadline_boot_ms: admitted,
+                authority_utc_deadline_ms: admitted_utc,
             };
             self.offer_input(attachment_id, epoch, batch)?;
         }
@@ -2683,6 +2720,13 @@ impl Session {
             admitted
         } else {
             authority_deadline_boot_ms
+        };
+        self.held_input_utc_deadline = if outcome.held == 0 {
+            None
+        } else if outcome.held > bytes.len() {
+            admitted_utc
+        } else {
+            authority.utc_ms
         };
         // A paste that has just closed, or a frame that has just completed, opens the gate the
         // response lane was waiting on. An application that asked a question during one of those
@@ -2778,10 +2822,12 @@ impl Session {
                             bytes,
                             paste: PasteTransition::default(),
                             authority_deadline_boot_ms: self.held_input_deadline,
+                            authority_utc_deadline_ms: self.held_input_utc_deadline,
                         },
                     );
                 }
                 self.held_input_deadline = None;
+                self.held_input_utc_deadline = None;
                 len
             }
             _ => 0,
@@ -2818,6 +2864,7 @@ impl Session {
             // Nothing holds the keys, so these bytes belong to a lease that has ended and went
             // with it. Writing them now would put an ended actor's input in front of the next one.
             self.held_input_deadline = None;
+            self.held_input_utc_deadline = None;
             return;
         }
         let epoch = self.lease.epoch();
@@ -2830,10 +2877,12 @@ impl Session {
                     bytes: released,
                     paste: PasteTransition::default(),
                     authority_deadline_boot_ms: self.held_input_deadline,
+                    authority_utc_deadline_ms: self.held_input_utc_deadline,
                 },
             );
         }
         self.held_input_deadline = None;
+        self.held_input_utc_deadline = None;
         // The held prefix has gone, so a frame that was open is closed and the response lane's
         // gate is open again.
         self.pump_replies();
@@ -4974,6 +5023,15 @@ impl Session {
 ///
 /// A null deadline is authority that does not expire, so it never shortens the other one and never
 /// replaces one that does expire.
+/// When the authority behind bytes of input ends, on both clocks it is decided on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputAuthority {
+    /// The end on the machine's continuous clock, in milliseconds since this boot.
+    pub boot_ms: Option<u64>,
+    /// The end in UTC milliseconds.
+    pub utc_ms: Option<u64>,
+}
+
 const fn tightest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(if left < right { left } else { right }),
@@ -5040,6 +5098,12 @@ pub enum InputBatch {
         /// application, and a batch can wait there: the grant behind it can end between the
         /// moment the host accepted it and the moment the terminal takes it.
         authority_deadline_boot_ms: Option<u64>,
+        /// When the membership lease that accepted these bytes runs out in UTC milliseconds, for a
+        /// local owner of a host that is exclusively organisation-managed. Null otherwise.
+        ///
+        /// Checked by the writer beside the continuous end, so a wall clock set forward ends bytes
+        /// that wait for the terminal even though no request and no output frame meets the gate.
+        authority_utc_deadline_ms: Option<u64>,
     },
     /// The host answering the application, on the response lane.
     Reply {
