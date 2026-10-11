@@ -37,7 +37,6 @@ fn managed(identity: ProcessStartIdentity) -> ManagedProcess {
             process: identity,
         },
         Credential::from_bytes(CREDENTIAL),
-        true,
         TimestampMs::new(1),
     )
 }

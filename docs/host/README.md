@@ -557,10 +557,8 @@ packages, so a malformed key is never read as no choice. `kr doctor` reports the
 package the document chooses `reduced` for: `reduced ownership is recorded and no launch on this
 host reads it; on Windows a launch whose profile records reduced is tracked by start identity and
 its closure never reads complete, and the command route has no such profile`. An export carries the
-package names by their class and length. The worker's launch runs an agent under the `ownership` its
-profile records and does not read this document, every profile this host writes records `full`, and
-this host starts no agent through that launch, so no edit to this section changes a launch on this
-host.
+package names by their class and length. Every profile this host writes records `full`, so no edit
+to this section changes a launch on this host.
 
 `environment_additions` is the preference that adds variables to a session started with the host's
 environment, described under *The environment a session starts with*.
@@ -1467,8 +1465,7 @@ stream is then projected, with the reason `stream_not_carryable`.
 
 **The job object.** The worker holds the sole owning handle for one job object per session, with
 kill-on-close, and the shell joins that job *before* it runs: it is created suspended, assigned,
-confirmed to be held, and only then resumed. An agent the worker's launch starts joins it as it is
-created, unless it runs under reduced ownership. Both limits are read back from the
+confirmed to be held, and only then resumed. Both limits are read back from the
 kernel rather than taken from what was asked for. Default breakaway stays disabled, so a child
 cannot leave by asking. A vendor sandbox that creates a job of its own nests inside this one;
 nesting and breakaway are separate questions, and disabling the second says nothing about the first.
@@ -1556,47 +1553,13 @@ Removing the task, as `kr host startup --clear` does, ends nothing it started.
 
 ### A vendor's own sandbox
 
-An agent the worker's launch starts is in the session's job and in a job of its own. A vendor's
-sandbox that makes jobs of its own nests under both: it limits processes, memory and the user
-interface, and closing the session's job ends every process it made. Codex 0.155.1 does this. Its
-sandbox runs a command as a restricted-token child of `codex.exe` inside the session's job. A child
-of that command that asks to break away leaves the sandbox's job and stays in the session's, which
-still holds it. The closure reads the session's ownership coverage as complete once the job lists
-nothing.
-
-A sandbox cannot start under a job that restricts access to desktops, because it makes a desktop of
-its own and the system refuses (`CreateDesktopW failed: 5`). Before a launch starts anything it
-reads the limits of the session's job and of the innermost job the worker itself is in. A
-restriction it finds is a named launch failure: nothing starts, the vendor's sandbox is left as it
-is, and no breakaway is granted. The jobs this product makes carry no such restriction, and the
-limits of a job above the worker cannot be read; there the vendor fails at its own start and the
-launch reports that exit.
-
-The other outcome is a choice, and it is somebody's to make. A launch whose profile records
-`ownership` as `reduced` starts that agent in a kill-on-close job of its own and not in the
-session's. The closure lists what that job holds by start identity and ends it, and reads its
-ownership coverage as incomplete, with the reason in the receipt. A worker that dies ends the agent
-too, since the worker holds the only handle to the job. The choice is no way past a restriction on
-the worker's own job, and it never switches the vendor's sandbox off. The `agents` section of the
-configuration document (see *Configuration*) is where the choice is written down for a package, and
-`kr doctor` reports it; the launch takes it from the profile it is given, and this host starts no
-agent through the worker's launch, so no edit to that section changes a launch on this host.
-Because the jobs this product makes restrict nothing, the profile is the explicit escape section 7
-asks for, and a test builds the job that needs it.
-
-The command route has no such profile: a program it starts runs in the shell's own job. A launcher
-whose job restricts desktops declines before it creates the program and says why to the backend,
+A vendor's sandbox cannot start under a job that restricts access to desktops, because it makes a
+desktop of its own and the system refuses (`CreateDesktopW failed: 5`). The jobs this product makes
+carry no such restriction. The command route has no reduced profile: a program it starts runs in
+the shell's own job. A launcher whose job restricts desktops declines before it creates the
+program and says why to the backend,
 which keeps the reason on the launch attempt. The typed command then runs as typed, as it does
 without the integration.
-
-A launch that meets a session already closing is refused by name before anything is created. A
-closure that begins while a launch is creating its agent ends what the launch made, and the launch
-fails by name, because a process created in a job that has been ended is not ended with it. The
-launch records a reduced agent's job on the session before its process exists, so a closure that
-begins at any point reads it. A launch is in flight on its session from the moment the session admits
-it, before the application's own configuration is read, until it has committed or undone everything
-it made. A closure waits for every launch admitted before it began, and a launch still under way
-when that wait ends keeps the closure's coverage incomplete, with the reason in the receipt.
 
 ### Running the Windows tests
 
@@ -1669,7 +1632,7 @@ Every command in that list needs the developer environment for the target loaded
 
 The runner runs the worker's suites one at a time (its library, and the `windows`,
 `windows_endpoint`, `listener`, `transport`, `broker`, `gateway`, `agent_service`,
-`windows_inheritance`, `command_backends`, `windows_vendor`, `launch_probe`, `question_bindings`,
+`windows_inheritance`, `command_backends`, `launch_probe`, `question_bindings`,
 `questions_answer`, `authority`, `persistence`, `snapshot`, `terminal`, `session`, `local_owner`,
 `input_lease`, `fence`, `desktop`, `performance`, `host`, `binder`, `channels`, `connectors` and
 `attention_source` suites) and does not run `cargo test -p kr-worker` with every suite, because the
@@ -1713,10 +1676,8 @@ from them.
 
 What no automated suite here establishes, and a person at this machine has to: an IME composing at
 a real keyboard; and Windows Terminal, WSL interop and a nested ConPTY across the release matrix.
-A vendor's sandbox running inside the session's job, and the closure ending what it made, is run
-against the pinned Codex build by the ignored cases of `crates/kr-worker/tests/windows_vendor.rs`
-once `KR_NATIVE_CODEX` names its `codex.exe`; the same cases run with a stand-in vendor in the
-windows job.
+A vendor's sandbox running inside the session's job, and the closure ending what it made, is
+checked by a person at this machine against the pinned Codex build.
 
 ## WSL and containers
 
@@ -5479,9 +5440,8 @@ argument vector, what is known about authentication, and the integration mode. I
 the launch, so a refused launch still leaves a record of what was going to be run.
 
 A profile also records how completely the session's closure accounts for what the launch starts, as
-`ownership`: `full` or `reduced`. The worker's launch runs the agent under the ownership its profile
-records and takes it from nowhere else. Every profile this host writes records `full`, and no edit
-to the `agents` section changes that (see *A vendor's own sandbox*). It records `vendor_mode` too:
+`ownership`: `full` or `reduced`. Every profile this host writes records `full`, and no edit to the
+`agents` section changes that. It records `vendor_mode` too:
 the word the application's own package read for the mode the application runs in, exactly as the
 application printed it, or null. A ledger an earlier build wrote holds profiles without the two
 fields. The first open by this build records each as `full` and null, in one transaction with the
@@ -5516,27 +5476,14 @@ the mode is. The owner confirms the capability `launch.probe` on every release, 
 runs the application's executable with arguments the package chose. Codex 0.155.1 prints `disabled`
 where no Windows sandbox is set, `elevated` for its elevated sandbox and `<redacted>` for its
 unelevated one, and a package for it reads that word at `/checks/sandbox.helpers/details/sandbox
-backend` of `codex doctor --json`. The host reports the word as printed and the worker's launch
-records it in the launch's profile; neither interprets it.
+backend` of `codex doctor --json`. The host reports the word as printed and does not interpret it.
 
-The worker's launch runs the probe before it reserves anything, in the launch's own environment
-and directory, with no input and no shell. The probe has five seconds and may print 256
+The probe runs with no input and no shell. It has five seconds and may print 256
 KiB, and it runs in a job (a process group on Unix) that ends with it. A nonzero exit status is not
 a failure, because the diagnostic reports a problem in the output it prints. A probe that cannot
-start, does not finish, prints too much or prints nothing the pointer reaches records no mode and
-does not stop the launch by itself, apart from the case below.
+start, does not finish, prints too much or prints nothing the pointer reaches records no mode.
 
-The options the declaration names are copied with their values from the launch's arguments, in the
-forms the vendor reads them: `-c v`, `-cv`, `-c=v`, `--config v` and `--config=v`. For Codex they
-are `-c`, `--config`, `--enable` and `--disable`, and each of them changes what `doctor` prints.
-Codex refuses `-p` and `--profile` before `doctor`, so they are not carried. A package can also list
-the modes its application cannot run with in a Windows service session, the session a worker has
-when no person is signed in. A launch there whose mode is listed fails by name before anything
-starts, where it would otherwise hang. So does a launch there whose probe does not finish in time,
-because its mode is unknown and may be a listed one.
-
-This host starts no agent through the worker's launch, so on it only the diagnostics read,
-`host.doctor`, runs a probe. `kr doctor` makes that read. So do `kr plugin integration enable` and
+Only the diagnostics read, `host.doctor`, runs a probe. `kr doctor` makes that read. So do `kr plugin integration enable` and
 `disable`, and a paired device may. The read runs the same declaration for the executable the
 daemon's own search path names for each granted package. It runs in the daemon's environment, which
 a launch's may differ from, and `kr doctor` prints the word it read and where it read it from, or
@@ -5547,28 +5494,14 @@ application reads.
 
 ### What a native exit ends
 
-A native terminal application's intentional exit ends its instance and names the backend to stop,
-by the full process identity this host recorded. Closing a KalaReach attachment ends nothing: the
-application keeps running in the worker's pseudo-terminal. A backend this host did not launch is
-never claimed or stopped as owned, however the instance ended.
+A native terminal application's intentional exit ends its instance. Closing a KalaReach attachment
+ends nothing: the application keeps running in the worker's pseudo-terminal.
 
 The terminal is watched as a process, for as long as it runs. A socket reaching end of file and the
 process behind it exiting are two events in either order, and neither bounds the other: a terminal
 can close its connection and go on running for an hour, and a terminal whose connection stays open
 can exit at once. So what decides is the process, and the watch outlives the connection: a terminal
-that exits long after its attachment closed still ends its instance and still stops the backend this
-host dedicated to it. The backend is asked to stop, given the grace period, forced if it has not
-gone, and then waited for, so what is reported is what happened rather than what was signalled.
-
-On Windows, a dedicated backend this host started is held by a job, and the stop is of that job. The
-end of the backend's standard input that this host writes is closed, which is how an agent is told
-to finish, and any write to it that is blocked is cancelled so that it cannot hold the stop up. Then
-a grace period is given to the job, after which the job is terminated if anything in it is left. The
-stop is complete only when the job lists nothing: the backend's root process may have exited while
-the helpers it started are alive, and the backend is then not yet stopped. If the job could not be
-asked at any point, even when a later question was answered, or a termination fails and leaves
-something in it, the stop is reported as unresolved. If a caller stops a backend while another
-caller's stop of it is in progress, the second caller waits for the first and gets the same answer.
+that exits long after its attachment closed still ends its instance.
 
 ## The gateway
 

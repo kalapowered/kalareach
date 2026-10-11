@@ -182,7 +182,6 @@ fn broker(journal: &std::path::Path) -> (Arc<Broker>, GatewayConnectionId) {
                     process: identity(),
                 },
                 Credential::from_bytes(CREDENTIAL),
-                true,
                 TimestampMs::new(1),
             )),
         )
