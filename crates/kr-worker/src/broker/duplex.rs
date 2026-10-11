@@ -2433,12 +2433,17 @@ impl Duplex {
                     }
                 }
             }
+            // The notification is made before the flag is read: a stop sets the flag and then
+            // wakes the waiters it finds, so a stop that lands between the two is seen by one of
+            // them and cannot be slept through.
+            let stop = self.stopping.notified();
+            tokio::pin!(stop);
             if self.stopped.load(Ordering::Acquire) {
                 return;
             }
             let read = tokio::select! {
                 read = reader.read(&mut chunk) => read,
-                () = self.stopping.notified() => return,
+                () = &mut stop => return,
             };
             match read {
                 Ok(0) => return,
