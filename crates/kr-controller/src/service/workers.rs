@@ -31,6 +31,11 @@ pub(super) const UNACCOUNTED_WORKER: &str = "unaccounted_worker";
 /// the report goes out without it.
 pub(super) const WORKER_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long making a worker known waits for it to be told what the host's local owner may do. A
+/// worker this daemon launched holds its local owner to the lease until it is told, so waiting
+/// longer protects nothing; the publisher tells it when it can.
+const TELL_BEFORE_PUBLISHING: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// This daemon's link to one worker, taken out of its slot for the work its holder does over it.
 ///
 /// The link goes back into the slot only when that work ended whole ([`Self::give_back`]), which is
@@ -189,8 +194,10 @@ impl Controller {
         // registry row by now, so every barrier from here on counts it; opening the link tells it
         // and tells it again until what it acknowledged is what is in force, so a worker is not
         // visible on a bound a restriction that committed meanwhile has already replaced. A
-        // restriction that commits after this reaches it through the barrier.
-        drop(self.open_worker(&worker).await?);
+        // restriction that commits after this reaches it through the barrier. A worker that
+        // cannot be reached yet is published all the same: one this daemon launched holds its
+        // local owner to the lease until it is told, and the publisher tells it when it can.
+        let _ = tokio::time::timeout(TELL_BEFORE_PUBLISHING, self.open_worker(&worker)).await;
         #[cfg(test)]
         self.before_a_worker_is_made_known.wait().await;
         // Whether it was written is looked at once the closure has been: a write that fails after

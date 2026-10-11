@@ -167,6 +167,33 @@ impl Fixture {
         .await
     }
 
+    /// The organisation signs a lease for the host's own key and the owner presents it at the local
+    /// socket: what the host's local owner must do on an exclusively organisation-managed host
+    /// before it is served anything but what recovers the host.
+    pub async fn lease_the_local_owner(&self) -> MembershipPresentResult {
+        let listed = self.listed().await;
+        let lease = self.organisation.lease(
+            2,
+            &member("owner"),
+            listed.host_device.authorisation_key,
+            self.now(),
+            &[ActionRight::SessionView],
+        );
+        let mut client = self.host.client().await;
+        calls::mutate_as(
+            self.host.environment_id,
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::MembershipPresent,
+            &MembershipPresentParams {
+                lease,
+                authority: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the host takes the lease for its local owner")
+    }
+
     /// The authority revision the host's policy follows now.
     pub fn authority_revision(&self) -> AuthorityRevision {
         self.host.controller().policy().authority_revision()

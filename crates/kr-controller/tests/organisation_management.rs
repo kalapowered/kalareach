@@ -995,6 +995,8 @@ async fn only_a_device_that_can_recover_the_host_reaches_what_recovers_it_and_a_
         .await
         .expect("the owner makes the host exclusive");
     drop(client);
+    // The host's local owner answers to a lease as a member does, and asks for what follows.
+    fixture.lease_the_local_owner().await;
 
     // A device with host management whose grant expires does not qualify.
     let helper = Device::create().await;
@@ -1061,9 +1063,11 @@ async fn at_the_terminal(
     client: &mut kr_ipc::client::LocalClient,
     subject: ConfirmationSubject,
 ) -> (bool, Result<(), kr_protocol::error::ProtocolError>) {
-    let challenge = calls::request(fixture.host.environment_id, client, subject)
-        .await
-        .expect("the host issues the challenge");
+    let challenge = match calls::request(fixture.host.environment_id, client, subject).await {
+        Ok(challenge) => challenge,
+        // The host refuses to issue it at all.
+        Err(refused) => return (false, Err(refused)),
+    };
     let key = DeviceKeys::generate().expect("a key for this one answer");
     let (proof, presented) =
         calls::sign(&challenge.request, &Signer::Bootstrap(&key.authorisation));
@@ -1156,8 +1160,9 @@ async fn the_terminal_confirms_the_end_of_exclusive_management_when_no_device_ca
     let refused = answered.expect_err("an owner invitation is not the terminal's either");
     assert_eq!(
         refused.code,
-        ErrorCode::OwnerConfirmationRequired,
-        "{refused:?}"
+        ErrorCode::PermissionDenied,
+        "the host's local owner holds no lease, so the host does not issue the challenge: \
+         {refused:?}"
     );
 
     // The end of exclusive management is.
@@ -1224,6 +1229,8 @@ async fn a_device_that_can_confirm_appearing_after_the_terminal_answered_stops_t
         .await
         .expect("the owner makes the host exclusive");
     drop(client);
+    // The host's local owner answers to a lease as a member does, and asks for what follows.
+    fixture.lease_the_local_owner().await;
 
     // A device whose grant ends can still confirm a pairing, which a lasting one can then make.
     let helper = Device::create().await;
@@ -1454,6 +1461,8 @@ async fn a_lapsed_owner_device_is_neither_shown_nor_allowed_to_answer_a_members_
         .expect("the owner makes the host exclusive");
     // Making the host exclusive fences it, which withdraws the connection it was asked on.
     drop(client);
+    // The host's local owner answers to a lease as a member does, and asks for what follows.
+    fixture.lease_the_local_owner().await;
     let mut client = fixture.host.client().await;
     let proposed = ProposedGrant {
         organisation: Nullable::some(OrganisationRequirement {
