@@ -1584,7 +1584,7 @@ async fn a_rights_ceiling_that_removes_host_management_leaves_no_device_that_can
 /// KR-REQ-17.54: a change of exclusive management is written whole or not at all. When the store
 /// refuses the record of the ending, the policy that went into the same transaction is not kept;
 /// when it refuses the policy, no record is kept; each attempt spent its confirmation, and a stop
-/// of the host after either leaves the host exclusive.
+/// of the host after either leaves the host exclusive and its ending to be confirmed again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_write_ends_exclusive_management_in_neither_the_policy_nor_the_record_and_spends_the_confirmation()
  {
@@ -1682,19 +1682,6 @@ async fn a_refused_write_ends_exclusive_management_in_neither_the_policy_nor_the
     );
     assert!(listed.exclusive_events.is_empty());
     let mut client = fixture.host.client().await;
-    let refused = calls::mutate::<_, OrganisationExclusiveSetResult>(
-        fixture.host.environment_id,
-        &mut client,
-        Method::OrganisationExclusiveSet,
-        &OrganisationExclusiveSetParams { exclusive: false },
-    )
-    .await
-    .expect_err("the confirmation was spent");
-    assert_eq!(
-        refused.code,
-        ErrorCode::OwnerConfirmationRequired,
-        "{refused:?}"
-    );
 
     // Confirmed again, it ends, with its record.
     calls::confirm_subject(

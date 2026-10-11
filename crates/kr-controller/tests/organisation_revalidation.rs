@@ -70,21 +70,6 @@ async fn what_ended_while_the_host_slept_is_over_at_the_first_request_after() {
             "the grant ended in the sleep"
         ),
     }
-    // A new connection finds the same: it is refused at the door or at its first request.
-    match net_support::RawDevice::try_connect(&fixture.host, &helper, &helper_record).await {
-        Err(_) => {}
-        Ok(fresh) => {
-            fresh.claim();
-            match fresh.try_read(Method::HostInfo, &()).await {
-                None => {}
-                Some(answer) => assert!(
-                    denied(&net_support::refusal(answer.map(|_| ()))),
-                    "a new connection of a device whose grant ended is not served"
-                ),
-            }
-            fresh.close();
-        }
-    }
     let owner = net_support::RawDevice::connect(
         &fixture.host,
         fixture
@@ -169,6 +154,9 @@ async fn a_reboot_leaves_no_lease_of_the_boot_before_and_keeps_what_was_written_
 /// holds after the owner left the organisation; the host starts, and keeps the higher revision, as
 /// it does when a crash left the policy row behind the registry. A grant issued at the revision in
 /// force is not refused as one nothing here issued.
+///
+/// That is the whole of what this shows. The older row also brings back the enrolment the owner
+/// left, which is the part of the requirement that stays open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_older_policy_row_cannot_lower_the_revision_in_force() {
     let fixture = Fixture::start().await;

@@ -1274,6 +1274,20 @@ fn the_terminal_answer_is_spent_for_the_end_of_exclusive_management_only_where_n
         .expect_err("a device can confirm for this host");
     assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
 
+    // Under a rights ceiling that removes host management from that device it cannot confirm,
+    // whatever its stored grant carries, and the terminal's answer is spent.
+    let narrowed = TerminalStanding::Recovery {
+        environment_id,
+        exclusive: true,
+        ceiling: Some(
+            [kr_protocol::rights::ActionRight::SessionView]
+                .into_iter()
+                .collect(),
+        ),
+    };
+    rows.record_consumed_under(&ending(6), "ending", TimestampMs::new(20), narrowed)
+        .expect("the ceiling leaves no device that can confirm for this host");
+
     // Its last device is revoked. A host that is not exclusive has nothing to end.
     directory
         .revoke(commitment.device_id, TimestampMs::new(21))
@@ -1281,6 +1295,24 @@ fn the_terminal_answer_is_spent_for_the_end_of_exclusive_management_only_where_n
     let refused = rows
         .record_consumed_under(&ending(3), "ending", TimestampMs::new(22), under(false))
         .expect_err("the host is not exclusively organisation-managed");
+    assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
+
+    // The terminal's answer is for the end of exclusive management and for no other action.
+    let invitation_proof = owner_host
+        .approval(
+            SensitiveAction::IssueInvitation,
+            Digest256::from_bytes([7; 32]),
+            None,
+        )
+        .proof;
+    let refused = rows
+        .record_consumed_under(
+            &invitation_proof,
+            "issuing",
+            TimestampMs::new(22),
+            under(true),
+        )
+        .expect_err("the terminal confirms no invitation here");
     assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
 
     // Exclusive and with nothing left that can confirm, the terminal's answer is spent, once, and
