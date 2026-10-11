@@ -2804,7 +2804,7 @@ export interface AccountSignedOut {
   /**
    * Whether the service has acknowledged every revocation this host holds: the one just sent
    * and any that were waiting. When it has not, the grant is gone from this host all the same,
-   * and the daemon sends what is left again when it next starts.
+   * and the daemon sends what is left again at a later start that can reach the service.
    */
   service_told: boolean
   /**
