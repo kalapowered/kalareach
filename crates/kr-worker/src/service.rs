@@ -3005,14 +3005,16 @@ impl WorkerService {
         // worker has fenced every revision up to that one. Otherwise a revision it missed, or one
         // it was refused for its boundary, withdrew authority this notice says nothing about.
         // What it was refused for its boundary it holds the reach of, and joins to this notice's,
-        // so a notice that begins after those revisions still describes all of them.
+        // so a notice that begins after those revisions still describes all of them. That includes
+        // a notice that repeats the newest revision it was refused: the daemon keeps the reaches of
+        // fewer revisions than a worker can have been refused, and the worker keeps them all.
         let joined = {
             let authority = self
                 .authority
                 .lock()
                 .expect("the authority lock is not poisoned");
             match &authority.owed {
-                Some(owed) if owed.revision.get() < notice.revision.get() => {
+                Some(owed) if owed.revision.get() <= notice.revision.get() => {
                     owed.reach.then(owed.revision, &notice.reach)
                 }
                 _ => notice.reach.clone(),
