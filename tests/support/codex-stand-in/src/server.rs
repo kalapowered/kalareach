@@ -106,21 +106,17 @@ impl Server {
 
     /// Ends the server's commands, each with what it started, and exits, as the pinned release
     /// does when it is told to.
+    ///
+    /// The command itself goes first and its group after it. A command that has not yet made its
+    /// session has no group to end, and ending it first is what leaves nothing for it to start.
     async fn finish(&mut self) -> ! {
         for started in &mut self.commands {
             let leader = started.child.id().and_then(|pid| i32::try_from(pid).ok());
-            match leader {
-                Some(pid) if started.leads_group => {
-                    if let Some(group) = rustix::process::Pid::from_raw(pid) {
-                        let _ = rustix::process::kill_process_group(
-                            group,
-                            rustix::process::Signal::KILL,
-                        );
-                    }
-                }
-                _ => {
-                    let _ = started.child.start_kill();
-                }
+            let _ = started.child.start_kill();
+            if started.leads_group
+                && let Some(group) = leader.and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
             }
         }
         for started in &mut self.commands {
@@ -208,6 +204,10 @@ impl Server {
             Frame::Response { id, method } | Frame::Failure { id, method } => {
                 self.sent.remove(&id);
                 if method == "item/commandExecution/requestApproval" {
+                    // The server dies with its command running, once the approval is answered.
+                    if self.variants.die_first {
+                        std::process::exit(0);
+                    }
                     self.send(json!({
                         "method": "turn/completed",
                         "params": { "threadId": "thread-1", "turn": turn("completed") }
@@ -286,9 +286,6 @@ impl Server {
         }
         eprintln!("stand-in: turn started");
         self.start_command();
-        if self.variants.die_first {
-            std::process::exit(0);
-        }
         let approval = json!({
             "id": if self.variants.colliding_ids { id.clone() } else { json!(APPROVAL) },
             "method": "item/commandExecution/requestApproval",
