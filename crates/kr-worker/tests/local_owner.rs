@@ -2702,6 +2702,34 @@ async fn an_announcement_accepted_after_refused_ones_is_joined_to_what_was_refus
         None,
         "revision 12 named the phone's grant"
     );
+
+    // A worker that was refused revisions 15 to 20 and accepts a repeat of the newest one: the
+    // notice begins after revision 19, and what the worker holds of 15 to 18 is joined to it.
+    typing.takes_the_lease_again(14).await;
+    let boundary = HeldBoundary::take(&typing.wired).await;
+    for revision in 15..=20 {
+        typing
+            .wired
+            .announced_and_refused(
+                &mut typing.authority,
+                revision,
+                grant_reach(revision - 1, stranger_grant),
+            )
+            .await;
+    }
+    boundary.release();
+    typing
+        .wired
+        .revise_within(&mut typing.authority, 20, grant_reach(19, stranger_grant))
+        .await;
+    assert_eq!(
+        typing.wired.service.acknowledged_revision(),
+        Some(AuthorityRevision::new(20))
+    );
+    assert!(
+        typing.holds_the_lease(),
+        "six revisions named a stranger's grant, and the repeat of the newest does not widen them"
+    );
     typing.close();
 }
 
