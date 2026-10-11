@@ -541,6 +541,38 @@ fn the_doctor_says_whether_an_integration_that_declares_a_backend_is_served_by_a
     assert_eq!(off.reason.0, None);
 }
 
+/// KR-REQ-07.45: an integration that declares a backend is not reported as one a gateway serves
+/// when the executable the search path names was found and could not be read, since no digest
+/// can be shown to a signed record.
+#[cfg(unix)]
+#[test]
+fn an_executable_the_doctor_cannot_read_is_why_a_backend_runs_as_typed() {
+    let store = Store::new("backend-unreadable");
+    let bin = store.0.join("bin");
+    let codex = executable(&bin, "codex");
+    // Larger than the most of an executable this host reads to hash it; a sparse file takes no
+    // space for it.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&codex)
+        .expect("the executable opens")
+        .set_len((1 << 30) + 1)
+        .expect("and is made larger");
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::codex_backend(), |_| {})]);
+    let reported = report(Some(&reading), &[], &enabled(&["codex"]), &able(vec![bin]))
+        .reports
+        .remove(0);
+    assert_eq!(reported.state, CommandIntegrationState::On);
+    assert_eq!(reported.mode, IntegrationMode::NativeTerminal);
+    let reason = reported.reason.0.as_deref().expect("a reason");
+    assert!(reason.contains("larger than"), "{reason}");
+    assert!(
+        reason.ends_with("so an invocation runs as typed"),
+        "{reason}"
+    );
+}
+
 /// KR-REQ-07.45: an integration the configuration turns on is reported as one a session created
 /// now cannot launch through where the platform establishes no backend or no launcher is
 /// installed, and its command then runs as typed.
