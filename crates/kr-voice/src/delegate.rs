@@ -568,7 +568,7 @@ impl Coordinator {
         // holding this coordinator's own lock across them is what makes the replacement atomic:
         // two changes arriving at once cannot each read the same standing grant, withdraw it and
         // leave two replacements standing. The broker is told afterwards, outside the lock.
-        let (written, ending) = {
+        let (written, ending, ended_sessions) = {
             let mut state = self.state.lock().expect("the coordinator's state");
             // Inside the lock, and immediately before the write. Waiting for this lock is the last
             // thing this change does, and an authority change whose admitted lifetime ran out
@@ -580,6 +580,8 @@ impl Coordinator {
             // has to be the last thing before it does.
             Self::still_admitted(admission)?;
             let mut ending: Vec<Ending> = Vec::new();
+            let mut ended_sessions: std::collections::BTreeSet<SessionId> =
+                std::collections::BTreeSet::new();
             // The replacement is one change in the authority store: the one it replaces goes and
             // the new one is written together, or neither happens. A second standing grant beside
             // the first would leave the old scope authorising calls nobody can see in the new
@@ -603,6 +605,7 @@ impl Coordinator {
             {
                 for ended in state.sessions.stop_under(replaced.grant_id) {
                     state.ledger.forget_session(ended.voice_session_id);
+                    ended_sessions.extend(ended.session_ids.iter().copied());
                     if let Some(call_id) = ended.call_id {
                         ending.push(Ending {
                             call_id,
@@ -612,7 +615,7 @@ impl Coordinator {
                 }
             }
             state.closing += ending.len();
-            (written, ending)
+            (written, ending, ended_sessions)
         };
         let _closing = Closing {
             state: &self.state,
@@ -628,10 +631,12 @@ impl Coordinator {
         }
         let written = written?;
         // The old grant is gone when the workers hold the revision that refuses what was sent under
-        // it, and the person is not told the replacement is made before that.
-        if let Some(fence) = written.fence {
-            fence.await;
-        }
+        // it, and the person is told whether they do: the barrier as the wait left it, cut to the
+        // sessions of the calls the replacement ended.
+        let barrier = match written.fence {
+            Some(fence) => Some(fence.await?.within(&ended_sessions)),
+            None => None,
+        };
         let written = written.grant;
 
         Ok(VoiceGrantResult {
@@ -639,6 +644,7 @@ impl Coordinator {
             device_id: params.device_id,
             statement: VoiceGrantStatement::of(&planned.plan.actions),
             not_held_by_device: planned.not_held_by_device,
+            barrier: Nullable(barrier),
         })
     }
 
@@ -1288,10 +1294,16 @@ impl Coordinator {
         }
         // Answered once the workers hold the revision that refuses whatever was sent under the
         // grant, when anything could have been: a stop that said the call was over while a close
-        // could still reach a worker would say more than the host knows.
-        if let Some(fence) = fence {
-            fence.await;
-        }
+        // could still reach a worker would say more than the host knows. What a worker that has
+        // not acknowledged is owed is in the answer, as pending.
+        let barrier = match fence {
+            Some(fence) => Some(
+                fence
+                    .await?
+                    .within(&record.session_ids.iter().copied().collect()),
+            ),
+            None => None,
+        };
 
         Ok(VoiceStopResult {
             voice_session_id: params.voice_session_id,
@@ -1299,6 +1311,7 @@ impl Coordinator {
             revoked_at_ms: TimestampMs::new(at_ms),
             broker_notified,
             sessions_left_running: record.session_ids,
+            barrier: Nullable(barrier),
         })
     }
 

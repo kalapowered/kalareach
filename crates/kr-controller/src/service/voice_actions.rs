@@ -440,12 +440,19 @@ impl Controller {
         // future is a cancellation, and a close that has reached a worker cannot be called back. So
         // its attempt runs on a task of its own, which owns the claim and records what the effect
         // came to under it, and a retry after a dropped connection is answered from that record.
-        if method == Method::VoiceDelegate {
+        // So does a change of the voice grant that waits for the workers before it answers: the
+        // grant is revoked once it has committed, and the answer is owed under the claim whether
+        // or not the link it was asked on is still there to carry it.
+        if matches!(
+            method,
+            Method::VoiceDelegate | Method::VoiceStop | Method::VoiceGrant
+        ) {
             let daemon = Arc::clone(self);
             return match tokio::spawn(async move { daemon.voice_attempt(attempt).await }).await {
                 Ok(outcome) => outcome,
                 Err(_) => Err(ControllerError::Uncertain {
-                    detail: "this host could not report what happened to the delegation".to_owned(),
+                    detail: "this host could not report what happened to that voice change"
+                        .to_owned(),
                 }),
             };
         }

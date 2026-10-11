@@ -847,18 +847,20 @@ impl Controller {
     /// Publishes the debt a voice revocation wrote, if it wrote one, raises its barrier on a task
     /// of its own, and returns the wait for it.
     ///
-    /// A voice revocation commits where nothing can wait, under the coordinator's lock. A voice
-    /// grant's withdrawal owes a fence only while a close forwarded under it can still run at a
-    /// worker, and the fence is the workers holding the revision that refuses it. Its reach is the
-    /// connections acting under the grants withdrawn, and none acts under a call's grant: every
-    /// connection stays admitted, at the revision now in force, so the answer to the stop that
-    /// withdrew the grant, and every other answer on the link it was sent on, is delivered. The
-    /// debt is published the moment the store has committed, so every admission and forward is
-    /// refused until the barrier retires it.
+    /// A voice revocation commits where nothing can wait, outside the lock of the coordinator that
+    /// answers for it. A voice grant's withdrawal owes a fence only while a close forwarded under it
+    /// can still run at a worker, and the fence is the workers holding the revision that refuses
+    /// it. Its reach is the connections acting under the grants withdrawn, and none acts under a
+    /// call's grant: every connection stays admitted, at the revision now in force, so the answer
+    /// to the stop that withdrew the grant, and every other answer on the link it was sent on, is
+    /// delivered. The debt is published the moment the store has committed, so every admission and
+    /// forward is refused until the barrier retires it.
     ///
-    /// The caller waits outside its lock and before it answers. The barrier runs on its own task,
-    /// so a caller that stops waiting leaves it running; where there is no runtime to run it on,
-    /// the debt is left to the debt pass.
+    /// The caller waits outside its lock and before it answers, and is given the barrier as it
+    /// stands when the wait ends, pending workers named. The barrier runs on its own task, so a
+    /// caller that stops waiting leaves it running; the task holds the daemon only while something
+    /// besides it does ([`while_held`]), and a daemon that has gone leaves the debt on disk for the
+    /// next start. Where there is no runtime to run it on, the debt is left to the debt pass.
     pub(crate) fn fence_voice_revocation(
         self: &Arc<Self>,
         revocation: &crate::grants::GrantRevocation,
@@ -875,12 +877,28 @@ impl Controller {
         };
         let own = self.publish_debts(&[(debt, reach)]);
         let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let daemon = Arc::clone(self);
+        let daemon = Arc::downgrade(self);
         let barrier = runtime.spawn(async move {
-            let _ = daemon.barrier(own).await;
+            while_held(&daemon, async move |controller: &Controller| {
+                controller.barrier(own).await
+            })
+            .await
         });
         Some(Box::pin(async move {
-            let _ = barrier.await;
+            match barrier.await {
+                Ok(Some(Ok(barrier))) => Ok(barrier),
+                Ok(Some(Err(error))) => Err(kr_voice::VoiceError::Host(
+                    kr_protocol::error::ProtocolError::new(error.code(), error.to_string()),
+                )),
+                Ok(None) | Err(_) => Err(kr_voice::VoiceError::Host(
+                    kr_protocol::error::ProtocolError::new(
+                        ErrorCode::ResourceUnavailable,
+                        "this host stopped before the fence the withdrawal owes was raised; the \
+                         withdrawal stands, and the host raises the fence when it starts again"
+                            .to_owned(),
+                    ),
+                )),
+            }
         }))
     }
 

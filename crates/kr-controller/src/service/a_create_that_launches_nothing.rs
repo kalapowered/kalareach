@@ -2438,7 +2438,8 @@ async fn a_voice_grants_withdrawal_through_the_seam_fences_nothing() {
     withdrawn
         .fence
         .expect("the withdrawal hands back the wait for its barrier")
-        .await;
+        .await
+        .expect("the barrier is raised");
     assert_eq!(revision().await, before + 1, "one barrier retires it");
     assert!(
         controller

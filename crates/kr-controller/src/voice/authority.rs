@@ -224,13 +224,17 @@ impl VoiceAuthority for GrantAuthority {
             .filter(|grant| !grant.permits(ActionRight::VoiceUse))
             .filter(|grant| session_id.is_none_or(|id| grant.session_selector.admits(id)))
             .max_by_key(|grant| grant.actions.len());
-        // As this host's configuration lets it be used: a right the rights ceiling takes away
-        // from every grant is not one a spoken action may use, whichever grant it was written in.
-        // The coordinator reads the device's authority here before it asks for a confirmation, and
-        // the host reads it again immediately before a close is forwarded, so both are under the
-        // ceiling in force when they read.
+        // As this host lets it be used: a right the rights ceiling takes away from every grant, or
+        // that an organisation's lease does not give, is not one a spoken action may use, whichever
+        // grant it was written in. The coordinator reads the device's authority here before it asks
+        // for a confirmation, and the host reads it again immediately before a close is forwarded,
+        // so both are under what is in force when they read.
         let daemon = self.daemon()?;
-        standing.answer(widest.map(|grant| daemon.under_the_rights_ceiling(grant)))
+        let usable = widest
+            .map(|grant| daemon.as_this_host_lets_it_be_used(grant))
+            .transpose()
+            .map_err(|refusal| VoiceError::Host(refusal.to_protocol_error()))?;
+        standing.answer(usable)
     }
 
     fn grant(&self, grant_id: GrantId) -> kr_voice::Result<Option<Grant>> {
@@ -246,7 +250,15 @@ impl VoiceAuthority for GrantAuthority {
             .stored_standing(grants, &record)
             .map_err(store)?
         {
-            GrantStanding::InForce => Ok(Some(record.grant)),
+            // As this host lets it be used, as the device's own grant is: this is the grant a
+            // spoken action is decided against, and a right the configuration or a lease takes
+            // away is not one it carries. A grant is recognised as a voice grant by the voice right
+            // in the store's record (see [`Self::standing_voice_grant`]), not by this answer.
+            GrantStanding::InForce => self
+                .daemon()?
+                .as_this_host_lets_it_be_used(record.grant)
+                .map(Some)
+                .map_err(|refusal| VoiceError::Host(refusal.to_protocol_error())),
             GrantStanding::OutOfForce => Ok(None),
             GrantStanding::Unrecorded => Err(store(crate::grants::store::unrecorded())),
         }

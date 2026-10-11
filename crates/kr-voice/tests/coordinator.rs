@@ -120,6 +120,35 @@ struct OwedFence {
     released: tokio::sync::Notify,
 }
 
+impl OwedFence {
+    /// The barrier this fence ends with: one worker that did not acknowledge, owned by the call's
+    /// session, and one of a session the call did not reach, which the answer does not carry.
+    fn barrier(&self) -> kr_protocol::action::RevocationBarrier {
+        let worker = |session_id, state| kr_protocol::action::WorkerBarrier {
+            session_id,
+            state,
+            acknowledged_revision: Nullable::null(),
+            rejected_actions: Vec::new(),
+            rejected_actions_total: U64::new(0),
+            possibly_executed: Vec::new(),
+            possibly_executed_total: U64::new(0),
+            omitted_actions: U64::new(0),
+            names_pending: U64::new(0),
+            detail: String::new(),
+        };
+        kr_protocol::action::RevocationBarrier::new(
+            AuthorityRevision::new(2),
+            vec![
+                worker(
+                    session(SESSION_A),
+                    kr_protocol::action::BarrierState::Pending,
+                ),
+                worker(session(0x7f), kr_protocol::action::BarrierState::Pending),
+            ],
+        )
+    }
+}
+
 /// The three reads of a grant the coordinator makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Seam {
@@ -172,6 +201,7 @@ impl Authority {
         Some(Box::pin(async move {
             held.waited_on.notify_one();
             held.released.notified().await;
+            Ok(held.barrier())
         }))
     }
 
@@ -2251,6 +2281,12 @@ async fn a_stop_waits_for_the_fence_its_withdrawal_owes() {
     let stopped = stopping.await.expect("the stop ends").expect("it stops");
     assert!(stopped.broker_notified);
     assert_eq!(coordinator.live_sessions(), 0);
+    // The answer says where the barrier stood, cut to the sessions the call reached: a worker that
+    // had not acknowledged is named as pending, and a session the call did not reach is not named.
+    let barrier = stopped.barrier.0.expect("the stop carries its barrier");
+    assert_eq!(barrier.pending(), vec![session(SESSION_A)]);
+    assert_eq!(barrier.workers_total.get(), 1);
+    assert!(!barrier.holds());
 }
 
 /// KR-REQ-15.14 and 09.12: replacing the standing grant answers once the fence the withdrawal of
@@ -2281,7 +2317,7 @@ async fn replacing_the_standing_grant_waits_for_the_fence_its_withdrawal_owes() 
     }
 
     owed.released.notify_one();
-    replacing
+    let replaced = replacing
         .await
         .expect("the replacement ends")
         .expect("it is made");
@@ -2290,6 +2326,12 @@ async fn replacing_the_standing_grant_waits_for_the_fence_its_withdrawal_owes() 
         0,
         "and the call under it ended"
     );
+    let barrier = replaced
+        .barrier
+        .0
+        .expect("the replacement carries its barrier");
+    assert_eq!(barrier.pending(), vec![session(SESSION_A)]);
+    assert_eq!(barrier.workers_total.get(), 1);
 }
 
 /// KR-REQ-15.02: a voice session is not a shell session. Stopping one names the terminal sessions
@@ -2306,6 +2348,10 @@ async fn stopping_a_voice_session_leaves_the_terminal_sessions_running() {
     assert_eq!(
         result.sessions_left_running,
         [session(SESSION_A)].into_iter().collect()
+    );
+    assert!(
+        result.barrier.0.is_none(),
+        "a stop that owed no fence reports none"
     );
     assert!(
         fixture.submitter.proposals().is_empty(),

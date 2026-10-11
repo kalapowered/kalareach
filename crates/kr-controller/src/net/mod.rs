@@ -1935,34 +1935,66 @@ impl Controller {
         decided
     }
 
-    /// A grant as this host's configuration lets it be used: its rights narrowed to the ceiling in
-    /// force, and nothing else changed.
+    /// A paired device's grant as this host lets it be used: its rights as the host's policy leaves
+    /// them and as the rights ceiling its configuration put in force allows, and nothing else
+    /// changed.
     ///
-    /// This is the narrowing [`crate::config::ceilings::decide_with_ceiling`] makes before it
-    /// decides a request, for a reader that has no request to decide: the voice service reads the
-    /// device's grant to see what a spoken action may use, and a right this host has taken away
-    /// from every grant is not one it may use. A host with no ceiling returns the grant as it is.
-    pub(crate) fn under_the_rights_ceiling(
+    /// The two narrowings [`Self::decide_for_device`] makes before it decides a request, for a
+    /// reader that has no request to decide: the voice service reads the grant a spoken action runs
+    /// under, and a right this host has taken away from every grant, or that an organisation's
+    /// lease does not give, is not one a spoken action may use. A grant that carries an
+    /// organisation requirement this host cannot meet, or whose offline bound has run out, is
+    /// refused as a typed request under it would be.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rule of the policy that refused.
+    pub(crate) fn as_this_host_lets_it_be_used(
         &self,
         grant: kr_protocol::grant::Grant,
-    ) -> kr_protocol::grant::Grant {
+    ) -> std::result::Result<kr_protocol::grant::Grant, crate::grants::Refusal> {
         let ceiling = self
             .rights_ceiling
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let Some(ceiling) = ceiling else {
-            return grant;
+        let narrowed = ceiling.as_ref().map_or_else(
+            || grant.clone(),
+            |ceiling| crate::config::ceilings::narrowed_by(&grant, ceiling),
+        );
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now_ms = policy.settled_now(self.wall_now_ms());
+        let request = crate::grants::AccessRequest {
+            method: kr_protocol::method::Method::VoiceDelegate,
+            ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+            environment_id: self.paths().environment_id(),
+            session_id: None,
+            claims_geometry: false,
+            own_subject: None,
+            now_ms,
+            continuous_now: self.clock.now(),
         };
-        kr_protocol::grant::Grant {
-            actions: grant
-                .actions
-                .iter()
-                .copied()
-                .filter(|right| ceiling.contains(right))
-                .collect(),
-            ..grant
+        let intersection = policy.intersect(&narrowed, &request, now_ms)?;
+        // The offline bound is held to its continuous end as well, as a typed request's is.
+        if self.lifetimes.offline_bound_ended(
+            intersection.offline.as_ref(),
+            self.clock.now(),
+            &policy,
+        ) {
+            return Err(crate::grants::Refusal::OfflineValidityLapsed {
+                last_synchronised_at_ms: policy
+                    .offline_validity()
+                    .and_then(|offline| offline.last_synchronised_at_ms.as_ref())
+                    .map(|at| at.get()),
+            });
         }
+        Ok(kr_protocol::grant::Grant {
+            actions: intersection.rights,
+            ..narrowed
+        })
     }
 
     /// Writes down the time the offline bound has spent, as the network's record task does at

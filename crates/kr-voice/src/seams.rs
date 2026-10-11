@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use kr_protocol::action::RevocationBarrier;
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{ActionId, ApprovalRequestId, DeviceId, GrantId, SessionId};
 use kr_protocol::scalars::{CanonicalSet, Digest256};
@@ -161,10 +162,11 @@ pub trait ContextSource: Send + Sync + fmt::Debug {
 ///
 /// A grant a worker could still be acting under is not gone until that worker holds the revision
 /// that refuses it. The host raises that fence as the withdrawal commits; this is the wait for it,
-/// to be awaited outside any lock and before the withdrawal is answered. Dropping it does not
-/// cancel the fence: a caller that stops waiting stops waiting to answer, and the host raises the
-/// fence all the same.
-pub type Fence = Pin<Box<dyn Future<Output = ()> + Send>>;
+/// to be awaited outside any lock and before the withdrawal is answered, and it ends with the
+/// barrier as it stands: every worker that acknowledged, and those that did not, named as pending.
+/// A barrier that could not be raised at all is the error. Dropping it does not cancel the fence:
+/// a caller that stops waiting stops waiting to answer, and the host raises the fence all the same.
+pub type Fence = Pin<Box<dyn Future<Output = Result<RevocationBarrier>> + Send>>;
 
 /// A grant withdrawn.
 pub struct Revoked {

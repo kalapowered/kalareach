@@ -38,6 +38,7 @@ use kr_cbor::CborError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::action::RevocationBarrier;
 use crate::ids::{ActionId, ConfirmationId, DeviceId, GrantId, SessionId, VoiceSessionId};
 use crate::rights::ActionRight;
 use crate::scalars::{
@@ -607,6 +608,11 @@ pub struct VoiceGrantParams {
     pub actions: Nullable<CanonicalSet<VoiceAction>>,
 }
 
+/// What a result an earlier build kept says of the barrier it did not report: none.
+fn no_barrier() -> Nullable<RevocationBarrier> {
+    Nullable::null()
+}
+
 /// The result of `voice.grant`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -623,6 +629,16 @@ pub struct VoiceGrantResult {
     /// device holds narrows rather than enlarges. Naming what was dropped is what stops a person
     /// believing they granted something they did not.
     pub not_held_by_device: CanonicalSet<VoiceAction>,
+    /// The per-worker status of the fence this replacement owed, cut to the sessions of the calls
+    /// it ended, and null when it owed none.
+    ///
+    /// A replacement withdraws the grant it replaces and the calls running under it. Withdrawing
+    /// a call's grant while a close sent under it can still reach a worker owes a fence, and the
+    /// withdrawal is complete only when the barrier holds: until then this names the workers that
+    /// have not acknowledged the new revision, not success. A result an earlier build kept has
+    /// none.
+    #[serde(default = "no_barrier")]
+    pub barrier: Nullable<RevocationBarrier>,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -921,6 +937,15 @@ pub struct VoiceStopResult {
     /// Section 15 ¶1: a voice session is not a shell session, and voice can stop while the agent
     /// continues.
     pub sessions_left_running: CanonicalSet<SessionId>,
+    /// The per-worker status of the fence this stop owed, cut to the sessions the call reached,
+    /// and null when it owed none.
+    ///
+    /// Withdrawing the call's grant while a close sent under it can still reach a worker owes a
+    /// fence, and the withdrawal is complete only when the barrier holds: until then this names
+    /// the workers that have not acknowledged the new revision, not success. The grant is revoked
+    /// either way. A result an earlier build kept has none.
+    #[serde(default = "no_barrier")]
+    pub barrier: Nullable<RevocationBarrier>,
 }
 
 /* -------------------------------------------------------------------------- */
