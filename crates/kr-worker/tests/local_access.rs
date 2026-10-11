@@ -623,10 +623,11 @@ async fn a_worker_with_no_clock_floor_serves_no_lease() {
 /// attachment, its input lease, and the stream it was sent.
 ///
 /// The connection is withdrawn, so a held input lease is released and nothing more is written to
-/// it. A statement that gives more than the one before it does none of this.
+/// it. A statement that gives more than the one before it does none of this. The shell is quiet,
+/// so no frame is written to the connection that could end it: only the statement does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_that_takes_access_away_withdraws_what_a_local_connection_holds() {
-    let world = world("while true; do printf 'line\\n'; sleep 1; done", true).await;
+    let world = world("sleep 30", true).await;
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
     tell(&mut daemon, world.machine.lease(1, FAR_MS, FAR_MS)).await;

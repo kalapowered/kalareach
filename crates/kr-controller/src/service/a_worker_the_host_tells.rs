@@ -6,7 +6,7 @@
 //! test reads what the worker was sent, in the order it arrived.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use kr_ipc::endpoint::Listener;
@@ -19,11 +19,15 @@ use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::worker::{AuthorityRevisionAck, LocalAccessAck};
 
 use super::Reach;
-use super::a_close_a_worker_never_answers::{self as world, Recorded, Silent};
+use super::a_close_a_worker_never_answers::{self as world, Silent};
 
 /// How long a test waits for something it waits for by condition, and fails after. Nothing is
 /// decided by it: a daemon that never gets there is the one thing that runs it out.
 const WAIT: Duration = Duration::from_secs(60);
+
+/// Every frame a recording worker was sent after its handshake, in arrival order, with the number
+/// of the connection that carried it.
+type Heard = Arc<std::sync::Mutex<Vec<(u64, ControlFrame)>>>;
 
 /// How a recording worker behaves.
 #[derive(Clone, Copy)]
@@ -37,10 +41,11 @@ struct Behaviour {
 /// A recording worker that answers what it is sent as a worker of `behaviour` does.
 fn recording(
     behaviour: Behaviour,
-    recorded: Recorded,
+    recorded: Heard,
 ) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
     move |listener, identity, endpoint_text| {
         let failing = Arc::new(AtomicBool::new(behaviour.fails_the_first_statement));
+        let links = Arc::new(AtomicU64::new(0));
         let stated: CanonicalSet<CapabilityId> = if behaviour.states {
             [CapabilityId::new(kr_protocol::local::LOCAL_ACCESS).expect("a capability")]
                 .into_iter()
@@ -58,6 +63,7 @@ fn recording(
                 let recorded = Arc::clone(&recorded);
                 let failing = Arc::clone(&failing);
                 let stated = stated.clone();
+                let link = links.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
@@ -80,7 +86,7 @@ fn recording(
                         recorded
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(frame.clone());
+                            .push((link, frame.clone()));
                         let answer = match frame {
                             ControlFrame::LocalAccess(access) => {
                                 // A worker that does not state the capability ends the link that
@@ -112,14 +118,22 @@ fn recording(
 }
 
 /// A daemon with one recording worker in its directory.
-async fn with(behaviour: Behaviour) -> (Silent, Recorded) {
-    let recorded: Recorded = Arc::default();
+async fn with(behaviour: Behaviour) -> (Silent, Heard) {
+    let recorded: Heard = Arc::default();
     let silent = world::fake_world(recording(behaviour, Arc::clone(&recorded))).await;
     (silent, recorded)
 }
 
 /// The frames the worker has been sent, in arrival order.
-fn heard(recorded: &Recorded) -> Vec<ControlFrame> {
+fn heard(recorded: &Heard) -> Vec<ControlFrame> {
+    heard_on(recorded)
+        .into_iter()
+        .map(|(_, frame)| frame)
+        .collect()
+}
+
+/// The same, with the connection each came on.
+fn heard_on(recorded: &Heard) -> Vec<(u64, ControlFrame)> {
     recorded
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -148,9 +162,16 @@ fn acknowledged(silent: &Silent, session_id: SessionId) -> u64 {
 }
 
 /// KR-REQ-17.54: a barrier tells a worker what the local owner may do before it announces the
-/// revision, so the worker acknowledges the revision only once it holds the bound in force.
+/// revision, over the link it announces on, so the worker acknowledges the revision only once it
+/// holds the bound in force.
+///
+/// The daemon's link to the worker was opened and used before, while the host was not exclusive. A
+/// restriction then commits, and the publisher has not yet repeated its pass. The barrier's own
+/// statement is the only thing that can put the new bound in front of the revision on that link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_barrier_tells_a_worker_what_its_local_owner_may_do_before_it_announces_the_revision() {
+    use kr_protocol::worker::LocalBound;
+
     let (silent, recorded) = with(Behaviour {
         states: true,
         fails_the_first_statement: false,
@@ -158,25 +179,46 @@ async fn a_barrier_tells_a_worker_what_its_local_owner_may_do_before_it_announce
     .await;
     let controller = &silent.controller;
     world::acknowledged(controller, silent.session_id);
+    controller.tell_workers().await;
+    assert!(
+        heard(&recorded)
+            .iter()
+            .any(|frame| matches!(frame, ControlFrame::LocalAccess(_))),
+        "the worker was told while the host was not exclusive"
+    );
 
+    // The restriction commits; nothing wakes the publisher.
+    controller
+        .policy
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_exclusively_managed(true);
     let debt = controller
         .owe_debt("a change that restricts", Reach::Host)
         .expect("written");
     let own = controller.publish_debts(&[(debt, Reach::Host)]);
     controller.barrier(own).await.expect("a barrier");
 
-    let frames = heard(&recorded);
-    let told = frames
+    let frames = heard_on(&recorded);
+    let (link, announced) = frames
         .iter()
-        .position(|frame| matches!(frame, ControlFrame::LocalAccess(_)))
-        .expect("the worker was told what the local owner may do");
-    let announced = frames
-        .iter()
-        .position(|frame| matches!(frame, ControlFrame::AuthorityRevision(_)))
+        .enumerate()
+        .find_map(|(at, (link, frame))| {
+            matches!(frame, ControlFrame::AuthorityRevision(_)).then_some((*link, at))
+        })
         .expect("the worker was sent the revision");
-    assert!(
-        told < announced,
-        "the statement comes before the revision: {frames:?}"
+    let told = frames[..announced]
+        .iter()
+        .rev()
+        .find_map(|(carried_on, frame)| match frame {
+            ControlFrame::LocalAccess(access) if *carried_on == link => Some(*access),
+            _ => None,
+        })
+        .expect("the link the revision came on carried a statement before it");
+    assert_eq!(
+        told.bound,
+        LocalBound::Closed,
+        "and it was the bound in force, not the one the link was last told: {frames:?}"
     );
     silent.serving.abort();
 }
