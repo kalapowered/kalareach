@@ -68,7 +68,9 @@ pub struct OrganisationWithdrawParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrganisationExclusiveSetResult {
-    /// Whether the host is exclusively organisation-managed now.
+    /// The value the action set, which is what the answer to a repeat of the action reports. A
+    /// later change leaves it as it was; `organisation.list` reports whether the host is
+    /// exclusively organisation-managed now.
     pub exclusive: bool,
     /// The authority revision in force when the change was answered.
     pub authority_revision: AuthorityRevision,

@@ -17897,7 +17897,9 @@ export interface OrganisationExclusiveSetResult {
    */
   barrier: RevocationBarrier1 | null
   /**
-   * Whether the host is exclusively organisation-managed now.
+   * The value the action set, which is what the answer to a repeat of the action reports. A
+   * later change leaves it as it was; `organisation.list` reports whether the host is
+   * exclusively organisation-managed now.
    */
   exclusive: boolean
 }

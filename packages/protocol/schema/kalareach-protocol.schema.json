@@ -22434,7 +22434,7 @@
           "description": "The per-worker completion of the fence that making a host exclusive owes, because it\nrestricts work already admitted. Null when the change was to end exclusive management,\nwhich restricts nothing."
         },
         "exclusive": {
-          "description": "Whether the host is exclusively organisation-managed now.",
+          "description": "The value the action set, which is what the answer to a repeat of the action reports. A\nlater change leaves it as it was; `organisation.list` reports whether the host is\nexclusively organisation-managed now.",
           "type": "boolean"
         }
       },
