@@ -196,6 +196,7 @@ impl UserManager {
             let mut asked = manager.systemctl(&["show", "--property=Version", "--value"]);
             asked.env_remove("DBUS_SESSION_BUS_ADDRESS");
             if bounded(asked, STREAMS_DEADLINE).is_ok_and(|answer| answer.status.success()) {
+                manager.keep_its_units_on_it()?;
                 return Ok(manager);
             }
             let ended = manager
@@ -210,6 +211,31 @@ impl UserManager {
                 ));
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Gives the units this manager starts their own manager's runtime directory, so that what
+    /// they ask of the user's service manager reaches this manager and not the one of whoever
+    /// runs the tests.
+    ///
+    /// A user manager takes the variables of the host's environment files (`/etc/environment`
+    /// through the environment generators) over those it was started with. Where such a file
+    /// names `XDG_RUNTIME_DIR`, as the hosted runner's image does, the units inherit the runtime
+    /// directory of whoever runs the tests, and a daemon in one of them that asks the user's
+    /// service manager to start a worker reaches that manager instead of this one. The manager's
+    /// own environment has priority over the generators' and is kept when the manager reads its
+    /// unit files again, which every case that chooses the service start does.
+    fn keep_its_units_on_it(&self) -> Result<(), String> {
+        let mut set = self.systemctl(&["set-environment"]);
+        set.arg(format!("XDG_RUNTIME_DIR={}", self.runtime.display()));
+        let set = bounded(set, STREAMS_DEADLINE)?;
+        if set.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the test's user manager would not take its own runtime directory for its units: {}",
+                String::from_utf8_lossy(&set.stderr).trim()
+            ))
         }
     }
 
