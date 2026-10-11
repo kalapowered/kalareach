@@ -1582,6 +1582,15 @@ struct Ends {
     client: Sink,
 }
 
+/// What is told of each frame a connection carries.
+struct FrameNote(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for FrameNote {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FrameNote")
+    }
+}
+
 /// One live connection, owned by one supervised task.
 #[derive(Debug)]
 pub struct Duplex {
@@ -1602,6 +1611,8 @@ pub struct Duplex {
     /// How long one reverse operation has before the upstream is told it did not finish, in
     /// milliseconds.
     reverse_deadline_ms: AtomicU64,
+    /// What is told of every frame this connection carries, once something has asked to be.
+    activity: std::sync::OnceLock<FrameNote>,
     /// A pause immediately before the next reverse operation touches the filesystem, which this
     /// host's own tests arm to stand at that point. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1666,6 +1677,7 @@ impl Duplex {
                 u64::try_from(crate::broker::host::REVERSE_DEADLINE.as_millis())
                     .unwrap_or(u64::MAX),
             ),
+            activity: std::sync::OnceLock::new(),
             #[cfg(feature = "testing")]
             reverse_pause: std::sync::Mutex::new(None),
         });
@@ -2352,6 +2364,15 @@ impl Duplex {
             .map(|_| true)
     }
 
+    /// Has `note` called for every frame this connection takes from either end, before the frame is
+    /// carried. It is set once: a second call changes nothing.
+    ///
+    /// The session uses it to look at the processes it owns while an agent is busy, since what an
+    /// agent starts is started in answer to a frame.
+    pub fn on_frame(&self, note: impl Fn() + Send + Sync + 'static) {
+        let _ = self.activity.set(FrameNote(Arc::new(note)));
+    }
+
     /// Reads one end for as long as it has frames, carrying each one.
     ///
     /// `upstream` says which end this is. The loop ends when the end closes, when the owner is
@@ -2380,6 +2401,9 @@ impl Duplex {
             loop {
                 match self.framing.decode(&mut buffer) {
                     Ok(Some(frame)) => {
+                        if let Some(note) = self.activity.get() {
+                            (note.0)();
+                        }
                         let now = kr_ipc::now_ms();
                         let carried = if upstream {
                             self.from_upstream(&frame, now).await
