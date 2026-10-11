@@ -146,7 +146,9 @@
       "digest": "3ab5cb547eb0cc1a0de8e94452f5094b985c5fe86b8d564ceb55cdad3b0761e6",
       "kept": [
         "ConfigurationDocument"
-      ]
+      ],
+      "level": 1,
+      "near_miss": 2
     },
     {
       "entry": {
