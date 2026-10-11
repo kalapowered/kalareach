@@ -9,11 +9,18 @@
 //!
 //! What this resolves: paths, generic arguments, tuples, references, arrays and slices; `use` lines
 //! with renames, groups and globs; `crate::`, `self::` and `super::`; modules that are files; and
-//! re-exports. What it refuses to resolve, and says so: a type made by a macro, a trait object, an
-//! `impl` type, a qualified path (`<T as Trait>::Name`), an alias, a name that is not brought in by
-//! any `use` and is not defined in the file, an item defined twice in one file, an item inside an
-//! inline module, and a path through an inline module or a module with a `#[path]` attribute (an
-//! inline module has a scope of its own, which this does not keep apart).
+//! re-exports. What it refuses to resolve, and says so: a type made by a macro in a type position,
+//! a trait object, an `impl` type, a qualified path (`<T as Trait>::Name`), an alias, a name that is
+//! not brought in by any `use` and is not defined in the file, an item defined twice in one file,
+//! an item inside an inline module, a path through an inline module or a module with a `#[path]`
+//! attribute (an inline module has a scope of its own, which this does not keep apart), a glob of
+//! the workspace that cannot be followed, and a name two globs bring in.
+//!
+//! What it takes for a definition without a line of its own, and the documents say so: a
+//! capitalised word in a macro call at the top of a file (a macro may define the type), a name an
+//! external glob might bring in (it is taken to be that crate's), and the protocol's scalars.
+//! Where the code is legal Rust and this refuses it (a glob of an enum's variants, a cycle of
+//! globs), the detection reports it, and the table names the type another way.
 //!
 //! What it does not see, and the documents say so: a serde attribute (`from`, `into`, `with`,
 //! `remote`) or a hand-written `Serialize` that changes the stored form of a field without
