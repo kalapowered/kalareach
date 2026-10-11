@@ -1373,14 +1373,6 @@ impl Broker {
         Ok(())
     }
 
-    /// Lets go of the tables pinned for one instance, because its launch was given back or its
-    /// backend has ended.
-    pub fn unpin_tables(&self, application_instance_id: ApplicationInstanceId) {
-        self.state()
-            .pinned_tables
-            .retain(|(instance, _), _| *instance != application_instance_id);
-    }
-
     /// Records that another attachment is watching one instance.
     pub fn attach(&self, application_instance_id: ApplicationInstanceId) {
         if let Some(instance) = self.state().instances.get_mut(&application_instance_id) {

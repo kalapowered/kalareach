@@ -539,6 +539,10 @@ pub struct CommandBackends {
     /// The session's adoptions, which end with its backends when the session closes.
     #[cfg(unix)]
     adoptions: Option<Arc<crate::broker::adoption::Adoptions>>,
+    /// The backends of a closing session whose servers are still to be ended, until the closure
+    /// ends them ([`CommandBackends::end_servers`]).
+    #[cfg(unix)]
+    closing: Mutex<Vec<Arc<Backend>>>,
     /// Where the next committed launch stops before the launcher is told, for this host's own tests.
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
@@ -572,6 +576,10 @@ pub struct CommandBackends {
     /// Where the next close stops before it retires a backend, for this host's own tests.
     #[cfg(feature = "testing")]
     retire_pause: Mutex<Option<DirectoryPause>>,
+    /// Where the next close stops once a backend's instance is ended and before its files are
+    /// taken down, for this host's own tests.
+    #[cfg(feature = "testing")]
+    files_pause: Mutex<Option<DirectoryPause>>,
 }
 
 /// The two ends of one armed pause: what says the launch arrived there, and what lets it go on.
@@ -654,6 +662,8 @@ impl CommandBackends {
             views: None,
             #[cfg(unix)]
             adoptions: None,
+            #[cfg(unix)]
+            closing: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             confirm_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
@@ -672,6 +682,8 @@ impl CommandBackends {
             connection_deadline: Mutex::new(None),
             #[cfg(feature = "testing")]
             retire_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            files_pause: Mutex::new(None),
         }
     }
 
@@ -853,6 +865,25 @@ impl CommandBackends {
         let (release, go) = tokio::sync::oneshot::channel();
         *self
             .unpublish_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next close once its first backend's instance is ended and before the backend's
+    /// files are taken down, for this host's own tests: what is true then is what a reader of the
+    /// registration sees while a close is half done.
+    ///
+    /// Returns the end that says the close has arrived there and the end that lets it go on. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_removing_files(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .files_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -1048,11 +1079,13 @@ impl CommandBackends {
     /// Retires every backend, because the session is closing, removes the session's root, and
     /// returns the ends the session is to announce.
     ///
-    /// No program is stopped here: the session's own closure owns the programs. What ends here is
-    /// each committed launch's instance, with its grant, since the session is ending its program,
-    /// and every instance the session adopted. It is called with the session's lock held, so
-    /// nothing here takes it: the session announces what this returns. A launcher that looks now
-    /// finds nothing to present to, and runs what was typed.
+    /// No program is stopped here: the session's own closure owns the programs, and the servers
+    /// that backends run are ended by it after the acceptance of the close has been delivered
+    /// ([`CommandBackends::end_servers`]), since the requester may be a command that a server
+    /// started. What ends here is each committed launch's instance, with its grant, since the
+    /// session is ending its program, and every instance the session adopted. It is called with
+    /// the session's lock held, so nothing here takes it: the session announces what this returns.
+    /// A launcher that looks now finds nothing to present to, and runs what was typed.
     #[must_use]
     pub fn close(&self) -> Vec<kr_protocol::projection::AgentInstanceSummary> {
         let backends = std::mem::take(
@@ -1078,9 +1111,31 @@ impl CommandBackends {
             // Retired first, under its lifecycle lock, so no launch commits under it afterwards;
             // then whatever instance it registered is ended, whichever state the launch had
             // reached: a committed one is the session's to end, and one a launch still holds is
-            // given back by that launch's guard, for which an ended instance is nothing to undo.
-            backend.retire();
+            // given back by that launch's guard, for which an ended instance is nothing to undo;
+            // and only then its files go, so that whoever finds the registration gone finds
+            // nothing of the launch held.
+            backend.fence();
             ended.extend(backend.end_at_close(&self.broker));
+            #[cfg(feature = "testing")]
+            {
+                let armed = self
+                    .files_pause
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((arrived, go)) = armed {
+                    let _ = arrived.send(());
+                    let _ = go.recv();
+                }
+            }
+            backend.remove_files();
+            #[cfg(unix)]
+            if backend.gateway_run.is_some() {
+                self.closing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(backend);
+            }
         }
         #[cfg(unix)]
         if let Some(adoptions) = self.adoptions.as_ref() {
@@ -1095,6 +1150,30 @@ impl CommandBackends {
             let _ = std::fs::remove_dir_all(root);
         }
         ended
+    }
+
+    /// Ends the servers the backends of a closing session run, and what the session recorded below
+    /// them, and returns the processes still running when they were ended.
+    ///
+    /// The session's closure calls this after the acceptance of the close has been delivered, and
+    /// beside its own request to stop the processes it owns, so that a server ends gently, with
+    /// the end of its input, before anything is forced.
+    #[cfg(unix)]
+    pub async fn end_servers(&self) -> Vec<ProcessStartIdentity> {
+        let closing = std::mem::take(
+            &mut *self
+                .closing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for backend in &closing {
+            backend.end_gateway();
+        }
+        let mut survivors = Vec::new();
+        for backend in &closing {
+            survivors.extend(backend.endings().await);
+        }
+        survivors
     }
 
     /// Returns the session's root, once the first establish has made it.
@@ -1605,6 +1684,16 @@ impl Backend {
     /// any guard it holds. A launcher that looks later finds nothing and runs what was typed, which
     /// its variable's file name tells it.
     fn retire(&self) {
+        self.fence();
+        // The program's connection and the server end with the backend.
+        #[cfg(unix)]
+        self.end_gateway();
+        self.remove_files();
+    }
+
+    /// Closes this backend to launches: no more connections and no running admission. Nothing it
+    /// published is taken down.
+    fn fence(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.lifecycle.retire();
         for task in self
@@ -1615,9 +1704,11 @@ impl Backend {
         {
             task.abort();
         }
-        // The program's connection and the server end with the backend.
-        #[cfg(unix)]
-        self.end_gateway();
+    }
+
+    /// Takes down what this backend published: its credential, registration, launch record,
+    /// sockets and directory. Idempotent.
+    fn remove_files(&self) {
         // The path held for the grant is let go of with the backend: the directory can be renamed
         // again once nothing is using it for a launch.
         #[cfg(windows)]
