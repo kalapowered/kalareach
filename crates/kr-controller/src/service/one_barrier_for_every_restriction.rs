@@ -337,13 +337,19 @@ fn the_holder() -> kr_protocol::ids::DeviceId {
     kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0xd0; 16]))
 }
 
+/// The session of the worker a notice is built for.
+fn a_session() -> kr_protocol::ids::SessionId {
+    kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([0x5e; 16]))
+}
+
 fn grants_reach(bytes: &[u8]) -> Reach {
-    Reach::Grants(
-        bytes
+    Reach::Grants {
+        grants: bytes
             .iter()
             .map(|byte| (a_grant(*byte), the_holder()))
             .collect(),
-    )
+        sessions: crate::grants::SessionScope::Every,
+    }
 }
 
 /// A worker that has acknowledged no revision.
@@ -385,20 +391,26 @@ async fn a_worker_that_does_not_read_a_revisions_reach_is_announced_the_whole_ho
 
     assert_eq!(
         controller
-            .revision_notice(revision, nothing_held(), 0, &stating())
+            .revision_notice(revision, nothing_held(), a_session(), 0, &stating())
             .reach,
         within(one_before(revision), &[0x61])
     );
     assert_eq!(
         controller
-            .revision_notice(revision, nothing_held(), 0, &CanonicalSet::new())
+            .revision_notice(
+                revision,
+                nothing_held(),
+                a_session(),
+                0,
+                &CanonicalSet::new()
+            )
             .reach,
         RevisionReach::Host,
         "a worker that states nothing is told nothing of the reach"
     );
     assert_eq!(
         controller
-            .revision_notice(revision, nothing_held(), 3, &stating())
+            .revision_notice(revision, nothing_held(), a_session(), 3, &stating())
             .reach,
         RevisionReach::Host,
         "a page of the evidence of a revision the worker has fenced names no reach"
@@ -442,7 +454,7 @@ async fn a_revision_is_announced_with_every_debt_its_barrier_captured_or_as_the_
     let RevisionReach::Within {
         grants, devices, ..
     } = controller
-        .revision_notice(both, nothing_held(), 0, &stating())
+        .revision_notice(both, nothing_held(), a_session(), 0, &stating())
         .reach
     else {
         panic!("a grant and a device are named");
@@ -478,7 +490,7 @@ async fn a_revision_is_announced_with_every_debt_its_barrier_captured_or_as_the_
         let revision = kr_protocol::ids::AuthorityRevision::new(revision(&controller).await);
         assert_eq!(
             controller
-                .revision_notice(revision, nothing_held(), 0, &stating())
+                .revision_notice(revision, nothing_held(), a_session(), 0, &stating())
                 .reach,
             RevisionReach::Host,
             "a restriction that reaches the host is the host's whatever else it took ({position})"
@@ -501,21 +513,21 @@ async fn a_revision_is_announced_with_the_reach_of_the_revisions_before_it_that_
     let second = barrier_for(&controller, grants_reach(&[0x62])).await;
     assert_eq!(
         controller
-            .revision_notice(second, nothing_held(), 0, &stating())
+            .revision_notice(second, nothing_held(), a_session(), 0, &stating())
             .reach,
         within(host, &[0x61, 0x62]),
         "the two revisions after the one that reached the host"
     );
     assert_eq!(
         controller
-            .revision_notice(first, nothing_held(), 0, &stating())
+            .revision_notice(first, nothing_held(), a_session(), 0, &stating())
             .reach,
         within(host, &[0x61]),
         "a revision announced after a later one was written is described as it was"
     );
     assert!(
         controller
-            .revision_notice(host, nothing_held(), 0, &stating())
+            .revision_notice(host, nothing_held(), a_session(), 0, &stating())
             .reach
             .is_host()
     );
@@ -541,8 +553,8 @@ async fn a_subtree_too_large_to_name_is_named_by_the_devices_that_hold_it() {
     // `count` grants from `first`, issued to the devices `holders` in turn.
     let held = |first: u32, count: u32, holders: std::ops::Range<u32>| {
         let holders: Vec<_> = holders.map(a_device).collect();
-        Reach::Grants(
-            (first..first + count)
+        Reach::Grants {
+            grants: (first..first + count)
                 .zip(holders.iter().cycle())
                 .map(|(number, holder)| {
                     let mut bytes = [0_u8; 16];
@@ -555,7 +567,8 @@ async fn a_subtree_too_large_to_name_is_named_by_the_devices_that_hold_it() {
                     )
                 })
                 .collect(),
-        )
+            sessions: crate::grants::SessionScope::Every,
+        }
     };
     let bound = u32::try_from(kr_protocol::worker::MAX_REVISION_REACH_NAMES).expect("fits");
     let named = |notice: kr_protocol::worker::AuthorityRevisionNotice| match notice.reach {
@@ -570,7 +583,7 @@ async fn a_subtree_too_large_to_name_is_named_by_the_devices_that_hold_it() {
     // More grants than a notice names, held by two devices: the two devices are named.
     let over = barrier_for(&controller, held(1, bound + 1, 1..3)).await;
     let (since, grants, devices) =
-        named(controller.revision_notice(over, one_before(over), 0, &stating()));
+        named(controller.revision_notice(over, one_before(over), a_session(), 0, &stating()));
     assert_eq!(since, one_before(over));
     assert!(grants.is_empty(), "no grant is named");
     assert_eq!(
@@ -582,7 +595,7 @@ async fn a_subtree_too_large_to_name_is_named_by_the_devices_that_hold_it() {
     let hosted = barrier_for(&controller, held(1, bound + 1, 1..bound + 2)).await;
     assert!(
         controller
-            .revision_notice(hosted, one_before(hosted), 0, &stating())
+            .revision_notice(hosted, one_before(hosted), a_session(), 0, &stating())
             .reach
             .is_host()
     );
@@ -593,14 +606,16 @@ async fn a_subtree_too_large_to_name_is_named_by_the_devices_that_hold_it() {
 
     // A worker that acknowledged the first is told the second alone, by grant: the devices that
     // held the first took their leases again after it, and are not named.
-    let (since, grants, devices) = named(controller.revision_notice(small, big, 0, &stating()));
+    let (since, grants, devices) =
+        named(controller.revision_notice(small, big, a_session(), 0, &stating()));
     assert_eq!(since, big);
     assert_eq!(grants.len(), 20, "the second revision, by grant");
     assert!(devices.is_empty(), "no device of the first revision");
 
     // A worker that acknowledged the revision before the first is told both: the first by its
     // device, the second by grant, and the join stops where the host's own begins.
-    let (since, grants, devices) = named(controller.revision_notice(small, hosted, 0, &stating()));
+    let (since, grants, devices) =
+        named(controller.revision_notice(small, hosted, a_session(), 0, &stating()));
     assert_eq!(since, hosted);
     assert_eq!(grants.len(), 20);
     assert_eq!(
@@ -608,11 +623,97 @@ async fn a_subtree_too_large_to_name_is_named_by_the_devices_that_hold_it() {
         vec![a_device(3)],
         "the device that held the first revision's grants"
     );
-    let (since, ..) = named(controller.revision_notice(small, nothing_held(), 0, &stating()));
+    let (since, ..) =
+        named(controller.revision_notice(small, nothing_held(), a_session(), 0, &stating()));
     assert_eq!(
         since, hosted,
         "and a worker that acknowledged none is told the same"
     );
+    drop(controller);
+}
+
+/// KR-REQ-10.45: a worker is told what was withdrawn in its own session. A subtree too large to name
+/// grant by grant is named by the devices that hold it, and a device that took part in it loses the
+/// input it holds under it in the sessions the subtree covers, not the input it holds in another
+/// session. A worker of a session the subtree does not cover is told nothing was withdrawn there,
+/// and keeps every lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_is_told_only_what_was_withdrawn_in_its_own_session() {
+    use kr_protocol::worker::RevisionReach;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+    let session = |byte: u8| {
+        kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
+    };
+    let device = |byte: u8| {
+        kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
+    };
+    let bound = u32::try_from(kr_protocol::worker::MAX_REVISION_REACH_NAMES).expect("fits");
+    // More grants than a notice names, in session A, held by two devices.
+    let in_a = Reach::Grants {
+        grants: (1..=bound + 1)
+            .map(|number| {
+                let mut bytes = [0_u8; 16];
+                bytes[..4].copy_from_slice(&number.to_be_bytes());
+                (
+                    kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(bytes)),
+                    device(if number % 2 == 0 { 0xa1 } else { 0xa2 }),
+                )
+            })
+            .collect(),
+        sessions: crate::grants::SessionScope::These([session(0xaa)].into_iter().collect()),
+    };
+    let revision = barrier_for(&controller, in_a).await;
+    let held = one_before(revision);
+
+    let RevisionReach::Within {
+        since,
+        grants,
+        devices,
+    } = controller
+        .revision_notice(revision, held, session(0xaa), 0, &stating())
+        .reach
+    else {
+        panic!("session A is told whose authority was withdrawn");
+    };
+    assert_eq!(since, held);
+    assert!(grants.is_empty());
+    assert_eq!(
+        devices.iter().copied().collect::<Vec<_>>(),
+        vec![device(0xa1), device(0xa2)],
+        "the two devices that hold the subtree, in the session it covers"
+    );
+
+    // Session B is told that nothing was withdrawn there: an empty reach it applies, not the host.
+    let RevisionReach::Within {
+        since,
+        grants,
+        devices,
+    } = controller
+        .revision_notice(revision, held, session(0xbb), 0, &stating())
+        .reach
+    else {
+        panic!("session B is told that nothing of its own was withdrawn");
+    };
+    assert_eq!(since, held);
+    assert!(grants.is_empty() && devices.is_empty());
+
+    // A subtree over every session is told to every worker.
+    let everywhere = barrier_for(&controller, grants_reach(&[0x61])).await;
+    let RevisionReach::Within { grants, .. } = controller
+        .revision_notice(
+            everywhere,
+            one_before(everywhere),
+            session(0xbb),
+            0,
+            &stating(),
+        )
+        .reach
+    else {
+        panic!("every session is told");
+    };
+    assert_eq!(grants.len(), 1);
     drop(controller);
 }
 
@@ -696,7 +797,7 @@ async fn a_revocation_names_every_held_grant_of_its_subtree_including_one_revoke
     let revision = kr_protocol::ids::AuthorityRevision::new(revision(&controller).await);
     assert_eq!(revision.get(), before + 1);
     let RevisionReach::Within { grants, .. } = controller
-        .revision_notice(revision, nothing_held(), 0, &stating())
+        .revision_notice(revision, nothing_held(), a_session(), 0, &stating())
         .reach
     else {
         panic!("the revocation names its grants");

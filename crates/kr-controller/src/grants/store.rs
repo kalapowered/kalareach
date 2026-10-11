@@ -193,6 +193,58 @@ impl Drop for ClaimHold {
     }
 }
 
+/// The sessions some grants cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionScope {
+    /// Every session.
+    Every,
+    /// These sessions and no others.
+    These(BTreeSet<SessionId>),
+}
+
+impl SessionScope {
+    /// The sessions none of the grants covers.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::These(BTreeSet::new())
+    }
+
+    /// Whether a worker of `session_id` can hold input under these.
+    #[must_use]
+    pub fn covers(&self, session_id: SessionId) -> bool {
+        match self {
+            Self::Every => true,
+            Self::These(sessions) => sessions.contains(&session_id),
+        }
+    }
+
+    /// The sessions either covers.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Every, _) | (_, Self::Every) => Self::Every,
+            (Self::These(mut sessions), Self::These(more)) => {
+                sessions.extend(more);
+                Self::These(sessions)
+            }
+        }
+    }
+
+    /// The sessions one grant covers.
+    fn of(record: &GrantRecord) -> Self {
+        let mut sessions = BTreeSet::new();
+        match &record.grant.session_selector {
+            kr_protocol::grant::SessionSelector::Any => return Self::Every,
+            kr_protocol::grant::SessionSelector::These { session_ids } => {
+                sessions.extend(session_ids.iter().copied());
+            }
+            kr_protocol::grant::SessionSelector::None => {}
+        }
+        sessions.extend(record.session_id);
+        Self::These(sessions)
+    }
+}
+
 /// What one revocation did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantRevocation {
@@ -201,16 +253,21 @@ pub struct GrantRevocation {
     /// Every grant this revocation revoked: the named one and its descendants, in order.
     pub revoked: Vec<GrantId>,
     /// Every grant of the subtree that can still hold input at a worker, each with the device it
-    /// was issued to (the device that acts under it): the live ones, and one that was revoked since
-    /// the oldest fence debt still on disk was recorded.
+    /// was issued to (the device that acts under it): the live ones, expired or not, and one that
+    /// was revoked at a moment a fence debt on disk was recorded.
     ///
     /// A grant a concurrent revocation withdrew just before this one read the subtree is not in
     /// [`Self::revoked`], and its own change may not have reached its barrier yet, so a fence that
-    /// named only what this call revoked would leave it out; its debt is on disk until that barrier
-    /// completes, which is what keeps it in here. A grant revoked earlier than every debt on disk
-    /// has been fenced, and so has one that ran out: the worker takes its lease at its deadline. A
-    /// proposal nobody redeemed has no holder and is not in here.
+    /// named only what this call revoked would leave it out; its debt, written in the transaction
+    /// that revoked it, is on disk until that barrier completes, which is what keeps it in here.
+    /// One revoked whose fence is done is not. A grant that has run out stays in: the worker takes
+    /// its lease at its own deadline on its own clock, and this host's clock is not the judge of
+    /// whether that has passed. A proposal nobody redeemed has no holder and is not in here. There
+    /// is one whenever [`Self::debt`] is, since the debt is written for a live grant of this list.
     pub reached: Vec<(GrantId, DeviceId)>,
+    /// The sessions the grants of [`Self::reached`] cover, which are the only workers that can hold
+    /// input under them.
+    pub reached_in: SessionScope,
     /// The devices that held what this call revoked, which is what a revocation has to fence.
     pub devices: BTreeSet<DeviceId>,
     /// The sessions those grants covered, which is what a revocation has to close subscriptions
@@ -906,6 +963,7 @@ impl GrantDirectory {
                 ),
                 revoked: Vec::new(),
                 reached: Vec::new(),
+                reached_in: SessionScope::none(),
                 devices: BTreeSet::new(),
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
@@ -947,6 +1005,7 @@ impl GrantDirectory {
                 )?;
                 merged.revoked.extend(one.revoked);
                 merged.reached.extend(one.reached);
+                merged.reached_in = merged.reached_in.union(one.reached_in);
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
                 merged.covers_every_session |= one.covers_every_session;
@@ -1004,20 +1063,21 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
         let mut reached = Vec::new();
+        let mut reached_in = SessionScope::none();
         let mut devices = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
         let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
-        let owed_since = oldest_fence_debt(connection)?;
+        let owed = moments_a_fence_is_owed(connection)?;
         for record in subtree {
             if record.is_active()
                 && owes_a_fence(&record.grant)
-                && record.grant.expiry.is_valid_at(now_ms)
                 && record
                     .revoked_at_ms
-                    .is_none_or(|revoked| owed_since.is_some_and(|owed| revoked >= owed))
+                    .is_none_or(|revoked| owed.contains(&revoked))
             {
                 reached.push((record.grant.grant_id, record.grant.recipient_device_id));
+                reached_in = reached_in.union(SessionScope::of(record));
             }
             let is_the_named_one = record.grant.grant_id == grant_id;
             let changed = connection
@@ -1073,6 +1133,7 @@ impl GrantDirectory {
             grant_id,
             revoked,
             reached,
+            reached_in,
             devices,
             sessions,
             covers_every_session,
@@ -3046,14 +3107,24 @@ fn owes_a_fence(grant: &Grant) -> bool {
     !grant.permits(kr_protocol::rights::ActionRight::VoiceUse)
 }
 
-/// When the oldest fence debt still on disk was recorded, in milliseconds.
-fn oldest_fence_debt(connection: &Connection) -> Result<Option<u64>> {
-    let oldest: Option<i64> = connection
-        .query_row("SELECT MIN(recorded_at_ms) FROM fence_debt", [], |row| {
-            row.get(0)
-        })
+/// The moments the fence debts still on disk were recorded at, in milliseconds.
+///
+/// A change writes its debt in the transaction that revokes, at the moment it revokes at, so a grant
+/// revoked at one of these moments is one whose fence has not completed: the debt is deleted when
+/// the barrier that follows its change is done.
+fn moments_a_fence_is_owed(connection: &Connection) -> Result<BTreeSet<u64>> {
+    let mut statement = connection
+        .prepare("SELECT recorded_at_ms FROM fence_debt")
         .map_err(ControllerError::registry)?;
-    Ok(oldest.map(|moment| u64::try_from(moment).unwrap_or_default()))
+    let moments = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(ControllerError::registry)?
+        .collect::<rusqlite::Result<Vec<i64>>>()
+        .map_err(ControllerError::registry)?;
+    Ok(moments
+        .into_iter()
+        .map(|moment| u64::try_from(moment).unwrap_or_default())
+        .collect())
 }
 
 /// Writes one change's fence debt inside the caller's transaction ([`GrantDirectory::owe_fence`]).

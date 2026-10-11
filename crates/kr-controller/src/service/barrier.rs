@@ -60,9 +60,15 @@ pub(crate) enum Reach {
     /// revision the barrier advances to, so one device's revocation is not everybody's reconnect.
     Device(kr_protocol::ids::DeviceId),
     /// The connections acting under these grants, which a share's revocation withdrew with its
-    /// descendants, each with the device it was issued to. A connection that acts under any other
-    /// grant, and the owner's own, are admitted again at the revision the barrier advances to.
-    Grants(std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::ids::DeviceId>),
+    /// descendants, each with the device it was issued to, in the sessions they cover. A connection
+    /// that acts under any other grant, and the owner's own, are admitted again at the revision the
+    /// barrier advances to.
+    Grants {
+        /// The grants, each with the device it was issued to.
+        grants: std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::ids::DeviceId>,
+        /// The sessions they cover: a worker of any other session holds nothing under them.
+        sessions: crate::grants::SessionScope,
+    },
 }
 
 /// The restrictive changes whose fence debt no barrier has retired (section 26).
@@ -93,7 +99,30 @@ pub(super) struct Debts {
     ///
     /// A daemon that restarts keeps none, and a revision with no entry is announced as the whole
     /// host's, which fences every caller under a grant.
-    reaches: BTreeMap<u64, Option<std::sync::Arc<Named>>>,
+    reaches: BTreeMap<u64, Option<std::sync::Arc<Withdrawn>>>,
+}
+
+/// What one revision withdrew, in the parts its debts reached, each with the sessions whose
+/// workers can hold input under it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Withdrawn {
+    parts: Vec<(crate::grants::SessionScope, Named)>,
+}
+
+impl Withdrawn {
+    /// What the worker of `session_id` is told of this revision: the parts that cover its session,
+    /// joined. A grant withdrawn in other sessions holds nothing there, and a device named for
+    /// them keeps what it holds here.
+    fn seen_by(&self, session_id: SessionId) -> Named {
+        self.parts
+            .iter()
+            .filter(|(sessions, _)| sessions.covers(session_id))
+            .fold(Named::default(), |named, (_, part)| named.joined(part))
+    }
+
+    fn len(&self) -> usize {
+        self.parts.iter().map(|(_, part)| part.len()).sum()
+    }
 }
 
 /// The grants and the devices one revision withdrew authority from.
@@ -108,10 +137,6 @@ impl Named {
     /// How many names a notice carries for this.
     fn len(&self) -> usize {
         self.grants.len() + self.devices.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     fn joined(&self, other: &Self) -> Self {
@@ -142,7 +167,7 @@ impl Named {
 
     /// This as a notice can carry it: as it is when it fits, and otherwise by devices
     /// ([`Self::by_devices`]). Only more devices than a notice can name make it none: the whole
-    /// host's, which no device can bring about, since the owner pairs every device.
+    /// host's.
     fn fitted(self) -> Option<Self> {
         if self.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES {
             return Some(self);
@@ -151,6 +176,10 @@ impl Named {
             .filter(|named| named.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES)
     }
 }
+
+/// How many grants and devices one revision's reach is kept with, in all its parts. A revision that
+/// withdrew more is announced as the whole host's.
+const MAX_RETAINED_REACH_NAMES: usize = 65_536;
 
 /// How many revisions' reaches the daemon keeps for their announcements.
 ///
@@ -452,6 +481,7 @@ impl Controller {
                                 .get(&session_id)
                                 .copied()
                                 .unwrap_or_else(|| AuthorityRevision::new(0)),
+                            session_id,
                             0,
                             &link.client().acknowledgement().capabilities,
                         );
@@ -843,46 +873,53 @@ impl Controller {
     /// ([`Named::fitted`]).
     fn reach_of(
         captured: &BTreeMap<crate::grants::store::DebtId, Reach>,
-    ) -> Option<std::sync::Arc<Named>> {
-        let mut named = Named::default();
+    ) -> Option<std::sync::Arc<Withdrawn>> {
+        let mut withdrawn = Withdrawn::default();
         for reach in captured.values() {
-            match reach {
+            let part = match reach {
                 Reach::Host => return None,
-                Reach::Device(device_id) => {
-                    named.devices.insert(*device_id);
-                }
-                Reach::Grants(grants) => {
-                    named
-                        .grants
-                        .extend(grants.iter().map(|(grant, device)| (*grant, *device)));
-                }
-            }
+                Reach::Device(device_id) => (
+                    crate::grants::SessionScope::Every,
+                    Named {
+                        grants: BTreeMap::new(),
+                        devices: [*device_id].into_iter().collect(),
+                    },
+                ),
+                Reach::Grants { grants, sessions } => (
+                    sessions.clone(),
+                    Named {
+                        grants: grants.clone(),
+                        devices: std::collections::BTreeSet::new(),
+                    },
+                ),
+            };
+            withdrawn.parts.push(part);
         }
-        named
-            .fitted()
-            .filter(|named| !named.is_empty())
-            .map(std::sync::Arc::new)
+        (withdrawn.len() > 0 && withdrawn.len() <= MAX_RETAINED_REACH_NAMES)
+            .then(|| std::sync::Arc::new(withdrawn))
     }
 
-    /// What the revisions a worker has not fenced withdrew, up to `revision`.
+    /// What the revisions a worker has not fenced withdrew, up to `revision`, as far as the worker
+    /// of `session_id` is concerned.
     ///
     /// `held` is the revision the worker last acknowledged, as this daemon recorded it, so the
     /// reach joins the revisions after it and no older ones: a lease the worker holds from before
     /// is a lease its holder took after those revisions, and a notice that named the holders of an
-    /// older revision again would take it. The reaches of consecutive revisions that each name
-    /// their authority are joined, back to the first one this daemon cannot name; the reach says it
-    /// follows that one, and a worker that has fenced it applies the reach, while any other fences
-    /// every caller under a grant. A join that passes what a notice can name is named by the
-    /// devices of its older revisions first ([`Named::by_devices`]), and the newest are kept by
-    /// grant for as long as they fit. A revision this daemon holds no reach for, because it
-    /// restarted since, is the whole host's.
+    /// older revision again would take it. Only what was withdrawn in the worker's session is
+    /// named. The reaches of consecutive revisions that each name their authority are joined, back
+    /// to the first one this daemon cannot name; the reach says it follows that one, and a worker
+    /// that has fenced it applies the reach, while any other fences every caller under a grant. A
+    /// join that passes what a notice can name is named by the devices of its older revisions
+    /// first ([`Named::by_devices`]), and the newest are kept by grant for as long as they fit. A
+    /// revision this daemon holds no reach for, because it restarted since, is the whole host's.
     fn reach_up_to(
         &self,
         revision: AuthorityRevision,
         held: AuthorityRevision,
+        session_id: SessionId,
     ) -> kr_protocol::worker::RevisionReach {
         // The entries are taken under the lock and joined outside it: they are shared, not copied.
-        let entries: Vec<std::sync::Arc<Named>> = {
+        let entries: Vec<std::sync::Arc<Withdrawn>> = {
             let debts = self.debts();
             let mut entries = Vec::new();
             let mut at = revision.get();
@@ -899,14 +936,17 @@ impl Controller {
             return kr_protocol::worker::RevisionReach::Host;
         };
         let bound = kr_protocol::worker::MAX_REVISION_REACH_NAMES;
-        let mut named = Named::clone(newest);
+        let Some(mut named) = newest.seen_by(session_id).fitted() else {
+            return kr_protocol::worker::RevisionReach::Host;
+        };
         let mut lowest = revision.get();
         for entry in older {
+            let entry = entry.seen_by(session_id);
             // As it is when it fits. Past what a notice can name, the older revision is named by
             // its devices and the newer ones stay by grant while that fits, and then all are
             // named by devices.
             let fits = |joined: Named| Some(joined).filter(|joined| joined.len() <= bound);
-            let joined = fits(named.joined(entry))
+            let joined = fits(named.joined(&entry))
                 .or_else(|| fits(named.joined(&entry.by_devices())))
                 .or_else(|| fits(named.by_devices().joined(&entry.by_devices())));
             let Some(joined) = joined else {
@@ -932,12 +972,13 @@ impl Controller {
         &self,
         revision: AuthorityRevision,
         held: AuthorityRevision,
+        session_id: SessionId,
         evidence_from: u64,
         capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> kr_protocol::worker::AuthorityRevisionNotice {
         let reach = if evidence_from == 0 && kr_protocol::local::reads_revision_reach(capabilities)
         {
-            self.reach_up_to(revision, held)
+            self.reach_up_to(revision, held, session_id)
         } else {
             kr_protocol::worker::RevisionReach::Host
         };
@@ -988,7 +1029,7 @@ impl Controller {
                     captured
                         .values()
                         .filter_map(|reach| match reach {
-                            Reach::Grants(grants) => Some(grants.keys().copied()),
+                            Reach::Grants { grants, .. } => Some(grants.keys().copied()),
                             Reach::Host | Reach::Device(_) => None,
                         })
                         .flatten()
@@ -1003,7 +1044,7 @@ impl Controller {
                             Reach::Device(device_id) => {
                                 Some(kr_transport::listener::device_principal(device_id))
                             }
-                            Reach::Host | Reach::Grants(_) => None,
+                            Reach::Host | Reach::Grants { .. } => None,
                         })
                         .collect();
                     // The connections that were not withdrawn hold authority these changes did not
