@@ -250,7 +250,7 @@ pub struct TextLines<S: AsyncRead + AsyncWrite + Unpin> {
     closing: Option<CloseCode>,
     /// When the window the ping and pong messages are counted in began, and how many have been
     /// read in it.
-    control_window: Option<(std::time::Instant, usize)>,
+    control_window: Option<(tokio::time::Instant, usize)>,
     /// Whether the terminal has sent a close, after which anything that goes wrong is its leaving.
     peer_closed: bool,
     /// The most bytes a message that is read may have.
@@ -373,7 +373,7 @@ where
                 continue;
             }
             if message.is_ping() || message.is_pong() {
-                let now = std::time::Instant::now();
+                let now = tokio::time::Instant::now();
                 let (since, counted) = this.control_window.get_or_insert((now, 0));
                 if now.duration_since(*since) >= CONTROL_WINDOW {
                     (*since, *counted) = (now, 0);
@@ -463,5 +463,79 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Drop for TextLines<S> {
         let mut context = Context::from_waker(std::task::Waker::noop());
         let _ = Pin::new(&mut self.socket).start_send(Message::close(Some(code), ""));
         let _ = Pin::new(&mut self.socket).poll_flush(&mut context);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::gateway::NativeFraming;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    /// A ping a terminal sends, which carries nothing and is masked, as a client's frames are.
+    const PING: [u8; 6] = [0x89, 0x80, 0, 0, 0, 0];
+
+    /// Gives the reading task the turns it needs to read what was written to it.
+    async fn settle() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// KR-REQ-11.32: the pings of a terminal are bounded by their rate and not by their number, so
+    /// a keepalive that goes on for as long as a session does is not cut off, and a flood is.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_11_32_a_slow_keepalive_is_not_cut_off_and_a_flood_is() {
+        let (mut terminal, gateway) = tokio::io::duplex(1 << 16);
+        let upgrading = tokio::spawn(accept(gateway, Framing::new(NativeFraming::JsonLines)));
+        terminal
+            .write_all(
+                b"GET /rpc HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .await
+            .expect("the request is written");
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 256];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = terminal.read(&mut chunk).await.expect("the response");
+            assert_ne!(read, 0, "the connection ended before the upgrade");
+            response.extend_from_slice(&chunk[..read]);
+        }
+        let mut lines = upgrading
+            .await
+            .expect("the upgrade ends")
+            .expect("the terminal is accepted");
+        let mut reading = tokio::spawn(async move {
+            let mut buffer = [0_u8; 16];
+            lines.read(&mut buffer).await
+        });
+
+        // A bound's worth of pings, then a window later as many again: a keepalive, not a flood.
+        for _ in 0..MAX_CONTROL_MESSAGES_PER_WINDOW {
+            terminal.write_all(&PING).await.expect("a ping");
+        }
+        settle().await;
+        assert!(
+            !reading.is_finished(),
+            "a bound's worth of pings is not cut off"
+        );
+        tokio::time::advance(CONTROL_WINDOW + Duration::from_secs(1)).await;
+        for _ in 0..MAX_CONTROL_MESSAGES_PER_WINDOW {
+            terminal.write_all(&PING).await.expect("a ping");
+        }
+        settle().await;
+        assert!(
+            !reading.is_finished(),
+            "a keepalive that goes on is not cut off"
+        );
+
+        // More than the bound inside one window is a flood.
+        terminal.write_all(&PING).await.expect("a ping");
+        settle().await;
+        let ended = (&mut reading).await.expect("the reader is joined");
+        assert!(ended.is_err(), "the flood ended the connection: {ended:?}");
     }
 }

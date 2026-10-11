@@ -105,6 +105,8 @@ rusqlite = { workspace = true, features = ["bundled"] }
 # A session that launches a real shell package needs a home directory on the internal disk that is
 # removed with the test, because nothing a launched process opens may be in the workspace.
 tempfile.workspace = true
+# A rate over a window of time is tested with a clock the test moves.
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # A test that needs a process held while it is ending attaches a debugger to it, which holds the
