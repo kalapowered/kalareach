@@ -1103,6 +1103,12 @@ impl Session {
         }
     }
 
+    /// The backends an integrated invocation is given, where this session has any.
+    #[must_use]
+    pub fn command_backends(&self) -> Option<Arc<crate::broker::commands::CommandBackends>> {
+        self.command_backends.clone()
+    }
+
     /// Sets up the backends an integrated invocation is given before it runs.
     pub fn set_command_backends(
         &mut self,
