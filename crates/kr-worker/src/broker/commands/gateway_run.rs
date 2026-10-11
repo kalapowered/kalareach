@@ -99,6 +99,9 @@ impl Backend {
         if let Some(owner) = connection {
             owner.shutdown();
         }
+        // The list of endings is held from the taking of the server to the keeping of its ending,
+        // so that whoever waits for the endings finds this one.
+        let mut ladders = run.ladders.lock().unwrap_or_else(PoisonError::into_inner);
         let server = run
             .server
             .lock()
@@ -118,18 +121,25 @@ impl Backend {
                 }
                 retirement
             });
-            run.ladders
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(ending);
+            ladders.push(ending);
         }
     }
 
-    /// Waits for the endings in progress, and returns the processes still running when they were
-    /// over.
-    pub(super) async fn endings(&self) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
+    /// Ends what the program's connection leaves when it ends: the server too, unless the session
+    /// is closing, whose closure ends the servers after the acceptance of its close has been
+    /// delivered ([`CommandBackends::end_servers`]), since the command that asked for the close may
+    /// be one the server started.
+    pub(super) fn end_after_connection(&self) {
+        if !self.closing.load(Ordering::SeqCst) {
+            self.end_gateway();
+        }
+    }
+
+    /// Waits for the endings in progress. What survived them is in the session's record of its
+    /// processes, which the closure's receipt reads.
+    pub(super) async fn endings(&self) {
         let Some(run) = self.gateway_run.as_ref() else {
-            return Vec::new();
+            return;
         };
         let endings: Vec<_> = run
             .ladders
@@ -137,13 +147,9 @@ impl Backend {
             .unwrap_or_else(PoisonError::into_inner)
             .drain(..)
             .collect();
-        let mut survivors = Vec::new();
         for ending in endings {
-            if let Ok(retirement) = ending.await {
-                survivors.extend(retirement.survivors);
-            }
+            let _ = ending.await;
         }
-        survivors
     }
 }
 
@@ -419,6 +425,6 @@ async fn handle(
             delivering.abort();
         }
         // The connection is over, and nothing is left for the server to serve.
-        backend.end_gateway();
+        backend.end_after_connection();
     });
 }
