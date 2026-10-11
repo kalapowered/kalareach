@@ -113,9 +113,7 @@ fn main() -> ExitCode {
     // on. A process that already leads its session is the image a start replaced itself with
     // below, and has nothing to leave.
     #[cfg(unix)]
-    if arguments.own_session
-        && !rustix::process::getsid(None).is_ok_and(|session| session == rustix::process::getpid())
-    {
+    if arguments.own_session && !kr_ipc::identity::leads_its_session() {
         if let Err(error) = rustix::process::setsid() {
             eprintln!("kr-controller: could not start a session of its own: {error}");
             return ExitCode::FAILURE;

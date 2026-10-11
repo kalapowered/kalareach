@@ -250,6 +250,19 @@ pub fn process_lineage(pid: u32) -> Result<Lineage> {
     platform::lineage(pid)
 }
 
+/// Whether this process leads the session it is in, so that it has no session to leave.
+///
+/// A process names its session by the identifier of the session's leader as seen from its own
+/// process identifier namespace. In a container, a command the container's runtime started from
+/// outside it can be in a session whose leader is outside the container; the kernel then names
+/// that session `0`, which no process leads. Where the platform names no session, or the reading
+/// fails, the process is not taken to lead one.
+#[must_use]
+pub fn leads_its_session() -> bool {
+    let pid = std::process::id();
+    process_lineage(pid).is_ok_and(|lineage| lineage.session == Some(pid))
+}
+
 /// The start of the name of the transient scope a control daemon moves itself into when a command
 /// of a session starts it, so that the end of the session's service does not end it.
 pub const DAEMON_SCOPE_PREFIX: &str = "kr-daemon-";
