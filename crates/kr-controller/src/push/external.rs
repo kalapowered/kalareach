@@ -228,13 +228,15 @@ pub struct ExternalSenders {
 
 impl ExternalSenders {
     /// Builds every adapter over the transports this host reaches destinations through, with mail
-    /// submitted under `mail`.
+    /// submitted under `mail`. Mail leaves by the route of those transports
+    /// ([`DeliveryTransports::outbound`]), whatever route `mail` was given before.
     #[must_use]
     pub fn new(
         transports: Arc<dyn DeliveryTransports>,
         runtime: tokio::runtime::Handle,
         mail: super::mail::MailSubmission,
     ) -> Self {
+        let mail = mail.through(transports.outbound());
         Self {
             webhook: WebhookSender::new(Arc::clone(&transports), runtime.clone()),
             chat: super::chat::ChatSender::new(transports, runtime.clone()),

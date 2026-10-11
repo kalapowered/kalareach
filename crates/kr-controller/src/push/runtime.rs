@@ -270,7 +270,6 @@ impl DeliveryRuntime {
     /// would put two sets of rules on one host's exchanges. Returns false when one was already
     /// attached.
     pub fn attach_transport(&self, transports: Arc<dyn DeliveryTransports>) -> bool {
-        let mail = MailSubmission::verified(transports.outbound());
         let senders = Arc::new(GatewaySenders::new(
             Arc::clone(&transports),
             Arc::clone(&self.signer),
@@ -292,7 +291,11 @@ impl DeliveryRuntime {
                     self.runtime.clone(),
                     self.cadence.unknown,
                 ),
-                external: ExternalSenders::new(Arc::clone(&transports), self.runtime.clone(), mail),
+                external: ExternalSenders::new(
+                    Arc::clone(&transports),
+                    self.runtime.clone(),
+                    MailSubmission::verified(),
+                ),
             })
             .is_ok();
         if attached {

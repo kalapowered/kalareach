@@ -12,14 +12,15 @@
 //!
 //! # Where the connection goes
 //!
-//! A submission leaves the host by the route the daemon started with, the one every other outbound
-//! connection takes ([`Outbound`]). Without a proxy it connects to the server directly. With the
+//! A submission leaves the host by the route the daemon started with, the one the other service
+//! connections take ([`Outbound`]). Without a proxy it connects to the server directly. With the
 //! proxy the host's configuration selects, it asks that proxy for an HTTP `CONNECT` tunnel to the
-//! server and port, and the conversation below, TLS included, runs inside the tunnel: the proxy
-//! sees where the submission goes and nothing that travels on it, and it resolves the server's
-//! name. A proxy that cannot be reached, or does not open the tunnel, leaves the message unsent;
-//! nothing goes around it. A daemon that started over a configuration document it could not use
-//! has no route, makes no connection, and says why.
+//! server and port, and the conversation below, TLS included, runs inside the tunnel. The proxy
+//! sees the server and the port, resolves the server's name, and with STARTTLS reads the greeting
+//! and the `EHLO` and `STARTTLS` exchange that come before TLS starts; it never sees a credential
+//! or a part of a message. A proxy that cannot be reached, or does not open the tunnel, leaves the
+//! message unsent; nothing goes around it. A daemon that started over a configuration document it
+//! could not use has no route, makes no connection, and says why.
 //!
 //! # What each answer means
 //!
@@ -239,14 +240,15 @@ impl MailSubmission {
     /// uses ([`kr_client::services::http::platform_tls`]): on Linux the distribution's certificate
     /// store, and no environment variable choosing another.
     ///
-    /// It leaves the host by `outbound`: the route the daemon started with, which every connection
-    /// of this host takes. There is no submission that chooses its own.
+    /// It has no route to leave the host by until it is given one ([`Self::through`]), and sends
+    /// nothing before that. The delivery service gives it the route of the transports it is built
+    /// over, so mail and every other exchange leave by the same one.
     ///
     /// A host with no usable verifier gets a submission that sends nothing and says why, rather
     /// than one that sends without verifying.
     #[must_use]
-    pub fn verified(outbound: Outbound) -> Self {
-        Self::with_tls(kr_client::services::http::platform_tls(&[]), outbound)
+    pub fn verified() -> Self {
+        Self::with_tls(kr_client::services::http::platform_tls(&[]))
     }
 
     /// Submission verified against the platform's trust, which also trusts one more authority:
@@ -256,24 +258,30 @@ impl MailSubmission {
     /// off. It exists only in builds made for this crate's own tests.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn trusting(authority: &[u8], outbound: Outbound) -> Self {
-        Self::with_tls(
-            kr_client::services::http::platform_tls(&[rustls::pki_types::CertificateDer::from(
-                authority.to_vec(),
-            )]),
-            outbound,
-        )
+    pub fn trusting(authority: &[u8]) -> Self {
+        Self::with_tls(kr_client::services::http::platform_tls(&[
+            rustls::pki_types::CertificateDer::from(authority.to_vec()),
+        ]))
     }
 
-    fn with_tls(tls: Result<rustls::ClientConfig, rustls::Error>, outbound: Outbound) -> Self {
+    fn with_tls(tls: Result<rustls::ClientConfig, rustls::Error>) -> Self {
         let tls = tls
             .map(Arc::new)
             .map_err(|error| format!("this host has no certificate verifier for mail: {error}"));
         Self {
             tls,
-            outbound,
+            outbound: Outbound::Closed(
+                "this mail submission was given no route to leave the host by".to_owned(),
+            ),
             deadlines: MailDeadlines::DEFAULT,
         }
+    }
+
+    /// The same submission, leaving the host by `outbound`.
+    #[must_use]
+    pub fn through(mut self, outbound: Outbound) -> Self {
+        self.outbound = outbound;
+        self
     }
 
     /// The same submission, keeping other deadlines.

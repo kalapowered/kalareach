@@ -34,7 +34,8 @@ async fn the_child_of_the_host_certificate_variable_test() {
         password: SecretText::new("a password").expect("a password"),
         from_address: "person@example.com".to_owned(),
     };
-    let _ = MailSubmission::verified(Outbound::Direct)
+    let _ = MailSubmission::verified()
+        .through(Outbound::Direct)
         .submit(
             &account,
             "someone@example.com",

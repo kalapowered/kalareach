@@ -1564,7 +1564,7 @@ fn mail_sender_by(
     outbound: Outbound,
 ) -> kr_controller::push::mail::MailSender {
     kr_controller::push::mail::MailSender::new(
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, outbound),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der).through(outbound),
         runtime.handle().clone(),
     )
 }
@@ -2030,8 +2030,9 @@ fn a_mail_server_that_stops_reading_cannot_hold_the_attempt() {
         "stalled",
     )
     .expect("a message");
-    let submission =
-        MailSubmission::trusting(&trusted.der, Outbound::Direct).with_deadlines(MailDeadlines {
+    let submission = MailSubmission::trusting(&trusted.der)
+        .through(Outbound::Direct)
+        .with_deadlines(MailDeadlines {
             connect: std::time::Duration::from_secs(10),
             reply: std::time::Duration::from_secs(10),
             final_reply: std::time::Duration::from_secs(2),
@@ -2309,7 +2310,7 @@ fn each_kind_is_configured_with_its_credential_and_a_pass_delivers_with_it() {
                 .with(TELEGRAM, &telegram),
         ),
         runtime.handle().clone(),
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, Outbound::Direct),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der),
     );
     let deliveries = deliveries();
     let kinds = [
@@ -2462,7 +2463,7 @@ fn a_replaced_credential_never_carries_what_was_admitted_under_the_old_one() {
     let senders = kr_controller::push::external::ExternalSenders::new(
         Arc::new(ToStandIns::default().with(SLACK, &slack)),
         runtime.handle().clone(),
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, Outbound::Direct),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der),
     );
     let deliveries = deliveries();
     let first = DestinationSecret::Slack {
@@ -2528,7 +2529,7 @@ fn each_kind_follows_the_journals_uncertainty_rules() {
     let senders = kr_controller::push::external::ExternalSenders::new(
         Arc::new(ToStandIns::default().with(SLACK, &slack)),
         runtime.handle().clone(),
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, Outbound::Direct),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der),
     );
     let deliveries = deliveries();
     deliveries
