@@ -6,14 +6,14 @@
 //! go through `observe` over the real configuration document, with a release of the test's own.
 
 use kr_protocol::hostinfo::configuration::{
-    ConfigurationDocument, Levelled, NEAR_MISS, Release, THIS_RELEASE, VERSION,
+    ConfigurationDocument, Levelled, NEAR_MISS, Release, VERSION,
 };
 use kr_protocol::update::{Recording, ReleaseStore, StoreScope};
 use serde_json::{Value, json};
 
 use super::{
-    Claim, Kept, Levels, Lock, Observed, ObservedLevels, Store, Writers, at_base, digest, findings,
-    levels_view, observe, table, write,
+    Claim, Kept, Levels, Lock, Observed, Store, Writers, at_base, digest, findings, levels_view,
+    observe, table, write,
 };
 
 const TELEMETRY: Levelled = Levelled {
@@ -409,6 +409,10 @@ fn the_folding_and_the_metric_of_the_near_miss_rule_are_pinned() {
         ("ceilnigs", "ceilings"),
         ("ceiling", "ceilings"),
         ("sessionlimit", "session_limit"),
+        // Six separators fold away; with none folded this is six edits.
+        ("c_e-i_l-i_n-g_s", "ceilings"),
+        // Two accents are two edits of characters, and four of bytes.
+        ("c\u{e9}il\u{ef}ngs", "ceilings"),
     ] {
         assert!(near_miss(a, b), "{a} and {b} are taken for each other");
     }
@@ -417,6 +421,9 @@ fn the_folding_and_the_metric_of_the_near_miss_rule_are_pinned() {
         ("authority", "agents"),
         ("sync", "startup"),
         ("ceil", "ceilings"),
+        // A transposition costs two edits and a substitution one: three in all. A metric that
+        // counted a transposition as one would take these for each other.
+        ("ceilnigz", "ceilings"),
     ] {
         assert!(!near_miss(a, b), "{a} and {b} are not");
     }
@@ -569,19 +576,6 @@ fn what_the_real_reader_and_writer_say_of_a_section_is_found_through_observe() {
         found.iter().any(|(member, finding)| member == "voice" && finding.contains("is written when it is")),
         "a section that is always written is found: {found:?}"
     );
-    let lock = write(
-        None,
-        &[observe(
-            &Store {
-                levels: None,
-                ..stand_in("voice")
-            },
-            &[],
-        )
-        .expect("observed")],
-        &[],
-    );
-    drop(lock);
     let refused = write(None, &[voice], &[]).expect_err("is not written");
     assert!(
         messages(&refused).contains("is written when it is"),
@@ -613,9 +607,145 @@ fn what_the_real_reader_and_writer_say_of_a_section_is_found_through_observe() {
     );
 }
 
-/// The production release has no section yet, and its observation is clean.
+/// A section whose own schema is a map, which accepts any key and reads back differently from the
+/// copy the registry keeps once it is unused, is refused at the same version and at a raised one.
 #[test]
-fn the_production_release_lists_no_section() {
-    assert!(THIS_RELEASE.levelled.is_empty());
-    let _: Option<ObservedLevels> = None;
+fn a_section_that_is_a_map_is_refused() {
+    let two = release(2, &[TELEMETRY]);
+    let mut schema = document();
+    schema["properties"]["telemetry"] = json!({
+        "type": "object",
+        "additionalProperties": nullable(json!({ "type": "string" })),
+        "default": {}
+    });
+    let found = designs(&schema, &two);
+    assert!(
+        messages(&found).contains("does not declare its fields"),
+        "{found:?}"
+    );
+    let lock = write(
+        None,
+        &[observed(
+            VERSION as u32,
+            "aa",
+            &document(),
+            &release(1, &[]),
+        )],
+        &[],
+    )
+    .expect("a lock");
+    for version in [VERSION as u32, VERSION as u32 + 1] {
+        let refused = write(Some(&lock), &[observed(version, "aa", &schema, &two)], &[])
+            .expect_err("a map is not a section");
+        assert!(
+            messages(&refused).contains("does not declare its fields"),
+            "{refused:?}"
+        );
+    }
+}
+
+/// A change that does not state the levels of a store that has them cannot remove them from the
+/// lock, even with the version and the digest unchanged and no section in the table.
+#[test]
+fn the_levels_of_a_store_are_not_removed_from_the_lock() {
+    let schema = document();
+    let one = release(1, &[]);
+    let lock = write(None, &[observed(VERSION as u32, "aa", &schema, &one)], &[]).expect("a lock");
+    assert_eq!(lock.stores[0].level, Some(1));
+    let mut without = observed(VERSION as u32, "aa", &schema, &one);
+    without.levels = None;
+    let refused = write(Some(&lock), &[without], &[]).expect_err("the levels are kept");
+    assert!(
+        messages(&refused).contains("would leave the lock"),
+        "{refused:?}"
+    );
+    let mut without = observed(VERSION as u32, "aa", &schema, &one);
+    without.levels = None;
+    let found = findings(&lock, &[without], &[]);
+    assert!(
+        messages(&found).contains("the levels of a store are kept"),
+        "{found:?}"
+    );
+}
+
+/// The check reports each way the levels of a store differ from the lock's: a section's level, the
+/// level of the store alone, and the distance; and the window refuses a new section that claims a
+/// level above the store's, which is a section without a level raise.
+#[test]
+fn the_check_reports_each_way_the_levels_differ_and_the_window_has_an_upper_bound() {
+    let schema = document();
+    let two = release(2, &[TELEMETRY]);
+    let lock = write(None, &[observed(VERSION as u32, "aa", &schema, &two)], &[]).expect("a lock");
+
+    let moved_level = observed(
+        VERSION as u32,
+        "aa",
+        &schema,
+        &release(
+            3,
+            &[Levelled {
+                member: "telemetry",
+                level: 3,
+            }],
+        ),
+    );
+    let found = findings(&lock, &[moved_level], &[]);
+    assert!(
+        messages(&found).contains("a section's level never changes"),
+        "{found:?}"
+    );
+
+    let store_alone = observed(VERSION as u32, "aa", &schema, &release(3, &[TELEMETRY]));
+    let found = findings(&lock, &[store_alone], &[]);
+    assert!(
+        messages(&found).contains("is read at level 3 in the code and 2 in the lock"),
+        "{found:?}"
+    );
+
+    let mut distance = observed(VERSION as u32, "aa", &schema, &two);
+    distance.levels.as_mut().expect("levels").near_miss = 3;
+    let found = findings(&lock, &[distance], &[]);
+    assert!(
+        messages(&found).contains("misspelling in the code"),
+        "{found:?}"
+    );
+
+    // A new section above the level the store is read at: no level was raised for it.
+    let above = release(2, &[TELEMETRY, RELAYS]);
+    let refused = write(
+        Some(&lock),
+        &[observed(VERSION as u32, "aa", &schema, &above)],
+        &[],
+    )
+    .expect_err("a section cannot claim a level the store is not at");
+    assert!(
+        messages(&refused).contains("no higher than the level 2"),
+        "{refused:?}"
+    );
+}
+
+/// A definition that a base section reaches stays in the base digest, whichever sections of a level
+/// share it, so a change to it needs the version raised.
+#[test]
+fn a_definition_a_base_section_shares_stays_in_the_base_digest() {
+    let two = release(2, &[TELEMETRY]);
+    let mut schema = document();
+    schema["$defs"]["Storage"]["properties"]["origin"] =
+        nullable(json!({ "$ref": "#/$defs/Limits" }));
+    let mut changed = schema.clone();
+    changed["$defs"]["Limits"]["properties"]["bytes"] = nullable(json!({ "type": "string" }));
+    let base = |schema: &Value| {
+        digest(
+            &Store {
+                writers: Writers::Daemon,
+                entry: entry(3),
+                owned: Vec::<Claim>::new(),
+                kept: vec![Kept::Protocol("Doc", at_base(schema, two.levelled), "Doc")],
+                levels: None,
+            },
+            &[],
+        )
+        .expect("a digest")
+    };
+    assert_ne!(base(&schema), base(&changed));
 }
