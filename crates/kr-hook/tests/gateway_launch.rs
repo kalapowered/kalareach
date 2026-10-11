@@ -703,19 +703,32 @@ fn kr_req_12_07_a_close_ends_the_instance_before_it_takes_down_the_registration(
 }
 
 /// KR-REQ-07.60: a session's closure ends the server of a backend after the acceptance of the close
-/// is delivered, and what the server started with it: until the gate is released the server and its
-/// command run, and when the closure is over both have ended, the server among the processes the
-/// closure names as terminated.
+/// is delivered, and what the server started with it. The requester of a close may be a command the
+/// server started, so that command is still running when the acceptance is delivered: here it
+/// waits for the test to say the acceptance is out, and shows it was alive. Then the gate is
+/// released, and when the closure is over the server and the command have ended, the server among
+/// the processes the closure names as terminated.
 #[test]
 fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance() {
     let shell = Gateway::new();
     let answer = shell
         .establish(&["codex"])
         .expect("a backend is established");
+    let delivered = shell.placed.host.root().join("delivered");
+    let alive = shell.placed.host.root().join("alive");
+    // A command that waits for the acceptance to be delivered and then says it was alive.
+    let requester = serde_json::json!([
+        "/bin/sh",
+        "-c",
+        "while [ ! -e \"$0\" ]; do sleep 0.05; done; : > \"$1\"; sleep 120",
+        delivered,
+        alive
+    ])
+    .to_string();
     let mut launched = shell.launch(
         &answer,
         "closure",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", &requester)],
     );
     launched.prints("TUI: turn/completed");
     eventually("the session recorded what the server started", || {
@@ -729,15 +742,13 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
         .runtime
         .close(kr_protocol::session::ClosureReason::CloseRequested);
     assert!(acceptance.initiated);
-    // The acceptance is out and nothing has been signalled: the server and its command run, since
-    // the requester of a close may be a command the server started.
-    for process in std::iter::once(&server).chain(&started) {
-        assert_ne!(
-            kr_ipc::identity::process_state(process),
-            kr_ipc::identity::ProcessState::Ended,
-            "{process:?} runs until the acceptance has been delivered"
-        );
-    }
+    // The acceptance is delivered, and the command that asked for the close is still there to read
+    // it: nothing has been signalled.
+    std::fs::write(&delivered, b"delivered").expect("the acceptance is delivered");
+    eventually(
+        "the command was alive when the acceptance was delivered",
+        || alive.exists(),
+    );
     gate.release();
     let closure = shell
         .runtime
