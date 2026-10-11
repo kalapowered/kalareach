@@ -4786,9 +4786,9 @@ async fn an_unfinished_device_revocation_is_not_answered_while_the_device_holds_
 }
 
 /// KR-REQ-09.08 and 23.27: what a device revocation answered from its claim withdrew is told apart
-/// from an earlier revocation by the claim, not by the moment. On a clock floor ahead of this
-/// machine's clock, one of the device's grants withdrawn on its own and the device's revocation
-/// carry the same moment; the retry names only what the device's revocation withdrew.
+/// from an earlier revocation by the claim. On a clock floor ahead of this machine's clock, one of
+/// the device's grants withdrawn on its own and the device's revocation are given moments one after
+/// the other; the retry names only what the device's revocation withdrew.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_withdrew() {
     let host = Serving::start().await;

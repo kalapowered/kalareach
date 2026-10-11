@@ -185,8 +185,8 @@ async fn kr_req_18_03_a_device_delegates_a_narrower_grant_and_revokes_what_it_de
 
 /// KR-REQ-10.45 and KR-REQ-23.49: a delegation tree holds at most as many grants as one revocation
 /// can name to a worker in one notice. A device delegating from a share it holds is refused the
-/// grant past the limit, with a quota error it can show and the limit in its words; a grant of
-/// another share is not refused; and a grant it withdraws gives its room back.
+/// grant past the limit, with a quota error it can show and the limit in its words; and a grant it
+/// withdraws gives its room back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_45_a_device_cannot_delegate_past_the_limit_of_a_tree() {
     let owner = DeviceKeys::generate().expect("owner keys");

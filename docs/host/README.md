@@ -5005,7 +5005,7 @@ on typing at the epoch it holds, though a batch it had in flight when the revisi
 refused and sent again. The host tells each worker whose authority the revisions after the one that
 worker last acknowledged withdrew. It names the grants that carry `terminal.input`, and the devices
 a revision withdrew. A share cannot hold more grants than one notice carries (4,096), so the
-revocation of a share, and of everything one device delegated, is named in full: it ends the input
+revocation of a share, and of everything delegated from it, is named in full: it ends the input
 lease of the callers under those grants and of no other. The host keeps this for the last 256
 revisions. A barrier takes together only the withdrawals that fit one notice, and the rest wait for
 a barrier of their own. A worker that was refused an announcement because it was inside a dispatch
@@ -5198,7 +5198,8 @@ A share holds at most 4,096 grants that are not revoked or are revoked with thei
 counting the share itself, everything delegated from it however far down, and invitations not yet
 redeemed. `grant.create` refuses the grant after the last with a `QUOTA_EXCEEDED` error that states
 the limit, and `grant.redeem` refuses an invitation into a share that holds more, which only a share
-from before the limit can. Withdrawing a grant gives its room back once the fence it owed is done.
+from before the limit can. A transfer and a voice grant are refused into a full share as a delegation
+is. Withdrawing a grant gives its room back once the fence it owed is done.
 The limit lets one revocation tell each worker, grant by grant and in one notice, exactly whose
 input to end.
 

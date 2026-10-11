@@ -2264,13 +2264,13 @@ fn live_in_tree(connection: &Connection, member: GrantId) -> Result<usize> {
         .query_row(
             "WITH RECURSIVE up(id, parent) AS (
                  SELECT grant_id, parent_grant_id FROM grants WHERE grant_id = ?1
-                 UNION ALL
+                 UNION
                  SELECT g.grant_id, g.parent_grant_id FROM grants g JOIN up ON g.grant_id = up.parent
              ),
              down(id) AS (
                  SELECT id FROM up
                   WHERE parent IS NULL OR parent NOT IN (SELECT grant_id FROM grants)
-                 UNION ALL
+                 UNION
                  SELECT g.grant_id FROM grants g JOIN down ON g.parent_grant_id = down.id
              )
              SELECT COUNT(*) FROM grants
@@ -2298,7 +2298,9 @@ fn tree_is_full() -> ControllerError {
 /// Writes one grant row inside a transaction the caller is already holding.
 ///
 /// A grant delegated from another is refused when its tree already holds [`MAX_GRANTS_PER_TREE`]
-/// that are not revoked.
+/// that are not revoked or are revoked with their fence still owed. Every grant row is written
+/// here: a delegation, a transfer's replacement and a voice grant are refused into a full tree
+/// as a delegation is.
 fn write_grant(connection: &Connection, record: &GrantRecord, encoded: &[u8]) -> Result<()> {
     if let Some(parent) = record.grant.parent_grant_id.as_ref()
         && live_in_tree(connection, *parent)? >= MAX_GRANTS_PER_TREE
