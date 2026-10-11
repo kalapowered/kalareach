@@ -251,7 +251,7 @@ async fn enrol(
 /// Says what an owner device is asked to confirm, as the host resolved it from the chain: each
 /// key by its whole identifier, revision and the moment it took over signing, which is what an
 /// administrator reads out and what the confirmation covers.
-fn say_what_is_asked(display: &ConfirmationDisplay) {
+pub(crate) fn say_what_is_asked(display: &ConfirmationDisplay) {
     if let Some(line) = what_is_asked(display) {
         output::line(&line);
     }

@@ -39,9 +39,10 @@ use kr_ipc::paths::HostPaths;
 use kr_pairing::confirm::sign_confirmation;
 use kr_pairing::grants::{personal_owner_grant, session_invitation_grant};
 use kr_protocol::confirmation::{
-    ConfirmationSubject, HostClockEstablishParams, HostClockEstablishResult,
+    ConfirmationDisplay, ConfirmationSubject, HostClockEstablishParams, HostClockEstablishResult,
     OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
-    OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
+    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
+    OwnerConfirmationRequestResult,
 };
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -57,8 +58,8 @@ use kr_protocol::organisation::{
     OrganisationListResult,
 };
 use kr_protocol::pairing::{
-    ConfirmationChannel, DevicePlatform, PairStatus, PairingConsumedReason, ProposedGrant,
-    RendezvousOrigin,
+    ConfirmationChannel, DevicePlatform, OwnerConfirmationRequest, PairStatus,
+    PairingConsumedReason, ProposedGrant, RendezvousOrigin,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
@@ -345,8 +346,8 @@ enum Ceremony<'a> {
     Approve { candidate: &'a PairCandidateView },
     /// Trusting this host's clock again, which reads `reading_ms` now.
     EstablishClock { reading_ms: u64 },
-    /// Ending exclusive management by `organisations`, when no device is left that can confirm it.
-    EndExclusive { organisations: Vec<OrganisationId> },
+    /// Ending exclusive management, which the host describes in the challenge it issues.
+    EndExclusive,
 }
 
 impl Ceremony<'_> {
@@ -361,7 +362,7 @@ impl Ceremony<'_> {
             Self::Issue { owner: true }
             | Self::Approve { .. }
             | Self::EstablishClock { .. }
-            | Self::EndExclusive { .. } => Ok(()),
+            | Self::EndExclusive => Ok(()),
         }
     }
 
@@ -381,12 +382,17 @@ impl Ceremony<'_> {
                  now.",
                 crate::shown::utc_moment(*reading_ms)
             )),
-            Self::EndExclusive { .. } => None,
+            Self::EndExclusive => None,
         }
     }
 
     /// Asks the person at the controlling terminal to confirm, and refuses unless they do.
-    fn confirm_at(&self, terminal: &mut Terminal) -> Result<()> {
+    /// `display` is what the host says the challenge asks to confirm.
+    fn confirm_at(
+        &self,
+        terminal: &mut Terminal,
+        display: Option<&ConfirmationDisplay>,
+    ) -> Result<()> {
         match self {
             Self::Issue { .. } => {
                 terminal.say(&stdout_line!(
@@ -433,13 +439,25 @@ impl Ceremony<'_> {
                     return Err(not_confirmed("the clock was not established"));
                 }
             }
-            Self::EndExclusive { organisations } => {
-                let names = Shown::joined(organisations.iter().map(|id| shown!("{}", *id)), ", ");
+            Self::EndExclusive => {
+                let Some(ConfirmationDisplay::ExclusiveManagement {
+                    organisation_ids, ..
+                }) = display
+                else {
+                    return Err(refused(
+                        ErrorCode::PermissionDenied,
+                        "the host did not say which organisations ending exclusive management \
+                         concerns",
+                    ));
+                };
+                let names =
+                    Shown::joined(organisation_ids.iter().map(|id| shown!("{}", *id)), ", ");
                 terminal.say(&stdout_line!(
                     "This host is exclusively managed by {}, and no owner device is left that can \
                      confirm for it. Ending exclusive management serves a personal grant, the \
                      owner's own devices included, without a membership lease. The host records \
-                     that it was ended here, and the organisation is told.",
+                     that it was ended here and lists it, and gives the time to members' devices \
+                     when they present a lease.",
                     names
                 ))?;
                 let typed = terminal.ask(&stdout_line!(
@@ -471,11 +489,17 @@ async fn confirmed(
         &OwnerConfirmationRequestParams { subject },
     )
     .await?;
+    // What the host says the challenge asks to confirm, which is what an owner device is shown.
+    let display = if matches!(ceremony, Ceremony::EndExclusive) {
+        displayed(client, &challenge.request).await?
+    } else {
+        None
+    };
     if challenge.initial_bootstrap {
         ceremony.bootstrap_permits()?;
         guard(build_id).await?;
         let mut terminal = Terminal::open()?;
-        ceremony.confirm_at(&mut terminal)?;
+        ceremony.confirm_at(&mut terminal, display.as_ref())?;
         let key = AuthorisationKeyPair::generate().map_err(|error| {
             CliError::Other(shown!("no key could be made: {}", Shown::crypto(&error)))
         })?;
@@ -508,6 +532,9 @@ async fn confirmed(
     if let Some(note) = ceremony.owner_device_note() {
         crate::report::say(&note);
     }
+    if let Some(display) = &display {
+        crate::organisation::say_what_is_asked(display);
+    }
     crate::report::say(&shown!(
         "Confirm this on an owner device. Waiting {}.",
         remaining(expires_at_ms, kr_ipc::now_ms().get())
@@ -524,6 +551,24 @@ async fn confirmed(
             Err(error) => return Err(CliError::Refused(error)),
         }
     }
+}
+
+/// What the host lists as the description of `request`, which the owner device is shown for it.
+async fn displayed(
+    client: &mut LocalClient,
+    request: &OwnerConfirmationRequest,
+) -> Result<Option<ConfirmationDisplay>> {
+    let pending: OwnerConfirmationPendingResult = bind::read(
+        client,
+        Method::OwnerConfirmationPending,
+        &OwnerConfirmationPendingParams {},
+    )
+    .await?;
+    Ok(pending
+        .pending
+        .into_iter()
+        .find(|listed| listed.request == *request)
+        .map(|listed| listed.display))
 }
 
 /// Asks for the effect once, under an action identity of its own.
@@ -576,26 +621,13 @@ pub async fn end_exclusive_management(
     let environment = resolve::select(paths, selector.environment.as_deref())?;
     let target = ActionTarget::environment(environment.environment_id);
     let mut client = resolve::open_controller(&environment.paths, build_id.clone()).await?;
-    let listed: OrganisationListResult = bind::read(
-        &mut client,
-        Method::OrganisationList,
-        &OrganisationListParams::default(),
-    )
-    .await?;
-    let ceremony = Ceremony::EndExclusive {
-        organisations: listed
-            .enrolments
-            .iter()
-            .map(|enrolment| enrolment.organisation_id)
-            .collect(),
-    };
     let params = OrganisationExclusiveSetParams { exclusive: false };
     let effect = Effect::EndExclusive(params);
     let answer = confirmed(
         &mut client,
         target,
         ConfirmationSubject::SetExclusiveManagement { exclusive: false },
-        &ceremony,
+        &Ceremony::EndExclusive,
         &effect,
         &build_id,
     )
