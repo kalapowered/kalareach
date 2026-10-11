@@ -762,6 +762,10 @@ impl kr_controller::push::transport::DeliveryTransports for Through {
     ) -> Result<Arc<dyn ServiceHttp>, String> {
         Ok(Arc::clone(&self.0) as Arc<dyn ServiceHttp>)
     }
+
+    fn outbound(&self) -> kr_controller::config::Outbound {
+        kr_controller::config::Outbound::Direct
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

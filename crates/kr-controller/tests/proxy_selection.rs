@@ -1,11 +1,11 @@
-//! The host's outbound HTTPS goes through the proxy its configuration document selects, and no
+//! The host's outbound connections go through the proxy its configuration document selects, and no
 //! other.
 //!
 //! The daemon reads the selection once, when it starts, and every client takes that one reading:
 //! the rendezvous it reserves locators at and opens its room at, and delivery, which carries
 //! notifications to the gateway and webhook messages to the addresses an owner configured. With
 //! none selected they go directly, and never through a proxy the environment names. Mail
-//! submission is the one outbound connection outside this: it is SMTP, made directly.
+//! submission follows the same route, as a `CONNECT` tunnel to the mail server.
 
 mod net_support;
 
@@ -23,6 +23,9 @@ use kr_controller::service::net::NetworkSetup;
 use kr_controller::service::net::rendezvous::Rendezvous;
 use kr_controller::service::net::rendezvous_https::HttpsRendezvous;
 use kr_crypto::secret::SymmetricKey;
+use kr_delivery::destination::{DestinationKind, ExternalDestination, Idempotency};
+use kr_delivery::external::{ExternalOutcome, ExternalSender as _};
+use kr_protocol::delivery::{DestinationSecret, MailAccount, MailSecurity, SecretText};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::InvitationId;
@@ -342,6 +345,86 @@ async fn a_daemon_started_over_a_document_it_cannot_use_leaves_no_route_out() {
 }
 
 /// KR-REQ-26.13, KR-REQ-26.14: a daemon that starts over a configuration document it cannot use
+/// submits no mail. The mail server's address, which a direct route would reach, hears nothing, and
+/// the outcome is the refusal the document gives every other route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_started_over_a_document_it_cannot_use_submits_no_mail() {
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    write_bytes(&environment, br#"{"version": 99}"#, 0o600);
+    let controller = start_controller(&environment, host.environment_id()).await;
+    assert!(matches!(
+        controller.started_outbound(),
+        Ok(Outbound::Closed(_))
+    ));
+    assert!(controller.attach_managed_delivery().expect("attaches"));
+
+    let server = listening();
+    let outcome = submit_mail(&controller, port_of(&server)).await;
+    let ExternalOutcome::NotDispatched { detail } = outcome else {
+        panic!("mail was submitted over a route the document closed: {outcome:?}");
+    };
+    assert!(
+        detail.contains("config.json") && detail.contains("could not use"),
+        "the refusal names the document: {detail}"
+    );
+    heard_nothing(&server);
+}
+
+/// KR-REQ-26.14: a daemon that selects a proxy submits mail through it, as a `CONNECT` tunnel to the
+/// mail server. A proxy that refuses the tunnel leaves the message unsent and the server unreached,
+/// and one that opens it is asked for the server and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_submits_mail_through_the_proxy_it_started_with() {
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    let mut document = ConfigurationDocument::empty();
+    document.revision = 1;
+
+    let refusing = ConnectProxy::refusing(403).await;
+    document.network.proxy_url = Nullable::some(refusing.url.clone());
+    write_document(&environment, &document);
+    let controller = start_controller(&environment, host.environment_id()).await;
+    assert!(controller.attach_managed_delivery().expect("attaches"));
+    let server = listening();
+    let port = port_of(&server);
+    let outcome = submit_mail(&controller, port).await;
+    let ExternalOutcome::NotDispatched { detail } = outcome else {
+        panic!("mail was submitted around a proxy that refused the tunnel: {outcome:?}");
+    };
+    assert!(
+        detail.contains("refused the tunnel with status 403"),
+        "the proxy's refusal is the outcome: {detail}"
+    );
+    assert_eq!(
+        refusing.asked(),
+        vec![format!("CONNECT 127.0.0.1:{port} HTTP/1.1")]
+    );
+    heard_nothing(&server);
+    drop(controller);
+
+    // The control: a proxy that opens the tunnel is asked for the server, and the server is reached
+    // through it.
+    let tunnelling = ConnectProxy::tunnelling().await;
+    document.revision = 2;
+    document.network.proxy_url = Nullable::some(tunnelling.url.clone());
+    write_document(&environment, &document);
+    let controller = start_controller(&environment, host.environment_id()).await;
+    assert!(controller.attach_managed_delivery().expect("attaches"));
+    let (port, accepted) = accepting_and_dropping().await;
+    let _ = submit_mail(&controller, port).await;
+    assert_eq!(
+        tunnelling.asked(),
+        vec![format!("CONNECT 127.0.0.1:{port} HTTP/1.1")]
+    );
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the proxy opened the tunnel to the mail server"
+    );
+}
+
+/// KR-REQ-26.13, KR-REQ-26.14: a daemon that starts over a configuration document it cannot use
 /// reaches the managed account service no more than it reaches the other routes, and keeps the
 /// account local. The sign-in an earlier daemon kept still shows, signing in again is refused
 /// naming the document, and signing out removes the grant and sends nothing: its revocation waits,
@@ -446,6 +529,80 @@ async fn fetch_error(
         .map_err(|_| "the answer did not end".to_owned())?
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Submits one message by the sender the daemon attached for email destinations, to a mail server
+/// on loopback at `port`, the way a pass hands one over.
+async fn submit_mail(
+    controller: &std::sync::Arc<kr_controller::service::Controller>,
+    port: u16,
+) -> ExternalOutcome {
+    let senders = controller
+        .delivery_runtime()
+        .external_senders()
+        .expect("the daemon attached its senders")
+        .clone();
+    let destination = ExternalDestination {
+        kind: DestinationKind::Email,
+        endpoint: "person@example.com".to_owned(),
+        idempotency: Idempotency::Unsupported,
+        credential: None,
+    };
+    let secret = DestinationSecret::Email {
+        account: MailAccount {
+            server: "127.0.0.1".to_owned(),
+            port: kr_protocol::scalars::U64::new(u64::from(port)),
+            security: MailSecurity::ImplicitTls,
+            username: SecretText::new("alerts@example.com").expect("a user name"),
+            password: SecretText::new("a-password").expect("a password"),
+            from_address: "alerts@example.com".to_owned(),
+        },
+    };
+    let message = kr_delivery::external::compose(
+        DestinationKind::Email,
+        kr_protocol::push::PushAlert::ApprovalWaiting,
+        vec![kr_delivery::external::ContentLine {
+            session_id: None,
+            produced_at_ms: Some(kr_ipc::now_ms().get()),
+            text: "A session is waiting.".to_owned(),
+        }],
+        &kr_worker::history_filter::HistoryFilter::new(
+            kr_worker::history_filter::ViewerScope::owner(),
+        ),
+        &kr_protocol::grant::SessionSelector::Any,
+        None,
+    )
+    .expect("a message");
+    // The sender blocks on the daemon's runtime, as a pass does from its own thread.
+    tokio::time::timeout(
+        WATCHDOG,
+        tokio::task::spawn_blocking(move || senders.send(&destination, Some(&secret), &message)),
+    )
+    .await
+    .expect("the submission ends")
+    .expect("the submission's thread")
+}
+
+/// The port a loopback listener is on.
+fn port_of(listener: &std::net::TcpListener) -> u16 {
+    listener.local_addr().expect("an address").port()
+}
+
+/// A loopback server that accepts every connection and closes it, and how many it accepted.
+async fn accepting_and_dropping() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .expect("a loopback port");
+    let port = listener.local_addr().expect("an address").port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (port, accepted)
 }
 
 /// A document that others can read, where there are modes to read it by.

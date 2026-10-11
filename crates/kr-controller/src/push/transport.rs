@@ -15,6 +15,10 @@
 //! selected none, so a webhook address that proxy cannot reach fails through it rather than going
 //! around it. A document the host could not use leaves no route, and no exchange is made.
 //!
+//! Mail submission is an exchange that is not HTTP, so it has no origin to ask for. It leaves the
+//! host by the same route: [`DeliveryTransports::outbound`] says which, and the submission the
+//! delivery service builds follows it.
+//!
 //! A test attaches a recorder instead, which is how a test sees exactly what left the host.
 
 use std::collections::BTreeMap;
@@ -33,6 +37,13 @@ pub trait DeliveryTransports: std::fmt::Debug + Send + Sync {
     ///
     /// Returns why no transport reaches that origin. Nothing has been sent when this fails.
     fn to(&self, origin: &GatewayOrigin) -> Result<Arc<dyn ServiceHttp>, String>;
+
+    /// The route every connection of the delivery service that is not an HTTP exchange leaves the
+    /// host by, which is mail submission's: through the proxy this host selected, directly when it
+    /// selected none, and not at all when its configuration could not be used.
+    ///
+    /// A transport that reaches origins another way says so here too, because mail follows it.
+    fn outbound(&self) -> Outbound;
 }
 
 /// The managed transport of every origin delivery reaches, built on first use.
@@ -58,6 +69,10 @@ impl ManagedTransports {
 }
 
 impl DeliveryTransports for ManagedTransports {
+    fn outbound(&self) -> Outbound {
+        self.outbound.clone()
+    }
+
     fn to(&self, origin: &GatewayOrigin) -> Result<Arc<dyn ServiceHttp>, String> {
         let mut built = self
             .built

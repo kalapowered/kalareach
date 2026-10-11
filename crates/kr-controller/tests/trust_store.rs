@@ -8,6 +8,7 @@
 #[path = "../../kr-client/tests/support/trust_store.rs"]
 mod trust_store;
 
+use kr_controller::config::Outbound;
 use kr_controller::push::mail::MailSubmission;
 use kr_protocol::delivery::{MailAccount, MailSecurity, SecretText};
 use kr_protocol::scalars::U64;
@@ -33,7 +34,7 @@ async fn the_child_of_the_host_certificate_variable_test() {
         password: SecretText::new("a password").expect("a password"),
         from_address: "person@example.com".to_owned(),
     };
-    let _ = MailSubmission::verified()
+    let _ = MailSubmission::verified(Outbound::Direct)
         .submit(
             &account,
             "someone@example.com",

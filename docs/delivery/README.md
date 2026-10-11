@@ -514,6 +514,12 @@ anything between agreeing to TLS and starting it. The server's certificate is ve
 operating system's own verifier, the one the managed HTTPS transport uses, and nothing turns that
 off. The host signs in with AUTH PLAIN, or AUTH LOGIN where the server offers only that.
 
+A submission leaves the host by the route every other connection takes. With a proxy in the host's
+configuration it asks the proxy for a `CONNECT` tunnel to the server and port, and the conversation
+above, TLS included, runs inside the tunnel. A proxy that cannot be reached or does not open the
+tunnel leaves the message unsent, and so does a daemon that started over a configuration document it
+could not use: the destination is told so and nothing is connected to.
+
 The addresses and the subject are checked before they are written, and none may carry a line break,
 so nothing a destination or an event supplies can add a header or a mail command. The body is
 quoted-printable, every line ends in CR LF, and a line that begins with a dot is sent with a second

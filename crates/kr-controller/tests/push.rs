@@ -344,6 +344,10 @@ impl kr_controller::push::transport::DeliveryTransports for OneTransport {
     ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
         Ok(Arc::clone(&self.0))
     }
+
+    fn outbound(&self) -> kr_controller::config::Outbound {
+        kr_controller::config::Outbound::Direct
+    }
 }
 
 /// The gateway's envelope around one recorded decision.

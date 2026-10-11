@@ -11302,16 +11302,16 @@ export interface NetworkSelection {
    */
   pkarr_resolver_url?: string | null
   /**
-   * The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
+   * The HTTP proxy this host's outbound connections go through, as an absolute `http` or
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
-   * and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and
-   * account service, uploads of backups to the managed storage service, the model's files,
-   * and plugin repositories. Nothing goes around it, so an address it cannot reach fails,
-   * and a daemon that started over a document it could not use sends nothing through these
-   * routes until it starts again over one it can. Name lookups and mail submission do not
-   * use it. It is this machine's own choice: no invitation or host bundle carries it. It
-   * names no user and no password, because a proxy that needs credentials is not
-   * supported.
+   * and Pkarr servers, the rendezvous, delivery and webhooks, mail submission (a `CONNECT`
+   * tunnel to the mail server), the managed voice broker and account service, uploads of
+   * backups to the managed storage service, the model's files, and plugin repositories.
+   * Nothing goes around it, so an address it cannot reach fails, and a daemon that started
+   * over a document it could not use sends nothing through these routes until it starts
+   * again over one it can. Name lookups do not use it. It is this machine's own choice: no
+   * invitation or host bundle carries it. It names no user and no password, because a
+   * proxy that needs credentials is not supported.
    */
   proxy_url?: string | null
   /**

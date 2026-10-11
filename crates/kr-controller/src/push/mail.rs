@@ -8,14 +8,24 @@
 //! anything between agreeing to it and starting it is not trusted with the rest. The server's
 //! certificate is verified against the platform's trust, the one the managed HTTPS transport uses
 //! (on Linux the distribution's certificate store, whatever `SSL_CERT_FILE` or `SSL_CERT_DIR`
-//! says), and there is no way to switch that off. The connection is the server's own: submission
-//! goes through no proxy.
+//! says), and there is no way to switch that off.
+//!
+//! # Where the connection goes
+//!
+//! A submission leaves the host by the route the daemon started with, the one every other outbound
+//! connection takes ([`Outbound`]). Without a proxy it connects to the server directly. With the
+//! proxy the host's configuration selects, it asks that proxy for an HTTP `CONNECT` tunnel to the
+//! server and port, and the conversation below, TLS included, runs inside the tunnel: the proxy
+//! sees where the submission goes and nothing that travels on it, and it resolves the server's
+//! name. A proxy that cannot be reached, or does not open the tunnel, leaves the message unsent;
+//! nothing goes around it. A daemon that started over a configuration document it could not use
+//! has no route, makes no connection, and says why.
 //!
 //! # What each answer means
 //!
 //! | Where | Answer | Outcome |
 //! | --- | --- | --- |
-//! | Before the final `.` is written | No connection, a connection that ends, a deadline | Nothing was sent |
+//! | Before the final `.` is written | No route, no connection, a proxy that does not open the tunnel, a connection that ends, a deadline | Nothing was sent |
 //! | Before the final `.` is written | A 4xx reply | Nothing was sent: the server asked for later |
 //! | Before the final `.` is written | A 5xx reply, no STARTTLS, a certificate that does not verify | Nothing was sent, and another attempt would meet the same answer |
 //! | After the final `.` is written | A 2xx reply | Delivered |
@@ -38,12 +48,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use kr_client::tunnel::{self, Carrier};
 use kr_delivery::destination::ExternalDestination;
 use kr_delivery::external::{ExternalMessage, ExternalOutcome};
 use kr_protocol::delivery::{MailAccount, MailSecurity};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
+
+use crate::config::Outbound;
 
 /// The longest address this host sends to or from.
 pub const MAX_ADDRESS_LEN: usize = 254;
@@ -194,18 +207,28 @@ const MAX_ENCODED_LINE: usize = 76;
 /// What this host calls itself in `EHLO`: an address literal, so no host name leaves it.
 const EHLO: &[u8] = b"EHLO [127.0.0.1]";
 
-/// The TLS every submission is made over, and the deadlines it keeps.
+/// The TLS every submission is made over, the route it leaves the host by, and the deadlines it
+/// keeps.
 #[derive(Clone)]
 pub struct MailSubmission {
     tls: Result<Arc<rustls::ClientConfig>, String>,
+    outbound: Outbound,
     deadlines: MailDeadlines,
 }
 
 impl std::fmt::Debug for MailSubmission {
+    /// Whether a proxy or no route carries the submissions, never the proxy's address, which its
+    /// owner configured.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let route = match &self.outbound {
+            Outbound::Direct => "direct",
+            Outbound::Through(_) => "proxied",
+            Outbound::Closed(_) => "closed",
+        };
         formatter
             .debug_struct("MailSubmission")
             .field("verifier", &self.tls.as_ref().map(|_| "platform"))
+            .field("route", &route)
             .field("deadlines", &self.deadlines)
             .finish()
     }
@@ -216,11 +239,14 @@ impl MailSubmission {
     /// uses ([`kr_client::services::http::platform_tls`]): on Linux the distribution's certificate
     /// store, and no environment variable choosing another.
     ///
+    /// It leaves the host by `outbound`: the route the daemon started with, which every connection
+    /// of this host takes. There is no submission that chooses its own.
+    ///
     /// A host with no usable verifier gets a submission that sends nothing and says why, rather
     /// than one that sends without verifying.
     #[must_use]
-    pub fn verified() -> Self {
-        Self::with_tls(kr_client::services::http::platform_tls(&[]))
+    pub fn verified(outbound: Outbound) -> Self {
+        Self::with_tls(kr_client::services::http::platform_tls(&[]), outbound)
     }
 
     /// Submission verified against the platform's trust, which also trusts one more authority:
@@ -230,18 +256,22 @@ impl MailSubmission {
     /// off. It exists only in builds made for this crate's own tests.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn trusting(authority: &[u8]) -> Self {
-        Self::with_tls(kr_client::services::http::platform_tls(&[
-            rustls::pki_types::CertificateDer::from(authority.to_vec()),
-        ]))
+    pub fn trusting(authority: &[u8], outbound: Outbound) -> Self {
+        Self::with_tls(
+            kr_client::services::http::platform_tls(&[rustls::pki_types::CertificateDer::from(
+                authority.to_vec(),
+            )]),
+            outbound,
+        )
     }
 
-    fn with_tls(tls: Result<rustls::ClientConfig, rustls::Error>) -> Self {
+    fn with_tls(tls: Result<rustls::ClientConfig, rustls::Error>, outbound: Outbound) -> Self {
         let tls = tls
             .map(Arc::new)
             .map_err(|error| format!("this host has no certificate verifier for mail: {error}"));
         Self {
             tls,
+            outbound,
             deadlines: MailDeadlines::DEFAULT,
         }
     }
@@ -274,6 +304,11 @@ impl MailSubmission {
         recipient: &str,
         message: &[u8],
     ) -> Result<ExternalOutcome, ExternalOutcome> {
+        // The route first: a host that has none sends nothing, whatever else is the matter.
+        let proxy = self
+            .outbound
+            .proxy()
+            .map_err(|refusal| not_sent(refusal.to_string()))?;
         let tls = self
             .tls
             .as_ref()
@@ -285,14 +320,13 @@ impl MailSubmission {
             .ok_or_else(|| unsendable("the account's port is not one a server listens on"))?;
         let server_name = ServerName::try_from(account.server.clone())
             .map_err(|_| unsendable("the account's server is not a name TLS can verify"))?;
-        let connector = tokio_rustls::TlsConnector::from(tls);
+        let connector = tokio_rustls::TlsConnector::from(Arc::clone(&tls));
         let tcp = tokio::time::timeout(
             self.deadlines.connect,
-            TcpStream::connect((account.server.as_str(), port)),
+            reach(proxy, &tls, &account.server, port),
         )
         .await
-        .map_err(|_| not_sent("the mail server could not be reached in time"))?
-        .map_err(|_| not_sent("the mail server could not be reached"))?;
+        .map_err(|_| not_sent("the mail server could not be reached in time"))??;
 
         let mut wire = match account.security {
             MailSecurity::ImplicitTls => {
@@ -432,8 +466,8 @@ impl MailSubmission {
         &self,
         connector: &tokio_rustls::TlsConnector,
         server_name: ServerName<'static>,
-        tcp: TcpStream,
-    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ExternalOutcome> {
+        tcp: Carrier,
+    ) -> Result<tokio_rustls::client::TlsStream<Carrier>, ExternalOutcome> {
         match tokio::time::timeout(self.deadlines.connect, connector.connect(server_name, tcp))
             .await
         {
@@ -562,6 +596,33 @@ impl MailSubmission {
                 reply.status()
             )),
         })
+    }
+}
+
+/// Opens the connection to the mail server at `host` and `port`: its own when there is no proxy,
+/// and otherwise a tunnel the proxy opens to it.
+///
+/// A failure is said in this host's words and, for a proxy that refused, its status. Nothing the
+/// proxy wrote is repeated, and neither is its address.
+async fn reach(
+    proxy: Option<&kr_transport::config::ProxyUrl>,
+    tls: &Arc<rustls::ClientConfig>,
+    host: &str,
+    port: u16,
+) -> Result<Carrier, ExternalOutcome> {
+    match proxy {
+        None => TcpStream::connect((host, port))
+            .await
+            .map(Carrier::Plain)
+            .map_err(|_| not_sent("the mail server could not be reached")),
+        Some(proxy) => tunnel::through(proxy, host, port, tls)
+            .await
+            .map_err(|failure| {
+                not_sent(format!(
+                    "the mail server could not be reached through the proxy: {}",
+                    failure.reason()
+                ))
+            }),
     }
 }
 

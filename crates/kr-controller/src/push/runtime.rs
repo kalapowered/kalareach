@@ -257,12 +257,20 @@ impl DeliveryRuntime {
         self.adapters.get().map(|adapters| &adapters.transports)
     }
 
+    /// The senders every external destination is sent through (webhooks, the chat services and
+    /// mail), once a transport has been attached. They are the ones a pass uses.
+    #[must_use]
+    pub fn external_senders(&self) -> Option<&ExternalSenders> {
+        self.adapters.get().map(|adapters| &adapters.external)
+    }
+
     /// Attaches the transport every delivery exchange goes through.
     ///
     /// Once: the transport is the composition root's decision, made at startup, and a second one
     /// would put two sets of rules on one host's exchanges. Returns false when one was already
     /// attached.
     pub fn attach_transport(&self, transports: Arc<dyn DeliveryTransports>) -> bool {
+        let mail = MailSubmission::verified(transports.outbound());
         let senders = Arc::new(GatewaySenders::new(
             Arc::clone(&transports),
             Arc::clone(&self.signer),
@@ -284,11 +292,7 @@ impl DeliveryRuntime {
                     self.runtime.clone(),
                     self.cadence.unknown,
                 ),
-                external: ExternalSenders::new(
-                    Arc::clone(&transports),
-                    self.runtime.clone(),
-                    MailSubmission::verified(),
-                ),
+                external: ExternalSenders::new(Arc::clone(&transports), self.runtime.clone(), mail),
             })
             .is_ok();
         if attached {

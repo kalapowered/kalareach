@@ -583,6 +583,10 @@ mod tests {
         fn to(&self, _origin: &GatewayOrigin) -> Result<Arc<dyn ServiceHttp>, String> {
             Ok(Arc::clone(&self.0) as Arc<dyn ServiceHttp>)
         }
+
+        fn outbound(&self) -> crate::config::Outbound {
+            crate::config::Outbound::Direct
+        }
     }
 
     fn uuid(byte: u8) -> Uuid {

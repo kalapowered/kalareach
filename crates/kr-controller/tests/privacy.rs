@@ -1591,6 +1591,10 @@ impl kr_controller::push::transport::DeliveryTransports for OneGateway {
     ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
         Ok(Arc::clone(&self.0) as Arc<dyn kr_client::services::ServiceHttp>)
     }
+
+    fn outbound(&self) -> kr_controller::config::Outbound {
+        kr_controller::config::Outbound::Direct
+    }
 }
 
 /// KR-REQ-18.08, KR-REQ-16.13: a question asked inside a session is an item whose words are the

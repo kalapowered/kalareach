@@ -1158,15 +1158,15 @@ impl Controller {
         });
     }
 
-    /// How this host's outbound HTTPS leaves it: through the configuration document's
+    /// How this host's outbound connections leave it: through the configuration document's
     /// `network.proxy_url` as this daemon read it when it started, directly when it named none,
     /// and not at all when the document could not be used, because the proxy it may have named is
     /// not known and nothing goes around it.
     ///
     /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
-    /// delivery, the managed voice broker and account service, backups to the managed storage
-    /// service, the model's files and the plugin catalogue never go through two different
-    /// routes, and an edit applies to all of them at the next start.
+    /// delivery and mail submission, the managed voice broker and account service, backups to the
+    /// managed storage service, the model's files and the plugin catalogue never go through two
+    /// different routes, and an edit applies to all of them at the next start.
     ///
     /// # Errors
     ///

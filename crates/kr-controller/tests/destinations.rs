@@ -10,9 +10,14 @@
 
 mod net_support;
 
+#[path = "../../kr-client/tests/support/connect_proxy.rs"]
+mod connect_proxy;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use connect_proxy::ConnectProxy;
+use kr_controller::config::Outbound;
 use kr_controller::push::secrets::DestinationSecrets;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::open_store_in;
@@ -803,6 +808,10 @@ impl kr_controller::push::transport::DeliveryTransports for ToStandIns {
             .cloned()
             .ok_or_else(|| format!("this test reaches no {origin}"))
     }
+
+    fn outbound(&self) -> kr_controller::config::Outbound {
+        kr_controller::config::Outbound::Direct
+    }
 }
 
 const SLACK: &str = "https://hooks.slack.com";
@@ -1540,8 +1549,17 @@ fn mail_sender(
     runtime: &tokio::runtime::Runtime,
     trusted: &Authority,
 ) -> kr_controller::push::mail::MailSender {
+    mail_sender_by(runtime, trusted, Outbound::Direct)
+}
+
+/// The adapter for a host whose mail leaves by `outbound`.
+fn mail_sender_by(
+    runtime: &tokio::runtime::Runtime,
+    trusted: &Authority,
+    outbound: Outbound,
+) -> kr_controller::push::mail::MailSender {
     kr_controller::push::mail::MailSender::new(
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, outbound),
         runtime.handle().clone(),
     )
 }
@@ -1679,6 +1697,43 @@ fn mail_over_starttls_says_only_ehlo_and_starttls_in_the_clear() {
     assert_eq!(seen.secure[0], "EHLO [127.0.0.1]");
     assert_eq!(seen.secure[1], format!("AUTH PLAIN {}", plain_token()));
     assert!(!seen.data.is_empty(), "the message went inside TLS");
+}
+
+/// KR-REQ-26.14: mail submitted through the proxy a host selected is the same conversation inside a
+/// `CONNECT` tunnel to the server. The proxy is asked for the server and its port and for nothing
+/// else, and each way of protecting the connection runs inside the tunnel: TLS from the first byte,
+/// or `EHLO` and `STARTTLS` alone in the clear, so the proxy carries no credential and no message
+/// in the clear.
+#[test]
+fn mail_through_a_proxy_is_the_same_conversation_inside_a_tunnel() {
+    let runtime = runtime();
+    let trusted = authority("kalareach test authority");
+    for (script, security) in [
+        (MailScript::implicit(), MailSecurity::ImplicitTls),
+        (MailScript::starttls(), MailSecurity::Starttls),
+    ] {
+        let server = MailServer::start(&runtime, script, &trusted);
+        let proxy = runtime.block_on(ConnectProxy::tunnelling());
+        let outbound = Outbound::Through(proxy.url.parse().expect("a proxy address"));
+        let outcome = mail_sender_by(&runtime, &trusted, outbound).send(
+            &external(DestinationKind::Email, "person@example.com"),
+            &account(&server, security),
+            &message(DestinationKind::Email),
+        );
+        assert_eq!(outcome, kr_delivery::external::ExternalOutcome::Delivered);
+        assert_eq!(
+            proxy.asked(),
+            vec![format!("CONNECT localhost:{} HTTP/1.1", server.port)]
+        );
+        let seen = server.seen();
+        assert_eq!(seen.handshakes, 1);
+        match security {
+            MailSecurity::ImplicitTls => assert!(seen.clear.is_empty(), "{:?}", seen.clear),
+            MailSecurity::Starttls => assert_eq!(seen.clear, vec!["EHLO [127.0.0.1]", "STARTTLS"]),
+        }
+        assert_eq!(seen.secure[1], format!("AUTH PLAIN {}", plain_token()));
+        assert!(!seen.data.is_empty(), "the message went through the tunnel");
+    }
 }
 
 /// KR-REQ-25.23: never downgraded. A server that offers no STARTTLS, one whose certificate this
@@ -1887,11 +1942,12 @@ fn a_mail_server_that_stops_reading_cannot_hold_the_attempt() {
         "stalled",
     )
     .expect("a message");
-    let submission = MailSubmission::trusting(&trusted.der).with_deadlines(MailDeadlines {
-        connect: std::time::Duration::from_secs(10),
-        reply: std::time::Duration::from_secs(10),
-        final_reply: std::time::Duration::from_secs(2),
-    });
+    let submission =
+        MailSubmission::trusting(&trusted.der, Outbound::Direct).with_deadlines(MailDeadlines {
+            connect: std::time::Duration::from_secs(10),
+            reply: std::time::Duration::from_secs(10),
+            final_reply: std::time::Duration::from_secs(2),
+        });
     let started = std::time::Instant::now();
     let outcome = runtime.block_on(submission.submit(
         &account(&server, MailSecurity::ImplicitTls),
@@ -2165,7 +2221,7 @@ fn each_kind_is_configured_with_its_credential_and_a_pass_delivers_with_it() {
                 .with(TELEGRAM, &telegram),
         ),
         runtime.handle().clone(),
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, Outbound::Direct),
     );
     let deliveries = deliveries();
     let kinds = [
@@ -2318,7 +2374,7 @@ fn a_replaced_credential_never_carries_what_was_admitted_under_the_old_one() {
     let senders = kr_controller::push::external::ExternalSenders::new(
         Arc::new(ToStandIns::default().with(SLACK, &slack)),
         runtime.handle().clone(),
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, Outbound::Direct),
     );
     let deliveries = deliveries();
     let first = DestinationSecret::Slack {
@@ -2384,7 +2440,7 @@ fn each_kind_follows_the_journals_uncertainty_rules() {
     let senders = kr_controller::push::external::ExternalSenders::new(
         Arc::new(ToStandIns::default().with(SLACK, &slack)),
         runtime.handle().clone(),
-        kr_controller::push::mail::MailSubmission::trusting(&trusted.der),
+        kr_controller::push::mail::MailSubmission::trusting(&trusted.der, Outbound::Direct),
     );
     let deliveries = deliveries();
     deliveries
