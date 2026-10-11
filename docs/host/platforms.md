@@ -146,7 +146,7 @@ service, obtains no privilege and changes nothing else about the machine.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "revision": 1,
   "preferences": { "sleep_inhibition": "mains_only" }
 }
