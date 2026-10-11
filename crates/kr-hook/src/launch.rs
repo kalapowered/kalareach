@@ -16,6 +16,11 @@
 //! registration the backend published names the program before the program runs, and every hook and
 //! channel the program starts finds it.
 //!
+//! A backend that runs an application server for the program names the address of its gateway in
+//! the launch record. The launcher then presents its environment too, which the server is started
+//! with, and once the launch is committed it writes the address in place of the integration's
+//! `{gateway}` flag element, so the program connects to the gateway the backend opened.
+//!
 //! Whatever else happens (the backend refuses, does not answer within its deadline, does not
 //! commit, or cannot be reached), the invocation runs as typed: the registration variable is taken
 //! out of the environment and the typed vector is executed. The declared variables are never set on
@@ -62,6 +67,16 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 #[cfg(unix)]
 const MAX_ANSWER_BYTES: usize = 4096;
 
+/// The flag element an integration writes where the gateway's address goes, as the package
+/// contract defines it.
+#[cfg(unix)]
+const GATEWAY_ELEMENT: &str = "{gateway}";
+
+/// The most bytes of environment, names and values, the launcher presents to a backend that
+/// starts a server with it.
+#[cfg(unix)]
+const MAX_ENVIRONMENT_BYTES: usize = 256 * 1024;
+
 /// How long the launcher waits before it connects again to an endpoint whose queue is full.
 #[cfg(unix)]
 const CONNECT_RETRY: Duration = Duration::from_millis(10);
@@ -91,6 +106,13 @@ struct Record {
     /// The variables the integration declares, in its order, which a committed launch sets and
     /// nothing else does.
     variables: Vec<Variable>,
+    /// The address of the gateway the backend opened for the program, where it runs an
+    /// application server for it. It goes in the program's arguments where the integration has
+    /// the `{gateway}` element, and a launch that names one presents its environment, for the
+    /// server to be started with.
+    #[cfg(unix)]
+    #[serde(default)]
+    gateway: Option<String>,
 }
 
 /// One variable an integration declares, as the launch record names it.
@@ -237,10 +259,14 @@ fn run_replacing(
             match go(&mut admitted) {
                 Ok(()) => {
                     close(admitted);
+                    let written = record.gateway.as_deref().map_or_else(
+                        || vector.clone(),
+                        |gateway| with_gateway(&registration, &vector, gateway),
+                    );
                     exec_after(
                         hold_before_exec,
                         &executable,
-                        &vector,
+                        &written,
                         Route::Committed(&record.variables),
                     )
                 }
@@ -434,18 +460,31 @@ fn present(
     if !endpoint.is_absolute() {
         return Err("the launch record names no private endpoint".to_owned());
     }
+    // A backend that starts a server with this environment is shown it; any other is not, since
+    // what is in it is the person's.
+    let environment = record
+        .gateway
+        .as_ref()
+        .map(|_| environment_text())
+        .transpose()?;
     let mut stream = connect_by(endpoint, deadline)?;
-    let rest = serde_json::json!({
+    let mut hello = serde_json::json!({
         "pid": identity.pid.get(),
         "start": identity.start_value.get(),
         "executable": executable_text,
         "arguments": arguments,
-    })
-    .to_string();
+    });
+    if let (Some(environment), Some(members)) = (environment, hello.as_object_mut()) {
+        members.insert("environment".to_owned(), serde_json::json!(environment));
+    }
+    let rest = kr_crypto::secret::SecretVec::new(
+        serde_json::to_vec(&hello)
+            .map_err(|error| format!("the hello cannot be written: {error}"))?,
+    );
     // `{"kr_launch":{"credential":"<hex>",` then the rest of the object without its opening brace.
     // The credential is hexadecimal, so it needs no escaping, and it is assembled in the host's own
     // zeroising buffer.
-    let tail = rest.as_bytes().get(1..).unwrap_or_default();
+    let tail = rest.expose().get(1..).unwrap_or_default();
     let opening: &[u8] = br#"{"kr_launch":{"credential":""#;
     let mut line = Vec::with_capacity(opening.len() + credential.len() + tail.len() + 4);
     line.extend_from_slice(opening);
@@ -462,6 +501,58 @@ fn present(
     } else {
         Err("the backend answered something other than an admission".to_owned())
     }
+}
+
+/// This process's environment as text, for a backend that starts a server with it.
+///
+/// # Errors
+///
+/// Returns why it cannot be presented: a variable that is not text (named, never its value), or
+/// more than [`MAX_ENVIRONMENT_BYTES`] of names and values.
+#[cfg(unix)]
+fn environment_text() -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut text = std::collections::BTreeMap::new();
+    let mut bytes = 0_usize;
+    for (name, value) in std::env::vars_os() {
+        let (Some(name_text), Some(value_text)) = (name.to_str(), value.to_str()) else {
+            return Err(format!(
+                "the variable {} is not text, so the environment cannot be presented to a backend \
+                 that starts a server with it",
+                name.to_string_lossy()
+            ));
+        };
+        bytes = bytes.saturating_add(name_text.len() + value_text.len());
+        if bytes > MAX_ENVIRONMENT_BYTES {
+            return Err(format!(
+                "the environment is more than {MAX_ENVIRONMENT_BYTES} bytes, which a backend that \
+                 starts a server with it does not take"
+            ));
+        }
+        text.insert(name_text.to_owned(), value_text.to_owned());
+    }
+    Ok(text)
+}
+
+/// The gateway's address written in place of the integration's `{gateway}` element, in the run of
+/// added flags the registration's name places and nowhere else: an operand the person typed that
+/// is the same text is theirs.
+#[cfg(unix)]
+fn with_gateway(registration: &Path, vector: &[OsString], gateway: &str) -> Vec<OsString> {
+    let placed = registration
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|name| name.strip_prefix(REGISTRATION_PREFIX))
+        .and_then(|placed| placed.split_once('.'))
+        .and_then(|(at, count)| Some((at.parse::<usize>().ok()?, count.parse::<usize>().ok()?)));
+    let mut written = vector.to_vec();
+    if let Some((at, count)) = placed {
+        for element in written.iter_mut().skip(at).take(count) {
+            if element == GATEWAY_ELEMENT {
+                *element = OsString::from(gateway);
+            }
+        }
+    }
+    written
 }
 
 /// Says the launch is going and waits, within [`COMMIT_DEADLINE`], for the backend to say it is
@@ -775,6 +866,35 @@ mod tests {
             typed("registration.0.0", &["claude", "-p"]),
             Ok(vector(&["claude", "-p"])),
             "nothing added, nothing taken"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_gateway_element_is_the_one_the_package_contract_defines() {
+        assert_eq!(
+            GATEWAY_ELEMENT,
+            kr_plugin_sdk::integration::GATEWAY_PLACEHOLDER
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_gateway_address_goes_in_the_added_run_and_nowhere_else() {
+        let written = with_gateway(
+            Path::new("/run/kr/c1/b2/registration.1.2"),
+            &vector(&["codex", "--remote", "{gateway}", "{gateway}"]),
+            "unix:///run/kr/c1/b2/gateway.sock",
+        );
+        assert_eq!(
+            written,
+            vector(&[
+                "codex",
+                "--remote",
+                "unix:///run/kr/c1/b2/gateway.sock",
+                "{gateway}"
+            ]),
+            "the operand after the added run is the person's own"
         );
     }
 
