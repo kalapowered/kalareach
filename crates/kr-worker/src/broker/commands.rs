@@ -128,7 +128,12 @@ pub const RESUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 pub const LAUNCH_RECORD_FILE: &str = "launch";
 
 /// How often the committed program is looked at while it runs.
-const SUPERVISION_POLL: std::time::Duration = crate::broker::attach::TERMINAL_POLL;
+///
+/// A socket reaching end of file and the process behind it exiting are two events in either order,
+/// and neither is a bound on the other: a terminal can close its connection and go on running for
+/// an hour, and a terminal whose connection stays open can exit at once. So the process is watched
+/// for as long as it runs rather than for a window after something else happened.
+const SUPERVISION_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Where one backend is.
 #[derive(Clone, Debug)]
@@ -1348,15 +1353,12 @@ impl CommandBackends {
         let launch = NativeLaunch {
             profile_id: profile_id.clone(),
             expected_process: None,
-            native_terminal: None,
             application_instance_id,
             plugin_id: connector.plugin_id(),
             installed_protocol_version: String::new(),
             framing: Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             site: self.environment_id,
             os_user: self.os_user.clone(),
-            // The directory the invocation runs in, which is what its program works in.
-            working_directory: PathBuf::from(request.cwd),
         };
         let mut gateway = NativeGateway::bind(Arc::clone(&self.broker), &directory, launch)?;
         // The hooks a package registers inline start the forwarder by the path they were written
@@ -2586,9 +2588,6 @@ async fn continue_launch(
             process: process.clone(),
         },
         backend.credential.duplicate(),
-        // The program is the person's own terminal application, not a backend this host started
-        // for it: nothing here stops it when it ends, because its ending is the end.
-        false,
         kr_ipc::now_ms(),
     );
     let registered = match reservation.register(IntegrationMode::NativeBridge, Some(managed)) {
@@ -2604,7 +2603,7 @@ async fn continue_launch(
     };
     // Kept for the broker, which places what the program starts by what its job holds. The
     // registered launch lets it go again if the launch is given back.
-    crate::windows::job::keep_agent(process.clone(), Arc::clone(&job), None);
+    crate::windows::job::keep_agent(process.clone(), Arc::clone(&job));
     let finished = finish_binding(backend, broker, identity, &process, directory).await;
     let (registered, registration) = match finished {
         Ok(finished) => (registered, finished),
@@ -2813,9 +2812,6 @@ async fn admit_claimed<'a>(
             process: process.clone(),
         },
         backend.credential.duplicate(),
-        // The program is the person's own terminal application, not a backend this host started
-        // for it: nothing here stops it when it ends, because its ending is the end.
-        false,
         kr_ipc::now_ms(),
     );
     let registered = reservation

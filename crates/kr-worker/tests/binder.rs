@@ -1423,7 +1423,6 @@ fn managed(number: u8) -> ManagedProcess {
             process: launched(),
         },
         Credential::from_bytes([9; 32]),
-        false,
         TimestampMs::new(1),
     )
 }

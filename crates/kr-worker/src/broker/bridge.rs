@@ -1328,7 +1328,6 @@ mod tests {
                     process: application(*instance),
                 },
                 Credential::from_bytes([9; CREDENTIAL_BYTES]),
-                true,
                 TimestampMs::new(1),
             );
             broker

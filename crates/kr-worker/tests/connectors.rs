@@ -667,7 +667,6 @@ fn managed(instance: ApplicationInstanceId) -> ManagedProcess {
             process,
         },
         Credential::from_bytes([9; 32]),
-        true,
         TimestampMs::new(1),
     )
 }

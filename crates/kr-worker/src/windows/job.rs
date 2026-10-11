@@ -967,8 +967,7 @@ pub fn holding(root: u32) -> Option<Arc<SessionJob>> {
     jobs.get(&root).and_then(Weak::upgrade)
 }
 
-/// The job each agent this worker launched was started in, found by that agent's start identity,
-/// and what stops it.
+/// The job each agent this worker launched was started in, found by that agent's start identity.
 ///
 /// The agent is started where the broker's launch is, and placed where a caller is verified, so the
 /// two need somewhere to meet, as a session's root shell and its boundary do. The reference is
@@ -976,51 +975,25 @@ pub fn holding(root: u32) -> Option<Arc<SessionJob>> {
 /// names the agent ends: an agent's job is not kill-on-close, so keeping it keeps no process alive,
 /// and the broker asks about an agent only for as long as one of its instances lasts. It costs one
 /// handle for each agent with a live instance.
-///
-/// The registry also holds the end of the agent's standard input that this host writes, so that
-/// stopping the agent can close it, and the one record of a stop: whoever stops the agent first
-/// does the work, and a concurrent caller waits for that and gets the same answer.
 static AGENTS: OnceLock<Mutex<Vec<KeptAgent>>> = OnceLock::new();
 
-/// One launched agent, the job it was started in and what stops it.
+/// One launched agent and the job it was started in.
 struct KeptAgent {
     agent: ProcessStartIdentity,
     job: Arc<AgentJob>,
-    writer: Option<super::launch::StdinPipe>,
-    stopping: Arc<tokio::sync::Mutex<Option<crate::broker::BackendStop>>>,
-}
-
-/// What stops one launched agent: its job, the writer of its input and the record of the stop.
-#[derive(Clone)]
-pub struct Stopper {
-    /// The job that holds the agent and what it started.
-    pub job: Arc<AgentJob>,
-    /// The end of the agent's standard input this host writes, where there is one.
-    pub writer: Option<super::launch::StdinPipe>,
-    /// The one record of the stop, held for as long as it is being done.
-    pub outcome: Arc<tokio::sync::Mutex<Option<crate::broker::BackendStop>>>,
 }
 
 fn agents() -> &'static Mutex<Vec<KeptAgent>> {
     AGENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Records that `agent` was started in `job`, with the end of its input this host writes.
-pub fn keep_agent(
-    agent: ProcessStartIdentity,
-    job: Arc<AgentJob>,
-    writer: Option<super::launch::StdinPipe>,
-) {
+/// Records that `agent` was started in `job`.
+pub fn keep_agent(agent: ProcessStartIdentity, job: Arc<AgentJob>) {
     let mut kept = agents()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     kept.retain(|recorded| recorded.agent != agent);
-    kept.push(KeptAgent {
-        agent,
-        job,
-        writer,
-        stopping: Arc::new(tokio::sync::Mutex::new(None)),
-    });
+    kept.push(KeptAgent { agent, job });
 }
 
 /// Forgets the job `agent` was started in.
@@ -1044,21 +1017,6 @@ pub fn agent_job(agent: &ProcessStartIdentity) -> Option<Arc<AgentJob>> {
     kept.iter()
         .find(|recorded| recorded.agent == *agent)
         .map(|recorded| Arc::clone(&recorded.job))
-}
-
-/// Returns what stops `agent`, or None when this worker did not start it or has let it go.
-#[must_use]
-pub fn stopper(agent: &ProcessStartIdentity) -> Option<Stopper> {
-    let kept = agents()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    kept.iter()
-        .find(|recorded| recorded.agent == *agent)
-        .map(|recorded| Stopper {
-            job: Arc::clone(&recorded.job),
-            writer: recorded.writer.clone(),
-            outcome: Arc::clone(&recorded.stopping),
-        })
 }
 
 /// What one query of the job's process list produced.
@@ -1225,7 +1183,7 @@ mod tests {
         );
         assert!(agent_job(&agent).is_none(), "nothing was started for it");
         let job = Arc::new(AgentJob::create().expect("a job"));
-        keep_agent(agent.clone(), Arc::clone(&job), None);
+        keep_agent(agent.clone(), Arc::clone(&job));
         assert!(agent_job(&agent).is_some_and(|found| Arc::ptr_eq(&found, &job)));
         let mut again = agent;
         again.start_value = kr_protocol::scalars::U64::new(18);
@@ -1242,8 +1200,8 @@ mod tests {
         let kept = ProcessStartIdentity::new(0xF000_0005, source, 17);
         let released_job = Arc::new(AgentJob::create().expect("a job"));
         let kept_job = Arc::new(AgentJob::create().expect("a job"));
-        keep_agent(released.clone(), Arc::clone(&released_job), None);
-        keep_agent(kept.clone(), Arc::clone(&kept_job), None);
+        keep_agent(released.clone(), Arc::clone(&released_job));
+        keep_agent(kept.clone(), Arc::clone(&kept_job));
 
         release_agent(&released);
         assert!(

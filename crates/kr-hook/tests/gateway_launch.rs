@@ -12,6 +12,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
+//! | KR-REQ-07.67 | the exit of the terminal stops its server and ends its instance |
 //! | KR-REQ-12.07 | a plain launch of an integrated terminal that has a server is served by a gateway: the server is started, recorded and bound before the program runs, the program's whole session runs through it, and the server and the instance end with the program; a launch that cannot have a server, or whose environment cannot be presented, runs the program as typed; a close ends a backend's instance before it takes down what the backend published, and a runtime directory with a space is served as any other |
 //! | KR-REQ-07.60 | a server is recorded before the launch commits, and one whose record cannot be written is not left running; a server and what it started end with the program, with the connection, at the bound for a connection, and with the session after the acceptance of its close is delivered, a stubborn one by force and a command that outlived its server included |
 //! | KR-REQ-07.61 | a process the server started is placed under the program's instance |
@@ -427,11 +428,11 @@ impl Drop for Launched {
     }
 }
 
-/// KR-REQ-12.07: a plain launch of a terminal whose package declares a server is served by a
-/// gateway: the server is started in a group of its own and recorded as a root of what the
-/// session owns before the program runs, the program connects to the socket the launch named and
-/// runs its whole session through it, the instance is a gateway's, and when the program ends the
-/// server and the instance end with it.
+/// KR-REQ-12.07 and KR-REQ-07.67: a plain launch of a terminal whose package declares a server is
+/// served by a gateway: the server is started in a group of its own and recorded as a root of what
+/// the session owns before the program runs, the program connects to the socket the launch named
+/// and runs its whole session through it, the instance is a gateway's, and when the program ends
+/// the server and the instance end with it.
 #[test]
 fn kr_req_12_07_a_plain_launch_of_a_terminal_with_a_server_is_served_by_a_gateway() {
     let shell = Gateway::new();

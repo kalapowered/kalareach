@@ -2213,7 +2213,6 @@ async fn a_question_asked_for_a_launched_agent_ends_with_the_agents_instance() {
                     process: helper,
                 },
                 kr_worker::broker::Credential::generate().expect("a launch credential"),
-                false,
                 TimestampMs::new(1),
             )),
         )

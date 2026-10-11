@@ -105,11 +105,8 @@ use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 pub use crate::broker::arbitration::{
     Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
-#[cfg(windows)]
-pub use crate::broker::attach::LaunchStage;
 pub use crate::broker::attach::{
-    AgentChild, Attached, Ended, Launched, NativeGateway, NativeLaunch, TEARDOWN_DEADLINE,
-    TerminalWatch, hello_frame,
+    Attached, Ended, NativeGateway, NativeLaunch, TEARDOWN_DEADLINE, hello_frame,
 };
 pub use crate::broker::bridge::{
     AdmittedBridge, BridgeDeclaration, BridgeProcess, BridgeStream, BridgeSurface, HookReport,
@@ -145,8 +142,7 @@ pub use crate::broker::methods::{
     UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
-    BackendStop, BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
-    stop_backend,
+    BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
 };
 pub use crate::broker::profiles::{
     ForegroundMark, LaunchIntent, LaunchReservation, ProfileStore, RegisteredLaunch,
@@ -489,7 +485,7 @@ impl Instance {
 pub enum InstanceEnding {
     /// The native terminal application exited on purpose.
     ///
-    /// This ends the instance and stops its dedicated backend through the normal grace period.
+    /// This ends the instance.
     NativeExit,
     /// A KalaReach attachment was closed.
     ///
@@ -645,13 +641,6 @@ pub struct ClaimedAttachment {
 pub struct StopOutcome {
     /// True when the instance's record was removed.
     pub instance_ended: bool,
-    /// The backend to stop, by full process identity, when this host owns one.
-    ///
-    /// It is the identity rather than a flag because the supervisor has to know *which* process to
-    /// stop, and a process identifier alone can already belong to something else. A bypassed or
-    /// shared backend is never claimed or terminated as owned, so this is absent for one of those
-    /// however the instance ended.
-    pub backend: Option<ProcessStartIdentity>,
     /// How many attachments are still watching.
     pub attachments_remaining: usize,
 }
@@ -1383,9 +1372,7 @@ impl Broker {
     /// Ends an instance, or does not, depending on what ended.
     ///
     /// Section 7 draws the line here and it is the line users notice: quitting the agent ends the
-    /// agent, and closing the window you were watching it through does not. The outcome names the
-    /// process to stop by its full identity, so the supervisor stops the process this host started
-    /// rather than whatever holds that identifier now.
+    /// agent, and closing the window you were watching it through does not.
     pub fn end(
         &self,
         application_instance_id: ApplicationInstanceId,
@@ -1395,7 +1382,6 @@ impl Broker {
         let Some(instance) = state.instances.get_mut(&application_instance_id) else {
             return StopOutcome {
                 instance_ended: false,
-                backend: None,
                 attachments_remaining: 0,
             };
         };
@@ -1404,22 +1390,13 @@ impl Broker {
                 instance.attachments = instance.attachments.saturating_sub(1);
                 StopOutcome {
                     instance_ended: false,
-                    backend: None,
                     attachments_remaining: instance.attachments,
                 }
             }
             InstanceEnding::NativeExit => {
-                let backend = instance
-                    .process
-                    .as_ref()
-                    .and_then(|process| process.dedicated.then(|| process.process.clone()));
                 let ended = state.instances.remove(&application_instance_id);
                 if let Some(agent) = ended.and_then(|instance| instance.process) {
-                    // A dedicated backend is stopped from what the registry holds by whoever ends
-                    // it, and let go of only after: see [`Broker::release_stopped`].
-                    if !agent.dedicated {
-                        release_agent_job(&state.instances, &agent.process);
-                    }
+                    release_agent_job(&state.instances, &agent.process);
                 }
                 state.tokens.withdraw(application_instance_id);
                 state.profiles.release(application_instance_id);
@@ -1429,21 +1406,10 @@ impl Broker {
                 self.notices_ready.notify_one();
                 StopOutcome {
                     instance_ended: true,
-                    backend,
                     attachments_remaining: 0,
                 }
             }
         }
-    }
-
-    /// Lets go of what a dedicated backend was held by, once it has been stopped.
-    ///
-    /// The job a backend was started in is what stops it, so ending its instance leaves the job
-    /// where the stop finds it, and the one that stops it calls this after. An instance of this
-    /// broker that still names the same process keeps it.
-    pub fn release_stopped(&self, backend: &ProcessStartIdentity) {
-        let state = self.state();
-        release_agent_job(&state.instances, backend);
     }
 
     /// Gives back everything one launch took, because it failed before it was committed.
