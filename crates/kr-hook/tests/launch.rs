@@ -1357,6 +1357,63 @@ fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
     let _ = finish(child);
 }
 
+/// KR-REQ-12.07: a launch whose admission cannot be delivered, because its launcher went away
+/// between the registration being published and the admission being written, gives its instance
+/// and its binding back before it takes the registration down, so nobody who finds the
+/// registration gone finds the launch still holding the instance. The two steps of taking such a
+/// launch back are held apart, and what is true between them is looked at.
+#[test]
+fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_registration_goes() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let registration = Shell::registration(&answer);
+    let (published, deliver) = shell.backends.pause_before_admitting();
+    let (giving_back, finish_giving_back) = shell.backends.pause_before_giving_back();
+    let mut launcher = shell.launcher(&shell.executable, &Shell::answered(), None);
+    shell.prepare(&mut launcher, Some(&answer), "undelivered", &[]);
+    let mut launcher = launcher.spawn().expect("the launcher starts");
+
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, published).await })
+        .expect("the registration is published")
+        .expect("and the backend waits to write the admission");
+    assert!(registration.exists());
+    // The launcher goes away before it is admitted, so the admission has nobody to reach.
+    let _ = launcher.kill();
+    let _ = launcher.wait();
+    deliver.send(()).expect("the backend waits");
+
+    // Between the two steps of taking the launch back: the first is done and the second is not.
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, giving_back).await })
+        .expect("the admission fails")
+        .expect("and the backend stops while it takes the launch back");
+    assert!(
+        shell.broker.live_bindings().is_empty(),
+        "the binding is given back before the registration is taken down"
+    );
+    assert!(
+        registration.exists(),
+        "and the registration is taken down after, never before"
+    );
+    finish_giving_back.send(()).expect("the backend waits");
+
+    eventually("the registration goes", || !registration.exists());
+    assert!(
+        shell.broker.live_bindings().is_empty(),
+        "and the binding with it"
+    );
+    let child = shell.launch(&answer, "again", &[]);
+    assert_eq!(
+        shell.report("again")["registered"],
+        "yes",
+        "a retry is admitted"
+    );
+    let _ = finish(child);
+}
+
 /// KR-REQ-12.07: a launcher stopped before it looked, whose line then ended, still runs the
 /// invocation as typed when it is resumed: what was typed is in its variable's file name.
 #[test]

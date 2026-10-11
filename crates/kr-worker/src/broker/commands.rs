@@ -295,6 +295,10 @@ struct Backend {
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
     #[cfg(feature = "testing")]
     commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    #[cfg(feature = "testing")]
+    admission_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    #[cfg(feature = "testing")]
+    give_back_pause: Arc<Mutex<Option<ConfirmPause>>>,
     #[cfg(all(feature = "testing", windows))]
     show_pause: Arc<Mutex<Option<ConfirmPause>>>,
     #[cfg(all(feature = "testing", windows))]
@@ -532,6 +536,14 @@ pub struct CommandBackends {
     /// own tests.
     #[cfg(feature = "testing")]
     commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// Where the next launch stops after its registration is published and before its admission is
+    /// written, for this host's own tests.
+    #[cfg(feature = "testing")]
+    admission_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// Where the next launch whose admission could not be written stops once its instance is given
+    /// back, for this host's own tests.
+    #[cfg(feature = "testing")]
+    give_back_pause: Arc<Mutex<Option<ConfirmPause>>>,
     /// Where the next launch that says it is going stops before its program is shown, for this
     /// host's own tests.
     #[cfg(all(feature = "testing", windows))]
@@ -636,6 +648,10 @@ impl CommandBackends {
             confirm_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
             commit_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "testing")]
+            admission_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "testing")]
+            give_back_pause: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "testing", windows))]
             show_pause: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "testing", windows))]
@@ -784,6 +800,49 @@ impl CommandBackends {
         let (release, go) = tokio::sync::oneshot::channel();
         *self
             .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next launch after its registration is published and before its admission is
+    /// written, for this host's own tests: the launcher can be ended while the backend waits.
+    ///
+    /// Returns the end that says the launch has arrived there and the end that lets it go on. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_admitting(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .admission_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next launch whose admission could not be written once its instance and binding are
+    /// given back and before its registration is taken down, for this host's own tests: what is
+    /// true then is what a reader of the registration sees while a launch is half taken back.
+    ///
+    /// Returns the end that says the launch has arrived there and the end that lets it go on. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_giving_back(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .give_back_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -1302,6 +1361,10 @@ impl CommandBackends {
             confirm_pause: Arc::clone(&self.confirm_pause),
             #[cfg(feature = "testing")]
             commit_pause: Arc::clone(&self.commit_pause),
+            #[cfg(feature = "testing")]
+            admission_pause: Arc::clone(&self.admission_pause),
+            #[cfg(feature = "testing")]
+            give_back_pause: Arc::clone(&self.give_back_pause),
             #[cfg(all(feature = "testing", windows))]
             show_pause: Arc::clone(&self.show_pause),
             #[cfg(all(feature = "testing", windows))]
@@ -2699,8 +2762,35 @@ async fn admit_claimed<'a>(
     kr_ipc::paths::write_owner_only_file(registration_path, published.as_bytes()).map_err(
         |error| BrokerError::ledger(format!("could not write the registration: {error}")),
     )?;
+    #[cfg(feature = "testing")]
+    {
+        let armed = backend
+            .admission_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
     if let Err(error) = stream.write_frame(&admission()).await {
-        let _ = std::fs::remove_file(registration_path);
+        // The instance and its binding are given back first, and the registration is taken down
+        // after, by the caller's roll-back: whoever finds the registration gone finds nothing of
+        // the launch held.
+        drop(registered);
+        #[cfg(feature = "testing")]
+        {
+            let armed = backend
+                .give_back_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((arrived, go)) = armed {
+                let _ = arrived.send(());
+                let _ = go.await;
+            }
+        }
         return Err(error);
     }
     Ok((registered, registration))
