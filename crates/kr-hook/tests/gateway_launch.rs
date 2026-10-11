@@ -807,6 +807,23 @@ fn kr_req_11_33_a_credential_a_terminal_signs_in_with_is_kept_nowhere() {
     // The server answered the sign-in, so the request reached it, and the session went on.
     launched.prints("TUI: the sign-in was refused; the stand-in goes on");
     launched.prints("TUI: turn/completed");
+    let instance = shell.announcement().instance.application_instance_id;
+    let intents = shell.broker.client_requests().expect("the records read");
+    let kept = |name: &str| {
+        let intent = intents
+            .iter()
+            .find(|intent| intent.method.as_str().contains(name))
+            .unwrap_or_else(|| panic!("the {name} request was recorded: {intents:?}"));
+        shell.broker.source(instance, &intent.source).is_some()
+    };
+    assert!(
+        kept("turn"),
+        "the control: an ordinary request's bytes are retained as a source event"
+    );
+    assert!(
+        !kept("login"),
+        "the sign-in request, which carries the key, is retained nowhere"
+    );
     let snapshot = format!(
         "{:?} {:?}",
         shell.broker.resource_snapshot(),
