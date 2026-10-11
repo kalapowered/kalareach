@@ -1435,6 +1435,11 @@ ConPTY's output pipe: every byte that arrives there is carried through unchanged
 application did through the console API rather than by writing bytes is whatever ConPTY made of it.
 A session never claims to have preserved writes it was never handed.
 
+**A link near the length bound.** ConPTY passes a hyperlink on under an identifier it writes
+itself, which makes the link up to 23 bytes longer. A hyperlink within 23 bytes of the 2,048-byte
+bound as the application wrote it is therefore refused on Windows, and a terminal that was being
+handed the stream is projected, with the reason `stream_not_carryable`.
+
 **The job object.** The worker holds the sole owning handle for one job object per session, with
 kill-on-close, and the shell joins that job *before* it runs: it is created suspended, assigned,
 confirmed to be held, and only then resumed. An agent the worker's launch starts joins it as it is
