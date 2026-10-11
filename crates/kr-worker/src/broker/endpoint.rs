@@ -107,6 +107,39 @@ impl BoundEndpoint {
     /// platform does not bind.
     pub fn bind(runtime_directory: &std::path::Path) -> Result<Self> {
         let address = ListenerAddress::for_launch(runtime_directory)?;
+        Self::bind_address(address, runtime_directory)
+    }
+
+    /// Binds a private socket of the given file name in `runtime_directory`, for an address the
+    /// caller has already told a process of.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`BoundEndpoint::bind`] does.
+    #[cfg(unix)]
+    pub fn bind_named(runtime_directory: &std::path::Path, name: &str) -> Result<Self> {
+        if !runtime_directory.is_absolute() {
+            return Err(BrokerError::invalid(
+                "a launch's runtime directory is an absolute path",
+            ));
+        }
+        Self::bind_address(
+            ListenerAddress::PrivateSocket(runtime_directory.join(name)),
+            runtime_directory,
+        )
+    }
+
+    fn bind_address(
+        address: ListenerAddress,
+        #[cfg_attr(
+            not(windows),
+            expect(
+                unused_variables,
+                reason = "a pipe's directory is read to be checked private, and a socket's is its path's parent"
+            )
+        )]
+        runtime_directory: &std::path::Path,
+    ) -> Result<Self> {
         address.require_local()?;
         match &address {
             #[cfg(unix)]

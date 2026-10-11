@@ -483,33 +483,60 @@ fn the_doctor_says_why_a_script_runs_as_typed() {
     assert_eq!(script.mode, IntegrationMode::NativeTerminal);
 }
 
-/// KR-REQ-07.45: the doctor says of an integration that declares a backend, and is on, that this
-/// host runs none and an invocation runs as typed; of one that is off it says nothing, since a
-/// session applies none of it either way.
+/// KR-REQ-07.45: the doctor says of an integration that declares a backend, and is on, whether an
+/// invocation is served by a gateway: it is where a Unix host finds an executable a signed record
+/// names that the connector's table is qualified for, and the mode is then the gateway's; where it
+/// is not, the reason says which part is missing and an invocation runs as typed. Of one that is
+/// off it says nothing, since a session applies none of it either way.
 #[test]
-fn the_doctor_says_an_integration_that_declares_a_backend_runs_as_typed() {
+fn the_doctor_says_whether_an_integration_that_declares_a_backend_is_served_by_a_gateway() {
     let store = Store::new("backend");
     let bin = store.0.join("bin");
-    executable(&bin, &format!("codex{}", std::env::consts::EXE_SUFFIX));
-    let reading =
+    let codex = executable(&bin, &format!("codex{}", std::env::consts::EXE_SUFFIX));
+    let digest = crate::catalogue::native_bridge::read_executable(&codex).expect("a digest");
+    let unrecorded =
         Integrations::new().read(&[store.admitted(&fixture::Shape::codex_backend(), |_| {})]);
-    let doctor = |on: &[String]| {
-        report(Some(&reading), &[], on, &able(vec![bin.clone()]))
+    let recorded = Integrations::new().read(&[store.admitted(
+        &fixture::Shape::codex_backend(),
+        |source| {
+            source.qualified = vec![kr_worker::broker::connectors::QualifiedExecutable {
+                digest,
+                version: fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
+            }];
+        },
+    )]);
+    let doctor = |reading: &Reading, on: &[String]| {
+        report(Some(reading), &[], on, &able(vec![bin.clone()]))
             .reports
             .remove(0)
     };
-    let on = doctor(&enabled(&["codex"]));
-    assert_eq!(on.state, CommandIntegrationState::On);
+    let unserved = doctor(&unrecorded, &enabled(&["codex"]));
+    assert_eq!(unserved.state, CommandIntegrationState::On);
+    assert_eq!(unserved.mode, IntegrationMode::NativeTerminal);
+    let reason = unserved.reason.0.as_deref().expect("a reason");
+    if cfg!(unix) {
+        assert!(
+            reason.contains("no signed qualification record names the executable"),
+            "{reason}"
+        );
+    } else {
+        assert!(reason.contains("this platform runs none"), "{reason}");
+    }
     assert!(
-        on.reason
-            .0
-            .as_deref()
-            .is_some_and(|reason| reason.contains("declares a backend, and this host runs none")),
-        "{:?}",
-        on.reason
+        reason.ends_with("so an invocation runs as typed"),
+        "{reason}"
     );
-    assert_eq!(on.mode, IntegrationMode::NativeTerminal);
-    let off = doctor(&[]);
+
+    let served = doctor(&recorded, &enabled(&["codex"]));
+    if cfg!(unix) {
+        assert_eq!(served.reason.0, None);
+        assert_eq!(served.mode, IntegrationMode::Gateway);
+        assert_eq!(
+            served.executable_version.0.as_deref(),
+            Some(fixture::GATEWAY_QUALIFIED_VERSION)
+        );
+    }
+    let off = doctor(&recorded, &[]);
     assert_eq!(off.state, CommandIntegrationState::Off);
     assert_eq!(off.reason.0, None);
 }
