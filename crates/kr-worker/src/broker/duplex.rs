@@ -45,7 +45,7 @@ use kr_protocol::scalars::TimestampMs;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::broker::error::{BrokerError, Result};
-use crate::broker::framing::Framing;
+use crate::broker::framing::{Framing, MAX_CLIENT_IDENTIFIER_BYTES};
 use crate::broker::host::Performed;
 use crate::broker::ledger::ClientRequestOutcome;
 use crate::broker::methods::{
@@ -84,12 +84,6 @@ pub const MAX_QUEUED_OBSERVATIONS: usize = 64;
 /// requests and never replies would otherwise grow that map for as long as the terminal kept
 /// asking, so the bound is what a terminal can have outstanding and the rest are refused in place.
 pub const MAX_FORWARDED_CLIENT_REQUESTS: usize = 256;
-
-/// The most bytes a request identifier of the client's may have, when it is a string.
-///
-/// It is the bound the upstream's identifiers have, and the client's is held until the upstream
-/// answers, as many as [`MAX_FORWARDED_CLIENT_REQUESTS`] at a time.
-pub const MAX_CLIENT_IDENTIFIER_BYTES: usize = 256;
 
 /// How long one of the client's own requests waits for the upstream before it is given up.
 ///
@@ -2001,14 +1995,19 @@ impl Duplex {
         let identifier = match members.get(&held.table.request_id_field) {
             None => None,
             Some(raw) => {
+                // The spelling is bounded, not the text it decodes to: the reply carries the
+                // spelling back, and one written in escapes is several times as long.
+                let spelled = splice::find_member(frame, &held.table.request_id_field)?;
                 let well_formed = match raw {
-                    serde_json::Value::String(text) => text.len() <= MAX_CLIENT_IDENTIFIER_BYTES,
+                    serde_json::Value::String(_) => spelled
+                        .as_ref()
+                        .is_some_and(|span| span.len() <= MAX_CLIENT_IDENTIFIER_BYTES),
                     serde_json::Value::Number(number) => number.is_i64() || number.is_u64(),
                     _ => false,
                 };
                 if !well_formed {
                     return Err(BrokerError::invalid(format!(
-                        "a request identifier is an integer or a string of at most \
+                        "a request identifier is an integer or a string spelled in at most \
                          {MAX_CLIENT_IDENTIFIER_BYTES} bytes"
                     )));
                 }
@@ -2023,10 +2022,9 @@ impl Duplex {
                     )));
                 }
                 // The text as the client wrote it, so the reply carries back the same one.
-                let span =
-                    splice::find_member(frame, &held.table.request_id_field)?.ok_or_else(|| {
-                        BrokerError::invalid("this frame's identifier could not be read as written")
-                    })?;
+                let span = spelled.ok_or_else(|| {
+                    BrokerError::invalid("this frame's identifier could not be read as written")
+                })?;
                 let text = std::str::from_utf8(&frame[span])
                     .map_err(|_| BrokerError::invalid("this frame's identifier is not text"))?;
                 Some(ClientId(text.to_owned()))

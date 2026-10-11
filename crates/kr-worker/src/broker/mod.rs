@@ -118,13 +118,12 @@ pub use crate::broker::bridge::{
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{
     CLIENT_REPLY_DEADLINE, Carried, Closure, Delivery, Dispatch, Duplex,
-    MAX_CLIENT_IDENTIFIER_BYTES, MAX_FORWARDED_CLIENT_REQUESTS, MAX_QUEUED_BYTES,
-    MAX_QUEUED_OBSERVATIONS, Observations, Observatory, Queued, ResourceTransition, Sink,
-    UpstreamFailure, UpstreamReply, WRITE_DEADLINE,
+    MAX_FORWARDED_CLIENT_REQUESTS, MAX_QUEUED_BYTES, MAX_QUEUED_OBSERVATIONS, Observations,
+    Observatory, Queued, ResourceTransition, Sink, UpstreamFailure, UpstreamReply, WRITE_DEADLINE,
 };
 pub use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 pub use crate::broker::error::{BrokerError, Result};
-pub use crate::broker::framing::Framing;
+pub use crate::broker::framing::{Framing, MAX_CLIENT_IDENTIFIER_BYTES};
 pub use crate::broker::gateway::{
     Connection, ConnectionOrigin, Forwarded, Gateway, PreparedResponse, ReverseRequest,
     RichInvocation,
