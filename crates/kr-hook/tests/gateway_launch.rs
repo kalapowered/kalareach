@@ -646,7 +646,7 @@ fn kr_req_07_60_a_program_that_never_connects_ends_its_instance_and_server_at_th
 }
 
 /// KR-REQ-12.07: a launch lost to a retirement between the server being started and the commit
-/// ends the server and runs the program as typed.
+/// runs the program as typed, and the closure that retired the backend ends its server.
 #[test]
 fn kr_req_12_07_a_launch_lost_to_a_retirement_ends_its_server() {
     let shell = Gateway::new();
@@ -663,6 +663,9 @@ fn kr_req_12_07_a_launch_lost_to_a_retirement_ends_its_server() {
     // left to let go; the launch is abandoned either way.
     let _ = release.send(());
     assert_eq!(launched.ends().code(), Some(2), "the program ran as typed");
+    // The server belongs to the closure now, which ends it once the acceptance is delivered.
+    let _entered = shell.runtime.enter();
+    shell.runtime.block_on(shell.backends.end_servers());
     eventually("the server ended", || {
         kr_ipc::identity::process_state(&servers[0]) == kr_ipc::identity::ProcessState::Ended
     });
