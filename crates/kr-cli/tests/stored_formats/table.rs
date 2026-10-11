@@ -165,6 +165,16 @@ pub fn known() -> Vec<Known> {
             "SessionRenameResult",
             "8647db2b73068c496d6d6fc3a923e0bf3b2838d05c6926b0052c937115003c2b",
         ),
+        known_protocol::<delivery::DeliveryDestinationConfigureResult>(
+            "registry",
+            "DeliveryDestinationConfigureResult",
+            "481a136e9e840abc8d93a11972f41ad975655e3d98deb982819a8113c3f4f1b7",
+        ),
+        known_protocol::<delivery::DeliveryDestinationRemoveResult>(
+            "registry",
+            "DeliveryDestinationRemoveResult",
+            "16a90c0562fa5ae4906d61e674153bf59c316d30abc54ec5ecc79b08e019c443",
+        ),
         known_protocol::<delivery::DeliveryDestinationSecretSetResult>(
             "registry",
             "DeliveryDestinationSecretSetResult",
