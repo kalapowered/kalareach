@@ -33,6 +33,7 @@ async fn main() {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["--version"] => println!("codex-cli {}", contract::RELEASE),
         ["app-server", "--listen", "stdio://"] => server::run(variants).await,
         ["--remote", remote, words @ ..] if remote.starts_with("unix://") => {
             let socket = &remote["unix://".len()..];
