@@ -60,7 +60,7 @@ async fn present(
 ) -> Result<()> {
     let lease: kr_protocol::account::MembershipLease = read_json(
         &arguments.lease,
-        "the lease file",
+        ("the lease file", "lease"),
         "the file is not a membership lease an organisation signed",
     )?;
     let authority = arguments
@@ -215,7 +215,7 @@ pub(crate) fn report_exclusive(made: &OrganisationExclusiveSetResult, json: bool
 fn read_chain(path: &std::path::Path) -> Result<PolicyAuthority> {
     read_json(
         path,
-        "the chain file",
+        ("the chain file", "chain"),
         "the file is not an organisation's published policy-signing chain",
     )
 }
@@ -223,14 +223,15 @@ fn read_chain(path: &std::path::Path) -> Result<PolicyAuthority> {
 /// An organisation's published object from a JSON file, bounded as [`read_chain`] says.
 fn read_json<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
-    what: &'static str,
+    (what, object): (&'static str, &'static str),
     not_it: &'static str,
 ) -> Result<T> {
     let bytes = read_bounded(path).map_err(|error| {
         CliError::Usage(if error.kind() == std::io::ErrorKind::InvalidData {
             shown!(
-                "{} is not a regular file, or is larger than this host would take",
-                Shown::said(what)
+                "{} is not a regular file, or is larger than any {} this host would take",
+                Shown::said(what),
+                Shown::said(object)
             )
         } else {
             shown!(
