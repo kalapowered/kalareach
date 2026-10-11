@@ -609,6 +609,43 @@ fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program(
     }
 }
 
+/// KR-REQ-07.61: what the server starts for the program belongs to the program's instance: a
+/// process below the server is placed under it, and a process outside the session is placed under
+/// no instance.
+#[test]
+fn kr_req_07_61_a_process_the_server_started_is_placed_under_the_programs_instance() {
+    use kr_worker::questions::binding::{AgentBindings as _, AgentPlacement};
+
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(
+        &answer,
+        "placed",
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+    );
+    launched.prints("TUI: turn/completed");
+    let instance = shell.announcement().instance.application_instance_id;
+    eventually("the session recorded what the server started", || {
+        !shell.started_by_servers().is_empty()
+    });
+    for process in shell.started_by_servers() {
+        match shell.broker.binding_of(&process) {
+            AgentPlacement::Bound(binding) => {
+                assert_eq!(binding.application_instance_id, instance);
+            }
+            other => panic!("{process:?} is below the server, and is placed {other:?}"),
+        }
+    }
+    let outside = kr_ipc::identity::current_process_start_identity().expect("this process");
+    assert_eq!(
+        shell.broker.binding_of(&outside),
+        AgentPlacement::Unbound,
+        "a process outside the session is under no instance"
+    );
+}
+
 /// KR-REQ-07.60: a server that dies first, leaving its command running, leaves nothing: the
 /// command was recorded while the server ran, and the program's end finds it.
 #[test]
