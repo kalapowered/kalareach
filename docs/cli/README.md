@@ -1745,8 +1745,8 @@ was not granted the voice scope, and `kr account show` lists the scopes it holds
 
 `kr account sign-out` has the daemon end a sign-in that is waiting, remove the account and ask the
 service to end it. When the service cannot be told, the account is gone from this host all the
-same, the command says so, and the daemon sends the revocation again when it next starts. It is
-refused while a voice call is open.
+same, the command says so, and the daemon sends the revocation again at a later start that can
+reach the service. It is refused while a voice call is open.
 
 `--json` prints `{ "ok", "opened", "authorise_url", "redirect_address", "expires_at_ms" }` for
 `sign-in`; when the attempt had already ended by the time the command looked, it prints the `show`

@@ -120,8 +120,8 @@ pub async fn sign_out(selector: &EnvironmentSelector, json: bool) -> Result<()> 
         ));
     } else {
         output::line(&stdout_line!(
-            "Signed out. The account service could not be told, so the daemon tells it when it \
-             next starts."
+            "Signed out. The account service could not be told, so the daemon tells it at a later \
+             start that can reach it."
         ));
     }
     Ok(())
