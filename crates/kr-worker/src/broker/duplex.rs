@@ -1556,12 +1556,7 @@ pub enum Carried {
 /// Why one connection's owner stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Closure {
-    /// The upstream's own end closed while the process this host launched had ended.
-    ///
-    /// Section 7 calls this the native TUI's intentional exit: it ends the instance and stops the
-    /// dedicated backend.
-    NativeExit,
-    /// An end closed and the process this host launched is still running.
+    /// An end closed.
     ///
     /// Closing an attachment is not an exit, and nothing of the upstream is stopped for it.
     Detached,

@@ -3268,7 +3268,6 @@ fn register_agent(worker: &Worker, upstream: Arc<CountingUpstream>) {
                     process,
                 },
                 Credential::from_bytes([9; 32]),
-                true,
                 TimestampMs::new(1),
             )),
         )

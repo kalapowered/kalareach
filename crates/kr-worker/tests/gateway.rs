@@ -71,7 +71,6 @@ fn managed(instance_id: ApplicationInstanceId) -> ManagedProcess {
             process,
         },
         Credential::from_bytes(CREDENTIAL),
-        true,
         TimestampMs::new(1),
     )
 }

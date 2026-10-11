@@ -112,7 +112,6 @@ fn launched(broker: &Broker, instance: ApplicationInstanceId, process: ProcessSt
                     process,
                 },
                 Credential::generate().expect("a launch credential"),
-                true,
                 TimestampMs::new(1),
             )),
         )
@@ -769,7 +768,7 @@ impl Started {
         let agent = running.agent.id();
         let identity =
             kr_ipc::identity::started_process_identity(agent).expect("the agent's identity");
-        kr_worker::windows::job::keep_agent(identity.clone(), Arc::clone(&job), None);
+        kr_worker::windows::job::keep_agent(identity.clone(), Arc::clone(&job));
         running.kept = Some(identity.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let helper = loop {
@@ -931,11 +930,10 @@ fn an_agent_started_in_no_job_places_nothing_below_it() {
     .expect("the agent itself is admitted");
 }
 
-/// On Windows, the job a dedicated agent was started in is let go of when its stop has finished and
-/// no instance of the broker names that agent any more, and not before: ending an instance leaves
-/// the job where the stop finds it, while another instance still names the agent its helper is
-/// still bound through the job, and once none does and the stop is done, the job is found no more
-/// and the helper is under no agent this session's broker knows.
+/// On Windows, the job an agent was started in is let go of when no instance of the broker names
+/// that agent any more, and not before: while another instance still names the agent its helper is
+/// still bound through the job, and once none does, the job is found no more and the helper is
+/// under no agent this session's broker knows.
 #[cfg(windows)]
 #[test]
 fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
@@ -959,7 +957,6 @@ fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
     verify().expect("admitted through the job the agent was started in");
 
     assert!(broker.end(first, InstanceEnding::NativeExit).instance_ended);
-    broker.release_stopped(&started.identity);
     assert!(
         kr_worker::windows::job::agent_job(&started.identity)
             .is_some_and(|job| Arc::ptr_eq(&job, &started.running.job)),
@@ -973,13 +970,8 @@ fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
             .instance_ended
     );
     assert!(
-        kr_worker::windows::job::agent_job(&started.identity).is_some(),
-        "the stop that follows the ending finds the job"
-    );
-    broker.release_stopped(&started.identity);
-    assert!(
         kr_worker::windows::job::agent_job(&started.identity).is_none(),
-        "no instance names the agent any more and it is stopped, so nothing keeps its job"
+        "no instance names the agent any more, so nothing keeps its job"
     );
     let refused = verify().expect_err("the helper is under no agent the broker knows");
     assert_eq!(refused.code(), ErrorCode::NotInKrSession, "{refused}");

@@ -11,7 +11,6 @@
 //! | KR-REQ-11.32, KR-REQ-12.14 | The endpoint a launch binds is a named pipe in the local namespace; the kernel names the process that connects to it; the owner arriving over the network is refused |
 //! | KR-REQ-11.43, KR-REQ-05.09 | A bridge the launched application started, presenting the launch's registration and credential, is admitted and named by the kernel; a wrong credential, an environment session identifier alone, a presented identity the kernel did not name, a browser's headers, a process outside every job and a process in another launch's job are each refused |
 //! | KR-REQ-11.23, KR-REQ-12.14 | The registration directory and the credential file are read back by their access-control lists, from the opened object: an ordinary directory, a widened one and a link are refused, and so is a credential file another account was granted |
-//! | KR-REQ-12.02 | A launch on this platform publishes the registration and the credential and starts the agent in its job, and one into a directory open to another account starts nothing |
 //!
 //! The pipe's own refusal of another account and of a restricted token is the pipe's list, which
 //! `kr-ipc`'s own suite runs against the listener this endpoint binds.
@@ -30,8 +29,8 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_worker::broker::{
-    BoundEndpoint, BridgeSurface, Broker, Framing, InstalledBridge, Launched, ListenerAddress,
-    NativeGateway, NativeLaunch,
+    BoundEndpoint, BridgeSurface, Broker, BrokerTransport, Credential, Framing, InstalledBridge,
+    ListenerAddress, ManagedProcess, NativeGateway, NativeLaunch, TransportHandle,
 };
 use kr_worker::persistence::JournalHealth;
 
@@ -125,25 +124,16 @@ fn close_to_administrators(path: &Path) {
     );
 }
 
-/// Whether `text` carries `secret`: the whole value, as written. A registration is full of
-/// numbers (a process identifier, a creation time) and random names, so any short run of digits can
-/// turn up in one by chance; only the credential itself says whether the credential was written.
-fn carries(text: &str, secret: &str) -> bool {
-    !secret.is_empty() && text.contains(secret)
-}
-
 fn launch_for(which: u8) -> NativeLaunch {
     NativeLaunch {
         profile_id: LaunchProfileId::new("lp-1").expect("valid"),
         expected_process: None,
-        native_terminal: None,
         application_instance_id: instance(which),
         plugin_id: package(),
         installed_protocol_version: "1".to_owned(),
         framing: Framing::new(NativeFraming::JsonLines),
         site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
         os_user: "agent-user".to_owned(),
-        working_directory: std::env::temp_dir(),
     }
 }
 
@@ -177,10 +167,9 @@ fn agent_profile(arguments: &[&str]) -> LaunchProfile {
 /// An agent this host started, ended with everything in its job when the test ends, however it
 /// ends.
 struct Launch {
-    broker: Arc<Broker>,
     gateway: NativeGateway,
     directory: PathBuf,
-    child: Option<kr_worker::broker::AgentChild>,
+    child: Option<kr_worker::windows::launch::Child>,
     process: ProcessStartIdentity,
     /// The session's job, which holds the launch and ends it when the test lets it go.
     _session: Arc<kr_worker::windows::job::SessionJob>,
@@ -203,11 +192,6 @@ impl Launch {
         };
         let session =
             Arc::new(kr_worker::windows::job::SessionJob::create().expect("a session job"));
-        let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(which))
-            .expect("the endpoint binds")
-            .with_bridge(installed)
-            .expect("the bridge belongs to this connector")
-            .in_session(Arc::clone(&session));
         let registration = towards.map_or_else(
             || "-".to_owned(),
             |other| {
@@ -233,16 +217,65 @@ impl Launch {
                 None,
             )
             .expect("the launch is prepared");
-        let Launched { child, process, .. } = gateway
-            .launch(
+        let reservation = broker
+            .execute_launch(
                 &intent,
                 &kr_worker::broker::ForegroundMark::idle(4),
-                IntegrationMode::Gateway,
-                TimestampMs::new(1),
+                instance(which),
             )
-            .expect("the agent is started");
+            .expect("the launch is executed");
+        // The agent starts in the session's job and in a job of its own, with the registration's
+        // path in its environment, and the registration that names it is published once it exists.
+        let job = Arc::new(kr_worker::windows::job::AgentJob::create().expect("an agent job"));
+        let own_registration = directory.join("registration");
+        let child = kr_worker::windows::launch::start(&kr_worker::windows::launch::Spec {
+            program: Path::new(&reservation.profile().binary.resolved_path),
+            arguments: &reservation.profile().arguments,
+            directory: &std::env::temp_dir(),
+            environment: &[("KR_REGISTRATION", own_registration.as_os_str())],
+            session: Some(session.as_ref()),
+            agent: &job,
+            pipe_input: true,
+            pipe_output: true,
+        })
+        .expect("the agent is started");
+        let process =
+            kr_ipc::identity::started_process_identity(child.id()).expect("the kernel names it");
+        kr_worker::windows::job::keep_agent(process.clone(), job);
+        let managed = ManagedProcess::new(
+            instance(which),
+            process.clone(),
+            TransportHandle {
+                transport: BrokerTransport::PrivateSocket,
+                application_instance_id: instance(which),
+                executable_digest: reservation.profile().binary.digest,
+                process: process.clone(),
+            },
+            Credential::generate().expect("a credential"),
+            TimestampMs::new(1),
+        );
+        managed
+            .write_registration(&directory.join("credential"))
+            .expect("the credential is written");
+        let registered = reservation
+            .register(IntegrationMode::Gateway, Some(managed))
+            .unwrap_or_else(|refused| panic!("the launch is registered: {}", refused.error));
+        let mut launch = launch_for(which);
+        launch.expected_process = Some(process.clone());
+        let gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch)
+            .expect("the endpoint binds")
+            .with_bridge(installed)
+            .expect("the bridge belongs to this connector");
+        kr_ipc::paths::write_owner_only_file(
+            &own_registration,
+            gateway
+                .registration()
+                .expect("the gateway has a registration")
+                .as_bytes(),
+        )
+        .expect("the registration is published");
+        let _ = registered.commit();
         Self {
-            broker,
             gateway,
             directory,
             child: Some(child),
@@ -854,7 +887,6 @@ fn kr_req_11_23_the_credential_file_is_owner_only_and_a_widened_one_is_refused()
             process: kr_ipc::identity::current_process_start_identity().expect("this process"),
         },
         kr_worker::broker::Credential::generate().expect("a credential"),
-        true,
         TimestampMs::new(1),
     );
     launched
@@ -888,160 +920,4 @@ fn kr_req_11_23_the_credential_file_is_owner_only_and_a_widened_one_is_refused()
     for directory in [&directory, &ordinary] {
         let _ = std::fs::remove_dir_all(directory);
     }
-}
-
-/// KR-REQ-12.02: a launch on this platform publishes the registration and the credential and
-/// starts the agent in its job. The registration names the pipe by its path and carries no secret;
-/// the credential file is the owner's; the agent is a member of the job the host keeps for it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_12_02_a_launch_publishes_its_files_and_starts_the_agent_in_its_job() {
-    let launch = Launch::start(2, "none", None);
-    let registration = std::fs::read_to_string(launch.directory.join("registration"))
-        .expect("the registration is published");
-    assert!(
-        registration.contains(&format!(
-            "endpoint={}\n",
-            launch.gateway.address().for_diagnostics()
-        )),
-        "it names the pipe by its path: {registration}"
-    );
-    assert!(registration.contains("pid="));
-    let stored = kr_ipc::paths::read_owner_only_file(&launch.directory.join("credential"), 256)
-        .expect("the credential file is the owner's")
-        .expect("it is there");
-    assert_eq!(stored.len(), 64);
-    let secret = String::from_utf8(stored).expect("hexadecimal");
-    assert!(
-        registration.contains("credential=") && !carries(&registration, &secret),
-        "it names the file the private exchange is in and carries none of it: {registration}"
-    );
-    assert!(
-        launch
-            .members()
-            .contains(&u32::try_from(launch.process.pid.get()).expect("a pid")),
-        "the agent was started in the job the host keeps for it"
-    );
-    assert!(
-        launch.broker.binding_state(instance(2)).is_ok(),
-        "and its instance is registered"
-    );
-}
-
-/// KR-REQ-12.02: what judges a registration to carry the credential is the credential. Digits that
-/// happen to read like a fixed test value do not, and the credential written into a line does, so
-/// the launch test above can neither fail on a number nor pass over a secret.
-#[test]
-fn kr_req_12_02_a_registration_is_judged_by_the_credential_and_not_by_its_digits() {
-    let secret = "ab".repeat(32);
-    let registration = "endpoint=\\\\.\\pipe\\kr-0909\npid=10909\nstart=134353840909000000\ncredential=C:\\0909\\credential\n";
-    assert!(
-        !carries(registration, &secret),
-        "a registration full of 0909 and without the credential carries none"
-    );
-    assert!(
-        carries(&format!("{registration}credential={secret}\n"), &secret),
-        "and one that has the credential written into it does"
-    );
-    assert!(!carries("", ""), "nothing is carried by nothing");
-}
-
-/// KR-REQ-12.02: a launch into a directory another account was granted starts nothing. The
-/// endpoint was bound while the directory was private, and the launch reads it again before it
-/// starts anything.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_12_02_a_launch_into_a_directory_open_to_another_account_starts_nothing() {
-    let directory = private_directory();
-    let broker =
-        Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"));
-    let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(2))
-        .expect("the endpoint binds")
-        .in_session(Arc::new(
-            kr_worker::windows::job::SessionJob::create().expect("a session job"),
-        ));
-    let intent = broker
-        .prepare_launch(
-            agent_profile(&[
-                "--ignored",
-                "--exact",
-                "agent_runs_a_helper",
-                "--nocapture",
-                "none",
-                "-",
-            ]),
-            kr_worker::broker::ForegroundMark::idle(4),
-            None,
-        )
-        .expect("the launch is prepared");
-    grant_full(&directory, EVERYONE);
-    let refused = gateway
-        .launch(
-            &intent,
-            &kr_worker::broker::ForegroundMark::idle(4),
-            IntegrationMode::Gateway,
-            TimestampMs::new(1),
-        )
-        .expect_err("a directory another account was granted is refused");
-    assert!(refused.to_string().contains("not owner-only"), "{refused}");
-    assert!(
-        gateway.last_started().is_none(),
-        "and no process was started only to be stopped"
-    );
-    assert!(broker.binding_state(instance(2)).is_err());
-    let _ = std::fs::remove_dir_all(&directory);
-}
-
-/// KR-REQ-07.62 and KR-REQ-12.02: a launch with no session job to be held by starts nothing, and
-/// the refusal is the precondition's own. Control: the same launch on a gateway that has the
-/// session's job starts the agent in it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_07_62_a_launch_with_no_session_job_starts_nothing() {
-    let directory = private_directory();
-    let broker =
-        Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"));
-    // No `in_session`: this gateway has no job the session could end the agent through.
-    let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(2))
-        .expect("the endpoint binds");
-    let intent = broker
-        .prepare_launch(
-            agent_profile(&[
-                "--ignored",
-                "--exact",
-                "agent_runs_a_helper",
-                "--nocapture",
-                "none",
-                "-",
-            ]),
-            kr_worker::broker::ForegroundMark::idle(4),
-            None,
-        )
-        .expect("the launch is prepared");
-    let refused = gateway
-        .launch(
-            &intent,
-            &kr_worker::broker::ForegroundMark::idle(4),
-            IntegrationMode::Gateway,
-            TimestampMs::new(1),
-        )
-        .expect_err("a launch with no session job is refused");
-    assert!(
-        matches!(
-            refused,
-            kr_worker::broker::BrokerError::PreconditionFailed { .. }
-        ),
-        "{refused}"
-    );
-    assert!(
-        gateway.last_started().is_none(),
-        "and no process was started for it"
-    );
-    assert!(broker.binding_state(instance(2)).is_err());
-    let _ = std::fs::remove_dir_all(&directory);
-
-    let launched = Launch::start(3, "none", None);
-    assert!(
-        launched
-            .members()
-            .contains(&u32::try_from(launched.process.pid.get()).unwrap_or(0)),
-        "the same launch with the session's job starts the agent, in its job"
-    );
 }

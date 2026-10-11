@@ -945,18 +945,6 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
-            "a vendor's own sandbox under the session's job",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "kr-worker",
-                "--test",
-                "windows_vendor",
-            ],
-        ),
-        Step::cargo(
-            Group::Rust,
             "what a launch reads of its application's mode",
             &[
                 "test",
