@@ -725,6 +725,11 @@
   flex-wrap: wrap;
 }
 
+.attachment-name {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
 .attachment-chip {
   display: inline-flex;
   flex-wrap: wrap;

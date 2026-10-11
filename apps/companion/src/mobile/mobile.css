@@ -939,9 +939,15 @@
   min-block-size: var(--target);
   padding: var(--gap-1) var(--gap-3);
   border: 1px solid var(--line);
-  border-radius: 999px;
+  /* A rounded end that does not grow with the chip, which wraps to many rows at a large text size. */
+  border-radius: calc(var(--target) / 2);
   background: var(--surface);
   font-size: 0.8125rem;
+}
+
+.m-attachment-name {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
 }
 
 /*

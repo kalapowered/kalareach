@@ -1524,7 +1524,7 @@ function Composer({
               data-upload={attachment.upload}
             >
               <AttachmentThumb attachment={attachment} />
-              {attachment.name}
+              <span className="attachment-name">{attachment.name}</span>
               {attachment.acceptedUpstream ? (
                 <Badge tone="success">Accepted</Badge>
               ) : attachment.upload === 'uploading' ? (

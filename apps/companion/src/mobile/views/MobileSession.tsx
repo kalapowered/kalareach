@@ -1088,7 +1088,7 @@ export function MobileSession({
                   data-upload={attachment.upload}
                 >
                   <AttachmentThumb attachment={attachment} />
-                  {attachment.name}
+                  <span className="m-attachment-name">{attachment.name}</span>
                   <span className="m-row-detail">
                     {`${describeBytes(attachment.byteLen)} · ${UPLOAD_WORDS[attachment.upload]}`}
                   </span>

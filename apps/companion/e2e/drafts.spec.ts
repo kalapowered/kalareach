@@ -154,16 +154,30 @@ for (const surface of ['ios', 'android'] as const) {
       expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
       const outside = await page.evaluate(() => {
         const edge = window.innerWidth
-        return [
-          ...document.querySelectorAll(
-            '[data-testid="attachment-paths"] *, [data-testid="draft-attachments"], [data-testid="draft-attachments"] *'
-          )
-        ]
-          .filter((element) => element.getBoundingClientRect().right > edge + 0.5)
-          .map((element) => element.textContent?.slice(0, 40) ?? element.tagName)
+        const past = (element: Element) => element.getBoundingClientRect().right > edge + 0.5
+        const label = (element: Element) => element.textContent?.slice(0, 40) ?? element.tagName
+        const path = [...document.querySelectorAll('[data-testid="attachment-paths"] *')]
+          .filter(past)
+          .map(label)
+        // Everything in a chip lies inside the chip's own box, and so inside the screen: the name
+        // is an element of its own, so it is among what is checked.
+        const chip = [...document.querySelectorAll('[data-testid="draft-attachments"] > *')].flatMap(
+          (each) => {
+            const box = each.getBoundingClientRect()
+            return [each, ...each.querySelectorAll('*')]
+              .filter((element) => {
+                const inner = element.getBoundingClientRect()
+                return past(element) || inner.left < box.left - 0.5 || inner.right > box.right + 0.5
+              })
+              .map(label)
+          }
+        )
+        return [...path, ...chip]
       })
-      expect(outside, 'lines of the chip and the path that run past the screen').toEqual([])
-      // The chip's own controls are within reach: Remove can be pressed.
+      expect(outside, 'lines of the chip and the path that run past the screen or their chip').toEqual([])
+      // The notice after the upload covers the screen at this size and goes by itself; the chip's
+      // own control can be pressed once it has.
+      await expect(page.locator('.toast')).toHaveCount(0, { timeout: 10_000 })
       await page
         .getByRole('button', { name: /^Remove .* from this draft$/ })
         .click({ trial: true, timeout: 2_000 })

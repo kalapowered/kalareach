@@ -385,13 +385,21 @@ describe('the host’s draft for a session’s files', () => {
 
   it('shows no path from a grant that names another file or another method', async () => {
     const { controls, one, two, paths } = await twoFiles()
+    // The host confirmed both binds, so what refuses them is the window's own check of the grant.
     controls.hostDrafts.giveNextGrantTo({ transfer_id: two.transfer_id })
     await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
-    expect(paths.snapshot().get(one.transfer_id)).toMatchObject({ kind: 'refused' })
+    expect(paths.snapshot().get(one.transfer_id)).toMatchObject({
+      kind: 'refused',
+      words: expect.stringContaining('gave no path') as string
+    })
 
     controls.hostDrafts.giveNextGrantTo({ insertion_method: 'typed_submission' })
     await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, two)
-    expect(paths.snapshot().get(two.transfer_id)).toMatchObject({ kind: 'refused' })
+    expect(paths.snapshot().get(two.transfer_id)).toMatchObject({
+      kind: 'refused',
+      words: expect.stringContaining('gave no path') as string
+    })
+    expect(controls.hostDrafts.bound).toHaveLength(2)
   })
 
   it('says a paired host takes no file, and asks the host for nothing', async () => {
@@ -402,7 +410,7 @@ describe('the host’s draft for a session’s files', () => {
 
     expect(paths.snapshot().get(one.transfer_id)).toMatchObject({
       kind: 'refused',
-      words: expect.stringContaining('takes no file') as string
+      words: 'A host this device is paired with takes no file from it, so this file gets no path here.'
     })
     expect(controls.hostDrafts.made).toEqual([])
   })
