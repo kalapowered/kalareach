@@ -639,12 +639,16 @@ impl Coordinator {
         };
         let written = written.grant;
 
-        Ok(VoiceGrantResult {
+        let result = VoiceGrantResult {
             grant_id: written.grant_id,
             device_id: params.device_id,
             statement: VoiceGrantStatement::of(&planned.plan.actions),
             not_held_by_device: planned.not_held_by_device,
-            barrier: Nullable(barrier),
+            barrier: Nullable::null(),
+        };
+        Ok(match barrier {
+            Some(barrier) => result.with_barrier(barrier),
+            None => result,
         })
     }
 
@@ -1305,13 +1309,17 @@ impl Coordinator {
             None => None,
         };
 
-        Ok(VoiceStopResult {
+        let result = VoiceStopResult {
             voice_session_id: params.voice_session_id,
             revoked_grant_id: record.grant_id,
             revoked_at_ms: TimestampMs::new(at_ms),
             broker_notified,
             sessions_left_running: record.session_ids,
-            barrier: Nullable(barrier),
+            barrier: Nullable::null(),
+        };
+        Ok(match barrier {
+            Some(barrier) => result.with_barrier(barrier),
+            None => result,
         })
     }
 

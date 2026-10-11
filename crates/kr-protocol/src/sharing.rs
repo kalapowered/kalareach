@@ -911,8 +911,26 @@ impl GrantTransferResult {
     }
 }
 
+impl RevocationBarrier {
+    /// This barrier cut so that it decodes, for an answer that carries `beside` and nothing else of
+    /// a revocation.
+    ///
+    /// The cut [`RevocationResult::bounded`] makes, measured against what `beside` (the answer's own
+    /// fields, with no barrier in them) has already spent of the decoder's limits: the workers whose
+    /// barrier has not held are taken before any that has, one of them is always kept when there
+    /// is one, the lists are cut to prefixes in identity order, and every total is counted before
+    /// anything is cut. What a caller reads of the cut barrier ([`Self::holds`], [`Self::pending`])
+    /// is what it would read of the whole.
+    #[must_use]
+    pub fn bounded_beside<T: Serialize>(self, beside: &T) -> Self {
+        let beside = Cost::of(beside).unwrap_or_default();
+        RevocationResult::bounded_beside(beside, self.authority_revision, std::iter::empty(), self)
+            .barrier
+    }
+}
+
 /// Whether `answer` decodes inside the decoder's limits, with the frame around it.
-fn fits_a_frame<T: Serialize>(answer: &T) -> bool {
+pub(crate) fn fits_a_frame<T: Serialize>(answer: &T) -> bool {
     let limits = kr_cbor::Limits::DEFAULT;
     Cost::of(answer).is_some_and(|cost| {
         cost.items <= limits.max_items - FRAME_RESERVE_ITEMS

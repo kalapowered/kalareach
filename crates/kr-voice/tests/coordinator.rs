@@ -118,18 +118,28 @@ struct Authority {
 struct OwedFence {
     waited_on: tokio::sync::Notify,
     released: tokio::sync::Notify,
+    /// How many actions the fence names at the call's worker.
+    names: std::sync::atomic::AtomicUsize,
 }
 
 impl OwedFence {
     /// The barrier this fence ends with: one worker that did not acknowledge, owned by the call's
     /// session, and one of a session the call did not reach, which the answer does not carry.
     fn barrier(&self) -> kr_protocol::action::RevocationBarrier {
+        let names = self.names.load(std::sync::atomic::Ordering::SeqCst);
         let worker = |session_id, state| kr_protocol::action::WorkerBarrier {
             session_id,
             state,
             acknowledged_revision: Nullable::null(),
-            rejected_actions: Vec::new(),
-            rejected_actions_total: U64::new(0),
+            rejected_actions: (0..names as u128)
+                .map(|index| kr_protocol::action::FencedAction {
+                    actor_id: kr_protocol::ids::ActorId::new("device:phone").expect("a principal"),
+                    action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                        index.to_be_bytes(),
+                    )),
+                })
+                .collect(),
+            rejected_actions_total: U64::new(names as u64),
             possibly_executed: Vec::new(),
             possibly_executed_total: U64::new(0),
             omitted_actions: U64::new(0),
@@ -192,6 +202,13 @@ impl Authority {
     fn owes_a_fence(&self) -> Arc<OwedFence> {
         let held = Arc::new(OwedFence::default());
         *self.fence.lock().expect("the fence") = Some(Arc::clone(&held));
+        held
+    }
+
+    /// Makes the next withdrawal owe a fence that names `names` actions at the call's worker.
+    fn owes_a_fence_naming(&self, names: usize) -> Arc<OwedFence> {
+        let held = self.owes_a_fence();
+        held.names.store(names, std::sync::atomic::Ordering::SeqCst);
         held
     }
 
@@ -2287,6 +2304,32 @@ async fn a_stop_waits_for_the_fence_its_withdrawal_owes() {
     assert_eq!(barrier.pending(), vec![session(SESSION_A)]);
     assert_eq!(barrier.workers_total.get(), 1);
     assert!(!barrier.holds());
+}
+
+/// KR-REQ-09.12: a stop whose fence named more actions than a frame carries is answered with an
+/// answer that decodes: the barrier is cut, its totals say what was cut, and the worker that has
+/// not held is still named as pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_whose_fence_named_more_actions_than_a_frame_holds_is_answered_in_a_frame() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    let owed = fixture.authority.owes_a_fence_naming(5_000);
+    owed.released.notify_one();
+    let coordinator = Arc::new(fixture.coordinator);
+
+    let stopped = coordinator
+        .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 12_000)
+        .await
+        .expect("it stops");
+
+    assert!(
+        stopped.fits_a_frame(),
+        "the answer decodes inside the limits"
+    );
+    let barrier = stopped.barrier.0.expect("the stop carries its barrier");
+    assert_eq!(barrier.pending(), vec![session(SESSION_A)]);
+    assert_eq!(barrier.workers[0].rejected_actions_total.get(), 5_000);
+    assert!(barrier.workers[0].rejected_actions.len() < 5_000);
 }
 
 /// KR-REQ-15.14 and 09.12: replacing the standing grant answers once the fence the withdrawal of

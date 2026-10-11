@@ -634,6 +634,25 @@ pub struct VoiceGrantResult {
     pub barrier: Nullable<RevocationBarrier>,
 }
 
+impl VoiceGrantResult {
+    /// This answer carrying `barrier`, cut so that the answer decodes: a fence can name more
+    /// actions than one frame holds, and a replacement takes effect whatever it names.
+    #[must_use]
+    pub fn with_barrier(self, barrier: RevocationBarrier) -> Self {
+        let barrier = barrier.bounded_beside(&self);
+        Self {
+            barrier: Nullable::some(barrier),
+            ..self
+        }
+    }
+
+    /// Whether this answer decodes inside the decoder's limits, with the frame around it.
+    #[must_use]
+    pub fn fits_a_frame(&self) -> bool {
+        crate::sharing::fits_a_frame(self)
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* voice.prepare                                                               */
 /* -------------------------------------------------------------------------- */
@@ -938,6 +957,25 @@ pub struct VoiceStopResult {
     /// the workers that have not acknowledged the new revision, not success. The grant is revoked
     /// either way.
     pub barrier: Nullable<RevocationBarrier>,
+}
+
+impl VoiceStopResult {
+    /// This answer carrying `barrier`, cut so that the answer decodes: a fence can name more
+    /// actions than one frame holds, and a stop takes effect whatever it names.
+    #[must_use]
+    pub fn with_barrier(self, barrier: RevocationBarrier) -> Self {
+        let barrier = barrier.bounded_beside(&self);
+        Self {
+            barrier: Nullable::some(barrier),
+            ..self
+        }
+    }
+
+    /// Whether this answer decodes inside the decoder's limits, with the frame around it.
+    #[must_use]
+    pub fn fits_a_frame(&self) -> bool {
+        crate::sharing::fits_a_frame(self)
+    }
 }
 
 /* -------------------------------------------------------------------------- */
