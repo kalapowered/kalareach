@@ -39,6 +39,9 @@ use sha2::{Digest as _, Sha256};
 /// something below the server to end.
 const COMMAND: &str = r#"["/bin/sh", "-c", "sleep 120 & wait"]"#;
 
+/// The same, for a command that ignores a terminate and passes that on to what it starts.
+const STUBBORN: &str = r#"["/bin/sh", "-c", "trap '' TERM; sleep 120 & wait"]"#;
+
 fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
@@ -74,6 +77,7 @@ struct Gateway {
     group: LaunchGroup,
     placed: Placed,
     runtime: tokio::runtime::Runtime,
+    broker: Arc<Broker>,
     backends: Arc<CommandBackends>,
     view: View,
     executable: PathBuf,
@@ -89,6 +93,12 @@ struct Launched {
 
 impl Gateway {
     fn new() -> Self {
+        Self::with(true)
+    }
+
+    /// A session whose signed record names the stand-in's digest, or, with `qualified` false,
+    /// names no executable at all.
+    fn with(qualified: bool) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -110,10 +120,12 @@ impl Gateway {
         let mut source =
             fixture::package(&store, &placed.forwarder, &fixture::Shape::codex_backend())
                 .expect("the package is written");
-        source.qualified = vec![QualifiedExecutable {
-            digest,
-            version: fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
-        }];
+        if qualified {
+            source.qualified = vec![QualifiedExecutable {
+                digest,
+                version: fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
+            }];
+        }
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
@@ -156,6 +168,7 @@ impl Gateway {
             group: LaunchGroup::new(),
             placed,
             runtime,
+            broker,
             backends,
             view,
             executable,
@@ -176,6 +189,11 @@ impl Gateway {
 
     /// Establishes the backend of a plain launch of `typed`, the way a session does.
     fn establish(&self, typed: &[&str]) -> Result<CommandBackend, String> {
+        self.establish_in(typed, self.placed.host.root())
+    }
+
+    /// Establishes the backend of a plain launch of `typed` the shell reports running in `cwd`.
+    fn establish_in(&self, typed: &[&str], cwd: &Path) -> Result<CommandBackend, String> {
         let typed = words(typed);
         let added = words(&["--remote", "{gateway}"]);
         let mut answered = vec![typed[0].clone()];
@@ -192,7 +210,7 @@ impl Gateway {
             added: &added,
             integration: &Self::integration(),
             executable: self.executable.to_str().expect("a text path"),
-            cwd: self.placed.host.root().to_str().expect("a text path"),
+            cwd: cwd.to_str().expect("a text path"),
             cwd_revision: CwdRevision::new(1),
             root_shell: kr_ipc::identity::current_process_start_identity().expect("this process"),
         })
@@ -238,6 +256,36 @@ impl Gateway {
             .owned()
             .map(|owned| owned.record().backends)
             .unwrap_or_default()
+    }
+
+    /// What the session records of the processes it owns.
+    fn recorded(&self) -> kr_worker::ownership::OwnedRecord {
+        self.view
+            .runtime
+            .session()
+            .owned()
+            .expect("the session records its processes")
+            .record()
+    }
+
+    /// The processes the session records that are neither its root shell nor a server: what the
+    /// servers started.
+    fn started_by_servers(&self) -> Vec<ProcessStartIdentity> {
+        let record = self.recorded();
+        record
+            .processes
+            .into_iter()
+            .filter(|process| *process != record.root && !record.backends.contains(process))
+            .collect()
+    }
+
+    /// Waits until the launch the confirmation pause holds is committed, its launcher waiting to
+    /// be told.
+    fn at_the_confirmation(&self, arrived: tokio::sync::oneshot::Receiver<()>) {
+        self.runtime
+            .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+            .expect("the launch is committed")
+            .expect("and paused before the launcher is told");
     }
 
     /// The next announcement about an agent instance the session's view is sent.
@@ -309,6 +357,25 @@ impl Launched {
     }
 }
 
+impl Launched {
+    /// What the launcher's process wrote to its standard error, once it has ended.
+    fn said(&mut self) -> String {
+        let mut said = String::new();
+        if let Some(stderr) = self.child.stderr.as_mut() {
+            let _ = std::io::Read::read_to_string(stderr, &mut said);
+        }
+        said
+    }
+}
+
+/// The directory a backend's answer names.
+fn directory_of(answer: &CommandBackend) -> PathBuf {
+    PathBuf::from(&answer.environment[0].value)
+        .parent()
+        .expect("the backend's directory")
+        .to_path_buf()
+}
+
 impl Drop for Launched {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -369,4 +436,202 @@ fn kr_req_12_07_a_plain_launch_of_a_terminal_with_a_server_is_served_by_a_gatewa
     });
     let ended = shell.announcement();
     assert!(ended.instance.ended_at.is_present(), "{ended:?}");
+}
+
+/// KR-REQ-11.32: only the process the launch registered reaches the gateway, and an upgrade a
+/// browser could have sent does not use the admission: another process is closed without a word
+/// while the program has not yet connected, and the program whose first upgrade is refused for its
+/// `Origin` header connects again and runs its whole session.
+#[test]
+fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let socket = directory_of(&answer).join("gw.sock");
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut launched = shell.launch(
+        &answer,
+        "second",
+        &[
+            ("KR_STAND_IN", "origin,retry-plain"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+        ],
+    );
+    // The launch is committed, so the socket is bound, and nothing has connected to it.
+    shell.at_the_confirmation(arrived);
+    let mut other = std::os::unix::net::UnixStream::connect(&socket).expect("the socket is bound");
+    other
+        .set_read_timeout(Some(LIVENESS))
+        .expect("a read timeout");
+    let mut heard = [0_u8; 16];
+    assert_eq!(
+        std::io::Read::read(&mut other, &mut heard).expect("the connection is closed, not held"),
+        0,
+        "another process is closed without a word"
+    );
+    release.send(()).expect("the launch waits");
+
+    launched.prints("TUI: turn/completed");
+    assert!(launched.ends().success());
+    assert!(
+        launched.printed().contains("did not upgrade"),
+        "the first upgrade was refused: {}",
+        launched.printed()
+    );
+}
+
+/// KR-REQ-12.07: a launch whose executable no signed record names, or whose server cannot be
+/// started, runs the program as typed: it gets no flag, no server is started and nothing of the
+/// launch is left published.
+#[test]
+fn kr_req_12_07_a_launch_that_cannot_have_a_server_runs_the_program_as_typed() {
+    for case in ["no record names the executable", "the directory is gone"] {
+        let shell = Gateway::with(case != "no record names the executable");
+        let work = shell.placed.host.root().join("work");
+        std::fs::create_dir_all(&work).expect("a working directory");
+        let answer = shell
+            .establish_in(&["codex"], &work)
+            .expect("a backend is established");
+        if case == "the directory is gone" {
+            std::fs::remove_dir(&work).expect("the directory is removed");
+        }
+        let registration = PathBuf::from(&answer.environment[0].value);
+        let mut launched = shell.launch(&answer, "typed", &[]);
+        // Run as typed, the stand-in is started with no arguments and says what it serves.
+        let status = launched.ends();
+        assert_eq!(status.code(), Some(2), "{case}: {}", launched.said());
+        assert!(
+            launched.said().contains("serves `app-server"),
+            "{case}: it ran with the arguments it was typed with"
+        );
+        assert!(shell.servers().is_empty(), "{case}: no server was started");
+        assert!(
+            !registration.exists(),
+            "{case}: the registration was taken back"
+        );
+        assert!(
+            shell.broker.live_bindings().is_empty(),
+            "{case}: and so was the binding"
+        );
+    }
+}
+
+/// KR-REQ-07.60: a program that was started and never connects, as one that ran as typed does not,
+/// ends the instance and the server at the bound, and the program is left to run.
+#[test]
+fn kr_req_07_60_a_program_that_never_connects_ends_its_instance_and_server_at_the_bound() {
+    let shell = Gateway::new();
+    shell.backends.connect_within(Duration::from_millis(500));
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(&answer, "idle", &[("KR_STAND_IN", "idle")]);
+    let started = shell.announcement();
+    assert_eq!(
+        started.instance.mode,
+        kr_protocol::broker::IntegrationMode::Gateway
+    );
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "the server was started and recorded");
+    let ended = shell.announcement();
+    assert!(ended.instance.ended_at.is_present(), "{ended:?}");
+    eventually("the server ended at the bound", || {
+        kr_ipc::identity::process_state(&servers[0]) == kr_ipc::identity::ProcessState::Ended
+    });
+    assert!(
+        launched.child.try_wait().expect("readable").is_none(),
+        "and the program that never connected is left running"
+    );
+}
+
+/// KR-REQ-12.07: a launch lost to a retirement between the server being started and the commit
+/// ends the server and runs the program as typed.
+#[test]
+fn kr_req_12_07_a_launch_lost_to_a_retirement_ends_its_server() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let (arrived, release) = shell.backends.pause_before_committing();
+    let mut launched = shell.launch(&answer, "lost", &[]);
+    shell.at_the_confirmation(arrived);
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "the server was started before the commit");
+    let _ = shell.backends.close();
+    release.send(()).expect("the launch waits");
+    assert_eq!(launched.ends().code(), Some(2), "the program ran as typed");
+    eventually("the server ended", || {
+        kr_ipc::identity::process_state(&servers[0]) == kr_ipc::identity::ProcessState::Ended
+    });
+}
+
+/// KR-REQ-07.60: a server that ignores both the end of its input and a terminate, with a command
+/// that ignores a terminate too, is ended by force with the command when the program ends.
+#[test]
+fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(
+        &answer,
+        "stubborn",
+        &[
+            ("KR_STAND_IN", "stay,ignore-eof,ignore-term"),
+            ("KR_STAND_IN_COMMAND", STUBBORN),
+        ],
+    );
+    launched.prints("TUI: turn/completed");
+    // The command is recorded below the server while it runs: the frames the session carried had
+    // it look.
+    eventually("the session recorded what the server started", || {
+        !shell.started_by_servers().is_empty()
+    });
+    let server = shell.servers().remove(0);
+    let started = shell.started_by_servers();
+    let _ = launched.child.kill();
+    let _ = launched.ends();
+    for process in std::iter::once(&server).chain(&started) {
+        eventually("everything the server started ended with it", || {
+            kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Ended
+        });
+    }
+}
+
+/// KR-REQ-07.60: a server that dies first, leaving its command running, leaves nothing: the
+/// command was recorded while the server ran, and the program's end finds it.
+#[test]
+fn kr_req_07_60_a_server_that_dies_first_leaves_no_command_behind() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let release = shell.placed.host.root().join("release");
+    let mut launched = shell.launch(
+        &answer,
+        "dies",
+        &[
+            ("KR_STAND_IN", "die-first,answer-when-released"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RELEASE",
+                release.to_str().expect("a text path"),
+            ),
+        ],
+    );
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+    eventually("the session recorded what the server started", || {
+        !shell.started_by_servers().is_empty()
+    });
+    let started = shell.started_by_servers();
+    std::fs::write(&release, b"go").expect("the terminal is released");
+    // The server dies as the approval is answered, with its command running; the program loses its
+    // connection and leaves with an error.
+    assert_eq!(launched.ends().code(), Some(1), "{}", launched.printed());
+    for process in &started {
+        eventually("what the server started was ended", || {
+            kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Ended
+        });
+    }
 }
