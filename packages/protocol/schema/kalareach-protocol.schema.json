@@ -9484,6 +9484,32 @@
         },
         {
           "additionalProperties": false,
+          "description": "What the host's local owner may do at this session, from the control daemon.",
+          "properties": {
+            "local_access": {
+              "$ref": "#/$defs/LocalAccess"
+            }
+          },
+          "required": [
+            "local_access"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's acknowledgement of that statement.",
+          "properties": {
+            "local_access_ack": {
+              "$ref": "#/$defs/LocalAccessAck"
+            }
+          },
+          "required": [
+            "local_access_ack"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "One part of a snapshot of plugin admissions: after a launch specification on the\nrendezvous connection, and on the control daemon's authority connection to a worker.",
           "properties": {
             "plugin_admissions": {
@@ -16845,6 +16871,25 @@
       ],
       "type": "object"
     },
+    "HostDeviceView": {
+      "additionalProperties": false,
+      "description": "The identity the host presents a lease as for its own local owner.",
+      "properties": {
+        "authorisation_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The authorisation key a lease for the host's local owner names."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host's own device identifier."
+        }
+      },
+      "required": [
+        "device_id",
+        "authorisation_key"
+      ],
+      "type": "object"
+    },
     "HostDoctorResult": {
       "additionalProperties": false,
       "description": "The result of `host.doctor`.",
@@ -19012,6 +19057,82 @@
       ],
       "type": "object"
     },
+    "LocalAccess": {
+      "additionalProperties": false,
+      "description": "The control daemon's statement of [`LocalBound`], on its authority connection to a worker.\n\nSent only to a worker that states [`crate::local::LOCAL_ACCESS`]: a worker of an earlier build\nends a connection that carries a frame it cannot read. The sequence rises within one controller\ngeneration, and a frame of a newer generation replaces the state whatever its sequence.",
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/LocalBound",
+          "description": "What the local owner may do."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "Which statement this is, within the generation that sent it."
+        }
+      },
+      "required": [
+        "sequence",
+        "bound"
+      ],
+      "type": "object"
+    },
+    "LocalAccessAck": {
+      "additionalProperties": false,
+      "description": "A worker's acknowledgement of [`LocalAccess`]: the sequence of the statement it now holds.",
+      "properties": {
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The sequence the worker holds, which is the frame's own or the higher one it already held."
+        }
+      },
+      "required": [
+        "sequence"
+      ],
+      "type": "object"
+    },
+    "LocalBound": {
+      "description": "What a host's local owner may do at a session, as the control daemon last told its worker.\n\nOn a host that is exclusively organisation-managed the local owner answers to a membership\nlease like a member (section 17), and the worker, which serves a local caller directly, holds\nthe methods the host holds to that lease until the lease's end.",
+      "oneOf": [
+        {
+          "const": "open",
+          "description": "No lease is needed: the host is not exclusively organisation-managed.",
+          "type": "string"
+        },
+        {
+          "const": "closed",
+          "description": "The host is exclusively organisation-managed and no lease of its own key is live.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host is exclusively organisation-managed and one lease of its own key is live. The two\nends are that lease's, together: the worker refuses at the earlier of them.",
+          "properties": {
+            "until": {
+              "additionalProperties": false,
+              "properties": {
+                "boot_deadline_ms": {
+                  "$ref": "#/$defs/U64",
+                  "description": "The lease's end on the machine's continuous clock, in milliseconds since this boot."
+                },
+                "utc_deadline_ms": {
+                  "$ref": "#/$defs/U64",
+                  "description": "The lease's end in UTC milliseconds, decided through the worker's time contract."
+                }
+              },
+              "required": [
+                "boot_deadline_ms",
+                "utc_deadline_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "until"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "LocalBuild": {
       "additionalProperties": false,
       "description": "The build of a local host process, as it states it in its answer to a hello.",
@@ -20245,7 +20366,7 @@
         },
         {
           "const": "membership.present",
-          "description": "Present the membership lease the organisation signed for this device, with the organisation's chain when it has moved, so the host answers for the device while the lease lasts. The device acts on its own standing and proves its own key.",
+          "description": "Present the membership lease the organisation signed for this device, with the organisation's chain when it has moved, so the host answers for the device while the lease lasts. The device acts on its own standing and proves its own key. At the host's own socket the lease is the one signed for the host's own key, which the host's local owner answers to while the host is exclusively organisation-managed.",
           "type": "string"
         },
         {
@@ -22500,13 +22621,26 @@
             "$ref": "#/$defs/ExclusiveManagementEvent"
           },
           "type": "array"
+        },
+        "host_device": {
+          "$ref": "#/$defs/HostDeviceView",
+          "description": "The device identity and authorisation key the host presents leases as for its own local\nowner, which an organisation signs a lease for while the host is exclusively\norganisation-managed."
+        },
+        "workers_without_local_enforcement": {
+          "description": "The sessions whose workers cannot be told what the host's local owner may do: a worker an\nearlier build started, or one this host has not reached. While one runs, the host does not\nbecome exclusively organisation-managed, and one that runs on an exclusive host serves its\nlocal caller without the hold. Ending the session (`kr close`) ends the exception.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array"
         }
       },
       "required": [
         "enrolments",
         "exclusive",
         "clock_trusted",
-        "exclusive_events"
+        "exclusive_events",
+        "host_device",
+        "workers_without_local_enforcement"
       ],
       "type": "object"
     },
@@ -38440,6 +38574,10 @@
         "environment_origin": {
           "$ref": "#/$defs/EnvironmentOrigin",
           "description": "Whose environment the variables in the create request are."
+        },
+        "holds_local_access": {
+          "description": "Whether the control daemon that launched this worker tells it what its local owner may do\n([`LocalAccess`]).\n\nTrue: the worker serves no local caller a method the host holds to its owner's lease until\nthe daemon has said so. Absent when false, so a specification from a daemon that does not\ntell workers is byte for byte what a worker built before this field reads, and such a\nworker serves its local caller as it always did.",
+          "type": "boolean"
         },
         "plugins": {
           "$ref": "#/$defs/AdmissionsHeader",

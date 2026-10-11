@@ -452,6 +452,12 @@ export type ControlFrame =
       authority_revision_ack: AuthorityRevisionAck
     }
   | {
+      local_access: LocalAccess
+    }
+  | {
+      local_access_ack: LocalAccessAck
+    }
+  | {
       plugin_admissions: PluginAdmissions
     }
   | {
@@ -7274,6 +7280,16 @@ export interface WorkerLaunchSpec {
    * Whose environment the variables in the create request are.
    */
   environment_origin: 'creator_snapshot' | 'host_context'
+  /**
+   * Whether the control daemon that launched this worker tells it what its local owner may do
+   * ([`LocalAccess`]).
+   *
+   * True: the worker serves no local caller a method the host holds to its owner's lease until
+   * the daemon has said so. Absent when false, so a specification from a daemon that does not
+   * tell workers is byte for byte what a worker built before this field reads, and such a
+   * worker serves its local caller as it always did.
+   */
+  holds_local_access?: boolean
   plugins: AdmissionsHeader
   privacy: PrivacyLaunch
   /**
@@ -7973,6 +7989,46 @@ export interface GenerationAccepted {
    * The generation the worker now accepts.
    */
   generation: string
+}
+/**
+ * The control daemon's statement of [`LocalBound`], on its authority connection to a worker.
+ *
+ * Sent only to a worker that states [`crate::local::LOCAL_ACCESS`]: a worker of an earlier build
+ * ends a connection that carries a frame it cannot read. The sequence rises within one controller
+ * generation, and a frame of a newer generation replaces the state whatever its sequence.
+ */
+export interface LocalAccess {
+  /**
+   * What the local owner may do.
+   */
+  bound:
+    | 'open'
+    | 'closed'
+    | {
+        until: {
+          /**
+           * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+           */
+          boot_deadline_ms: string
+          /**
+           * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+           */
+          utc_deadline_ms: string
+        }
+      }
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+}
+/**
+ * A worker's acknowledgement of [`LocalAccess`]: the sequence of the statement it now holds.
+ */
+export interface LocalAccessAck {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
 }
 /**
  * One part of a snapshot of admissions.
@@ -17953,6 +18009,29 @@ export interface OrganisationListResult {
    * Every time exclusive management was turned off, oldest first.
    */
   exclusive_events: ExclusiveManagementEvent[]
+  host_device: HostDeviceView
+  /**
+   * The sessions whose workers cannot be told what the host's local owner may do: a worker an
+   * earlier build started, or one this host has not reached. While one runs, the host does not
+   * become exclusively organisation-managed, and one that runs on an exclusive host serves its
+   * local caller without the hold. Ending the session (`kr close`) ends the exception.
+   */
+  workers_without_local_enforcement: SessionId[]
+}
+/**
+ * The device identity and authorisation key the host presents leases as for its own local
+ * owner, which an organisation signs a lease for while the host is exclusively
+ * organisation-managed.
+ */
+export interface HostDeviceView {
+  /**
+   * The authorisation key a lease for the host's local owner names.
+   */
+  authorisation_key: string
+  /**
+   * One paired device.
+   */
+  device_id: string
 }
 /**
  * One organisation's host policy, signed by its policy-signing key.

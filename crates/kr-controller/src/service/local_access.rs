@@ -152,6 +152,87 @@ impl Controller {
         self.local_access.draw(protocol)
     }
 
+    /// What the host's local owner may do now.
+    pub(crate) fn local_owner_bound_now(&self) -> LocalOwnerBound {
+        let now_ms = self.settled_utc_now();
+        self.policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .local_owner_bound(self.local_owner_device(), self.clock.now(), now_ms)
+    }
+
+    /// Whether the host is exclusively organisation-managed and its local owner has no live
+    /// lease: what a local caller may then ask for is the recovery set and nothing else.
+    pub(crate) fn local_owner_is_closed(&self) -> bool {
+        self.local_owner_bound_now() == LocalOwnerBound::Closed
+    }
+
+    /// Holds a local caller's use of `method` to the local owner's membership lease, at the
+    /// daemon's door.
+    ///
+    /// A method the host does not hold to the lease ([`kr_protocol::method::local_hold`]) is served
+    /// whatever the lease says, and so is every method on a host that is not exclusively
+    /// organisation-managed. Otherwise the lease must be live, and the work it admits may run no
+    /// longer than the lease does: the earlier of its continuous end and its UTC end laid over the
+    /// continuous clock now.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of a held method when no lease is live.
+    pub(crate) fn local_hold(
+        &self,
+        method: kr_protocol::method::Method,
+    ) -> Result<Option<kr_transport::clock::ContinuousInstant>> {
+        if kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free {
+            return Ok(None);
+        }
+        let now_ms = self.settled_utc_now();
+        let now = self.clock.now();
+        let bound = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .local_owner_bound(self.local_owner_device(), now, now_ms);
+        match bound {
+            LocalOwnerBound::Open => Ok(None),
+            LocalOwnerBound::Closed => Err(ControllerError::PermissionDenied {
+                detail: "this host is exclusively organisation-managed and its local owner's \
+                         membership lease is not live; present one with `kr organisation present`"
+                    .to_owned(),
+            }),
+            LocalOwnerBound::Until { continuous, utc_ms } => {
+                let remaining = std::time::Duration::from_millis(utc_ms.saturating_sub(now_ms));
+                let laid = now.checked_add(remaining).unwrap_or(continuous);
+                Ok(Some(continuous.min(laid)))
+            }
+        }
+    }
+
+    /// A request that a held read must be refused at the door, once the local owner's lease is no
+    /// longer live, as the reply to send.
+    pub(crate) fn read_refused(
+        &self,
+        request: &kr_protocol::envelope::Request,
+    ) -> Option<kr_protocol::envelope::ControlFrame> {
+        let method = request.method.method()?;
+        let error = self.local_hold(method).err()?;
+        Some(super::error_reply(
+            request.request_id,
+            error.code(),
+            error.to_string(),
+        ))
+    }
+
+    /// The caller a local request is decided as for pairing and owner confirmation: the host's own
+    /// account, limited to the recovery set while the local owner has no live lease.
+    pub(crate) fn local_caller(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+    ) -> super::net::owner::Caller {
+        super::net::owner::Caller::local(actor_id.clone())
+            .confirming_recovery_only(self.local_owner_is_closed())
+    }
+
     /// The bound as a worker is told it: the lease's continuous end laid over the machine's own
     /// boot clock, which the worker reads.
     fn protocol_bound(&self, bound: LocalOwnerBound) -> LocalBound {

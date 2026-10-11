@@ -636,6 +636,12 @@ pub enum OrganisationCommand {
     /// A host that is exclusively organisation-managed keeps its last organisation until
     /// exclusive management is ended.
     Withdraw(OrganisationWithdrawArguments),
+    /// Present the membership lease the organisation signed for this host's own local owner.
+    ///
+    /// While the host is exclusively organisation-managed, its local owner answers to a lease like
+    /// a member: the sessions on this host refuse what the owner asks for once the lease ends.
+    /// `kr organisation list` shows the identity a lease for this host is signed for.
+    Present(OrganisationPresentArguments),
     /// Make this host exclusively organisation-managed, or end that.
     ///
     /// While it is on, a personal grant, the owner's own devices included, answers to a membership
@@ -662,6 +668,20 @@ pub enum OrganisationExclusiveCommand {
     On(PrivacyArguments),
     /// End exclusive management.
     Off(PrivacyArguments),
+}
+
+/// `kr organisation present`.
+#[derive(Args)]
+pub struct OrganisationPresentArguments {
+    /// The file holding the lease the organisation signed for this host, as JSON.
+    pub lease: std::path::PathBuf,
+    /// A file holding the organisation's policy-signing chain, when it has moved since this host
+    /// last accepted one.
+    #[arg(long)]
+    pub chain: Option<std::path::PathBuf>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// `kr organisation enrol`.

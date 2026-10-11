@@ -516,9 +516,15 @@ impl Controller {
                     // carries what a model wrote. Neither leaves this daemon except under the
                     // privacy fence it was read under: its ticket is checked before every write.
                     match self.authorised(connection_id) {
+                        Ok(_) if self.read_refused(&request).is_some() => self
+                            .read_refused(&request)
+                            .unwrap_or_else(|| unreachable!()),
                         Ok(_) => {
                             let released = self.read_released(&actor_id, &request).await;
                             match self.authorised(connection_id) {
+                                Ok(_) if self.read_refused(&request).is_some() => self
+                                    .read_refused(&request)
+                                    .unwrap_or_else(|| unreachable!()),
                                 Ok(_) => {
                                     if self
                                         .attention
@@ -546,6 +552,9 @@ impl Controller {
                 }
                 ControlFrame::Request(request) if negotiated => {
                     match self.authorised(connection_id) {
+                        Ok(_) if self.read_refused(&request).is_some() => self
+                            .read_refused(&request)
+                            .unwrap_or_else(|| unreachable!()),
                         Ok(_) => {
                             let answer = self.read_method(&actor_id, &request).await;
                             // Checked again now the read has finished. A read that passed its check
@@ -553,6 +562,9 @@ impl Controller {
                             // behind it was withdrawn, and what the contract forbids is *serving*
                             // that state rather than reading it.
                             match self.authorised(connection_id) {
+                                Ok(_) if self.read_refused(&request).is_some() => self
+                                    .read_refused(&request)
+                                    .unwrap_or_else(|| unreachable!()),
                                 Ok(_) => answer,
                                 Err(error) => error_reply(
                                     request.request_id,
@@ -570,9 +582,26 @@ impl Controller {
                 }
                 ControlFrame::Mutation(mutation) if negotiated => {
                     let confirm = mutation.action_id;
+                    let request_id = mutation.request_id;
+                    let method = mutation.method.method();
                     let reply = self
                         .perform(&actor_id, connection_id, origin, *mutation)
                         .await;
+                    // The answer of a held method is shown only while the local owner's lease
+                    // holds: a retained answer, or one that waited for a worker or a store, is
+                    // withheld once it has ended. The action it asked for stays recorded.
+                    let reply = match method.map(|method| self.local_hold(method)) {
+                        Some(Err(error)) => error_reply(
+                            request_id,
+                            error.code(),
+                            format!(
+                                "{error}. The result of this request is withheld; the action it \
+                                 asked for is recorded and is not to be asked again under a new \
+                                 identifier."
+                            ),
+                        ),
+                        _ => reply,
+                    };
                     // The acceptance reaches the caller here. A worker that is holding a close for
                     // this action learns that it has, and only then starts signalling.
                     if writer.write_message(&reply).await.is_err() {
@@ -627,6 +656,12 @@ impl Controller {
                 "the method is not in the registry",
             );
         };
+        // On a host that is exclusively organisation-managed the local owner answers to a
+        // membership lease like a member, so a held method is refused here, before a retained
+        // answer is looked for, once no lease is live.
+        if let Err(error) = self.local_hold(method) {
+            return error_reply(mutation.request_id, error.code(), error.to_string());
+        }
         // A retained action is answered before anything about a first admission is considered.
         // Section 9 makes the freshness window the thing that admits a *new* action; applying it to
         // a retry would refuse a caller its own completed result because its window has since been
@@ -669,11 +704,7 @@ impl Controller {
         }
         if retained.is_none() && net::methods::serves(method) {
             retained = self
-                .pairing_retained(
-                    net::owner::Caller::local(actor_id.clone()),
-                    method,
-                    &mutation,
-                )
+                .pairing_retained(self.local_caller(actor_id), method, &mutation)
                 .await
                 .map(|outcome| respond(mutation.request_id, outcome));
         }

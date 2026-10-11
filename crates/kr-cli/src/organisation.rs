@@ -15,15 +15,15 @@ use kr_protocol::ids::OrganisationId;
 use kr_protocol::limits::MAX_CONTROL_FRAME_LEN;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
-    OrganisationEnrolParams, OrganisationEnrolResult, OrganisationExclusiveSetParams,
-    OrganisationExclusiveSetResult, OrganisationListParams, OrganisationListResult,
-    OrganisationWithdrawParams,
+    MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
+    OrganisationEnrolResult, OrganisationExclusiveSetParams, OrganisationExclusiveSetResult,
+    OrganisationListParams, OrganisationListResult, OrganisationWithdrawParams,
 };
 use kr_protocol::sharing::RevocationResult;
 
 use crate::cli::{
     OrganisationCommand, OrganisationEnrolArguments, OrganisationExclusiveCommand,
-    OrganisationWithdrawArguments, PrivacyArguments,
+    OrganisationPresentArguments, OrganisationWithdrawArguments, PrivacyArguments,
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
@@ -42,6 +42,7 @@ pub async fn run(paths: &HostPaths, command: OrganisationCommand, json: bool) ->
         OrganisationCommand::Enrol(arguments) => enrol(paths, &arguments, json).await,
         OrganisationCommand::List(arguments) => list(paths, &arguments, json).await,
         OrganisationCommand::Withdraw(arguments) => withdraw(paths, &arguments, json).await,
+        OrganisationCommand::Present(arguments) => present(paths, &arguments, json).await,
         OrganisationCommand::Exclusive(OrganisationExclusiveCommand::On(arguments)) => {
             exclusive_on(paths, &arguments, json).await
         }
@@ -49,6 +50,66 @@ pub async fn run(paths: &HostPaths, command: OrganisationCommand, json: bool) ->
             crate::pair::end_exclusive_management(paths, &arguments.selector, json).await
         }
     }
+}
+
+/// `kr organisation present`.
+async fn present(
+    paths: &HostPaths,
+    arguments: &OrganisationPresentArguments,
+    json: bool,
+) -> Result<()> {
+    let lease: kr_protocol::account::MembershipLease = read_json(
+        &arguments.lease,
+        "the lease file",
+        "the file is not a membership lease an organisation signed",
+    )?;
+    let authority = arguments
+        .chain
+        .as_ref()
+        .map(|path| read_chain(path))
+        .transpose()?;
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let presented: MembershipPresentResult = daemon
+        .mutate(
+            Method::MembershipPresent,
+            &MembershipPresentParams {
+                lease,
+                authority: authority.map_or_else(
+                    kr_protocol::scalars::Nullable::null,
+                    kr_protocol::scalars::Nullable::some,
+                ),
+            },
+        )
+        .await?;
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("organisation_id", closed(&presented.organisation_id))
+                .with(
+                    "account_id",
+                    Asked::text(Request::Organisations, presented.account_id.as_str()),
+                )
+                .with("key_revision", closed(&presented.key_revision))
+                .with("expires_at_ms", closed(&presented.expires_at_ms))
+                .with("exclusive", presented.exclusive),
+        );
+    } else {
+        output::line(&stdout_line!(
+            "This host's local owner answers to organisation {} as {}, signed by key revision {}, \
+             until {}.",
+            presented.organisation_id,
+            Asked::text(Request::Organisations, presented.account_id.as_str()),
+            presented.key_revision,
+            utc_moment(presented.expires_at_ms.get())
+        ));
+        if !presented.exclusive {
+            output::line(&stdout_line!(
+                "This host is not exclusively organisation-managed, so the lease binds nothing yet."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `kr organisation withdraw`.
@@ -152,21 +213,34 @@ pub(crate) fn report_exclusive(made: &OrganisationExclusiveSetResult, json: bool
 /// larger chain for, and it is the organisation's published object as JSON. On Unix a link and a
 /// pipe are refused: this reads a file, and does not wait for a writer.
 fn read_chain(path: &std::path::Path) -> Result<PolicyAuthority> {
+    read_json(
+        path,
+        "the chain file",
+        "the file is not an organisation's published policy-signing chain",
+    )
+}
+
+/// An organisation's published object from a JSON file, bounded as [`read_chain`] says.
+fn read_json<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    what: &'static str,
+    not_it: &'static str,
+) -> Result<T> {
     let bytes = read_bounded(path).map_err(|error| {
         CliError::Usage(if error.kind() == std::io::ErrorKind::InvalidData {
-            Shown::said(
-                "the chain file is not a regular file, or is larger than any chain this host \
-                 would take",
+            shown!(
+                "{} is not a regular file, or is larger than this host would take",
+                Shown::said(what)
             )
         } else {
-            shown!("the chain file could not be read: {}", Shown::io(&error))
+            shown!(
+                "{} could not be read: {}",
+                Shown::said(what),
+                Shown::io(&error)
+            )
         })
     })?;
-    serde_json::from_slice(&bytes).map_err(|_| {
-        CliError::Usage(Shown::said(
-            "the file is not an organisation's published policy-signing chain",
-        ))
-    })
+    serde_json::from_slice(&bytes).map_err(|_| CliError::Usage(Shown::said(not_it)))
 }
 
 /// The file's bytes, when it is a regular file of at most one control frame.
@@ -348,6 +422,21 @@ async fn list(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Re
         }
     }
     output::line(&stdout_line!(
+        "A lease for this host's own local owner is signed for device {} and key {}.",
+        listed.host_device.device_id,
+        key_identifier(&kr_protocol::pairing::key_id(
+            kr_protocol::pairing::KeyPurpose::Authorisation,
+            listed.host_device.authorisation_key.as_bytes(),
+        ))
+    ));
+    for session_id in &listed.workers_without_local_enforcement {
+        output::line(&stdout_line!(
+            "The worker of session {} cannot be told what this host's local owner may do; end the \
+             session with `kr close` to hold it to the lease.",
+            output::closed_word(session_id)
+        ));
+    }
+    output::line(&stdout_line!(
         "Exclusive management is {}. This host {} its clock.",
         if listed.exclusive { "on" } else { "off" },
         if listed.clock_trusted {
@@ -428,6 +517,22 @@ fn document(listed: &OrganisationListResult) -> Document {
         .with("ok", true)
         .with("exclusive", listed.exclusive)
         .with("clock_trusted", listed.clock_trusted)
+        .with(
+            "host_device",
+            Document::new()
+                .with("device_id", closed(&listed.host_device.device_id))
+                .with(
+                    "authorisation_key_id",
+                    output::said(&key_identifier(&kr_protocol::pairing::key_id(
+                        kr_protocol::pairing::KeyPurpose::Authorisation,
+                        listed.host_device.authorisation_key.as_bytes(),
+                    ))),
+                ),
+        )
+        .with(
+            "workers_without_local_enforcement",
+            closed(&listed.workers_without_local_enforcement),
+        )
         .with("enrolments", enrolments)
         .with("exclusive_events", events)
 }

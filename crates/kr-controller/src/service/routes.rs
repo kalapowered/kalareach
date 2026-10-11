@@ -222,7 +222,7 @@ impl Controller {
             return self.automation.read_frame(request, None).await;
         }
         if net::methods::serves(method) {
-            let caller = net::owner::Caller::local(actor_id.clone());
+            let caller = self.local_caller(actor_id);
             let outcome = self.pairing_read(caller, method, &request.params).await;
             return respond(request.request_id, outcome);
         }
@@ -301,7 +301,7 @@ impl Controller {
         if net::methods::serves(method) {
             // Pairing and owner confirmation are the network module's, and a local caller reaches
             // them as the host's own account: the issuing owner of what it invites.
-            let caller = net::owner::Caller::local(actor_id.clone());
+            let caller = self.local_caller(actor_id);
             let admission = self.pairing_admission(
                 connection_id,
                 admitted,
@@ -725,6 +725,20 @@ impl Controller {
                     super::authority_changes::AuthorityCaller::Owner,
                     mutation,
                     method,
+                    carried,
+                )
+                .await
+            }
+            // The host presenting the lease its organisation signed for its own local owner, who
+            // answers to a membership lease like a member while the host is exclusively
+            // organisation-managed. The same function the paired door calls does the work, as the
+            // host's own device identity and key: the local caller proves no key, the operating
+            // system identity the socket authenticated is the proof.
+            Method::MembershipPresent => {
+                self.membership_present(
+                    self.local_owner_device(),
+                    &self.host_authorisation_key,
+                    mutation,
                     carried,
                 )
                 .await

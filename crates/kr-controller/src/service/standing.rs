@@ -270,6 +270,17 @@ impl Controller {
         let Some(enrolment) = held.enrolment(organisation_id) else {
             return Ok(Standing::Lacks);
         };
+        // The host's own local owner is no paired device and holds no grant: its standing is that
+        // the host is exclusively organisation-managed and enrolled in the lease's organisation,
+        // which is the only case a lease for it binds anything. A paired device never has this
+        // identifier, which is the host's own and is never issued to a device.
+        if device_id == self.local_owner_device() {
+            return Ok(if held.is_exclusively_managed() {
+                Standing::Holds
+            } else {
+                Standing::Lacks
+            });
+        }
         let revision = enrolment.enrolment_revision();
         let environment_id = self.paths.environment_id();
         let exclusive = held.is_exclusively_managed();

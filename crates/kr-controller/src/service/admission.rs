@@ -843,6 +843,15 @@ impl Controller {
                 let _: kr_protocol::organisation::OrganisationEnrolParams =
                     parse(&mutation.params)?;
             }
+            Method::MembershipPresent => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a membership lease belongs to this host, not to one session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::organisation::MembershipPresentParams =
+                    parse(&mutation.params)?;
+            }
             Method::OrganisationExclusiveSet | Method::OrganisationWithdraw => {
                 if mutation.target.session_id.as_ref().is_some() {
                     return Err(ControllerError::InvalidArgument(
@@ -937,7 +946,10 @@ impl Controller {
         }
         // The accepted deadline is the earliest of what the window has left, receipt time plus the
         // requested lifetime, and any applicable authority deadline. The caller never supplies an
-        // authoritative deadline, and nothing downstream lengthens this one.
+        // authoritative deadline, and nothing downstream lengthens this one. The one local
+        // authority that ends is the owner of a host that is exclusively organisation-managed, for
+        // a method the host holds to its membership lease: the lease's end bounds the work.
+        let authority = self.local_hold(method)?;
         self.windows
             .accept_at(
                 &mutation.action_window_id,
@@ -945,7 +957,7 @@ impl Controller {
                 self.boot_epoch,
                 received_at,
                 mutation.requested_ttl_ms,
-                None,
+                authority,
             )
             .map_err(|refusal| ControllerError::WindowExpired {
                 detail: window_refusal_detail(refusal).to_owned(),

@@ -798,6 +798,7 @@
         }
       },
       "ingress": [
+        "local_ipc",
         "paired_device"
       ],
       "method": "membership.present",
@@ -811,7 +812,7 @@
       "resource_selectors": [
         "device"
       ],
-      "summary": "Present the membership lease the organisation signed for this device, with the organisation's chain when it has moved, so the host answers for the device while the lease lasts. The device acts on its own standing and proves its own key.",
+      "summary": "Present the membership lease the organisation signed for this device, with the organisation's chain when it has moved, so the host answers for the device while the lease lasts. The device acts on its own standing and proves its own key. At the host's own socket the lease is the one signed for the host's own key, which the host's local owner answers to while the host is exclusively organisation-managed.",
       "version": 1
     },
     {
