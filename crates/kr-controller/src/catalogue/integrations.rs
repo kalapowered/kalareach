@@ -505,15 +505,19 @@ fn resolved(
             );
         }
     }
-    // The digest of the executable a shell finds first, where one is found and read.
-    let mut found_digest = None;
+    // What reading the executable a shell finds first gave, where one is found: its digest, or why
+    // it was not read.
+    let mut found = None;
     if let Some(command) = report.command.0.as_deref()
         && let Some(executable) = resolve(command, &host.search_path)
     {
         // Read once: the digest names the version a signed record gives it, and a script, which
         // the worker reads no identity for, is the reason an invocation runs as typed.
         let read = connector.map(|_| super::native_bridge::read_executable(&executable));
-        found_digest = read.as_ref().and_then(|read| read.as_ref().ok()).copied();
+        found = read.as_ref().map(|read| match read {
+            Ok(digest) => Ok(*digest),
+            Err(error) => Err(error.to_string()),
+        });
         report.executable_version = Nullable(connector.and_then(|connector| {
             read.as_ref()
                 .and_then(|read| read.as_ref().ok())
@@ -554,13 +558,24 @@ fn resolved(
                  invocation runs as typed"
                     .to_owned(),
             );
-        } else if let (Some(connector), Some(digest)) = (connector, found_digest.as_ref())
-            && let Err(refusal) = connector.native_tables(digest)
-        {
-            report.reason = Nullable::some(format!(
-                "{}, so an invocation runs as typed",
-                refusal.detail
-            ));
+        } else if let Some(connector) = connector {
+            // A digest no record qualifies, and an executable that was found and not read, are
+            // alike a launch the worker would run as typed.
+            match found.as_ref() {
+                Some(Ok(digest)) => {
+                    if let Err(refusal) = connector.native_tables(digest) {
+                        report.reason = Nullable::some(format!(
+                            "{}, so an invocation runs as typed",
+                            refusal.detail
+                        ));
+                    }
+                }
+                Some(Err(why)) => {
+                    report.reason =
+                        Nullable::some(format!("{why}, so an invocation runs as typed"));
+                }
+                None => {}
+            }
         }
     }
     // What an integrated launch records as its mode: only an integration a new session can use.
