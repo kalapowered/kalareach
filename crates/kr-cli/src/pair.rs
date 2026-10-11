@@ -490,16 +490,17 @@ async fn confirmed(
     )
     .await?;
     // What the host says the challenge asks to confirm, which is what an owner device is shown.
+    // The terminal needs it to say what it confirms; the wait for an owner device only reports it.
     let display = if matches!(ceremony, Ceremony::EndExclusive) {
-        displayed(client, &challenge.request).await?
+        displayed(client, &challenge.request).await
     } else {
-        None
+        Ok(None)
     };
     if challenge.initial_bootstrap {
         ceremony.bootstrap_permits()?;
         guard(build_id).await?;
         let mut terminal = Terminal::open()?;
-        ceremony.confirm_at(&mut terminal, display.as_ref())?;
+        ceremony.confirm_at(&mut terminal, display?.as_ref())?;
         let key = AuthorisationKeyPair::generate().map_err(|error| {
             CliError::Other(shown!("no key could be made: {}", Shown::crypto(&error)))
         })?;
@@ -532,7 +533,7 @@ async fn confirmed(
     if let Some(note) = ceremony.owner_device_note() {
         crate::report::say(&note);
     }
-    if let Some(display) = &display {
+    if let Ok(Some(display)) = &display {
         crate::organisation::say_what_is_asked(display);
     }
     crate::report::say(&shown!(
