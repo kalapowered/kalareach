@@ -2487,6 +2487,9 @@ async fn continue_launch(
         Ok(registered) => registered,
         Err(refused) => {
             let error = failed(backend, refused.error.to_string());
+            // The refused registration holds the reservation; it is let go of before the backend
+            // is unbound, so a retry that claims the backend does not find the instance reserved.
+            drop(refused);
             backend.roll_back();
             return Err(error);
         }
