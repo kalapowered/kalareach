@@ -1329,7 +1329,7 @@ impl Registry {
     /// (`grant.transfer`) keeps its answer, a `GrantTransferResult`, when it answers. Both are
     /// read back to a repeat of the action, as the answers to a share and to a revocation are, and
     /// a release that reads 9 does not know the methods that write them. No row changes, and no
-    /// table: a row of either kind is written only by a release that writes 10.
+    /// table: a row of either kind is written only by a release that writes 10 or later.
     ///
     /// This migration goes in the first release after every install has opened the registry at
     /// this version: nothing before it is installed anywhere it has to be read from again.
@@ -4427,44 +4427,47 @@ mod tests {
         assert_eq!(document.revision, 4);
     }
 
-    /// A release that reads version 9 kept no answer to a redemption or to a transfer of control.
-    /// A registry it left comes forward through 10 to this version with no row changed: the
-    /// answers these methods keep are written by a release that writes 10.
+    /// A release that reads version 9 kept no answer to a redemption or to a transfer of control,
+    /// and one that reads 10 recorded the configuration document at the version before this one's.
+    /// A registry either left comes forward to this version with no row changed: the answers these
+    /// methods keep are written by a release that writes 10 or later.
     #[test]
-    fn a_registry_at_the_version_before_comes_forward_and_changes_no_row() {
-        let directory = tempfile::tempdir().expect("a directory");
-        let path = directory.path().join("registry.sqlite3");
-        drop(Registry::open(&path, environment()).expect("a registry"));
-        let connection = Connection::open(&path).expect("opens");
-        connection
-            .execute("UPDATE schema_version SET version = 9", [])
-            .expect("sets the file back to the release before");
-        let rows = |connection: &Connection| -> i64 {
+    fn a_registry_at_an_earlier_version_comes_forward_and_changes_no_row() {
+        for from in [9, SCHEMA_VERSION - 1] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("registry.sqlite3");
+            drop(Registry::open(&path, environment()).expect("a registry"));
+            let connection = Connection::open(&path).expect("opens");
             connection
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM authority_receipts) + (SELECT COUNT(*) FROM grants)",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("counts")
-        };
-        let before = rows(&connection);
-        drop(connection);
+                .execute("UPDATE schema_version SET version = ?1", [from])
+                .expect("sets the file back to the release before");
+            let rows = |connection: &Connection| -> i64 {
+                connection
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM authority_receipts) + (SELECT COUNT(*) FROM grants)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("counts")
+            };
+            let before = rows(&connection);
+            drop(connection);
 
-        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
-        assert_eq!(
-            carried,
-            Some(Carried {
-                from: 9,
-                to: SCHEMA_VERSION
-            })
-        );
-        let connection = Connection::open(&path).expect("opens");
-        assert_eq!(rows(&connection), before);
-        let version: i64 = connection
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .expect("the version");
-        assert_eq!(version, SCHEMA_VERSION);
+            let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+            assert_eq!(
+                carried,
+                Some(Carried {
+                    from,
+                    to: SCHEMA_VERSION
+                })
+            );
+            let connection = Connection::open(&path).expect("opens");
+            assert_eq!(rows(&connection), before, "from {from}");
+            let version: i64 = connection
+                .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                .expect("the version");
+            assert_eq!(version, SCHEMA_VERSION, "from {from}");
+        }
     }
 
     /// A registry that is at this build's schema is not migrated, and one with no log to take in is
