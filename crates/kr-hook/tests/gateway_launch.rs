@@ -12,7 +12,13 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a plain launch of an integrated terminal that has a server is served by a gateway: the server is started, recorded and bound before the program runs, the program's whole session runs through it, and the server and the instance end with the program |
+//! | KR-REQ-12.07 | a plain launch of an integrated terminal that has a server is served by a gateway: the server is started, recorded and bound before the program runs, the program's whole session runs through it, and the server and the instance end with the program; a launch that cannot have a server, or whose environment cannot be presented, runs the program as typed; a close ends a backend's instance before it takes down what the backend published, and a runtime directory with a space is served as any other |
+//! | KR-REQ-07.60 | a server is recorded before the launch commits, and one whose record cannot be written is not left running; a server and what it started end with the program, with the connection, at the bound for a connection, and with the session after the acceptance of its close is delivered, a stubborn one by force and a command that outlived its server included |
+//! | KR-REQ-07.61 | a process the server started is placed under the program's instance |
+//! | KR-REQ-11.32 | only the process the launch registered reaches the gateway, and a plain upgrade from another is closed without a word; a message at the connector's limit is carried both ways and one above it ends the connection and the server; a terminal that stops reading loses its connection |
+//! | KR-REQ-11.33 | the key a terminal signs in with reaches the server and is kept nowhere |
+//! | KR-REQ-11.35 | a ledger fault in live traffic keeps the session going and fences rich work |
+//! | KR-REQ-12.13 | an approval is an opaque pending resource of the instance before the terminal answers, and its one answer resolves it once, under an identifier one side shares with the other's |
 
 #![cfg(unix)]
 
@@ -341,6 +347,10 @@ impl Gateway {
 impl Drop for Gateway {
     fn drop(&mut self) {
         let _ = self.backends.close();
+        // What a session's closure does for the servers its backends ran, so that none is left
+        // running, and nothing it started, when the test ends.
+        let _entered = self.runtime.enter();
+        self.runtime.block_on(self.backends.end_servers());
     }
 }
 
@@ -932,7 +942,7 @@ fn kr_req_11_35_a_ledger_fault_in_live_traffic_keeps_the_session_and_fences_rich
 #[test]
 fn kr_req_07_60_a_program_that_never_connects_ends_its_instance_and_server_at_the_bound() {
     let shell = Gateway::new();
-    shell.backends.connect_within(Duration::from_millis(500));
+    shell.backends.connect_within(Duration::from_secs(5));
     let answer = shell
         .establish(&["codex"])
         .expect("a backend is established");
@@ -1021,10 +1031,11 @@ fn kr_req_12_07_a_close_ends_the_instance_before_it_takes_down_the_registration(
 
 /// KR-REQ-07.60: a session's closure ends the server of a backend after the acceptance of the close
 /// is delivered, and what the server started with it. The requester of a close may be a command the
-/// server started, so that command is still running when the acceptance is delivered: here it
-/// waits for the test to say the acceptance is out, and shows it was alive. Then the gate is
-/// released, and when the closure is over the server and the command have ended, the server among
-/// the processes the closure names as terminated.
+/// server started, so that command is still running when the acceptance is delivered, though the
+/// terminal sends a request after the close is admitted and so loses its connection: here the
+/// command waits for the test to say the acceptance is out, and shows it was alive. Then the gate
+/// is released, and when the closure is over the server and the command have ended, the server
+/// among the processes the closure names as terminated.
 #[test]
 fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance() {
     let shell = Gateway::new();
@@ -1042,10 +1053,15 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
         alive
     ])
     .to_string();
+    let ask = shell.placed.host.root().join("ask");
     let mut launched = shell.launch(
         &answer,
         "closure",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", &requester)],
+        &[
+            ("KR_STAND_IN", "stay,request-when-released"),
+            ("KR_STAND_IN_COMMAND", &requester),
+            ("KR_STAND_IN_RELEASE", ask.to_str().expect("a text path")),
+        ],
     );
     launched.prints("TUI: turn/completed");
     eventually("the session recorded what the server started", || {
@@ -1059,6 +1075,12 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
         .runtime
         .close(kr_protocol::session::ClosureReason::CloseRequested);
     assert!(acceptance.initiated);
+    // The terminal asks something of the server while the close waits for its acceptance to be
+    // delivered. The instance is gone, so the host cannot carry the request and ends the
+    // connection, and the terminal with it; the server is not the connection's to end.
+    std::fs::write(&ask, b"ask").expect("the terminal is released");
+    let status = launched.ends();
+    assert_eq!(status.code(), Some(1), "{}", launched.printed());
     // The acceptance is delivered, and the command that asked for the close is still there to read
     // it: nothing has been signalled.
     std::fs::write(&delivered, b"delivered").expect("the acceptance is delivered");

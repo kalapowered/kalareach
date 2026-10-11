@@ -19,11 +19,6 @@ use crate::variants::{Variants, padded};
 /// The identifier of the one approval the server asks for.
 const APPROVAL: &str = "approval-1";
 
-/// The identifier a terminal gives its request to start a turn, which the server asks for its
-/// approval under, as a number, under `colliding-ids`: the two requests then carry one spelling,
-/// one from each side.
-const TERMINAL_TURN_REQUEST: i64 = 3;
-
 /// The program's argument that makes it lead a session of its own and run a command in it.
 pub const EXEC_IN_NEW_SESSION: &str = "--exec-in-new-session";
 
@@ -295,7 +290,7 @@ impl Server {
         eprintln!("stand-in: turn started");
         self.start_command();
         let approval = json!({
-            "id": if self.variants.colliding_ids { json!(TERMINAL_TURN_REQUEST) } else { json!(APPROVAL) },
+            "id": if self.variants.colliding_ids { json!(crate::terminal::TURN) } else { json!(APPROVAL) },
             "method": "item/commandExecution/requestApproval",
             "params": {
                 "itemId": "item-1",
