@@ -270,11 +270,6 @@ pub struct ManagedProcess {
     pub handle: TransportHandle,
     /// The credential the process authenticates with. It stays here.
     credential: Credential,
-    /// True when this backend is dedicated to a native terminal this host started.
-    ///
-    /// Section 7: a native TUI's intentional exit ends the instance and stops its dedicated
-    /// backend. A bypassed or shared backend is never claimed or terminated as owned.
-    pub dedicated: bool,
     /// When the broker started it.
     pub started_at: TimestampMs,
 }
@@ -287,7 +282,6 @@ impl ManagedProcess {
         process: ProcessStartIdentity,
         handle: TransportHandle,
         credential: Credential,
-        dedicated: bool,
         started_at: TimestampMs,
     ) -> Self {
         Self {
@@ -295,7 +289,6 @@ impl ManagedProcess {
             process,
             handle,
             credential,
-            dedicated,
             started_at,
         }
     }
@@ -338,8 +331,7 @@ impl ManagedProcess {
     /// directory it writes into; on Windows it reads the directory's access-control list from an
     /// opened handle and refuses a list that names an account the host does not trust, so on both
     /// "no other account can read this" is a fact rather than a hope. A platform that can do
-    /// neither is refused before anything starts, and [`crate::broker::NativeGateway::launch`] asks
-    /// this first.
+    /// neither is refused before anything starts.
     #[must_use]
     pub const fn publishes_credential_file() -> bool {
         cfg!(any(unix, windows))
@@ -549,6 +541,12 @@ impl SourceFrame {
     }
 }
 
+/// Why a Windows machine runs no command backend: the kernel's record of when a process started is
+/// what places a launcher and its program, and it cannot be believed here.
+#[cfg(windows)]
+const START_RECORD_NOT_BELIEVED: &str =
+    "the kernel's record of when a process started cannot be believed on this machine";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,7 +569,6 @@ mod tests {
                 process: process(41, 900),
             },
             credential,
-            true,
             TimestampMs::new(1),
         )
     }
@@ -703,101 +700,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&private);
     }
 
-    /// A job that answers from a script, so that a query or a termination can fail where the
-    /// operating system will not fail on request.
-    struct Scripted {
-        listings: std::sync::Mutex<std::collections::VecDeque<std::io::Result<Vec<u32>>>>,
-        terminated: std::sync::atomic::AtomicBool,
-        terminates: bool,
-    }
-
-    impl Scripted {
-        fn new(listings: Vec<std::io::Result<Vec<u32>>>, terminates: bool) -> Self {
-            Self {
-                listings: std::sync::Mutex::new(listings.into()),
-                terminated: std::sync::atomic::AtomicBool::new(false),
-                terminates,
-            }
-        }
-
-        /// The next answer; the last one is the answer from then on.
-        fn list(&self) -> std::io::Result<Vec<u32>> {
-            let mut listings = self.listings.lock().expect("the script");
-            let next = if listings.len() > 1 {
-                listings.pop_front().expect("an answer")
-            } else {
-                match listings.front().expect("an answer") {
-                    Ok(held) => Ok(held.clone()),
-                    Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
-                }
-            };
-            if self.terminated.load(std::sync::atomic::Ordering::SeqCst) && self.terminates {
-                return Ok(Vec::new());
-            }
-            next
-        }
-
-        fn terminate(&self) -> std::io::Result<()> {
-            self.terminated
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            if self.terminates {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("the job would not end"))
-            }
-        }
-    }
-
-    async fn followed(job: &Scripted) -> BackendStop {
-        follow_job(
-            || job.list(),
-            || job.terminate(),
-            || {},
-            std::time::Duration::from_secs(1),
-        )
-        .await
-    }
-
-    /// KR-REQ-07.67: a stop whose query of the job failed at any point is not reported complete,
-    /// even when a later query answered that the job is empty. Control: the same stop with every
-    /// query answered is complete.
-    #[tokio::test(start_paused = true)]
-    async fn kr_req_07_67_a_job_query_that_failed_leaves_the_stop_unresolved() {
-        let answered = Scripted::new(vec![Ok(vec![7]), Ok(Vec::new())], true);
-        let stop = followed(&answered).await;
-        assert!(stop.asked && stop.ended && !stop.forced);
-        assert!(!stop.unresolved, "every query answered, so it is complete");
-        let failed = Scripted::new(
-            vec![
-                Err(std::io::Error::other("the job would not say")),
-                Ok(Vec::new()),
-            ],
-            true,
-        );
-        let stop = followed(&failed).await;
-        assert!(stop.ended, "the job listed nothing in the end");
-        assert!(
-            stop.unresolved,
-            "a query failed on the way, so it is not complete"
-        );
-    }
-
-    /// KR-REQ-07.67: a termination that failed and left the job holding something is unresolved.
-    /// Control: a termination that worked ends the job and the stop is complete.
-    #[tokio::test(start_paused = true)]
-    async fn kr_req_07_67_a_termination_that_failed_leaves_the_stop_unresolved() {
-        let works = Scripted::new(vec![Ok(vec![7])], true);
-        let stop = followed(&works).await;
-        assert!(stop.forced && stop.ended && !stop.unresolved);
-        let fails = Scripted::new(vec![Ok(vec![7])], false);
-        let stop = followed(&fails).await;
-        assert!(
-            stop.forced && !stop.ended,
-            "the job still holds what it held"
-        );
-        assert!(stop.unresolved);
-    }
-
     #[test]
     fn a_transcript_tail_cannot_carry_forwarding() {
         assert!(!BrokerTransport::TranscriptTail.carries_forwarding());
@@ -807,246 +709,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Why a Windows machine runs no command backend: the kernel's record of when a process started is
-/// what places a launcher and its program, and it cannot be believed here.
-#[cfg(windows)]
-const START_RECORD_NOT_BELIEVED: &str =
-    "the kernel's record of when a process started cannot be believed on this machine";
-
-/// How long a dedicated backend is given to stop before it is forced.
-///
-/// Section 7 makes the native TUI's intentional exit stop its dedicated backend "through the
-/// normal grace period", and section 7's close sequence is where that period is defined.
-pub const BACKEND_GRACE: std::time::Duration = crate::session::GRACE_PERIOD;
-
-/// How often a stopping backend is looked at again.
-const BACKEND_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// How long this host waits for the kernel to agree that a forced stop happened.
-const FORCED_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// What stopping one dedicated backend did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BackendStop {
-    /// True when this host asked the process to stop.
-    ///
-    /// False means the identity named no running process: either it had already ended, or the
-    /// identifier belongs to something else now, and section 7 stops what this host started rather
-    /// than whatever holds that identifier.
-    pub asked: bool,
-    /// True when the grace period ended with the process still running, so it was forced.
-    pub forced: bool,
-    /// True when the kernel says the process this host started has gone.
-    pub ended: bool,
-    /// True when the kernel would not say whether it has gone.
-    ///
-    /// It is neither running nor known to have ended, and section 7 does not let this host report
-    /// a shutdown it cannot establish.
-    pub unresolved: bool,
-}
-
-/// Stops one dedicated backend through the normal grace period.
-///
-/// The identity is checked before anything is signalled and again before anything is forced,
-/// because a bare process identifier can be reused and signalling a stranger is worse than leaving
-/// a backend running.
-///
-/// On Windows a backend this host started is held by a job, and that job is what is stopped: its
-/// input is closed, which is how the agent is told to finish, the grace period is given to
-/// everything the job holds, and then the job is terminated. It is complete only when the job lists
-/// nothing, and an agent whose root has exited and whose helpers have not is not yet complete.
-pub async fn stop_backend(
-    process: &ProcessStartIdentity,
-    grace: std::time::Duration,
-) -> BackendStop {
-    #[cfg(windows)]
-    if let Some(stopper) = crate::windows::job::stopper(process) {
-        return stop_held(stopper, grace).await;
-    }
-    stop_by_identity(process, grace).await
-}
-
-/// Stops the agent whose job and input are `stopper`, once, whoever asks.
-///
-/// The first caller does the stop while holding the record of it, and a concurrent caller waits for
-/// the record and returns what the first found, so one agent is stopped by one owner and never
-/// twice.
-#[cfg(windows)]
-async fn stop_held(
-    stopper: crate::windows::job::Stopper,
-    grace: std::time::Duration,
-) -> BackendStop {
-    let mut outcome = stopper.outcome.lock().await;
-    if let Some(done) = *outcome {
-        return done;
-    }
-    let done = stop_job(&stopper, grace).await;
-    *outcome = Some(done);
-    done
-}
-
-/// Closes the agent's input, waits the grace period for its job to empty, then terminates the job.
-#[cfg(windows)]
-async fn stop_job(
-    stopper: &crate::windows::job::Stopper,
-    grace: std::time::Duration,
-) -> BackendStop {
-    let closing = stopper.writer.clone();
-    // Closing cancels a write that is blocked and takes the lock the write held, which waits, so it
-    // is not done on the runtime's own threads.
-    let close = move || {
-        if let Some(writer) = closing {
-            let _ = writer.close();
-        }
-    };
-    follow_job(
-        || stopper.job.process_ids(),
-        || stopper.job.terminate(1),
-        close,
-        grace,
-    )
-    .await
-}
-
-/// Follows one job through a stop: what it holds is listed, the agent's input is closed, the grace
-/// period is given to everything the job holds, and then the job is terminated.
-///
-/// The stop is complete only when the job lists nothing. What could not be established is never
-/// reported as a stop: a query of the job that failed at any point leaves the stop unresolved, even
-/// when a later one answered, and so does a termination that failed and left something in it.
-#[cfg(any(windows, test))]
-async fn follow_job(
-    list: impl Fn() -> std::io::Result<Vec<u32>> + Sync,
-    terminate: impl Fn() -> std::io::Result<()> + Sync,
-    close: impl FnOnce() + Send + 'static,
-    grace: std::time::Duration,
-) -> BackendStop {
-    let failed = std::sync::atomic::AtomicBool::new(false);
-    let look = || {
-        let listing = list();
-        if listing.is_err() {
-            failed.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        listing
-    };
-    let failed_at_all = || failed.load(std::sync::atomic::Ordering::SeqCst);
-    let emptied = |listing: &std::io::Result<Vec<u32>>| listing.as_ref().is_ok_and(Vec::is_empty);
-    let first = look();
-    let _ = tokio::task::spawn_blocking(close).await;
-    if emptied(&first) {
-        return BackendStop {
-            asked: false,
-            forced: false,
-            ended: true,
-            unresolved: failed_at_all(),
-        };
-    }
-    let deadline = tokio::time::Instant::now() + grace;
-    loop {
-        if emptied(&look()) {
-            return BackendStop {
-                asked: true,
-                forced: false,
-                ended: true,
-                unresolved: failed_at_all(),
-            };
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(BACKEND_POLL).await;
-    }
-    let terminated = terminate();
-    // A termination is not instant either: the job is looked at until it is empty, within a bound.
-    let confirm = tokio::time::Instant::now() + FORCED_CONFIRMATION;
-    let listing = loop {
-        let listing = look();
-        if emptied(&listing) || tokio::time::Instant::now() >= confirm {
-            break listing;
-        }
-        tokio::time::sleep(BACKEND_POLL).await;
-    };
-    let ended = emptied(&listing);
-    BackendStop {
-        asked: true,
-        forced: true,
-        ended,
-        unresolved: failed_at_all() || (terminated.is_err() && !ended),
-    }
-}
-
-/// Stops one process by its identity: asked, then forced once the grace period has passed.
-async fn stop_by_identity(
-    process: &ProcessStartIdentity,
-    grace: std::time::Duration,
-) -> BackendStop {
-    let mut state = kr_ipc::identity::process_state(process);
-    if !matches!(state, kr_ipc::identity::ProcessState::Running) {
-        return settled(false, false, &state);
-    }
-    signal(process, false);
-    let deadline = tokio::time::Instant::now() + grace;
-    loop {
-        state = kr_ipc::identity::process_state(process);
-        if !matches!(state, kr_ipc::identity::ProcessState::Running) {
-            return settled(true, false, &state);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(BACKEND_POLL).await;
-    }
-    signal(process, true);
-    // A forced stop is not instant, and reading the state once the instant after it would report a
-    // process still running as a shutdown that did not happen. This waits for the kernel to agree,
-    // within a bound, and reports what it actually saw.
-    let confirm = tokio::time::Instant::now() + FORCED_CONFIRMATION;
-    loop {
-        let state = kr_ipc::identity::process_state(process);
-        if !matches!(state, kr_ipc::identity::ProcessState::Running)
-            || tokio::time::Instant::now() >= confirm
-        {
-            return settled(true, true, &state);
-        }
-        tokio::time::sleep(BACKEND_POLL).await;
-    }
-}
-
-/// Reads the last state this host saw as what it proves, and nothing more.
-///
-/// `Ended` is the kernel saying the process has gone. `Unknown` is the kernel saying it cannot
-/// tell, which is not the same thing and is never recorded as one: a caller that read `ended` for
-/// it would believe a backend had stopped on evidence nobody has.
-fn settled(asked: bool, forced: bool, state: &kr_ipc::identity::ProcessState) -> BackendStop {
-    BackendStop {
-        asked,
-        forced,
-        ended: matches!(state, kr_ipc::identity::ProcessState::Ended),
-        unresolved: matches!(state, kr_ipc::identity::ProcessState::Unknown { .. }),
-    }
-}
-
-#[cfg(unix)]
-fn signal(process: &ProcessStartIdentity, force: bool) {
-    let signal = if force {
-        rustix::process::Signal::KILL
-    } else {
-        rustix::process::Signal::TERM
-    };
-    let Ok(pid) = i32::try_from(process.pid.get()) else {
-        return;
-    };
-    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
-        return;
-    };
-    let _ = rustix::process::kill_process(pid, signal);
-}
-
-#[cfg(not(unix))]
-fn signal(_process: &ProcessStartIdentity, _force: bool) {
-    // The job object this worker owns ends its processes when it is closed. Nothing here signals
-    // one at a time, and section 12 keeps the Windows managed gateway unsupported until its own
-    // protected exchange exists.
 }

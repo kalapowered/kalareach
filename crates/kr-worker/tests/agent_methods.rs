@@ -107,7 +107,6 @@ fn managed() -> ManagedProcess {
             process: process_identity(),
         },
         Credential::from_bytes(CREDENTIAL),
-        true,
         TimestampMs::new(1),
     )
 }

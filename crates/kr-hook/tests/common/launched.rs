@@ -12,15 +12,15 @@ use std::time::Duration;
 
 use kr_protocol::broker::{AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile};
 use kr_protocol::gateway::NativeFraming;
-#[cfg(windows)]
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
     ApplicationInstanceId, EnvironmentId, LaunchProfileId, PluginId, SessionId,
 };
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_worker::broker::{
-    AdmittedBridge, AgentChild, BridgeSurface, Broker, BrokerError, ForegroundMark, Framing,
-    InstalledBridge, NativeGateway, NativeLaunch,
+    AdmittedBridge, BridgeSurface, Broker, BrokerError, BrokerTransport, Credential,
+    ForegroundMark, Framing, InstalledBridge, ManagedProcess, NativeGateway, NativeLaunch,
+    TransportHandle,
 };
 
 use super::{LIVENESS, Placed};
@@ -120,6 +120,13 @@ set code=%errorlevel%\r\n\
 > \"{code}.tmp\" echo %code%\r\n\
 move /y \"{code}.tmp\" \"{code}\" > NUL\r\n\
 exit /b %code%\r\n";
+
+/// The process a launch starts, as this platform hands it back.
+#[cfg(unix)]
+type AgentChild = std::process::Child;
+/// The process a launch starts, as this platform hands it back.
+#[cfg(windows)]
+type AgentChild = kr_worker::windows::launch::Child;
 
 /// What a test writes a stand-in application's requests to.
 #[cfg(unix)]
@@ -360,21 +367,6 @@ fn private(directory: &Path) {
     kr_ipc::paths::create_private_directory(directory).expect("a private directory");
 }
 
-/// The directory the launched application works in: the launch's own, on Unix, and one beside it
-/// on Windows, where the backend never works in the directory its files are published in.
-#[cfg(unix)]
-fn working_directory(_placed: &Placed, runtime: &Path) -> PathBuf {
-    runtime.to_path_buf()
-}
-
-/// The directory the launched application works in.
-#[cfg(windows)]
-fn working_directory(placed: &Placed, _runtime: &Path) -> PathBuf {
-    let directory = placed.host.root().join("w");
-    std::fs::create_dir_all(&directory).expect("a working directory");
-    directory
-}
-
 /// The program a launch starts for the stand-in application `script` stands for, and its
 /// arguments: `/bin/sh` running the script under a leader of a process group of its own, the
 /// program, the application's name and the file its exit code goes to.
@@ -435,6 +427,65 @@ fn application(
     )
 }
 
+/// The stand-in application a launch started, and what the kernel says it is.
+struct Started {
+    child: AgentChild,
+    identity: ProcessStartIdentity,
+    /// The session's job, which a launch on Windows is held by and which ends all of it when it
+    /// closes.
+    #[cfg(windows)]
+    session: Arc<kr_worker::windows::job::SessionJob>,
+}
+
+impl Started {
+    /// Starts `program` with `arguments` in `directory`, with the registration's path in its
+    /// environment and its standard input and output as pipes this host keeps.
+    #[cfg(unix)]
+    fn new(program: &str, arguments: &[String], directory: &Path, registration: &Path) -> Self {
+        use std::process::{Command, Stdio};
+
+        let child = Command::new(program)
+            .args(arguments)
+            .current_dir(directory)
+            .env("KR_REGISTRATION", registration)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the application starts");
+        let identity =
+            kr_ipc::identity::started_process_identity(child.id()).expect("the kernel names it");
+        Self { child, identity }
+    }
+
+    /// Starts `program` with `arguments` in `directory`, with the registration's path in its
+    /// environment and its standard input and output as pipes this host keeps, in the session's
+    /// job and in a job of its own, both joined before it runs.
+    #[cfg(windows)]
+    fn new(program: &str, arguments: &[String], directory: &Path, registration: &Path) -> Self {
+        let session = Arc::new(kr_worker::windows::job::SessionJob::create().expect("a job"));
+        let job = Arc::new(kr_worker::windows::job::AgentJob::create().expect("a job"));
+        let child = kr_worker::windows::launch::start(&kr_worker::windows::launch::Spec {
+            program: Path::new(program),
+            arguments,
+            directory,
+            environment: &[("KR_REGISTRATION", registration.as_os_str())],
+            session: Some(session.as_ref()),
+            agent: &job,
+            pipe_input: true,
+            pipe_output: true,
+        })
+        .expect("the application starts");
+        let identity =
+            kr_ipc::identity::started_process_identity(child.id()).expect("the kernel names it");
+        kr_worker::windows::job::keep_agent(identity.clone(), job);
+        Self {
+            child,
+            identity,
+            session,
+        }
+    }
+}
+
 impl Launch {
     /// Launches the stand-in application, whose hooks run `hook_program` for the application
     /// the installation names, against an installation of `installed`.
@@ -487,31 +538,6 @@ impl Launch {
             )
             .expect("a broker"),
         );
-        let gateway = NativeGateway::bind(
-            Arc::clone(&broker),
-            &runtime,
-            NativeLaunch {
-                profile_id: LaunchProfileId::new("lp-claude").expect("valid"),
-                expected_process: None,
-                native_terminal: None,
-                application_instance_id: instance(),
-                plugin_id: installed.plugin_id.clone(),
-                installed_protocol_version: "2.1.278".to_owned(),
-                framing: Framing::new(NativeFraming::JsonLines),
-                site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
-                os_user: "agent-user".to_owned(),
-                working_directory: working_directory(placed, &runtime),
-            },
-        )
-        .expect("the endpoint binds")
-        .with_bridge(installed)
-        .expect("the bridge is this launch's connector's");
-        // A launch on Windows is held by the session's job, which ends all of it when it closes.
-        #[cfg(windows)]
-        let session = Arc::new(kr_worker::windows::job::SessionJob::create().expect("a job"));
-        #[cfg(windows)]
-        let gateway = gateway.in_session(Arc::clone(&session));
-        let mut gateway = gateway;
         let (resolved_path, arguments) = application(placed, script, program, invoked, &code);
         let profile = LaunchProfile {
             profile_id: LaunchProfileId::new("lp-claude").expect("valid"),
@@ -532,31 +558,79 @@ impl Launch {
         let intent = broker
             .prepare_launch(profile, ForegroundMark::idle(4), None)
             .expect("the launch is prepared");
-        let mut launched = gateway
-            .launch(
-                &intent,
-                &ForegroundMark::idle(4),
-                IntegrationMode::NativeBridge,
-                TimestampMs::new(1),
-            )
-            .expect("the application is started");
-        let requests = launched
-            .child
-            .stdin
-            .take()
-            .expect("the application reads requests");
-        let stdout = launched.child.stdout.take();
+        let reservation = broker
+            .execute_launch(&intent, &ForegroundMark::idle(4), instance())
+            .expect("the launch is executed");
+        // The application starts first, with the registration's path in its environment and
+        // nothing else: the registration names the process the kernel started, so it is written
+        // once the process exists, and the application reads it when its first hook runs.
+        let registration = runtime.join("registration");
+        let credential_file = runtime.join("credential");
+        let started = Started::new(
+            &reservation.profile().binary.resolved_path,
+            &reservation.profile().arguments,
+            &runtime,
+            &registration,
+        );
+        let mut child = started.child;
+        let credential = Credential::generate().expect("a credential");
+        let process = ManagedProcess::new(
+            instance(),
+            started.identity.clone(),
+            TransportHandle {
+                transport: BrokerTransport::PrivateSocket,
+                application_instance_id: instance(),
+                executable_digest: reservation.profile().binary.digest,
+                process: started.identity.clone(),
+            },
+            credential,
+            TimestampMs::new(1),
+        );
+        process
+            .write_registration(&credential_file)
+            .expect("the credential is written");
+        let registered = reservation
+            .register(IntegrationMode::NativeBridge, Some(process))
+            .unwrap_or_else(|refused| panic!("the launch is registered: {}", refused.error));
+        let gateway = NativeGateway::bind(
+            Arc::clone(&broker),
+            &runtime,
+            NativeLaunch {
+                profile_id: LaunchProfileId::new("lp-claude").expect("valid"),
+                expected_process: Some(started.identity.clone()),
+                application_instance_id: instance(),
+                plugin_id: installed.plugin_id.clone(),
+                installed_protocol_version: "2.1.278".to_owned(),
+                framing: Framing::new(NativeFraming::JsonLines),
+                site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
+                os_user: "agent-user".to_owned(),
+            },
+        )
+        .expect("the endpoint binds")
+        .with_bridge(installed)
+        .expect("the bridge is this launch's connector's");
+        kr_ipc::paths::write_owner_only_file(
+            &registration,
+            gateway
+                .registration()
+                .expect("the gateway has a registration")
+                .as_bytes(),
+        )
+        .expect("the registration is published");
+        let _ = registered.commit();
+        let requests = child.stdin.take().expect("the application reads requests");
+        let stdout = child.stdout.take();
         Self {
             broker,
             gateway,
             application: Application {
-                child: launched.child,
+                child,
                 stdout,
                 code,
                 #[cfg(windows)]
-                process: launched.process,
+                process: started.identity,
                 #[cfg(windows)]
-                session,
+                session: started.session,
             },
             requests: Some(requests),
             runtime,
@@ -588,8 +662,7 @@ impl Launch {
     /// Closes the application's input, as the application's own end of a connection closes when it
     /// goes: what reads it then reads the end.
     ///
-    /// On Windows the host keeps a handle on the pipe for the agent's stop, so a test that only
-    /// dropped its own would leave the pipe open.
+    /// On Windows the pipe is closed by name, as the agent's own end of it is.
     pub fn close_input(&mut self) {
         let Some(input) = self.requests.take() else {
             return;

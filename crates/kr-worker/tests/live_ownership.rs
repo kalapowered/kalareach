@@ -182,7 +182,6 @@ fn launched(instance: ApplicationInstanceId, pid: u64) -> ManagedProcess {
             process: process(pid),
         },
         Credential::from_bytes(CREDENTIAL),
-        true,
         TimestampMs::new(1),
     )
 }
