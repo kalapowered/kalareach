@@ -24,6 +24,8 @@
 //! has no command, so it cannot be reached from the page at all. [`commands::NAMED_COMMANDS`] is
 //! that list as data, and the crate's tests hold the handler list and the allowlist to each other.
 
+#[cfg(target_os = "macos")]
+mod access_list;
 pub mod account;
 pub mod agent;
 pub mod commands;
