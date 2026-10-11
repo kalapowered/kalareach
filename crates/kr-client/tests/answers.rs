@@ -942,14 +942,13 @@ async fn keeping_an_answer_refuses_a_lock_that_is_a_link() {
     let _ = std::fs::remove_file(&lock);
     let target_of_the_link = directory.path().join("somebody-elses");
     if let Err(error) = link(&target_of_the_link, &lock) {
-        // Windows lets an account make a link only when it holds the privilege to; a Unix account
-        // always can.
+        // Windows lets an account make a link only when it holds the privilege to (error 1314, not
+        // held); a Unix account always can, and any other failure is the test's.
         #[cfg(windows)]
-        {
+        if error.raw_os_error() == Some(1314) {
             eprintln!("skipped: this account cannot make a symbolic link here: {error}");
             return;
         }
-        #[cfg(not(windows))]
         panic!("a link is made where the lock belongs: {error}");
     }
     let error = drafts
