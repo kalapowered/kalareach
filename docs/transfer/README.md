@@ -667,7 +667,7 @@ Section 12 allows three insertion methods and no others:
 | --- | --- | --- |
 | `typed_submission` | no | A typed submission against the exact upstream binding |
 | `verified_composer_insertion` | yes | Insertion into a native composer behind a qualified atomic editor boundary |
-| `manual_terminal_workflow` | yes | The user performs the native operation after an environment-local transfer, with the host showing the tested syntax |
+| `manual_terminal_workflow` | yes | The user performs the native operation after an environment-local transfer; the host gives the staged file's path under a read grant, with no shell quoting |
 
 The two that need a readable path get an `AttachmentReadGrant`: one file, read only, one purpose,
 fifteen minutes. The staged file is inside the environment's state directory and outside every
@@ -675,6 +675,10 @@ repository, which is what keeps an upload from becoming a file in a working tree
 widened and no file is placed in a repository. A typed submission needs no path when it is bound
 and is given none; the claim of an offer to an agent issues a grant over the one file, as
 described below.
+
+A local caller that holds the necessary rights can have the daemon bind a `manual_terminal_workflow` once the transfer has completed and the attachment is published, subject to the checks above. The binding needs no declaration from an integration, because nothing is put in front of an agent. The reply carries the host path of a read grant, which holds for fifteen minutes, and the person performs the native operation with that path. The path is not quoted for any shell.
+
+A `typed_submission` or a `verified_composer_insertion` reaches the agent through an integration, so the daemon binds one only for a path that the session's integration has declared for the operation. The daemon holds no such declaration, so it rejects both with an error of type `UNSUPPORTED_CAPABILITY` that names the path, before the transfer service checks the draft, the attachment or the contribution. Nothing is bound and the revision of the draft does not change. The declaration meant here is an integration's, whereas the contribution described above is the caller's statement of what one operation accepts.
 
 ### Offering an attachment to an agent
 
@@ -817,6 +821,7 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `ID_CONFLICT` | one action identifier used for two different payloads |
 | `INVALID_ARGUMENT` | a malformed request, or an identifier that names nothing this caller owns |
 | `STORAGE_UNAVAILABLE` | the journal or the staging area could not be used, including a name the storage would not answer about |
+| `UNSUPPORTED_CAPABILITY` | a binding by `typed_submission` or `verified_composer_insertion`, which no integration declared for the operation |
 | `SESSION_CLOSED` | a new draft for a session whose closure is recorded, a binding, the record of a new prompt or an adapter's report for a draft of such a session, or a binding of an upload that belongs to one |
 
 An identifier that names nothing is `INVALID_ARGUMENT` rather than a code of its own, and an

@@ -17644,7 +17644,7 @@
         },
         {
           "const": "manual_terminal_workflow",
-          "description": "The user performs the native operation after an environment-local transfer completes. The\nhost shows the tested syntax; it never injects at a guessed prompt.",
+          "description": "The user performs the native operation after an environment-local transfer completes. The\nhost gives the staged file's path under a read grant, with no shell quoting; it never\ninjects at a guessed prompt.",
           "type": "string"
         }
       ]
@@ -20366,7 +20366,7 @@
         },
         {
           "const": "agent.draft.add_attachment",
-          "description": "Insert a completed attachment handle into a draft through the active adapter.",
+          "description": "Bind a completed attachment handle to a draft. A manual terminal workflow needs no declaration; any other insertion path needs one from the session's integration.",
           "type": "string"
         },
         {

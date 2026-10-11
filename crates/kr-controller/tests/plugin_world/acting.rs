@@ -867,6 +867,9 @@ impl Acting {
     }
 
     /// Binds a published file to a draft, as a typed submission the package offers.
+    ///
+    /// The daemon makes this binding only for a path an integration declared, so it is made through
+    /// the transfer service here, as that integration's binding.
     pub fn bind(
         &self,
         draft: &kr_protocol::transfer::DraftRecord,

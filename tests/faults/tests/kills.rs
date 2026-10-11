@@ -309,28 +309,14 @@ impl Host {
             .handle
     }
 
-    /// What an adapter's offer of an attachment to a session's agent comes to at the daemon: a draft
-    /// that targets the session is created and the file is bound to it, both through the daemon's
-    /// own methods, as an insertion no upstream evidence has confirmed.
-    async fn offer_attachment(
+    /// What a person's attachment to a session's draft comes to at the daemon: a draft that targets
+    /// the session is created and the file is bound to it, both through the daemon's own methods,
+    /// as a manual terminal workflow, which the daemon binds with no declaration from an
+    /// integration and which no upstream evidence confirms.
+    async fn attach_manually(
         &self,
         session_id: SessionId,
         bytes: &[u8],
-    ) -> (DraftId, AttachmentHandle) {
-        self.offer_attachment_by(
-            session_id,
-            bytes,
-            InsertionMethod::VerifiedComposerInsertion,
-        )
-        .await
-    }
-
-    /// The same, for an attachment to be inserted by `method`.
-    async fn offer_attachment_by(
-        &self,
-        session_id: SessionId,
-        bytes: &[u8],
-        method: InsertionMethod,
     ) -> (DraftId, AttachmentHandle) {
         let handle = self.publish_for(session_id, bytes);
         let draft: DraftCreateResult = self
@@ -359,7 +345,6 @@ impl Host {
                 draft.draft.draft_id,
                 draft.draft.revision,
                 &handle,
-                method,
             )
             .await
             .unwrap_or_else(|error| panic!("the daemon refused the binding: {error}"));
@@ -367,14 +352,66 @@ impl Host {
         (draft.draft.draft_id, handle)
     }
 
-    /// Binds a published file to a draft through the daemon.
+    /// What an adapter's offer of an attachment to a session's agent comes to once an integration
+    /// has declared the typed path for the operation: a draft that targets the session is created
+    /// and the file is bound to it as a typed submission, through the transfer service.
+    ///
+    /// The daemon binds a typed submission only for a path an integration declared, and none can
+    /// today, so this stands for the binding the declaring integration will make; what an offer
+    /// does with the binding once it exists is the daemon's and the worker's.
+    fn offer_declared_attachment(
+        &self,
+        session_id: SessionId,
+        bytes: &[u8],
+    ) -> (DraftId, AttachmentHandle) {
+        let handle = self.publish_for(session_id, bytes);
+        let service = self.controller.transfer().service();
+        let actor = local_actor();
+        let draft = service
+            .draft_create(
+                &actor,
+                &DraftCreateParams {
+                    environment_id: self.environment_id,
+                    device_id: Nullable::null(),
+                    session_id: Nullable::some(session_id),
+                    application_instance_id: Nullable::null(),
+                    text: "have a look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft;
+        let bound = service
+            .draft_add_attachment(
+                &actor,
+                &AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: draft.revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: AttachmentContribution {
+                        operation_id: "attach".to_owned(),
+                        accepted_media_types: vec![handle.declared_media_type.clone()],
+                        max_byte_len: U64::new(1024),
+                        max_count: U64::new(2),
+                        insertion_method: InsertionMethod::TypedSubmission,
+                        external_destination: Nullable::null(),
+                        model_media_capability: false,
+                    },
+                },
+                None,
+            )
+            .expect("binds the attachment");
+        assert_eq!(bound.attachment.state, InsertionState::Recorded);
+        (draft.draft_id, handle)
+    }
+
+    /// Binds a published file to a draft through the daemon, as a manual terminal workflow.
     async fn bind(
         &self,
         session_id: SessionId,
         draft_id: DraftId,
         expected_revision: kr_protocol::ids::DraftRevision,
         handle: &AttachmentHandle,
-        method: InsertionMethod,
     ) -> Result<AgentDraftAddAttachmentResult, kr_protocol::error::ProtocolError> {
         self.daemon()
             .await
@@ -391,7 +428,7 @@ impl Host {
                         accepted_media_types: vec![handle.declared_media_type.clone()],
                         max_byte_len: U64::new(1024),
                         max_count: U64::new(2),
-                        insertion_method: method,
+                        insertion_method: InsertionMethod::ManualTerminalWorkflow,
                         external_destination: Nullable::null(),
                         model_media_capability: false,
                     },
@@ -1082,10 +1119,10 @@ async fn a_dead_workers_unconfirmed_insertion_fails_and_its_completed_upload_kee
     let (ended, _) = host.create(&ended_work).await;
     let (kept, _) = host.create(&kept_work).await;
     let (ended_draft, ended_handle) = host
-        .offer_attachment(ended, b"for the session that ends")
+        .attach_manually(ended, b"for the session that ends")
         .await;
     let (kept_draft, kept_handle) = host
-        .offer_attachment(kept, b"for the session that stays")
+        .attach_manually(kept, b"for the session that stays")
         .await;
     let before = host.draft(ended_draft);
 
@@ -1117,16 +1154,10 @@ async fn a_dead_workers_unconfirmed_insertion_fails_and_its_completed_upload_kee
         ended_handle
     );
 
-    // Nothing is offered to the agent of a session that has ended: a later binding is refused.
+    // A session that has ended is given no new binding, whatever its path: a later one is refused.
     let late = host.publish_for(ended, b"too late for the session that ended");
     let refusal = host
-        .bind(
-            ended,
-            ended_draft,
-            after.revision,
-            &late,
-            InsertionMethod::VerifiedComposerInsertion,
-        )
+        .bind(ended, ended_draft, after.revision, &late)
         .await
         .expect_err("a binding for an ended session is refused");
     assert_eq!(
@@ -1156,20 +1187,10 @@ async fn a_dead_workers_offer_in_flight_fails_its_draft_is_orphaned_and_a_late_r
     let (ended_work, kept_work) = (host.work("offer-ended"), host.work("offer-kept"));
     let (ended, _) = host.create(&ended_work).await;
     let (kept, _) = host.create(&kept_work).await;
-    let (ended_draft, ended_handle) = host
-        .offer_attachment_by(
-            ended,
-            b"offered to the session that ends",
-            InsertionMethod::TypedSubmission,
-        )
-        .await;
-    let (kept_draft, kept_handle) = host
-        .offer_attachment_by(
-            kept,
-            b"offered to the session that stays",
-            InsertionMethod::TypedSubmission,
-        )
-        .await;
+    let (ended_draft, ended_handle) =
+        host.offer_declared_attachment(ended, b"offered to the session that ends");
+    let (kept_draft, kept_handle) =
+        host.offer_declared_attachment(kept, b"offered to the session that stays");
     let ended_offer = host.claim(ended, ended_draft, &ended_handle);
     let kept_offer = host.claim(kept, kept_draft, &kept_handle);
     let claimed = host.draft(ended_draft);

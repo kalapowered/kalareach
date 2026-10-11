@@ -1027,11 +1027,12 @@ impl TransferModule {
                     Method::DraftUpdate => {
                         encode(&service.draft_update(&actor, &typed(&params)?, Some(&performed))?)
                     }
-                    Method::AgentDraftAddAttachment => encode(&service.draft_add_attachment(
-                        &actor,
-                        &typed(&params)?,
-                        Some(&performed),
-                    )?),
+                    Method::AgentDraftAddAttachment => {
+                        let params: kr_protocol::transfer::AgentDraftAddAttachmentParams =
+                            typed(&params)?;
+                        require_declared_path(params.contribution.insertion_method)?;
+                        encode(&service.draft_add_attachment(&actor, &params, Some(&performed))?)
+                    }
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,
                         format!(
@@ -1495,6 +1496,31 @@ fn subject_of(params: &ParamsValue, method: Method) -> Answer<Option<Subject>> {
         }
         _ => None,
     })
+}
+
+/// Refuses an insertion path that no integration declared for the session.
+///
+/// A manual terminal workflow puts nothing in front of the agent: the host binds the completed
+/// transfer, and the person performs the native operation with the file's path, so it needs no
+/// declaration. A typed submission and a verified composer insertion both reach the agent through
+/// its integration, so they are admitted only for a path the session's integration declared for
+/// the operation. The daemon holds no such declaration, so both are refused.
+fn require_declared_path(method: kr_protocol::transfer::InsertionMethod) -> Answer<()> {
+    use kr_protocol::transfer::InsertionMethod;
+
+    match method {
+        InsertionMethod::ManualTerminalWorkflow => Ok(()),
+        InsertionMethod::TypedSubmission | InsertionMethod::VerifiedComposerInsertion => {
+            Err(ProtocolError::new(
+                ErrorCode::UnsupportedCapability,
+                format!(
+                    "no integration declared {} for this operation; only a manual_terminal_workflow \
+                     can be bound",
+                    method.as_str()
+                ),
+            ))
+        }
+    }
 }
 
 fn typed<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Answer<T> {

@@ -492,7 +492,8 @@ pub enum InsertionMethod {
     /// Verified insertion into a native composer behind a qualified atomic editor boundary.
     VerifiedComposerInsertion,
     /// The user performs the native operation after an environment-local transfer completes. The
-    /// host shows the tested syntax; it never injects at a guessed prompt.
+    /// host gives the staged file's path under a read grant, with no shell quoting; it never
+    /// injects at a guessed prompt.
     ManualTerminalWorkflow,
 }
 

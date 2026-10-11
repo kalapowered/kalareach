@@ -190,7 +190,7 @@ links to its document.
 | --- | --- | --- | --- | --- |
 | `draft.create` | write | `local_ipc`, `paired_device` | Create a device-owned draft that survives attachment replacement. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
 | `draft.update` | write | `local_ipc`, `paired_device` | Update a draft at its exact revision. A draft is never submitted automatically. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
-| `agent.draft.add_attachment` | write | `local_ipc`, `paired_device` | Insert a completed attachment handle into a draft through the active adapter. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
+| `agent.draft.add_attachment` | write | `local_ipc`, `paired_device` | Bind a completed attachment handle to a draft. A manual terminal workflow needs no declaration; any other insertion path needs one from the session's integration. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
 | `upload.begin` | write | `local_ipc`, `paired_device`, `workflow` | Reserve the declared size and return an upload identifier, chunk size and expiry. | [Transfer: The seven methods](../transfer/README.md) |
 | `upload.status` | read | `local_ipc`, `paired_device`, `workflow` | Report verified chunk status so an interrupted transfer resumes without republishing. | [Transfer: The seven methods](../transfer/README.md) |
 | `upload.chunk` | write | `local_ipc`, `paired_device`, `workflow` | Send one chunk with its index, exact length and digest. A matching duplicate is acknowledged; a conflicting duplicate invalidates the upload. | [Transfer: The seven methods](../transfer/README.md) |

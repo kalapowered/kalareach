@@ -2942,12 +2942,7 @@
       "version": 1
     },
     {
-      "capability": {
-        "required": {
-          "capability_id": "agent.attachment",
-          "revision": "agent_binding"
-        }
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
@@ -2988,7 +2983,7 @@
         "session",
         "application_instance"
       ],
-      "summary": "Insert a completed attachment handle into a draft through the active adapter.",
+      "summary": "Bind a completed attachment handle to a draft. A manual terminal workflow needs no declaration; any other insertion path needs one from the session's integration.",
       "version": 1
     },
     {

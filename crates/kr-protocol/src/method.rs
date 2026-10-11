@@ -1071,9 +1071,9 @@ methods! {
     effect: Write, ingress: [LocalIpc, PairedDevice],
     rights: [basis(ResourceOwner), req(FilesUpload), req(AgentPrompt)],
     selectors: [Draft, Transfer, Session, ApplicationInstance],
-    history: NotApplicable, capability: cap("agent.attachment", AgentBinding),
+    history: NotApplicable, capability: NO_CAPABILITY,
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
-    doc: "Insert a completed attachment handle into a draft through the active adapter.";
+    doc: "Bind a completed attachment handle to a draft. A manual terminal workflow needs no declaration; any other insertion path needs one from the session's integration.";
 
     UploadBegin = "upload.begin", DraftsAndMedia,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(FilesUpload)],

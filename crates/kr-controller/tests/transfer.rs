@@ -923,6 +923,325 @@ async fn a_draft_is_created_through_the_daemon_and_carries_its_revision() {
     assert!(created.draft.attachments.is_empty());
 }
 
+/// Publishes `bytes` the way a client does, over the daemon's two endpoints, and returns the
+/// completed attachment.
+async fn published_through_the_daemon(
+    host: &Host,
+    control: &mut LocalClient,
+    chunks: &mut ChunkChannel,
+    bytes: &[u8],
+) -> kr_protocol::transfer::AttachmentHandle {
+    let begun: UploadBeginResult = typed(
+        &control
+            .mutate(
+                Method::UploadBegin,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &begin_params(host, bytes, "notes.bin"),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.begin succeeds"),
+    );
+    for index in 0..begun.layout.chunk_count.get() {
+        let (chunk, payload) = chunk_of(bytes, index);
+        chunks
+            .send_chunk(
+                &ActionTarget::environment(host.environment_id),
+                begun.transfer_id,
+                chunk,
+                payload,
+            )
+            .await
+            .expect("upload.chunk succeeds on the attachment endpoint");
+    }
+    let finished: UploadFinishResult = typed(
+        &control
+            .mutate(
+                Method::UploadFinish,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &UploadFinishParams {
+                    transfer_id: begun.transfer_id,
+                    declared_byte_len: U64::new(bytes.len() as u64),
+                    declared_digest: digest(bytes),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.finish succeeds"),
+    );
+    finished.handle
+}
+
+/// A draft the caller made through the daemon, naming no session.
+async fn a_draft_through_the_daemon(
+    host: &Host,
+    control: &mut LocalClient,
+) -> kr_protocol::transfer::DraftRecord {
+    let created: DraftCreateResult = typed(
+        &control
+            .mutate(
+                Method::DraftCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &DraftCreateParams {
+                    environment_id: host.environment_id,
+                    device_id: Nullable::null(),
+                    session_id: Nullable::null(),
+                    application_instance_id: Nullable::null(),
+                    text: "have a look".to_owned(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("draft.create succeeds"),
+    );
+    created.draft
+}
+
+/// Asks the daemon to bind `handle` to `draft` by `method`, as a client does, under `action`.
+async fn bound_as(
+    host: &Host,
+    control: &mut LocalClient,
+    action: ActionId,
+    draft: &kr_protocol::transfer::DraftRecord,
+    handle: &kr_protocol::transfer::AttachmentHandle,
+    method: kr_protocol::transfer::InsertionMethod,
+) -> std::result::Result<kr_protocol::transfer::AgentDraftAddAttachmentResult, ProtocolError> {
+    control
+        .mutate(
+            Method::AgentDraftAddAttachment,
+            action,
+            ActionTarget::environment(host.environment_id),
+            &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                expected_revision: draft.revision,
+                transfer_id: handle.transfer_id,
+                contribution: kr_protocol::transfer::AttachmentContribution {
+                    operation_id: "attach".to_owned(),
+                    accepted_media_types: vec![handle.declared_media_type.clone()],
+                    max_byte_len: U64::new(1024),
+                    max_count: U64::new(2),
+                    insertion_method: method,
+                    external_destination: Nullable::null(),
+                    model_media_capability: false,
+                },
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|value| typed(&value))
+}
+
+/// Asks the daemon to bind `handle` to `draft` by `method`, under an action of its own.
+async fn bound_through_the_daemon(
+    host: &Host,
+    control: &mut LocalClient,
+    draft: &kr_protocol::transfer::DraftRecord,
+    handle: &kr_protocol::transfer::AttachmentHandle,
+    method: kr_protocol::transfer::InsertionMethod,
+) -> std::result::Result<kr_protocol::transfer::AgentDraftAddAttachmentResult, ProtocolError> {
+    bound_as(
+        host,
+        control,
+        ActionId::new(kr_ipc::new_uuid()),
+        draft,
+        handle,
+        method,
+    )
+    .await
+}
+
+/// KR-REQ-13.14, KR-REQ-23.41: a caller with the rights binds a completed environment-local
+/// transfer to a draft for a manual terminal workflow with no declaration from an integration, and
+/// the reply carries the read grant whose path the person is shown: the file at that path is the
+/// file that was sent, and the grant still has time to run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manual_terminal_workflow_is_bound_after_a_completed_transfer_with_no_declaration() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let mut chunks = channel(&host).await;
+    let bytes = pattern(64);
+    let handle = published_through_the_daemon(&host, &mut control, &mut chunks, &bytes).await;
+    let draft = a_draft_through_the_daemon(&host, &mut control).await;
+
+    let bound = bound_through_the_daemon(
+        &host,
+        &mut control,
+        &draft,
+        &handle,
+        kr_protocol::transfer::InsertionMethod::ManualTerminalWorkflow,
+    )
+    .await
+    .expect("a manual terminal workflow binds");
+
+    assert_eq!(
+        bound.attachment.insertion_method,
+        kr_protocol::transfer::InsertionMethod::ManualTerminalWorkflow
+    );
+    assert_eq!(
+        bound.attachment.state,
+        kr_protocol::transfer::InsertionState::Recorded
+    );
+    let grant = bound
+        .attachment
+        .read_grant
+        .0
+        .expect("the person is given the path the file can be read at");
+    assert_eq!(grant.transfer_id, handle.transfer_id);
+    assert_eq!(
+        grant.insertion_method,
+        kr_protocol::transfer::InsertionMethod::ManualTerminalWorkflow
+    );
+    assert!(grant.expires_at_ms.get() > kr_ipc::now_ms().get());
+    assert_eq!(
+        std::fs::read(&grant.host_path).expect("the file is at the path the person is shown"),
+        bytes
+    );
+}
+
+/// KR-REQ-13.14, KR-REQ-23.41: the manual path binds only a transfer that has completed: an upload
+/// that was begun and not finished is refused by the transfer service, as a transfer in a state
+/// that admits no binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manual_terminal_workflow_is_not_bound_before_the_transfer_has_completed() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let bytes = pattern(64);
+    let begun: UploadBeginResult = typed(
+        &control
+            .mutate(
+                Method::UploadBegin,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &begin_params(&host, &bytes, "notes.bin"),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.begin succeeds"),
+    );
+    let draft = a_draft_through_the_daemon(&host, &mut control).await;
+    let mut unfinished = published_handle_stub(&host, &bytes);
+    unfinished.transfer_id = begun.transfer_id;
+
+    let refusal = bound_through_the_daemon(
+        &host,
+        &mut control,
+        &draft,
+        &unfinished,
+        kr_protocol::transfer::InsertionMethod::ManualTerminalWorkflow,
+    )
+    .await
+    .expect_err("an unfinished upload is not bound");
+
+    assert_eq!(refusal.code, ErrorCode::ResourceUnavailable, "{refusal:?}");
+    assert!(
+        refusal.message.contains("published"),
+        "the refusal says the attachment is not published yet: {refusal:?}"
+    );
+}
+
+/// The handle of a file as `upload.finish` would publish it, for naming an upload that has not
+/// been finished.
+fn published_handle_stub(host: &Host, bytes: &[u8]) -> kr_protocol::transfer::AttachmentHandle {
+    kr_protocol::transfer::AttachmentHandle {
+        environment_id: host.environment_id,
+        transfer_id: TransferId::new(kr_ipc::new_uuid()),
+        session_id: Nullable::null(),
+        byte_len: U64::new(bytes.len() as u64),
+        content_digest: digest(bytes),
+        declared_media_type: "application/octet-stream".to_owned(),
+        original_file_name: "notes.bin".to_owned(),
+        preview: Nullable::null(),
+        presented_as_image: false,
+        published_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        expires_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        submitted: false,
+    }
+}
+
+/// KR-REQ-13.14, KR-REQ-23.41: an insertion path the session's integration did not declare is
+/// refused with a stated error, and nothing is bound: the draft is at the revision it was.
+///
+/// No integration declares one of these two paths, so every request for one is refused. The
+/// daemon keeps the refusal: the same action asked again is answered the same way, and the same
+/// action identifier with another payload is a conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_insertion_path_no_integration_declared_is_refused_and_binds_nothing() {
+    use kr_protocol::transfer::InsertionMethod;
+
+    let host = host().await;
+    let mut control = client(&host).await;
+    let mut chunks = channel(&host).await;
+    let handle = published_through_the_daemon(&host, &mut control, &mut chunks, &pattern(64)).await;
+    let draft = a_draft_through_the_daemon(&host, &mut control).await;
+
+    // Both are asked before either is judged, and their codes are compared as one list, so a wrong
+    // answer for the first path does not hide the second's.
+    let mut answers = Vec::new();
+    for method in [
+        InsertionMethod::TypedSubmission,
+        InsertionMethod::VerifiedComposerInsertion,
+    ] {
+        let action = ActionId::new(kr_ipc::new_uuid());
+        let first = bound_as(&host, &mut control, action, &draft, &handle, method).await;
+        let again = bound_as(&host, &mut control, action, &draft, &handle, method).await;
+        answers.push((method, action, first, again));
+    }
+    let codes: Vec<_> = answers
+        .iter()
+        .map(|(method, _, first, _)| (*method, first.as_ref().err().map(|error| error.code)))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            (
+                InsertionMethod::TypedSubmission,
+                Some(ErrorCode::UnsupportedCapability)
+            ),
+            (
+                InsertionMethod::VerifiedComposerInsertion,
+                Some(ErrorCode::UnsupportedCapability)
+            ),
+        ]
+    );
+    for (method, action, first, again) in answers {
+        let refusal = first.expect_err("the path was not declared");
+        assert!(
+            refusal.message.contains(method.as_str()),
+            "the refusal names the path: {}",
+            refusal.message
+        );
+        let repeated = again.expect_err("the same action is refused the same way");
+        assert_eq!(repeated.code, refusal.code, "{method:?}");
+        assert_eq!(repeated.message, refusal.message, "{method:?}");
+        // The action identifier belongs to the payload that was refused.
+        let conflict = bound_as(
+            &host,
+            &mut control,
+            action,
+            &draft,
+            &handle,
+            InsertionMethod::ManualTerminalWorkflow,
+        )
+        .await
+        .expect_err("the identifier carried another payload");
+        assert_eq!(conflict.code, ErrorCode::IdConflict, "{method:?}");
+    }
+
+    // Nothing was bound: the draft is still at the revision the refusals were asked at.
+    bound_through_the_daemon(
+        &host,
+        &mut control,
+        &draft,
+        &handle,
+        InsertionMethod::ManualTerminalWorkflow,
+    )
+    .await
+    .expect("the draft is as it was, so the manual path binds at its first revision");
+}
+
 /// KR-REQ-24.09: the daemon's own expiry sweep runs against the archive's view of its sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_daemon_sweeps_under_the_archives_view_of_its_sessions() {
@@ -1403,6 +1722,10 @@ fn publish_for(
         .handle
 }
 
+/// Binds a published file to a draft as a verified composer insertion, through the transfer service.
+///
+/// The daemon binds that path only for an integration that declared it, so these tests make the
+/// binding the declaring integration will make.
 fn bind(
     service: &kr_transfer::TransferService,
     draft: &kr_protocol::transfer::DraftRecord,

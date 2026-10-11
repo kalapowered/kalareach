@@ -2049,6 +2049,9 @@ fn a_published_attachment_for(
 }
 
 /// Binds a published attachment to a draft, and returns the draft as it stands then.
+///
+/// The binding is a typed submission, which the daemon makes only for a path an integration
+/// declared, so it is made through the transfer service here, as that integration's binding.
 fn bound_to_a_draft(
     controller: &crate::service::Controller,
     actor: &kr_protocol::ids::ActorId,
